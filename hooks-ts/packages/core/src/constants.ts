@@ -5,8 +5,9 @@
 // imports anything.
 //
 // What is NOT here: the facts that differ per agent. The agent-specific key env var, the errors
-// `hook_source`, the turn-log route, the wire app label and the heartbeat's version metadata key come
-// from the injected `AgentProfile` (`profile.ts`).
+// `hook_source`, the turn-log route, the wire app label, the heartbeat's version metadata key, the
+// agent's own directory and its credential-store layout come from the injected `AgentProfile`
+// (`profile.ts`).
 
 // --- Environment variables (naming precedent: RESEARCH §C3) ---------------------------------
 export const ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
@@ -18,16 +19,12 @@ export const DEFAULT_GATEWAY_URL = "https://api.getunbound.ai";
 export const CONFIG_DIR_NAME = ".unbound";
 export const CONFIG_FILE_NAME = "config.json";
 /**
- * The policy cache lives beside pi's own install, not in `~/.unbound`: `<agent dir>/.unbound/
- * policy_cache.json`. Same literal as `CONFIG_DIR_NAME`, deliberately a separate constant — the two
+ * The policy cache lives beside the agent's own install, not in `~/.unbound`: `<agent dir>/.unbound/
+ * policy_cache.json`, with the agent dir from `AgentProfile.resolveAgentDir`. Same literal as `CONFIG_DIR_NAME`, deliberately a separate constant — the two
  * have different parents and relocating one must not move the other.
  */
 export const CACHE_DIR_NAME = ".unbound";
 export const CACHE_FILE_NAME = "policy_cache.json";
-/** `join(homedir(), ...)` — pi's default agent dir, `PI/dist/config.js:405-427`. */
-export const PI_AGENT_DIR_SEGMENTS = [".pi", "agent"] as const;
-/** pi's own relocation hook, tilde-expanded, takes precedence over the default (§A6). */
-export const ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
 /** The cache is keyed on a digest, never on the key. See `keyFingerprint` (T-09-14). */
 export const KEY_FINGERPRINT_PREFIX = "sha256:";
 export const EVENT_NAME_TOOL_USE = "tool_use";
@@ -344,14 +341,13 @@ export const KEY_REJECTED_BLOCK_REASON =
 
 // --- Account identity (parity with the Claude Code hook's `account_identity`) ------------------
 
-/** pi's credential store, beside its own install: `<agent dir>/auth.json`. Read, never written. */
-export const PI_AUTH_FILE_NAME = "auth.json";
-/** A handful of provider entries. Anything bigger is not pi's auth file, and is not opened. */
+/**
+ * The size cap an adapter's credential-store reader applies (`AgentProfile.readAuth`). A handful of
+ * provider entries; anything bigger is not an agent's auth file, and is not opened.
+ */
 export const MAX_AUTH_FILE_BYTES = 65_536;
 /** The only provider whose OAuth token we know how to turn into an account. */
 export const ANTHROPIC_PROVIDER_ID = "anthropic";
-/** pi's credential `type` for a subscription sign-in. */
-export const PI_AUTH_TYPE_OAUTH = "oauth";
 /**
  * The profile endpoint Claude Code itself uses. The token goes to its own issuer and nowhere else:
  * this is the ONLY request that ever carries it, and redirects are refused so it cannot be bounced.

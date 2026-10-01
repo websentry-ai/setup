@@ -66,7 +66,6 @@ import {
   keyFingerprint,
   readCache,
   resolveCachePath,
-  resolvePiAgentDir,
   writeCache,
 } from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
@@ -172,7 +171,7 @@ export interface Deps {
    * Seams for the account-identity lookup (profile URL, fetch, serial probe, deadline). The agent dir
    * is NOT among them: it is always resolved from `env` / `homeDir`, exactly like the policy cache.
    */
-  identity: Omit<AccountIdentityLoaderOptions, "agentDir">;
+  identity: Omit<AccountIdentityLoaderOptions, "agentDir" | "readAuth">;
 }
 
 interface Resolved {
@@ -229,7 +228,7 @@ export function makeCacheSync(
   env: NodeJS.ProcessEnv = {},
   homeDir = "",
 ): ((snapshot: PolicySnapshot) => void) | undefined {
-  const cachePath = resolveCachePath(env, homeDir);
+  const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
   if (cachePath === undefined) return undefined;
   const fingerprint = keyFingerprint(apiKey);
   return (snapshot: PolicySnapshot) => {
@@ -278,7 +277,7 @@ function hydrateFromCache(
   homeDir: string,
 ): void {
   try {
-    const cachePath = resolveCachePath(env, homeDir);
+    const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
     if (cachePath === undefined) return;
     const onDisk = readCache(cachePath, { gatewayUrl: baseUrl, fingerprint: keyFingerprint(apiKey) });
     if (onDisk !== undefined) policyState.hydrate(onDisk);
@@ -318,7 +317,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
    */
   const identityLoader: AccountIdentityLoader = createAccountIdentityLoader({
     ...deps.identity,
-    agentDir: resolvePiAgentDir(env, homeDir),
+    agentDir: PI_PROFILE.resolveAgentDir(env, homeDir),
+    // A profile may omit `readAuth`; then there is no credential store and no identity is sent.
+    readAuth: PI_PROFILE.readAuth ?? (() => undefined),
   });
 
   /** The settled identity as a spreadable option: `{}` while pending or when there is none. */

@@ -1,11 +1,13 @@
-// Account identity — which provider account pi is signed in with, for the console's Account Usage
-// page. Parity with the Claude Code hook (`unbound.py` `read_account_identity` / `_device_serial`):
+// Account identity — which provider account the agent is signed in with, for the console's Account
+// Usage page. Parity with the Claude Code hook (`unbound.py` `read_account_identity` / `_device_serial`):
 // the same `account_identity` wire object, the same `plan` / `auth_mode` vocabulary.
 //
 // Where it comes from:
 //
-//   * `<agent dir>/auth.json` — pi's own credential store, resolved exactly like the policy cache
-//     (`resolvePiAgentDir`). Read, never written.
+//   * The agent's own credential store, read by the adapter and handed over as an
+//     `AgentAuthSummary` (`AgentProfile.readAuth`). Core never opens that store and does not know
+//     its layout; the agent dir is resolved exactly like the policy cache
+//     (`AgentProfile.resolveAgentDir`).
 //   * For an Anthropic **OAuth** sign-in with a live token: the same profile endpoint Claude Code
 //     uses, which names the account email, the organisation and its plan.
 //   * Everything else — an API-key provider, or an OAuth provider we cannot resolve — is
@@ -16,31 +18,27 @@
 // `api.anthropic.com`, on a request that refuses redirects. It is never logged, never written, never
 // placed in anything this module returns, and never sent to Unbound.
 //
-// **Total by construction.** No `throw` in this file; every failure is an absence. A missing or
-// corrupt `auth.json` is no identity at all; a failed profile call is an identity without email/plan;
+// **Total by construction.** No `throw` in this file; every failure is an absence. No credential
+// store (or a reader that throws) is no identity at all; a failed profile call is an identity without email/plan;
 // a failed probe is an identity without a serial. Every wait has a deadline.
 
 import { execFile as nodeExecFile } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 import {
   ACCOUNT_IDENTITY_TIMEOUT_MS,
   ANTHROPIC_OAUTH_BETA_HEADER,
   ANTHROPIC_OAUTH_BETA_VALUE,
   ANTHROPIC_PROFILE_URL,
-  ANTHROPIC_PROVIDER_ID,
   AUTH_MODE_API_KEY,
   AUTH_MODE_SUBSCRIPTION,
   LINUX_MACHINE_ID_PATHS,
-  MAX_AUTH_FILE_BYTES,
   MAX_IDENTITY_FIELD_CHARS,
   MAX_PROFILE_BYTES,
   MAX_SERIAL_PROBE_BYTES,
-  PI_AUTH_FILE_NAME,
-  PI_AUTH_TYPE_OAUTH,
   PLACEHOLDER_SERIALS,
 } from "./constants.ts";
+import type { AgentAuthSummary } from "./profile.ts";
 import { readSmallRegularFile } from "./safeRead.ts";
 
 /** The wire object, field for field what `preToolUseHandler.ts` declares. All optional strings. */
@@ -52,18 +50,6 @@ export interface AccountIdentity {
   email_domain?: string;
   device_serial?: string;
 }
-
-/**
- * One `auth.json` entry, narrowed to what the identity needs. `access` is held in memory only for
- * the one profile request; the refresh token and any API key are never read into this shape.
- */
-export interface PiAuthEntry {
-  type: string;
-  access?: string;
-  expires?: number;
-}
-
-export type PiAuth = Record<string, PiAuthEntry>;
 
 /** What the profile endpoint says, already validated. */
 export interface AnthropicProfile {
@@ -92,6 +78,9 @@ function label(value: unknown): string | undefined {
   if (trimmed.length === 0 || trimmed.length > MAX_IDENTITY_FIELD_CHARS) return undefined;
   return trimmed;
 }
+
+/** `label`, for an adapter's credential-store reader: a provider name is held to the same rule. */
+export { label as identityLabel };
 
 /**
  * Resolve `promise`, or `fallback` once `ms` elapses — whichever is first. The timer is unref'd so a
@@ -127,57 +116,6 @@ function attempt<T>(fn: () => Promise<T>): Promise<T> {
   } catch (error) {
     return Promise.reject(error);
   }
-}
-
-// --- auth.json -------------------------------------------------------------------------------------
-
-/**
- * pi's credential store, narrowed to `{type, access?, expires?}` per provider — or `undefined` when
- * it is missing, unreadable, not a small regular file, not JSON, or not an object. Entries that are
- * not objects with a string `type` are skipped.
- */
-export function readPiAuth(agentDir: string | undefined): PiAuth | undefined {
-  try {
-    if (typeof agentDir !== "string" || agentDir === "") return undefined;
-    const raw = readSmallRegularFile(join(agentDir, PI_AUTH_FILE_NAME), MAX_AUTH_FILE_BYTES);
-    if (raw === undefined) return undefined;
-    const parsed: unknown = JSON.parse(raw);
-    if (!isRecord(parsed)) return undefined;
-    const out: PiAuth = {};
-    for (const [provider, value] of Object.entries(parsed)) {
-      if (!isRecord(value) || typeof value.type !== "string") continue;
-      const entry: PiAuthEntry = { type: value.type };
-      if (typeof value.access === "string" && value.access.length > 0) entry.access = value.access;
-      if (typeof value.expires === "number" && Number.isFinite(value.expires)) entry.expires = value.expires;
-      out[provider] = entry;
-    }
-    return out;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * The session's provider when pi knows it (`ctx.model.provider`), else the only provider in
- * `auth.json`, else none — an ambiguous store names no account rather than a guessed one.
- */
-export function chooseProvider(
-  auth: Record<string, unknown> | undefined,
-  modelProvider: string | undefined,
-): string | undefined {
-  try {
-    const fromModel = label(modelProvider);
-    if (fromModel !== undefined) return fromModel;
-    if (!isRecord(auth)) return undefined;
-    const providers = Object.keys(auth);
-    return providers.length === 1 ? providers[0] : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function isAnthropicOAuth(provider: string | undefined, entry: PiAuthEntry | undefined): boolean {
-  return provider === ANTHROPIC_PROVIDER_ID && entry?.type === PI_AUTH_TYPE_OAUTH;
 }
 
 // --- profile ---------------------------------------------------------------------------------------
@@ -253,24 +191,27 @@ function emailDomain(email: string | undefined): string | undefined {
 }
 
 export interface BuildIdentityInput {
-  auth: PiAuth | undefined;
-  provider: string | undefined;
+  /** What the agent's credential store says (`AgentProfile.readAuth`); `undefined` = no store. */
+  auth: AgentAuthSummary | undefined;
   profile?: AnthropicProfile;
   deviceSerial?: string;
 }
 
 /**
- * The wire object, or `undefined` when there is nothing to say. No `auth.json` means no identity at
- * all (not even a serial): there is no sign-in to describe.
+ * The wire object, or `undefined` when there is nothing to say. No credential store means no
+ * identity at all (not even a serial): there is no sign-in to describe.
+ *
+ * A store with a credential for the session's provider is `subscription` when that credential is an
+ * Anthropic OAuth sign-in (the profile fields ride along when known) and `api_key` otherwise. A store
+ * with no credential for the provider says nothing about the mode.
  */
 export function buildAccountIdentity(input: BuildIdentityInput): AccountIdentity | undefined {
   try {
     if (!isRecord(input?.auth)) return undefined;
     const identity: AccountIdentity = {};
-    const provider = input.provider;
-    const entry = provider === undefined ? undefined : input.auth[provider];
-    if (entry !== undefined) {
-      if (isAnthropicOAuth(provider, entry)) {
+    const auth = input.auth;
+    if (auth.hasCredential === true) {
+      if (auth.anthropicOAuth === true) {
         identity.auth_mode = AUTH_MODE_SUBSCRIPTION;
         const profile = input.profile;
         const email = label(profile?.email);
@@ -413,6 +354,11 @@ export async function readDeviceSerial(opts: SerialProbeOptions = {}): Promise<s
 
 export interface AccountIdentityLoaderOptions extends SerialProbeOptions {
   agentDir: string | undefined;
+  /**
+   * The adapter's credential-store reader (`AgentProfile.readAuth`). `undefined` from it means "no
+   * store", and a throw is treated the same way.
+   */
+  readAuth: (agentDir: string | undefined, modelProvider: string | undefined) => AgentAuthSummary | undefined;
   fetch?: typeof fetch;
   profileUrl?: string;
   now?: () => number;
@@ -434,21 +380,30 @@ export function createAccountIdentityLoader(opts: AccountIdentityLoaderOptions):
   let settled: AccountIdentity | undefined;
 
   async function compute(modelProvider: string | undefined): Promise<AccountIdentity | undefined> {
-    const auth = readPiAuth(opts.agentDir);
+    let auth: AgentAuthSummary | undefined;
+    try {
+      auth = opts.readAuth(opts.agentDir, modelProvider);
+    } catch {
+      auth = undefined;
+    }
     // No credential store, no sign-in to describe: nothing is probed and nothing leaves the machine.
-    if (auth === undefined) return undefined;
-    const provider = chooseProvider(auth, modelProvider);
-    const entry = provider === undefined ? undefined : auth[provider];
+    if (!isRecord(auth)) return undefined;
     const now = (opts.now ?? Date.now)();
-    const live =
-      isAnthropicOAuth(provider, entry) &&
-      entry?.access !== undefined &&
-      entry.expires !== undefined &&
-      entry.expires > now;
+    // The token is spent only when it is an Anthropic OAuth token that has not expired. It goes to
+    // `fetchAnthropicProfile` and nowhere else.
+    const token =
+      auth.hasCredential === true &&
+      auth.anthropicOAuth === true &&
+      typeof auth.accessToken === "string" &&
+      auth.accessToken.length > 0 &&
+      typeof auth.expiresAt === "number" &&
+      auth.expiresAt > now
+        ? auth.accessToken
+        : undefined;
     const timeoutMs = opts.timeoutMs ?? ACCOUNT_IDENTITY_TIMEOUT_MS;
     const [profile, deviceSerial] = await Promise.all([
-      live && entry?.access !== undefined
-        ? fetchAnthropicProfile(entry.access, {
+      token !== undefined
+        ? fetchAnthropicProfile(token, {
             timeoutMs,
             ...(opts.fetch === undefined ? {} : { fetch: opts.fetch }),
             ...(opts.profileUrl === undefined ? {} : { url: opts.profileUrl }),
@@ -458,7 +413,6 @@ export function createAccountIdentityLoader(opts: AccountIdentityLoaderOptions):
     ]);
     return buildAccountIdentity({
       auth,
-      provider,
       ...(profile === undefined ? {} : { profile }),
       ...(deviceSerial === undefined ? {} : { deviceSerial }),
     });

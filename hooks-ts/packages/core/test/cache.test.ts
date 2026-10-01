@@ -16,12 +16,11 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, join, sep } from "node:path";
+import { dirname, join, sep } from "node:path";
 import test from "node:test";
 
 import {
   CACHE_TTL_MS,
-  ENV_PI_AGENT_DIR,
   KEY_FINGERPRINT_PREFIX,
   MAX_CACHE_BYTES,
 } from "../src/constants.ts";
@@ -68,7 +67,7 @@ function record(extra: Partial<CachedPolicy> = {}): CachedPolicy {
 /** A temp HOME plus the cache path under it. Callers must `cleanup()`. */
 function fixture() {
   const home = createFakeHome();
-  const path = resolveCachePath({}, home.homeDir);
+  const path = resolveCachePath({}, home.homeDir, TEST_PROFILE);
   assert.ok(path !== undefined, "a temp HOME resolves a cache path");
   return { home, path, dir: dirname(path) };
 }
@@ -80,57 +79,38 @@ const SHELL_TOOL = "bash";
 
 // --- resolveCachePath -------------------------------------------------------------------------
 
-test("resolveCachePath: PI_CODING_AGENT_DIR wins over the home default", () => {
-  const custom = join(sep, "custom", "agent");
-  assert.equal(
-    resolveCachePath({ [ENV_PI_AGENT_DIR]: custom }, join(sep, "home", "u")),
-    join(custom, ".unbound", "policy_cache.json"),
-  );
+// The agent-dir resolution itself (an agent's relocation variable, its home default) belongs to the
+// adapter and is tested there. What core owns is the join and the refusal.
+
+/** A profile whose agent dir is whatever the case says. */
+function dirProfile(answer: () => unknown): { resolveAgentDir: (env: NodeJS.ProcessEnv, homeDir: string) => string | undefined } {
+  return { resolveAgentDir: answer as () => string | undefined };
+}
+
+test("resolveCachePath: <agent dir>/.unbound/policy_cache.json, with the agent dir from the profile", () => {
+  const dir = join(sep, "custom", "agent");
+  const seen: unknown[] = [];
+  const env = { SOME_VAR: "x" };
+  const profile = {
+    resolveAgentDir(e: NodeJS.ProcessEnv, homeDir: string): string | undefined {
+      seen.push(e, homeDir);
+      return dir;
+    },
+  };
+  assert.equal(resolveCachePath(env, "/home/u", profile), join(dir, ".unbound", "policy_cache.json"));
+  assert.deepEqual(seen, [env, "/home/u"], "the profile resolves from the caller's env and home");
 });
 
-test("resolveCachePath: falls back to <home>/.pi/agent when the env var is absent", () => {
-  const home = join(sep, "home", "u");
-  const path = resolveCachePath({}, home);
-  assert.equal(path, join(home, ".pi", "agent", ".unbound", "policy_cache.json"));
-});
-
-test("resolveCachePath: a leading tilde expands against the passed home dir", () => {
-  const home = join(sep, "home", "u");
-  assert.equal(
-    resolveCachePath({ [ENV_PI_AGENT_DIR]: "~/relocated" }, home),
-    join(home, "relocated", ".unbound", "policy_cache.json"),
-  );
-  assert.equal(
-    resolveCachePath({ [ENV_PI_AGENT_DIR]: "~" }, home),
-    join(home, ".unbound", "policy_cache.json"),
-  );
-});
-
-test("resolveCachePath: a relative or blank env value falls back instead of resolving against cwd", () => {
-  const home = join(sep, "home", "u");
-  const fallback = join(home, ".pi", "agent", ".unbound", "policy_cache.json");
-  // A repo-relative value must never be honoured: `join(cwd, ...)` would put the cache inside
-  // whatever repository pi was started in, where the repo itself could plant one.
-  assert.equal(resolveCachePath({ [ENV_PI_AGENT_DIR]: "agent" }, home), fallback);
-  assert.equal(resolveCachePath({ [ENV_PI_AGENT_DIR]: "./agent" }, home), fallback);
-  assert.equal(resolveCachePath({ [ENV_PI_AGENT_DIR]: "   " }, home), fallback);
-  assert.equal(resolveCachePath({ [ENV_PI_AGENT_DIR]: "" }, home), fallback);
-});
-
-test("resolveCachePath: a non-absolute resolved base is refused outright — no read, no write", () => {
-  // `os.homedir()` can fail and the caller's fallback is "", exactly the config.ts hazard.
-  assert.equal(resolveCachePath({}, ""), undefined);
-  assert.equal(resolveCachePath({}, "relative/home"), undefined);
-  assert.equal(resolveCachePath({ [ENV_PI_AGENT_DIR]: "agent" }, ""), undefined);
-  assert.equal(resolveCachePath({ [ENV_PI_AGENT_DIR]: "~/x" }, ""), undefined);
-  assert.equal(resolveCachePath({}, undefined as unknown as string), undefined);
-});
-
-test("resolveCachePath: never throws, whatever the env holds", () => {
-  assert.doesNotThrow(() => resolveCachePath(undefined as unknown as NodeJS.ProcessEnv, "/home/u"));
-  assert.doesNotThrow(() => resolveCachePath({ [ENV_PI_AGENT_DIR]: 42 as unknown as string }, "/home/u"));
-  const path = resolveCachePath({}, "/home/u");
-  assert.ok(path !== undefined && isAbsolute(path));
+test("resolveCachePath: no agent dir, a relative one, or a resolver that throws is no cache", () => {
+  // A relative base would resolve against the process cwd — the repository the agent was started in.
+  for (const answer of [undefined, "", "agent", "./agent", "relative/home", 42, null, {}]) {
+    assert.equal(resolveCachePath({}, "/home/u", dirProfile(() => answer)), undefined, JSON.stringify(answer));
+  }
+  const throwing = dirProfile(() => {
+    throw new Error("resolver failed");
+  });
+  assert.doesNotThrow(() => resolveCachePath({}, "/home/u", throwing));
+  assert.equal(resolveCachePath({}, "/home/u", throwing), undefined);
 });
 
 // --- keyFingerprint --------------------------------------------------------------------------

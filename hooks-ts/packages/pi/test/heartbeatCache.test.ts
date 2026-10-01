@@ -84,7 +84,7 @@ async function fixture(api: MockApi): Promise<Fixture> {
 
   const handler = handlers.get("session_start");
   assert.ok(handler !== undefined, "session_start must be registered");
-  const cachePath = resolveCachePath(env, homeDir);
+  const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
   assert.ok(cachePath !== undefined, "the fixture must resolve a cache path");
   return {
     handler,

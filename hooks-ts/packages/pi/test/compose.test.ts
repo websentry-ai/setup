@@ -86,7 +86,7 @@ function fixture(api: MockApi): Fixture {
     UNBOUND_PI_API_KEY: TEST_KEY,
     UNBOUND_GATEWAY_URL: api.url,
   };
-  const cachePath = resolveCachePath(env, homeDir);
+  const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
   assert.ok(cachePath !== undefined, "a temp HOME resolves a cache path");
   return {
     env,

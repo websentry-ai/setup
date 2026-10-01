@@ -4,20 +4,17 @@
 // values below are exactly what pi has always put on the wire — they are pinned literally by
 // `test/profile.test.ts` and, end to end, by the frozen wire golden.
 //
-// The file-tool taxonomy is defined here. `resolveAgentDir` and `readAuth` still delegate to readers
-// that live in core today (`resolvePiAgentDir`, `readPiAuth`, `chooseProvider`); a later slice of the
-// same refactor moves those into this package, and the profile's surface and values do not change
-// when it does.
+// The file-tool taxonomy is defined here; the agent dir resolver is `./agentDir.ts` and the
+// `auth.json` reader is `./auth.ts`. All of it is pi's, none of it is core's.
 //
 // **Every function here is total.** A throw out of a pi handler is a BLOCK whose message reaches the
 // model, so each member answers a safe default for any input — `null`, a Proxy whose getters throw,
 // a non-string environment value — instead of raising.
 
-import { chooseProvider, readPiAuth } from "../../core/src/accountIdentity.ts";
-import { resolvePiAgentDir } from "../../core/src/cache.ts";
-import { ANTHROPIC_PROVIDER_ID, PI_AUTH_TYPE_OAUTH } from "../../core/src/constants.ts";
 import { nativeFileTools } from "../../core/src/payload.ts";
-import type { AgentAuthSummary, AgentFileTools, AgentProfile } from "../../core/src/profile.ts";
+import type { AgentFileTools, AgentProfile } from "../../core/src/profile.ts";
+import { resolvePiAgentDir } from "./agentDir.ts";
+import { readPiAuthSummary } from "./auth.ts";
 import { resolveClientEntrypoint } from "./version.ts";
 
 /** What `resolveClientEntrypoint` answers when even the total reader could not be reached. */
@@ -53,32 +50,6 @@ export const PI_FILE_TOOLS: AgentFileTools = Object.freeze({
  */
 export const PI_NATIVE_FILE_TOOLS: ReadonlySet<string> = nativeFileTools(PI_FILE_TOOLS);
 
-/**
- * pi's `auth.json`, reduced to what the account identity needs.
- *
- * `undefined` means "no credential store": nothing to describe, so nothing is probed. Otherwise the
- * provider is the session's own when pi knows it, else the only one in the store, else none.
- */
-function readAuth(agentDir: string | undefined, modelProvider: string | undefined): AgentAuthSummary | undefined {
-  try {
-    const auth = readPiAuth(agentDir);
-    if (auth === undefined) return undefined;
-    const provider = chooseProvider(auth, modelProvider);
-    const entry = provider !== undefined && Object.hasOwn(auth, provider) ? auth[provider] : undefined;
-    const summary: AgentAuthSummary = {
-      provider,
-      hasCredential: entry !== undefined,
-      // The one provider whose subscription sign-in can be turned into an account.
-      anthropicOAuth: provider === ANTHROPIC_PROVIDER_ID && entry?.type === PI_AUTH_TYPE_OAUTH,
-    };
-    if (entry?.access !== undefined) summary.accessToken = entry.access;
-    if (entry?.expires !== undefined) summary.expiresAt = entry.expires;
-    return summary;
-  } catch {
-    return undefined;
-  }
-}
-
 export const PI_PROFILE: AgentProfile = Object.freeze({
   appLabel: "pi",
   hookSource: "pi",
@@ -92,13 +63,7 @@ export const PI_PROFILE: AgentProfile = Object.freeze({
       return UNKNOWN_ENTRYPOINT;
     }
   },
-  resolveAgentDir(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
-    try {
-      return resolvePiAgentDir(env, homeDir);
-    } catch {
-      return undefined;
-    }
-  },
+  resolveAgentDir: resolvePiAgentDir,
   fileTools: PI_FILE_TOOLS,
-  readAuth,
+  readAuth: readPiAuthSummary,
 });
