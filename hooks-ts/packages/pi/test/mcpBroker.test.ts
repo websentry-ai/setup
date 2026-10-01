@@ -836,6 +836,42 @@ test("PR #371: a broker request before session_start does not latch the config o
   }
 });
 
+test("PR #371: a direct tool under toolPrefix \"mcp\" (mcp__<server>_<tool>) correlates, and its output lands on its row", async () => {
+  const f = await fixture("allow");
+  try {
+    await f.handlers.get("input")?.(createFakeInputEvent("open an issue"), f.ctx);
+    // Top-level arguments, no `tool`/`args` wrapper fields — a direct tool that merely LOOKS like a wrapper.
+    await f.handlers.get("tool_call")?.(
+      createFakeToolCallEvent("mcp__github_create_issue", { title: "t", labels: ["bug"] }, "toolu_direct_mcp"),
+      f.ctx,
+    );
+    await brokerRequest(f.bus, {
+      serverName: "github",
+      originalToolName: "create_issue",
+      prefixedToolName: "mcp__github_create_issue",
+      args: { labels: ["bug"], title: "t" },
+      origin: "direct",
+    });
+    const mcpBody = pretoolBodies(f.api).find((b) => dataOf(b).metadata.mcp_server !== undefined);
+    assert.equal(dataOf(mcpBody).tool_use_id, "toolu_direct_mcp", "the real id, not a minted one");
+
+    await f.handlers.get("tool_result")?.(
+      createFakeToolResultEvent("mcp__github_create_issue", { toolCallId: "toolu_direct_mcp", content: [{ type: "text", text: "issue #7" }] }),
+      f.ctx,
+    );
+    f.handlers.get("agent_end")?.(createFakeAgentEndEvent([]), f.ctx);
+    await sleep(80);
+    const logs = f.api.requests.filter((r) => r.path === TURNLOG_PATH);
+    assert.equal(logs.length, 1, "no standalone row: it is part of the turn");
+    const use = (logs[0]?.body as { messages: { tool_use?: { tool_use_id: string; tool_response: { content?: string } }[] }[] })
+      .messages[1]?.tool_use?.[0];
+    assert.equal(use?.tool_use_id, "toolu_direct_mcp");
+    assert.equal(use?.tool_response.content, "issue #7");
+  } finally {
+    await f.close();
+  }
+});
+
 // Must stay LAST: the key latch is permanent for this process.
 test("a latched key ⇒ no claim", async () => {
   const f = await fixture("401");

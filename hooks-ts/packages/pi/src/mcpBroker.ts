@@ -23,7 +23,9 @@
 // typed structurally here, so the bundle stays dependency-free.
 //
 // **Audit correlation.** The broker request carries no `toolCallId`. So `tool_call` remembers in-flight
-// non-native calls (`InflightCalls`) with their name AND their serialised arguments, and the broker
+// non-native calls (`InflightCalls`) with their name AND their serialised arguments — read both as a
+// wrapper (`input.tool` + `input.args`) and as a direct tool (the whole input), because a direct tool
+// under `toolPrefix: "mcp"` is named `mcp__<server>_<tool>` just like a wrapper — and the broker
 // handler claims the oldest entry whose name matches and whose arguments are equal (stable key order)
 // — so two overlapping calls to the same tool with different arguments cannot swap ids. Entries
 // expire after `MCP_INFLIGHT_MAX_AGE_MS`. No match (an `mcpScript` call, a resource read, an iframe, a
@@ -163,15 +165,17 @@ export function stableKey(value: unknown): string | undefined {
   }
 }
 
+/** `isWrapperName`: the proxy (`mcp`) or a name that MAY be a namespace wrapper (`mcp__…`). */
+function mayBeWrapper(toolName: string): boolean {
+  return toolName === MCP_PROXY_TOOL_NAME || toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
+}
+
 /**
- * The arguments a `tool_call` will hand the MCP tool, keyed for comparison with the broker's `args`:
- * a wrapper (`mcp`, `mcp__<ns>`) carries them in `input.args` (an object, a JSON string, or absent ⇒
- * `{}`, as the adapter parses them); a direct tool's input IS its arguments.
+ * The arguments a call carries if it is a WRAPPER (`mcp`, `mcp__<ns>`): `input.args` — an object, a
+ * JSON string, or absent ⇒ `{}`, as the adapter parses them. `undefined` when they cannot be keyed.
  */
-function argsKeyOf(toolName: string, input: unknown): string | undefined {
+function wrapperArgsKey(input: unknown): string | undefined {
   try {
-    const wrapper = toolName === MCP_PROXY_TOOL_NAME || toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
-    if (!wrapper) return stableKey(isRecord(input) ? input : {});
     const raw = isRecord(input) ? input.args : undefined;
     if (raw === undefined || raw === "") return stableKey({});
     if (typeof raw === "string") return stableKey(JSON.parse(raw) as unknown);
@@ -181,13 +185,24 @@ function argsKeyOf(toolName: string, input: unknown): string | undefined {
   }
 }
 
+/** The arguments a call carries if it is a DIRECT tool: its whole input. */
+function directArgsKey(input: unknown): string | undefined {
+  return stableKey(isRecord(input) ? input : {});
+}
+
 interface InflightEntry {
   toolCallId: string;
   toolName: string;
   /** `input.tool` for the proxy / namespace wrappers, when it is a string. */
   tool: string | undefined;
-  /** `stableKey` of the arguments the call carries; `undefined` = cannot be compared ⇒ never matched. */
-  argsKey: string | undefined;
+  /**
+   * Both readings of the arguments, because the NAME cannot say which shape the call has: a direct
+   * tool under `toolPrefix: "mcp"` is `mcp__<server>_<tool>`, which looks like a namespace wrapper
+   * but carries its arguments at the top level. The broker's `prefixedToolName` settles it at claim
+   * time. `undefined` = that reading cannot be compared ⇒ never matched that way.
+   */
+  directKey: string | undefined;
+  wrapperKey: string | undefined;
   sessionId: string;
   at: number;
 }
@@ -222,7 +237,8 @@ export function createInflightCalls(max: number, maxAgeMs: number, now: () => nu
           toolCallId: entry.toolCallId,
           toolName: entry.toolName,
           tool,
-          argsKey: argsKeyOf(entry.toolName, entry.input),
+          directKey: directArgsKey(entry.input),
+          wrapperKey: mayBeWrapper(entry.toolName) ? wrapperArgsKey(entry.input) : undefined,
           sessionId: typeof sessionId === "string" ? sessionId : "",
           at: now(),
         });
@@ -253,12 +269,14 @@ export function createInflightCalls(max: number, maxAgeMs: number, now: () => nu
         const argsKey = stableKey(isRecord(args) ? args : {});
         if (argsKey === undefined) return undefined;
         const index = entries.findIndex((entry) => {
-          if (entry.argsKey === undefined || entry.argsKey !== argsKey) return false;
-          if (prefixedToolName !== "" && entry.toolName === prefixedToolName) return true;
-          const wrapper =
-            entry.toolName === MCP_PROXY_TOOL_NAME || entry.toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
+          // Direct: the pi tool IS the adapter's prefixed tool, and its whole input is the arguments.
+          if (prefixedToolName !== "" && entry.toolName === prefixedToolName && entry.directKey === argsKey) {
+            return true;
+          }
+          // Wrapper: `input.tool` names the tool, `input.args` carries the arguments.
           return (
-            wrapper &&
+            mayBeWrapper(entry.toolName) &&
+            entry.wrapperKey === argsKey &&
             entry.tool !== undefined &&
             (entry.tool === originalToolName || (prefixedToolName !== "" && entry.tool === prefixedToolName))
           );
