@@ -920,6 +920,32 @@ test("formatServerNamespace mirrors the adapter (dash, unsafe chars, long names)
   assert.ok(long.length <= 59 && long.startsWith("_mcpns__h_"));
 });
 
+test("PR #371 round 2: a finished run's aborted signal does not cancel the broker's confirm", async () => {
+  // The last ctx a handler saw belongs to a run that already ended (its signal aborted); a
+  // between-turn MCP call that policy says to confirm must still ASK.
+  const f = await fixture("ask", { ctx: { hasUI: true, confirmResult: true, signal: AbortSignal.abort() } });
+  try {
+    const live = new AbortController();
+    const { decision } = await brokerRequest(f.bus, { serverName: "s", originalToolName: "t", origin: "resource", signal: live.signal });
+    assert.equal(f.ctx.confirmCalls.length, 1, "the dialog is shown");
+    assert.equal(f.ctx.confirmCalls[0]?.opts?.signal, live.signal, "tied to the broker request only");
+    assert.equal(decision, "allow_once");
+  } finally {
+    await f.close();
+  }
+});
+
+test("PR #371 round 2: an aborted broker signal still means no dialog and abstain", async () => {
+  const f = await fixture("ask", { ctx: { hasUI: true, confirmResult: true } });
+  try {
+    const { decision } = await brokerRequest(f.bus, { serverName: "s", originalToolName: "t", signal: AbortSignal.abort() });
+    assert.equal(decision, "abstain");
+    assert.equal(f.ctx.confirmCalls.length, 0);
+  } finally {
+    await f.close();
+  }
+});
+
 // Must stay LAST: the key latch is permanent for this process.
 test("a latched key ⇒ no claim", async () => {
   const f = await fixture("401");

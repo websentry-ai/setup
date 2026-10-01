@@ -367,7 +367,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
   /**
    * The most recent ctx a handler saw. The broker request carries none, so the confirm dialog, the
    * notice, the cwd and the session id for a brokered call come from here. Possibly stale after a
-   * reload — every read of it goes through a guard, and a stale UI simply means "no UI": deny.
+   * reload — every read of it goes through a guard, and a stale UI simply means "no UI": deny. Its
+   * `signal` is never used for a brokered confirm: that belongs to whichever run last called a
+   * handler; the dialog is cancelled only by the broker request's own signal.
    */
   let lastCtx: DecideCtx | undefined;
   const seeCtx = (ctx: unknown): void => {

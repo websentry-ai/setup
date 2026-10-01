@@ -313,7 +313,12 @@ export interface McpApprovalInput {
 /**
  * The confirm for a brokered call, behind its own guard: a policy "confirm" that cannot be asked must
  * be a `deny`, never fall through to `abstain` (which the adapter, with no `approveTools`, runs).
- * The dialog closes on either the agent run's signal or the broker request's, whichever aborts first.
+ *
+ * The dialog's cancellation is the broker request's OWN signal (plus the confirm timeout) and nothing
+ * else. The ctx is the most recent one a handler saw and is used for its UI handle only: its `signal`
+ * belongs to whichever agent run last called a handler, which may long since have finished or been
+ * aborted — tying the dialog to it made a between-turn MCP call (a resource read, an iframe) that
+ * policy says to confirm resolve `false` without ever asking (PR #371).
  */
 async function confirmBrokered(ui: UiCtx, reason: string, signal: AbortSignal | undefined): Promise<McpApprovalAnswer> {
   try {
@@ -322,9 +327,7 @@ async function confirmBrokered(ui: UiCtx, reason: string, signal: AbortSignal | 
       return "deny";
     }
     notifySafe(ui, reason, "warning");
-    const signals = [ui.signal, signal].filter((s): s is AbortSignal => s instanceof AbortSignal);
-    const combined = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
-    const dialogCtx: UiCtx = { hasUI: true, ui: ui.ui, signal: combined };
+    const dialogCtx: UiCtx = { hasUI: true, ui: ui.ui, signal: signal instanceof AbortSignal ? signal : undefined };
     const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
     return accepted ? "allow_once" : "deny";
   } catch {
