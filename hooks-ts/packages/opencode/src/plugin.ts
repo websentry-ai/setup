@@ -42,7 +42,7 @@ import type {
   AccountIdentityLoader,
   AccountIdentityLoaderOptions,
 } from "../../core/src/accountIdentity.ts";
-import { MAX_TRACKED_INSTANCES, MAX_TRACKED_SESSIONS } from "../../core/src/constants.ts";
+import { MAX_ASSISTANT_CHARS, MAX_TRACKED_INSTANCES, MAX_TRACKED_SESSIONS } from "../../core/src/constants.ts";
 import { createKeyedState } from "../../core/src/keyedState.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
@@ -83,6 +83,10 @@ const MAX_PARENT_DEPTH = 8;
 const MAX_MODEL_CHARS = 256;
 /** The most call ids any one per-session id set keeps; the oldest is dropped first. */
 const MAX_IDS_PER_SESSION = 512;
+/** The most message roles remembered per session. */
+const MAX_MESSAGES_PER_SESSION = 256;
+/** The most assistant text parts kept per session between idles; the oldest is dropped first. */
+const MAX_ASSISTANT_PARTS = 32;
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -174,6 +178,16 @@ export interface Runtime {
   takeDigest(sessionID: string, callID: string): string | undefined;
   /** Claim the one audited result of a call: true the first time, false after (and on a fault). */
   markResulted(sessionID: string, callID: string): boolean;
+  /** Remember a message's role (`message.updated`). */
+  setRole(sessionID: string, messageID: string, role: string): void;
+  /** A remembered message role, or `undefined`. */
+  roleOf(sessionID: string, messageID: string): string | undefined;
+  /** Keep the latest text of one assistant text part (bounded). */
+  setAssistantPart(sessionID: string, partID: string, text: string): void;
+  /** The session's assistant text since the last take, parts joined with `\n`; clears it. */
+  takeAssistantText(sessionID: string): string;
+  /** Drop everything kept for a session (`session.deleted`). A pending turn is NOT posted. */
+  releaseSession(sessionID: string): void;
 }
 
 /** Read-only test seam, attached to the factory as a NON-enumerable `inspect` property. */
@@ -249,10 +263,36 @@ export interface SessionExtras {
   parent?: string;
   /** Call ids whose result was already audited (one result per call). */
   resulted: Set<string>;
+  /** messageID → role, from `message.updated`. */
+  roles: Map<string, string>;
+  /** partID → latest assistant text of that part, in first-seen order. */
+  assistant: Map<string, string>;
 }
 
 function freshExtras(): SessionExtras {
-  return { resulted: new Set<string>() };
+  return { resulted: new Set<string>(), roles: new Map<string, string>(), assistant: new Map<string, string>() };
+}
+
+/** Set `key` in an insertion-ordered map, dropping the oldest past `max`. */
+function boundedSet(map: Map<string, string>, key: string, value: string, max: number): void {
+  if (!map.has(key)) {
+    while (map.size >= max) {
+      const oldest = map.keys().next().value;
+      if (oldest === undefined) break;
+      map.delete(oldest);
+    }
+  }
+  map.set(key, value);
+}
+
+/**
+ * One part's text as kept: whole up to twice the turn-log cap, otherwise its head and tail at the
+ * cap each. The turn-log builder keeps both ends of the joined text at `MAX_ASSISTANT_CHARS`, so
+ * nothing it could send is lost, and memory stays bounded however long the answer streams.
+ */
+function keepText(text: string): string {
+  if (text.length <= MAX_ASSISTANT_CHARS * 2) return text;
+  return text.slice(0, MAX_ASSISTANT_CHARS) + text.slice(text.length - MAX_ASSISTANT_CHARS);
 }
 
 /** Add `id` to an insertion-ordered set, dropping the oldest past `max`. */
@@ -548,6 +588,51 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         return digest;
       } catch {
         return undefined;
+      }
+    },
+    setRole(sessionID: string, messageID: string, role: string): void {
+      try {
+        if (sessionID === "" || messageID === "" || typeof role !== "string" || role === "") return;
+        boundedSet(extras.get(sessionID).roles, messageID, role, MAX_MESSAGES_PER_SESSION);
+      } catch {
+        // Unknown role = not assistant text.
+      }
+    },
+    roleOf(sessionID: string, messageID: string): string | undefined {
+      try {
+        return extras.peek(sessionID)?.roles.get(messageID);
+      } catch {
+        return undefined;
+      }
+    },
+    setAssistantPart(sessionID: string, partID: string, text: string): void {
+      try {
+        if (sessionID === "" || partID === "" || typeof text !== "string") return;
+        boundedSet(extras.get(sessionID).assistant, partID, keepText(text), MAX_ASSISTANT_PARTS);
+      } catch {
+        // A lost column, never a fault.
+      }
+    },
+    takeAssistantText(sessionID: string): string {
+      try {
+        const kept = extras.peek(sessionID);
+        if (kept === undefined) return "";
+        const text = [...kept.assistant.values()].filter((t) => t !== "").join("\n");
+        kept.assistant.clear();
+        kept.roles.clear();
+        return text;
+      } catch {
+        return "";
+      }
+    },
+    releaseSession(sessionID: string): void {
+      try {
+        if (sessionID === "") return;
+        sessions.release(sessionID);
+        extras.release(sessionID);
+        digests.release(sessionID);
+      } catch {
+        // Nothing to release.
       }
     },
     markResulted(sessionID: string, callID: string): boolean {

@@ -7,10 +7,14 @@
 // awaits nothing: the bookkeeping is synchronous and every network call is fire-and-forget with a
 // terminal catch.
 
+import { buildHeartbeatPayload } from "../../core/src/heartbeat.ts";
+import { directoryKey } from "../../core/src/sessionState.ts";
 import { hashContent } from "../../core/src/turn.ts";
+import { buildTurnLogBody, shouldPostTurn } from "../../core/src/turnLog.ts";
 import { SIGNAL_ARGS_CHANGED } from "./constants.ts";
 import { argsDigest } from "./narrow.ts";
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
+import { OPENCODE_PROFILE } from "./profile.ts";
 
 export interface RecordContext {
   runtime: Runtime;
@@ -101,6 +105,21 @@ function onToolPart(sessionID: string, part: unknown, ctx: RecordContext): void 
   recordResult(ctx, sessionID, callID, tool, true, [{ type: "text", text: typeof error === "string" ? error : "" }]);
 }
 
+/** `message.part.updated` for a text part: keep the latest text of a non-synthetic assistant part. */
+function onTextPart(sessionID: string, part: unknown, ctx: RecordContext): void {
+  const { runtime } = ctx;
+  if (readField(part, "synthetic") === true) return;
+  // Child (subagent) text is not the root's answer, and a child idle posts nothing.
+  if (runtime.isChild(sessionID)) return;
+  if (!runtime.recordingActive()) return;
+  const messageID = readString(part, "messageID");
+  if (runtime.roleOf(sessionID, messageID) !== "assistant") return;
+  const partID = readString(part, "id");
+  const text = readField(part, "text");
+  if (partID === "" || typeof text !== "string") return;
+  runtime.setAssistantPart(sessionID, partID, text);
+}
+
 /** `message.part.updated`: dispatch by part type. */
 function onPartUpdated(properties: unknown, ctx: RecordContext): void {
   const part = readField(properties, "part");
@@ -110,17 +129,130 @@ function onPartUpdated(properties: unknown, ctx: RecordContext): void {
     case "tool":
       onToolPart(sessionID, part, ctx);
       return;
+    case "text":
+      onTextPart(sessionID, part, ctx);
+      return;
     default:
       return;
   }
 }
 
-/** `session.created`: remember the parent of a child session. */
+/** `info.version` if it is a plain version token, else `undefined` (T-13-33). */
+export function sanitizeHostVersion(value: unknown): string | undefined {
+  return typeof value === "string" && /^[0-9A-Za-z.+-]{1,64}$/.test(value) ? value : undefined;
+}
+
+/**
+ * The heartbeat for a new root session: once per directory per TTL, fire-and-forget, mirroring pi's
+ * `session_start` (warm the policy metadata, then persist it through the identity-bound cache).
+ */
+function sendHeartbeat(sessionID: string, info: unknown, version: string | undefined, ctx: RecordContext): void {
+  const { runtime, record } = ctx;
+  if (!runtime.recordingActive()) return;
+  const resolved = runtime.init();
+  const client = resolved.client;
+  const scope = resolved.scope;
+  if (client === undefined || scope === undefined) return;
+  const directory = directoryKey(readField(info, "directory")) ?? record.directory;
+  const gate = runtime.instances.forDirectory(directory).heartbeatGate;
+  if (!gate.shouldSend(scope.policy.getFetchedAt())) return;
+  // Claimed before dispatch: two creations in the same tick must not both get through.
+  gate.markSent();
+  const identity = runtime.identity();
+  const body = buildHeartbeatPayload(
+    {
+      cwd: directory,
+      sessionId: sessionID,
+      model: undefined,
+      clientEntrypoint: runtime.entrypoint(),
+      hasUI: false,
+      agentVersion: version ?? "unknown",
+      ...(identity === undefined ? {} : { accountIdentity: identity }),
+    },
+    OPENCODE_PROFILE,
+  );
+  void Promise.resolve()
+    .then(() => client.postPretool(body))
+    .then((result) => {
+      if (!result.ok) return;
+      scope.policy.recordSuccess(result.body);
+      try {
+        resolved.cacheSync?.(scope.policy.snapshot());
+      } catch {
+        // A cache we could not write costs one round trip next time.
+      }
+    })
+    .catch(() => {
+      // A failed heartbeat is a cache miss, never a block and never a notice.
+    });
+}
+
+/** `session.created`: parent map, host version, and the root heartbeat. */
 function onSessionCreated(properties: unknown, ctx: RecordContext): void {
+  const { runtime } = ctx;
   const info = readField(properties, "info");
   const sessionID = readString(properties, "sessionID") || readString(info, "id");
   if (sessionID === "") return;
-  ctx.runtime.setParent(sessionID, readField(info, "parentID"));
+  runtime.setParent(sessionID, readField(info, "parentID"));
+  const version = sanitizeHostVersion(readField(info, "version"));
+  // Process-wide: one opencode binary serves every directory. A bad value never replaces a good one.
+  if (version !== undefined) runtime.hostVersion = version;
+  if (runtime.isChild(sessionID)) return;
+  sendHeartbeat(sessionID, info, version, ctx);
+}
+
+/** `message.updated`: remember the message's role, so its text parts can be attributed. */
+function onMessageUpdated(properties: unknown, ctx: RecordContext): void {
+  const info = readField(properties, "info");
+  const sessionID = readString(properties, "sessionID") || readString(info, "sessionID");
+  ctx.runtime.setRole(sessionID, readString(info, "id"), readString(info, "role"));
+}
+
+/**
+ * `session.idle`: one turn log per root turn (12-03: post before any release). A child idle posts
+ * nothing; its calls were recorded into the root's turn. Dispatched, never awaited.
+ */
+function onSessionIdle(properties: unknown, ctx: RecordContext): void {
+  const { runtime, record } = ctx;
+  const sessionID = readString(properties, "sessionID");
+  if (sessionID === "" || runtime.isChild(sessionID)) return;
+  // Taken unconditionally: a record nothing will post must not linger.
+  const turn = runtime.sessions.forSession(sessionID).turn.take();
+  const assistantText = runtime.takeAssistantText(sessionID);
+  if (!runtime.recordingActive() || !shouldPostTurn(turn)) return;
+  const resolved = runtime.init();
+  const client = resolved.client;
+  if (client === undefined || turn === undefined) return;
+  const now = runtime.deps.now;
+  const completedAtMs = now();
+  const identity = runtime.identity();
+  const body = buildTurnLogBody(turn, {
+    cwd: record.directory,
+    completedAtMs,
+    assistantText,
+    ...(resolved.apiKey === undefined ? {} : { apiKey: resolved.apiKey }),
+    ...(identity === undefined ? {} : { accountIdentity: identity }),
+  });
+  void Promise.resolve()
+    .then(() => client.postTurnLog(body))
+    .then((ok) => {
+      if (ok) return;
+      resolved.telemetry?.reportTurnLogFailure({
+        errorClass: "TurnLogFailed",
+        toolName: "session.idle",
+        elapsedMs: now() - completedAtMs,
+      });
+    })
+    .catch(() => {
+      // Never an unhandled rejection in the host.
+    });
+}
+
+/** `session.deleted`: release every per-session store. Dropped state is never posted (12-03). */
+function onSessionDeleted(properties: unknown, ctx: RecordContext): void {
+  const info = readField(properties, "info");
+  const sessionID = readString(properties, "sessionID") || readString(info, "id");
+  ctx.runtime.releaseSession(sessionID);
 }
 
 /** Handle one bus event synchronously. Total. */
@@ -135,6 +267,15 @@ export function handleEvent(input: unknown, ctx: RecordContext): void {
         return;
       case "message.part.updated":
         onPartUpdated(properties, ctx);
+        return;
+      case "message.updated":
+        onMessageUpdated(properties, ctx);
+        return;
+      case "session.idle":
+        onSessionIdle(properties, ctx);
+        return;
+      case "session.deleted":
+        onSessionDeleted(properties, ctx);
         return;
       default:
         return;
