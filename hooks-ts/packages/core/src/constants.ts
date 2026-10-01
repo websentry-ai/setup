@@ -86,6 +86,14 @@ export const TURNLOG_TOOL_USE_TYPE = "PostToolUse";
 
 // --- Timeouts (RESEARCH §F5: an unbounded confirm hangs the whole tool batch) -----------------
 export const PRETOOL_TIMEOUT_MS = 20_000;
+/**
+ * Added to `PRETOOL_TIMEOUT_MS` to give the outer bound `evaluate.ts` puts on one policy check.
+ *
+ * The client already aborts its own request at `PRETOOL_TIMEOUT_MS`, so this outer bound only fires
+ * for an injected or future checker that ignores its own deadline. On the normal path the client's
+ * abort always comes first, and the timing an adapter sees is unchanged.
+ */
+export const EVALUATE_DEADLINE_SLACK_MS = 2_000;
 export const ERRORS_TIMEOUT_MS = 10_000;
 /**
  * The turn-log deadline, locked by 09-CONTEXT and matching the Python hook's 10 s curl timeout
