@@ -36,7 +36,8 @@ import { keyFingerprint, readCache, resolveCachePath, writeCache } from "../../c
 import { createApiClient } from "../../core/src/client.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
-import { MAX_TRACKED_INSTANCES } from "../../core/src/constants.ts";
+import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
+import { MAX_TRACKED_INSTANCES, MAX_TRACKED_SESSIONS } from "../../core/src/constants.ts";
 import { createKeyedState } from "../../core/src/keyedState.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
@@ -49,7 +50,8 @@ import { createSignalReporter } from "../../core/src/signals.ts";
 import type { SignalReporter } from "../../core/src/signals.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
-import type { TurnRecord } from "../../core/src/turn.ts";
+import type { TurnRecord, TurnStore } from "../../core/src/turn.ts";
+import { toolExecuteBefore } from "./before.ts";
 import {
   ENTRYPOINT_PREFIX,
   SENTINEL_KEY,
@@ -65,6 +67,8 @@ const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
 
 /** The most MCP server names kept per directory. A real config has a handful. */
 const MAX_MCP_SERVER_NAMES = 1024;
+/** The most allowed-call digests kept per session (HOOK-18); the oldest is dropped first. */
+const MAX_DIGESTS_PER_SESSION = 256;
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -127,6 +131,16 @@ export interface Runtime {
   reportSignal(category: string, toolName: string, detail?: string): void;
   /** A signal sent at most once per plugin copy; no-op without a key. */
   reportOnce(category: string, toolName: string, detail?: string): void;
+  /** The turn record a session's decisions go to. 13-06 re-points a child session to its root. */
+  turnFor(sessionID: string): TurnStore;
+  /** The model a session is using, once 13-06 records it from `chat.message`. */
+  modelFor(sessionID: string): string | undefined;
+  /** The settled account identity, once 13-06 loads it. */
+  identity(): AccountIdentity | undefined;
+  /** Remember the args digest of an ALLOWED call, for the after-hook comparison (HOOK-18). */
+  rememberDigest(sessionID: string, callID: string, digest: string | undefined): void;
+  /** Take (and forget) a remembered digest. */
+  takeDigest(sessionID: string, callID: string): string | undefined;
 }
 
 /** Read-only test seam, attached to the factory as a NON-enumerable `inspect` property. */
@@ -216,6 +230,13 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     normalizeKey: directoryKey,
     create: (directory) => ({ directory, client: undefined, mcpServerNames: [] }),
     fallback: () => ({ directory: "", client: undefined, mcpServerNames: [] }),
+  });
+
+  // Per-session digests of allowed calls: bounded sessions, each a bounded insertion-ordered map.
+  const digests = createKeyedState<Map<string, string>>({
+    max: MAX_TRACKED_SESSIONS,
+    create: () => new Map<string, string>(),
+    fallback: () => new Map<string, string>(),
   });
 
   let resolved: Resolved | undefined;
@@ -331,6 +352,41 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         // ditto
       }
     },
+    turnFor(sessionID: string): TurnStore {
+      return sessions.forSession(sessionID).turn;
+    },
+    modelFor(_sessionID: string): string | undefined {
+      return undefined;
+    },
+    identity(): AccountIdentity | undefined {
+      return undefined;
+    },
+    rememberDigest(sessionID: string, callID: string, digest: string | undefined): void {
+      try {
+        if (sessionID === "" || callID === "") return;
+        const map = digests.get(sessionID);
+        map.delete(callID);
+        if (digest === undefined) return;
+        map.set(callID, digest);
+        while (map.size > MAX_DIGESTS_PER_SESSION) {
+          const oldest = map.keys().next().value;
+          if (oldest === undefined) break;
+          map.delete(oldest);
+        }
+      } catch {
+        // A digest we could not keep is a comparison we skip.
+      }
+    },
+    takeDigest(sessionID: string, callID: string): string | undefined {
+      try {
+        const map = digests.peek(sessionID);
+        const digest = map?.get(callID);
+        map?.delete(callID);
+        return digest;
+      } catch {
+        return undefined;
+      }
+    },
   };
 
   /** The allow-everything set served when the factory itself faulted. Reports, never decides. */
@@ -357,6 +413,8 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
 
   function fullHooks(record: DirectoryRecord): HooksLike {
     return {
+      // The enforcement path. The handler raises only through `block.ts`, and only on a verdict.
+      "tool.execute.before": toolExecuteBefore({ runtime, record }),
       // Called with the live merged config once per instance. Read-only (Pitfall 16): the object is
       // shared with every other plugin, so only its MCP server NAMES are copied out.
       config: async (cfg: unknown) => {
