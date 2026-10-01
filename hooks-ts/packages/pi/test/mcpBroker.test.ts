@@ -817,6 +817,25 @@ test("an unmatched brokered call posts its own one-call turn log and never enter
   }
 });
 
+test("PR #371: a broker request before session_start does not latch the config off", async () => {
+  const f = await fixture("allow", {
+    seeCtx: false,
+    setup: (_home, cwd, write) => write(join(cwd, ".mcp.json"), { mcpServers: { github: GOOD } }),
+  });
+  try {
+    // No ctx seen yet ⇒ no cwd ⇒ this call goes without a config…
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "q" });
+    // …and once a session starts, calls are described again.
+    await f.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, f.ctx);
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "q" });
+    const configs = pretoolBodies(f.api).map((b) => dataOf(b).metadata.mcp_server_config);
+    assert.equal(configs[0], undefined);
+    assert.deepStrictEqual(configs[1], GOOD);
+  } finally {
+    await f.close();
+  }
+});
+
 // Must stay LAST: the key latch is permanent for this process.
 test("a latched key ⇒ no claim", async () => {
   const f = await fixture("401");

@@ -231,6 +231,11 @@ test("a new file appearing after the snapshot, or a different cwd, also omits", 
     reader.snapshot(f.cwd);
     assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { url: "https://s.invalid" });
     assert.equal(reader.serverConfig("s", other), undefined, "another cwd than the adapter loaded with");
+    assert.deepStrictEqual(
+      reader.serverConfig("s", f.cwd),
+      { url: "https://s.invalid" },
+      "per call: the other cwd did not poison the snapshot of the adapter's own cwd",
+    );
 
     const g = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
     g.snapshot(f.cwd);
@@ -246,4 +251,37 @@ test("total on hostile options", () => {
   const hostile = createMcpConfigReader({ env: undefined as never, homeDir: undefined as never, argv: null as never });
   assert.doesNotThrow(() => hostile.snapshot(undefined as never));
   assert.equal(hostile.serverConfig(undefined as never, undefined as never), undefined);
+});
+
+// --- PR #371 review: an unusable cwd must not latch ---------------------------------------------
+
+test("an empty or relative cwd omits for that call only; the next real cwd still takes the snapshot", () => {
+  const f = fixture();
+  try {
+    f.write(PROJECT(f), { mcpServers: { s: { url: "https://s.invalid" } } });
+    const reader = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
+    assert.equal(reader.serverConfig("s", ""), undefined, "no usable cwd: omitted");
+    assert.equal(reader.serverConfig("s", "relative"), undefined);
+    reader.snapshot("");
+    assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { url: "https://s.invalid" }, "not latched");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a file changed after a REAL snapshot still omits for good", () => {
+  const f = fixture();
+  try {
+    f.write(PROJECT(f), { mcpServers: { s: { command: "/tmp/evil-mcp" } } });
+    const reader = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
+    assert.equal(reader.serverConfig("s", ""), undefined);
+    assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { command: "/tmp/evil-mcp" });
+    f.write(PROJECT(f), { mcpServers: { s: { command: "npx" } } });
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(PROJECT(f), later, later);
+    assert.equal(reader.serverConfig("s", f.cwd), undefined);
+    assert.equal(reader.serverConfig("s", ""), undefined);
+  } finally {
+    f.cleanup();
+  }
 });

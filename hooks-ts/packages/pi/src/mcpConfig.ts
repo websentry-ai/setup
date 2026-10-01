@@ -29,9 +29,10 @@
 //
 // **Snapshot once.** The adapter loads its config once, at session init, and never watches it. So the
 // sources are read once per extension instance — at the first `session_start` with a key, or at
-// first need — and their file signatures recorded. If any signature later differs, or the cwd
-// differs from the snapshot's, the answer is `undefined` for the rest of the instance: the adapter
-// is still running what it loaded, and this reader can no longer know what that was.
+// first need — and only with a usable cwd, and their file signatures recorded. If any signature later
+// differs, the answer is `undefined` for the rest of the instance: the adapter is still running what
+// it loaded, and this reader can no longer know what that was. A call with an unusable or different
+// cwd omits for that call only (see `createMcpConfigReader`).
 //
 // **Reads cannot block.** `open(O_RDONLY | O_NONBLOCK)`, then `fstat` on the descriptor (regular file
 // only, 1 MiB cap), then read from the same descriptor — one lookup, so a path swapped for a FIFO
@@ -320,19 +321,34 @@ export interface McpConfigReader {
   serverConfig(serverName: string, cwd: string): Record<string, unknown> | undefined;
 }
 
-/** One snapshot per instance; a later signature or cwd change latches "unknown" for good. */
+/**
+ * One snapshot per instance, taken only with a USABLE cwd.
+ *
+ *   * An unusable cwd (empty, relative, a throwing `ctx.cwd` — or a broker request before any
+ *     `session_start`) omits the config for THAT call only and takes no snapshot, so the next call with
+ *     a real cwd can still take one. Latching on it would omit every MCP config for the rest of the
+ *     process, and a sanctioned-list org would then deny every MCP call.
+ *   * A different real cwd than the snapshot's omits for that call only and leaves the snapshot alone:
+ *     the snapshot describes what the adapter loaded for ITS cwd, and nothing about the other one is
+ *     known. It does not weaken CR-02 — no other cwd's files are ever read or sent.
+ *   * A changed file signature is permanent: the adapter is still running what it loaded, so nothing
+ *     this reader could re-read describes it any more (review CR-02).
+ */
 export function createMcpConfigReader(options: McpConfigEnv): McpConfigReader {
-  let snap: { cwd: string; sources: string[] | undefined; signature: string; view: McpServerView } | undefined;
+  let snap: { cwd: string; sources: string[]; signature: string; view: McpServerView } | undefined;
   let invalidated = false;
 
-  function take(cwd: string): void {
+  /** Take the snapshot when `cwd` is usable; `false` (and no snapshot) otherwise. */
+  function take(cwd: string): boolean {
     const safeCwd = typeof cwd === "string" ? cwd : "";
     const sources = mcpConfigSources(options, safeCwd);
-    const signature = sources === undefined ? "" : signatureOf(sources);
+    if (sources === undefined) return false;
+    const signature = signatureOf(sources);
     const view = readMcpServerView(sources);
     // A file that changed while it was being read: never trust that view.
-    if (sources !== undefined && signatureOf(sources) !== signature) invalidated = true;
+    if (signatureOf(sources) !== signature) invalidated = true;
     snap = { cwd: safeCwd, sources, signature, view };
+    return true;
   }
 
   return {
@@ -340,18 +356,18 @@ export function createMcpConfigReader(options: McpConfigEnv): McpConfigReader {
       try {
         if (snap === undefined) take(cwd);
       } catch {
-        invalidated = true;
+        // No snapshot: the next call with a usable cwd tries again.
       }
     },
     serverConfig(serverName: string, cwd: string): Record<string, unknown> | undefined {
       try {
-        if (snap === undefined) take(cwd);
-        if (invalidated || snap === undefined) return undefined;
-        if (snap.sources === undefined || snap.view === undefined) return undefined;
-        if (cwd !== snap.cwd || signatureOf(snap.sources) !== snap.signature) {
+        if (snap === undefined && !take(cwd)) return undefined;
+        if (invalidated || snap === undefined || snap.view === undefined) return undefined;
+        if (signatureOf(snap.sources) !== snap.signature) {
           invalidated = true;
           return undefined;
         }
+        if (cwd !== snap.cwd) return undefined;
         return projectServerConfig(snap.view, serverName);
       } catch {
         return undefined;
