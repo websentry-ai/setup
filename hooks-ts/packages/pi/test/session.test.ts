@@ -51,6 +51,7 @@ import {
   createFakeCtx,
   createFakeInputEvent,
   createFakeSessionStartEvent,
+  createFakeToolCallEvent,
   createFakeUserBashEvent,
 } from "./helpers/fakeCtx.ts";
 
@@ -132,15 +133,19 @@ test("a turn started in one session is never posted under the next one", async (
 
     await handlerOf(f, "session_start")(createFakeSessionStartEvent("new"), ctxB);
 
-    // Session B: a `!cmd`, which records a tool call. pi fires no `agent_end` for it, so before the
-    // fix this rode along inside A's record.
+    // Session B: a `!cmd`. pi fires no `agent_end` for it, so before the session fix it rode along
+    // inside A's record. Since the standalone-turn change it never enters the shared store at all:
+    // it is posted as its own one-call row immediately, so the store stays exactly as
+    // `session_start` left it (empty) — the new contract this case now pins.
     await handlerOf(f, "user_bash")(createFakeUserBashEvent("echo hi"), ctxB);
-    const pending = turnStore.snapshot();
-    assert.equal(pending.session_id, SESSION_B, "the new record belongs to B");
-    assert.equal(pending.prompt, undefined, "A's prompt did not follow it");
-    assert.equal(pending.tool_calls.length, 1, "just the !cmd");
+    assert.deepEqual(
+      turnStore.snapshot(),
+      { tool_calls: [], results: [] },
+      "nothing of A's survived, and the !cmd did not enter the store",
+    );
 
-    // B's run ends. Exactly one row, under B, with nothing of A's in it.
+    // B's run ends with nothing recorded, so it posts nothing; the only row is the !cmd's own,
+    // under B, with nothing of A's in it.
     handlerOf(f, "agent_end")(createFakeAgentEndEvent([]), ctxB);
     await sleep(60);
 
@@ -260,6 +265,45 @@ test("a ctx whose session id cannot be read does not drop the live record", asyn
     await handlerOf(f, "session_start")(createFakeSessionStartEvent("reload"), blind);
 
     assert.equal(turnStore.snapshot().prompt, "still going", "the record survives an unreadable id");
+    turnStore.take();
+  } finally {
+    f.cleanup();
+    await api.close();
+  }
+});
+
+test("IN-04 a prompt pending in session A never rides session B's tool call", async () => {
+  // Handler-level, end to end: the roll-over the `!cmd` case used to exercise. A prompt is recorded
+  // in A, the developer types `/new`, and the first tool call in B must not carry A's prompt as the
+  // pretool `messages[0].content` — that field is what the gateway writes a block row from.
+  const api = await startMockApi({ mode: "allow" });
+  const f = await fixture(api);
+  try {
+    const ctxA = createFakeCtx({ sessionId: SESSION_A });
+    const ctxB = createFakeCtx({ sessionId: SESSION_B });
+    await handlerOf(f, "input")(createFakeInputEvent("a prompt that belongs to A"), ctxA);
+    assert.equal(turnStore.currentPrompt(SESSION_A), "a prompt that belongs to A");
+
+    await handlerOf(f, "session_start")(createFakeSessionStartEvent("new"), ctxB);
+    await handlerOf(f, "tool_call")(createFakeToolCallEvent("bash", { command: "ls" }), ctxB);
+
+    const toolBodies = api.requests
+      .filter((r) => r.path === "/v1/hooks/pretool")
+      .map((r) => r.body as { event_name?: string; conversation_id?: string; messages?: { content?: string }[] })
+      .filter((b) => b.event_name === "tool_use");
+    assert.equal(toolBodies.length, 1);
+    assert.equal(toolBodies[0]?.conversation_id, SESSION_B);
+    assert.equal(toolBodies[0]?.messages?.[0]?.content, "", "A's prompt did not cross the session boundary");
+
+    // And the same holds without session_start reaching us first: startTurn's roll-over backstop.
+    await handlerOf(f, "input")(createFakeInputEvent("another A prompt"), ctxA);
+    await handlerOf(f, "tool_call")(createFakeToolCallEvent("bash", { command: "pwd" }), ctxB);
+    const last = api.requests
+      .filter((r) => r.path === "/v1/hooks/pretool")
+      .map((r) => r.body as { event_name?: string; messages?: { content?: string }[] })
+      .filter((b) => b.event_name === "tool_use")
+      .at(-1);
+    assert.equal(last?.messages?.[0]?.content, "", "a foreign session's prompt is never sent");
     turnStore.take();
   } finally {
     f.cleanup();

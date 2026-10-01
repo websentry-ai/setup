@@ -28,6 +28,7 @@ import type { TurnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import { assistantTextFrom, handleAgentEnd } from "../src/agentEnd.ts";
+import { recordToolResult } from "../src/toolResult.ts";
 import { decideToolCall } from "../src/decide.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 import {
@@ -38,7 +39,8 @@ import {
   createFakeUserMessage,
 } from "./helpers/fakeCtx.ts";
 
-const MARKER = "PRIVATE_KEY_BEGIN-never-posted";
+/** An output marker: since tool output is sent (capped, redacted), it is EXPECTED in the turn log. */
+const MARKER = "PRIVATE_KEY_BEGIN-output-marker";
 /** Well under the real 10 s deadline, so the abort is observable inside a test run. */
 const SHORT_TIMEOUT_MS = 150;
 
@@ -120,7 +122,10 @@ test("the posted model is auto even when ctx carries a real model id", async () 
   }
 });
 
-test("the posted body carries the prompt, the tool call and the hashes — and no raw output", async () => {
+test("the posted body carries the prompt, the tool call, the hashes and the redacted text output", async () => {
+  // Updated deliberately: this used to assert that no output marker travelled at all. Tool output is
+  // now sent by user decision — capped by the record, redacted at post time — so the text marker DOES
+  // travel, a bearer token in the same output does not, and an image part's base64 never does.
   const api = await startMockApi();
   try {
     const store = createTurnStore();
@@ -130,17 +135,20 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
       "sess-marker",
       1_001,
     );
-    // What a real handler would have hashed; the marker is what must NOT travel.
-    store.recordResult({
-      tool_name: "read",
-      tool_use_id: "call_1",
-      is_error: false,
-      content_sha256: "f".repeat(64),
-      content_bytes: Buffer.byteLength(MARKER, "utf8"),
-    });
+    const IMAGE_ONLY = "IMAGE-ONLY-never-posted";
+    recordToolResult(
+      {
+        toolCallId: "call_1",
+        toolName: "read",
+        isError: false,
+        content: [
+          { type: "text", text: `${MARKER}\nAuthorization: Bearer sk-live-deadbeefcafe` },
+          { type: "image", data: Buffer.from(IMAGE_ONLY).toString("base64"), mimeType: "image/png" },
+        ],
+      },
+      store,
+    );
 
-    // The model's own words DO travel; the output it read does not. Both halves in one case, so the
-    // difference between them stays visible.
     handleAgentEnd(
       createFakeAgentEndEvent([
         createFakeAssistantMessage([{ type: "text", text: "I read the file you asked for." }]),
@@ -151,7 +159,9 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
     await sleep(120);
 
     const serialised = JSON.stringify(api.requests);
-    assert.equal(serialised.includes(MARKER), false, "no raw output marker anywhere in any request");
+    assert.ok(serialised.includes(MARKER), "the text output travels now");
+    assert.equal(serialised.includes("deadbeefcafe"), false, "redacted at post time");
+    assert.equal(serialised.includes(Buffer.from(IMAGE_ONLY).toString("base64")), false, "never image data");
 
     const body = turnLogs(api)[0]?.body as {
       conversation_id?: string;
@@ -167,10 +177,10 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
       { path: "/srv/id_rsa" },
       "the allowlisted input the pretool check already carried — the row has to say what was read",
     );
-    assert.deepEqual(entries[0]?.tool_response, {
-      content_sha256: "f".repeat(64),
-      content_bytes: Buffer.byteLength(MARKER, "utf8"),
-    });
+    const response = entries[0]?.tool_response as Record<string, unknown>;
+    assert.deepEqual(Object.keys(response).sort(), ["content", "content_bytes", "content_sha256"]);
+    assert.equal(response.content, `${MARKER}\nAuthorization: Bearer [REDACTED]`);
+    assert.equal(typeof response.content_sha256, "string");
   } finally {
     await api.close();
   }

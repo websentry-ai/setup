@@ -217,6 +217,32 @@ test("RES-01 the default export is a factory registering exactly the implemented
   ]);
 });
 
+test("RES-01 plus one guarded pi.events listener (the MCP approval broker), and none when events is absent", async () => {
+  // Deliberate addition (Revision 2): the one non-`pi.on` registration. Still exactly six `pi.on`.
+  const channels: string[] = [];
+  const stub = stubApi();
+  (stub.api as unknown as { events: unknown }).events = {
+    on(channel: string) {
+      channels.push(channel);
+      return () => {};
+    },
+    emit() {},
+  };
+  await extension(stub.api);
+  assert.equal(stub.registered.length, 6);
+  assert.deepStrictEqual(channels, ["pi-mcp-adapter:tool-approval-request"]);
+
+  // An `events` whose `on` throws, or one that is not an object, must not break the load.
+  for (const events of [{ on() { throw new Error("bus exploded"); } }, "nope", null]) {
+    const s2 = stubApi();
+    (s2.api as unknown as { events: unknown }).events = events;
+    await assert.doesNotReject(async () => {
+      await createExtension({})(s2.api);
+    });
+    assert.equal(s2.registered.length, 6);
+  }
+});
+
 test("HOOK-06 the registered tool_result handler returns undefined, never a result patch", async () => {
   const stub = stubApi();
   await extension(stub.api);

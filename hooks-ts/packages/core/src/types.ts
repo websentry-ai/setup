@@ -8,6 +8,13 @@
 // `account_identity` has since joined the type (parity with the Claude Code hook): optional, and
 // only ever set through `withAccountIdentity`, which forwards the six wire strings and nothing else.
 //
+// `PretoolPayloadInput.mcp` is the one input that changes the body's SHAPE: an MCP call handed over
+// by the pi-mcp-adapter approval broker goes to the gateway's MCP path (Path 3) as
+// `tool_name: "mcp__<server>__<tool>"` with `metadata.mcp_server` / `mcp_tool` / `tool_input` (the
+// arguments, whole up to 512 KiB) and, when the config could be read unambiguously,
+// `mcp_server_config`. The native-tool allowlist still governs every other call; MCP arguments are
+// the one explicit exception.
+//
 // Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
 // future opencode adapter can reuse it unchanged.
 
@@ -96,6 +103,36 @@ export interface PretoolPayloadInput {
   pullPolicies?: boolean;
   /** The process's settled account identity, when known. */
   accountIdentity?: AccountIdentity;
+  /**
+   * A resolved MCP call (see the header). When set, `toolName`/`command`/`toolInput` no longer shape
+   * the body: the builder sends the Path-3 MCP shape instead. Absent for every native/custom tool.
+   */
+  mcp?: McpCallInfo;
+}
+
+/**
+ * One MCP call as the pi-mcp-adapter approval broker describes it — the adapter's own resolution of
+ * (server, original tool, args), never re-derived here — and what the MCP branch of
+ * `buildPretoolPayload` consumes.
+ */
+export interface McpCallInfo {
+  /** The configured server name, verbatim (the broker's `serverName`). */
+  server: string;
+  /** The MCP tool's ORIGINAL name (the broker's `originalToolName`). */
+  tool: string;
+  /** The arguments the tool will receive. Sent whole up to 512 KiB, never redacted (gateway DLP). */
+  args: Record<string, unknown>;
+  /**
+   * The server's config as `{url, type?}` or `{command, args?, type?}`, read from the adapter's config
+   * files by exact server name — the same fields the Claude Code hook sends. `env`, `headers`, bearer
+   * tokens and OAuth settings are never read into it, but a `url` query string or an `args` entry can
+   * itself carry a credential, and is sent as written, exactly as the Python hook sends it. Absent
+   * unless every config source is strict, fully-modelled JSON unchanged since session start
+   * (`mcpConfig.ts`, strict-or-omit) and the server is found there.
+   */
+  serverConfig?: Record<string, unknown>;
+  /** The broker's `origin`: `proxy` | `direct` | `script` | `resource` | `iframe`. Audit only. */
+  origin?: string;
 }
 
 /**

@@ -274,14 +274,31 @@ test("HOOK-01 the wire body carries the pi identity taken from ctx", async () =>
 // field was making exactly that trip.
 
 test("WR-04 a custom tool with nothing evaluable makes zero HTTP requests", async () => {
-  // A deny-scripted mock proves it: a request would have produced a block.
+  // A deny-scripted mock proves it: a request would have produced a block. A non-MCP name now: MCP
+  // calls the resolver can attribute go to the gateway's MCP path (see the MCP cases below), so this
+  // case pins the contract for a genuinely unevaluable custom tool.
   const { result, api } = await run("deny", {
-    toolName: "mcp__notion__search",
+    toolName: "my_custom_tool",
     input: { query: "quarterly numbers" },
   });
 
   assert.equal(result, undefined, "nothing to evaluate is nothing to ask about");
   assert.equal(api.requests.length, 0, "no round trip at all");
+});
+
+test("WR-04 an MCP tool call makes zero HTTP requests at tool_call — the broker decides it", async () => {
+  // Revision 2: MCP enforcement moved to the pi-mcp-adapter approval broker (`decideMcpApproval`),
+  // which sees the adapter's own resolution. `tool_call` makes no MCP request and resolves no names,
+  // whatever the name looks like.
+  for (const [toolName, input] of [
+    ["mcp__notion__search", { query: "quarterly numbers" }],
+    ["mcp", { tool: "search", args: { q: "x" } }],
+    ["notion_search", { query: "x" }],
+  ] as const) {
+    const { result, api } = await run("deny", { toolName, input });
+    assert.equal(result, undefined, toolName);
+    assert.equal(api.requests.length, 0, toolName);
+  }
 });
 
 test("WR-04 a tool with an empty input object makes zero HTTP requests", async () => {
@@ -422,4 +439,61 @@ test("RES-01 a remembered block-on-failure turns a failure into the unavailable 
     block: true,
     reason: "Unbound policy engine unavailable — please retry",
   });
+});
+
+// --- The turn prompt on the pretool body ---------------------------------------------------------
+//
+// The gateway writes its block/warn row from the pretool `messages`, so a tool call that sent `""`
+// there produced a block log with no prompt ("empty block logs"). `currentPrompt` is the seam.
+
+async function promptSent(currentPrompt: DecideDeps["currentPrompt"]): Promise<{
+  content: unknown;
+  result: unknown;
+  requests: number;
+}> {
+  const api = await startMockApi({ mode: "deny" });
+  try {
+    const result = await decideToolCall(
+      createFakeToolCallEvent("bash", { command: "ls" }),
+      createFakeCtx(),
+      { ...depsFor(api), currentPrompt },
+    );
+    const bodies = pretoolRequests(api) as { body?: { messages?: { content?: unknown }[] } }[];
+    return { content: bodies[0]?.body?.messages?.[0]?.content, result, requests: bodies.length };
+  } finally {
+    await api.close();
+  }
+}
+
+test("a tool call carries the turn's prompt as messages[0].content", async () => {
+  const { content, requests } = await promptSent(() => "list the repo please");
+  assert.equal(requests, 1);
+  assert.equal(content, "list the repo please");
+});
+
+test("a prompt over MAX_PROMPT_CHARS is sent capped at both ends", async () => {
+  const long = "H".repeat(6000) + "MIDDLE" + "T".repeat(6000);
+  const { content } = await promptSent(() => long);
+  assert.equal(typeof content, "string");
+  const sent = content as string;
+  assert.ok(sent.length <= 8192, `capped, got ${sent.length}`);
+  assert.ok(sent.startsWith("HHH") && sent.endsWith("TTT"), "both ends kept");
+  assert.ok(sent.includes("#...unbound: omitted..."), "spliced with the command marker");
+});
+
+test("with no prompt recorded the content is ''", async () => {
+  assert.equal((await promptSent(() => undefined)).content, "");
+  assert.equal((await promptSent(undefined)).content, "");
+});
+
+test("a currentPrompt getter that throws costs the prompt, never the verdict", async () => {
+  const { content, result, requests } = await promptSent(() => {
+    throw new Error("store exploded");
+  });
+  assert.equal(requests, 1, "the call was still checked");
+  assert.equal(content, "");
+  assert.deepStrictEqual(result, {
+    block: true,
+    reason: "Blocked by Unbound policy: Reading secrets is blocked.",
+  }, "the deny still applied — a throw did not turn into an allow or a different block");
 });

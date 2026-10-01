@@ -96,7 +96,8 @@ class TestMainErrorHandling(unittest.TestCase):
         from io import StringIO
 
         with patch.object(setup, "run_callback_server") as mock_server, \
-             patch.object(setup, "install_macos_certificates"):
+             patch.object(setup, "install_macos_certificates"), \
+             patch.object(setup, "check_enterprise_hooks_conflict", return_value=False):
             mock_server.return_value = {
                 "method": "GET",
                 "path": "/callback",
@@ -1203,3 +1204,76 @@ class TestInstallUnderResolvedDir(unittest.TestCase):
         settings = json.loads((self.home / ".claude" / "settings.json").read_text())
         cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         self.assertEqual(cmd, str(hook_path))
+
+
+class TestEnterpriseHooksConflict(unittest.TestCase):
+    """The user-level setup must skip when the MDM install is present, or both
+    hooks fire and every event is logged twice."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.managed = Path(self.tmp) / "ClaudeCode"
+        self.managed.mkdir(parents=True, exist_ok=True)
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _conflict(self):
+        with patch.object(setup, "get_managed_settings_dir", return_value=self.managed):
+            return setup.check_enterprise_hooks_conflict()
+
+    def test_flat_managed_settings_with_unbound_hook_is_a_conflict(self):
+        # MDM's fallback: a flat managed-settings.json carrying the managed hook.
+        (self.managed / "managed-settings.json").write_text(json.dumps({
+            "hooks": {"UserPromptSubmit": [{"hooks": [
+                {"type": "command",
+                 "command": '"/opt/unbound/current/unbound-hook/unbound-hook" hook claude-code User'}
+            ]}]}
+        }))
+        self.assertTrue(self._conflict())
+
+    def test_managed_dropin_is_a_conflict(self):
+        (self.managed / "managed-settings.d").mkdir(parents=True, exist_ok=True)
+        (self.managed / "managed-settings.d" / "unbound.json").write_text("{}")
+        self.assertTrue(self._conflict())
+
+    def test_flat_managed_settings_without_our_hook_is_not_a_conflict(self):
+        # Another org's managed hook must not be mistaken for ours.
+        (self.managed / "managed-settings.json").write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": "/opt/acme/their-hook.sh"}
+            ]}]}
+        }))
+        self.assertFalse(self._conflict())
+
+    def test_command_with_token_but_not_our_path_is_not_a_conflict(self):
+        # A foreign command that merely mentions "unbound-hook" is not ours —
+        # matching it would wrongly skip the user hook.
+        (self.managed / "managed-settings.json").write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": "/usr/local/bin/unbound-hook-lookalike"}
+            ]}]}
+        }))
+        self.assertFalse(self._conflict())
+
+    def test_a_malformed_entry_does_not_abandon_the_scan(self):
+        # Dirty/foreign shapes earlier in the shared file (non-dict group, null
+        # hooks list, non-dict hook) must not stop us finding a real one after.
+        (self.managed / "managed-settings.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": ["not-a-dict", {"hooks": None}, {"hooks": ["also-bad"]},
+                               {"hooks": [{"command": 1}]}],
+                "UserPromptSubmit": [{"hooks": [
+                    {"type": "command",
+                     "command": '"/opt/unbound/current/unbound-hook/unbound-hook" hook claude-code User'}
+                ]}],
+            }
+        }))
+        self.assertTrue(self._conflict())
+
+    def test_top_level_hooks_not_a_dict_is_not_a_conflict(self):
+        # A hooks value that is a list (or otherwise malformed) must fail open,
+        # not raise.
+        (self.managed / "managed-settings.json").write_text(json.dumps({"hooks": ["x"]}))
+        self.assertFalse(self._conflict())
+
+    def test_unmanaged_box_is_not_a_conflict(self):
+        self.assertFalse(self._conflict())
