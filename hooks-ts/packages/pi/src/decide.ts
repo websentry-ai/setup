@@ -21,6 +21,7 @@ import {
   DENY_PREFIX,
   ENGINE_UNAVAILABLE_REASON,
   GENERIC_DENY_REASON,
+  MAX_PROMPT_CHARS,
   NO_UI_REASON,
 } from "../../core/src/constants.ts";
 import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
@@ -28,6 +29,7 @@ import {
   NATIVE_FILE_TOOLS,
   auditToolInput,
   buildPretoolPayload,
+  capCommand,
   resolveFilePath,
 } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
@@ -92,6 +94,33 @@ export interface DecideDeps {
    * lookup settles simply goes without it (the Python hook's pre-tool path reads a cache, likewise).
    */
   accountIdentity?: AccountIdentity;
+  /**
+   * The turn's user prompt, read lazily for the pretool body's `messages[0].content`.
+   *
+   * The gateway writes its block/warn row from the pretool `messages` (`queueHookLog`'s
+   * `hookRequestBody`), so a blank there is the "empty block log" bug: a row that says a command was
+   * blocked without saying what the developer had asked for. `user_prompts` is deliberately NOT sent —
+   * the gateway's only reader of it falls back to `messages` anyway.
+   *
+   * A closure rather than a value so a call that takes an early return (nothing evaluable, cache
+   * skip) costs nothing, and read through `promptOf`, so a getter that throws costs the prompt column
+   * and never the verdict. Optional: absent means `""`, today's behaviour.
+   */
+  currentPrompt?: () => string | undefined;
+}
+
+/**
+ * The prompt for the pretool `messages`, capped exactly as the prompt check caps it, or `""`.
+ * Total: a throwing or non-string getter is an empty prompt, never a thrown `tool_call` (= a BLOCK).
+ */
+function promptOf(deps: Pick<DecideDeps, "currentPrompt">): string {
+  try {
+    const prompt = deps.currentPrompt?.();
+    if (typeof prompt !== "string" || prompt === "") return "";
+    return capCommand(prompt, MAX_PROMPT_CHARS).command;
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -232,6 +261,8 @@ export async function decideToolCall(
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       pullPolicies,
+      // Read here, after both early returns: a skipped call never pays for it.
+      lastUserPrompt: promptOf(deps),
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
 

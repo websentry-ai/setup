@@ -29,6 +29,13 @@
 //   | `agent_end`   | record   | `undefined`, synchronously, POST not awaited            |
 //   | `session_start`| record  | `undefined`; one gated heartbeat per process            |
 //
+// Turn logs come from two places. `agent_end` posts the turn the `input` / `tool_call` /
+// `tool_result` handlers recorded; `user_bash` posts its `!cmd` as its own one-call row the moment the
+// decision is made (`postStandaloneTurn`), because pi fires no `agent_end` for a typed command and a
+// stored entry would otherwise ride the next turn's log under that turn's prompt. Neither awaits the
+// POST. `tool_call` also sends the turn's prompt as the pretool `messages`, which is what the gateway
+// writes a block/warn row from.
+//
 // Nothing is registered speculatively: a registered handler is one pi will call, and every
 // registration is another way to block or hang a session. `nothrow.test.ts` asserts the exact set and
 // `build.test.ts` re-asserts it against the real bundle, so both adding and losing one is a
@@ -89,7 +96,7 @@ import type { PolicySnapshot } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
 import { turnStore } from "../../core/src/turn.ts";
-import { handleAgentEnd } from "./agentEnd.ts";
+import { handleAgentEnd, postStandaloneTurn } from "./agentEnd.ts";
 import { decideToolCall } from "./decide.ts";
 import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
@@ -378,8 +385,8 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     pi.on("session_start", async (_event, ctx) => {
       try {
         // FIRST, before `init()` and before every early return below: a turn record left pending by
-        // the previous session cannot belong to this one, and `/new` is exactly when one is pending
-        // (a `!cmd` records a tool call and pi fires no `agent_end` for it). Dropped, never posted —
+        // the previous session cannot belong to this one, and `/new` is exactly when one can be
+        // pending (a prompt whose run never ended). Dropped, never posted —
         // nothing says that turn finished, and this handler is awaited by pi, so it is the wrong
         // place for a POST. `reset` keys on the id, so a `/reload` re-firing with the same session
         // and a ctx whose id cannot be read both leave a mid-flight turn alone.
@@ -483,6 +490,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          // The pretool `messages[0].content`, which the gateway writes its block/warn row from. A
+          // cheap getter, not `snapshot()`: this runs on every evaluated tool call.
+          currentPrompt: () => turnStore.currentPrompt(sessionIdOf(ctx)),
           // Re-checked here rather than above: `checkTool` may have latched the key on this very
           // call, and the turn that latched is one nothing will post.
           onDecision: (entry) => {
@@ -550,8 +560,20 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           entrypoint: state.entrypoint,
           ...identityOption(),
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          // Posted as its OWN one-call turn log, immediately, and never written into `turnStore`:
+          // pi fires no `agent_end` for a `!cmd`, so a stored entry waited for the next agent turn
+          // and was posted under that turn's prompt. Fire-and-forget — this handler is awaited, and
+          // `postStandaloneTurn` returns before the POST settles. `recordingActive` is re-checked
+          // here for the same reason as on `tool_call`: this very call may have latched the key.
           onDecision: (entry) => {
-            if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
+            if (recordingActive(state)) {
+              postStandaloneTurn(entry, ctx, sessionIdOf(ctx), {
+                client: state.client,
+                apiKey: state.apiKey,
+                ...(state.telemetry === undefined ? {} : { telemetry: state.telemetry }),
+                ...identityOption(),
+              });
+            }
           },
         });
       } catch {

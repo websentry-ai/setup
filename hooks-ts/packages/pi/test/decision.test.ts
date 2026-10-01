@@ -423,3 +423,60 @@ test("RES-01 a remembered block-on-failure turns a failure into the unavailable 
     reason: "Unbound policy engine unavailable — please retry",
   });
 });
+
+// --- The turn prompt on the pretool body ---------------------------------------------------------
+//
+// The gateway writes its block/warn row from the pretool `messages`, so a tool call that sent `""`
+// there produced a block log with no prompt ("empty block logs"). `currentPrompt` is the seam.
+
+async function promptSent(currentPrompt: DecideDeps["currentPrompt"]): Promise<{
+  content: unknown;
+  result: unknown;
+  requests: number;
+}> {
+  const api = await startMockApi({ mode: "deny" });
+  try {
+    const result = await decideToolCall(
+      createFakeToolCallEvent("bash", { command: "ls" }),
+      createFakeCtx(),
+      { ...depsFor(api), currentPrompt },
+    );
+    const bodies = pretoolRequests(api) as { body?: { messages?: { content?: unknown }[] } }[];
+    return { content: bodies[0]?.body?.messages?.[0]?.content, result, requests: bodies.length };
+  } finally {
+    await api.close();
+  }
+}
+
+test("a tool call carries the turn's prompt as messages[0].content", async () => {
+  const { content, requests } = await promptSent(() => "list the repo please");
+  assert.equal(requests, 1);
+  assert.equal(content, "list the repo please");
+});
+
+test("a prompt over MAX_PROMPT_CHARS is sent capped at both ends", async () => {
+  const long = "H".repeat(6000) + "MIDDLE" + "T".repeat(6000);
+  const { content } = await promptSent(() => long);
+  assert.equal(typeof content, "string");
+  const sent = content as string;
+  assert.ok(sent.length <= 8192, `capped, got ${sent.length}`);
+  assert.ok(sent.startsWith("HHH") && sent.endsWith("TTT"), "both ends kept");
+  assert.ok(sent.includes("#...unbound: omitted..."), "spliced with the command marker");
+});
+
+test("with no prompt recorded the content is ''", async () => {
+  assert.equal((await promptSent(() => undefined)).content, "");
+  assert.equal((await promptSent(undefined)).content, "");
+});
+
+test("a currentPrompt getter that throws costs the prompt, never the verdict", async () => {
+  const { content, result, requests } = await promptSent(() => {
+    throw new Error("store exploded");
+  });
+  assert.equal(requests, 1, "the call was still checked");
+  assert.equal(content, "");
+  assert.deepStrictEqual(result, {
+    block: true,
+    reason: "Blocked by Unbound policy: Reading secrets is blocked.",
+  }, "the deny still applied — a throw did not turn into an allow or a different block");
+});

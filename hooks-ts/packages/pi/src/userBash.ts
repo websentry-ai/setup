@@ -21,6 +21,10 @@
 //
 // `excludeFromContext` is read by nobody in this file on purpose: it is an input signal describing
 // how pi will handle the output, not something a handler sets.
+//
+// The decision is handed out through `onDecision`, and the composition root posts it as its own
+// one-call turn log rather than recording it into the shared turn store — there is no `agent_end`
+// for a `!cmd` to post it, and the next turn's would have claimed it.
 
 import { randomBytes } from "node:crypto";
 
@@ -98,9 +102,12 @@ export async function decideUserBash(
     const hooks: CheckHooks =
       deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
-    // A typed `!cmd` is a real tool call in the audit trail, so it belongs in the turn record on the
-    // same terms — `noteDecision` swallows its own failures, which matters more here than anywhere:
-    // a throw out of this function means the command silently never runs (§A1.2).
+    // A typed `!cmd` is a real tool call in the audit trail. `index.ts` posts this entry as its own
+    // one-call turn log, immediately (`postStandaloneTurn`): pi fires no `agent_end` for a `!cmd`, and
+    // merging it into the shared record mis-attributed it to the NEXT turn's prompt. Emitted before
+    // the confirm, like `decide.ts`, so the row records what the policy said rather than the answer.
+    // `noteDecision` swallows its own failures, which matters more here than anywhere: a throw out of
+    // this function means the command silently never runs (§A1.2).
     noteDecision(deps, {
       tool_name: "bash",
       tool_use_id: toolUseId,

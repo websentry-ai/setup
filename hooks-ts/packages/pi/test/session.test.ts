@@ -132,15 +132,19 @@ test("a turn started in one session is never posted under the next one", async (
 
     await handlerOf(f, "session_start")(createFakeSessionStartEvent("new"), ctxB);
 
-    // Session B: a `!cmd`, which records a tool call. pi fires no `agent_end` for it, so before the
-    // fix this rode along inside A's record.
+    // Session B: a `!cmd`. pi fires no `agent_end` for it, so before the session fix it rode along
+    // inside A's record. Since the standalone-turn change it never enters the shared store at all:
+    // it is posted as its own one-call row immediately, so the store stays exactly as
+    // `session_start` left it (empty) — the new contract this case now pins.
     await handlerOf(f, "user_bash")(createFakeUserBashEvent("echo hi"), ctxB);
-    const pending = turnStore.snapshot();
-    assert.equal(pending.session_id, SESSION_B, "the new record belongs to B");
-    assert.equal(pending.prompt, undefined, "A's prompt did not follow it");
-    assert.equal(pending.tool_calls.length, 1, "just the !cmd");
+    assert.deepEqual(
+      turnStore.snapshot(),
+      { tool_calls: [], results: [] },
+      "nothing of A's survived, and the !cmd did not enter the store",
+    );
 
-    // B's run ends. Exactly one row, under B, with nothing of A's in it.
+    // B's run ends with nothing recorded, so it posts nothing; the only row is the !cmd's own,
+    // under B, with nothing of A's in it.
     handlerOf(f, "agent_end")(createFakeAgentEndEvent([]), ctxB);
     await sleep(60);
 

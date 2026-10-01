@@ -561,3 +561,53 @@ test("WR-04 an unstamped entry is kept — absent means 'unknown', not 'foreign'
     ["blind_cmd", "known"],
   );
 });
+
+// --- currentPrompt (the pretool `messages` source) ----------------------------------------------
+//
+// The gateway writes its block/warn row from the pretool `messages`, so `tool_call` reads the turn's
+// prompt through this getter on every evaluated call. It is the per-tool-call path: no copy, and
+// total.
+
+test("currentPrompt returns the pending prompt for the same session", () => {
+  const store = createTurnStore();
+  store.recordPrompt("what does this repo do?", SESSION, 1_000);
+  assert.equal(store.currentPrompt(SESSION), "what does this repo do?");
+});
+
+test("currentPrompt is undefined with no prompt, or for a different session", () => {
+  const store = createTurnStore();
+  assert.equal(store.currentPrompt(SESSION), undefined, "nothing recorded yet");
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "c1", decision: "allow" }, SESSION, 1_000);
+  assert.equal(store.currentPrompt(SESSION), undefined, "a call-only turn has no prompt");
+  store.recordPrompt("mine", SESSION, 1_100);
+  assert.equal(store.currentPrompt("someone-else"), undefined, "a foreign session's prompt is not ours");
+});
+
+test("currentPrompt answers for an unknown ('') session id and an unstamped record", () => {
+  const store = createTurnStore();
+  store.recordPrompt("stamped", SESSION, 1_000);
+  assert.equal(store.currentPrompt(""), "stamped", "'' means not known, never 'changed'");
+
+  const unstamped = createTurnStore();
+  unstamped.recordPrompt("unstamped", "", 1_000);
+  assert.equal(unstamped.snapshot().session_id, undefined);
+  assert.equal(unstamped.currentPrompt(SESSION), "unstamped", "no stored session to disagree with");
+});
+
+test("currentPrompt is total, including after take()", () => {
+  const store = createTurnStore();
+  store.recordPrompt("gone soon", SESSION, 1_000);
+  store.take();
+  assert.equal(store.currentPrompt(SESSION), undefined);
+  assert.doesNotThrow(() => store.currentPrompt(undefined as unknown as string));
+  assert.doesNotThrow(() => store.currentPrompt(null as unknown as string));
+});
+
+test("currentPrompt does not go through snapshot() (no per-call copy)", () => {
+  const store = createTurnStore();
+  store.recordPrompt("cheap", SESSION, 1_000);
+  store.snapshot = () => {
+    throw new Error("currentPrompt must not deep-copy the record");
+  };
+  assert.equal(store.currentPrompt(SESSION), "cheap");
+});

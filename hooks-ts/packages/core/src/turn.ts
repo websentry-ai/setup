@@ -28,11 +28,14 @@
 //
 // Across sessions the opposite is required. pi's session id changes on `/new`, `/resume` and `/fork`,
 // and a record pending when that happens can never be posted under the new one — `thread_id` would
-// stitch two conversations together. `user_bash` is what makes this reachable rather than theoretical:
-// it records a tool call, and pi fires no `agent_end` for a bare `!cmd`, so that record is still
-// sitting here when the developer types `/new`. Two guards, belt and braces: `reset(sessionId)` for
-// `session_start` to drop it, and `startTurn` rolling the record over when the id it is handed differs
-// from the stored one. Neither ever posts the old record — `agent_end` never fired for it.
+// stitch two conversations together. `user_bash` is what first made this reachable: it used to record
+// a tool call here, and pi fires no `agent_end` for a bare `!cmd`, so that record sat pending until
+// the developer typed `/new` (or rode the NEXT turn's log under that turn's prompt). A `!cmd` is now
+// posted as its own one-call turn log and never enters this store (`agentEnd.ts postStandaloneTurn`),
+// but a prompt left by an aborted run can still be pending across `/new`, so both guards stay, belt
+// and braces: `reset(sessionId)` for `session_start` to drop it, and `startTurn` rolling the record
+// over when the id it is handed differs from the stored one. Neither ever posts the old record —
+// `agent_end` never fired for it.
 //
 // Every method is total. A fault here would surface inside a `tool_call` or `tool_result` handler,
 // and pi reads a thrown `tool_call` handler as a BLOCK — an audit record must never be able to change
@@ -143,6 +146,17 @@ export interface TurnStore {
   isEmpty(): boolean;
   /** A deep-enough copy for assertions; mutating it cannot reach the live record. */
   snapshot(): TurnRecord;
+  /**
+   * The pending prompt, when it belongs to `sessionId` — or `undefined`.
+   *
+   * The pretool request's `messages[0].content` is what the gateway writes its block/warn row from,
+   * so `tool_call` reads this on every evaluated call. That is why it is a getter and not
+   * `snapshot()`: it is the per-tool-call path and must stay O(1) — no copy, no allocation, one
+   * reference handed back. `""` (an unreadable session id) means "not known" and still answers, as
+   * does a record not yet stamped with any session; a record stamped with a DIFFERENT session does
+   * not, because its prompt describes another conversation. Total.
+   */
+  currentPrompt(sessionId: string): string | undefined;
 }
 
 /**
@@ -414,6 +428,20 @@ export function createTurnStore(): TurnStore {
         copy.tool_calls_truncated = record.tool_calls_truncated;
       }
       return copy;
+    },
+
+    currentPrompt(sessionId: string): string | undefined {
+      try {
+        const prompt = record.prompt;
+        if (typeof prompt !== "string") return undefined;
+        if (sessionId === "" || record.session_id === undefined || record.session_id === sessionId) {
+          return prompt;
+        }
+        return undefined;
+      } catch {
+        // Total by contract — a fault here would surface inside a `tool_call` handler.
+        return undefined;
+      }
     },
   };
 }
