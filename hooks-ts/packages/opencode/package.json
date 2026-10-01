@@ -1,0 +1,7 @@
+{
+  "name": "@unbound/opencode-plugin",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "opencode 1.18.x adapter: opencode plugin hooks -> @unbound/hooks-core (imported by relative .ts path, not by package name)"
+}
