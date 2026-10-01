@@ -153,16 +153,31 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
   the `mcp` proxy tool, `mcp__<server>` namespace tools, direct `<server>_<tool>` tools, `mcpScript`,
   resource reads and MCP UI iframes. The adapter tells the extension exactly which server and tool it
   is about to run and with which arguments; the extension sends that to the gateway's MCP policy path
-  as `mcp__<server>__<tool>`, with the arguments whole up to 1 MB (beyond that, their head and tail
-  with a `tool_input_truncated` flag), and the server's `url`, or `command` + `args`, read from the
-  adapter's config files. The server's `env`, `headers`, bearer tokens and OAuth settings are never
-  read. A `url` query string or an `args` entry is sent as written, as the Claude Code hook sends it,
-  so a credential placed there leaves with it. If any of those config files cannot be read, the
-  server config is left out rather than guessed.
+  as `mcp__<server>__<tool>`.
+  - **Arguments** are sent whole up to 512 KB. Larger arguments are sent as the head and tail of their
+    serialisation with a `tool_input_truncated` flag, and **the middle of oversized arguments is not
+    inspected**. The whole request is kept under 900 KB so the gateway's 1 MB request limit can never
+    turn a check into an unchecked allow.
+  - **Server config** (`url`, or `command` + `args`) is sent only when the adapter's config files are
+    unambiguous: every one of them is plain JSON (no comments, no trailing commas), uses only the
+    settings and server fields the extension understands (no `imports`, plugins, ancestor roots, host
+    discovery or `socket` servers), pi was not started with `--mcp-config`, and none of the files has
+    changed since the session started (the adapter reads them once, at startup). Otherwise the config
+    is **left out** rather than guessed. `env`, `headers`, bearer tokens and OAuth settings are never
+    read. A `url` query string or an `args` entry is sent as written, as the Claude Code hook sends
+    it, so a credential placed there leaves with it.
+  - **What an omitted config means.** Without a config the gateway cannot fingerprint the server. In
+    an org that restricts MCP servers to a sanctioned list, those calls are **denied** as an
+    unrecognised server. Elsewhere, policy still applies by server and tool name. To get the config
+    sent, keep the MCP config files as plain JSON in the standard locations.
   - **On a deny**, the model sees the adapter's own generic denial; the developer sees the policy's
     reason as a notice. A "warn" policy asks the developer to confirm; without a UI it denies.
+  - **Unbound decides first.** The extension claims the adapter's approval request, which pre-empts
+    any other permission extension and a host-managed approval broker. On a policy allow it hands the
+    decision back to the adapter, so the adapter's own `approveTools` prompt still applies. If another
+    extension claims the request first, Unbound does not check that call (this is reported once).
   - **Requires pi-mcp-adapter 2.21.0 or later.** Older adapters, other MCP bridges, and pi builds
-    without `pi.events` are not enforced for MCP.
+    without `pi.events` are not enforced for MCP, and nothing signals that at runtime.
 - **The turn log** (`POST /v1/hooks/pi`) carries each tool's text output, capped at 8 KB per result
   (head and tail kept) and 128 KB per turn, with bearer tokens and the Unbound key redacted, next to a
   sha256 and a byte count. Image output is never sent; it is represented by its hash and size only.
@@ -172,12 +187,16 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
 
 Known gaps:
 
+- The per-turn output budget (128 KB) is shared: earlier results in a turn can use it up, after
+  which later results carry only a hash and size.
+- Output of MCP calls made from `mcpScript` is not captured; the script's own call carries it.
+- `mcp({action: "install"})`, which adds a server by URL, is not an MCP tool call and is not checked.
+
 - There is no unknown-server scan dispatch. In an org that blocks unsanctioned MCP servers, a server no
   device has scanned yet is reported as "being scanned" for up to an hour and is not resolved by pi.
 - Local-script stdio servers (`node ./server.js`) get no `scriptHash`, so their fingerprint is null.
-- The adapter's config `imports`, plugins and opt-in ancestor files are not read. When a config file
-  uses `imports` or ancestor roots, or a server is only defined by a plugin, the server config is left
-  out. In an org that only allows sanctioned MCP servers, those calls are then denied as unknown.
+- MCP servers provided by pi packages (named `<package>__<server>`) or plugins never get a server
+  config (see "What an omitted config means" above).
 - Allowed pi MCP calls do not show up in MCP usage analytics yet; that needs a separate
   `ai-gateway-data` change to parse pi turn logs. Blocked and warned MCP calls do appear, through the
   gateway's block row.

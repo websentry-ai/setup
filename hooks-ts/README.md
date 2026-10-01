@@ -57,11 +57,16 @@ Shipped knowingly, each with its owner and evidence, in
   never in tool input.
 - **MCP is enforced through pi-mcp-adapter's approval broker** (`pi-mcp-adapter:tool-approval-request`
   on `pi.events`), for every origin the adapter brokers — proxy, direct, namespace, `mcpScript`,
-  resource and iframe — with the adapter's own resolution of server, tool and arguments (sent whole
-  up to 1 MB). It needs pi-mcp-adapter 2.21.0 or later; older adapters and other MCP bridges are
-  unenforced. On a deny the model sees the adapter's generic denial text, and the developer sees the
-  policy reason. The remaining MCP gaps (no unknown-server scan dispatch, no `scriptHash`, config
-  imports/plugins, and MCP usage analytics for allowed calls) are listed in
+  resource and iframe — with the adapter's own resolution of server, tool and arguments. Arguments
+  are sent whole up to 512 KB; past that, head and tail only (the middle is not inspected), and the
+  whole request stays under 900 KB. The server config is sent only when the adapter's config files
+  are plain, fully-understood JSON unchanged since session start; otherwise it is omitted, and an org
+  that restricts MCP servers to a sanctioned list then denies those calls. Claiming the request
+  pre-empts other permission extensions and host-managed approval. It needs pi-mcp-adapter 2.21.0 or
+  later; older adapters and other MCP bridges are unenforced, with no runtime signal. On a deny the
+  model sees the adapter's generic denial text, and the developer sees the policy reason. The rest —
+  `action:"install"` unchecked, `mcpScript` call output not captured, the shared per-turn output
+  budget, no unknown-server scan, no `scriptHash`, no analytics for allowed calls — is in
   [`../pi/README.md`](../pi/README.md).
 - **Prompt templates are checked unexpanded.** `input` fires before expansion, so `/name args` is
   checked as the literal text typed, not as what it becomes.
