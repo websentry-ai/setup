@@ -362,7 +362,7 @@ test("no core module creates a registry at module scope", () => {
   // A module-scope registry is shared by every caller in the process - the bleed these containers
   // exist to remove. Each adapter creates and owns its own.
   const srcDir = resolve(import.meta.dirname, "..", "src");
-  const moduleScope = /^(export )?(const|let|var) \w+\s*(:[^=]+)?=\s*create(SessionStates|InstanceStates|BreakerRegistry|KeyedState)\b/m;
+  const moduleScope = /^(export )?(const|let|var) \w+\s*(:[^=]+)?=\s*create(SessionStates|InstanceStates|BreakerRegistry|KeyedState|ScopedStates)\b/m;
 
   for (const file of readdirSync(srcDir).filter((name) => name.endsWith(".ts"))) {
     assert.equal(moduleScope.test(readFileSync(join(srcDir, file), "utf8")), false, file);

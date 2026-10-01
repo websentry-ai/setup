@@ -39,6 +39,7 @@ import { GENERIC_DENY_REASON } from "../../core/src/constants.ts";
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import { evaluatePrompt, verdictMessage } from "../../core/src/evaluate.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import { policyState } from "../../core/src/policyState.ts";
 import { noteSafe } from "./decide.ts";
 import { PI_PROFILE } from "./profile.ts";
 import { notifySafe } from "./ui.ts";
@@ -109,6 +110,9 @@ export async function decideInput(
         checker: deps.checker,
         profile: PI_PROFILE,
         entrypoint: deps.entrypoint,
+        // pi's one-key, one-gateway process: the process-wide policy memory, named explicitly
+        // because core has no default (WR-03).
+        state: policyState,
         hooks: deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) },
         accountIdentity: deps.accountIdentity,
       },

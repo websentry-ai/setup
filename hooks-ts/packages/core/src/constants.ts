@@ -176,6 +176,11 @@ export const MAX_TRACKED_INSTANCES = 64;
  */
 export const MAX_TRACKED_GATEWAYS = 16;
 /**
+ * How many (gateway, API key) scopes one process keeps policy memory and a revoked-key latch for
+ * (`scopedState.ts`). Normally one per org a host serves; 16 is far above that.
+ */
+export const MAX_TRACKED_SCOPES = 16;
+/**
  * The capacity `createKeyedState` uses when its `max` is unusable: not a number, not finite
  * (`Infinity` included), or below 1 (IN-06). A caller asking for "unbounded" gets a bounded registry
  * of this size, never a single-entry one that evicts on every new key. Equal to the largest of the

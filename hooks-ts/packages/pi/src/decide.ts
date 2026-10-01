@@ -28,6 +28,7 @@ import {
 import { evaluateToolCall, verdictMessage } from "../../core/src/evaluate.ts";
 import type { DecisionEntry } from "../../core/src/evaluate.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
@@ -141,7 +142,10 @@ export async function decideToolCall(
         checker: deps.checker,
         profile: PI_PROFILE,
         entrypoint: deps.entrypoint,
-        state: deps.state,
+        // pi has one key and one gateway per process, so its policy memory is the process-wide
+        // singleton. Core requires the state explicitly (it has no default of its own), so pi's
+        // wiring names it here; a test may still inject a fresh one.
+        state: deps.state ?? policyState,
         now: deps.now,
         // `notifySafe` already swallows its own failures, and core wraps the call again: a notice
         // must never be able to change a verdict.

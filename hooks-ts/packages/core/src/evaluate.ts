@@ -41,7 +41,7 @@ import {
 } from "./constants.ts";
 import { auditToolInput, buildPretoolPayload, buildPromptPayload, nativeFileTools, resolveFilePath } from "./payload.ts";
 import type { CheckHooks, PolicyChecker } from "./policy.ts";
-import { policyState } from "./policyState.ts";
+import { createPolicyState } from "./policyState.ts";
 import type { PolicyState } from "./policyState.ts";
 import type { AgentProfile } from "./profile.ts";
 import type { Telemetry } from "./telemetry.ts";
@@ -96,11 +96,17 @@ export interface EvaluateDeps {
   /** `client_entrypoint` on the wire: "<agent>/<version>". */
   entrypoint: string;
   /**
-   * The remembered policy metadata. Defaults to the process-wide `policyState`, which is the right
-   * production answer: the memory has to survive across tool calls within a session. Injectable
-   * because the singleton only ever moves forward, and tests need "nothing learned yet".
+   * The remembered policy metadata for the org this call is checked against: the SAME instance the
+   * checker records responses into. Required, with no default (WR-03). The memory is per org and
+   * per gateway, so which instance is right depends on the adapter: pi (one key, one gateway per
+   * process) passes the process-wide `policyState` explicitly; a host serving several projects
+   * passes `createScopedStates().forScope(baseUrl, apiKey).policy`. A silent fall back to a process
+   * singleton would let one project's tool list or failure action decide another's calls.
+   *
+   * A caller that ignores the type and passes nothing usable gets a fresh, unstored state for that
+   * one call, which fails toward checking (no tool is cache-skipped), never the singleton.
    */
-  state?: PolicyState;
+  state: PolicyState;
   /** Injectable clock, so a 300 s cache-TTL test runs in milliseconds. Defaults to `Date.now`. */
   now?: () => number;
   /** The per-call notice channel handed to the checker. Its failures are swallowed here. */
@@ -163,6 +169,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+// The caller's state, or a fresh one for this call only. Never a process singleton (WR-03): a fresh
+// state has no confirmed tool list and no remembered failure action, so nothing is skipped and a
+// timeout allows, which is the cold-start behaviour.
+function resolveState(raw: unknown): PolicyState {
+  return raw !== null && typeof raw === "object" ? (raw as PolicyState) : createPolicyState();
 }
 
 function resolveDeadlineMs(raw: unknown): number {
@@ -294,11 +307,11 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
     const auditInput = auditToolInput(toolInput, command);
 
     const now = (deps.now ?? Date.now)();
-    const state = deps.state ?? policyState;
+    const state = resolveState(deps.state);
 
     // WR-02. "The server has already told us" is the entire justification for the skip below, so the
     // skip is gated on the server having told *this process* — not on a number a file supplied.
-    // `policyState.hydrate` never sets this bit, so it is false until the first response that carries
+    // `PolicyState.hydrate` never sets this bit, so it is false until the first response that carries
     // `tools_to_check` lands, which the forced pull below guarantees happens on the first real tool
     // call of the session.
     //
@@ -384,7 +397,7 @@ export async function evaluatePrompt(input: PromptInput, deps: EvaluateDeps): Pr
     const prompt = asString(source.text);
     if (prompt.trim() === "") return { kind: "skip", why: "nothing-evaluable" };
 
-    const state = deps.state ?? policyState;
+    const state = resolveState(deps.state);
     const model = source.model;
     const payload = buildPromptPayload({
       prompt,
