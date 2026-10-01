@@ -10,9 +10,6 @@
 // `!!command || (isValidNativeTool && !!filePath)` to be true (§B3) — so those three tools must
 // always carry a `metadata.file_path`, defaulting to cwd.
 
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -31,10 +28,7 @@ import {
   resolveFilePath,
   sanitizeToolInput,
 } from "../src/payload.ts";
-import { resolveClientEntrypoint } from "../src/piVersion.ts";
 import type { PretoolPayloadInput } from "../src/types.ts";
-
-const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 
 function bashInput(overrides: Partial<PretoolPayloadInput> = {}): PretoolPayloadInput {
   return {
@@ -437,49 +431,4 @@ test("buildPretoolPayload: the body is a plain JSON-serialisable object", () => 
   const body = buildPretoolPayload(bashInput());
   const roundTripped = JSON.parse(JSON.stringify(body));
   assert.deepEqual(roundTripped, body);
-});
-
-test("resolveClientEntrypoint: reads the managed install's current-version file", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-install-"));
-  try {
-    writeFileSync(join(root, "current-version"), "0.87.1\n");
-    assert.equal(resolveClientEntrypoint({ PI_MANAGED_INSTALL_ROOT: root }), "pi/0.87.1");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("resolveClientEntrypoint: walks up from argv[1] to the pi package.json", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-global-"));
-  try {
-    writeFileSync(join(root, "package.json"), JSON.stringify({ name: PI_PACKAGE_NAME, version: "9.9.9" }));
-    const bundleDir = join(root, "dist", "bundle");
-    mkdirSync(bundleDir, { recursive: true });
-    assert.equal(resolveClientEntrypoint({}, join(bundleDir, "cli.js")), "pi/9.9.9");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
-
-test("resolveClientEntrypoint: unresolvable version -> pi/unknown, never throws", () => {
-  assert.doesNotThrow(() => resolveClientEntrypoint({ PI_MANAGED_INSTALL_ROOT: "/nope/does/not/exist" }));
-  assert.equal(
-    resolveClientEntrypoint({ PI_MANAGED_INSTALL_ROOT: "/nope/does/not/exist" }, "/nope/also/cli.js"),
-    "pi/unknown",
-  );
-  assert.equal(resolveClientEntrypoint({}), "pi/unknown");
-  assert.doesNotThrow(() => resolveClientEntrypoint({}, ""));
-});
-
-test("resolveClientEntrypoint: a hostile version string is sanitised and capped", () => {
-  const root = mkdtempSync(join(tmpdir(), "pi-hostile-"));
-  try {
-    writeFileSync(join(root, "current-version"), "0.87.1; rm -rf / #" + "z".repeat(80));
-    const entrypoint = resolveClientEntrypoint({ PI_MANAGED_INSTALL_ROOT: root });
-    assert.ok(entrypoint.startsWith("pi/"), entrypoint);
-    assert.ok(!/[;\s#\/]/.test(entrypoint.slice(3)), entrypoint);
-    assert.ok(entrypoint.length <= 3 + 32, entrypoint);
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
 });

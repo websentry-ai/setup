@@ -8,8 +8,6 @@
 export const ENV_API_KEY_PI = "UNBOUND_PI_API_KEY";
 export const ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
 export const ENV_GATEWAY_URL = "UNBOUND_GATEWAY_URL";
-/** Exported by pi's managed-install launcher; its `current-version` file holds the pi version (§A8). */
-export const ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
 
 // --- Hosts, paths, identity ------------------------------------------------------------------
 /** unbound-cli `src/config.js:9` DEFAULT_GATEWAY_URL. */

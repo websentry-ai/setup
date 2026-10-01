@@ -81,7 +81,6 @@ import type { HeartbeatGate } from "../../core/src/heartbeat.ts";
 import { buildTurnLogBody } from "../../core/src/turnLog.ts";
 import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
 import { keyState } from "../../core/src/keyState.ts";
-import { resolveClientEntrypoint } from "../../core/src/piVersion.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
@@ -95,6 +94,7 @@ import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
 import { notifySafe } from "./ui.ts";
 import { decideUserBash } from "./userBash.ts";
+import { resolveClientEntrypoint } from "./version.ts";
 
 /**
  * The session id, read defensively: `ctx.sessionManager` is the live object and a fault reading it
