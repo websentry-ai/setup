@@ -65,6 +65,7 @@ var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
 var MAX_ASSISTANT_CHARS = 16384;
 var MAX_TOOL_INPUT_VALUE_BYTES = 2048;
+var MAX_MCP_NAME_CHARS = 256;
 var TOOL_INPUT_ALLOWLIST = [
   "path",
   "pattern",
@@ -552,6 +553,40 @@ function resolveFilePath(toolName, toolInput, cwd, fileTools) {
   return isDefaulting ? cwd : void 0;
 }
 var ALLOWED_TOOL_INPUT_KEYS = new Set(TOOL_INPUT_ALLOWLIST);
+function allowedKeysFor(extraKeys) {
+  try {
+    if (!Array.isArray(extraKeys) || extraKeys.length === 0) return ALLOWED_TOOL_INPUT_KEYS;
+    const allowed = new Set(ALLOWED_TOOL_INPUT_KEYS);
+    for (const key of extraKeys) if (typeof key === "string" && key !== "") allowed.add(key);
+    return allowed;
+  } catch {
+    return ALLOWED_TOOL_INPUT_KEYS;
+  }
+}
+function profileExtraToolInputKeys(profile) {
+  try {
+    if (profile === null || typeof profile !== "object") return void 0;
+    const keys = profile.extraToolInputKeys;
+    return Array.isArray(keys) ? keys : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function validMcpName(value) {
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAX_MCP_NAME_CHARS) return void 0;
+  return value;
+}
+function normaliseMcp(raw) {
+  try {
+    if (raw === null || typeof raw !== "object") return void 0;
+    const server = validMcpName(raw.server);
+    if (server === void 0) return void 0;
+    const tool = validMcpName(raw.tool);
+    return tool === void 0 ? { server } : { server, tool };
+  } catch {
+    return void 0;
+  }
+}
 function sliceToBytes(value, maxBytes) {
   if (Buffer.byteLength(value) <= maxBytes) return value;
   let out = "";
@@ -564,13 +599,14 @@ function sliceToBytes(value, maxBytes) {
   }
   return out;
 }
-function sanitizeToolInput(toolInput) {
+function sanitizeToolInput(toolInput, extraKeys) {
   const out = {};
   if (toolInput === null || typeof toolInput !== "object" || Array.isArray(toolInput)) return out;
+  const allowed = allowedKeysFor(extraKeys);
   let dropped = false;
   let truncated = false;
   for (const [key, value] of Object.entries(toolInput)) {
-    if (!ALLOWED_TOOL_INPUT_KEYS.has(key)) {
+    if (!allowed.has(key)) {
       dropped = true;
       continue;
     }
@@ -622,11 +658,11 @@ function capCommand(command, maxChars = MAX_COMMAND_CHARS) {
     truncated: true
   };
 }
-function auditToolInput(toolInput, command) {
+function auditToolInput(toolInput, command, extraKeys) {
   const isObject = toolInput !== null && typeof toolInput === "object" && !Array.isArray(toolInput);
   const source = isObject ? { ...toolInput } : {};
   delete source.command;
-  const out = sanitizeToolInput(source);
+  const out = sanitizeToolInput(source, extraKeys);
   if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
   return capToolInput(out);
 }
@@ -661,7 +697,7 @@ function buildPretoolPayload(input, profile) {
   const metadata = {
     cwd: input.cwd,
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
-    tool_input: capToolInput(sanitizeToolInput(input.toolInput))
+    tool_input: capToolInput(sanitizeToolInput(input.toolInput, profileExtraToolInputKeys(profile)))
   };
   const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
   if (filePath !== void 0) metadata.file_path = filePath;
@@ -669,6 +705,11 @@ function buildPretoolPayload(input, profile) {
   if (capped.truncated) {
     metadata.command_truncated = true;
     metadata.command_original_chars = input.command.length;
+  }
+  const mcp = normaliseMcp(input.mcp);
+  if (mcp !== void 0) {
+    metadata.mcp_server = mcp.server;
+    if (mcp.tool !== void 0) metadata.mcp_tool = mcp.tool;
   }
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
@@ -1596,9 +1637,13 @@ async function evaluateToolCall(call, deps) {
     const toolInput = isRecord2(source.toolInput) ? source.toolInput : {};
     const cwd = asString(source.cwd);
     const profile = deps.profile;
+    const mcp = normaliseMcp(source.mcp);
     const filePath = resolveFilePath(toolName, toolInput, cwd, profile.fileTools);
-    if (command.trim() === "" && filePath === void 0) return { kind: "skip", why: "nothing-evaluable" };
-    const auditInput = auditToolInput(toolInput, command);
+    if (command.trim() === "" && filePath === void 0 && mcp === void 0) {
+      return { kind: "skip", why: "nothing-evaluable" };
+    }
+    const extraKeys = profileExtraToolInputKeys(profile);
+    const auditInput = auditToolInput(toolInput, command, extraKeys);
     const now = (deps.now ?? Date.now)();
     const state = resolveState(deps.state);
     const toolsConfirmed = state.getToolsConfirmed();
@@ -1623,7 +1668,8 @@ async function evaluateToolCall(call, deps) {
       model: typeof model === "string" ? model : void 0,
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
-      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
+      ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }
     }, profile);
     const outcome = await check(payload, toolName, deps, state);
     if (outcome === void 0) return { kind: "allow" };
