@@ -27,6 +27,14 @@ const PI_TEST_DIR = resolve(HELPERS_DIR, "..");
 export const WORKSPACE_ROOT = resolve(PI_TEST_DIR, "..", "..", "..");
 /** The frozen pre-refactor transcript. Written only under `UNBOUND_WRITE_GOLDEN=1`. */
 export const GOLDEN_PATH = join(PI_TEST_DIR, "fixtures", "pi-wire-golden.json");
+/**
+ * The SECOND golden (review WR-05): the `EXTRA_SCENARIOS` below, captured by running the
+ * pre-refactor ARTIFACT (`git show <EXTRA_GOLDEN_BASE>:pi/index.js`) through this same harness.
+ * Written only under `UNBOUND_WRITE_EXTRA_GOLDEN=1`. The first golden is never touched by it.
+ */
+export const EXTRA_GOLDEN_PATH = join(PI_TEST_DIR, "fixtures", "pi-wire-golden-extra.json");
+/** The commit the first golden was captured from, and whose artifact the second one is captured from. */
+export const EXTRA_GOLDEN_BASE = "a9f621e";
 /** The source entry the refactor will change. */
 export const SOURCE_ENTRY = join(WORKSPACE_ROOT, "packages", "pi", "src", "index.ts");
 /** The committed, installable bundle — one directory above the workspace, beside `setup.py`. */
@@ -86,10 +94,40 @@ export interface ScenarioDef {
   keys: readonly KeyTier[];
   /** Where the mock's URL is planted. `config` exercises the `~/.unbound/config.json` URL tier. */
   gatewayVia: "env" | "config";
-  /** Written verbatim to `<home>/.pi/agent/auth.json` when present. Absent in all scenarios but one. */
+  /** Written verbatim to `<home>/<authJsonDir>/auth.json` when present. */
   authJson?: Record<string, unknown>;
   steps: readonly Step[];
+
+  // --- Used only by EXTRA_SCENARIOS (WR-05). Every one is optional and changes nothing when absent,
+  // so the frozen first golden's scenarios produce exactly the transcripts they always did.
+
+  /**
+   * `PI_CODING_AGENT_DIR`, set before the entry is imported. `{HOME}` is replaced by the fake home;
+   * a value starting `~/` is passed as is, to exercise the resolver's own expansion.
+   */
+  agentDirEnv?: string;
+  /** Where `authJson` goes, relative to the fake home. Default `.pi/agent`. */
+  authJsonDir?: string;
+  /**
+   * A `policy_cache.json` planted before the entry is imported, at `<home>/<dir>/.unbound/`.
+   * `identity: "matching"` binds it to the mock's URL and the pi-tier key, the way the extension
+   * itself would; `"foreign"` binds it to another key, which the extension must ignore. Every
+   * `{NOW}` value in `snapshot` is replaced by the epoch-ms time of planting (a fresh stamp).
+   */
+  seedCache?: { dir: string; identity: "matching" | "foreign"; snapshot: Record<string, unknown> };
+  /**
+   * Record planted files too in `files_written` (at their end-of-scenario content), so a cache the
+   * extension rewrote — or left alone — is visible. Default: only files the extension created.
+   */
+  recordSeeded?: boolean;
+  /** Record what each step wrote to the process's stderr (the headless notice mirror). */
+  captureStderr?: boolean;
 }
+
+/** `{HOME}` inside `agentDirEnv`. */
+export const HOME_PLACEHOLDER = "{HOME}";
+/** `{NOW}` inside a `seedCache.snapshot` value. */
+export const NOW_PLACEHOLDER = "{NOW}";
 
 const bash = (name: string, id: string, command: string, extra: Partial<StepBase> = {}): Step => ({
   name,
@@ -299,11 +337,153 @@ export const SCENARIOS = {
   },
 } as const satisfies Record<string, ScenarioDef>;
 
+/**
+ * WR-05: paths the first table cannot see, each captured from the PRE-refactor artifact into the
+ * second golden. A separate table, so the first golden (which must cover exactly `SCENARIOS`) is
+ * never edited.
+ */
+export const EXTRA_SCENARIOS = {
+  // The agent-dir relocation variable, absolute: the cache AND auth.json both follow it, and nothing
+  // is written under the `~/.pi/agent` default.
+  "agent-dir-env-absolute": {
+    keys: ["pi"],
+    gatewayVia: "env",
+    agentDirEnv: `${HOME_PLACEHOLDER}/alt-agent`,
+    authJsonDir: "alt-agent",
+    authJson: { openai: { type: "api_key" } },
+    steps: [
+      { name: "session-start", event: "session_start", reason: "startup", mode: "allow", minRequests: 1 },
+      { name: "prompt", event: "input", text: "hello" },
+      bash("learn-tools", "toolu_wire_1", "ls", { mode: "toolsList" }),
+      {
+        name: "read-checked",
+        event: "tool_call",
+        toolName: "read",
+        toolCallId: "toolu_wire_2",
+        input: { path: `${CWD_PLACEHOLDER}/src/app.ts` },
+      },
+    ],
+  },
+
+  // The same variable in `~/` form: the resolver expands it against the home directory.
+  "agent-dir-env-tilde": {
+    keys: ["pi"],
+    gatewayVia: "env",
+    agentDirEnv: "~/tilde-agent",
+    steps: [bash("learn-tools", "toolu_wire_1", "ls", { mode: "toolsList" })],
+  },
+
+  // WR-02 on the wire: a matching, fresh cache that says "no file policies" is hydrated, but the
+  // first file tool is still SENT with `pull_policies`; only after the server confirms `[]` is the
+  // next one skipped.
+  "hydrated-cache-pulls": {
+    keys: ["pi"],
+    gatewayVia: "env",
+    seedCache: {
+      dir: ".pi/agent",
+      identity: "matching",
+      snapshot: { fetched_at: NOW_PLACEHOLDER, tools_synced_at: NOW_PLACEHOLDER, tools_to_check: [], policy_check_failure_action: "allow" },
+    },
+    recordSeeded: true,
+    steps: [
+      {
+        name: "read-1-pulled",
+        event: "tool_call",
+        toolName: "read",
+        toolCallId: "toolu_wire_1",
+        input: { path: `${CWD_PLACEHOLDER}/src/app.ts` },
+        mode: "toolsEmpty",
+      },
+      {
+        name: "read-2-skipped",
+        event: "tool_call",
+        toolName: "read",
+        toolCallId: "toolu_wire_2",
+        input: { path: `${CWD_PLACEHOLDER}/src/other.ts` },
+      },
+    ],
+  },
+
+  // A hydrated `block` failure action applies from the very first call of the session.
+  "hydrated-cache-fail-closed": {
+    keys: ["pi"],
+    gatewayVia: "env",
+    seedCache: {
+      dir: ".pi/agent",
+      identity: "matching",
+      snapshot: { fetched_at: NOW_PLACEHOLDER, tools_synced_at: NOW_PLACEHOLDER, tools_to_check: ["read"], policy_check_failure_action: "block" },
+    },
+    recordSeeded: true,
+    steps: [bash("fail-blocks", "toolu_wire_1", "ls", { mode: "500" })],
+  },
+
+  // A cache bound to another key is ignored: the same failure is fail-open.
+  "foreign-cache-ignored": {
+    keys: ["pi"],
+    gatewayVia: "env",
+    seedCache: {
+      dir: ".pi/agent",
+      identity: "foreign",
+      snapshot: { fetched_at: NOW_PLACEHOLDER, tools_synced_at: NOW_PLACEHOLDER, tools_to_check: [], policy_check_failure_action: "block" },
+    },
+    recordSeeded: true,
+    steps: [
+      bash("fail-allows", "toolu_wire_1", "ls", { mode: "500" }),
+      {
+        name: "read-checked",
+        event: "tool_call",
+        toolName: "read",
+        toolCallId: "toolu_wire_2",
+        input: { path: `${CWD_PLACEHOLDER}/src/app.ts` },
+        mode: "allow",
+      },
+    ],
+  },
+
+  // Headless (`pi -p`): every notice is mirrored to stderr, since there is no UI to show it.
+  "headless-stderr": {
+    keys: ["pi"],
+    gatewayVia: "env",
+    captureStderr: true,
+    steps: [
+      { name: "prompt-deny", event: "input", text: "read the secrets", mode: "deny", ctx: { mode: "print", hasUI: false } },
+      bash("bash-deny", "toolu_wire_1", "cat ~/.aws/credentials", { ctx: { mode: "print", hasUI: false } }),
+      bash("bash-ask-no-ui", "toolu_wire_2", "git push --force", { mode: "ask", ctx: { mode: "print", hasUI: false } }),
+      bash("reject-1", "toolu_wire_3", "ls", { mode: "401", ctx: { mode: "print", hasUI: false } }),
+      bash("reject-2-latches", "toolu_wire_4", "ls", { ctx: { mode: "print", hasUI: false } }),
+    ],
+  },
+
+  // Headless with no key: the one-time notice goes to stderr.
+  "headless-no-key": {
+    keys: [],
+    gatewayVia: "env",
+    captureStderr: true,
+    steps: [
+      { name: "session-start", event: "session_start", reason: "startup", mode: "deny", ctx: { mode: "print", hasUI: false } },
+      { name: "session-start-again", event: "session_start", reason: "new", ctx: { mode: "print", hasUI: false } },
+    ],
+  },
+} as const satisfies Record<string, ScenarioDef>;
+
 export type ScenarioName = keyof typeof SCENARIOS;
 export const SCENARIO_NAMES: readonly ScenarioName[] = Object.keys(SCENARIOS) as ScenarioName[];
+export type ExtraScenarioName = keyof typeof EXTRA_SCENARIOS;
+export const EXTRA_SCENARIO_NAMES: readonly ExtraScenarioName[] = Object.keys(EXTRA_SCENARIOS) as ExtraScenarioName[];
 
 export function isScenarioName(name: string): name is ScenarioName {
   return Object.hasOwn(SCENARIOS, name);
+}
+
+export function isExtraScenarioName(name: string): name is ExtraScenarioName {
+  return Object.hasOwn(EXTRA_SCENARIOS, name);
+}
+
+/** A scenario from either table. The two tables share no name (asserted by the equivalence test). */
+export function scenarioDef(name: string): ScenarioDef | undefined {
+  if (isScenarioName(name)) return SCENARIOS[name];
+  if (isExtraScenarioName(name)) return EXTRA_SCENARIOS[name];
+  return undefined;
 }
 
 // --- transcript shapes ----------------------------------------------------------------------------
@@ -329,6 +509,8 @@ export interface StepRecord {
   notices: { message: string; type: string | null }[];
   confirms: { title: string; message: string; timeout: number | null; has_signal: boolean }[];
   requests: RequestRecord[];
+  /** What the step wrote to stderr. Present only for a scenario with `captureStderr`. */
+  stderr?: string[];
 }
 
 export interface FileRecord {
@@ -358,7 +540,7 @@ export interface RawTranscript extends Transcript {
 // --- the runner -----------------------------------------------------------------------------------
 
 /** Run one scenario against one extension entry in a fresh process and return its NORMALISED transcript. */
-export function runScenario(entryPath: string, name: ScenarioName): Promise<Transcript> {
+export function runScenario(entryPath: string, name: ScenarioName | ExtraScenarioName): Promise<Transcript> {
   return new Promise<Transcript>((resolveRun, rejectRun) => {
     const child = spawn(
       process.execPath,

@@ -19,6 +19,7 @@
 // `pi/src` is imported statically here — the oracle drives the extension through the same door pi
 // does (`default(pi)` + `pi.on`), so it keeps working when the internals are rearranged.
 
+import { createHash } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -38,11 +39,12 @@ import {
 } from "./fakeCtx.ts";
 import {
   CWD_PLACEHOLDER,
-  SCENARIOS,
+  HOME_PLACEHOLDER,
+  NOW_PLACEHOLDER,
   SCENARIO_KEYS,
   SESSION_ID,
   UNDEFINED_MARKER,
-  isScenarioName,
+  scenarioDef,
 } from "./wireScenario.ts";
 import type { FileRecord, RawTranscript, RequestRecord, ScenarioDef, Step, StepRecord } from "./wireScenario.ts";
 
@@ -117,6 +119,41 @@ function substituteCwd<T>(value: T, cwd: string): T {
   return out as T;
 }
 
+/**
+ * The cache's identity half for a key, computed here from the documented format (`"sha256:"` + the
+ * first 16 hex of the key's sha256) rather than imported, so the harness keeps depending on no
+ * extension internals. A format change in the extension would show up as an ignored cache.
+ */
+function fingerprintOf(apiKey: string): string {
+  return `sha256:${createHash("sha256").update(apiKey, "utf8").digest("hex").slice(0, 16)}`;
+}
+
+/** Replace `{NOW}` values (top level of a snapshot) with `now`. */
+function stampNow(snapshot: Record<string, unknown>, now: number): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(snapshot)) out[key] = value === NOW_PLACEHOLDER ? now : value;
+  return out;
+}
+
+/** Collect everything written to stderr while `run` runs, without passing it through. */
+async function withCapturedStderr<T>(enabled: boolean, run: () => Promise<T>): Promise<{ value: T; lines: string[] }> {
+  if (!enabled) return { value: await run(), lines: [] };
+  const chunks: string[] = [];
+  const original = process.stderr.write;
+  process.stderr.write = ((chunk: unknown, ...rest: unknown[]) => {
+    chunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk as Uint8Array).toString("utf8"));
+    const callback = rest.find((arg) => typeof arg === "function") as (() => void) | undefined;
+    callback?.();
+    return true;
+  }) as typeof process.stderr.write;
+  try {
+    const value = await run();
+    return { value, lines: chunks.join("").split("\n").filter((line) => line !== "") };
+  } finally {
+    process.stderr.write = original;
+  }
+}
+
 function headerOf(headers: Record<string, string | string[] | undefined>, name: string): string | null {
   const value = headers[name];
   if (value === undefined) return null;
@@ -183,8 +220,8 @@ async function settle(mock: MockApi, before: number, minRequests: number): Promi
 }
 
 async function run(entryArg: string, scenarioName: string): Promise<RawTranscript> {
-  if (!isScenarioName(scenarioName)) throw new Error(`unknown scenario: ${scenarioName}`);
-  const scenario: ScenarioDef = SCENARIOS[scenarioName];
+  const scenario: ScenarioDef | undefined = scenarioDef(scenarioName);
+  if (scenario === undefined) throw new Error(`unknown scenario: ${scenarioName}`);
   // Resolved against the launch cwd BEFORE anything moves; a relative entry path is the common case.
   const entryPath = resolve(entryArg);
 
@@ -215,10 +252,23 @@ async function run(entryArg: string, scenarioName: string): Promise<RawTranscrip
     if (scenario.keys.includes("config")) config.api_key = SCENARIO_KEYS.config;
     if (scenario.gatewayVia === "config") config.gateway_url = mock.url;
     if (Object.keys(config).length > 0) writePrivateJson(join(home, ".unbound"), "config.json", config);
-    if (scenario.authJson !== undefined) writePrivateJson(join(home, ".pi", "agent"), "auth.json", scenario.authJson);
+    if (scenario.authJson !== undefined) {
+      writePrivateJson(join(home, ...(scenario.authJsonDir ?? ".pi/agent").split("/")), "auth.json", scenario.authJson);
+    }
+    if (scenario.agentDirEnv !== undefined) {
+      process.env.PI_CODING_AGENT_DIR = scenario.agentDirEnv.split(HOME_PLACEHOLDER).join(home);
+    }
+    if (scenario.seedCache !== undefined) {
+      const { dir, identity, snapshot } = scenario.seedCache;
+      writePrivateJson(join(home, ...dir.split("/"), ".unbound"), "policy_cache.json", {
+        ...stampNow(snapshot, Date.now()),
+        gateway_url: mock.url,
+        key_fingerprint: fingerprintOf(identity === "matching" ? SCENARIO_KEYS.pi : `${SCENARIO_KEYS.pi}_foreign`),
+      });
+    }
 
     // Whatever exists now was planted here; whatever appears later, the extension wrote.
-    const seeded = new Set(listFiles(home));
+    const seeded = new Set(scenario.recordSeeded === true ? [] : listFiles(home));
 
     const mod = (await import(pathToFileURL(entryPath).href)) as { default?: unknown };
     if (typeof mod.default !== "function") throw new Error(`${entryPath} has no default-exported factory`);
@@ -234,6 +284,7 @@ async function run(entryArg: string, scenarioName: string): Promise<RawTranscrip
     await (mod.default as (pi: unknown) => unknown)(stubPi);
 
     const steps: StepRecord[] = [];
+    const activeMock: MockApi = mock;
     let mode: MockMode = "allow";
     for (const step of scenario.steps) {
       if (step.mode !== undefined) {
@@ -248,8 +299,11 @@ async function run(entryArg: string, scenarioName: string): Promise<RawTranscrip
       const event = substituteCwd(eventFor(step), cwd);
       // A user-typed command carries its own cwd on the event; pin it to the scenario's.
       if (step.event === "user_bash") (event as { cwd: string }).cwd = cwd;
-      const returned = await handler(event, ctx);
-      await settle(mock, before, step.minRequests ?? 0);
+      const { value: returned, lines: stderrLines } = await withCapturedStderr(scenario.captureStderr === true, async () => {
+        const value = await handler(event, ctx);
+        await settle(activeMock, before, step.minRequests ?? 0);
+        return value;
+      });
 
       const requests: RequestRecord[] = mock.requests.slice(before).map((request) => ({
         method: request.method,
@@ -271,6 +325,7 @@ async function run(entryArg: string, scenarioName: string): Promise<RawTranscrip
           has_signal: call.opts?.signal !== undefined,
         })),
         requests,
+        ...(scenario.captureStderr === true ? { stderr: stderrLines } : {}),
       });
     }
 
