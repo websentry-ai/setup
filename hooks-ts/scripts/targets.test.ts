@@ -25,6 +25,8 @@ import {
 } from "./targets.mjs";
 
 const hooksRoot = resolve(import.meta.dirname, "..");
+// This file lives in hooks-ts/scripts, so the repo root is two levels up.
+const workflowFile = resolve(import.meta.dirname, "..", "..", ".github", "workflows", "hooks-ts.yml");
 
 const BUNDLE = "export default function () {}\n";
 
@@ -278,4 +280,26 @@ test("syncTarget reports a missing build instead of writing anything", (t) => {
   assert.equal(problems.length, 1, problems.join(" | "));
   assert.equal(readFileSync(triple.sidecarFile, "utf8"), before);
   assert.equal(readFileSync(triple.artifactFile, "utf8"), BUNDLE);
+});
+
+// --- the workflow ------------------------------------------------------------------------------
+
+test("the workflow gates targets through the table, with no target path spelled out", () => {
+  const workflow = readFileSync(workflowFile, "utf8");
+
+  for (const target of TARGETS) {
+    assert.equal(
+      workflow.includes(artifactRelPath(target)),
+      false,
+      `hooks-ts.yml names ${artifactRelPath(target)} literally - drive it from scripts/targets.mjs`,
+    );
+  }
+  assert.ok(workflow.includes("artifacts:check"), "hooks-ts.yml does not run artifacts:check");
+  assert.ok(
+    workflow.includes("targets.mjs --sidecars"),
+    "hooks-ts.yml does not verify the sidecars listed by targets.mjs",
+  );
+  // Path filters: any top-level <dir>/index.js(.sha256), on both triggers.
+  assert.equal(workflow.split('"*/index.js"').length - 1, 2);
+  assert.equal(workflow.split('"*/index.js.sha256"').length - 1, 2);
 });
