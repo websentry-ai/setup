@@ -40,6 +40,7 @@ var TURNLOG_MODEL = "auto";
 var TURNLOG_TOOL_USE_TYPE = "PostToolUse";
 var PRETOOL_TIMEOUT_MS = 2e4;
 var EVALUATE_DEADLINE_SLACK_MS = 2e3;
+var EVALUATE_DEADLINE_ERROR_CLASS = "EvaluateDeadline";
 var ERRORS_TIMEOUT_MS = 1e4;
 var TURNLOG_TIMEOUT_MS = 1e4;
 var CONFIRM_TIMEOUT_MS = 12e4;
@@ -1526,6 +1527,9 @@ function isRecord2(value) {
 function asString(value) {
   return typeof value === "string" ? value : "";
 }
+function resolveState(raw) {
+  return raw !== null && typeof raw === "object" ? raw : createPolicyState();
+}
 function resolveDeadlineMs(raw) {
   if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.min(raw, MAX_TIMER_MS);
   return PRETOOL_TIMEOUT_MS + EVALUATE_DEADLINE_SLACK_MS;
@@ -1550,7 +1554,6 @@ function raceDeadline(start, deadlineMs) {
     };
     try {
       timer = setTimeout(() => finish({ state: "timed-out" }), deadlineMs);
-      timer.unref?.();
       Promise.resolve(start()).then(
         (value) => finish({ state: "answered", value }),
         () => finish({ state: "faulted" })
@@ -1569,13 +1572,20 @@ function normaliseOutcome(raw) {
 }
 async function check(payload, label2, deps, state) {
   const hooks = safeHooks(deps.hooks);
-  const raced = await raceDeadline(
-    () => deps.checker.checkTool(payload, label2, hooks),
-    resolveDeadlineMs(deps.deadlineMs)
-  );
+  const deadlineMs = resolveDeadlineMs(deps.deadlineMs);
+  const raced = await raceDeadline(() => deps.checker.checkTool(payload, label2, hooks), deadlineMs);
   if (raced.state === "answered") return normaliseOutcome(raced.value);
   if (raced.state === "faulted") return void 0;
-  return state.getFailureAction() === "block" ? { kind: "unavailable" } : { kind: "allow" };
+  const blocked = state.getFailureAction() === "block";
+  noteSafe(
+    () => deps.telemetry?.reportBypass({
+      errorClass: EVALUATE_DEADLINE_ERROR_CLASS,
+      toolName: label2,
+      elapsedMs: deadlineMs,
+      blocked
+    })
+  );
+  return blocked ? { kind: "unavailable" } : { kind: "allow" };
 }
 async function evaluateToolCall(call, deps) {
   try {
@@ -1590,7 +1600,7 @@ async function evaluateToolCall(call, deps) {
     if (command.trim() === "" && filePath === void 0) return { kind: "skip", why: "nothing-evaluable" };
     const auditInput = auditToolInput(toolInput, command);
     const now = (deps.now ?? Date.now)();
-    const state = deps.state ?? policyState;
+    const state = resolveState(deps.state);
     const toolsConfirmed = state.getToolsConfirmed();
     if (toolsConfirmed && nativeFileTools(profile.fileTools).has(toolName) && shouldSkipFileToolFromState(toolName, state, now, profile.fileTools)) {
       noteDecision(deps, {
@@ -1634,7 +1644,7 @@ async function evaluatePrompt(input, deps) {
     if (source.source === HOST_GENERATED_SOURCE) return { kind: "skip", why: "nothing-evaluable" };
     const prompt = asString(source.text);
     if (prompt.trim() === "") return { kind: "skip", why: "nothing-evaluable" };
-    const state = deps.state ?? policyState;
+    const state = resolveState(deps.state);
     const model = source.model;
     const payload = buildPromptPayload({
       prompt,
@@ -1889,7 +1899,10 @@ async function decideToolCall(event, ctx, deps) {
         checker: deps.checker,
         profile: PI_PROFILE,
         entrypoint: deps.entrypoint,
-        state: deps.state,
+        // pi has one key and one gateway per process, so its policy memory is the process-wide
+        // singleton. Core requires the state explicitly (it has no default of its own), so pi's
+        // wiring names it here; a test may still inject a fresh one.
+        state: deps.state ?? policyState,
         now: deps.now,
         // `notifySafe` already swallows its own failures, and core wraps the call again: a notice
         // must never be able to change a verdict.
@@ -1943,6 +1956,9 @@ async function decideInput(event, ctx, deps) {
         checker: deps.checker,
         profile: PI_PROFILE,
         entrypoint: deps.entrypoint,
+        // pi's one-key, one-gateway process: the process-wide policy memory, named explicitly
+        // because core has no default (WR-03).
+        state: policyState,
         hooks: deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) },
         accountIdentity: deps.accountIdentity
       }
