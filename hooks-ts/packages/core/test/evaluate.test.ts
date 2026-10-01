@@ -9,6 +9,7 @@
 // throw is a block the model sees.
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import test from "node:test";
@@ -648,6 +649,48 @@ test("prompt deadline: a checker that never settles is bounded and honours the f
 
   const closed = harness({ checker: hangingChecker(), state: confirmedState([], "block"), deadlineMs: 25 });
   assert.deepEqual(await settle(() => evaluatePrompt(promptInput(), closed.deps)), { kind: "unavailable" });
+});
+
+// WR-01. The tests above run under `node:test` (and `settle`'s keep-alive), which holds the event
+// loop open by itself, so they cannot tell a deadline that fires from a process that would have
+// exited first. A standalone child with nothing else pending can: if the deadline timer did not keep
+// the process alive, the child exits 0 with no output and no verdict ever exists.
+test("deadline: in a process with nothing else pending, a hung checker still yields a verdict", () => {
+  const child = resolve(import.meta.dirname, "helpers", "hangingCheckerChild.ts");
+  const cases: [string, string, ToolEvaluation][] = [
+    ["tool", "allow", { kind: "allow" }],
+    ["tool", "block", { kind: "unavailable" }],
+    ["prompt", "allow", { kind: "allow" }],
+    ["prompt", "block", { kind: "unavailable" }],
+  ];
+  for (const [path, failureAction, expected] of cases) {
+    const run = spawnSync(process.execPath, ["--experimental-strip-types", "--no-warnings", child, path, failureAction], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    const label = `${path}/${failureAction}`;
+    assert.equal(run.error, undefined, `${label}: the child ran`);
+    assert.equal(run.status, 0, `${label}: exit status (stderr: ${run.stderr})`);
+    const line = run.stdout.trim();
+    assert.notEqual(line, "", `${label}: the process exited without delivering a verdict`);
+    assert.deepEqual(JSON.parse(line), { verdict: expected }, label);
+  }
+});
+
+test("deadline: a check that settles clears the timer, so a 60 s deadline does not hold the process open", () => {
+  const child = resolve(import.meta.dirname, "helpers", "hangingCheckerChild.ts");
+  for (const path of ["tool", "prompt"]) {
+    const started = Date.now();
+    const run = spawnSync(
+      process.execPath,
+      ["--experimental-strip-types", "--no-warnings", child, path, "allow", "answers"],
+      { encoding: "utf8", timeout: 20_000 },
+    );
+    assert.equal(run.error, undefined, `${path}: the child exited before the spawn timeout`);
+    assert.equal(run.status, 0, `${path}: exit status (stderr: ${run.stderr})`);
+    assert.deepEqual(JSON.parse(run.stdout.trim()), { verdict: { kind: "deny", reason: "answered" } });
+    assert.ok(Date.now() - started < 20_000, `${path}: well inside the 60 s deadline`);
+  }
 });
 
 // --- verdictMessage ------------------------------------------------------------------------------

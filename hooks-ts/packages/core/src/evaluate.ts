@@ -177,9 +177,15 @@ type Raced =
 
 // Start `start()` and wait for it for at most `deadlineMs`. The returned promise always resolves.
 //
-// The timer is cleared as soon as the work settles and is unref'd, so it never keeps a process
-// alive and never fires late into a finished call. A result that arrives after the deadline is
-// dropped.
+// The timer is cleared as soon as the work settles, so on the normal path it never extends a
+// process's lifetime and never fires late into a finished call. A result that arrives after the
+// deadline is dropped.
+//
+// The timer is deliberately NOT unref'd (WR-01). It only outlives the work when the work hangs, and
+// then it IS the guarantee: a checker stuck on a lost resolver holds no handle of its own, so an
+// unref'd deadline would let Node exit 0 mid tool call with no verdict, and a fail-closed org would
+// never get its `unavailable`. Keeping the process alive for at most `deadlineMs` while a check is
+// outstanding is exactly what contract item 3 promises.
 function raceDeadline(start: () => unknown, deadlineMs: number): Promise<Raced> {
   return new Promise<Raced>((resolve) => {
     let done = false;
@@ -192,7 +198,6 @@ function raceDeadline(start: () => unknown, deadlineMs: number): Promise<Raced> 
     };
     try {
       timer = setTimeout(() => finish({ state: "timed-out" }), deadlineMs);
-      timer.unref?.();
       Promise.resolve(start()).then(
         (value) => finish({ state: "answered", value }),
         () => finish({ state: "faulted" }),
