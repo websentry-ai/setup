@@ -168,6 +168,13 @@ export const MAX_TRACKED_INSTANCES = 64;
  * Normally exactly 1; more only when projects in the same process point at different gateways.
  */
 export const MAX_TRACKED_GATEWAYS = 16;
+/**
+ * The capacity `createKeyedState` uses when its `max` is unusable: not a number, not finite
+ * (`Infinity` included), or below 1 (IN-06). A caller asking for "unbounded" gets a bounded registry
+ * of this size, never a single-entry one that evicts on every new key. Equal to the largest of the
+ * per-purpose caps above.
+ */
+export const DEFAULT_KEYED_STATE_MAX = MAX_TRACKED_SESSIONS;
 
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;

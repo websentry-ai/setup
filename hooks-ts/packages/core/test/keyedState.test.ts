@@ -8,6 +8,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { DEFAULT_KEYED_STATE_MAX, MAX_TRACKED_SESSIONS } from "../src/constants.ts";
 import { createKeyedState } from "../src/keyedState.ts";
 
 interface Box {
@@ -267,20 +268,39 @@ test("even a faulting fallback does not escape get", () => {
   assert.equal(registry.size(), 0);
 });
 
-test("max below 1, fractional or non-finite is clamped", () => {
-  for (const max of [0, -5, Number.NaN, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, undefined as unknown as number, "9" as unknown as number]) {
-    const { registry } = boxes(max);
+test("max below 1 or non-finite falls back to the bounded default cap, never to 1 (IN-06)", () => {
+  assert.equal(DEFAULT_KEYED_STATE_MAX, MAX_TRACKED_SESSIONS);
+  for (const max of [0, -5, 0.5, Number.NaN, Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY, undefined as unknown as number, "9" as unknown as number]) {
+    const { registry, evicted } = boxes(max);
+    // Two keys both survive: "unbounded" must not mean "evict on every new key".
     registry.get("a");
     registry.get("b");
-    assert.equal(registry.size(), 1, `max ${String(max)}`);
-    assert.deepEqual(registry.keys(), ["b"]);
-  }
+    assert.equal(registry.size(), 2, `max ${String(max)}: a second key must not evict the first`);
+    assert.deepEqual(registry.keys(), ["a", "b"]);
 
+    // And it is still a bound: past the default cap, the least-recently-used keys go.
+    const extra = 5;
+    for (let i = 0; i < DEFAULT_KEYED_STATE_MAX + extra; i += 1) registry.get(`k${i}`);
+    assert.equal(registry.size(), DEFAULT_KEYED_STATE_MAX, `max ${String(max)}: bounded at the default cap`);
+    assert.equal(evicted.length, 2 + extra, `max ${String(max)}: exactly the overflow was evicted`);
+    assert.deepEqual(evicted.slice(0, 2).map(([key]) => key), ["a", "b"], "least-recently-used first");
+  }
+});
+
+test("a fractional max rounds down, and 1 is honoured as 1", () => {
   const { registry } = boxes(2.9);
   registry.get("a");
   registry.get("b");
   registry.get("c");
   assert.equal(registry.size(), 2, "a fractional max rounds down");
+
+  for (const max of [1, 1.5]) {
+    const { registry: one } = boxes(max);
+    one.get("a");
+    one.get("b");
+    assert.equal(one.size(), 1, `max ${max}`);
+    assert.deepEqual(one.keys(), ["b"]);
+  }
 });
 
 test("no method ever throws, whatever it is handed", () => {

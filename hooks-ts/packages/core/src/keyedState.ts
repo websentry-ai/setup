@@ -28,6 +28,8 @@
 // No I/O, no timers, no module-scope state: each caller owns the registries it creates. A registry
 // at module scope would be exactly the cross-session bleed this file exists to remove.
 
+import { DEFAULT_KEYED_STATE_MAX } from "./constants.ts";
+
 export interface KeyedState<V> {
   /** The value for `key`, created on first use. An invalid key gets an unstored fallback value. */
   get(key: unknown): V;
@@ -43,7 +45,10 @@ export interface KeyedState<V> {
 }
 
 export interface KeyedStateOptions<V> {
-  /** Capacity. Anything that is not a finite number of at least 1 is treated as 1. */
+  /**
+   * Capacity, rounded down. Anything that is not a finite number of at least 1 (`Infinity`, `NaN`,
+   * `0`, a negative, a non-number) is `DEFAULT_KEYED_STATE_MAX`: a bounded default, never 1 (IN-06).
+   */
   max: number;
   /** Builds the value for a key seen for the first time. Handed the NORMALISED key. */
   create(key: string): V;
@@ -58,8 +63,11 @@ export interface KeyedStateOptions<V> {
   onEvict?(key: string, value: V): void;
 }
 
+// An unusable cap falls back to the default rather than to 1 (IN-06): a caller who meant
+// "unbounded" (`Infinity`) would otherwise get a registry that evicts on every new key, which for
+// sessions silently drops every other session's pending turn. The default is still a bound.
 function clampMax(max: unknown): number {
-  if (typeof max !== "number" || !Number.isFinite(max) || max < 1) return 1;
+  if (typeof max !== "number" || !Number.isFinite(max) || max < 1) return DEFAULT_KEYED_STATE_MAX;
   return Math.floor(max);
 }
 
