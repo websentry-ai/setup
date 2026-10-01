@@ -5,14 +5,22 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
-import { DENY_PREFIX } from "../../core/src/constants.ts";
+import { DENY_PREFIX, ENGINE_UNAVAILABLE_REASON, NO_KEY_NOTICE } from "../../core/src/constants.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import type { PretoolRequestBody } from "../../core/src/types.ts";
 import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import { createServerPlugin } from "../src/plugin.ts";
 import type { Deps } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage, blockingMessage, strictest } from "../src/verdicts.ts";
-import { makeDeps, makeFakeInput, pretoolRequests, startOpencodeMock } from "./helpers/fakeHost.ts";
+import {
+  makeDeps,
+  makeFakeInput,
+  pretoolRequests,
+  signalsOf,
+  startOpencodeMock,
+  tick,
+  waitFor,
+} from "./helpers/fakeHost.ts";
 import type { FakeInput } from "./helpers/fakeHost.ts";
 
 let mock: MockApi;
@@ -271,4 +279,144 @@ test("approvalMessage is approval-specific and sanitised", () => {
   assert.ok(bare.startsWith(APPROVAL_PREFIX));
   assert.ok(!bare.startsWith(`${APPROVAL_PREFIX}:`), "no ': …' part without a reason");
   assert.equal(approvalMessage(42 as never), bare);
+});
+
+// --- MCP attribution (HOOK-13) ------------------------------------------------------------------
+
+test("MCP: longest configured prefix → explicit mcp_server / mcp_tool, and the deny applies", async () => {
+  const h = await harness("deny");
+  try {
+    await h.hooks.config?.({ mcp: { my: {}, my_server: {} } });
+    const message = await outcome(h.before(call("my_server_list_files"), { args: {} }));
+    assert.equal(message, SECRETS_DENY);
+    const m = metadataOf(body(0));
+    assert.equal(m.mcp_server, "my_server");
+    assert.equal(m.mcp_tool, "list_files");
+    assert.equal(body(0).pre_tool_use_data.tool_name, "my_server_list_files");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("MCP resource tools carry their server argument", async () => {
+  const h = await harness("allow");
+  try {
+    await h.hooks.config?.({ mcp: { my: {} } });
+    await h.before(call("read_mcp_resource"), { args: { server: "my", uri: "u" } });
+    const m = metadataOf(body(0));
+    assert.equal(m.mcp_server, "my");
+    assert.equal(m.mcp_tool, "read_mcp_resource");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("an unresolved non-built-in tool with MCP configured is an attribution miss, never a guess", async () => {
+  const h = await harness("deny");
+  try {
+    await h.hooks.config?.({ mcp: { my: {}, my_server: {} } });
+    assert.equal(await outcome(h.before(call("other_tool"), { args: {} })), undefined);
+    assert.ok(await waitFor(() => signalsOf(mock, "mcp_attribution_miss").length === 1));
+    assert.equal(pretoolRequests(mock).length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("with no MCP servers configured a custom tool is neither checked nor reported", async () => {
+  const h = await harness("deny");
+  try {
+    await h.hooks.config?.({});
+    assert.equal(await outcome(h.before(call("mytool"), { args: {} })), undefined);
+    await tick(100);
+    assert.equal(pretoolRequests(mock).length, 0);
+    assert.equal(signalsOf(mock, "mcp_attribution_miss").length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+// --- task (HOOK-11) -----------------------------------------------------------------------------
+
+test("task is audited, never sent for a decision, never denied", async () => {
+  const h = await harness("deny");
+  try {
+    const args = { description: "d", prompt: "cat .env", subagent_type: "general" };
+    assert.equal(await outcome(h.before(call("task", "ses_t", "call_task"), { args })), undefined);
+    assert.equal(pretoolRequests(mock).length, 0);
+    const turn = h.server.inspect.turn("ses_t");
+    assert.equal(turn.tool_calls.length, 1);
+    assert.equal(turn.tool_calls[0]?.tool_name, "task");
+    assert.equal(turn.tool_calls[0]?.tool_use_id, "call_task");
+    assert.equal(turn.tool_calls[0]?.decision, "audited");
+  } finally {
+    h.cleanup();
+  }
+});
+
+// --- approval, fail-closed, fail-open (HOOK-10, RES-11) -----------------------------------------
+
+test("ask and approval_required block with the approval text, not the deny text", async () => {
+  const h = await harness("ask");
+  try {
+    assert.equal(await outcome(h.before(call("bash"), { args: { command: "rm -rf /tmp/x" } })), approvalMessage("Unusual command."));
+    mock.setMode("approval");
+    assert.equal(
+      await outcome(h.before(call("bash", "ses_root", "call_2"), { args: { command: "rm -rf /tmp/x" } })),
+      approvalMessage("Needs admin approval."),
+    );
+    assert.ok(h.fake.toasts.some((t) => t.variant === "warning"), "approval is toasted as a warning");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a fail-closed org blocks with the engine-unavailable text and reports a blocked failure", async () => {
+  const h = await harness("failBlock", {
+    deps: { timeouts: { pretoolMs: 200, errorsMs: 2000, turnLogMs: 2000 }, deadlineMs: 400 },
+  });
+  try {
+    assert.equal(await outcome(h.before(call("bash"), { args: { command: "ls" } })), undefined, "first call learns block");
+    const message = await outcome(h.before(call("bash", "ses_root", "call_2"), { args: { command: "ls" } }));
+    assert.equal(message, ENGINE_UNAVAILABLE_REASON);
+    assert.ok(await waitFor(() => signalsOf(mock, "blocked_due_to_failure").length >= 1));
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a 500 or a malformed answer fails open and reports a bypass", async () => {
+  for (const mode of ["500", "malformed"] as const) {
+    const h = await harness(mode);
+    try {
+      assert.equal(await outcome(h.before(call("bash"), { args: { command: "cat .env" } })), undefined);
+      assert.ok(await waitFor(() => signalsOf(mock, "bypassed_due_to_failure").length >= 1), mode);
+    } finally {
+      h.cleanup();
+    }
+  }
+});
+
+// --- no key -------------------------------------------------------------------------------------
+
+test("without a key: no requests, one no-key notice per directory", async () => {
+  const h = await harness("deny", { deps: { withKey: false } });
+  try {
+    assert.equal(await outcome(h.before(call("bash"), { args: { command: "cat .env" } })), undefined);
+    assert.equal(await outcome(h.before(call("bash", "ses_root", "call_2"), { args: { command: "cat .env" } })), undefined);
+    await tick();
+    assert.equal(mock.requests.length, 0);
+    assert.equal(h.fake.toasts.filter((t) => t.message === NO_KEY_NOTICE).length, 1);
+
+    const other = makeFakeInput({ directory: "/other" });
+    const otherHooks = (await h.server(other.input)) as Hooks;
+    await (otherHooks["tool.execute.before"] as BeforeHook)(call("bash"), { args: { command: "ls" } });
+    await (otherHooks["tool.execute.before"] as BeforeHook)(call("bash"), { args: { command: "ls" } });
+    await tick();
+    assert.equal(other.toasts.filter((t) => t.message === NO_KEY_NOTICE).length, 1);
+    assert.equal(h.fake.toasts.filter((t) => t.message === NO_KEY_NOTICE).length, 1);
+    assert.equal(mock.requests.length, 0);
+  } finally {
+    h.cleanup();
+  }
 });
