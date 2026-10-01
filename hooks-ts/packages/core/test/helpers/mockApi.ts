@@ -10,7 +10,10 @@
 //
 //   isAllowedToolName(tool_name,'pi') && (!!command || (PI_NATIVE_FILE_TOOLS.includes(tool_name) && !!file_path))
 //
-// Anything else falls through to a `no_policy` allow (`:1008-1012`). A mock that denies every
+// Anything else falls through to a `no_policy` allow (`:1008-1012`). The API has a second evaluating
+// path for MCP calls (Path 3): a request that carries an explicit, non-blank `metadata.mcp_server`
+// is evaluated as an MCP call, whatever its command and file path. So the gate this mock models is
+// "a non-blank command, a non-blank file_path, OR a non-blank mcp_server". A mock that denies every
 // request regardless would make a file-tool test that forgets `metadata.file_path` pass
 // VACUOUSLY - green locally, unenforced in production. Modelling the gate means such a test
 // fails instead. That is this model's entire purpose; do not "simplify" it away.
@@ -38,7 +41,11 @@ export type MockMode =
   | "toolsList"
   | "toolsEmpty"
   | "toolsOmitted"
-  | "401";
+  | "401"
+  // A deny that reaches a tool call: `deny` ONLY for `event_name: "tool_use"`, and `allow` for every
+  // other event (`user_prompt`, `session_start`). Under plain `deny` a headless smoke is blocked at
+  // the prompt check before the model can call any tool, so the tool-deny path is never exercised.
+  | "denyTools";
 
 /** Scripted behaviour of `POST /v1/hooks/errors`, independent of `MockMode`. */
 export type MockErrorsMode = "ok" | "500" | "hang";
@@ -82,6 +89,12 @@ export const ENTRY_GATE_MARKER = "no_evaluable_input";
 /** `tools_to_check` under `toolsList`: a strict subset, so a `grep` skip is observable. */
 export const TOOLS_LIST = ["read", "write"] as const;
 
+/** The deny reason `denyTools` answers a tool call with. */
+export const DENY_TOOLS_REASON = "Smoke: tool calls are blocked.";
+
+/** The `event_name` of a tool call; the only event `denyTools` denies. */
+const TOOL_USE_EVENT = "tool_use";
+
 /**
  * The two `event_name`s the gate never applies to: neither carries a command by design, and the
  * server routes both to handlers that answer without the Path-2 gate.
@@ -112,9 +125,10 @@ function isNonBlankString(value: unknown): boolean {
  * The client half of the server's Path-2 entry gate: does this request carry anything the command
  * policy engine could possibly evaluate?
  *
- * `true` when `pre_tool_use_data.command` is a non-blank string, or `metadata.file_path` is. Read
- * defensively off an arbitrary parsed body - a test may post a string, `null`, or a half-built
- * object, and the mock must answer rather than throw.
+ * `true` when `pre_tool_use_data.command` is a non-blank string, or `metadata.file_path` is (Path 2),
+ * or `metadata.mcp_server` is (Path 3: an explicitly attributed MCP call is evaluated even with no
+ * command and no file path). Read defensively off an arbitrary parsed body - a test may post a
+ * string, `null`, or a half-built object, and the mock must answer rather than throw.
  */
 export function hasEvaluableInput(body: unknown): boolean {
   const data = (body as { pre_tool_use_data?: unknown } | null | undefined)?.pre_tool_use_data as
@@ -122,14 +136,20 @@ export function hasEvaluableInput(body: unknown): boolean {
     | null
     | undefined;
   if (isNonBlankString(data?.command)) return true;
-  const metadata = data?.metadata as { file_path?: unknown } | null | undefined;
-  return isNonBlankString(metadata?.file_path);
+  const metadata = data?.metadata as { file_path?: unknown; mcp_server?: unknown } | null | undefined;
+  return isNonBlankString(metadata?.file_path) || isNonBlankString(metadata?.mcp_server);
+}
+
+/** The request's `event_name`, or `undefined` when it has none. */
+function eventNameOf(body: unknown): string | undefined {
+  const eventName = (body as { event_name?: unknown } | null | undefined)?.event_name;
+  return typeof eventName === "string" ? eventName : undefined;
 }
 
 /** Is the Path-2 gate relevant to this request at all? `user_prompt` / `session_start` bypass it. */
 function isGatedRequest(body: unknown): boolean {
-  const eventName = (body as { event_name?: unknown } | null | undefined)?.event_name;
-  return !(typeof eventName === "string" && GATE_EXEMPT_EVENTS.has(eventName));
+  const eventName = eventNameOf(body);
+  return !(eventName !== undefined && GATE_EXEMPT_EVENTS.has(eventName));
 }
 
 /** The `no_policy` allow a request with nothing evaluable falls through to, plus a named reason. */
@@ -177,6 +197,10 @@ export function pretoolResponse(
       return json(200, { decision: "allow", policy_check_failure_action: "allow" });
     case "deny":
       return json(200, { decision: "deny", reason: "Reading secrets is blocked." });
+    case "denyTools":
+      return eventNameOf(body) === TOOL_USE_EVENT
+        ? json(200, { decision: "deny", reason: DENY_TOOLS_REASON })
+        : json(200, { decision: "allow", policy_check_failure_action: "allow" });
     case "denyNoReason":
       return json(200, { decision: "deny" });
     case "ask":
@@ -218,7 +242,7 @@ export function pretoolResponse(
  * exactly what a mistyped or not-yet-shipped route does in production. Add a name when its adapter
  * exists.
  */
-export const TURNLOG_AGENTS: ReadonlySet<string> = new Set(["pi"]);
+export const TURNLOG_AGENTS: ReadonlySet<string> = new Set(["pi", "opencode"]);
 
 /** `/v1/hooks/<agent>`: one lowercase path segment. Which names are served is `TURNLOG_AGENTS`. */
 const TURNLOG_ROUTE = /^\/v1\/hooks\/([a-z][a-z0-9-]*)$/;

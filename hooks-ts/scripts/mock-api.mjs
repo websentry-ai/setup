@@ -3,14 +3,14 @@
 //   npm run mock-api -- --mode deny --port 8799
 //   UNBOUND_GATEWAY_URL=http://127.0.0.1:8799 UNBOUND_PI_API_KEY=test pi
 //
-// `--agent <name>` (default: pi) only changes the hint printed at startup; the mock serves the
-// turn-log route of every agent in TURNLOG_AGENTS whichever one is named.
+// `--agent <name>` (default: pi; also opencode) only changes the hint printed at startup; the mock
+// serves the turn-log route of every agent in TURNLOG_AGENTS whichever one is named.
 //
 // Everything is logged to stderr, never stdout - an agent's print/json modes own stdout.
 // Run through the npm script (it supplies --experimental-strip-types for the .ts import).
 //
-// NOTE: the mock models the server's Path-2 entry gate, so a pretool request carrying neither a
-// command nor a metadata.file_path is answered `allow` with `_entry_gate: no_evaluable_input`
+// NOTE: the mock models the server's entry gate, so a pretool request carrying neither a command,
+// a metadata.file_path nor a metadata.mcp_server is answered `allow` with `_entry_gate: no_evaluable_input`
 // whatever --mode says. That is faithful to the real API; see mockApi.ts's header.
 
 import { startMockApi, TURNLOG_AGENTS } from "../packages/core/test/helpers/mockApi.ts";
@@ -31,6 +31,7 @@ const VALID_MODES = [
   "toolsEmpty",
   "toolsOmitted",
   "401",
+  "denyTools",
 ];
 
 const VALID_ERRORS_MODES = ["ok", "500", "hang"];
@@ -52,7 +53,9 @@ const USAGE = `usage: npm run mock-api -- [options]
   --help                  print this and exit 0
 
   toolsList returns tools_to_check: ["read","write"]; toolsEmpty returns []; toolsOmitted omits
-  the key entirely; 401 rejects every pretool request (the errors route keeps --errors-mode).`;
+  the key entirely; 401 rejects every pretool request (the errors route keeps --errors-mode);
+  denyTools denies only tool_use requests and allows the prompt and session_start checks, so a
+  headless smoke reaches a tool call before it is blocked.`;
 
 function parseArgs(argv) {
   const parsed = {
