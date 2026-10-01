@@ -65,6 +65,9 @@ var MAX_TOOL_NAME_CHARS = 64;
 var MAX_CONFIG_BYTES = 262144;
 var MAX_HASH_BYTES = 4194304;
 var MAX_TURN_RESULTS = 500;
+var MAX_TOOL_OUTPUT_CHARS = 8192;
+var MAX_TURN_OUTPUT_CHARS = 131072;
+var OUTPUT_TRUNCATION_MARKER = "\n...unbound: output truncated...\n";
 var MAX_TURN_TOOL_CALLS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
@@ -132,6 +135,18 @@ var PLACEHOLDER_SERIALS = [
   "123456789",
   "xxxxxxxx"
 ];
+var MCP_PROXY_TOOL_NAME = "mcp";
+var MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
+var MCP_PROXY_NON_CALL_ACTIONS = [
+  "install",
+  "ui-messages",
+  "auth-start",
+  "auth-complete"
+];
+var ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
+var MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
+var MCP_CACHE_FILE_NAME = "mcp-cache.json";
+var MAX_MCP_CACHE_BYTES = 2097152;
 
 // packages/core/src/safeRead.ts
 import { lstatSync, readFileSync } from "node:fs";
@@ -681,23 +696,50 @@ function withAccountIdentity(body, identity) {
   if (clean !== void 0) body.account_identity = clean;
   return body;
 }
+function capMcpArgs(args, maxBytes = MAX_TOOL_INPUT_BYTES) {
+  try {
+    if (args === null || typeof args !== "object" || Array.isArray(args)) return {};
+    const serialised = JSON.stringify(args) ?? "";
+    const originalBytes = Buffer.byteLength(serialised);
+    if (originalBytes <= maxBytes) return args;
+    const capped = { _truncated: true, _original_bytes: originalBytes };
+    let usedBytes = Buffer.byteLength(JSON.stringify(capped));
+    for (const [key, raw] of Object.entries(args)) {
+      if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") continue;
+      const value = typeof raw === "string" ? sliceToBytes(raw, MAX_TOOL_INPUT_VALUE_BYTES) : raw;
+      const entryBytes = Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(value)) + 2;
+      if (usedBytes + entryBytes > maxBytes) continue;
+      capped[key] = value;
+      usedBytes += entryBytes;
+    }
+    return capped;
+  } catch {
+    return { _truncated: true };
+  }
+}
 function buildPretoolPayload(input) {
-  const metadata = {
-    cwd: input.cwd,
-    // Allowlist first, then the whole-object cap as defence in depth (WR-04).
-    tool_input: capToolInput(sanitizeToolInput(input.toolInput))
-  };
-  const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
-  if (filePath !== void 0) metadata.file_path = filePath;
-  const capped = capCommand(input.command);
+  const mcp = input.mcp;
+  const metadata = { cwd: input.cwd };
+  if (mcp !== void 0) {
+    metadata.mcp_server = mcp.server;
+    metadata.mcp_tool = mcp.tool;
+    metadata.tool_input = capMcpArgs(mcp.args);
+    if (mcp.serverConfig !== void 0) metadata.mcp_server_config = mcp.serverConfig;
+  } else {
+    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));
+    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
+    if (filePath !== void 0) metadata.file_path = filePath;
+  }
+  const capped = capCommand(mcp === void 0 ? input.command : "");
   if (capped.truncated) {
     metadata.command_truncated = true;
     metadata.command_original_chars = input.command.length;
   }
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
-    // server never matches the tool and enforcement silently disappears.
-    tool_name: input.toolName,
+    // server never matches the tool and enforcement silently disappears. A resolved MCP call is
+    // named the way the gateway and the backend parse MCP names, `mcp__<server>__<tool>`.
+    tool_name: mcp === void 0 ? input.toolName : `mcp__${mcp.server}__${mcp.tool}`,
     command: capped.command,
     metadata
   };
@@ -1057,11 +1099,34 @@ function shouldPostTurn(record) {
     return false;
   }
 }
+var MAX_REDACT_DEPTH = 8;
+function redactLeaves(value, apiKey, depth) {
+  if (typeof value === "string") return redactSecrets(value, apiKey);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (depth >= MAX_REDACT_DEPTH || typeof value !== "object") return void 0;
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const out2 = redactLeaves(item, apiKey, depth + 1);
+      return out2 === void 0 ? null : out2;
+    });
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return void 0;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    const redacted = redactLeaves(item, apiKey, depth + 1);
+    if (redacted !== void 0) out[key] = redacted;
+  }
+  return out;
+}
 function toolInputFor(value, apiKey) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
-  const input = { ...value };
-  if (typeof input.command === "string") input.command = redactSecrets(input.command, apiKey);
-  return input;
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+    const redacted = redactLeaves(value, apiKey, 0);
+    return redacted !== null && typeof redacted === "object" && !Array.isArray(redacted) ? redacted : {};
+  } catch {
+    return {};
+  }
 }
 function capAssistantText(text, apiKey) {
   try {
@@ -1072,17 +1137,29 @@ function capAssistantText(text, apiKey) {
     return { content: "", truncated: false };
   }
 }
-function toolResponseFor(record, toolUseId) {
+function toolResponseFor(record, toolUseId, apiKey) {
   const results = Array.isArray(record.results) ? record.results : [];
   const match = results.find((entry) => entry?.tool_use_id === toolUseId);
   if (match === void 0) return {};
+  const bytes = typeof match.content_bytes === "number" ? match.content_bytes : 0;
+  let response;
   if (match.hash_skipped === true) {
-    return { hash_skipped: true, content_bytes: match.content_bytes };
+    response = { hash_skipped: true, content_bytes: bytes };
+  } else if (typeof match.content_sha256 === "string") {
+    response = { content_sha256: match.content_sha256, content_bytes: bytes };
+  } else if (typeof match.content !== "string") {
+    return {};
+  } else {
+    response = { content_bytes: bytes };
   }
-  if (typeof match.content_sha256 === "string") {
-    return { content_sha256: match.content_sha256, content_bytes: match.content_bytes };
+  if (typeof match.content === "string") response.content = redactSecrets(match.content, apiKey);
+  if (match.is_error === true) response.is_error = true;
+  if (match.content_truncated === true) response.content_truncated = true;
+  if (typeof match.content_original_chars === "number") {
+    response.content_original_chars = match.content_original_chars;
   }
-  return {};
+  if (match.content_omitted === true) response.content_omitted = true;
+  return response;
 }
 function buildTurnLogBody(record, opts) {
   let conversationId = "";
@@ -1106,7 +1183,11 @@ function buildTurnLogBody(record, opts) {
       // `call`-derived, and still never `event.input`-derived: what the record holds was already
       // allowlisted and capped by `auditToolInput` — header decision 2.
       tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
-      tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : "")
+      tool_response: toolResponseFor(
+        safe,
+        typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
+        opts?.apiKey
+      )
     }));
   } catch {
   }
@@ -1377,14 +1458,76 @@ function hashContent(parts) {
     return { content_sha256: void 0, content_bytes: 0, hash_skipped: true };
   }
 }
+function copyInput(input) {
+  try {
+    return structuredClone(input);
+  } catch {
+    return { ...input };
+  }
+}
+function textOf(part) {
+  if (part === null || typeof part !== "object") return void 0;
+  const record = part;
+  return record.type === "text" && typeof record.text === "string" ? record.text : void 0;
+}
+function flatten(value) {
+  return Buffer.from(value, "utf8").toString("utf8");
+}
+function captureText(parts, maxChars) {
+  try {
+    if (!Array.isArray(parts)) return void 0;
+    const texts = [];
+    for (const part of parts) {
+      const text = textOf(part);
+      if (text !== void 0) texts.push(text);
+    }
+    if (texts.length === 0) return void 0;
+    let total = 0;
+    for (let i = 0; i < texts.length; i += 1) total += (i > 0 ? 1 : 0) + texts[i].length;
+    const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
+    if (total <= cap) return { text: flatten(texts.join("\n")) };
+    const headBudget = Math.ceil(cap / 2);
+    const tailBudget = cap - headBudget;
+    const segments = [];
+    for (let i = 0; i < texts.length; i += 1) {
+      if (i > 0) segments.push("\n");
+      segments.push(texts[i]);
+    }
+    let head = "";
+    for (const segment of segments) {
+      const room = headBudget - head.length;
+      if (room <= 0) break;
+      head += segment.length <= room ? segment : segment.slice(0, room);
+    }
+    let tail = "";
+    for (let i = segments.length - 1; i >= 0; i -= 1) {
+      const room = tailBudget - tail.length;
+      if (room <= 0) break;
+      const segment = segments[i];
+      tail = (segment.length <= room ? segment : segment.slice(segment.length - room)) + tail;
+    }
+    return {
+      text: flatten(head) + OUTPUT_TRUNCATION_MARKER + flatten(tail),
+      truncated: true,
+      original_chars: total
+    };
+  } catch {
+    return void 0;
+  }
+}
 function createTurnStore() {
   let record = { tool_calls: [], results: [] };
+  let outputChars = 0;
+  const fresh = () => {
+    outputChars = 0;
+    return { tool_calls: [], results: [] };
+  };
   const started = () => record.prompt !== void 0 || record.tool_calls.length > 0;
   const idOf = (sessionId) => typeof sessionId === "string" && sessionId !== "" ? sessionId : void 0;
   function startTurn(sessionId, now) {
     const incoming = idOf(sessionId);
     if (incoming !== void 0 && record.session_id !== void 0 && record.session_id !== incoming) {
-      record = { tool_calls: [], results: [] };
+      record = fresh();
     }
     if (incoming !== void 0) {
       const ours = record.tool_calls.filter(
@@ -1406,7 +1549,7 @@ function createTurnStore() {
         const incoming = idOf(sessionId);
         if (incoming === void 0) return;
         if (record.session_id === incoming) return;
-        record = { tool_calls: [], results: [] };
+        record = fresh();
       } catch {
       }
     },
@@ -1473,6 +1616,20 @@ function createTurnStore() {
         };
         if (typeof entry.content_sha256 === "string") stored.content_sha256 = entry.content_sha256;
         if (entry.hash_skipped === true) stored.hash_skipped = true;
+        if (typeof entry.content === "string") {
+          if (outputChars + entry.content.length > MAX_TURN_OUTPUT_CHARS) {
+            stored.content_omitted = true;
+          } else {
+            stored.content = entry.content;
+            outputChars += entry.content.length;
+            if (entry.content_truncated === true) stored.content_truncated = true;
+            if (typeof entry.content_original_chars === "number" && Number.isFinite(entry.content_original_chars)) {
+              stored.content_original_chars = entry.content_original_chars;
+            }
+          }
+        } else if (entry.content_omitted === true) {
+          stored.content_omitted = true;
+        }
         record.results.push(stored);
       } catch {
       }
@@ -1481,17 +1638,17 @@ function createTurnStore() {
      * Consumes the record unconditionally, and answers `undefined` when there was nothing postable.
      *
      * The reset is NOT conditional on the record being postable, and that is the point. A turn can
-     * collect results without ever starting — a custom or MCP tool takes the nothing-evaluable skip
-     * and records no decision, an extension-sourced prompt records no prompt — and an early return
-     * here left those results in place, where `agent_end` could never drain them. They then belonged
-     * to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
+     * collect results without ever starting — a custom tool (or an MCP call nobody could resolve)
+     * takes the nothing-evaluable skip and records no decision, an extension-sourced prompt records
+     * no prompt — and an early return here left those results in place, where `agent_end` could
+     * never drain them. They then belonged to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
      * fail to match them by `tool_use_id`. Consumed and dropped is the honest outcome.
      */
     take() {
       try {
         const taken = record;
         const postable = started();
-        record = { tool_calls: [], results: [] };
+        record = fresh();
         return postable ? taken : void 0;
       } catch {
         return void 0;
@@ -1506,11 +1663,11 @@ function createTurnStore() {
     },
     snapshot() {
       const copy = {
-        // `tool_input` is spread a second time so the copy is deep ENOUGH: its values are scalars by
-        // construction (`sanitizeToolInput` forwards nothing else), so one more level is the whole
-        // object. Without it, `snapshot()` handed callers a live reference into the record.
+        // `tool_input` is copied a second time so `snapshot()` never hands callers a live reference
+        // into the record. A native call's values are scalars (`sanitizeToolInput` forwards nothing
+        // else), but an MCP call's capped arguments can nest, so the copy is structural.
         tool_calls: record.tool_calls.map(
-          (entry) => entry.tool_input === void 0 ? { ...entry } : { ...entry, tool_input: { ...entry.tool_input } }
+          (entry) => entry.tool_input === void 0 ? { ...entry } : { ...entry, tool_input: copyInput(entry.tool_input) }
         ),
         results: record.results.map((entry) => ({ ...entry }))
       };
@@ -1522,6 +1679,18 @@ function createTurnStore() {
         copy.tool_calls_truncated = record.tool_calls_truncated;
       }
       return copy;
+    },
+    currentPrompt(sessionId) {
+      try {
+        const prompt = record.prompt;
+        if (typeof prompt !== "string") return void 0;
+        if (sessionId === "" || record.session_id === void 0 || record.session_id === sessionId) {
+          return prompt;
+        }
+        return void 0;
+      } catch {
+        return void 0;
+      }
     }
   };
 }
@@ -1553,21 +1722,17 @@ function assistantTextFrom(messages) {
   }
 }
 var TURNLOG_LABEL = "agent_end";
-function handleAgentEnd(event, ctx, deps) {
+var USER_BASH_LABEL = "user_bash";
+function cwdOf(ctx) {
   try {
-    const record = deps.store.take();
-    if (!shouldPostTurn(record)) return void 0;
+    return typeof ctx?.cwd === "string" ? ctx.cwd : "";
+  } catch {
+    return "";
+  }
+}
+function dispatchTurnLog(record, cwd, assistantText, label2, deps) {
+  try {
     const completedAtMs = (deps.now ?? Date.now)();
-    let cwd = "";
-    try {
-      cwd = typeof ctx?.cwd === "string" ? ctx.cwd : "";
-    } catch {
-    }
-    let assistantText = "";
-    try {
-      assistantText = assistantTextFrom(event?.messages);
-    } catch {
-    }
     const body = buildTurnLogBody(record, {
       cwd,
       completedAtMs,
@@ -1580,11 +1745,49 @@ function handleAgentEnd(event, ctx, deps) {
       if (ok) return;
       deps.telemetry?.reportTurnLogFailure({
         errorClass: "TurnLogFailed",
-        toolName: TURNLOG_LABEL,
+        toolName: label2,
         elapsedMs: (deps.now ?? Date.now)() - dispatchedAtMs
       });
     }).catch(() => {
     });
+  } catch {
+  }
+}
+function handleAgentEnd(event, ctx, deps) {
+  try {
+    const record = deps.store.take();
+    if (!shouldPostTurn(record)) return void 0;
+    let assistantText = "";
+    try {
+      assistantText = assistantTextFrom(event?.messages);
+    } catch {
+    }
+    dispatchTurnLog(record, cwdOf(ctx), assistantText, TURNLOG_LABEL, deps);
+  } catch {
+  }
+  return void 0;
+}
+function postStandaloneTurn(entry, ctx, sessionId, deps) {
+  try {
+    if (entry === null || typeof entry !== "object") return void 0;
+    const now = (deps.now ?? Date.now)();
+    const call = {
+      tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
+      tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
+      decision: typeof entry.decision === "string" ? entry.decision : "",
+      ts: now
+    };
+    const input = entry.tool_input;
+    if (input !== null && typeof input === "object" && !Array.isArray(input)) {
+      call.tool_input = { ...input };
+    }
+    const record = { tool_calls: [call], results: [], started_at: now };
+    if (typeof sessionId === "string" && sessionId !== "") {
+      record.session_id = sessionId;
+      call.session_id = sessionId;
+    }
+    if (!shouldPostTurn(record)) return void 0;
+    dispatchTurnLog(record, cwdOf(ctx), "", USER_BASH_LABEL, deps);
   } catch {
   }
   return void 0;
@@ -1620,6 +1823,35 @@ async function confirmWithTimeout(ctx, title, message, timeoutMs = CONFIRM_TIMEO
 }
 
 // packages/pi/src/decide.ts
+function mcpOf(deps, toolName, input, cwd) {
+  try {
+    const call = deps.resolveMcp?.(toolName, input, cwd);
+    if (call === null || typeof call !== "object") return void 0;
+    if (typeof call.server !== "string" || call.server === "") return void 0;
+    if (typeof call.tool !== "string" || call.tool === "") return void 0;
+    if (call.args === null || typeof call.args !== "object" || Array.isArray(call.args)) return void 0;
+    return call;
+  } catch {
+    return void 0;
+  }
+}
+function auditMcpArgs(args) {
+  try {
+    const cloned = JSON.parse(JSON.stringify(capMcpArgs(args)));
+    return cloned !== null && typeof cloned === "object" && !Array.isArray(cloned) ? cloned : {};
+  } catch {
+    return {};
+  }
+}
+function promptOf(deps) {
+  try {
+    const prompt = deps.currentPrompt?.();
+    if (typeof prompt !== "string" || prompt === "") return "";
+    return capCommand(prompt, MAX_PROMPT_CHARS).command;
+  } catch {
+    return "";
+  }
+}
 function noteDecision(deps, entry) {
   noteSafe(() => deps.onDecision?.(entry));
 }
@@ -1634,6 +1866,10 @@ async function decideToolCall(event, ctx, deps) {
     const shell = isShellCall(event);
     const command = shell ? event.input.command : "";
     const toolInput = event.input ?? {};
+    if (!shell && !NATIVE_FILE_TOOLS.has(event.toolName)) {
+      const mcp = mcpOf(deps, event.toolName, event.input, ctx.cwd);
+      if (mcp !== void 0) return await decideMcpCall(event, ctx, deps, mcp);
+    }
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === void 0) return void 0;
     const auditInput = auditToolInput(toolInput, command);
@@ -1662,6 +1898,8 @@ async function decideToolCall(event, ctx, deps) {
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       pullPolicies,
+      // Read here, after both early returns: a skipped call never pays for it.
+      lastUserPrompt: promptOf(deps),
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
@@ -1672,30 +1910,458 @@ async function decideToolCall(event, ctx, deps) {
       decision: outcome.kind,
       tool_input: auditInput
     });
-    switch (outcome.kind) {
-      case "allow":
-        return void 0;
-      case "deny": {
-        const reason = outcome.reason;
-        notifySafe(ctx, reason ?? GENERIC_DENY_REASON, "error");
-        return {
-          block: true,
-          reason: reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason
-        };
-      }
-      case "confirm": {
-        if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
-        const reason = outcome.reason ?? GENERIC_DENY_REASON;
-        notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
-        return accepted ? void 0 : { block: true, reason: DECLINED_REASON };
-      }
-      case "unavailable":
-        return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
-    }
+    return await applyOutcome(outcome, ctx);
   } catch {
     return void 0;
   }
+}
+async function decideMcpCall(event, ctx, deps, mcp) {
+  const now = (deps.now ?? Date.now)();
+  const state = deps.state ?? policyState;
+  const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
+  const payload = buildPretoolPayload({
+    toolName: event.toolName,
+    command: "",
+    toolUseId: event.toolCallId,
+    toolInput: {},
+    cwd: ctx.cwd,
+    sessionId: ctx.sessionManager.getSessionId(),
+    model: ctx.model?.id,
+    clientEntrypoint: deps.entrypoint,
+    pullPolicies,
+    lastUserPrompt: promptOf(deps),
+    mcp,
+    ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
+  });
+  const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+  const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
+  noteDecision(deps, {
+    tool_name: `mcp__${mcp.server}__${mcp.tool}`,
+    tool_use_id: event.toolCallId,
+    decision: outcome.kind,
+    tool_input: auditMcpArgs(mcp.args)
+  });
+  return await applyOutcome(outcome, ctx);
+}
+async function applyOutcome(outcome, ctx) {
+  switch (outcome.kind) {
+    case "allow":
+      return void 0;
+    case "deny": {
+      const reason = outcome.reason;
+      notifySafe(ctx, reason ?? GENERIC_DENY_REASON, "error");
+      return {
+        block: true,
+        reason: reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason
+      };
+    }
+    case "confirm": {
+      if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
+      const reason = outcome.reason ?? GENERIC_DENY_REASON;
+      notifySafe(ctx, reason, "warning");
+      const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
+      return accepted ? void 0 : { block: true, reason: DECLINED_REASON };
+    }
+    case "unavailable":
+      return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
+  }
+  return void 0;
+}
+
+// packages/pi/src/mcpResolve.ts
+import { createHash as createHash3 } from "node:crypto";
+import { lstatSync as lstatSync2 } from "node:fs";
+import { isAbsolute as isAbsolute3, join as join5 } from "node:path";
+var TOOL_PREFIXES = /* @__PURE__ */ new Set(["server", "none", "short", "mcp"]);
+var EMPTY_CONFIG = () => ({ servers: /* @__PURE__ */ new Map(), settings: {} });
+var NATIVE_TOOL_NAMES = /* @__PURE__ */ new Set([
+  "bash",
+  "powershell",
+  "read",
+  "write",
+  "edit",
+  "grep",
+  "find",
+  "ls"
+]);
+var BUILTIN_NAMES = /* @__PURE__ */ new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
+var NON_CALL_ACTIONS = new Set(MCP_PROXY_NON_CALL_ACTIONS);
+var ENCODED_SERVER_NAMESPACE_MARKER = "_mcpns_";
+var MAX_SERVER_NAMESPACE_LENGTH = 59;
+function encodeServerNamespace(name) {
+  return Array.from(name, (character) => {
+    if (character === "_") return "__";
+    return /^[A-Za-z0-9]$/.test(character) ? character : `_${character.codePointAt(0).toString(16)}_`;
+  }).join("");
+}
+function formatServerNamespace(serverName) {
+  const normalized = serverName.replace(/-/g, "_");
+  const safe = /^[A-Za-z0-9_]*$/.test(normalized) && !normalized.startsWith(ENCODED_SERVER_NAMESPACE_MARKER);
+  const body = safe ? normalized : encodeServerNamespace(normalized);
+  const namespace = safe ? body : `${ENCODED_SERVER_NAMESPACE_MARKER}${body}`;
+  if (namespace.length <= MAX_SERVER_NAMESPACE_LENGTH) return namespace;
+  const digest = createHash3("sha256").update(namespace, "utf8").digest("hex").slice(0, 16);
+  const hashPrefix = `${ENCODED_SERVER_NAMESPACE_MARKER}_h_`;
+  const head = body.slice(0, MAX_SERVER_NAMESPACE_LENGTH - hashPrefix.length - digest.length - 1);
+  return `${hashPrefix}${head}_${digest}`;
+}
+function sanitizeServerPrefix(serverName, preserveProviderValid = true) {
+  const validCharacters = preserveProviderValid ? /^[A-Za-z0-9_-]$/ : /^[A-Za-z0-9]$/;
+  return Array.from(
+    serverName,
+    (char) => validCharacters.test(char) ? char : `_${char.codePointAt(0).toString(16)}_`
+  ).join("");
+}
+function getServerPrefix(serverName, mode) {
+  if (mode === "none") return "";
+  if (mode === "short") {
+    let short = sanitizeServerPrefix(serverName.replace(/-?mcp$/i, ""));
+    if (!short) short = "mcp";
+    return short;
+  }
+  if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName)}`;
+  return sanitizeServerPrefix(serverName);
+}
+function formatToolName(toolName, serverName, prefix) {
+  const p = getServerPrefix(serverName, prefix);
+  const sanitized = toolName.replace(/\./g, "_");
+  if (p && sanitized.startsWith(`${p}_`) && sanitized.length > p.length + 1) {
+    return sanitized;
+  }
+  return p ? `${p}_${sanitized}` : sanitized;
+}
+function resolveToolPrefix(definition, globalPrefix) {
+  return definition?.toolPrefix ?? globalPrefix ?? "server";
+}
+function getLegacyServerPrefix(serverName, mode) {
+  if (mode === "none") return "";
+  if (mode === "short") return sanitizeServerPrefix(serverName.replace(/-?mcp$/i, ""), false) || "mcp";
+  if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName, false)}`;
+  return sanitizeServerPrefix(serverName, false);
+}
+function formatLegacyToolName(toolName, serverName, prefix) {
+  const serverPrefix = getLegacyServerPrefix(serverName, prefix);
+  const sanitizedToolName = toolName.replace(/[.-]/g, "_");
+  return serverPrefix ? `${serverPrefix}_${sanitizedToolName}` : sanitizedToolName;
+}
+function getToolNameCandidates(toolName, serverName, prefix) {
+  const candidates = /* @__PURE__ */ new Set([
+    toolName,
+    formatToolName(toolName, serverName, prefix),
+    formatToolName(toolName, serverName, "server"),
+    formatToolName(toolName, serverName, "short"),
+    formatToolName(toolName, serverName, "mcp")
+  ]);
+  const legacyToolName = toolName.replace(/-/g, "_");
+  candidates.add(legacyToolName);
+  candidates.add(formatToolName(legacyToolName, serverName, prefix));
+  candidates.add(formatToolName(legacyToolName, serverName, "server"));
+  candidates.add(formatToolName(legacyToolName, serverName, "short"));
+  candidates.add(formatToolName(legacyToolName, serverName, "mcp"));
+  candidates.add(formatLegacyToolName(toolName, serverName, prefix));
+  candidates.add(formatLegacyToolName(toolName, serverName, "server"));
+  candidates.add(formatLegacyToolName(toolName, serverName, "short"));
+  candidates.add(formatLegacyToolName(toolName, serverName, "mcp"));
+  candidates.add(formatToolName(toolName, serverName, prefix).replace(/-/g, "_"));
+  candidates.add(formatToolName(toolName, serverName, "server").replace(/-/g, "_"));
+  candidates.add(formatToolName(toolName, serverName, "short").replace(/-/g, "_"));
+  candidates.add(formatToolName(toolName, serverName, "mcp").replace(/-/g, "_"));
+  return candidates;
+}
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function parseJson(text) {
+  if (text === void 0) return void 0;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return void 0;
+  }
+}
+function mcpConfigPaths(env, homeDir, cwd) {
+  try {
+    const agentDir = resolvePiAgentDir(env, homeDir);
+    const adapterFile = agentDir === void 0 ? void 0 : join5(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
+    const mode = env?.[ENV_PI_MCP_CONFIG_MODE];
+    if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") {
+      return adapterFile === void 0 ? [] : [adapterFile];
+    }
+    const paths = [];
+    if (typeof homeDir === "string" && homeDir !== "" && isAbsolute3(homeDir)) {
+      paths.push(join5(homeDir, ".config", "mcp", "mcp.json"));
+      paths.push(join5(homeDir, ".agents", "mcp.json"));
+      paths.push(join5(homeDir, ".agents", "mcp", "mcp.json"));
+    }
+    if (adapterFile !== void 0) paths.push(adapterFile);
+    if (typeof cwd === "string" && cwd !== "" && isAbsolute3(cwd)) {
+      paths.push(join5(cwd, ".mcp.json"));
+      paths.push(join5(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
+    }
+    return [...new Set(paths)];
+  } catch {
+    return [];
+  }
+}
+function projectServer(raw) {
+  if (!isRecord2(raw)) return void 0;
+  const out = {};
+  if (typeof raw.url === "string") out.url = raw.url;
+  if (typeof raw.command === "string") out.command = raw.command;
+  if (Array.isArray(raw.args)) {
+    if (raw.args.every((arg) => typeof arg === "string")) out.args = [...raw.args];
+    else out.argsInvalid = true;
+  }
+  if (typeof raw.type === "string") out.type = raw.type;
+  if (typeof raw.toolPrefix === "string" && TOOL_PREFIXES.has(raw.toolPrefix)) {
+    out.toolPrefix = raw.toolPrefix;
+  }
+  if (typeof raw.disabled === "boolean") out.disabled = raw.disabled;
+  return out;
+}
+function mergeSource(target, parsed) {
+  if (!isRecord2(parsed)) return;
+  const servers = isRecord2(parsed.mcpServers) ? parsed.mcpServers : isRecord2(parsed["mcp-servers"]) ? parsed["mcp-servers"] : void 0;
+  if (servers !== void 0) {
+    for (const [name, raw] of Object.entries(servers)) {
+      const next = projectServer(raw);
+      if (next === void 0) continue;
+      const base = { ...target.servers.get(name) ?? {} };
+      if (typeof next.command === "string") delete base.url;
+      if (typeof next.url === "string") {
+        delete base.command;
+        delete base.args;
+      }
+      if (next.argsInvalid === true) delete base.args;
+      const { argsInvalid: _ignored, ...fields } = next;
+      target.servers.set(name, { ...base, ...fields });
+    }
+  }
+  const settings = parsed.settings;
+  if (isRecord2(settings)) {
+    if (typeof settings.toolPrefix === "string" && TOOL_PREFIXES.has(settings.toolPrefix)) {
+      target.settings.toolPrefix = settings.toolPrefix;
+    }
+    if (typeof settings.namespaceProxyTools === "boolean") {
+      target.settings.namespaceProxyTools = settings.namespaceProxyTools;
+    }
+  }
+}
+function readMcpAdapterConfig(env, homeDir, cwd) {
+  const config = EMPTY_CONFIG();
+  try {
+    for (const path of mcpConfigPaths(env, homeDir, cwd)) {
+      mergeSource(config, parseJson(readSmallRegularFile(path, MAX_CONFIG_BYTES)));
+    }
+    return config;
+  } catch {
+    return EMPTY_CONFIG();
+  }
+}
+function readMcpCache(agentDir) {
+  const cache = /* @__PURE__ */ new Map();
+  try {
+    if (typeof agentDir !== "string" || agentDir === "") return cache;
+    const parsed = parseJson(readSmallRegularFile(join5(agentDir, MCP_CACHE_FILE_NAME), MAX_MCP_CACHE_BYTES));
+    if (!isRecord2(parsed) || !isRecord2(parsed.servers)) return cache;
+    for (const [server, entry] of Object.entries(parsed.servers)) {
+      if (!isRecord2(entry) || !Array.isArray(entry.tools)) continue;
+      const names = [];
+      for (const tool of entry.tools) {
+        if (isRecord2(tool) && typeof tool.name === "string" && tool.name !== "") names.push(tool.name);
+      }
+      cache.set(server, names);
+    }
+    return cache;
+  } catch {
+    return /* @__PURE__ */ new Map();
+  }
+}
+function projectServerConfig(def) {
+  if (def === void 0) return void 0;
+  if (typeof def.url === "string" && def.url !== "") {
+    return typeof def.type === "string" ? { url: def.url, type: def.type } : { url: def.url };
+  }
+  if (typeof def.command === "string" && def.command !== "") {
+    const out = { command: def.command };
+    if (Array.isArray(def.args)) out.args = [...def.args];
+    if (typeof def.type === "string") out.type = def.type;
+    return out;
+  }
+  return void 0;
+}
+function parseArgs(value) {
+  if (value === void 0 || value === "") return {};
+  let args = value;
+  if (typeof value === "string") {
+    try {
+      args = JSON.parse(value);
+    } catch {
+      return void 0;
+    }
+  }
+  return isRecord2(args) ? args : void 0;
+}
+function universeOf(config, cache) {
+  const names = /* @__PURE__ */ new Set([...config.servers.keys(), ...cache.keys()]);
+  const servers = [...names].filter((name) => config.servers.get(name)?.disabled !== true);
+  return { config, cache, servers };
+}
+function prefixOf(u, server) {
+  return resolveToolPrefix(u.config.servers.get(server), u.config.settings.toolPrefix);
+}
+function toolOnServer(u, server, requested) {
+  const prefix = prefixOf(u, server);
+  const tools = u.cache.get(server) ?? [];
+  const exact = tools.filter((tool) => formatToolName(tool, server, prefix) === requested);
+  if (exact.length > 0) return exact.length === 1 ? exact[0] : void 0;
+  const candidates = tools.filter((tool) => getToolNameCandidates(tool, server, prefix).has(requested));
+  if (candidates.length > 1) return void 0;
+  if (candidates.length === 1) return candidates[0];
+  const p = getServerPrefix(server, prefix);
+  if (p !== "" && requested.startsWith(`${p}_`) && requested.length > p.length + 1) {
+    return requested.slice(p.length + 1);
+  }
+  return requested;
+}
+function only(items) {
+  return items.length === 1 ? items[0] : void 0;
+}
+function resolveProxy(u, input) {
+  const tool = input.tool;
+  if (typeof tool !== "string" || tool === "") return void 0;
+  if (typeof input.action === "string" && NON_CALL_ACTIONS.has(input.action)) return void 0;
+  const args = parseArgs(input.args);
+  if (args === void 0) return void 0;
+  const requestedServer = input.server;
+  if (typeof requestedServer === "string" && requestedServer !== "") {
+    if (!u.servers.includes(requestedServer)) return void 0;
+    const original2 = toolOnServer(u, requestedServer, tool);
+    return original2 === void 0 ? void 0 : { server: requestedServer, tool: original2, args };
+  }
+  if (requestedServer !== void 0 && requestedServer !== "") return void 0;
+  const prefixed = [];
+  const original = [];
+  for (const server of u.servers) {
+    const prefix = prefixOf(u, server);
+    for (const name of u.cache.get(server) ?? []) {
+      if (formatToolName(name, server, prefix) === tool) prefixed.push({ server, tool: name });
+      if (name === tool) original.push({ server, tool: name });
+    }
+  }
+  if (prefixed.length > 1) return void 0;
+  if (prefixed.length === 1) return { ...prefixed[0], args };
+  if (original.length > 1) return void 0;
+  if (original.length === 1) return { ...original[0], args };
+  const scoped = u.servers.filter((server) => u.config.servers.has(server)).map((server) => ({ server, prefix: getServerPrefix(server, prefixOf(u, server)) })).filter(({ prefix }) => prefix.length > 0 && tool.startsWith(`${prefix}_`)).sort((a, b) => b.prefix.length - a.prefix.length);
+  if (scoped.length > 0) {
+    const longest = scoped[0].prefix.length;
+    const best = only(scoped.filter(({ prefix }) => prefix.length === longest));
+    if (best === void 0) return void 0;
+    const resolved = toolOnServer(u, best.server, tool);
+    return resolved === void 0 ? void 0 : { server: best.server, tool: resolved, args };
+  }
+  const candidates = [];
+  for (const server of u.servers) {
+    const prefix = prefixOf(u, server);
+    for (const name of u.cache.get(server) ?? []) {
+      if (getToolNameCandidates(name, server, prefix).has(tool)) candidates.push({ server, tool: name });
+    }
+  }
+  const match = only(candidates);
+  return match === void 0 ? void 0 : { ...match, args };
+}
+function namespaceOwners(u, toolName) {
+  if (u.config.settings.namespaceProxyTools === false) return [];
+  if (!toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX)) return [];
+  return u.servers.filter((server) => MCP_NAMESPACE_TOOL_PREFIX + formatServerNamespace(server) === toolName);
+}
+function directOwners(u, toolName) {
+  if (BUILTIN_NAMES.has(toolName)) return [];
+  const owners = [];
+  for (const server of u.servers) {
+    const prefix = prefixOf(u, server);
+    for (const name of u.cache.get(server) ?? []) {
+      if (formatToolName(name, server, prefix) === toolName) owners.push({ server, tool: name });
+    }
+  }
+  return owners;
+}
+function withConfig(u, call) {
+  const serverConfig = projectServerConfig(u.config.servers.get(call.server));
+  return serverConfig === void 0 ? { ...call } : { ...call, serverConfig };
+}
+function resolveMcpCall(toolName, input, config, cache) {
+  try {
+    if (typeof toolName !== "string" || toolName === "" || NATIVE_TOOL_NAMES.has(toolName)) return void 0;
+    const u = universeOf(config, cache);
+    if (u.servers.length === 0) return void 0;
+    if (toolName === MCP_PROXY_TOOL_NAME) {
+      if (!isRecord2(input)) return void 0;
+      const call = resolveProxy(u, input);
+      return call === void 0 ? void 0 : withConfig(u, call);
+    }
+    const namespaces = namespaceOwners(u, toolName);
+    const directs = directOwners(u, toolName);
+    if (namespaces.length + directs.length !== 1) return void 0;
+    const namespaceServer = only(namespaces);
+    if (namespaceServer !== void 0) {
+      if (!isRecord2(input)) return void 0;
+      const tool = input.tool;
+      if (typeof tool !== "string" || tool === "") return void 0;
+      const args = parseArgs(input.args);
+      if (args === void 0) return void 0;
+      const original = toolOnServer(u, namespaceServer, tool);
+      return original === void 0 ? void 0 : withConfig(u, { server: namespaceServer, tool: original, args });
+    }
+    const direct = only(directs);
+    if (direct === void 0) return void 0;
+    return withConfig(u, { server: direct.server, tool: direct.tool, args: isRecord2(input) ? input : {} });
+  } catch {
+    return void 0;
+  }
+}
+function signatureOf(paths) {
+  const parts = [];
+  for (const path of paths) {
+    try {
+      const stats = lstatSync2(path);
+      parts.push(`${path}=${stats.mtimeMs}:${stats.size}:${stats.isFile() ? "f" : "x"}`);
+    } catch {
+      parts.push(`${path}=-`);
+    }
+  }
+  return parts.join("|");
+}
+function createMcpResolver(options) {
+  let memo;
+  return {
+    resolve(toolName, input, cwd) {
+      try {
+        if (typeof toolName !== "string" || toolName === "" || NATIVE_TOOL_NAMES.has(toolName)) {
+          return void 0;
+        }
+        const env = options.env ?? {};
+        const homeDir = typeof options.homeDir === "string" ? options.homeDir : "";
+        const safeCwd2 = typeof cwd === "string" ? cwd : "";
+        const agentDir = resolvePiAgentDir(env, homeDir);
+        const configPaths = mcpConfigPaths(env, homeDir, safeCwd2);
+        const cachePath = agentDir === void 0 ? void 0 : join5(agentDir, MCP_CACHE_FILE_NAME);
+        const signature = signatureOf(cachePath === void 0 ? configPaths : [...configPaths, cachePath]);
+        if (memo === void 0 || memo.cwd !== safeCwd2 || memo.signature !== signature) {
+          memo = {
+            cwd: safeCwd2,
+            signature,
+            config: readMcpAdapterConfig(env, homeDir, safeCwd2),
+            cache: readMcpCache(agentDir)
+          };
+        }
+        return resolveMcpCall(toolName, input, memo.config, memo.cache);
+      } catch {
+        return void 0;
+      }
+    }
+  };
 }
 
 // packages/pi/src/prompt.ts
@@ -1744,13 +2410,17 @@ function recordToolResult(event, store) {
   try {
     const content = Array.isArray(event?.content) ? event.content : [];
     const hashed = hashContent(content);
+    const captured = captureText(content, MAX_TOOL_OUTPUT_CHARS);
     store.recordResult({
       tool_name: typeof event?.toolName === "string" ? event.toolName : "",
       tool_use_id: typeof event?.toolCallId === "string" ? event.toolCallId : "",
       is_error: event?.isError === true,
       ...hashed.content_sha256 === void 0 ? {} : { content_sha256: hashed.content_sha256 },
       content_bytes: hashed.content_bytes,
-      ...hashed.hash_skipped === true ? { hash_skipped: true } : {}
+      ...hashed.hash_skipped === true ? { hash_skipped: true } : {},
+      ...captured === void 0 ? {} : { content: captured.text },
+      ...captured?.truncated === true ? { content_truncated: true } : {},
+      ...captured?.original_chars === void 0 ? {} : { content_original_chars: captured.original_chars }
     });
   } catch {
   }
@@ -1916,6 +2586,7 @@ function createExtension(overrides = {}) {
       return {};
     }
   }
+  const mcpResolver = createMcpResolver({ env, homeDir });
   let resolved;
   let notified = false;
   function init() {
@@ -2005,6 +2676,12 @@ function createExtension(overrides = {}) {
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          // The pretool `messages[0].content`, which the gateway writes its block/warn row from. A
+          // cheap getter, not `snapshot()`: this runs on every evaluated tool call.
+          currentPrompt: () => turnStore.currentPrompt(sessionIdOf(ctx)),
+          // An MCP call made through pi-mcp-adapter goes to the gateway's MCP path (Path 3) rather
+          // than taking the nothing-evaluable skip. `tool_call` only: no other event carries one.
+          resolveMcp: (name, input, cwd) => mcpResolver.resolve(name, input, cwd),
           // Re-checked here rather than above: `checkTool` may have latched the key on this very
           // call, and the turn that latched is one nothing will post.
           onDecision: (entry) => {
@@ -2051,8 +2728,20 @@ function createExtension(overrides = {}) {
           entrypoint: state.entrypoint,
           ...identityOption(),
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          // Posted as its OWN one-call turn log, immediately, and never written into `turnStore`:
+          // pi fires no `agent_end` for a `!cmd`, so a stored entry waited for the next agent turn
+          // and was posted under that turn's prompt. Fire-and-forget — this handler is awaited, and
+          // `postStandaloneTurn` returns before the POST settles. `recordingActive` is re-checked
+          // here for the same reason as on `tool_call`: this very call may have latched the key.
           onDecision: (entry) => {
-            if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
+            if (recordingActive(state)) {
+              postStandaloneTurn(entry, ctx, sessionIdOf(ctx), {
+                client: state.client,
+                apiKey: state.apiKey,
+                ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry },
+                ...identityOption()
+              });
+            }
           }
         });
       } catch {

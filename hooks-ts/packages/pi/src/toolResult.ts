@@ -15,17 +15,23 @@
 //
 // **It is on an awaited path.** Registering any `tool_result` handler switches on an extra awaited
 // pass for every tool result (`agent-session.js:267`, the `hasHandlers` gate), between the tool
-// finishing and the model seeing its output. So: one hash, no `await`, no filesystem, no network, no
-// stderr — and a size bail-out in `hashContent` for the 100 MB `read` (§F7). A grep of this file for
-// either capability finds nothing, which is how the property is checked rather than asserted.
+// finishing and the model seeing its output. So: one hash and one capped text capture, no `await`,
+// no filesystem, no network, no stderr — a size bail-out in `hashContent` for the 100 MB `read`
+// (§F7), and a `captureText` that sizes before it copies and only ever copies the head and the tail.
+// A grep of this file for either capability finds nothing, which is how the property is checked
+// rather than asserted.
 //
-// **The raw content is read once and dropped.** `event.content` is projected, hashed and forgotten;
-// `event.input` is not read at all, because the turn log sends `tool_input: {}` and reaching for it
-// here would re-open the egress that 09-02's allowlist closed.
+// **What is kept: a hash, and capped text.** `event.content` is hashed (every part), and its TEXT
+// parts are captured at `MAX_TOOL_OUTPUT_CHARS`, both ends kept, so the turn log can carry the output
+// for tool-output DLP and MCP output audit (HOOK-06's hash-only rule, reversed by user decision).
+// Image parts are represented by the hash and byte count only; their base64 is never kept. The
+// per-turn budget and the redaction happen downstream (`turn.ts`, `turnLog.ts`). `event.input` is
+// not read at all: the call's input is recorded at the decision seam, already allowlisted.
 
 import type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
 
-import { hashContent } from "../../core/src/turn.ts";
+import { MAX_TOOL_OUTPUT_CHARS } from "../../core/src/constants.ts";
+import { captureText, hashContent } from "../../core/src/turn.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 
 /**
@@ -58,6 +64,8 @@ export function recordToolResult(event: ToolResultLike, store: TurnStore): undef
   try {
     const content = Array.isArray(event?.content) ? event.content : [];
     const hashed = hashContent(content);
+    // Text parts only, capped at both ends; `undefined` for an output with no text (all images).
+    const captured = captureText(content, MAX_TOOL_OUTPUT_CHARS);
     store.recordResult({
       tool_name: typeof event?.toolName === "string" ? event.toolName : "",
       tool_use_id: typeof event?.toolCallId === "string" ? event.toolCallId : "",
@@ -65,6 +73,9 @@ export function recordToolResult(event: ToolResultLike, store: TurnStore): undef
       ...(hashed.content_sha256 === undefined ? {} : { content_sha256: hashed.content_sha256 }),
       content_bytes: hashed.content_bytes,
       ...(hashed.hash_skipped === true ? { hash_skipped: true as const } : {}),
+      ...(captured === undefined ? {} : { content: captured.text }),
+      ...(captured?.truncated === true ? { content_truncated: true as const } : {}),
+      ...(captured?.original_chars === undefined ? {} : { content_original_chars: captured.original_chars }),
     });
   } catch {
     // `emitToolResult` catches and reports handler exceptions without rethrowing, so a throw here

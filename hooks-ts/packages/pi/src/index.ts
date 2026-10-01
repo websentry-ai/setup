@@ -52,10 +52,14 @@
 // under a `gateway_url` + key-fingerprint identity, so one tenant's snapshot can never be read by
 // another. It bounds `tools_synced_at` only: an org's fail-open opt-out is honoured regardless of age.
 //
-// **The audit trail** is hash-only. Tool output is recorded as a sha256 and a byte count and never
-// leaves the process; the turn log's `model` is pinned to `"auto"` because the backend drops rows for
-// anything else. Two consequences are accepted and documented rather than hidden: tool-output DLP and
-// assistant-text DLP cannot fire for pi.
+// **The audit trail** carries tool output, capped and redacted. Each result is recorded as a sha256,
+// a byte count and its TEXT parts capped at 8 KB (both ends kept) under a 128 KB per-turn budget;
+// image parts are hash and bytes only. The turn log sends that text through `redactSecrets`, so
+// tool-output DLP and MCP output audit can fire for pi (gated server-side per org by
+// `DLP_SCAN_MCP_PAYLOAD_ORG_IDS` and the org's audit config), and the assistant's own text is already
+// sent. Nothing is captured for a keyless or latched session: `recordingActive` is checked before
+// `recordToolResult`. The turn log's `model` is pinned to `"auto"` because the backend drops rows for
+// anything else.
 //
 // Built and tested against pi 0.87.1 on Node >= 22.19.0.
 

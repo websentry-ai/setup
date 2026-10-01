@@ -4,14 +4,16 @@
 //      handler result back into the real tool result the model reads, so `{}` is safe only by
 //      accident and `{isError:false}` would rewrite a genuine error. A truthiness check would pass
 //      for `{}` — hence `assert.strictEqual(result, undefined)` everywhere below.
-//   2. No raw output is retained. The marker is written into the tool content and then grepped out
-//      of the store's serialised snapshot.
+//   2. What is retained is bounded: a digest, a byte count and the TEXT output capped at
+//      `MAX_TOOL_OUTPUT_CHARS` (HOOK-06's hash-only rule, reversed by user decision so tool-output DLP
+//      can fire). An image part's base64 is never retained, and neither is the tool input — both are
+//      grepped for in the store's serialised snapshot.
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { MAX_HASH_BYTES } from "../../core/src/constants.ts";
+import { MAX_HASH_BYTES, MAX_TOOL_OUTPUT_CHARS, OUTPUT_TRUNCATION_MARKER } from "../../core/src/constants.ts";
 import { createTurnStore } from "../../core/src/turn.ts";
 import { recordToolResult } from "../src/toolResult.ts";
 import { createFakeToolResultEvent } from "./helpers/fakeCtx.ts";
@@ -78,6 +80,8 @@ test("the result is recorded as name, isError, digest and byte count", () => {
       is_error: false,
       content_sha256: sha256("text:file contents"),
       content_bytes: Buffer.byteLength("text:file contents", "utf8"),
+      // New contract: the text output rides along, capped (here whole — it fits).
+      content: "file contents",
     },
   ]);
 });
@@ -88,22 +92,61 @@ test("isError rides through verbatim", () => {
   assert.equal(store.snapshot().results[0]?.is_error, true);
 });
 
-test("the raw tool output never reaches the record (T-09-10)", () => {
+test("text output is recorded; image data and the tool input never are (T-09-10, updated)", () => {
+  // Updated deliberately: this used to assert the marker was nowhere in the record. Text output is
+  // now captured (capped) by user decision; what still never enters the record is an image part's
+  // base64 and `event.input`.
+  const IMAGE_SECRET = "IMAGE-ONLY-SECRET";
   const store = createTurnStore();
   const event = createFakeToolResultEvent("bash", {
     input: { command: `echo ${MARKER}` },
     content: [
       { type: "text", text: `stdout:\n${MARKER}\n`, textSignature: "sig" },
-      { type: "image", data: Buffer.from(MARKER).toString("base64"), mimeType: "image/png" },
+      { type: "image", data: Buffer.from(IMAGE_SECRET).toString("base64"), mimeType: "image/png" },
     ],
   });
 
   recordToolResult(event, store);
 
   const serialised = JSON.stringify(store.snapshot());
-  assert.equal(serialised.includes(MARKER), false, `raw output leaked into ${serialised}`);
+  assert.equal(store.snapshot().results[0]?.content, `stdout:\n${MARKER}\n`, "the text output is held");
+  assert.equal(serialised.includes(IMAGE_SECRET), false, "no decoded image content");
+  assert.equal(serialised.includes(Buffer.from(IMAGE_SECRET).toString("base64")), false, "no image base64");
   assert.equal(serialised.includes("echo "), false, "and the tool input is not recorded either");
+  assert.equal(serialised.includes("sig"), false, "nor provider metadata");
   assert.equal(typeof store.snapshot().results[0]?.content_sha256, "string");
+});
+
+test("a 10 MB text output is recorded capped at both ends, and the handler still returns undefined", () => {
+  const store = createTurnStore();
+  const huge = "A".repeat(5_000_000) + "B".repeat(5_000_000);
+  const result = recordToolResult(createFakeToolResultEvent("read", { content: [{ type: "text", text: huge }] }), store);
+  assert.strictEqual(result, undefined);
+
+  const [only] = store.snapshot().results;
+  assert.ok(only?.content !== undefined);
+  assert.ok(only.content.length <= MAX_TOOL_OUTPUT_CHARS + OUTPUT_TRUNCATION_MARKER.length);
+  assert.ok(only.content.startsWith("AAAA") && only.content.endsWith("BBBB"), "both ends kept");
+  assert.equal(only.content_truncated, true);
+  assert.equal(only.content_original_chars, huge.length);
+  assert.equal(only.hash_skipped, true, "and the hash bail-out still applies independently");
+});
+
+test("a throwing content getter is still a silent no-op", () => {
+  const store = createTurnStore();
+  const event = {
+    toolCallId: "c",
+    toolName: "bash",
+    isError: false,
+    get content(): unknown[] {
+      throw new Error("content getter exploded");
+    },
+  };
+  let result: unknown = "unset";
+  assert.doesNotThrow(() => {
+    result = recordToolResult(event, store);
+  });
+  assert.strictEqual(result, undefined);
 });
 
 test("an oversized result is counted, flagged and not hashed", () => {

@@ -49,11 +49,14 @@ statement.
 Shipped knowingly, each with its owner and evidence, in
 **[`docs/SPIKES.md`](docs/SPIKES.md) → Intentional parity gaps**. In short:
 
-- **Tool-output DLP cannot fire for pi.** `tool_result` sends a sha256 digest and a byte count, never
-  the output, so there is nothing for DLP to match on. Assistant text is no longer part of this gap:
-  the turn log carries the model's own text (16 KB cap, both ends kept), and tool input carries the
-  allowlisted keys — `command`, `path`, `pattern` — that the pretool check is evaluated on. File
-  bodies (`content`, `edits`) are in neither.
+- **Tool-output DLP is no longer a gap.** The turn log's `tool_response` carries each tool's text
+  output, capped at 8 KB per result (both ends kept) and 128 KB per turn and redacted, next to the
+  sha256 and byte count; image parts are hash and bytes only. The turn log also carries the model's
+  own text (16 KB cap, both ends kept), and tool input carries the allowlisted keys — `command`,
+  `path`, `pattern` — that the pretool check is evaluated on. File bodies (`content`, `edits`) are
+  never in tool input. MCP calls made through `pi-mcp-adapter` are enforced on the gateway's MCP path
+  with their arguments; the remaining MCP gaps (`mcpScript`, no unknown-server scan, no `scriptHash`,
+  cold-cache resolution) are listed in [`../pi/README.md`](../pi/README.md).
 - **Prompt templates are checked unexpanded.** `input` fires before expansion, so `/name args` is
   checked as the literal text typed, not as what it becomes.
 - **Slash commands never reach the `input` handler.** Built-ins and extension commands are

@@ -140,6 +140,43 @@ On a successful install the installer makes one best-effort `POST /api/v1/setup/
   The extension enforces from the key on the machine, not from the report, so a failed report costs
   you a console row and nothing else.
 
+## What the extension sends at runtime
+
+That report is the installer's. Once installed, the extension itself sends the following, and only
+with a key on the machine (no key, or a key the gateway rejected, means nothing is sent or captured):
+
+- **Every evaluated tool call** (`POST /v1/hooks/pretool`) carries the current turn's prompt as
+  `messages[0].content`, capped at 8 KB with both ends kept. The gateway writes its block/warn row from
+  that field, so a blocked command's row shows what was being asked.
+- **MCP calls made through `pi-mcp-adapter`** (the `mcp` proxy tool, a `mcp__<server>` namespace tool,
+  or a direct `<server>_<tool>` tool) are resolved to the server and tool the adapter will run and sent
+  to the gateway's MCP policy path as `mcp__<server>__<tool>`, with the call's arguments (capped at
+  16 KB) and the server's `url`, or `command` + `args`, read from the adapter's config files. The
+  server's `env`, `headers`, bearer tokens and OAuth settings are never read into the request.
+  A call that cannot be attributed to exactly one server and tool is not checked (as before).
+- **The turn log** (`POST /v1/hooks/pi`) carries each tool's text output, capped at 8 KB per result
+  (head and tail kept) and 128 KB per turn, with bearer tokens and the Unbound key redacted, next to a
+  sha256 and a byte count. Image output is never sent; it is represented by its hash and size only.
+  This is what lets tool-output DLP and MCP output audit run for pi (where the org has them enabled).
+- **A typed `!cmd`** is logged as its own one-call row the moment it is checked, not folded into the
+  next agent turn.
+
+Known gaps:
+
+- `mcpScript` (a script that can call several MCP tools) is not enforced. The follow-up is the
+  adapter's own `pi-mcp-adapter:tool-approval-request` broker event.
+- There is no unknown-server scan dispatch. In an org that blocks unsanctioned MCP servers, a server no
+  device has scanned yet is reported as "being scanned" for up to an hour and is not resolved by pi.
+- Local-script stdio servers (`node ./server.js`) get no `scriptHash`, so their fingerprint is null.
+- The adapter's config imports, plugins and opt-in ancestor files are not read; only the six standard
+  config files are.
+- With a cold or missing `mcp-cache.json`, only calls whose name starts with a configured server's
+  prefix can be resolved. Anything unresolved runs unenforced, which is the behaviour before this
+  change.
+- Allowed pi MCP calls do not show up in MCP usage analytics yet; that needs a separate
+  `ai-gateway-data` change to parse pi turn logs. Blocked and warned MCP calls do appear, through the
+  gateway's block row.
+
 ## `--clear` removes the extension and reports **nothing**
 
 ```bash

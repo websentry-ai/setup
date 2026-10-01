@@ -80,7 +80,8 @@ export const NATIVE_FILE_TOOLS: ReadonlySet<string> = new Set([
 
 /**
  * `metadata.file_path` for a tool call, or `undefined` when the tool has no file semantics
- * (`bash`, `powershell`, any custom/MCP tool) — those are evaluated on `command`.
+ * (`bash`, `powershell`, any custom/MCP tool) — those are evaluated on `command`, or (a resolved
+ * MCP call) on the MCP branch of `buildPretoolPayload`.
  */
 export function resolveFilePath(
   toolName: string,

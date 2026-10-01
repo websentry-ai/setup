@@ -5,11 +5,11 @@
 //   * `model === "auto"`. `add_gateway_metrics_task.py:565-577` returns early on `"Model Not found"`
 //     and hook telemetry never takes the `add_new_model` path, so a real model id means **no row at
 //     all**. The test passes a real id in and asserts `"auto"` comes out.
-//   * nothing in `tool_use[]` carries content. `tool_input` carries the SAME allowlisted projection
-//     the pretool request sends — `command`, `path`, `pattern` — and `tool_response` holds a digest
-//     and a byte count. The serialised body is grepped for a marker and for the two key names that
-//     would mean file bodies had come back (`content`, `edits`), and asserted to contain the three
-//     that must be there.
+//   * `tool_input` carries the SAME allowlisted projection the pretool request sends — `command`,
+//     `path`, `pattern` — and never a file body (`content`, `edits`). `tool_response` holds a digest,
+//     a byte count and, since HOOK-06's hash-only rule was reversed by user decision, the captured
+//     TEXT output, capped by the record and redacted here. What must never arrive is image data or an
+//     unredacted secret; both are asserted directly.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -20,6 +20,8 @@ import { buildTurnLogBody, shouldPostTurn } from "../src/turnLog.ts";
 import type { TurnRecord } from "../src/turn.ts";
 
 const MARKER = "GITHUB_TOKEN=ghp-never-on-the-wire";
+/** A synthetic session key, scrubbed by literal match wherever it appears. */
+const SESSION_KEY = "unb_live_" + "0123456789abcdef";
 const CWD = "/tmp/project";
 const STARTED_AT = 1_700_000_000_000;
 const COMPLETED_AT = STARTED_AT + 4_200;
@@ -152,6 +154,7 @@ test("each tool_use entry is the PostToolUse shape the backend reads", () => {
     { path: "/etc/app/config.yaml" },
     "the allowlisted input the pretool request already sent, not a second projection of it",
   );
+  // A record with no captured text sends the hash pair alone: every new key is present-only.
   assert.deepEqual(entry?.tool_response, { content_sha256: "a".repeat(64), content_bytes: 812 });
 });
 
@@ -191,7 +194,35 @@ test("a skipped hash is encoded honestly rather than as a missing digest", () =>
   });
   const [entry] = build(rec).messages[1]?.tool_use ?? [];
 
-  assert.deepEqual(entry?.tool_response, { hash_skipped: true, content_bytes: 9_000_000 });
+  // `is_error: true` now rides `tool_response` (present-only), so a failed output reads as one.
+  assert.deepEqual(entry?.tool_response, { hash_skipped: true, content_bytes: 9_000_000, is_error: true });
+});
+
+test("a hash-skipped result still carries its captured text", () => {
+  // The 4 MB hash bail-out and the 8 KB text cap are independent: a huge output skips the digest but
+  // its head and tail are exactly what the audit wants.
+  const rec = record({
+    results: [
+      {
+        tool_name: "read",
+        tool_use_id: "call_1",
+        is_error: false,
+        content_bytes: 9_000_000,
+        hash_skipped: true,
+        content: "head…tail",
+        content_truncated: true,
+        content_original_chars: 8_999_000,
+      },
+    ],
+  });
+  const [entry] = build(rec).messages[1]?.tool_use ?? [];
+  assert.deepEqual(entry?.tool_response, {
+    hash_skipped: true,
+    content_bytes: 9_000_000,
+    content: "head…tail",
+    content_truncated: true,
+    content_original_chars: 8_999_000,
+  });
 });
 
 test("a tool call with no matching result still appears, with an empty response", () => {
@@ -221,7 +252,11 @@ test("results are matched to calls by tool_use_id, not by position", () => {
   const entries = build(rec).messages[1]?.tool_use ?? [];
 
   assert.equal(entries[0]?.tool_use_id, "c1");
-  assert.deepEqual(entries[0]?.tool_response, { content_sha256: "c".repeat(64), content_bytes: 20 });
+  assert.deepEqual(entries[0]?.tool_response, {
+    content_sha256: "c".repeat(64),
+    content_bytes: 20,
+    is_error: true,
+  });
   assert.equal(entries[1]?.tool_use_id, "c2");
   assert.deepEqual(entries[1]?.tool_response, { content_sha256: "b".repeat(64), content_bytes: 10 });
 });
@@ -259,30 +294,84 @@ test("the server-set fields are never sent", () => {
   }
 });
 
-test("no raw output and no file-body key reaches the body (T-09-10)", () => {
+test("no image data, no unredacted secret and no file-body key reaches the body (T-09-10)", () => {
+  // Rewritten deliberately: T-09-10 used to be "no raw output reaches the body". Tool output is now
+  // sent by user decision (capped, redacted), so what this pins is the part of T-09-10 that still
+  // holds — an image's base64 never arrives (the record never captures it: `turn.test.ts`), a secret
+  // in the captured text arrives redacted, and `tool_input` still carries no file body.
+  const IMAGE_B64 = Buffer.from(MARKER).toString("base64");
   const rec = record({
     prompt: `please read the file containing ${MARKER}`,
     results: [
-      { tool_name: "read", tool_use_id: "call_1", is_error: false, content_sha256: "d".repeat(64), content_bytes: 4 },
+      {
+        tool_name: "read",
+        tool_use_id: "call_1",
+        is_error: false,
+        content_sha256: "d".repeat(64),
+        content_bytes: 4,
+        content: `config:\nAuthorization: Bearer sk-live-deadbeefcafe\nkey=${SESSION_KEY}\n`,
+      },
     ],
   });
-  const body = build(rec);
+  const body = buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT, apiKey: SESSION_KEY });
   const toolUse = JSON.stringify(body.messages[1]?.tool_use);
 
-  // The prompt IS sent — that is the existing product contract. The tool output is not.
-  assert.equal(toolUse.includes(MARKER), false, `output-bearing text in ${toolUse}`);
-  // Matched as quoted JSON keys, so `content_sha256` (which is meant to be there) cannot satisfy
-  // the assertion for `content` (which must not be). These two are the file-body keys, and they are
-  // absent here because they are absent from what the decision seam recorded — the allowlist drops
-  // them before either the pretool request or this row can see them.
+  assert.equal(toolUse.includes(IMAGE_B64), false, "no image data");
+  assert.equal(toolUse.includes("deadbeefcafe"), false, "a bearer token in the output is redacted");
+  assert.equal(toolUse.includes(SESSION_KEY), false, "the session key in the output is redacted");
+  const response = body.messages[1]?.tool_use?.[0]?.tool_response as { content?: string };
+  assert.equal(response.content, "config:\nAuthorization: Bearer [REDACTED]\nkey=[REDACTED]\n");
+  // Matched as quoted JSON keys INSIDE `tool_input`: `tool_response.content` is meant to be there now,
+  // `tool_input.content` / `.edits` (file bodies) are not — the allowlist drops them at the seam.
+  const input = JSON.stringify(body.messages[1]?.tool_use?.[0]?.tool_input);
   for (const key of ["content", "edits"]) {
-    assert.equal(
-      toolUse.includes(`"${key}":`),
-      false,
-      `tool_use[] carries a ${key} key: ${toolUse}`,
-    );
+    assert.equal(input.includes(`"${key}":`), false, `tool_input carries a ${key} key: ${input}`);
   }
-  assert.ok(toolUse.includes('"content_sha256":'), "the digest, by contrast, is present");
+  assert.ok(toolUse.includes('"content_sha256":'), "the digest is still present alongside the text");
+  // The record itself is untouched: redaction happens at the wire, not in the store.
+  assert.match(String(rec.results[0]?.content), /deadbeefcafe/);
+});
+
+test("tool_response flags are present-only: truncated, original length, omitted", () => {
+  const rec = record({
+    tool_calls: [
+      { tool_name: "bash", tool_use_id: "c1", decision: "allow", ts: 1 },
+      { tool_name: "bash", tool_use_id: "c2", decision: "allow", ts: 2 },
+    ],
+    results: [
+      {
+        tool_name: "bash",
+        tool_use_id: "c1",
+        is_error: false,
+        content_sha256: "e".repeat(64),
+        content_bytes: 50_000,
+        content: "HEAD...TAIL",
+        content_truncated: true,
+        content_original_chars: 49_000,
+      },
+      {
+        tool_name: "bash",
+        tool_use_id: "c2",
+        is_error: false,
+        content_sha256: "f".repeat(64),
+        content_bytes: 10,
+        content_omitted: true,
+      },
+    ],
+  });
+  const entries = build(rec).messages[1]?.tool_use ?? [];
+  assert.deepEqual(entries[0]?.tool_response, {
+    content_sha256: "e".repeat(64),
+    content_bytes: 50_000,
+    content: "HEAD...TAIL",
+    content_truncated: true,
+    content_original_chars: 49_000,
+  });
+  assert.deepEqual(entries[1]?.tool_response, {
+    content_sha256: "f".repeat(64),
+    content_bytes: 10,
+    content_omitted: true,
+  });
 });
 
 test("the allowlisted keys the pretool request sends ARE present in tool_use[]", () => {
@@ -386,7 +475,6 @@ test("WR-04 a call's session_id stamp is never sent on the wire", () => {
 // Server-side DLP scans what remains, exactly as for every other hook's turn log.
 // ---------------------------------------------------------------------------------------------------
 
-const SESSION_KEY = "unb_live_" + "0123456789abcdef";
 
 test("the session key never rides the assistant text", () => {
   const body = buildTurnLogBody(record(), {

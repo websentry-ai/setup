@@ -215,6 +215,26 @@ export const MAX_HASH_BYTES = 4_194_304;
  */
 export const MAX_TURN_RESULTS = 500;
 /**
+ * The per-result cap on the tool OUTPUT text the turn log carries (`tool_response.content`), kept at
+ * **both ends** with `OUTPUT_TRUNCATION_MARKER` between: an error is usually at the tail, a header at
+ * the head, and a secret the server-side DLP should see can be at either. About 8 KB.
+ *
+ * This reverses HOOK-06's hash-only rule by explicit decision, so tool-output DLP and MCP output
+ * audit can fire for pi as they do for the Claude Code hook. Image parts are never captured.
+ */
+export const MAX_TOOL_OUTPUT_CHARS = 8192;
+/**
+ * The per-TURN budget for stored output text, about 128 KB. `MAX_TURN_RESULTS` × 8 KB is 4 MB of
+ * retained strings in the worst case; past this budget later results keep their hash and byte count
+ * but no text, and say so with `content_omitted: true`.
+ */
+export const MAX_TURN_OUTPUT_CHARS = 131_072;
+/**
+ * Spliced between the head and the tail of a capped tool output. Distinct from the command marker so
+ * a reader can tell which cap produced a splice; newlines for the same reason that one has them.
+ */
+export const OUTPUT_TRUNCATION_MARKER = "\n...unbound: output truncated...\n";
+/**
  * The same backstop for `tool_calls` (WR-04), and the path that made it necessary is not
  * hypothetical: `user_bash` records a tool call, and pi fires no `agent_end` for a bare `!cmd`
  * (RESEARCH §F3), so nothing calls `take()` and that entry lives for the whole session.

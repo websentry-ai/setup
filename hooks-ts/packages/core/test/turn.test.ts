@@ -1,16 +1,25 @@
-// HOOK-06 — the in-memory turn record and the content hash.
+// HOOK-06 — the in-memory turn record, the content hash and the captured output text.
 //
-// The security-relevant assertion in this file is the negative one: a distinctive marker written
-// into a tool result must not be findable anywhere in `snapshot()`. Everything else — stability,
-// `textSignature` independence, the size bail-out — protects the hash's usefulness; that one
-// protects the requirement.
+// The security-relevant assertions in this file are about what the record may hold. HOOK-06 used to
+// be hash-only, proved by grepping `snapshot()` for a marker; that rule was reversed by user decision
+// (tool output is sent, capped and redacted), so the marker test is INVERTED deliberately: a marker in
+// a TEXT part now does appear, within the cap, while a marker hidden in an IMAGE part's base64 still
+// never does. The caps (per result and per turn) are asserted directly. Everything else — stability,
+// `textSignature` independence, the size bail-out — protects the hash's usefulness.
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { MAX_HASH_BYTES, MAX_TURN_RESULTS, MAX_TURN_TOOL_CALLS } from "../src/constants.ts";
-import { createTurnStore, hashContent } from "../src/turn.ts";
+import {
+  MAX_HASH_BYTES,
+  MAX_TOOL_OUTPUT_CHARS,
+  MAX_TURN_OUTPUT_CHARS,
+  MAX_TURN_RESULTS,
+  MAX_TURN_TOOL_CALLS,
+  OUTPUT_TRUNCATION_MARKER,
+} from "../src/constants.ts";
+import { captureText, createTurnStore, hashContent } from "../src/turn.ts";
 import type { TurnResult } from "../src/turn.ts";
 
 const SESSION = "sess-turn-1";
@@ -293,31 +302,40 @@ test("recordResult stores a name, a flag, a digest and a count — and no text",
   ]);
 });
 
-test("the raw tool output is nowhere in the record (T-09-10)", () => {
+test("text output is held within the cap; image data never is (T-09-10, inverted for text)", () => {
+  // Deliberately inverted: this used to assert the marker was NOWHERE in the record. Tool output is
+  // now captured by user decision, so a TEXT marker is expected in `snapshot()` — and the half of
+  // T-09-10 that still holds is asserted next to it: an image part's base64 (which also carries the
+  // marker, encoded) never enters the record at all.
   const store = createTurnStore();
   store.recordPrompt("read the credentials file", SESSION, 1);
   store.recordToolCall({ tool_name: "read", tool_use_id: "call_1", decision: "allow" }, SESSION, 2);
-  const hashed = hashContent([
+  const IMAGE_ONLY = "IMAGE-ONLY-" + MARKER;
+  const parts = [
     { type: "text", text: `line one\n${MARKER}\nline three` },
-    { type: "image", data: Buffer.from(MARKER).toString("base64"), mimeType: "image/png" },
-  ]);
+    { type: "image", data: Buffer.from(IMAGE_ONLY).toString("base64"), mimeType: "image/png" },
+  ];
+  const hashed = hashContent(parts);
+  const captured = captureText(parts, MAX_TOOL_OUTPUT_CHARS);
   store.recordResult({
     tool_name: "read",
     tool_use_id: "call_1",
     is_error: false,
     content_sha256: hashed.content_sha256,
     content_bytes: hashed.content_bytes,
+    ...(captured === undefined ? {} : { content: captured.text }),
   });
 
   const serialised = JSON.stringify(store.snapshot());
-  assert.equal(serialised.includes(MARKER), false, `the marker survived into ${serialised}`);
+  assert.ok(serialised.includes(MARKER), "the text output is held");
+  assert.equal(store.snapshot().results[0]?.content, `line one\n${MARKER}\nline three`);
+  assert.equal(serialised.includes(IMAGE_ONLY), false, "no decoded image content");
   assert.equal(
-    serialised.includes(Buffer.from(MARKER).toString("base64")),
+    serialised.includes(Buffer.from(IMAGE_ONLY).toString("base64")),
     false,
-    "and neither did its base64 encoding",
+    "and no image base64 — images are hash and bytes only",
   );
-  // What IS there: the digest and a count. Nothing a reader could invert.
-  assert.ok(serialised.includes(String(hashed.content_sha256)), "the digest is what survives");
+  assert.ok(serialised.includes(String(hashed.content_sha256)), "the digest is still there");
 });
 
 test("a skipped hash is recorded as such rather than as a digest", () => {
@@ -610,4 +628,106 @@ test("currentPrompt does not go through snapshot() (no per-call copy)", () => {
     throw new Error("currentPrompt must not deep-copy the record");
   };
   assert.equal(store.currentPrompt(SESSION), "cheap");
+});
+
+// --- captureText (the output text the turn log carries) ----------------------------------------
+
+test("captureText returns the joined text parts whole when they fit", () => {
+  const captured = captureText(
+    [
+      { type: "text", text: "first" },
+      { type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+      { type: "text", text: "second", textSignature: "sig" },
+    ],
+    100,
+  );
+  assert.deepStrictEqual(captured, { text: "first\nsecond" }, "images skipped, text joined with \\n");
+});
+
+test("captureText keeps head and tail with the marker when over the cap", () => {
+  const big = "H".repeat(10_000) + "M".repeat(10_000) + "T".repeat(10_000);
+  const captured = captureText([{ type: "text", text: big }], MAX_TOOL_OUTPUT_CHARS);
+  assert.ok(captured !== undefined);
+  assert.equal(captured.truncated, true);
+  assert.equal(captured.original_chars, big.length);
+  assert.equal(captured.text.length, MAX_TOOL_OUTPUT_CHARS + OUTPUT_TRUNCATION_MARKER.length);
+  assert.ok(captured.text.startsWith("H".repeat(MAX_TOOL_OUTPUT_CHARS / 2)));
+  assert.ok(captured.text.endsWith("T".repeat(MAX_TOOL_OUTPUT_CHARS / 2)));
+  assert.equal(captured.text.includes("M"), false, "the middle is what goes");
+  assert.ok(captured.text.includes(OUTPUT_TRUNCATION_MARKER));
+});
+
+test("captureText head and tail span part boundaries", () => {
+  const captured = captureText(
+    [
+      { type: "text", text: "aaaa" },
+      { type: "text", text: "bbbbbbbbbbbbbbbbbbbb" },
+      { type: "text", text: "cccc" },
+    ],
+    12,
+  );
+  // Stream: "aaaa\nbbbb…bbbb\ncccc" — first 6 and last 6 characters.
+  assert.equal(captured?.text, "aaaa\nb" + OUTPUT_TRUNCATION_MARKER + "b\ncccc");
+  assert.equal(captured?.original_chars, 4 + 1 + 20 + 1 + 4);
+});
+
+test("captureText: an all-image result has no text; hostile parts are undefined, never a throw", () => {
+  assert.equal(captureText([{ type: "image", data: "eA==", mimeType: "image/png" }], 100), undefined);
+  assert.equal(captureText([], 100), undefined);
+  assert.equal(captureText("nope" as unknown as unknown[], 100), undefined);
+  assert.equal(captureText(null as unknown as unknown[], 100), undefined);
+  const hostile = [
+    new Proxy({}, { get: () => { throw new Error("getter exploded"); } }),
+  ];
+  assert.doesNotThrow(() => captureText(hostile, 100));
+  assert.equal(captureText(hostile, 100), undefined);
+});
+
+// --- The per-turn output budget -----------------------------------------------------------------
+
+test("once the turn's output budget is spent, results keep hash and bytes but no text", () => {
+  const store = createTurnStore();
+  store.recordPrompt("p", SESSION, 1);
+  const chunk = "x".repeat(MAX_TOOL_OUTPUT_CHARS);
+  const fits = Math.floor(MAX_TURN_OUTPUT_CHARS / MAX_TOOL_OUTPUT_CHARS);
+  for (let i = 0; i < fits + 2; i += 1) {
+    store.recordResult({
+      tool_name: "bash",
+      tool_use_id: `c${i}`,
+      is_error: false,
+      content_sha256: "a".repeat(64),
+      content_bytes: chunk.length,
+      content: chunk,
+    });
+  }
+  const results = store.snapshot().results;
+  assert.equal(results.filter((r) => r.content !== undefined).length, fits, "exactly the budget's worth");
+  const over = results.slice(fits);
+  for (const r of over) {
+    assert.equal(r.content, undefined);
+    assert.equal(r.content_omitted, true);
+    assert.equal(r.content_sha256, "a".repeat(64), "the hash still describes the output");
+    assert.equal(r.content_bytes, chunk.length);
+  }
+});
+
+test("the output budget resets on take() and on a session rollover", () => {
+  const store = createTurnStore();
+  const chunk = "y".repeat(MAX_TURN_OUTPUT_CHARS);
+  const fill = (id: string) =>
+    store.recordResult({ tool_name: "bash", tool_use_id: id, is_error: false, content_bytes: 1, content: chunk });
+
+  store.recordPrompt("one", SESSION, 1);
+  fill("a1");
+  fill("a2");
+  assert.equal(store.snapshot().results[1]?.content_omitted, true, "spent");
+  store.take();
+
+  store.recordPrompt("two", SESSION, 2);
+  fill("b1");
+  assert.equal(store.snapshot().results[0]?.content, chunk, "a fresh turn has a fresh budget");
+
+  store.recordPrompt("three", "another-session", 3);
+  fill("c1");
+  assert.equal(store.snapshot().results[0]?.content, chunk, "and so does a rolled-over record");
 });

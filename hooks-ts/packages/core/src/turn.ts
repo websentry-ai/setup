@@ -1,14 +1,17 @@
 // The in-memory turn record (HOOK-06 / RES-04) — what happened during one turn, and nothing more.
 //
-// Three deliberate absences define this module.
+// Three deliberate limits define this module.
 //
-//   * **No raw tool output.** A result is recorded as a tool name, an `isError` flag, a sha256 of a
-//     canonical projection and a byte count. The content itself is read once, projected, hashed and
-//     dropped; it is never stored, never serialised and never written anywhere. That is the whole
-//     requirement, and `turn.test.ts` proves it by grepping `snapshot()` for a marker string. Tool
-//     *input* is a different question and answered differently: a call stores the allowlisted
-//     projection the pretool request already sent (`tool_input`), because that is what makes the row
-//     say which command ran. Nothing here does the allowlisting — see that field.
+//   * **Tool output is held capped, and images never.** A result is recorded as a tool name, an
+//     `isError` flag, a sha256 of a canonical projection, a byte count — and, since HOOK-06's
+//     hash-only rule was reversed by user decision so tool-output DLP and MCP output audit can fire,
+//     the TEXT parts' content capped at `MAX_TOOL_OUTPUT_CHARS` with both ends kept (`captureText`),
+//     under a per-turn budget of `MAX_TURN_OUTPUT_CHARS`. Image parts are hashed and counted and
+//     their base64 is never stored; `turn.test.ts` proves it by grepping `snapshot()` for a marker
+//     hidden in one. Nothing is written anywhere: the text lives until `agent_end` posts it (redacted
+//     there, in `turnLog.ts`). Tool *input* is a different question and answered differently: a call
+//     stores the allowlisted projection the pretool request already sent (`tool_input`), because that
+//     is what makes the row say which command ran. Nothing here does the allowlisting — see that field.
 //   * **No `model`.** 09-CONTEXT's record shape lists one, and it is deliberately omitted here: the
 //     wire value is pinned to `TURNLOG_MODEL` (`"auto"`) because the backend drops the row for any id
 //     that is not an enabled `AIModel` (`add_gateway_metrics_task.py:565-577`). Keeping a real model
@@ -43,7 +46,13 @@
 
 import { createHash } from "node:crypto";
 
-import { MAX_HASH_BYTES, MAX_TURN_RESULTS, MAX_TURN_TOOL_CALLS } from "./constants.ts";
+import {
+  MAX_HASH_BYTES,
+  MAX_TURN_OUTPUT_CHARS,
+  MAX_TURN_RESULTS,
+  MAX_TURN_TOOL_CALLS,
+  OUTPUT_TRUNCATION_MARKER,
+} from "./constants.ts";
 
 /** pi's `TextContent` (`AI/dist/types.d.ts:242-246`). `textSignature` is provider metadata. */
 export interface TextPart {
@@ -109,6 +118,21 @@ export interface TurnResult {
   content_sha256?: string;
   content_bytes: number;
   hash_skipped?: boolean;
+  /** The text parts of the output, capped by `captureText`. Absent: no text, or over the budget. */
+  content?: string;
+  /** Only ever `true`: `content` is a head + marker + tail of the output, not all of it. */
+  content_truncated?: true;
+  /** The full text length (UTF-16 units) when `content_truncated` is set. */
+  content_original_chars?: number;
+  /** Only ever `true`: there was text, but the turn's `MAX_TURN_OUTPUT_CHARS` budget was spent. */
+  content_omitted?: true;
+}
+
+/** What `captureText` hands back: the text to keep, and whether it is all of it. */
+export interface CapturedText {
+  text: string;
+  truncated?: true;
+  original_chars?: number;
 }
 
 export interface TurnRecord {
@@ -260,8 +284,87 @@ function copyInput(input: Record<string, unknown>): Record<string, unknown> {
   }
 }
 
+/** The text of a part, or `undefined` for anything that is not a `type:"text"` part with a string. */
+function textOf(part: unknown): string | undefined {
+  if (part === null || typeof part !== "object") return undefined;
+  const record = part as { type?: unknown; text?: unknown };
+  return record.type === "text" && typeof record.text === "string" ? record.text : undefined;
+}
+
+/**
+ * A flat copy of `value`. V8 can represent `big.slice(…)` as a view that keeps `big` alive, and
+ * `big` here can be a 100 MB `read`; a UTF-8 round trip forces a fresh, standalone string. Only ever
+ * applied to text already bounded by the cap.
+ */
+function flatten(value: string): string {
+  return Buffer.from(value, "utf8").toString("utf8");
+}
+
+/**
+ * The TEXT of a tool result, capped at `maxChars` with both ends kept — or `undefined` when there is
+ * no text part at all (an all-image result, an empty array, a hostile input).
+ *
+ * Same discipline as `hashContent`: the parts are SIZED first without concatenating them, and an
+ * over-cap output only ever has its first `maxChars/2` and last `maxChars/2` characters collected,
+ * across part boundaries (parts are joined with `\n`, as `hashContent` separates them). Image parts are
+ * skipped entirely — base64 is never captured. The result is flattened so it cannot pin a huge parent
+ * string in memory for the rest of the turn. Total.
+ */
+export function captureText(parts: readonly unknown[], maxChars: number): CapturedText | undefined {
+  try {
+    if (!Array.isArray(parts)) return undefined;
+    const texts: string[] = [];
+    for (const part of parts) {
+      const text = textOf(part);
+      if (text !== undefined) texts.push(text);
+    }
+    if (texts.length === 0) return undefined;
+
+    let total = 0;
+    for (let i = 0; i < texts.length; i += 1) total += (i > 0 ? 1 : 0) + texts[i]!.length;
+    const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
+    if (total <= cap) return { text: flatten(texts.join("\n")) };
+
+    const headBudget = Math.ceil(cap / 2);
+    const tailBudget = cap - headBudget;
+    // The joined stream is `texts[0] + "\n" + texts[1] + …`, walked as segments so nothing is joined.
+    const segments: string[] = [];
+    for (let i = 0; i < texts.length; i += 1) {
+      if (i > 0) segments.push("\n");
+      segments.push(texts[i]!);
+    }
+    let head = "";
+    for (const segment of segments) {
+      const room = headBudget - head.length;
+      if (room <= 0) break;
+      head += segment.length <= room ? segment : segment.slice(0, room);
+    }
+    let tail = "";
+    for (let i = segments.length - 1; i >= 0; i -= 1) {
+      const room = tailBudget - tail.length;
+      if (room <= 0) break;
+      const segment = segments[i]!;
+      tail = (segment.length <= room ? segment : segment.slice(segment.length - room)) + tail;
+    }
+    return {
+      text: flatten(head) + OUTPUT_TRUNCATION_MARKER + flatten(tail),
+      truncated: true,
+      original_chars: total,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 export function createTurnStore(): TurnStore {
   let record: TurnRecord = { tool_calls: [], results: [] };
+  /** Output characters stored in THIS record — the `MAX_TURN_OUTPUT_CHARS` budget. */
+  let outputChars = 0;
+  /** A new, empty record — and a fresh budget with it. Every replacement goes through here. */
+  const fresh = (): TurnRecord => {
+    outputChars = 0;
+    return { tool_calls: [], results: [] };
+  };
 
   const started = (): boolean => record.prompt !== undefined || record.tool_calls.length > 0;
 
@@ -277,7 +380,7 @@ export function createTurnStore(): TurnStore {
     // backstop for any path that reaches a record before `session_start` resets it; `user_bash` is
     // the one that made it necessary, because pi fires no `agent_end` for a bare `!cmd`.
     if (incoming !== undefined && record.session_id !== undefined && record.session_id !== incoming) {
-      record = { tool_calls: [], results: [] };
+      record = fresh();
     }
     // Per-entry attribution, for the case the whole-record check above cannot see (WR-04). A `ctx`
     // whose session id is unreadable stamps `record.session_id` with nothing, so a later real id
@@ -306,7 +409,7 @@ export function createTurnStore(): TurnStore {
         const incoming = idOf(sessionId);
         if (incoming === undefined) return;
         if (record.session_id === incoming) return;
-        record = { tool_calls: [], results: [] };
+        record = fresh();
       } catch {
         // Total by contract — see the header.
       }
@@ -385,6 +488,22 @@ export function createTurnStore(): TurnStore {
         };
         if (typeof entry.content_sha256 === "string") stored.content_sha256 = entry.content_sha256;
         if (entry.hash_skipped === true) stored.hash_skipped = true;
+        // The output text, under the per-turn budget. Over it, the text is dropped and the row says
+        // so; the hash and the byte count above still describe the output.
+        if (typeof entry.content === "string") {
+          if (outputChars + entry.content.length > MAX_TURN_OUTPUT_CHARS) {
+            stored.content_omitted = true;
+          } else {
+            stored.content = entry.content;
+            outputChars += entry.content.length;
+            if (entry.content_truncated === true) stored.content_truncated = true;
+            if (typeof entry.content_original_chars === "number" && Number.isFinite(entry.content_original_chars)) {
+              stored.content_original_chars = entry.content_original_chars;
+            }
+          }
+        } else if (entry.content_omitted === true) {
+          stored.content_omitted = true;
+        }
         record.results.push(stored);
       } catch {
         // ditto
@@ -395,17 +514,17 @@ export function createTurnStore(): TurnStore {
      * Consumes the record unconditionally, and answers `undefined` when there was nothing postable.
      *
      * The reset is NOT conditional on the record being postable, and that is the point. A turn can
-     * collect results without ever starting — a custom or MCP tool takes the nothing-evaluable skip
-     * and records no decision, an extension-sourced prompt records no prompt — and an early return
-     * here left those results in place, where `agent_end` could never drain them. They then belonged
-     * to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
+     * collect results without ever starting — a custom tool (or an MCP call nobody could resolve)
+     * takes the nothing-evaluable skip and records no decision, an extension-sourced prompt records
+     * no prompt — and an early return here left those results in place, where `agent_end` could
+     * never drain them. They then belonged to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
      * fail to match them by `tool_use_id`. Consumed and dropped is the honest outcome.
      */
     take(): TurnRecord | undefined {
       try {
         const taken = record;
         const postable = started();
-        record = { tool_calls: [], results: [] };
+        record = fresh();
         return postable ? taken : undefined;
       } catch {
         return undefined;

@@ -17,10 +17,15 @@
 //      key that cannot ride a pretool check cannot ride an audit row either. `turnLog.test.ts`
 //      asserts both halves — `content`/`edits` absent, `command`/`path`/`pattern` present — rather
 //      than trusting this paragraph.
-//   3. **`tool_response` carries `{content_sha256, content_bytes}`** — HOOK-06's whole point. This is
-//      also a documented parity gap: `audit_service.py:113-139` feeds the serialised `tool_use` array
-//      (including `tool_response`) to DLP, so **tool-output DLP cannot fire for pi**. That is a direct
-//      consequence of the locked requirement, not a bug.
+//   3. **`tool_response` carries the tool's text output, capped and redacted**, alongside
+//      `{content_sha256, content_bytes}`. HOOK-06 used to make it hash-only, and that was reversed by
+//      user decision: `audit_service.py:113-139` feeds the serialised `tool_use` array (including
+//      `tool_response`) to DLP, so hash-only meant **tool-output DLP could not fire for pi**, and an MCP
+//      call's output could never be audited. The text is the record's `captureText` capture (8 KB per
+//      result, both ends; 128 KB per turn), scrubbed with `redactSecrets` HERE, at post time, because
+//      the key lives in the post options. Image parts are never captured — hash and bytes only.
+//      `is_error`, `content_truncated`, `content_original_chars` and `content_omitted` ride only when
+//      they say something.
 //   4. **The assistant `content` is the model's own text**, capped at `MAX_ASSISTANT_CHARS`. It used
 //      to be hard-coded `""`, on the reasoning that the turn record holds no assistant text and
 //      inventing one would be new egress. The record still holds none: the text is read off
@@ -41,11 +46,23 @@ import type { AccountIdentity } from "./accountIdentity.ts";
 import { capCommand, withAccountIdentity } from "./payload.ts";
 import type { TurnRecord } from "./turn.ts";
 
-/** The hash pair, or the honest statement that the output was too big to hash. */
+/**
+ * `{}` for a call with no result; otherwise the hash pair (or the honest statement that the output was
+ * too big to hash) plus, when captured, the redacted text and its present-only flags.
+ */
 export type ToolResponse =
   | Record<string, never>
-  | { content_sha256: string; content_bytes: number }
-  | { hash_skipped: true; content_bytes: number };
+  | ({ content_bytes: number } & (
+      | { content_sha256: string; hash_skipped?: never }
+      | { hash_skipped: true; content_sha256?: never }
+      | { content_sha256?: never; hash_skipped?: never }
+    ) & {
+      content?: string;
+      is_error?: true;
+      content_truncated?: true;
+      content_original_chars?: number;
+      content_omitted?: true;
+    });
 
 export interface TurnLogToolUse {
   type: string;
@@ -208,20 +225,39 @@ function capAssistantText(text: unknown, apiKey?: string): { content: string; tr
   }
 }
 
-/** `{}` for a call with no result, the hash pair otherwise. Never the raw output. */
-function toolResponseFor(record: TurnRecord, toolUseId: string): ToolResponse {
+/**
+ * `{}` for a call with no result; otherwise the digest (or `hash_skipped`), the byte count and — when
+ * the record captured any — the output text, redacted here, at post time.
+ *
+ * Redaction is per result, after the cap: a token split exactly at the head/tail boundary of a capped
+ * output can survive in part. That is accepted — the cap is what bounds the egress, `redactSecrets`
+ * only knows `Bearer …` and the session key anyway, and server-side DLP scans what arrives.
+ */
+function toolResponseFor(record: TurnRecord, toolUseId: string, apiKey?: string): ToolResponse {
   const results = Array.isArray(record.results) ? record.results : [];
   // Matched by id, not by position: a batch can finish out of order, and mis-pairing a digest with
   // another tool's call would make the audit trail actively misleading.
   const match = results.find((entry) => entry?.tool_use_id === toolUseId);
   if (match === undefined) return {};
+  const bytes = typeof match.content_bytes === "number" ? match.content_bytes : 0;
+  let response: ToolResponse;
   if (match.hash_skipped === true) {
-    return { hash_skipped: true, content_bytes: match.content_bytes };
+    response = { hash_skipped: true, content_bytes: bytes };
+  } else if (typeof match.content_sha256 === "string") {
+    response = { content_sha256: match.content_sha256, content_bytes: bytes };
+  } else if (typeof match.content !== "string") {
+    return {};
+  } else {
+    response = { content_bytes: bytes };
   }
-  if (typeof match.content_sha256 === "string") {
-    return { content_sha256: match.content_sha256, content_bytes: match.content_bytes };
+  if (typeof match.content === "string") response.content = redactSecrets(match.content, apiKey);
+  if (match.is_error === true) response.is_error = true;
+  if (match.content_truncated === true) response.content_truncated = true;
+  if (typeof match.content_original_chars === "number") {
+    response.content_original_chars = match.content_original_chars;
   }
-  return {};
+  if (match.content_omitted === true) response.content_omitted = true;
+  return response;
 }
 
 /**
@@ -264,7 +300,11 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
       // `call`-derived, and still never `event.input`-derived: what the record holds was already
       // allowlisted and capped by `auditToolInput` — header decision 2.
       tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
-      tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : ""),
+      tool_response: toolResponseFor(
+        safe,
+        typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
+        opts?.apiKey,
+      ),
     }));
   } catch {
     // Fall through with the defaults above: a degraded row beats a thrown handler.
