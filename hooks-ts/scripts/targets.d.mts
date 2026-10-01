@@ -21,3 +21,9 @@ export declare function metaFileOf(target: BuildTarget): string;
 export declare function artifactRelPath(target: BuildTarget): string;
 /** `<name>/index.js.sha256`, relative to the repo root. */
 export declare function sidecarRelPath(target: BuildTarget): string;
+
+/**
+ * Whether `moduleUrl` (an `import.meta.url`) is the module Node was asked to run, compared as real
+ * paths so a symlinked or absolute invocation still counts. `argv1` defaults to `process.argv[1]`.
+ */
+export declare function isMainModule(moduleUrl: string, argv1?: string): boolean;

@@ -15,7 +15,8 @@
 //
 // Each target owns its banner: the banner states the contract of that agent's extension API, which
 // is not the same from one agent to the next.
-import { pathToFileURL } from "node:url";
+import { realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const PI_BANNER = [
   "/**",
@@ -75,12 +76,31 @@ const LISTINGS = {
   "--sidecars": sidecarRelPath,
 };
 
+/**
+ * Is the module at `moduleUrl` the one Node was asked to run?
+ *
+ * Compared as REAL paths (WR-02). Node resolves symlinks for the main module's `import.meta.url`
+ * but not for `process.argv[1]`, so a plain URL comparison is false whenever the script is reached
+ * through a symlink (a checkout under a symlinked directory, `/tmp` -> `/private/tmp` on macOS) and
+ * the CLI silently does nothing and exits 0. For a drift gate, "did nothing" reads as "passed".
+ * Any failure to resolve either side is "not the main module", which a CLI below turns into nothing
+ * only when it was genuinely imported.
+ *
+ * @param {string} moduleUrl the caller's `import.meta.url`
+ * @param {string | undefined} [argv1] defaults to `process.argv[1]`
+ */
+export function isMainModule(moduleUrl, argv1 = process.argv[1]) {
+  try {
+    if (typeof argv1 !== "string" || argv1 === "") return false;
+    return realpathSync(argv1) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
 // CLI, for the shell loop in the workflow: one value per line. Guarded so that importing this
 // module prints nothing.
-const invokedDirectly =
-  typeof process.argv[1] === "string" && import.meta.url === pathToFileURL(process.argv[1]).href;
-
-if (invokedDirectly) {
+if (isMainModule(import.meta.url)) {
   const flag = process.argv[2];
   const listing = typeof flag === "string" && Object.hasOwn(LISTINGS, flag) ? LISTINGS[flag] : undefined;
   if (listing === undefined) {

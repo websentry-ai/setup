@@ -19,9 +19,9 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 
-import { TARGETS, artifactRelPath, distFileOf, sidecarRelPath } from "./targets.mjs";
+import { TARGETS, artifactRelPath, distFileOf, isMainModule, sidecarRelPath } from "./targets.mjs";
 
 const REFRESH = "cd hooks-ts && npm run build && npm run artifacts:sync";
 
@@ -133,9 +133,23 @@ function pathsOf(target) {
   };
 }
 
-function runCheck() {
+/**
+ * The `check` command. Exit code 0 only if at least one target was checked and every one passed:
+ * a gate must never report success without having compared anything (WR-02), so an empty table is
+ * a failure, and the last line always says how many targets were checked.
+ *
+ * @param {readonly { name: string }[]} [targets] defaults to TARGETS; injectable for the tests
+ * @returns {0 | 1}
+ */
+export function runCheck(targets = TARGETS) {
+  if (!Array.isArray(targets) || targets.length === 0) {
+    console.log("::error::no build targets to check — TARGETS in scripts/targets.mjs is empty");
+    return 1;
+  }
   let failed = false;
-  for (const target of TARGETS) {
+  let checked = 0;
+  for (const target of targets) {
+    checked += 1;
     const paths = pathsOf(target);
     const problems = checkTarget(paths);
     for (const problem of problems) {
@@ -150,10 +164,15 @@ function runCheck() {
       );
     }
   }
+  console.log(`checked ${checked} target(s): ${failed ? "FAILED" : "all OK"}`);
   return failed ? 1 : 0;
 }
 
 function runSync() {
+  if (TARGETS.length === 0) {
+    console.error("no build targets to sync — TARGETS in scripts/targets.mjs is empty");
+    return 1;
+  }
   let failed = false;
   for (const target of TARGETS) {
     const paths = pathsOf(target);
@@ -169,10 +188,8 @@ function runSync() {
   return failed ? 1 : 0;
 }
 
-const invokedDirectly =
-  typeof process.argv[1] === "string" && import.meta.url === pathToFileURL(process.argv[1]).href;
-
-if (invokedDirectly) {
+// Compared as real paths, so a symlinked or absolute invocation still runs the gate (WR-02).
+if (isMainModule(import.meta.url)) {
   const command = process.argv[2];
   if (command === "check") {
     process.exit(runCheck());

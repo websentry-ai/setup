@@ -16,3 +16,9 @@ export declare function checkTarget(paths: ArtifactPaths): string[];
 
 /** Copy the build over the artifact and rewrite its sidecar. Returns problems; never throws. */
 export declare function syncTarget(paths: ArtifactPaths): string[];
+
+/**
+ * The `check` command: 0 only if at least one target was checked and every one passed. An empty
+ * table is a failure. Logs one line per target plus a "checked N target(s)" summary.
+ */
+export declare function runCheck(targets?: readonly { readonly name: string }[]): 0 | 1;

@@ -8,18 +8,20 @@
 //      rather than a table entry plus two path filters plus two steps.
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
-import { checkTarget, syncTarget } from "./artifacts.mjs";
+import { checkTarget, runCheck, syncTarget } from "./artifacts.mjs";
 import {
   TARGETS,
   artifactRelPath,
   distFileOf,
+  isMainModule,
   metaFileOf,
   sidecarRelPath,
 } from "./targets.mjs";
@@ -118,6 +120,78 @@ test("the targets CLI prints one value per line, and importing it prints nothing
     { encoding: "utf8" },
   );
   assert.equal(imported, "");
+});
+
+/** A symlink to the repo root in a fresh temp dir, so a script reached through it has a non-real argv[1]. */
+function symlinkedRepo(t: { after(fn: () => void): void }): string {
+  const dir = mkdtempSync(join(tmpdir(), "hooks-ts-symlink-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const link = join(dir, "repo");
+  symlinkSync(resolve(hooksRoot, ".."), link, "dir");
+  return link;
+}
+
+/** Run a script with node and report status + stdout, whether it exits 0 or not. */
+function runNode(args: string[]): { status: number | null; stdout: string; stderr: string } {
+  const run = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 60_000 });
+  assert.equal(run.error, undefined, `node ${args.join(" ")} ran`);
+  return { status: run.status, stdout: run.stdout, stderr: run.stderr };
+}
+
+test("WR-02: the targets CLI works when invoked through a symlinked path", (t) => {
+  const link = symlinkedRepo(t);
+  const viaLink = join(link, "hooks-ts", "scripts", "targets.mjs");
+  assert.notEqual(realpathSync(viaLink), viaLink, "the invocation path really is a symlink");
+
+  for (const flag of ["--names", "--artifacts", "--sidecars"]) {
+    const direct = runNode([join(hooksRoot, "scripts", "targets.mjs"), flag]);
+    const linked = runNode([viaLink, flag]);
+    assert.equal(linked.status, 0, flag);
+    assert.notEqual(linked.stdout, "", `${flag}: printed nothing through the symlink`);
+    assert.equal(linked.stdout, direct.stdout, flag);
+  }
+  // And an unknown flag still fails through the symlink instead of silently exiting 0.
+  assert.equal(runNode([viaLink, "--nope"]).status, 2);
+});
+
+test("WR-02: artifacts check runs the gate when invoked through a symlinked path", (t) => {
+  const link = symlinkedRepo(t);
+  const viaLink = join(link, "hooks-ts", "scripts", "artifacts.mjs");
+  const direct = runNode([join(hooksRoot, "scripts", "artifacts.mjs"), "check"]);
+  const linked = runNode([viaLink, "check"]);
+
+  // Whatever the state of dist/ (this test does not build), the symlinked run must do exactly what
+  // the direct run does: check every target, report each one, and exit with the same status.
+  assert.equal(linked.status, direct.status, `same verdict (stdout: ${linked.stdout})`);
+  assert.notEqual(linked.stdout, "", "a gate that printed nothing did not check anything");
+  for (const target of TARGETS) {
+    assert.match(linked.stdout, new RegExp(`(^OK ${target.name}:|^::error::${target.name}:)`, "m"), target.name);
+  }
+  assert.match(linked.stdout, new RegExp(`^checked ${TARGETS.length} target\\(s\\): `, "m"));
+  // An unknown command still fails through the symlink.
+  assert.equal(runNode([viaLink, "nope"]).status, 2);
+});
+
+test("WR-02: isMainModule compares real paths and is false for anything unresolvable", (t) => {
+  const link = symlinkedRepo(t);
+  const real = join(hooksRoot, "scripts", "targets.mjs");
+  const url = pathToFileURL(real).href;
+  assert.equal(isMainModule(url, real), true);
+  assert.equal(isMainModule(url, join(link, "hooks-ts", "scripts", "targets.mjs")), true);
+  assert.equal(isMainModule(url, join(hooksRoot, "scripts", "artifacts.mjs")), false);
+  assert.equal(isMainModule(url, join(hooksRoot, "scripts", "does-not-exist.mjs")), false);
+  assert.equal(isMainModule(url, ""), false);
+  assert.equal(isMainModule(url, undefined), false);
+  assert.equal(isMainModule("not a url", real), false);
+});
+
+test("WR-02: artifacts check never passes without having checked a target", (t) => {
+  const logged: string[] = [];
+  t.mock.method(console, "log", (line: unknown) => {
+    logged.push(String(line));
+  });
+  assert.equal(runCheck([]), 1);
+  assert.ok(logged.some((line) => line.includes("no build targets")), logged.join("\n"));
 });
 
 test("the targets CLI rejects an unknown flag rather than printing nothing", () => {
