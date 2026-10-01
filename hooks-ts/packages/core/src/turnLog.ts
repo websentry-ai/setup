@@ -22,8 +22,9 @@
 //      user decision: `audit_service.py:113-139` feeds the serialised `tool_use` array (including
 //      `tool_response`) to DLP, so hash-only meant **tool-output DLP could not fire for pi**, and an MCP
 //      call's output could never be audited. The text is the record's `captureText` capture (8 KB per
-//      result, both ends; 128 KB per turn), scrubbed with `redactSecrets` HERE, at post time, because
-//      the key lives in the post options. Image parts are never captured — hash and bytes only.
+//      result, both ends; 128 KB per turn), scrubbed with `redactSecrets` at capture time — over
+//      windows wider than each cut, so a secret straddling a cut cannot survive in part — and again
+//      here, at post time. Image parts are never captured — hash and bytes only.
 //      `is_error`, `content_truncated`, `content_original_chars` and `content_omitted` ride only when
 //      they say something.
 //   4. **The assistant `content` is the model's own text**, capped at `MAX_ASSISTANT_CHARS`. It used
@@ -233,9 +234,11 @@ function capAssistantText(text: unknown, apiKey?: string): { content: string; tr
  * `{}` for a call with no result; otherwise the digest (or `hash_skipped`), the byte count and — when
  * the record captured any — the output text, redacted here, at post time.
  *
- * Redaction is per result, after the cap: a token split exactly at the head/tail boundary of a capped
- * output can survive in part. That is accepted — the cap is what bounds the egress, `redactSecrets`
- * only knows `Bearer …` and the session key anyway, and server-side DLP scans what arrives.
+ * This is the SECOND redaction. The first runs at capture time (`captureText` with a `redact`
+ * function), over windows wider than each cut, so a token straddling the head/tail boundary is
+ * replaced before the cut can split it. This pass covers anything recorded without that (a test, a
+ * future caller). `redactSecrets` only knows `Bearer …` and the session key; server-side DLP scans
+ * what arrives.
  */
 function toolResponseFor(record: TurnRecord, toolUseId: string, apiKey?: string): ToolResponse {
   const results = Array.isArray(record.results) ? record.results : [];

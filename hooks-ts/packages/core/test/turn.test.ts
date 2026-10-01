@@ -782,3 +782,81 @@ test("recorded args with __proto__ / constructor keys survive copying as plain d
   assert.equal(Object.getPrototypeOf(recorded), Object.prototype);
   assert.equal(JSON.stringify(recorded), '{"__proto__":{"secret":"s"},"constructor":"c","q":"x"}');
 });
+
+// --- PR #371: redacted BEFORE the cut -------------------------------------------------------------
+
+const PR_KEY = "unb_live_" + "a1b2c3d4e5f6a7b8";
+/** The production redaction shape: bearer tokens by pattern, the session key by literal match. */
+const prRedact = (text: string): string =>
+  text.split(PR_KEY).join("[REDACTED]").replace(/Bearer\s+\S+/g, "Bearer [REDACTED]");
+
+/** Fragments of `secret` long enough to identify it (6+ chars). */
+function fragmentsOf(secret: string): string[] {
+  const out: string[] = [];
+  for (let i = 0; i + 6 <= secret.length; i += 1) out.push(secret.slice(i, i + 6));
+  return out;
+}
+
+function assertNoFragment(text: string, secret: string, label: string): void {
+  for (const fragment of fragmentsOf(secret)) {
+    assert.equal(text.includes(fragment), false, `${label}: fragment "${fragment}" survived`);
+  }
+}
+
+test("a secret straddling the head cut or the tail cut does not survive even in part", () => {
+  const half = MAX_TOOL_OUTPUT_CHARS / 2;
+  const TOKEN = "sk-live-0123456789abcdefSECRETTOKEN";
+  const total = 60_000;
+  const cases: [string, string, number][] = [
+    ["bearer at head cut", `Bearer ${TOKEN}`, half - 10],
+    ["bearer at tail cut", `Bearer ${TOKEN}`, total - half - 10],
+    ["session key at head cut", PR_KEY, half - 8],
+    ["session key at tail cut", PR_KEY, total - half - 8],
+  ];
+  for (const [label, secret, at] of cases) {
+    const text = "x".repeat(at) + " " + secret + " " + "y".repeat(total - at - secret.length - 2);
+    const captured = captureText([{ type: "text", text }], MAX_TOOL_OUTPUT_CHARS, prRedact);
+    assert.ok(captured?.truncated, label);
+    const body = secret.startsWith("Bearer") ? TOKEN : PR_KEY;
+    assertNoFragment(captured?.text ?? "", body, label);
+    assert.equal(captured?.original_chars, text.length, `${label}: the original length is reported`);
+  }
+});
+
+test("without capture-time redaction the straddling fragment WOULD survive (the bug the fix closes)", () => {
+  const half = MAX_TOOL_OUTPUT_CHARS / 2;
+  const text = "x".repeat(half - 8) + PR_KEY + "y".repeat(50_000);
+  const raw = captureText([{ type: "text", text }], MAX_TOOL_OUTPUT_CHARS)?.text ?? "";
+  // Post-time redaction of the cut text cannot match the split key...
+  assert.equal(prRedact(raw).includes(PR_KEY.slice(0, 8)), true);
+  // ...capture-time redaction removes it.
+  assertNoFragment(captureText([{ type: "text", text }], MAX_TOOL_OUTPUT_CHARS, prRedact)?.text ?? "", PR_KEY, "fixed");
+});
+
+test("small outputs are unchanged except for the redaction itself", () => {
+  assert.deepStrictEqual(captureText([{ type: "text", text: "plain output" }], 100, prRedact), { text: "plain output" });
+  assert.deepStrictEqual(
+    captureText([{ type: "text", text: `key=${PR_KEY} ok` }], 100, prRedact),
+    { text: "key=[REDACTED] ok" },
+  );
+});
+
+test("redaction work stays bounded by the cap plus two margins, whatever the output size", () => {
+  const seen: number[] = [];
+  const measuring = (text: string): string => {
+    seen.push(text.length);
+    return text;
+  };
+  captureText([{ type: "text", text: "z".repeat(50_000_000) }], MAX_TOOL_OUTPUT_CHARS, measuring);
+  assert.equal(seen.length, 2, "one head window, one tail window");
+  for (const length of seen) assert.ok(length <= MAX_TOOL_OUTPUT_CHARS / 2 + 4096, `window ${length}`);
+});
+
+test("a throwing redact loses the text, never the call", () => {
+  assert.equal(
+    captureText([{ type: "text", text: "x" }], 100, () => {
+      throw new Error("boom");
+    }),
+    undefined,
+  );
+});

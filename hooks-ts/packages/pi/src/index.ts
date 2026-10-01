@@ -103,7 +103,7 @@ import { NATIVE_FILE_TOOLS } from "../../core/src/payload.ts";
 import { buildHeartbeatPayload, createHeartbeatGate } from "../../core/src/heartbeat.ts";
 import type { HeartbeatGate } from "../../core/src/heartbeat.ts";
 import { buildTurnLogBody } from "../../core/src/turnLog.ts";
-import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
+import { redactSecrets, resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
 import { keyState } from "../../core/src/keyState.ts";
 import { resolveClientEntrypoint } from "../../core/src/piVersion.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
@@ -683,7 +683,8 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         // session that cannot post has no reader for what it records, and `recordToolResult` hashes
         // up to `MAX_HASH_BYTES` of output per call. Checked before the hash, not after it.
         if (!recordingActive(init())) return undefined;
-        recordToolResult(event, turnStore);
+        const apiKey = init().apiKey;
+        recordToolResult(event, turnStore, (text) => redactSecrets(text, apiKey));
       } catch {
         // Unreachable — `recordToolResult` is already total — and kept anyway: the cost of being
         // wrong about that is a rewritten tool result.

@@ -51,6 +51,7 @@ import {
   MAX_TURN_OUTPUT_CHARS,
   MAX_TURN_RESULTS,
   MAX_TURN_TOOL_CALLS,
+  OUTPUT_REDACTION_MARGIN_CHARS,
   OUTPUT_TRUNCATION_MARKER,
 } from "./constants.ts";
 
@@ -301,17 +302,52 @@ function flatten(value: string): string {
   return Buffer.from(value, "utf8").toString("utf8");
 }
 
+/** The first `n` characters of the joined segment stream, collected without joining the rest. */
+function headOf(segments: readonly string[], n: number): string {
+  let out = "";
+  for (const segment of segments) {
+    const room = n - out.length;
+    if (room <= 0) break;
+    out += segment.length <= room ? segment : segment.slice(0, room);
+  }
+  return out;
+}
+
+/** The last `n` characters of the joined segment stream. */
+function tailOf(segments: readonly string[], n: number): string {
+  let out = "";
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const room = n - out.length;
+    if (room <= 0) break;
+    const segment = segments[i]!;
+    out = (segment.length <= room ? segment : segment.slice(segment.length - room)) + out;
+  }
+  return out;
+}
+
 /**
  * The TEXT of a tool result, capped at `maxChars` with both ends kept — or `undefined` when there is
  * no text part at all (an all-image result, an empty array, a hostile input).
  *
  * Same discipline as `hashContent`: the parts are SIZED first without concatenating them, and an
- * over-cap output only ever has its first `maxChars/2` and last `maxChars/2` characters collected,
- * across part boundaries (parts are joined with `\n`, as `hashContent` separates them). Image parts are
- * skipped entirely — base64 is never captured. The result is flattened so it cannot pin a huge parent
- * string in memory for the rest of the turn. Total.
+ * over-cap output only ever has a head and a tail window collected, across part boundaries (parts
+ * are joined with `\n`, as `hashContent` separates them). Image parts are skipped entirely — base64
+ * is never captured. The result is flattened so it cannot pin a huge parent string in memory.
+ *
+ * **Redacted before it is cut** (PR #371). With a `redact` function, the head window is the first
+ * `maxChars/2 + margin` characters and the tail window the last `maxChars/2 + margin`; each is
+ * redacted whole and only then cut to its kept size. A secret that straddles a cut is therefore
+ * replaced before the cut could split it into an unrecognisable fragment — a guarantee a post-time
+ * redaction of the already-cut text cannot give. An output within the cap is redacted whole. The
+ * work stays bounded by the cap plus two margins, whatever the output's size. Total; a throwing
+ * `redact` loses the text, never the call.
  */
-export function captureText(parts: readonly unknown[], maxChars: number): CapturedText | undefined {
+export function captureText(
+  parts: readonly unknown[],
+  maxChars: number,
+  redact?: (text: string) => string,
+  margin: number = OUTPUT_REDACTION_MARGIN_CHARS,
+): CapturedText | undefined {
   try {
     if (!Array.isArray(parts)) return undefined;
     const texts: string[] = [];
@@ -320,33 +356,25 @@ export function captureText(parts: readonly unknown[], maxChars: number): Captur
       if (text !== undefined) texts.push(text);
     }
     if (texts.length === 0) return undefined;
+    const clean = (text: string): string => (redact === undefined ? text : redact(text));
 
     let total = 0;
     for (let i = 0; i < texts.length; i += 1) total += (i > 0 ? 1 : 0) + texts[i]!.length;
     const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
-    if (total <= cap) return { text: flatten(texts.join("\n")) };
+    if (total <= cap) return { text: flatten(clean(texts.join("\n"))) };
 
     const headBudget = Math.ceil(cap / 2);
     const tailBudget = cap - headBudget;
+    const extra = Number.isFinite(margin) && margin > 0 ? Math.floor(margin) : 0;
     // The joined stream is `texts[0] + "\n" + texts[1] + …`, walked as segments so nothing is joined.
     const segments: string[] = [];
     for (let i = 0; i < texts.length; i += 1) {
       if (i > 0) segments.push("\n");
       segments.push(texts[i]!);
     }
-    let head = "";
-    for (const segment of segments) {
-      const room = headBudget - head.length;
-      if (room <= 0) break;
-      head += segment.length <= room ? segment : segment.slice(0, room);
-    }
-    let tail = "";
-    for (let i = segments.length - 1; i >= 0; i -= 1) {
-      const room = tailBudget - tail.length;
-      if (room <= 0) break;
-      const segment = segments[i]!;
-      tail = (segment.length <= room ? segment : segment.slice(segment.length - room)) + tail;
-    }
+    const head = clean(headOf(segments, headBudget + extra)).slice(0, headBudget);
+    const redactedTail = clean(tailOf(segments, tailBudget + extra));
+    const tail = redactedTail.slice(Math.max(0, redactedTail.length - tailBudget));
     return {
       text: flatten(head) + OUTPUT_TRUNCATION_MARKER + flatten(tail),
       truncated: true,

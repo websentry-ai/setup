@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 
 import { MAX_HASH_BYTES, MAX_TOOL_OUTPUT_CHARS, OUTPUT_TRUNCATION_MARKER } from "../../core/src/constants.ts";
+import { redactSecrets } from "../../core/src/config.ts";
 import { createTurnStore } from "../../core/src/turn.ts";
 import { recordToolResult } from "../src/toolResult.ts";
 import { createFakeToolResultEvent } from "./helpers/fakeCtx.ts";
@@ -192,4 +193,22 @@ test("two results are recorded in order, one entry each", () => {
   assert.equal(results[0]?.tool_use_id, "c1");
   assert.equal(results[1]?.tool_use_id, "c2");
   assert.equal(results[1]?.is_error, true);
+});
+
+test("PR #371: a session key straddling the head cut is redacted before the cut (real redactSecrets)", () => {
+  const key = "unb_live_" + "f00dfacecafe1234";
+  const store = storeWithCall("call_straddle");
+  const text = "x".repeat(MAX_TOOL_OUTPUT_CHARS / 2 - 6) + key + "y".repeat(40_000);
+  recordToolResult(
+    createFakeToolResultEvent("bash", { toolCallId: "call_straddle", content: [{ type: "text", text }] }),
+    store,
+    (t) => redactSecrets(t, key),
+  );
+  const [only] = store.snapshot().results;
+  assert.equal(only?.content_truncated, true);
+  for (let i = 0; i + 6 <= key.length; i += 1) {
+    assert.equal(only?.content?.includes(key.slice(i, i + 6)), false, `fragment ${key.slice(i, i + 6)}`);
+  }
+  // Hash and byte count describe the ORIGINAL output, not the redacted text.
+  assert.equal(only?.content_bytes, Buffer.byteLength(`text:${text}`, "utf8"));
 });

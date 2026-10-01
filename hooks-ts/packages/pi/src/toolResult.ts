@@ -25,8 +25,10 @@
 // parts are captured at `MAX_TOOL_OUTPUT_CHARS`, both ends kept, so the turn log can carry the output
 // for tool-output DLP and MCP output audit (HOOK-06's hash-only rule, reversed by user decision).
 // Image parts are represented by the hash and byte count only; their base64 is never kept. The
-// per-turn budget and the redaction happen downstream (`turn.ts`, `turnLog.ts`). `event.input` is
-// not read at all: the call's input is recorded at the decision seam, already allowlisted.
+// text is redacted before it is cut (head and tail windows wider than each cut, `captureText`), so a
+// secret straddling a cut cannot survive in part; the per-turn budget and a second, post-time
+// redaction happen downstream (`turn.ts`, `turnLog.ts`). `event.input` is not read at all: the
+// call's input is recorded at the decision seam, already allowlisted.
 
 import type { ToolResultEvent } from "@earendil-works/pi-coding-agent";
 
@@ -60,12 +62,21 @@ export type ToolResultEventIsCompatible = ToolResultEvent extends ToolResultLike
  * throwing one). The `try` opens before the first statement: a malformed event, a hostile getter or a
  * store fault must all produce the same silent no-op.
  */
-export function recordToolResult(event: ToolResultLike, store: TurnStore): undefined {
+export function recordToolResult(
+  event: ToolResultLike,
+  store: TurnStore,
+  /**
+   * Scrub secrets from the captured text BEFORE it is cut (see `captureText`): the composition root
+   * binds it to `redactSecrets` and the session key. Optional so a test can capture raw text.
+   */
+  redact?: (text: string) => string,
+): undefined {
   try {
     const content = Array.isArray(event?.content) ? event.content : [];
     const hashed = hashContent(content);
     // Text parts only, capped at both ends; `undefined` for an output with no text (all images).
-    const captured = captureText(content, MAX_TOOL_OUTPUT_CHARS);
+    // Hash and byte count above are over the ORIGINAL content; only the kept text is redacted.
+    const captured = captureText(content, MAX_TOOL_OUTPUT_CHARS, redact);
     store.recordResult({
       tool_name: typeof event?.toolName === "string" ? event.toolName : "",
       tool_use_id: typeof event?.toolCallId === "string" ? event.toolCallId : "",

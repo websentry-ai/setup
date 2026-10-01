@@ -235,6 +235,14 @@ export const MAX_TURN_OUTPUT_CHARS = 131_072;
  */
 export const OUTPUT_TRUNCATION_MARKER = "\n...unbound: output truncated...\n";
 /**
+ * Context redacted around each cut of a capped tool output (4 KB). The head and the tail are each
+ * redacted as a window of their kept size PLUS this margin, and only then cut, so a secret that
+ * straddles a cut is replaced whole before the cut can split it — without redacting a 100 MB output
+ * on the awaited `tool_result` path. A token longer than the margin can still straddle the outer
+ * edge of the tail window; server-side DLP is the backstop.
+ */
+export const OUTPUT_REDACTION_MARGIN_CHARS = 4096;
+/**
  * The same backstop for `tool_calls` (WR-04), and the path that made it necessary is not
  * hypothetical: `user_bash` records a tool call, and pi fires no `agent_end` for a bare `!cmd`
  * (RESEARCH §F3), so nothing calls `take()` and that entry lives for the whole session.
