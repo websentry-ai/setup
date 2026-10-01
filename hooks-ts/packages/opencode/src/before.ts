@@ -18,11 +18,23 @@
 // is compared with the executed args in 13-06 (HOOK-18).
 
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
-import { evaluateToolCall } from "../../core/src/evaluate.ts";
+import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
+import { evaluateToolCall, noteSafe } from "../../core/src/evaluate.ts";
 import type { EvaluateDeps, ToolCallInput, ToolEvaluation } from "../../core/src/evaluate.ts";
 import { block } from "./block.ts";
-import { PATCH_CONCURRENCY, SIGNAL_PATCH_TARGETS_CAPPED } from "./constants.ts";
-import { applyPatchTargets, argsDigest, shellCommandOf, shellCwdOf, SHELL_TOOLS } from "./narrow.ts";
+import { auditToolInput } from "../../core/src/payload.ts";
+import { PATCH_CONCURRENCY, SIGNAL_MCP_ATTRIBUTION_MISS, SIGNAL_PATCH_TARGETS_CAPPED } from "./constants.ts";
+import {
+  applyPatchTargets,
+  argsDigest,
+  BUILTIN_TOOLS,
+  mcpResourceTarget,
+  resolveMcpTool,
+  shellCommandOf,
+  shellCwdOf,
+  SHELL_TOOLS,
+  TASK_TOOL,
+} from "./narrow.ts";
 import { notify } from "./notify.ts";
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
 import { OPENCODE_PROFILE } from "./profile.ts";
@@ -81,7 +93,15 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     const resolved = runtime.init();
     const checker = resolved.checker;
     const scope = resolved.scope;
-    if (checker === undefined || scope === undefined) return undefined;
+    // No key ⇒ inert (RES-06): no request, no verdict, one notice per directory.
+    if (checker === undefined || scope === undefined) {
+      const instance = runtime.instances.forDirectory(record.directory);
+      if (!instance.noKeyNoticeShown) {
+        instance.noKeyNoticeShown = true;
+        void notify(record.client, NO_KEY_NOTICE, "info");
+      }
+      return undefined;
+    }
 
     const tool = readString(input, "tool");
     const sessionID = readString(input, "sessionID");
@@ -89,6 +109,36 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     const rawArgs = readField(output, "args");
     const args: Record<string, unknown> = isPlainObject(rawArgs) ? rawArgs : {};
     const directory = record.directory;
+
+    // `task` (HOOK-11): audited, never sent for a decision, so it can never be denied. A deny here
+    // would strand the subtask part: opencode triggers the subtask outside the tool's error capture
+    // (Pitfall 12). The child session's own tool calls are each enforced on their own.
+    if (tool === TASK_TOOL) {
+      if (runtime.recordingActive()) {
+        noteSafe(() =>
+          runtime.turnFor(sessionID).recordToolCall(
+            {
+              tool_name: TASK_TOOL,
+              tool_use_id: callID,
+              decision: "audited",
+              tool_input: auditToolInput({}, "", OPENCODE_PROFILE.extraToolInputKeys),
+            },
+            sessionID,
+          ),
+        );
+      }
+      return undefined;
+    }
+
+    // MCP (HOOK-13): attribution only from the call's own server argument (resource tools) or the
+    // longest configured server-name prefix; never by splitting the id. A non-built-in tool that
+    // matches no configured server is reported and evaluated without MCP metadata (core then skips
+    // it as nothing-evaluable unless it carries something else the server evaluates).
+    const builtin = BUILTIN_TOOLS.has(tool);
+    const mcp = mcpResourceTarget(tool, args) ?? (builtin ? undefined : resolveMcpTool(tool, record.mcpServerNames));
+    if (mcp === undefined && !builtin && record.mcpServerNames.length > 0) {
+      runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_MISS, tool, "unresolved");
+    }
 
     const identity: AccountIdentity | undefined = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
@@ -141,10 +191,15 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
         cwd: SHELL_TOOLS.has(tool) ? shellCwdOf(args, directory) : directory,
         sessionId: sessionID,
         model,
+        ...(mcp === undefined ? {} : { mcp }),
       };
       verdict = await evaluateToolCall(call, evalDeps);
     }
 
+    // deny → the deny text; confirm (ask / approval_required) → the approval text, because v1 cannot
+    // ask; unavailable → core's engine-unavailable text, which core only returns for a fail-closed
+    // org. RES-11: core files that case as `blocked_due_to_failure` and a fail-open failure as
+    // `bypassed_due_to_failure` (`reportBypass({ blocked })`), so the two never share a category.
     const message = blockingMessage(verdict);
     if (message === undefined) {
       runtime.rememberDigest(sessionID, callID, argsDigest(rawArgs));
