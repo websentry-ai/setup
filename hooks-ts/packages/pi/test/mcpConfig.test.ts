@@ -1,9 +1,10 @@
-// `mcp_server_config` lookup by the broker's exact server name (Revision 2).
+// `mcp_server_config` lookup — strict-or-omit (Revision 3).
 //
-// The rule with security weight: when this reader cannot be sure it sees what the adapter sees, it
-// answers `undefined` (config omitted) — never a possibly wrong config, which could lend an
-// unsanctioned server a sanctioned fingerprint (review CR-02). So the JSONC parser is pinned against
-// the edge cases `strip-json-comments` handles, and every "cannot be sure" case is asserted to omit.
+// The rule with security weight: a config is described ONLY when every source is in a shape whose
+// meaning is unambiguous, and the files are still the ones the adapter loaded. Everything else omits
+// — for every server — because a wrong config can lend an unsanctioned binary a sanctioned server's
+// fingerprint. So most cases here assert ABSENCE; the positive cases at the top prove the feature is
+// not dead for an ordinary configuration.
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -13,19 +14,13 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { createFakeHome } from "../../core/test/helpers/fakeHome.ts";
-import {
-  createMcpConfigReader,
-  mcpConfigOverride,
-  mcpConfigSources,
-  parseJsonc,
-  stripJsonComments,
-} from "../src/mcpConfig.ts";
+import { createMcpConfigReader, hasMcpConfigFlag, mcpConfigSources } from "../src/mcpConfig.ts";
 
 interface Fixture {
   homeDir: string;
   cwd: string;
   agentDir: string;
-  write(path: string, content: string): void;
+  write(path: string, content: unknown): void;
   cleanup(): void;
 }
 
@@ -38,7 +33,7 @@ function fixture(): Fixture {
     agentDir: join(home.homeDir, ".pi", "agent"),
     write(path, content) {
       mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, content);
+      writeFileSync(path, typeof content === "string" ? content : JSON.stringify(content));
     },
     cleanup() {
       home.cleanup();
@@ -50,184 +45,205 @@ function fixture(): Fixture {
 const lookup = (f: Fixture, server: string, env: NodeJS.ProcessEnv = {}, argv: string[] = []) =>
   createMcpConfigReader({ env, homeDir: f.homeDir, argv }).serverConfig(server, f.cwd);
 
-// --- JSONC -------------------------------------------------------------------------------------
+const GLOBAL = (f: Fixture) => join(f.homeDir, ".config", "mcp", "mcp.json");
+const PROJECT = (f: Fixture) => join(f.cwd, ".mcp.json");
+const PROJECT_PI = (f: Fixture) => join(f.cwd, ".pi", "mcp-adapter.json");
 
-test("stripJsonComments: comments and trailing commas outside strings only", () => {
-  const text = `{
-    // line comment with "quotes", and a comma,
-    "url": "https://x.invalid/a//b?c=/*not*/", /* block, */
-    "s": "a \\"quoted, // still string\\" b",
-    "list": [1, 2, /* c */ ],
-    "o": { "k": 1, },
-  }`;
-  assert.deepStrictEqual(JSON.parse(stripJsonComments(text)), {
-    url: "https://x.invalid/a//b?c=/*not*/",
-    s: 'a "quoted, // still string" b',
-    list: [1, 2],
-    o: { k: 1 },
-  });
-});
+// --- The feature is alive ----------------------------------------------------------------------
 
-test("parseJsonc: a BOM is accepted, and invalid JSON still throws", () => {
-  assert.deepStrictEqual(parseJsonc('﻿{"a": 1}'), { a: 1 });
-  assert.throws(() => parseJsonc("{ nope"));
-  assert.throws(() => parseJsonc('{"a": 1,, }'));
-});
-
-// --- Sources -----------------------------------------------------------------------------------
-
-test("sources: the adapter's order; --mcp-config replaces the adapter file; exclusive reads only it", () => {
+test("a plain strict-JSON single source sends the config", () => {
   const f = fixture();
   try {
-    const base = mcpConfigSources({ env: {}, homeDir: f.homeDir, argv: [] }, f.cwd);
-    assert.deepStrictEqual(base, [
-      join(f.homeDir, ".config", "mcp", "mcp.json"),
-      join(f.homeDir, ".agents", "mcp.json"),
-      join(f.homeDir, ".agents", "mcp", "mcp.json"),
-      join(f.agentDir, "mcp-adapter.json"),
-      join(f.cwd, ".mcp.json"),
-      join(f.cwd, ".pi", "mcp-adapter.json"),
-    ]);
-    const override = join(f.cwd, "custom.json");
-    assert.equal(mcpConfigOverride(["pi", "--mcp-config", override]), override);
-    assert.equal(mcpConfigOverride(["pi", `--mcp-config=${override}`]), override);
-    assert.equal(mcpConfigOverride(["pi"]), undefined);
-    const withOverride = mcpConfigSources({ env: {}, homeDir: f.homeDir, argv: ["--mcp-config", override] }, f.cwd);
-    assert.equal(withOverride[3], override);
-    assert.equal(withOverride.includes(join(f.agentDir, "mcp-adapter.json")), false);
-    assert.deepStrictEqual(
-      mcpConfigSources({ env: { PI_MCP_CONFIG_MODE: "exclusive" }, homeDir: f.homeDir, argv: [] }, f.cwd),
-      [join(f.agentDir, "mcp-adapter.json")],
-    );
-    // A global path that IS the adapter file is read once, at the adapter-file position.
-    const generic = join(f.homeDir, ".config", "mcp", "mcp.json");
-    const same = mcpConfigSources({ env: {}, homeDir: f.homeDir, argv: ["--mcp-config", generic] }, f.cwd);
-    assert.equal(same.filter((p) => p === generic).length, 1);
-    assert.equal(same.indexOf(generic), 2);
+    f.write(PROJECT(f), { mcpServers: { github: { command: "npx", args: ["-y", "srv"], env: { K: "SECRET" } } } });
+    assert.deepStrictEqual(lookup(f, "github"), { command: "npx", args: ["-y", "srv"] });
+    f.write(GLOBAL(f), { mcpServers: { remote: { url: "https://r.invalid/mcp", type: "http", headers: { A: "SECRET" } } } });
+    assert.deepStrictEqual(lookup(f, "remote"), { url: "https://r.invalid/mcp", type: "http" });
   } finally {
     f.cleanup();
   }
 });
 
-test("later sources win per field; a later url drops command/args and vice versa", () => {
+test("a two-source override sends the merged config (later wins; url drops command/args)", () => {
   const f = fixture();
   try {
-    f.write(join(f.homeDir, ".config", "mcp", "mcp.json"), '{"mcpServers": {"s": {"command": "c", "args": ["1"]}, "t": {"url": "https://t.invalid"}}}');
-    f.write(join(f.homeDir, ".agents", "mcp.json"), '{"mcpServers": {"s": {"args": ["2"], "type": "stdio"}}}');
-    f.write(join(f.cwd, ".mcp.json"), '{"mcpServers": {"t": {"command": "tc"}}}');
-    assert.deepStrictEqual(lookup(f, "s"), { command: "c", args: ["2"], type: "stdio" });
-    assert.deepStrictEqual(lookup(f, "t"), { command: "tc" });
+    f.write(GLOBAL(f), { mcpServers: { s: { command: "c", args: ["1"] }, t: { command: "tc", args: ["x"] } } });
+    f.write(PROJECT(f), { mcpServers: { s: { args: ["2"] }, t: { url: "https://t.invalid" } } });
+    assert.deepStrictEqual(lookup(f, "s"), { command: "c", args: ["2"] });
+    assert.deepStrictEqual(lookup(f, "t"), { url: "https://t.invalid" });
   } finally {
     f.cleanup();
   }
 });
 
-// --- Unknown ⇒ omitted --------------------------------------------------------------------------
-
-test("omitted: server not found, or a server with neither url nor command", () => {
-  const f = fixture();
-  try {
-    f.write(join(f.cwd, ".mcp.json"), '{"mcpServers": {"bare": {"type": "x"}}}');
-    assert.equal(lookup(f, "missing"), undefined);
-    assert.equal(lookup(f, "bare"), undefined);
-  } finally {
-    f.cleanup();
-  }
-});
-
-test("omitted: any existing source that is unparseable, a directory, over-unreadable, or a FIFO", () => {
-  const variants: [string, (f: Fixture, path: string) => void][] = [
-    ["unparseable", (f, path) => f.write(path, "{ nope")],
-    ["directory", (_f, path) => mkdirSync(path, { recursive: true })],
-    ["fifo", (_f, path) => {
-      mkdirSync(dirname(path), { recursive: true });
-      execFileSync("mkfifo", [path]);
-    }],
-  ];
-  for (const [name, plant] of variants) {
-    const f = fixture();
-    try {
-      f.write(join(f.cwd, ".mcp.json"), '{"mcpServers": {"s": {"url": "https://s.invalid"}}}');
-      plant(f, join(f.homeDir, ".agents", "mcp.json"));
-      assert.equal(lookup(f, "s"), undefined, `${name}: never a config from a partial view`);
-    } finally {
-      f.cleanup();
-    }
-  }
-});
-
-test("omitted: a source pulling in servers this reader does not model (imports, ancestor roots)", () => {
-  for (const extra of ['"imports": ["cursor"]', '"settings": {"ancestorConfigRoots": ["~/work"]}']) {
-    const f = fixture();
-    try {
-      f.write(join(f.homeDir, ".config", "mcp", "mcp.json"), `{${extra}, "mcpServers": {"s": {"url": "https://s.invalid"}}}`);
-      assert.equal(lookup(f, "s"), undefined, extra);
-    } finally {
-      f.cleanup();
-    }
-  }
-});
-
-test("not omitted: an empty or comment-only file is skipped like the adapter skips it", () => {
-  const f = fixture();
-  try {
-    f.write(join(f.homeDir, ".config", "mcp", "mcp.json"), "  // nothing yet\n");
-    f.write(join(f.cwd, ".mcp.json"), '{"mcpServers": {"s": {"url": "https://s.invalid"}}}');
-    assert.deepStrictEqual(lookup(f, "s"), { url: "https://s.invalid" });
-  } finally {
-    f.cleanup();
-  }
-});
-
-test("symlinked sources are followed (dotfile managers)", () => {
+test("a BOM, symlinks and an empty file are accepted", () => {
   const f = fixture();
   try {
     const target = join(f.cwd, "dotfiles", "mcp.json");
-    f.write(target, '{"mcpServers": {"s": {"url": "https://linked.invalid"}}}');
-    mkdirSync(join(f.homeDir, ".config", "mcp"), { recursive: true });
-    symlinkSync(target, join(f.homeDir, ".config", "mcp", "mcp.json"));
+    f.write(target, `﻿${JSON.stringify({ mcpServers: { s: { url: "https://linked.invalid" } } })}`);
+    mkdirSync(dirname(GLOBAL(f)), { recursive: true });
+    symlinkSync(target, GLOBAL(f));
+    f.write(PROJECT(f), "  \n");
     assert.deepStrictEqual(lookup(f, "s"), { url: "https://linked.invalid" });
   } finally {
     f.cleanup();
   }
 });
 
-test("only url / command / args / type are ever read into the config", () => {
+// --- Strict: anything not fully modelled omits, for every server -----------------------------------
+
+const OMIT_SOURCES: [string, string][] = [
+  ["a // comment", '// c\n{"mcpServers":{"s":{"url":"https://s.invalid"}}}'],
+  ["a trailing comma", '{"mcpServers":{"s":{"url":"https://s.invalid"},}}'],
+  ["a top-level non-object", "[1]"],
+  ["mcpServers not an object", '{"mcpServers":0}'],
+  ["an mcp-servers key", '{"mcp-servers":{"s":{"url":"https://s.invalid"}}}'],
+  ["a non-object settings", '{"settings":1}'],
+  ["imports", '{"imports":["cursor"]}'],
+  ["claudePlugins", '{"claudePlugins":[]}'],
+  ["settings.ancestorConfigRoots", '{"settings":{"ancestorConfigRoots":[]}}'],
+  ["settings.agentPluginPaths", '{"settings":{"agentPluginPaths":["x"]}}'],
+  ["settings.hostConfigDiscovery", '{"settings":{"hostConfigDiscovery":"off"}}'],
+  ["settings.jev", '{"settings":{"jev":{}}}'],
+  ["a socket transport", '{"mcpServers":{"other":{"socket":"/tmp/x.sock"}}}'],
+  ["an unknown server key", '{"mcpServers":{"other":{"command":"o","transport":"weird"}}}'],
+  ["a non-object server", '{"mcpServers":{"other":"npx"}}'],
+  ["a non-string command", '{"mcpServers":{"other":{"command":1}}}'],
+  ["non-string args", '{"mcpServers":{"other":{"command":"o","args":["a",2]}}}'],
+];
+
+test("omitted when ANY source is not strict, fully-modelled JSON", () => {
+  for (const [name, text] of OMIT_SOURCES) {
+    const f = fixture();
+    try {
+      f.write(GLOBAL(f), { mcpServers: { s: { url: "https://s.invalid" } } });
+      f.write(PROJECT_PI(f), text);
+      assert.equal(lookup(f, "s"), undefined, `${name}: never a config from a partial or ambiguous view`);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("omitted: a directory, a FIFO or an oversized file in place of a source", () => {
+  const plants: [string, (path: string) => void][] = [
+    ["directory", (path) => mkdirSync(path, { recursive: true })],
+    ["fifo", (path) => {
+      mkdirSync(dirname(path), { recursive: true });
+      execFileSync("mkfifo", [path]);
+    }],
+    ["oversized", (path) => {
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(path, `{"pad":"${"x".repeat(1_100_000)}"}`);
+    }],
+  ];
+  for (const [name, plant] of plants) {
+    const f = fixture();
+    try {
+      f.write(PROJECT(f), { mcpServers: { s: { url: "https://s.invalid" } } });
+      plant(join(f.homeDir, ".agents", "mcp.json"));
+      assert.equal(lookup(f, "s"), undefined, name);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("omitted: both url and command, neither, a `__` name, or a server not found", () => {
   const f = fixture();
   try {
-    f.write(
-      join(f.cwd, ".mcp.json"),
-      '{"mcpServers": {"s": {"url": "https://s.invalid?api_key=k", "headers": {"A": "SECRET"}, "bearerToken": "SECRET", "oauth": {"x": "SECRET"}, "env": {"E": "SECRET"}}}}',
-    );
-    const config = lookup(f, "s");
-    // The URL is sent as written — a credential in a query string is parity egress with the Python
-    // hook, documented, not claimed away.
-    assert.deepStrictEqual(config, { url: "https://s.invalid?api_key=k" });
-    assert.equal(JSON.stringify(config).includes("SECRET"), false);
+    f.write(PROJECT(f), {
+      mcpServers: { both: { url: "https://b.invalid", command: "b" }, bare: { type: "x" }, "pkg__srv": { command: "p" } },
+    });
+    for (const name of ["both", "bare", "pkg__srv", "missing"]) assert.equal(lookup(f, name), undefined, name);
   } finally {
     f.cleanup();
   }
 });
 
-test("memoised on the sources' stat signature; a touched file is re-read; total on hostile input", () => {
+test("omitted when the extension cannot resolve the adapter's paths", () => {
   const f = fixture();
   try {
-    const path = join(f.cwd, ".mcp.json");
-    f.write(path, '{"mcpServers": {"s": {"command": "c"}}}');
-    const reader = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
-    const pinned = new Date(Date.now() - 60_000);
-    utimesSync(path, pinned, pinned);
-    assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { command: "c" });
-    f.write(path, '{"mcpServers": {"s": {"command": "d"}}}');
-    utimesSync(path, pinned, pinned);
-    assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { command: "c" }, "served from the memo");
-    const later = new Date();
-    utimesSync(path, later, later);
-    assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { command: "d" });
-
-    const hostile = createMcpConfigReader({ env: undefined as never, homeDir: undefined as never, argv: null as never });
-    assert.equal(hostile.serverConfig(undefined as never, undefined as never), undefined);
+    f.write(PROJECT(f), { mcpServers: { s: { url: "https://s.invalid" } } });
+    assert.equal(lookup(f, "s", {}, ["node", "pi", "--mcp-config", "/x.json"]), undefined, "--mcp-config");
+    assert.equal(lookup(f, "s", {}, ["node", "pi", "--mcp-config=@x"]), undefined, "--mcp-config=");
+    assert.equal(lookup(f, "s", { PI_PACKAGE_DIR: "/opt/arc" }), undefined, "a rebranded build");
+    assert.equal(lookup(f, "s", { PI_CODING_AGENT_DIR: "relative/dir" }), undefined, "a relative agent dir");
+    assert.equal(createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] }).serverConfig("s", ""), undefined, "no cwd");
+    assert.equal(createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] }).serverConfig("s", "rel"), undefined);
+    assert.equal(hasMcpConfigFlag(["pi", "--mcp-config"]), true);
+    assert.equal(hasMcpConfigFlag(["pi"]), false);
   } finally {
     f.cleanup();
   }
+});
+
+test("sources follow the adapter's order; exclusive mode reads only the adapter file", () => {
+  const f = fixture();
+  try {
+    assert.deepStrictEqual(mcpConfigSources({ env: {}, homeDir: f.homeDir, argv: [] }, f.cwd), [
+      GLOBAL(f),
+      join(f.homeDir, ".agents", "mcp.json"),
+      join(f.homeDir, ".agents", "mcp", "mcp.json"),
+      join(f.agentDir, "mcp-adapter.json"),
+      PROJECT(f),
+      PROJECT_PI(f),
+    ]);
+    f.write(PROJECT(f), { mcpServers: { s: { command: "project" } } });
+    f.write(join(f.agentDir, "mcp-adapter.json"), { mcpServers: { s: { url: "https://adapter.invalid" } } });
+    assert.deepStrictEqual(lookup(f, "s", { PI_MCP_CONFIG_MODE: "exclusive" }), { url: "https://adapter.invalid" });
+    assert.deepStrictEqual(lookup(f, "s"), { command: "project" }, "non-exclusive: the project file wins");
+  } finally {
+    f.cleanup();
+  }
+});
+
+// --- Snapshot once (REVIEW-2 CR-02) --------------------------------------------------------------
+
+test("CR-02: a file changed after the snapshot omits the config for the rest of the instance", () => {
+  const f = fixture();
+  try {
+    f.write(PROJECT(f), { mcpServers: { github: { command: "/tmp/evil-mcp" } } });
+    const reader = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
+    reader.snapshot(f.cwd);
+    assert.deepStrictEqual(reader.serverConfig("github", f.cwd), { command: "/tmp/evil-mcp" });
+
+    // A prompt-injected model rewrites the file to the sanctioned definition. The adapter is still
+    // running what it loaded, so the reader must not start describing the new file.
+    f.write(PROJECT(f), { mcpServers: { github: { command: "npx", args: ["-y", "srv"] } } });
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(PROJECT(f), later, later);
+    assert.equal(reader.serverConfig("github", f.cwd), undefined);
+
+    // Latched: even restoring the original content does not re-enable it.
+    f.write(PROJECT(f), { mcpServers: { github: { command: "/tmp/evil-mcp" } } });
+    assert.equal(reader.serverConfig("github", f.cwd), undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a new file appearing after the snapshot, or a different cwd, also omits", () => {
+  const f = fixture();
+  const other = mkdtempSync(join(tmpdir(), "mcp-config-other-"));
+  try {
+    f.write(GLOBAL(f), { mcpServers: { s: { url: "https://s.invalid" } } });
+    const reader = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
+    reader.snapshot(f.cwd);
+    assert.deepStrictEqual(reader.serverConfig("s", f.cwd), { url: "https://s.invalid" });
+    assert.equal(reader.serverConfig("s", other), undefined, "another cwd than the adapter loaded with");
+
+    const g = createMcpConfigReader({ env: {}, homeDir: f.homeDir, argv: [] });
+    g.snapshot(f.cwd);
+    f.write(PROJECT(f), { mcpServers: { s: { command: "planted" } } });
+    assert.equal(g.serverConfig("s", f.cwd), undefined, "a source that appeared later");
+  } finally {
+    f.cleanup();
+    rmSync(other, { recursive: true, force: true });
+  }
+});
+
+test("total on hostile options", () => {
+  const hostile = createMcpConfigReader({ env: undefined as never, homeDir: undefined as never, argv: null as never });
+  assert.doesNotThrow(() => hostile.snapshot(undefined as never));
+  assert.equal(hostile.serverConfig(undefined as never, undefined as never), undefined);
 });

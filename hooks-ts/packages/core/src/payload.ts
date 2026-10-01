@@ -31,10 +31,11 @@
 // **The one exception: an MCP call** (`PretoolPayloadInput.mcp`). The gateway's MCP path (Path 3)
 // evaluates MCP policies and input DLP on the arguments themselves, so for a call the
 // pi-mcp-adapter approval broker handed us, `metadata.tool_input` carries the arguments WHOLE up to
-// `MAX_MCP_ARGS_BYTES` (1 MiB) and unredacted, exactly as the Claude Code hook sends them; past that,
-// the head and tail of their serialisation with `metadata.tool_input_truncated: true`
-// (`mcpArgsForWire`). That is a deliberate, MCP-only egress widening; every native tool still goes
-// through the allowlist above. The same branch names the call `mcp__<server>__<tool>` with explicit
+// `MAX_MCP_ARGS_BYTES` (512 KiB) and unredacted; past that, the head and tail of their serialisation
+// with `metadata.tool_input_truncated: true` (`mcpArgsForWire`) — the middle is not inspected. The
+// whole serialised body is then held under `MAX_PRETOOL_BODY_BYTES` (900 KiB, `fitMcpBody`), so the
+// 1 MiB ingress limit can never turn a check into a 413 and a fail-open allow. That is a deliberate,
+// MCP-only egress widening; every native tool still goes through the allowlist above. The same branch names the call `mcp__<server>__<tool>` with explicit
 // `metadata.mcp_server` / `mcp_tool`, so neither the gateway's Path-2 name diversion nor its
 // first-`__` split can reinterpret it, and attaches `mcp_server_config` (`url`, or `command` + `args`)
 // when the config could be read unambiguously.
@@ -46,6 +47,7 @@ import {
   MAX_COMMAND_CHARS,
   MAX_PROMPT_CHARS,
   MAX_MCP_ARGS_BYTES,
+  MAX_PRETOOL_BODY_BYTES,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
@@ -318,10 +320,10 @@ export interface McpArgsForWire {
 /**
  * The MCP arguments as `metadata.tool_input` — the MCP-only egress widening described in the header.
  *
- * The object itself, whole and unredacted, while its JSON fits `maxBytes` (1 MiB): DLP and arg-based
+ * The object itself, whole and unredacted, while its JSON fits `maxBytes` (512 KiB): DLP and arg-based
  * policies must see exactly what the tool receives, nested values and all (CR-04). Past it — and only
- * then — `{_truncated_json}` holding the head and tail of the serialisation, sized so the result stays
- * within `maxBytes` even for 3-byte characters, and the caller sets `tool_input_truncated`. Nothing
+ * then — `{_truncated_json}` holding the head and tail of the serialisation, split by bytes within
+ * `maxBytes`, and the caller sets `tool_input_truncated`. Nothing
  * is silently dropped from the part that is sent. Total: unserialisable arguments are
  * `{_unserializable: true}`, marked truncated.
  */
@@ -332,11 +334,15 @@ export function mcpArgsForWire(args: Record<string, unknown>, maxBytes = MAX_MCP
     if (typeof serialised !== "string") return { toolInput: { _unserializable: true }, truncated: true };
     const originalBytes = Buffer.byteLength(serialised);
     if (originalBytes <= maxBytes) return { toolInput: args, truncated: false };
-    const side = Math.max(1, Math.floor((maxBytes - MCP_ARGS_TRUNCATION_MARKER.length * 3) / 6));
+    // Split by UTF-8 BYTES, half each side, so the most of the arguments a byte budget allows is
+    // inspected whatever the script. A character cut at the boundary decodes as U+FFFD. The second
+    // JSON escaping this string gets inside the body is bounded by the caller (`fitMcpBody`).
+    const half = Math.max(1, Math.floor((maxBytes - Buffer.byteLength(MCP_ARGS_TRUNCATION_MARKER)) / 2));
+    const bytes = Buffer.from(serialised, "utf8");
+    const head = bytes.subarray(0, half).toString("utf8");
+    const tail = bytes.subarray(bytes.length - half).toString("utf8");
     return {
-      toolInput: {
-        _truncated_json: serialised.slice(0, side) + MCP_ARGS_TRUNCATION_MARKER + serialised.slice(-side),
-      },
+      toolInput: { _truncated_json: head + MCP_ARGS_TRUNCATION_MARKER + tail },
       truncated: true,
       originalBytes,
     };
@@ -451,7 +457,51 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   // and every key that rides a request the caller did not ask for is a key a future reader has to
   // account for.
   if (input.pullPolicies === true) body.pull_policies = true;
-  return withAccountIdentity(body, input.accountIdentity);
+  const finished = withAccountIdentity(body, input.accountIdentity);
+  if (mcp !== undefined) fitMcpBody(finished, mcp.args);
+  return finished;
+}
+
+/** `JSON.stringify` byte length, or `Infinity` when it cannot be serialised. */
+function serialisedBytes(value: unknown): number {
+  try {
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? Buffer.byteLength(text) : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+/**
+ * Keep the whole serialised MCP request under `MAX_PRETOOL_BODY_BYTES` (CR-03).
+ *
+ * The 512 KiB argument cap alone does not bound the BODY: a truncated `_truncated_json` string is
+ * escaped a second time when the body is serialised (a `"` becomes `\"`, a control char six bytes),
+ * and the prompt and metadata ride along. An over-limit body reaches the ingress as a 413, which the
+ * checker reads as a fail-open allow and a breaker failure. So the final body is measured, and the
+ * arguments halved until it fits; if even an empty argument object would not fit, `tool_input` is
+ * `{}` — still marked truncated, never silently whole.
+ */
+function fitMcpBody(body: PretoolRequestBody, args: Record<string, unknown>): void {
+  try {
+    const metadata = body.pre_tool_use_data.metadata;
+    let budget = MAX_MCP_ARGS_BYTES;
+    while (serialisedBytes(body) >= MAX_PRETOOL_BODY_BYTES) {
+      budget = Math.floor(budget / 2);
+      if (budget < 1024) {
+        metadata.tool_input = {};
+        metadata.tool_input_truncated = true;
+        metadata.tool_input_original_bytes = serialisedBytes(args);
+        return;
+      }
+      const wire = mcpArgsForWire(args, budget);
+      metadata.tool_input = wire.toolInput;
+      metadata.tool_input_truncated = true;
+      metadata.tool_input_original_bytes = wire.originalBytes ?? serialisedBytes(args);
+    }
+  } catch {
+    // `mcpArgsForWire` and `serialisedBytes` are total; this is the belt to their braces.
+  }
 }
 
 /**

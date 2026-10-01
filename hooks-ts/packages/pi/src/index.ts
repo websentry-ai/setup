@@ -94,6 +94,7 @@ import type { ApiClient } from "../../core/src/client.ts";
 import {
   CACHE_TTL_MS,
   MAX_INFLIGHT_MCP_CALLS,
+  MCP_INFLIGHT_MAX_AGE_MS,
   MCP_TOOL_APPROVAL_REQUEST_EVENT,
   NO_KEY_NOTICE,
   SESSION_PRESENCE_ROW_ENABLED,
@@ -362,7 +363,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
    * for the audit row only. Neither touches anything until a handler or the broker asks.
    */
   const mcpConfigReader = createMcpConfigReader({ env, homeDir, argv: deps.argv });
-  const inflight = createInflightCalls(MAX_INFLIGHT_MCP_CALLS);
+  const inflight = createInflightCalls(MAX_INFLIGHT_MCP_CALLS, MCP_INFLIGHT_MAX_AGE_MS);
   /**
    * The most recent ctx a handler saw. The broker request carries none, so the confirm dialog, the
    * notice, the cwd and the session id for a brokered call come from here. Possibly stale after a
@@ -449,8 +450,10 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     const ctx = lastCtx;
     const sessionId = ctx === undefined ? "" : sessionIdOf(ctx);
     const cwd = ctx === undefined ? "" : safeCwd(ctx);
-    // Audit only: the matching in-flight `tool_call`'s id, or a minted one. Never a verdict input.
-    const toolUseId = inflight.claim(call.prefixedToolName, call.originalToolName) ?? mintBrokerId();
+    // Audit only: the in-flight `tool_call` with this name AND these arguments, or a minted id. Never
+    // a verdict input.
+    const matchedId = inflight.claim(call.prefixedToolName, call.originalToolName, call.args);
+    const toolUseId = matchedId ?? mintBrokerId();
     const serverConfig = mcpConfigReader.serverConfig(call.serverName, cwd);
     return decideMcpApproval(
       {
@@ -466,6 +469,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         sessionId,
         model: modelIdOf(ctx),
         ui: ctx,
+        ...(call.signal === undefined ? {} : { signal: call.signal }),
       },
       {
         checker: state.checker,
@@ -474,10 +478,40 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         ...identityOption(),
         currentPrompt: () => turnStore.currentPrompt(sessionId),
         onDecision: (entry) => {
-          if (recordingActive(state)) turnStore.recordToolCall(entry, sessionId);
+          if (!recordingActive(state)) return;
+          // Matched to a live `tool_call`: part of this turn, paired with its output by id.
+          if (matchedId !== undefined) {
+            turnStore.recordToolCall(entry, sessionId);
+            return;
+          }
+          // Unmatched (`mcpScript`, a resource read, an iframe, a call between turns): its own
+          // one-call turn log, like `!cmd` — never the shared store, where the NEXT turn would post
+          // it under that turn's prompt.
+          postStandaloneTurn(entry, { cwd }, sessionId, {
+            client: state.client,
+            apiKey: state.apiKey,
+            ...(state.telemetry === undefined ? {} : { telemetry: state.telemetry }),
+            ...identityOption(),
+          });
         },
       },
     );
+  }
+
+  /** Another permission extension claimed a broker request first: report it once, as a bypass. */
+  function brokerPreempted(): void {
+    try {
+      const state = init();
+      if (!recordingActive(state)) return;
+      state.telemetry?.reportBypass({
+        errorClass: "McpBrokerPreempted",
+        toolName: "mcp_broker",
+        elapsedMs: 0,
+        blocked: false,
+      });
+    } catch {
+      // telemetry
+    }
   }
 
   return (pi: ExtensionAPI) => {
@@ -491,7 +525,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         (events.on as (channel: string, handler: (data: unknown) => void) => unknown).call(
           events,
           MCP_TOOL_APPROVAL_REQUEST_EVENT,
-          createMcpApprovalListener({ active: brokerActive, decide: decideBrokered }),
+          createMcpApprovalListener({ active: brokerActive, decide: decideBrokered, preempted: brokerPreempted }),
         );
       }
     } catch {
@@ -523,6 +557,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         // the developer is trying to start.
         if (state.apiKey === undefined || state.client === undefined) return undefined;
         if (keyState.isInactive()) return undefined;
+        // The adapter loads its MCP config once, at session init: snapshot the same files now (once per
+        // instance; a later edit makes the server config "unknown" rather than re-read — `mcpConfig.ts`).
+        mcpConfigReader.snapshot(safeCwd(ctx));
         // Fired, never awaited here: the promise settles within its own deadline and is cached, so
         // every later `session_start` gets the same one back. Started before the heartbeat gate so a
         // process whose gate is already closed (a `/reload`) still learns who it is signed in as.

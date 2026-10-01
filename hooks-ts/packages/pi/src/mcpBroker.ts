@@ -23,10 +23,17 @@
 // typed structurally here, so the bundle stays dependency-free.
 //
 // **Audit correlation.** The broker request carries no `toolCallId`. So `tool_call` remembers in-flight
-// non-native calls (`InflightCalls`), and the broker handler claims the oldest matching one for its
-// `tool_use_id` — so the turn log pairs the decision with the call's output. No match (an `mcpScript`
-// call, a resource read, an iframe) mints an `mcpb_…` id. Correlation is audit only: it never feeds a
-// verdict, and a wrong or missing match costs output pairing, nothing else.
+// non-native calls (`InflightCalls`) with their name AND their serialised arguments, and the broker
+// handler claims the oldest entry whose name matches and whose arguments are equal (stable key order)
+// — so two overlapping calls to the same tool with different arguments cannot swap ids. Entries
+// expire after `MCP_INFLIGHT_MAX_AGE_MS`. No match (an `mcpScript` call, a resource read, an iframe, a
+// direct tool whose arguments the adapter reshaped) mints an `mcpb_…` id, and that decision is posted
+// as its own one-call turn log rather than entering the shared turn store. Correlation is audit only:
+// it never feeds a verdict.
+//
+// **Another broker first.** The first synchronous claim wins. If another permission extension (or a
+// host-managed runtime) claimed before us, `claim()` returns `false`: the call is decided without
+// Unbound. That is reported once, through bypass telemetry, and no policy request is made.
 
 import { randomBytes } from "node:crypto";
 
@@ -51,6 +58,8 @@ export interface McpBrokerDeps {
   active(): boolean;
   /** Decide a claimed call. May throw or reject; the wrapper turns that into `abstain`. */
   decide(call: McpBrokerCall): Promise<McpApprovalAnswer>;
+  /** Another broker claimed first (our `claim()` returned `false`). Called at most once per listener. */
+  preempted?(call: McpBrokerCall): void;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -87,13 +96,14 @@ function snapshot(data: unknown): (McpBrokerCall & { claim: (handler: () => Prom
  * answers above.
  */
 export function createMcpApprovalListener(deps: McpBrokerDeps): (data: unknown) => void {
+  let reportedPreemption = false;
   return (data: unknown): void => {
     try {
       const request = snapshot(data);
       if (request === undefined) return;
       if (!deps.active()) return;
       const { claim, ...call } = request;
-      claim(async (): Promise<McpApprovalAnswer> => {
+      const claimed = claim(async (): Promise<McpApprovalAnswer> => {
         try {
           // Cheap honour of the adapter's signal: a call already aborted is not worth a round trip.
           if (call.signal?.aborted === true) return "abstain";
@@ -103,6 +113,15 @@ export function createMcpApprovalListener(deps: McpBrokerDeps): (data: unknown) 
           return "abstain";
         }
       });
+      // `false`: someone else is deciding this call. No request — report it once.
+      if (claimed === false && !reportedPreemption) {
+        reportedPreemption = true;
+        try {
+          deps.preempted?.(call);
+        } catch {
+          // telemetry is never worth a throw
+        }
+      }
     } catch {
       // A malformed request or a throwing getter: no claim, so the adapter's own approval applies.
     }
@@ -111,12 +130,66 @@ export function createMcpApprovalListener(deps: McpBrokerDeps): (data: unknown) 
 
 // --- In-flight correlation (audit only) ---------------------------------------------------------
 
+/** JSON with object keys sorted at every level, or `undefined` when it cannot be serialised. Total. */
+export function stableKey(value: unknown): string | undefined {
+  try {
+    const seen = new Set<unknown>();
+    const walk = (v: unknown, depth: number): unknown => {
+      if (depth > 64) throw new Error("too deep");
+      if (v === null || typeof v !== "object") return v;
+      if (seen.has(v)) throw new Error("cycle");
+      seen.add(v);
+      let out: unknown;
+      if (Array.isArray(v)) out = v.map((item) => walk(item, depth + 1));
+      else {
+        const sorted: Record<string, unknown> = {};
+        for (const key of Object.keys(v as Record<string, unknown>).sort()) {
+          Object.defineProperty(sorted, key, {
+            value: walk((v as Record<string, unknown>)[key], depth + 1),
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
+        }
+        out = sorted;
+      }
+      seen.delete(v);
+      return out;
+    };
+    const text = JSON.stringify(walk(value, 0));
+    return typeof text === "string" ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The arguments a `tool_call` will hand the MCP tool, keyed for comparison with the broker's `args`:
+ * a wrapper (`mcp`, `mcp__<ns>`) carries them in `input.args` (an object, a JSON string, or absent ⇒
+ * `{}`, as the adapter parses them); a direct tool's input IS its arguments.
+ */
+function argsKeyOf(toolName: string, input: unknown): string | undefined {
+  try {
+    const wrapper = toolName === MCP_PROXY_TOOL_NAME || toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
+    if (!wrapper) return stableKey(isRecord(input) ? input : {});
+    const raw = isRecord(input) ? input.args : undefined;
+    if (raw === undefined || raw === "") return stableKey({});
+    if (typeof raw === "string") return stableKey(JSON.parse(raw) as unknown);
+    return stableKey(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 interface InflightEntry {
   toolCallId: string;
   toolName: string;
   /** `input.tool` for the proxy / namespace wrappers, when it is a string. */
   tool: string | undefined;
+  /** `stableKey` of the arguments the call carries; `undefined` = cannot be compared ⇒ never matched. */
+  argsKey: string | undefined;
   sessionId: string;
+  at: number;
 }
 
 export interface InflightCalls {
@@ -124,15 +197,19 @@ export interface InflightCalls {
   forget(toolCallId: unknown): void;
   /** Drop entries from any session other than `sessionId` (`""` = unknown: drops nothing). */
   keepSession(sessionId: string): void;
-  /** The oldest matching entry's id, consumed — or `undefined`. */
-  claim(prefixedToolName: string, originalToolName: string): string | undefined;
+  /** The oldest entry matching name AND arguments, consumed — or `undefined`. */
+  claim(prefixedToolName: string, originalToolName: string, args: unknown): string | undefined;
   size(): number;
 }
 
-/** A bounded FIFO of in-flight non-native tool calls. Every method is total. */
-export function createInflightCalls(max: number): InflightCalls {
+/** A bounded, age-expiring FIFO of in-flight non-native tool calls. Every method is total. */
+export function createInflightCalls(max: number, maxAgeMs: number, now: () => number = Date.now): InflightCalls {
   let entries: InflightEntry[] = [];
   const cap = Number.isFinite(max) && max > 0 ? Math.floor(max) : 1;
+  const expire = (): void => {
+    const cutoff = now() - maxAgeMs;
+    entries = entries.filter((entry) => entry.at >= cutoff);
+  };
   return {
     remember(entry, sessionId) {
       try {
@@ -140,11 +217,14 @@ export function createInflightCalls(max: number): InflightCalls {
         if (typeof entry.toolName !== "string" || entry.toolName === "") return;
         let tool: string | undefined;
         if (isRecord(entry.input) && typeof entry.input.tool === "string") tool = entry.input.tool;
+        expire();
         entries.push({
           toolCallId: entry.toolCallId,
           toolName: entry.toolName,
           tool,
+          argsKey: argsKeyOf(entry.toolName, entry.input),
           sessionId: typeof sessionId === "string" ? sessionId : "",
+          at: now(),
         });
         while (entries.length > cap) entries.shift();
       } catch {
@@ -167,9 +247,13 @@ export function createInflightCalls(max: number): InflightCalls {
         // Audit only.
       }
     },
-    claim(prefixedToolName, originalToolName) {
+    claim(prefixedToolName, originalToolName, args) {
       try {
+        expire();
+        const argsKey = stableKey(isRecord(args) ? args : {});
+        if (argsKey === undefined) return undefined;
         const index = entries.findIndex((entry) => {
+          if (entry.argsKey === undefined || entry.argsKey !== argsKey) return false;
           if (prefixedToolName !== "" && entry.toolName === prefixedToolName) return true;
           const wrapper =
             entry.toolName === MCP_PROXY_TOOL_NAME || entry.toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);

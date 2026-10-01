@@ -11,7 +11,7 @@
 // `PretoolPayloadInput.mcp` is the one input that changes the body's SHAPE: an MCP call handed over
 // by the pi-mcp-adapter approval broker goes to the gateway's MCP path (Path 3) as
 // `tool_name: "mcp__<server>__<tool>"` with `metadata.mcp_server` / `mcp_tool` / `tool_input` (the
-// arguments, whole up to 1 MiB) and, when the config could be read unambiguously,
+// arguments, whole up to 512 KiB) and, when the config could be read unambiguously,
 // `mcp_server_config`. The native-tool allowlist still governs every other call; MCP arguments are
 // the one explicit exception.
 //
@@ -120,14 +120,15 @@ export interface McpCallInfo {
   server: string;
   /** The MCP tool's ORIGINAL name (the broker's `originalToolName`). */
   tool: string;
-  /** The arguments the tool will receive. Sent whole up to 1 MiB, never redacted (gateway DLP). */
+  /** The arguments the tool will receive. Sent whole up to 512 KiB, never redacted (gateway DLP). */
   args: Record<string, unknown>;
   /**
    * The server's config as `{url, type?}` or `{command, args?, type?}`, read from the adapter's config
    * files by exact server name — the same fields the Claude Code hook sends. `env`, `headers`, bearer
    * tokens and OAuth settings are never read into it, but a `url` query string or an `args` entry can
    * itself carry a credential, and is sent as written, exactly as the Python hook sends it. Absent
-   * when any config source was unreadable, imports were in play, or the server was not found.
+   * unless every config source is strict, fully-modelled JSON unchanged since session start
+   * (`mcpConfig.ts`, strict-or-omit) and the server is found there.
    */
   serverConfig?: Record<string, unknown>;
   /** The broker's `origin`: `proxy` | `direct` | `script` | `resource` | `iframe`. Audit only. */

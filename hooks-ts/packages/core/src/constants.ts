@@ -287,7 +287,7 @@ export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
  * independently so an addition cannot be slipped in as a formatting change.
  *
  * MCP arguments reach `metadata.tool_input` through the separate MCP branch in `payload.ts`
- * (`mcpArgsForWire`, whole up to 1 MiB), which is the deliberate, MCP-only egress widening: the
+ * (`mcpArgsForWire`, whole up to 512 KiB, body under 900 KiB), which is the deliberate, MCP-only egress widening: the
  * gateway's MCP policies and input DLP evaluate exactly those arguments. This list still governs
  * every native tool.
  */
@@ -417,20 +417,34 @@ export const MCP_BROKER_ID_PREFIX = "mcpb_";
 /** In-flight non-native tool calls remembered for audit correlation. Oldest dropped past this. */
 export const MAX_INFLIGHT_MCP_CALLS = 64;
 /**
- * MCP arguments go on the wire whole up to this many serialised bytes (1 MiB) — parity with the
- * Claude Code hook, which sends them uncapped, because the gateway's MCP input DLP and arg-based
- * policies must see what the tool will receive. Beyond it the head and tail of the serialisation
- * are sent, with `metadata.tool_input_truncated: true`.
+ * MCP arguments go on the wire whole up to this many serialised bytes (512 KiB), because the gateway's
+ * MCP input DLP and arg-based policies must see what the tool will receive. Beyond it the head and tail
+ * of the serialisation are sent, with `metadata.tool_input_truncated: true` — the middle of oversized
+ * arguments is NOT inspected.
  */
-export const MAX_MCP_ARGS_BYTES = 1_048_576;
+export const MAX_MCP_ARGS_BYTES = 524_288;
+/**
+ * The ceiling on a whole serialised pretool request body carrying MCP arguments (900 KiB). The
+ * ingress in front of ai-gateway rejects bodies over 1 MiB with a 413, which the checker treats as an
+ * API failure — a fail-open allow, and a breaker failure that can switch off checks for every tool.
+ * So the body is measured after the final serialisation and the arguments shrunk until it fits;
+ * a 413 is unreachable by construction (review CR-03).
+ */
+export const MAX_PRETOOL_BODY_BYTES = 921_600;
+/**
+ * How long an in-flight non-native `tool_call` stays claimable by a broker request (5 min). An entry
+ * whose `tool_result` never fires (a call blocked upstream) must not be claimed by an unrelated call
+ * later — audit correlation only.
+ */
+export const MCP_INFLIGHT_MAX_AGE_MS = 300_000;
 /** `PI_MCP_CONFIG_MODE=exclusive` makes the adapter read only its own config file. */
 export const ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
 /** The adapter's own config file, under the agent dir and under `<cwd>/.pi/`. */
 export const MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
-/** The pi CLI flag the adapter registers to replace that file (`index.ts registerFlag`). */
+/** The pi CLI flag the adapter registers to replace that file. Its presence omits the config. */
 export const MCP_CONFIG_FLAG = "--mcp-config";
 /**
- * A generous cap on one MCP config file (16 MiB). The adapter has none; a file over it is treated as
- * unreadable, which omits `mcp_server_config` rather than guessing.
+ * The cap on one MCP config file (1 MiB; adapter configs are kilobytes). A file over it is "unknown",
+ * which omits `mcp_server_config` rather than guessing.
  */
-export const MAX_MCP_CONFIG_BYTES = 16_777_216;
+export const MAX_MCP_CONFIG_BYTES = 1_048_576;

@@ -306,6 +306,30 @@ export interface McpApprovalInput {
   model: string | undefined;
   /** The most recent live ctx, for the notice and the confirm. Absent ⇒ no UI. */
   ui: UiCtx | undefined;
+  /** The broker request's own signal: the adapter aborted the call ⇒ no dialog, `abstain`. */
+  signal?: AbortSignal;
+}
+
+/**
+ * The confirm for a brokered call, behind its own guard: a policy "confirm" that cannot be asked must
+ * be a `deny`, never fall through to `abstain` (which the adapter, with no `approveTools`, runs).
+ * The dialog closes on either the agent run's signal or the broker request's, whichever aborts first.
+ */
+async function confirmBrokered(ui: UiCtx, reason: string, signal: AbortSignal | undefined): Promise<McpApprovalAnswer> {
+  try {
+    if (ui.hasUI !== true) {
+      notifySafe(ui, NO_UI_REASON, "warning");
+      return "deny";
+    }
+    notifySafe(ui, reason, "warning");
+    const signals = [ui.signal, signal].filter((s): s is AbortSignal => s instanceof AbortSignal);
+    const combined = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+    const dialogCtx: UiCtx = { hasUI: true, ui: ui.ui, signal: combined };
+    const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
+    return accepted ? "allow_once" : "deny";
+  } catch {
+    return "deny";
+  }
 }
 
 /**
@@ -362,21 +386,19 @@ export async function decideMcpApproval(input: McpApprovalInput, deps: DecideDep
       tool_input: auditMcpArgs(call.args),
     });
 
+    // The adapter aborted the call while the policy request was in flight (Esc, a reload): it will
+    // never run, so no dialog and no notice — the adapter rethrows the abort itself.
+    if (input.signal?.aborted === true) return "abstain";
+
     switch (outcome.kind) {
       case "allow":
         return "abstain";
       case "deny":
         if (ui !== undefined) notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "error");
         return "deny";
-      case "confirm": {
-        if (ui === undefined || ui.hasUI !== true) {
-          if (ui !== undefined) notifySafe(ui, NO_UI_REASON, "warning");
-          return "deny";
-        }
-        notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "warning");
-        const accepted = await confirmWithTimeout(ui, CONFIRM_TITLE, CONFIRM_QUESTION);
-        return accepted ? "allow_once" : "deny";
-      }
+      case "confirm":
+        if (ui === undefined) return "deny";
+        return await confirmBrokered(ui, outcome.reason ?? GENERIC_DENY_REASON, input.signal);
       case "unavailable":
         if (ui !== undefined) notifySafe(ui, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
         return "deny";

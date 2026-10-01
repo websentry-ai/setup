@@ -534,7 +534,7 @@ test("MCP branch: a command passed alongside is ignored", () => {
   assert.equal(Object.hasOwn(body.pre_tool_use_data.metadata, "command_truncated"), false);
 });
 
-test("MCP args: whole on the wire up to 1 MiB — a secret deep in a big arg reaches the gateway (CR-04)", () => {
+test("MCP args: whole on the wire up to 512 KiB — a secret deep in a big arg reaches the gateway (CR-04)", () => {
   // The security property, not only the size bound: the gateway's MCP input DLP must see what the
   // tool will receive. A 17 KB pad used to push everything nested, and every byte past 2 KB of a
   // string, out of `tool_input`.
@@ -547,7 +547,7 @@ test("MCP args: whole on the wire up to 1 MiB — a secret deep in a big arg rea
   assert.ok(JSON.stringify(body).includes("ghp_nested"));
 });
 
-test("MCP args over 1 MiB: head and tail of the serialisation, with an explicit truncation marker", () => {
+test("MCP args over 512 KiB: head and tail of the serialisation, with an explicit truncation marker", () => {
   const args = { head: "HEAD-SECRET", blob: "z".repeat(MAX_MCP_ARGS_BYTES + 10), tail: "TAIL-SECRET" };
   const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }));
   const metadata = body.pre_tool_use_data.metadata;
@@ -588,4 +588,24 @@ test("auditMcpArgs: an owned copy, capped for the audit row, __proto__ and const
   const cappedProto = auditMcpArgs(bigProto);
   assert.ok(Object.hasOwn(cappedProto, "__proto__"), "kept as an own key in the truncated branch too");
   assert.equal(Object.getPrototypeOf(cappedProto), Object.prototype);
+});
+
+test("the whole MCP body stays under 900 KiB whatever the args — a 413 at the 1 MiB ingress is unreachable (REVIEW-2 CR-03)", () => {
+  // The reviewer's probe: ASCII just under 1 MiB, CJK (3-byte) over it, and quote-heavy input that
+  // doubles when the truncated string is escaped a second time. Plus an 8 KB prompt riding along.
+  for (const args of [
+    { body: "a".repeat(1_040_000) },
+    { body: "a".repeat(1_048_000) },
+    { body: "中".repeat(2_000_000) },
+    { body: '"'.repeat(2_000_000) },
+    { body: "\u0001".repeat(600_000) },
+  ]) {
+    const body = buildPretoolPayload(
+      bashInput({ toolName: "mcp", command: "", lastUserPrompt: "p".repeat(8000), mcp: { ...MCP, args } }),
+    );
+    const bytes = Buffer.byteLength(JSON.stringify(body));
+    assert.ok(bytes < 921_600, `body ${bytes} bytes`);
+    assert.equal(body.pre_tool_use_data.metadata.tool_input_truncated, true);
+    assert.equal(typeof body.pre_tool_use_data.metadata.tool_input_original_bytes, "number");
+  }
 });

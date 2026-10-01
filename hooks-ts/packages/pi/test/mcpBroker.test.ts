@@ -15,7 +15,7 @@
 
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -128,7 +128,7 @@ interface Fixture {
   ctx: FakeCtx;
   homeDir: string;
   cwd: string;
-  write(path: string, content: string): void;
+  write(path: string, content: unknown): void;
   close(): Promise<void>;
 }
 
@@ -154,13 +154,23 @@ async function fixture(
     argv?: string[];
     env?: Record<string, string>;
     seeCtx?: boolean;
+    /** Write config files BEFORE `session_start`, which is when the config snapshot is taken. */
+    setup?: (homeDir: string, cwd: string, write: (path: string, content: unknown) => void) => void;
+    /** A listener registered on the bus BEFORE the extension's — another permission extension. */
+    preListener?: (data: unknown) => void;
   } = {},
 ): Promise<Fixture> {
   turnStore.take();
   const api = await startMockApi({ mode });
   const home = createFakeHome();
   const cwd = mkdtempSync(join(tmpdir(), "mcp-broker-cwd-"));
+  const writeFile = (path: string, content: unknown): void => {
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, typeof content === "string" ? content : JSON.stringify(content));
+  };
+  opts.setup?.(home.homeDir, cwd, writeFile);
   const bus = createBus();
+  if (opts.preListener !== undefined) bus.on(EVENT, opts.preListener);
   const handlers = new Map<string, AnyHandler>();
   const pi = {
     on(event: string, handler: AnyHandler) {
@@ -191,10 +201,7 @@ async function fixture(
     ctx,
     homeDir: home.homeDir,
     cwd,
-    write(path, content) {
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, content);
-    },
+    write: writeFile,
     async close() {
       home.cleanup();
       rmSync(cwd, { recursive: true, force: true });
@@ -390,7 +397,10 @@ test("correlation: a matched tool_call id rides the request, the record and the 
   const f = await fixture("allow");
   try {
     await f.handlers.get("input")?.(createFakeInputEvent("file the bug"), f.ctx);
-    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("mcp", { tool: "create_issue", args: {} }, "toolu_proxy_1"), f.ctx);
+    await f.handlers.get("tool_call")?.(
+      createFakeToolCallEvent("mcp", { tool: "create_issue", args: '{"title":"Bearer sk-live-argsecret"}' }, "toolu_proxy_1"),
+      f.ctx,
+    );
     await brokerRequest(f.bus, {
       serverName: "github",
       originalToolName: "create_issue",
@@ -441,7 +451,7 @@ test("correlation: a direct tool matches by prefixed name; an unmatched call get
 });
 
 test("in-flight entries are bounded, forgotten on tool_result, and dropped on a session change", () => {
-  const inflight = createInflightCalls(3);
+  const inflight = createInflightCalls(3, 60_000);
   for (let i = 0; i < 5; i += 1) inflight.remember({ toolCallId: `c${i}`, toolName: "mcp", input: { tool: "t" } }, "A");
   assert.equal(inflight.size(), 3, "bounded, oldest dropped");
   inflight.forget("c4");
@@ -466,17 +476,21 @@ test("the listener is synchronous and total, whatever the deps do", () => {
 
 // --- mcp_server_config by exact server name -----------------------------------------------------
 
-test("mcp_server_config: found by exact name, JSONC (comments, trailing comma, BOM) and symlinks accepted", async () => {
-  const f = await fixture("allow");
-  try {
-    f.write(
-      join(f.homeDir, ".config", "mcp", "mcp.json"),
-      '﻿{\n  // global\n  "mcpServers": {\n    "remote": { "url": "https://remote.invalid/mcp", "headers": {"Authorization": "Bearer sk-SECRET"}, "env": {"K": "sk-SECRET2"}, },\n  },\n}\n',
-    );
-    const real = join(f.cwd, "tools", "mcp.json");
-    f.write(real, '{ /* project */ "mcpServers": { "local": { "command": "npx", "args": ["-y", "srv"], "env": {"API_KEY": "sk-SECRET3"} } } }');
-    symlinkSync(real, join(f.cwd, ".mcp.json"));
+const GOOD = { command: "npx", args: ["-y", "@modelcontextprotocol/server-github"] };
+const EVIL = { command: "/tmp/evil-mcp" };
 
+test("mcp_server_config: plain strict JSON is sent by exact name; env and headers never are", async () => {
+  const f = await fixture("allow", {
+    setup: (home, cwd, write) => {
+      write(join(home, ".config", "mcp", "mcp.json"), {
+        mcpServers: { remote: { url: "https://remote.invalid/mcp", headers: { Authorization: "Bearer sk-SECRET" } } },
+      });
+      const real = join(cwd, "tools", "mcp.json");
+      write(real, { mcpServers: { local: { command: "npx", args: ["-y", "srv"], env: { API_KEY: "sk-SECRET3" } } } });
+      symlinkSync(real, join(cwd, ".mcp.json"));
+    },
+  });
+  try {
     await brokerRequest(f.bus, { serverName: "remote", originalToolName: "q" });
     await brokerRequest(f.bus, { serverName: "local", originalToolName: "r" });
     await brokerRequest(f.bus, { serverName: "unknown", originalToolName: "s" });
@@ -492,32 +506,127 @@ test("mcp_server_config: found by exact name, JSONC (comments, trailing comma, B
   }
 });
 
-test("mcp_server_config is OMITTED when any existing source cannot be parsed", async () => {
-  const f = await fixture("allow");
+test("mcp_server_config: a two-source override is sent merged", async () => {
+  const f = await fixture("allow", {
+    setup: (home, cwd, write) => {
+      write(join(home, ".config", "mcp", "mcp.json"), { mcpServers: { github: { url: "https://api.githubcopilot.com/mcp/" } } });
+      write(join(cwd, ".mcp.json"), { mcpServers: { github: EVIL } });
+    },
+  });
   try {
-    f.write(join(f.homeDir, ".config", "mcp", "mcp.json"), '{"mcpServers": {"github": {"url": "https://ok.invalid"}}}');
-    f.write(join(f.cwd, ".mcp.json"), "{ this is not json");
-    await brokerRequest(f.bus, { serverName: "github", originalToolName: "q" });
-    const data = dataOf(pretoolBodies(f.api)[0]);
-    assert.equal(Object.hasOwn(data.metadata, "mcp_server_config"), false, "never a possibly wrong config");
-    assert.equal(data.metadata.mcp_server, "github", "the call is still checked");
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "create_issue" });
+    assert.deepStrictEqual(dataOf(pretoolBodies(f.api)[0]).metadata.mcp_server_config, EVIL, "the binary the adapter runs");
   } finally {
     await f.close();
   }
 });
 
-test("--mcp-config replaces the adapter file; exclusive mode reads only it", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "mcp-override-"));
-  const override = join(dir, "custom.json");
-  writeFileSync(override, '{"mcpServers": {"s": {"url": "https://override.invalid"}}}');
-  const f = await fixture("allow", { argv: ["node", "pi", "--mcp-config", override], env: { PI_MCP_CONFIG_MODE: "exclusive" } });
+test("mcp_server_config is OMITTED when any source cannot be parsed strictly — the call is still checked", async () => {
+  const f = await fixture("allow", {
+    setup: (home, cwd, write) => {
+      write(join(home, ".config", "mcp", "mcp.json"), { mcpServers: { github: { url: "https://ok.invalid" } } });
+      write(join(cwd, ".mcp.json"), "{ this is not json");
+    },
+  });
   try {
-    f.write(join(f.cwd, ".mcp.json"), '{"mcpServers": {"s": {"command": "ignored-in-exclusive"}}}');
-    await brokerRequest(f.bus, { serverName: "s", originalToolName: "t" });
-    assert.deepStrictEqual(dataOf(pretoolBodies(f.api)[0]).metadata.mcp_server_config, { url: "https://override.invalid" });
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "q" });
+    const data = dataOf(pretoolBodies(f.api)[0]);
+    assert.equal(Object.hasOwn(data.metadata, "mcp_server_config"), false, "never a possibly wrong config");
+    assert.equal(data.metadata.mcp_server, "github");
   } finally {
     await f.close();
-    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("--mcp-config on argv omits the config; exclusive mode without it reads only the adapter file", async () => {
+  const flagged = await fixture("allow", {
+    argv: ["node", "pi", "--mcp-config", "/tmp/custom.json"],
+    setup: (_home, cwd, write) => write(join(cwd, ".mcp.json"), { mcpServers: { s: { url: "https://s.invalid" } } }),
+  });
+  try {
+    await brokerRequest(flagged.bus, { serverName: "s", originalToolName: "t" });
+    assert.equal(Object.hasOwn(dataOf(pretoolBodies(flagged.api)[0]).metadata, "mcp_server_config"), false);
+  } finally {
+    await flagged.close();
+  }
+  const exclusive = await fixture("allow", {
+    env: { PI_MCP_CONFIG_MODE: "exclusive" },
+    setup: (home, cwd, write) => {
+      write(join(home, ".pi", "agent", "mcp-adapter.json"), { mcpServers: { s: { url: "https://adapter.invalid" } } });
+      write(join(cwd, ".mcp.json"), { mcpServers: { s: { command: "ignored-in-exclusive" } } });
+    },
+  });
+  try {
+    await brokerRequest(exclusive.bus, { serverName: "s", originalToolName: "t" });
+    assert.deepStrictEqual(dataOf(pretoolBodies(exclusive.api)[0]).metadata.mcp_server_config, { url: "https://adapter.invalid" });
+  } finally {
+    await exclusive.close();
+  }
+});
+
+// --- REVIEW-2 regressions -----------------------------------------------------------------------
+
+test("REVIEW-2 CR-01: all five reproduced config differentials omit the config, and the call is still checked", async () => {
+  // Each case: the adapter runs the EVIL project server (or a socket), while the old lenient reader
+  // described GOOD. Strict-or-omit sends no config at all — never the sanctioned fingerprint.
+  const cases: [string, unknown, unknown][] = [
+    ["mcpServers non-object + mcp-servers", { mcpServers: { github: EVIL } }, { mcpServers: 0, "mcp-servers": { github: GOOD } }],
+    ["invalid settings (adapter skips the file)", { mcpServers: { github: EVIL } }, { settings: 1, mcpServers: { github: GOOD } }],
+    ["socket override", { mcpServers: { github: GOOD } }, { mcpServers: { github: { socket: "/tmp/evil.sock" } } }],
+    ["lone CR ends // only for a lenient stripper", { mcpServers: { github: EVIL } }, '{"mcpServers":{//\r"github":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}\n}}'],
+    ["unterminated block comment", { mcpServers: { github: EVIL } }, '{"mcpServers":{"github":{"command":"npx","args":["-y","@modelcontextprotocol/server-github"]}}} /* '],
+  ];
+  for (const [name, project, projectPi] of cases) {
+    const f = await fixture("deny", {
+      setup: (_home, cwd, write) => {
+        write(join(cwd, ".mcp.json"), project);
+        write(join(cwd, ".pi", "mcp-adapter.json"), projectPi);
+      },
+    });
+    try {
+      const { decision } = await brokerRequest(f.bus, { serverName: "github", originalToolName: "create_issue" });
+      assert.equal(decision, "deny", name);
+      const data = dataOf(pretoolBodies(f.api)[0]);
+      assert.equal(Object.hasOwn(data.metadata, "mcp_server_config"), false, `${name}: config ABSENT`);
+      assert.deepStrictEqual([data.metadata.mcp_server, data.metadata.mcp_tool], ["github", "create_issue"], name);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("REVIEW-2 CR-02: a config file edited after session start omits the config from then on", async () => {
+  const f = await fixture("allow", {
+    setup: (_home, cwd, write) => write(join(cwd, ".mcp.json"), { mcpServers: { github: EVIL } }),
+  });
+  try {
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "q" });
+    f.write(join(f.cwd, ".mcp.json"), { mcpServers: { github: GOOD } });
+    const later = new Date(Date.now() + 5_000);
+    utimesSync(join(f.cwd, ".mcp.json"), later, later);
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "q" });
+    const configs = pretoolBodies(f.api).map((b) => dataOf(b).metadata.mcp_server_config);
+    assert.deepStrictEqual(configs[0], EVIL, "what the adapter loaded at session start");
+    assert.equal(configs[1], undefined, "never the rewritten (sanctioned-looking) file");
+  } finally {
+    await f.close();
+  }
+});
+
+test("REVIEW-2 CR-03: ~1 MiB ASCII and >1 MiB CJK args keep the body under 900 KiB, marked truncated", async () => {
+  const f = await fixture("deny");
+  try {
+    for (const args of [{ body: "a".repeat(1_048_000) }, { body: "中".repeat(400_000) }, { body: '"'.repeat(2_000_000) }]) {
+      const { decision } = await brokerRequest(f.bus, { serverName: "github", originalToolName: "create_issue", args });
+      assert.equal(decision, "deny", "evaluated — not a 413 turned fail-open allow");
+    }
+    for (const request of f.api.requests.filter((r) => r.path === PRETOOL_PATH)) {
+      const bytes = Buffer.byteLength(JSON.stringify(request.body));
+      assert.ok(bytes < 900 * 1024, `body ${bytes} bytes`);
+      assert.equal(dataOf(request.body as Record<string, unknown>).metadata.tool_input_truncated, true);
+    }
+  } finally {
+    await f.close();
   }
 });
 
@@ -541,29 +650,26 @@ test("CR-01 regression: a stale cache server sharing a tool name no longer makes
   }
 });
 
-test("CR-02 regression: a JSONC / symlinked project file that redefines a server is honoured, not spoofed", async () => {
-  for (const variant of ["comment", "trailing", "bom", "symlink"]) {
-    const f = await fixture("allow");
+test("CR-02 (first review) regression: JSONC never yields the sanctioned url; a plain symlinked override is honoured", async () => {
+  for (const variant of ["comment", "trailing", "symlink"]) {
+    const f = await fixture("allow", {
+      setup: (home, cwd, write) => {
+        write(join(home, ".config", "mcp", "mcp.json"), { mcpServers: { github: { url: "https://api.githubcopilot.com/mcp/" } } });
+        const evil = '{"mcpServers": {"github": {"command": "evil", "args": ["--x"]}}}';
+        if (variant === "symlink") {
+          const target = join(cwd, "tools", "mcp.json");
+          write(target, evil);
+          symlinkSync(target, join(cwd, ".mcp.json"));
+        } else {
+          write(join(cwd, ".mcp.json"), variant === "comment" ? `// project\n${evil}` : '{"mcpServers": {"github": {"command": "evil",},}}');
+        }
+      },
+    });
     try {
-      f.write(join(f.homeDir, ".config", "mcp", "mcp.json"), '{"mcpServers": {"github": {"url": "https://api.githubcopilot.com/mcp/"}}}');
-      const evil = '{"mcpServers": {"github": {"command": "evil", "args": ["--x"]}}}';
-      const text =
-        variant === "comment" ? `// project\n${evil}` :
-        variant === "trailing" ? '{"mcpServers": {"github": {"command": "evil", "args": ["--x"],},},}' :
-        variant === "bom" ? `﻿${evil}` : evil;
-      if (variant === "symlink") {
-        const target = join(f.cwd, "tools", "mcp.json");
-        f.write(target, text);
-        symlinkSync(target, join(f.cwd, ".mcp.json"));
-      } else {
-        f.write(join(f.cwd, ".mcp.json"), text);
-      }
       await brokerRequest(f.bus, { serverName: "github", originalToolName: "create_issue" });
-      assert.deepStrictEqual(
-        dataOf(pretoolBodies(f.api)[0]).metadata.mcp_server_config,
-        { command: "evil", args: ["--x"] },
-        `${variant}: the binary the adapter runs, never the sanctioned url`,
-      );
+      const config = dataOf(pretoolBodies(f.api)[0]).metadata.mcp_server_config;
+      if (variant === "symlink") assert.deepStrictEqual(config, { command: "evil", args: ["--x"] });
+      else assert.equal(config, undefined, `${variant}: omitted, never the sanctioned url`);
     } finally {
       await f.close();
     }
@@ -601,6 +707,111 @@ test("CR-04 regression: a secret past 16 KB of padding, and in a nested value, r
     const data = dataOf(pretoolBodies(f.api)[0]);
     assert.deepStrictEqual(data.metadata.tool_input, args);
     assert.equal(Object.hasOwn(data.metadata, "tool_input_truncated"), false);
+  } finally {
+    await f.close();
+  }
+});
+
+// --- Revision 3 broker behaviour --------------------------------------------------------------
+
+test("another broker claimed first ⇒ no request, and one rate-limited bypass report", async () => {
+  const f = await fixture("deny", {
+    preListener: (data) => {
+      (data as { claim: (h: () => string) => boolean }).claim(() => "allow_once");
+    },
+  });
+  try {
+    for (let i = 0; i < 3; i += 1) {
+      const { decision } = await brokerRequest(f.bus, { serverName: "s", originalToolName: "t" });
+      assert.equal(decision, "allow_once", "the other extension's answer stands");
+    }
+    await sleep(60);
+    assert.equal(pretoolBodies(f.api).length, 0, "no policy request for a call someone else decides");
+    const reports = f.api.requests.filter((r) => r.path === "/v1/hooks/errors");
+    assert.equal(reports.length, 1, "reported once");
+    assert.match(JSON.stringify(reports[0]?.body), /McpBrokerPreempted/);
+  } finally {
+    await f.close();
+  }
+});
+
+test("aborted while the policy request was in flight ⇒ abstain, and no dialog", async () => {
+  const controller = new AbortController();
+  const f = await fixture("allow", {
+    ctx: { hasUI: true, confirmResult: true },
+    makeChecker: () => ({
+      async checkTool() {
+        controller.abort();
+        return { kind: "confirm", reason: "Unusual." };
+      },
+    }),
+  });
+  try {
+    const { decision } = await brokerRequest(f.bus, { serverName: "s", originalToolName: "t", signal: controller.signal });
+    assert.equal(decision, "abstain");
+    assert.equal(f.ctx.confirmCalls.length, 0, "no dialog for a call that will never run");
+  } finally {
+    await f.close();
+  }
+});
+
+test("a throw inside the confirm branch ⇒ deny, never abstain", async () => {
+  const f = await fixture("ask", { seeCtx: false });
+  try {
+    const stale = createFakeCtx({ cwd: f.cwd, sessionId: "sess-broker" });
+    Object.defineProperty(stale, "hasUI", {
+      get() {
+        throw new Error("This extension ctx is stale");
+      },
+    });
+    await f.handlers.get("session_start")?.({ type: "session_start", reason: "startup" }, stale);
+    const { decision } = await brokerRequest(f.bus, { serverName: "s", originalToolName: "t" });
+    assert.equal(decision, "deny", "a verdict that needed confirmation must not become an allow");
+  } finally {
+    await f.close();
+  }
+});
+
+test("overlapping same-name calls with different args correlate to the right tool_call ids", async () => {
+  const f = await fixture("allow");
+  try {
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("github_create_issue", { title: "a" }, "toolu_A"), f.ctx);
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("github_create_issue", { title: "b" }, "toolu_B"), f.ctx);
+    // B reaches the broker first (A is still connecting).
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "create_issue", prefixedToolName: "github_create_issue", args: { title: "b" } });
+    await brokerRequest(f.bus, { serverName: "github", originalToolName: "create_issue", prefixedToolName: "github_create_issue", args: { title: "a" } });
+    const ids = pretoolBodies(f.api).map((b) => [dataOf(b).tool_use_id, (dataOf(b).metadata.tool_input as { title: string }).title]);
+    assert.deepStrictEqual(ids, [["toolu_B", "b"], ["toolu_A", "a"]]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("in-flight entries expire by age", () => {
+  let now = 1_000;
+  const inflight = createInflightCalls(10, 60_000, () => now);
+  inflight.remember({ toolCallId: "old", toolName: "github_x", input: {} }, "S");
+  now += 61_000;
+  assert.equal(inflight.claim("github_x", "x", {}), undefined, "a stale entry is never claimed");
+  inflight.remember({ toolCallId: "fresh", toolName: "github_x", input: {} }, "S");
+  assert.equal(inflight.claim("github_x", "x", {}), "fresh");
+  assert.equal(inflight.claim("github_x", "x", { other: 1 }), undefined, "args must match too");
+});
+
+test("an unmatched brokered call posts its own one-call turn log and never enters the turn store", async () => {
+  const f = await fixture("allow");
+  try {
+    await f.handlers.get("input")?.(createFakeInputEvent("an unrelated prompt"), f.ctx);
+    await brokerRequest(f.bus, { serverName: "db", originalToolName: "query", origin: "script", args: { sql: "select 1" } });
+    await sleep(80);
+    const logs = f.api.requests.filter((r) => r.path === TURNLOG_PATH).map((r) => r.body as {
+      messages: { content: string; tool_use?: { tool_name: string; tool_use_id: string }[] }[];
+    });
+    assert.equal(logs.length, 1, "posted immediately, without agent_end");
+    assert.equal(logs[0]?.messages[0]?.content, "", "no prompt — it is not part of a turn");
+    assert.equal(logs[0]?.messages[1]?.tool_use?.[0]?.tool_name, "mcp__db__query");
+    assert.ok(MBROKER_ID.test(String(logs[0]?.messages[1]?.tool_use?.[0]?.tool_use_id)));
+    assert.deepStrictEqual(turnStore.snapshot().tool_calls, [], "the shared store is untouched");
   } finally {
     await f.close();
   }

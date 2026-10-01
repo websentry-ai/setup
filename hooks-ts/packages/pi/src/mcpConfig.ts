@@ -1,138 +1,88 @@
-// `mcp_server_config` for a brokered MCP call: the server's `url`, or `command` + `args`, read from the
-// pi-mcp-adapter's own config files by the broker's EXACT `serverName` — or nothing.
+// `mcp_server_config` for a brokered MCP call: the server's `url`, or `command` + `args`, as the
+// pi-mcp-adapter loaded it — or NOTHING. Strict-or-omit (Revision 3).
 //
 // The gateway fingerprints a server from this config to decide whether it is sanctioned, so a wrong
-// config is worse than none: a project file the adapter honours but this reader ignored would let an
-// unsanctioned binary borrow a sanctioned server's fingerprint (review CR-02). So the reader sees the
-// files the way the adapter does, and when it cannot be sure, it says nothing:
+// config is worse than none: if this reader and the adapter disagree about a file, an unsanctioned
+// binary can borrow a sanctioned server's fingerprint. Two reviews reproduced exactly that, by making
+// a lenient re-implementation of the adapter's parser and merge disagree with the real one (comment
+// edge cases, `mcp-servers` fallbacks, an invalid `settings` that makes the adapter skip a file, a
+// `socket` transport, a file edited after the adapter loaded it). Mirroring leniency keeps producing
+// differentials, so this reader does the opposite: it describes a server ONLY when the configuration
+// is in a shape whose meaning is unambiguous, and otherwise answers `undefined` — for every server.
 //
-//   * **Same files, same order** (`config.ts getConfigSources` / `loadMcpConfigWithSources`, adapter
-//     4.0.0; later wins, merged per field per server): `~/.config/mcp/mcp.json`, `~/.agents/mcp.json`,
-//     `~/.agents/mcp/mcp.json`, the adapter's own file (`<agentDir>/mcp-adapter.json`, or the path
-//     given to pi's `--mcp-config` flag), `<cwd>/.mcp.json`, `<cwd>/.pi/mcp-adapter.json`.
-//     `PI_MCP_CONFIG_MODE=exclusive` reads only the adapter's own file. A global path that IS the
-//     adapter's own file is read once, at the adapter-file position, as the adapter does.
-//   * **Same parsing**: a UTF-8 BOM, `//` and `/* */` comments and trailing commas are all accepted
-//     (`utils.ts parseJsonWithComments`, ported below without the dependency); symlinks are FOLLOWED
-//     (dotfile managers make every config a link). The FIFO protection `safeRead.ts` exists for is
-//     kept by `stat`ing the TARGET and reading only a regular file under a generous 16 MiB cap.
-//   * **Unknown ⇒ omitted.** If ANY source exists but cannot be read or parsed, if any source pulls in
-//     servers this reader does not model (`imports`, `settings.ancestorConfigRoots`), or if the server
-//     is not found, the answer is `undefined` and the request goes without `mcp_server_config`. The
-//     gateway then treats the server as unknown (a null fingerprint), which in a sanctioning org is a
-//     deny — fail-closed for the one case where guessing could have meant a spoof.
+// **Send** only when ALL of these hold:
+//   * every existing source is plain strict JSON (`JSON.parse` on the raw text after an optional BOM;
+//     comments are NOT stripped — a comment makes the file "unknown");
+//   * every source is an object with only `mcpServers` (a plain object), `settings` (a plain object)
+//     and `$schema` at the top level;
+//   * no `settings` key that pulls in servers or files this reader does not see (`ancestorConfigRoots`,
+//     `agentPluginPaths`, `hostConfigDiscovery`) or that the adapter validates and may reject (`jev`);
+//   * every server definition, in every source, is a plain object with only keys from the adapter's
+//     `ServerEntry` (`types.ts`) — and none of them uses `socket`;
+//   * the server's merged definition has a string `url` XOR a string `command` (+ string-array `args`);
+//   * the extension can resolve the same sources the adapter does: an absolute `cwd`, an agent dir
+//     from `PI_CODING_AGENT_DIR` (absolute) or `~/.pi/agent`, no `PI_PACKAGE_DIR` (a rebranded build
+//     relocates both), and no `--mcp-config` anywhere in pi's argv;
+//   * the server name has no `__` (pi packages contribute servers named `<package>__<server>`, merged
+//     below the config files, which this reader does not load);
+//   * the snapshot is still valid (below).
 //
-// **What is sent, and what is not.** `env`, `headers`, bearer tokens and OAuth settings are never even
-// read into memory. `url` and `args` are sent as written — the same fields the Claude Code hook sends
-// — and a `url` query string or an `args` entry CAN itself carry a credential (`?api_key=…`,
-// `-e TOKEN=…`). That is parity egress, documented rather than claimed away.
+// **Snapshot once.** The adapter loads its config once, at session init, and never watches it. So the
+// sources are read once per extension instance — at the first `session_start` with a key, or at
+// first need — and their file signatures recorded. If any signature later differs, or the cwd
+// differs from the snapshot's, the answer is `undefined` for the rest of the instance: the adapter
+// is still running what it loaded, and this reader can no longer know what that was.
 //
-// Memoised against each source's `stat` signature, one entry (the most recent cwd + flags) kept, so a
-// warm lookup is six `stat`s. Every exported function is total.
+// **Reads cannot block.** `open(O_RDONLY | O_NONBLOCK)`, then `fstat` on the descriptor (regular file
+// only, 1 MiB cap), then read from the same descriptor — one lookup, so a path swapped for a FIFO
+// between a check and a read is not possible. Symlinks are followed, as the adapter follows them.
+//
+// **What is sent.** `env`, `headers`, bearer tokens and OAuth settings are never read into the result.
+// `url` and `args` are sent as written — the fields the Claude Code hook sends — and a `url` query
+// string or an `args` entry CAN itself carry a credential. That is parity egress, documented.
+//
+// Every exported function is total.
 
-import { readFileSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 
-import { resolvePiAgentDir } from "../../core/src/cache.ts";
 import {
+  ENV_PI_AGENT_DIR,
   ENV_PI_MCP_CONFIG_MODE,
   MAX_MCP_CONFIG_BYTES,
   MCP_ADAPTER_CONFIG_FILE_NAME,
   MCP_CONFIG_FLAG,
 } from "../../core/src/constants.ts";
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
+/** Every key of the adapter's `ServerEntry` (`types.ts:438-522`, 4.0.0), plus the inert `type`. */
+const KNOWN_SERVER_KEYS: ReadonlySet<string> = new Set([
+  "command", "args", "socket", "env", "inheritEnv", "cwd", "url", "caFile", "headers",
+  "requestHeadersCommand", "auth", "bearerToken", "bearerTokenEnv", "bearerTokenStore", "oauth",
+  "lifecycle", "idleTimeout", "requestTimeoutMs", "exposeResources", "directTools", "toolPrefix",
+  "includeTools", "excludeTools", "searchKeywords", "approveTools", "debug", "trace", "httpTransport",
+  "pluginDataDir", "literalEnv", "protocolVersion", "tasks", "disabled",
+  // Not read by the adapter at all (no transport selection reads it); common in `.mcp.json` files.
+  "type",
+]);
 
-/**
- * Strip `//` and `/* *\/` comments and trailing commas outside strings — the behaviour of
- * `strip-json-comments` with `{trailingCommas: true}`, which is what the adapter parses with. Comments
- * become whitespace; a comma followed only by whitespace/comments and then `}` or `]` is removed. An
- * unterminated block comment runs to the end, as there. Total on any string.
- */
-export function stripJsonComments(text: string): string {
-  const out: string[] = [];
-  let pendingComma = -1;
-  let i = 0;
-  const n = text.length;
-  while (i < n) {
-    const c = text[i]!;
-    if (c === '"') {
-      // A string, copied verbatim with its escapes.
-      let j = i + 1;
-      while (j < n) {
-        const d = text[j]!;
-        if (d === "\\") {
-          j += 2;
-          continue;
-        }
-        j += 1;
-        if (d === '"') break;
-      }
-      out.push(text.slice(i, Math.min(j, n)));
-      pendingComma = -1;
-      i = j;
-      continue;
-    }
-    if (c === "/" && text[i + 1] === "/") {
-      let j = i + 2;
-      while (j < n && text[j] !== "\n" && text[j] !== "\r") j += 1;
-      out.push(" ");
-      i = j;
-      continue;
-    }
-    if (c === "/" && text[i + 1] === "*") {
-      const end = text.indexOf("*/", i + 2);
-      out.push(" ");
-      i = end === -1 ? n : end + 2;
-      continue;
-    }
-    if (c === ",") {
-      pendingComma = out.length;
-      out.push(c);
-      i += 1;
-      continue;
-    }
-    if (c === "}" || c === "]") {
-      if (pendingComma >= 0) out[pendingComma] = " ";
-      pendingComma = -1;
-      out.push(c);
-      i += 1;
-      continue;
-    }
-    if (c !== " " && c !== "\t" && c !== "\n" && c !== "\r") pendingComma = -1;
-    out.push(c);
-    i += 1;
-  }
-  return out.join("");
-}
+/** Top-level keys a modelled source may have. Anything else (`imports`, `claudePlugins`, `mcp-servers`…) ⇒ omit. */
+const KNOWN_TOP_LEVEL_KEYS: ReadonlySet<string> = new Set(["mcpServers", "settings", "$schema"]);
 
-/** `parseJsonWithComments` (`utils.ts:13-15`): BOM, comments, trailing commas. Throws on bad JSON. */
-export function parseJsonc(raw: string): unknown {
-  const text = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
-  return JSON.parse(stripJsonComments(text)) as unknown;
-}
+/** `settings` keys that pull in sources this reader does not load, or that the adapter may reject. */
+const UNMODELLED_SETTINGS_KEYS: readonly string[] = [
+  "ancestorConfigRoots",
+  "agentPluginPaths",
+  "hostConfigDiscovery",
+  "jev",
+];
 
-/** The `--mcp-config <path>` / `--mcp-config=<path>` value from argv, resolved like the adapter does. */
-export function mcpConfigOverride(argv: readonly string[] | undefined): string | undefined {
-  try {
-    if (!Array.isArray(argv)) return undefined;
-    let value: string | undefined;
-    for (let i = 0; i < argv.length; i += 1) {
-      const arg = argv[i];
-      if (arg === MCP_CONFIG_FLAG) {
-        const next = argv[i + 1];
-        if (typeof next === "string" && next !== "") value = next;
-      } else if (typeof arg === "string" && arg.startsWith(`${MCP_CONFIG_FLAG}=`)) {
-        const inline = arg.slice(MCP_CONFIG_FLAG.length + 1);
-        if (inline !== "") value = inline;
-      }
-    }
-    return value === undefined ? undefined : resolve(value);
-  } catch {
-    return undefined;
-  }
+/** Set by a rebranded pi build; it moves both the agent dir and the project config dir. */
+const ENV_PI_PACKAGE_DIR = "PI_PACKAGE_DIR";
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value) as unknown;
+  return proto === Object.prototype || proto === null;
 }
 
 export interface McpConfigEnv {
@@ -142,70 +92,99 @@ export interface McpConfigEnv {
   argv?: readonly string[];
 }
 
-/** The sources in precedence order (later wins), as the adapter lists them. */
-export function mcpConfigSources(options: McpConfigEnv, cwd: string): string[] {
+/** Does pi's argv carry the adapter's `--mcp-config` flag in any form? (⇒ omit; not modelled.) */
+export function hasMcpConfigFlag(argv: readonly string[] | undefined): boolean {
   try {
-    const env = options.env ?? {};
-    const homeDir = typeof options.homeDir === "string" ? options.homeDir : "";
-    const agentDir = resolvePiAgentDir(env, homeDir);
-    const userPath =
-      mcpConfigOverride(options.argv) ??
-      (agentDir === undefined ? undefined : join(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME));
-    const mode = env[ENV_PI_MCP_CONFIG_MODE];
-    if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") {
-      return userPath === undefined ? [] : [userPath];
-    }
-    const sources: string[] = [];
-    if (homeDir !== "" && isAbsolute(homeDir)) {
-      for (const path of [
-        join(homeDir, ".config", "mcp", "mcp.json"),
-        join(homeDir, ".agents", "mcp.json"),
-        join(homeDir, ".agents", "mcp", "mcp.json"),
-      ]) {
-        // `getConfigSources:640-665`: a global path that is the adapter's own file is read at that
-        // file's position instead.
-        if (path !== userPath) sources.push(path);
-      }
-    }
-    if (userPath !== undefined) sources.push(userPath);
-    if (typeof cwd === "string" && cwd !== "" && isAbsolute(cwd)) {
-      const project = join(cwd, ".mcp.json");
-      if (project !== userPath) sources.push(project);
-      sources.push(join(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
-    }
-    return [...new Set(sources)];
+    if (!Array.isArray(argv)) return false;
+    return argv.some((arg) => arg === MCP_CONFIG_FLAG || (typeof arg === "string" && arg.startsWith(`${MCP_CONFIG_FLAG}=`)));
   } catch {
-    return [];
+    return true;
   }
 }
 
-/** One source, read: absent, a parsed value, or "could not be read/parsed". */
-type SourceRead = { kind: "absent" } | { kind: "parsed"; value: unknown } | { kind: "failed" };
+/**
+ * The sources in the adapter's precedence order (later wins), or `undefined` when the extension cannot
+ * be sure it resolves the same paths the adapter does.
+ */
+export function mcpConfigSources(options: McpConfigEnv, cwd: string): string[] | undefined {
+  try {
+    const env = options.env ?? {};
+    const homeDir = options.homeDir;
+    if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute(homeDir)) return undefined;
+    if (typeof cwd !== "string" || cwd === "" || !isAbsolute(cwd)) return undefined;
+    if (hasMcpConfigFlag(options.argv)) return undefined;
+    const packageDir = env[ENV_PI_PACKAGE_DIR];
+    if (typeof packageDir === "string" && packageDir !== "") return undefined;
+    const agentEnv = env[ENV_PI_AGENT_DIR];
+    let agentDir: string;
+    if (typeof agentEnv === "string" && agentEnv !== "") {
+      // The adapter `resolve()`s a relative value against its own cwd; not modelled.
+      if (!isAbsolute(agentEnv)) return undefined;
+      agentDir = agentEnv;
+    } else {
+      agentDir = join(homeDir, ".pi", "agent");
+    }
+    const adapterFile = join(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
+    const mode = env[ENV_PI_MCP_CONFIG_MODE];
+    if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") return [adapterFile];
+    const sources: string[] = [];
+    for (const path of [
+      join(homeDir, ".config", "mcp", "mcp.json"),
+      join(homeDir, ".agents", "mcp.json"),
+      join(homeDir, ".agents", "mcp", "mcp.json"),
+    ]) {
+      if (path !== adapterFile) sources.push(path);
+    }
+    sources.push(adapterFile);
+    const project = join(cwd, ".mcp.json");
+    if (project !== adapterFile) sources.push(project);
+    sources.push(join(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
+    return [...new Set(sources)];
+  } catch {
+    return undefined;
+  }
+}
+
+/** One source, read: absent, its raw text, or "could not be read". */
+type SourceRead = { kind: "absent" } | { kind: "text"; text: string } | { kind: "failed" };
 
 function isMissing(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
   return code === "ENOENT" || code === "ENOTDIR";
 }
 
-/** `stat` (follows links) → regular file within the cap → read → JSONC parse. Never blocks on a FIFO. */
+/** `open(O_NONBLOCK)` → `fstat` (regular, capped) → read from the descriptor. Never blocks. */
 function readSource(path: string): SourceRead {
-  let size: number;
+  let fd: number | undefined;
   try {
-    const stats = statSync(path);
+    try {
+      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+    } catch (error) {
+      return isMissing(error) ? { kind: "absent" } : { kind: "failed" };
+    }
+    const stats = fstatSync(fd);
     if (!stats.isFile()) return { kind: "failed" };
-    size = stats.size;
-  } catch (error) {
-    return isMissing(error) ? { kind: "absent" } : { kind: "failed" };
-  }
-  if (!Number.isFinite(size) || size > MAX_MCP_CONFIG_BYTES) return { kind: "failed" };
-  try {
-    const text = readFileSync(path, "utf8");
-    // `readValidatedConfig:1044`: a file that is empty once comments are stripped is skipped, not an error.
-    const stripped = stripJsonComments(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
-    if (stripped.trim() === "") return { kind: "absent" };
-    return { kind: "parsed", value: parseJsonc(text) };
+    if (!Number.isFinite(stats.size) || stats.size > MAX_MCP_CONFIG_BYTES) return { kind: "failed" };
+    // One byte past the cap, so a file that grew after `fstat` is caught rather than truncated.
+    const buffer = Buffer.alloc(MAX_MCP_CONFIG_BYTES + 1);
+    let total = 0;
+    while (total < buffer.length) {
+      const read = readSync(fd, buffer, total, buffer.length - total, null);
+      if (read <= 0) break;
+      total += read;
+    }
+    if (total > MAX_MCP_CONFIG_BYTES) return { kind: "failed" };
+    return { kind: "text", text: buffer.subarray(0, total).toString("utf8") };
   } catch {
     return { kind: "failed" };
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // nothing to do
+      }
+    }
   }
 }
 
@@ -216,52 +195,76 @@ interface ServerFields {
   type?: string;
 }
 
-/** The merged view: per-server kept fields, or `undefined` when the view cannot be trusted. */
-type MergedServers = Map<string, ServerFields> | undefined;
+/** The merged, fully-modelled view — or `undefined` when anything in any source is not modelled. */
+export type McpServerView = Map<string, ServerFields> | undefined;
 
-function serversOf(parsed: Record<string, unknown>): Record<string, unknown> | undefined {
-  if (isRecord(parsed.mcpServers)) return parsed.mcpServers;
-  if (isRecord(parsed["mcp-servers"])) return parsed["mcp-servers"] as Record<string, unknown>;
-  return undefined;
+/** Strict parse + shape check of one source. `null` = unmodelled ⇒ omit everything. */
+function modelledServers(text: string): Record<string, Record<string, unknown>> | null | "empty" {
+  const raw = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
+  // `readValidatedConfig:1044`: an empty file is skipped. (A comment-only file is not empty here:
+  // comments are not stripped, so it fails the strict parse below and omits.)
+  if (raw.trim() === "") return "empty";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed)) return null;
+  for (const key of Object.keys(parsed)) if (!KNOWN_TOP_LEVEL_KEYS.has(key)) return null;
+  if (Object.hasOwn(parsed, "settings")) {
+    const settings = parsed.settings;
+    if (!isPlainObject(settings)) return null;
+    for (const key of UNMODELLED_SETTINGS_KEYS) if (Object.hasOwn(settings, key)) return null;
+  }
+  if (!Object.hasOwn(parsed, "mcpServers")) return {};
+  const servers = parsed.mcpServers;
+  if (!isPlainObject(servers)) return null;
+  const out: Record<string, Record<string, unknown>> = {};
+  for (const name of Object.keys(servers)) {
+    const def = servers[name];
+    if (!isPlainObject(def)) return null;
+    for (const key of Object.keys(def)) if (!KNOWN_SERVER_KEYS.has(key)) return null;
+    if (Object.hasOwn(def, "socket")) return null;
+    // The fields the result is built from must be exactly the types the merge rule keys on.
+    if (Object.hasOwn(def, "url") && typeof def.url !== "string") return null;
+    if (Object.hasOwn(def, "command") && typeof def.command !== "string") return null;
+    if (Object.hasOwn(def, "args") && !(Array.isArray(def.args) && def.args.every((a) => typeof a === "string"))) {
+      return null;
+    }
+    Object.defineProperty(out, name, { value: def, enumerable: true, writable: true, configurable: true });
+  }
+  return out;
 }
 
-/** Read and merge every source. `undefined` = some source failed, or pulls in what is not modelled. */
-export function readMcpServers(options: McpConfigEnv, cwd: string): MergedServers {
+/**
+ * Read and merge every source, or `undefined`. The merge is `mergeServerMaps` (`config.ts:826-882`)
+ * restricted to the modelled fields: a later `command` drops an inherited `url`; a later `url` drops
+ * an inherited `command`/`args`; then the later definition's fields win.
+ */
+export function readMcpServerView(sources: readonly string[] | undefined): McpServerView {
   try {
+    if (sources === undefined) return undefined;
     const merged = new Map<string, ServerFields>();
-    for (const path of mcpConfigSources(options, cwd)) {
+    for (const path of sources) {
       const read = readSource(path);
       if (read.kind === "absent") continue;
       if (read.kind === "failed") return undefined;
-      const parsed = read.value;
-      // `validateConfig:1052`: a non-object file contributes no servers.
-      if (!isRecord(parsed)) continue;
-      // Servers this reader cannot see (host imports, ancestor project files) could redefine a name.
-      if (Array.isArray(parsed.imports) && parsed.imports.length > 0) return undefined;
-      const settings = parsed.settings;
-      if (isRecord(settings) && Array.isArray(settings.ancestorConfigRoots) && settings.ancestorConfigRoots.length > 0) {
-        return undefined;
-      }
-      const servers = serversOf(parsed);
-      if (servers === undefined) continue;
+      const servers = modelledServers(read.text);
+      if (servers === null) return undefined;
+      if (servers === "empty") continue;
       for (const name of Object.keys(servers)) {
-        const raw = servers[name];
-        if (!isRecord(raw)) continue;
+        const def = servers[name]!;
         const base: ServerFields = { ...(merged.get(name) ?? {}) };
-        // `mergeServerMaps:826-880`: a later `command` drops an inherited `url`, a later `url` drops
-        // an inherited `command`/`args`, so a repointed server is never described half-and-half.
-        if (typeof raw.command === "string") delete base.url;
-        if (typeof raw.url === "string") {
+        if (typeof def.command === "string") delete base.url;
+        else if (typeof def.url === "string") {
           delete base.command;
           delete base.args;
         }
-        if (typeof raw.url === "string") base.url = raw.url;
-        if (typeof raw.command === "string") base.command = raw.command;
-        if (Array.isArray(raw.args)) {
-          if (raw.args.every((arg) => typeof arg === "string")) base.args = [...(raw.args as string[])];
-          else delete base.args;
-        }
-        if (typeof raw.type === "string") base.type = raw.type;
+        if (typeof def.url === "string") base.url = def.url;
+        if (typeof def.command === "string") base.command = def.command;
+        if (Array.isArray(def.args)) base.args = [...(def.args as string[])];
+        if (typeof def.type === "string") base.type = def.type;
         merged.set(name, base);
       }
     }
@@ -271,59 +274,85 @@ export function readMcpServers(options: McpConfigEnv, cwd: string): MergedServer
   }
 }
 
-/** `{url, type?}` or `{command, args?, type?}` for `serverName`, or `undefined`. */
-export function projectServerConfig(servers: MergedServers, serverName: string): Record<string, unknown> | undefined {
+/** `{url, type?}` or `{command, args?, type?}` for exactly `serverName`, or `undefined`. */
+export function projectServerConfig(view: McpServerView, serverName: string): Record<string, unknown> | undefined {
   try {
-    if (servers === undefined || typeof serverName !== "string" || serverName === "") return undefined;
-    if (!servers.has(serverName)) return undefined;
-    const def = servers.get(serverName)!;
-    if (typeof def.url === "string" && def.url !== "") {
-      return typeof def.type === "string" ? { url: def.url, type: def.type } : { url: def.url };
-    }
-    if (typeof def.command === "string" && def.command !== "") {
-      const out: Record<string, unknown> = { command: def.command };
-      if (Array.isArray(def.args)) out.args = [...def.args];
-      if (typeof def.type === "string") out.type = def.type;
-      return out;
-    }
-    return undefined;
+    if (view === undefined || typeof serverName !== "string" || serverName === "") return undefined;
+    if (serverName.includes("__")) return undefined;
+    const def = view.get(serverName);
+    if (def === undefined) return undefined;
+    const hasUrl = typeof def.url === "string" && def.url !== "";
+    const hasCommand = typeof def.command === "string" && def.command !== "";
+    // Both (a definition that set both at once) or neither: the transport is not unambiguous.
+    if (hasUrl === hasCommand) return undefined;
+    if (hasUrl) return typeof def.type === "string" ? { url: def.url, type: def.type } : { url: def.url };
+    const out: Record<string, unknown> = { command: def.command };
+    if (Array.isArray(def.args)) out.args = [...def.args];
+    if (typeof def.type === "string") out.type = def.type;
+    return out;
   } catch {
     return undefined;
   }
 }
 
-/** `mtimeMs:size` per source path (following links), or a sentinel. Total. */
-function signatureOf(paths: readonly string[]): string {
+/** Link and target identity per path — dev, inode, size, mtime, ctime — or a sentinel. Total. */
+export function signatureOf(paths: readonly string[]): string {
   const parts: string[] = [];
   for (const path of paths) {
-    try {
-      const stats = statSync(path);
-      parts.push(`${path}=${stats.mtimeMs}:${stats.size}:${stats.isFile() ? "f" : "x"}`);
-    } catch {
-      parts.push(`${path}=-`);
+    let part = `${path}=`;
+    for (const stat of [lstatSync, statSync]) {
+      try {
+        const s = stat(path);
+        part += `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs};`;
+      } catch {
+        part += "-;";
+      }
     }
+    parts.push(part);
   }
   return parts.join("|");
 }
 
 export interface McpConfigReader {
-  /** The config for exactly `serverName` as the adapter would load it from `cwd`, or `undefined`. */
+  /** Take the snapshot now, if none was taken yet (the adapter loads at session init). */
+  snapshot(cwd: string): void;
+  /** The config for exactly `serverName`, or `undefined` (see the header for every reason). */
   serverConfig(serverName: string, cwd: string): Record<string, unknown> | undefined;
 }
 
-/** The memoised reader: one entry (most recent cwd/flags), re-read when any source's stat moves. */
+/** One snapshot per instance; a later signature or cwd change latches "unknown" for good. */
 export function createMcpConfigReader(options: McpConfigEnv): McpConfigReader {
-  let memo: { key: string; servers: MergedServers } | undefined;
+  let snap: { cwd: string; sources: string[] | undefined; signature: string; view: McpServerView } | undefined;
+  let invalidated = false;
+
+  function take(cwd: string): void {
+    const safeCwd = typeof cwd === "string" ? cwd : "";
+    const sources = mcpConfigSources(options, safeCwd);
+    const signature = sources === undefined ? "" : signatureOf(sources);
+    const view = readMcpServerView(sources);
+    // A file that changed while it was being read: never trust that view.
+    if (sources !== undefined && signatureOf(sources) !== signature) invalidated = true;
+    snap = { cwd: safeCwd, sources, signature, view };
+  }
+
   return {
+    snapshot(cwd: string): void {
+      try {
+        if (snap === undefined) take(cwd);
+      } catch {
+        invalidated = true;
+      }
+    },
     serverConfig(serverName: string, cwd: string): Record<string, unknown> | undefined {
       try {
-        const safeCwd = typeof cwd === "string" ? cwd : "";
-        const sources = mcpConfigSources(options, safeCwd);
-        const key = `${safeCwd}\u0000${signatureOf(sources)}`;
-        if (memo === undefined || memo.key !== key) {
-          memo = { key, servers: readMcpServers(options, safeCwd) };
+        if (snap === undefined) take(cwd);
+        if (invalidated || snap === undefined) return undefined;
+        if (snap.sources === undefined || snap.view === undefined) return undefined;
+        if (cwd !== snap.cwd || signatureOf(snap.sources) !== snap.signature) {
+          invalidated = true;
+          return undefined;
         }
-        return projectServerConfig(memo.servers, serverName);
+        return projectServerConfig(snap.view, serverName);
       } catch {
         return undefined;
       }
