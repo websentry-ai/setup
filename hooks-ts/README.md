@@ -61,7 +61,7 @@ Shipped knowingly, each with its owner and evidence, in
   are sent whole up to 512 KB; past that, every argument is kept and only the largest values are cut
   to head and tail (the middle of oversized values is not inspected; other fields are sent whole),
   and the whole request stays under 900 KB. The server config is sent only when the adapter's config files
-  are plain, fully-understood JSON unchanged since session start; otherwise it is omitted, and an org
+  are plain, fully-understood JSON unchanged since session start and the config is at most 32 KB; otherwise it is omitted, and an org
   that restricts MCP servers to a sanctioned list then denies those calls. Claiming the request
   pre-empts other permission extensions and host-managed approval. It needs pi-mcp-adapter 2.21.0 or
   later; older adapters and other MCP bridges are unenforced, with no runtime signal. On a deny the
