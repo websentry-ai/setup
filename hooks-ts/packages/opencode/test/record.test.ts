@@ -31,10 +31,10 @@ function toolPart(callID: string, tool: string, state: Record<string, unknown>, 
 test("a successful bash call is audited once, hash-only", async () => {
   const h = await startHarness(mock, "allow");
   try {
-    await h.hook("tool.execute.before")({ tool: "bash", sessionID: S, callID: "c1" }, { args: { command: "echo hello" } });
+    await h.hook("tool.execute.before")({ tool: "bash", sessionID: S, callID: "c1" }, { args: { command: "printf greeting" } });
     const r = await outcome(
       h.hook("tool.execute.after")(
-        { tool: "bash", sessionID: S, callID: "c1", args: { command: "echo hello" } },
+        { tool: "bash", sessionID: S, callID: "c1", args: { command: "printf greeting" } },
         { title: "echo", output: "hello", metadata: {} },
       ),
     );
@@ -49,8 +49,7 @@ test("a successful bash call is audited once, hash-only", async () => {
       content_sha256: expected.content_sha256,
       content_bytes: expected.content_bytes,
     });
-    assert.ok(!JSON.stringify(turn).includes("hello\""), "the raw output is not in the record");
-    assert.ok(!JSON.stringify(turn.results).includes("hello"));
+    assert.ok(!JSON.stringify(turn).includes("hello"), "the raw output is not in the record");
   } finally {
     h.cleanup();
   }
@@ -137,6 +136,8 @@ test("no key, or a latched key: nothing is recorded", async () => {
 
   const latched = await startHarness(mock, "401");
   try {
+    // Two consecutive 401s latch a fail-open session (core keyState).
+    await latched.hook("tool.execute.before")({ tool: "bash", sessionID: S, callID: "c0" }, { args: { command: "ls" } });
     await latched.hook("tool.execute.before")({ tool: "bash", sessionID: S, callID: "c1" }, { args: { command: "ls" } });
     assert.equal(latched.server.inspect.runtime().recordingActive(), false, "the key latched");
     await latched.hook("tool.execute.after")({ tool: "bash", sessionID: S, callID: "c1", args: {} }, { title: "", output: "x", metadata: {} });

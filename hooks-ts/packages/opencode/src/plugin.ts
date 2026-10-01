@@ -68,7 +68,7 @@ import {
 import type { HooksLike, ServerFactory } from "./hostTypes.ts";
 import { chatMessage } from "./prompt.ts";
 import { OPENCODE_PROFILE, resolveOpencodeDataDir } from "./profile.ts";
-import { eventHandler } from "./record.ts";
+import { eventHandler, toolExecuteAfter } from "./record.ts";
 
 /** The token of THIS module copy. A second evaluated copy of the bundle has a different one. */
 const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
@@ -81,6 +81,8 @@ const MAX_DIGESTS_PER_SESSION = 256;
 const MAX_PARENT_DEPTH = 8;
 /** The longest model string kept per session. */
 const MAX_MODEL_CHARS = 256;
+/** The most call ids any one per-session id set keeps; the oldest is dropped first. */
+const MAX_IDS_PER_SESSION = 512;
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -170,6 +172,8 @@ export interface Runtime {
   rememberDigest(sessionID: string, callID: string, digest: string | undefined): void;
   /** Take (and forget) a remembered digest. */
   takeDigest(sessionID: string, callID: string): string | undefined;
+  /** Claim the one audited result of a call: true the first time, false after (and on a fault). */
+  markResulted(sessionID: string, callID: string): boolean;
 }
 
 /** Read-only test seam, attached to the factory as a NON-enumerable `inspect` property. */
@@ -243,10 +247,22 @@ export interface SessionExtras {
   model?: string;
   /** The parent session id, for a child (subagent) session. */
   parent?: string;
+  /** Call ids whose result was already audited (one result per call). */
+  resulted: Set<string>;
 }
 
 function freshExtras(): SessionExtras {
-  return {};
+  return { resulted: new Set<string>() };
+}
+
+/** Add `id` to an insertion-ordered set, dropping the oldest past `max`. */
+function boundedAdd(set: Set<string>, id: string, max: number): void {
+  set.add(id);
+  while (set.size > max) {
+    const oldest = set.values().next().value;
+    if (oldest === undefined) break;
+    set.delete(oldest);
+  }
 }
 
 /**
@@ -534,6 +550,17 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         return undefined;
       }
     },
+    markResulted(sessionID: string, callID: string): boolean {
+      try {
+        if (sessionID === "" || callID === "") return false;
+        const seen = extras.get(sessionID).resulted;
+        if (seen.has(callID)) return false;
+        boundedAdd(seen, callID, MAX_IDS_PER_SESSION);
+        return true;
+      } catch {
+        return false;
+      }
+    },
   };
 
   /** The allow-everything set served when the factory itself faulted. Reports, never decides. */
@@ -562,6 +589,8 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     return {
       // The enforcement path. The handler raises only through `block.ts`, and only on a verdict.
       "tool.execute.before": toolExecuteBefore({ runtime, record }),
+      // The success-path audit and the args tamper check. Never raises.
+      "tool.execute.after": toolExecuteAfter({ runtime, record }),
       // The prompt check (V1-5 GO). Raises only through `block.ts`, and only on a verdict.
       "chat.message": chatMessage({ runtime, record }),
       // The bus. Never rejects (V1-4): every branch is guarded and nothing is awaited.
