@@ -133,7 +133,8 @@ function modelProviderOf(ctx: { model?: { provider?: unknown } | undefined }): s
 }
 
 /**
- * `"pi/0.87.1"` → `"0.87.1"`, for `metadata.pi_version`.
+ * `"pi/0.87.1"` → `"0.87.1"`, for the heartbeat's `metadata.<versionMetadataKey>`
+ * (`pi_version`).
  *
  * Derived from the resolved entrypoint rather than resolved a second time: two independent lookups
  * could disagree, and the entrypoint is the value that already survived `sanitizeVersion`.
@@ -423,7 +424,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           model: ctx.model?.id,
           clientEntrypoint: state.entrypoint,
           hasUI: ctx.hasUI === true,
-          piVersion: versionOf(state.entrypoint),
+          agentVersion: versionOf(state.entrypoint),
         };
         const client = state.client;
         // The heartbeat waits for the identity (bounded by its deadline) so the session's first
@@ -431,10 +432,13 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         void identityPending
           .then((identity) =>
             client.postPretool(
-              buildHeartbeatPayload({
-                ...heartbeatInput,
-                ...(identity === undefined ? {} : { accountIdentity: identity }),
-              }),
+              buildHeartbeatPayload(
+                {
+                  ...heartbeatInput,
+                  ...(identity === undefined ? {} : { accountIdentity: identity }),
+                },
+                PI_PROFILE,
+              ),
             ),
           )
           .then((result) => {

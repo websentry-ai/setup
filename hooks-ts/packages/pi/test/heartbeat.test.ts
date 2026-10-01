@@ -100,8 +100,8 @@ test("the heartbeat payload carries the locked fields and nothing tool-shaped", 
     model: undefined,
     clientEntrypoint: ENTRYPOINT,
     hasUI: true,
-    piVersion: "0.87.1",
-  });
+    agentVersion: "0.87.1",
+  }, PI_PROFILE);
 
   assert.equal(payload.event_name, "session_start");
   assert.equal(payload.pull_policies, true);
@@ -136,8 +136,8 @@ test("the payload reports has_ui false under pi -p", () => {
     model: undefined,
     clientEntrypoint: ENTRYPOINT,
     hasUI: false,
-    piVersion: "unknown",
-  });
+    agentVersion: "unknown",
+  }, PI_PROFILE);
   assert.equal(payload.pre_tool_use_data.metadata["has_ui"], false);
   assert.equal(payload.pre_tool_use_data.metadata["pi_version"], "unknown");
 });

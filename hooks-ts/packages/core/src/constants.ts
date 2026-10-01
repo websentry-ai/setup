@@ -5,7 +5,8 @@
 // imports anything.
 //
 // What is NOT here: the facts that differ per agent. The agent-specific key env var, the errors
-// `hook_source` and the turn-log route come from the injected `AgentProfile` (`profile.ts`).
+// `hook_source`, the turn-log route, the wire app label and the heartbeat's version metadata key come
+// from the injected `AgentProfile` (`profile.ts`).
 
 // --- Environment variables (naming precedent: RESEARCH §C3) ---------------------------------
 export const ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
@@ -29,8 +30,6 @@ export const PI_AGENT_DIR_SEGMENTS = [".pi", "agent"] as const;
 export const ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
 /** The cache is keyed on a digest, never on the key. See `keyFingerprint` (T-09-14). */
 export const KEY_FINGERPRINT_PREFIX = "sha256:";
-/** `unbound_app_label` on the wire; `'pi'` joined the union in Phase 7. */
-export const APP_LABEL = "pi";
 export const EVENT_NAME_TOOL_USE = "tool_use";
 /**
  * RES-05's `event_name`. It lands on `preToolUseHandler.ts:1008-1012` — the fall-through for an

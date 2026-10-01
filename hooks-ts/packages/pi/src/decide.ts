@@ -35,6 +35,7 @@ import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
+import { PI_PROFILE } from "./profile.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import type { UiCtx } from "./ui.ts";
@@ -233,7 +234,7 @@ export async function decideToolCall(
       clientEntrypoint: deps.entrypoint,
       pullPolicies,
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
-    });
+    }, PI_PROFILE);
 
     // `notifySafe` already swallows its own failures, and `policy.ts` wraps the call again: a notice
     // must never be able to change a verdict.

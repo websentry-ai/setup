@@ -29,7 +29,6 @@
 // and one pair of caps. A key the pretool request does not carry cannot appear in an audit row.
 
 import {
-  APP_LABEL,
   EVENT_NAME_TOOL_USE,
   EVENT_NAME_USER_PROMPT,
   MAX_COMMAND_CHARS,
@@ -39,6 +38,7 @@ import {
   TOOL_INPUT_ALLOWLIST,
 } from "./constants.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
+import type { AgentProfile } from "./profile.ts";
 import type {
   PreToolUseData,
   PretoolPayloadInput,
@@ -291,8 +291,16 @@ export function withAccountIdentity<T extends { account_identity?: AccountIdenti
   return body;
 }
 
-/** Assemble the §B1 body. Pure: same input, same output, no side effects. */
-export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestBody {
+/**
+ * Assemble the §B1 body. Pure: same input, same output, no side effects.
+ *
+ * The profile supplies the two things that differ per agent: the wire app label and the file-tool
+ * taxonomy that decides `metadata.file_path`.
+ */
+export function buildPretoolPayload(
+  input: PretoolPayloadInput,
+  profile: Pick<AgentProfile, "appLabel" | "fileTools">,
+): PretoolRequestBody {
   const metadata: Record<string, unknown> = {
     cwd: input.cwd,
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
@@ -329,7 +337,7 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
     event_name: EVENT_NAME_TOOL_USE,
     pre_tool_use_data: preToolUseData,
     messages: [{ role: "user", content: input.lastUserPrompt ?? "" }],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint,
   };
   // Set only when true. `pull_policies: false` would say nothing the absence does not already say,
@@ -354,7 +362,10 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
  *
  * Pure, like `buildPretoolPayload`: same input, same output, nothing written anywhere.
  */
-export function buildPromptPayload(input: PromptPayloadInput): PretoolRequestBody {
+export function buildPromptPayload(
+  input: PromptPayloadInput,
+  profile: Pick<AgentProfile, "appLabel">,
+): PretoolRequestBody {
   // The same both-ends discipline a command gets, for the same padding-bypass reason — see
   // `MAX_PROMPT_CHARS`.
   const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
@@ -372,7 +383,7 @@ export function buildPromptPayload(input: PromptPayloadInput): PretoolRequestBod
     event_name: EVENT_NAME_USER_PROMPT,
     pre_tool_use_data: { tool_name: "", command: "", metadata },
     messages: [{ role: "user", content: capped.command }],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint,
   };
   // Inert on this path — `handleGuardrails` never attaches `tools_to_check` (§C2) — so it is only

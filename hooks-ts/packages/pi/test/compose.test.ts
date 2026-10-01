@@ -33,6 +33,7 @@ import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import { createExtension, defaultMakeChecker } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
+import { PI_PROFILE } from "../src/profile.ts";
 import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
@@ -112,7 +113,7 @@ function payload(): ReturnType<typeof buildPretoolPayload> {
     sessionId: "sess-compose",
     model: "claude-sonnet-4-6",
     clientEntrypoint: "pi/0.87.1",
-  });
+  }, PI_PROFILE);
 }
 
 // --- init() hydrates the cache ------------------------------------------------------------------

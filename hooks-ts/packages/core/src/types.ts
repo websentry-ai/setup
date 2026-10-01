@@ -8,8 +8,8 @@
 // `account_identity` has since joined the type (parity with the Claude Code hook): optional, and
 // only ever set through `withAccountIdentity`, which forwards the six wire strings and nothing else.
 //
-// Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
-// future opencode adapter can reuse it unchanged.
+// Type-only file. Core imports no agent SDK, even as a type, so every adapter package reuses it
+// unchanged.
 
 import type { AccountIdentity } from "./accountIdentity.ts";
 
@@ -34,7 +34,11 @@ export interface PretoolRequestBody {
   pre_tool_use_data: PreToolUseData;
   /** Required by the server type; may be an empty array. */
   messages: PretoolMessage[];
-  unbound_app_label: "pi";
+  /**
+   * Set from `AgentProfile.appLabel`. A plain string here on purpose: which labels exist is the
+   * server's decision (`KNOWN_APP_LABELS`), not this type's.
+   */
+  unbound_app_label: string;
   client_entrypoint?: string;
   /**
    * Ask the response to carry the policy payload (RES-03).

@@ -210,7 +210,7 @@ test("after a restart the persisted block turns the first failed tool call into 
       sessionId: "sess-restart",
       model: "claude-sonnet-4-6",
       clientEntrypoint: ENTRYPOINT,
-    });
+    }, PI_PROFILE);
 
     assert.deepEqual(
       await checker.checkTool(payload, "bash"),

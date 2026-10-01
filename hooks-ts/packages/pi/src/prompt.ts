@@ -44,6 +44,7 @@ import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import { buildPromptPayload } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
 import { noteSafe } from "./decide.ts";
+import { PI_PROFILE } from "./profile.ts";
 import { notifySafe } from "./ui.ts";
 import type { UiCtx } from "./ui.ts";
 
@@ -102,7 +103,7 @@ export async function decideInput(
       clientEntrypoint: deps.entrypoint,
       hasUI: ctx.hasUI,
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
-    });
+    }, PI_PROFILE);
 
     const hooks: CheckHooks =
       deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
