@@ -23,7 +23,6 @@ import test from "node:test";
 
 import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
-import { NATIVE_FILE_TOOLS } from "../../core/src/payload.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import { createPolicyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
@@ -35,7 +34,7 @@ import type { DecideDeps } from "../src/decide.ts";
 import { createFakeClock, createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeClock } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
-import { PI_PROFILE } from "../src/profile.ts";
+import { PI_NATIVE_FILE_TOOLS as NATIVE_FILE_TOOLS, PI_PROFILE } from "../src/profile.ts";
 
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
@@ -216,14 +215,14 @@ test("RES-03 the skip predicate refuses every name outside the six, whatever the
 
   for (const toolName of ["bash", "powershell", "mcp__notion__search", "some_custom_tool", "READ", "Read", ""]) {
     assert.equal(
-      shouldSkipFileToolFromState(toolName, state, clock.now()),
+      shouldSkipFileToolFromState(toolName, state, clock.now(), PI_PROFILE.fileTools),
       false,
       `${toolName} must never be cache-skipped`,
     );
   }
   // And the six are, under the same state.
   for (const toolName of NATIVE_FILE_TOOLS) {
-    assert.equal(shouldSkipFileToolFromState(toolName, state, clock.now()), true, toolName);
+    assert.equal(shouldSkipFileToolFromState(toolName, state, clock.now(), PI_PROFILE.fileTools), true, toolName);
   }
 });
 
@@ -239,8 +238,8 @@ test("RES-03 the skip predicate needs tools-freshness, and the window boundary b
   assert.equal(areToolsFresh(undefined, syncedAt), false, "never synced is never fresh");
   assert.equal(areToolsFresh(syncedAt, syncedAt - 1), false, "a future stamp is skew, not freshness");
 
-  assert.equal(shouldSkipFileToolFromState("read", state, syncedAt + TTL_MS), true);
-  assert.equal(shouldSkipFileToolFromState("read", state, syncedAt + TTL_MS + 1), false);
+  assert.equal(shouldSkipFileToolFromState("read", state, syncedAt + TTL_MS, PI_PROFILE.fileTools), true);
+  assert.equal(shouldSkipFileToolFromState("read", state, syncedAt + TTL_MS + 1, PI_PROFILE.fileTools), false);
 });
 
 test("RES-03 a state that never learned a list skips nothing", () => {
@@ -249,7 +248,7 @@ test("RES-03 a state that never learned a list skips nothing", () => {
 
   assert.equal(state.getToolsSyncedAt(), undefined);
   for (const toolName of NATIVE_FILE_TOOLS) {
-    assert.equal(shouldSkipFileToolFromState(toolName, state, clock.now()), false, toolName);
+    assert.equal(shouldSkipFileToolFromState(toolName, state, clock.now(), PI_PROFILE.fileTools), false, toolName);
   }
 });
 

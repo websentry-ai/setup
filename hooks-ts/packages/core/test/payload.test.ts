@@ -127,12 +127,12 @@ test("path contract: bash and other command tools never send a file_path", () =>
   const custom = buildPretoolPayload(bashInput({ toolName: "mcp__x__y", toolInput: { path: "/a" } }), TEST_PROFILE);
   assert.equal(Object.hasOwn(custom.pre_tool_use_data.metadata, "file_path"), false);
 
-  assert.equal(resolveFilePath("bash", { path: "/a" }, "/cwd"), undefined);
-  assert.equal(resolveFilePath("powershell", {}, "/cwd"), undefined);
+  assert.equal(resolveFilePath("bash", { path: "/a" }, "/cwd", TEST_PROFILE.fileTools), undefined);
+  assert.equal(resolveFilePath("powershell", {}, "/cwd", TEST_PROFILE.fileTools), undefined);
   // A blank or non-string path is treated as absent.
-  assert.equal(resolveFilePath("grep", { path: "" }, "/cwd"), "/cwd");
-  assert.equal(resolveFilePath("grep", { path: 42 }, "/cwd"), "/cwd");
-  assert.equal(resolveFilePath("read", { path: "" }, "/cwd"), undefined);
+  assert.equal(resolveFilePath("grep", { path: "" }, "/cwd", TEST_PROFILE.fileTools), "/cwd");
+  assert.equal(resolveFilePath("grep", { path: 42 }, "/cwd", TEST_PROFILE.fileTools), "/cwd");
+  assert.equal(resolveFilePath("read", { path: "" }, "/cwd", TEST_PROFILE.fileTools), undefined);
 });
 
 // --- WR-04: the tool_input allowlist -----------------------------------------------------------

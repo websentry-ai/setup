@@ -277,6 +277,9 @@ export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
  *
  * **Widening this list is an egress decision, not a convenience.** A test spells the set out
  * independently so an addition cannot be slipped in as a formatting change.
+ *
+ * These are wire keys the server reads, not an agent's argument names. `path` here is unrelated to
+ * how a profile finds a file tool's path argument (`AgentProfile.fileTools.pathOf`).
  */
 export const TOOL_INPUT_ALLOWLIST = [
   "path",

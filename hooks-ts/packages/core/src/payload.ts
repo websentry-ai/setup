@@ -16,11 +16,11 @@
 //
 //   * The §B1 field list, exactly. Every Phase-9 / Future field is absent from the code as well as
 //     the type — the identity field in particular runs a deny-capable gate server-side.
-//   * The path contract carried forward from the Phase-7 review (STATE.md): pi makes `path`
-//     OPTIONAL on grep/find/ls (§A2), while the API entry gate requires
+//   * The path contract carried forward from the Phase-7 review (STATE.md): an agent can make the
+//     path OPTIONAL on its search tools (§A2), while the API entry gate requires
 //     `!!command || (isValidNativeTool && !!filePath)` (§B3). A pathless search would therefore
-//     skip policy evaluation entirely, so those three tools always send `metadata.file_path`,
-//     defaulting to cwd.
+//     skip policy evaluation entirely, so the tools a profile lists as `fileTools.defaulting`
+//     always send `metadata.file_path`, defaulting to cwd.
 //   * The allowlist runs BEFORE the existing 16 KB whole-object cap, which stays as defence in
 //     depth for the keys that do survive.
 //
@@ -38,7 +38,7 @@ import {
   TOOL_INPUT_ALLOWLIST,
 } from "./constants.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
-import type { AgentProfile } from "./profile.ts";
+import type { AgentFileTools, AgentProfile } from "./profile.ts";
 import type {
   PreToolUseData,
   PretoolPayloadInput,
@@ -46,41 +46,67 @@ import type {
   PromptPayloadInput,
 } from "./types.ts";
 
-/** Native search tools whose `path` is optional in pi — `file_path` falls back to cwd. */
-export const PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"] as const;
-/** Native file tools whose `path` is required by pi's schema. */
-export const PATH_REQUIRED_TOOLS = ["read", "write", "edit"] as const;
-
-const PATH_DEFAULTING: ReadonlySet<string> = new Set(PATH_DEFAULTING_TOOLS);
-const PATH_REQUIRED: ReadonlySet<string> = new Set(PATH_REQUIRED_TOOLS);
+/** What `nativeFileTools` answers for a taxonomy it cannot read: nothing is a file tool. */
+const NO_FILE_TOOLS: ReadonlySet<string> = new Set<string>();
+const nativeFileToolsMemo = new WeakMap<object, ReadonlySet<string>>();
 
 /**
- * The six tools the API evaluates on `metadata.file_path` rather than on a command —
- * `PI_NATIVE_FILE_TOOLS` in `taxonomy.ts:137-144`, and the exact set `computeToolsToCheck`
- * intersects against.
+ * Every tool the profile declares as evaluated on `metadata.file_path` rather than on a command: the
+ * union of `fileTools.defaulting` and `fileTools.required`.
  *
- * Exported so `cache.ts` (RES-03's file-tool skip) imports the list instead of retyping it: a
- * taxonomy change must not be able to drift between the payload builder and the skip decision, and
- * a name in one place but not the other is either a skipped check or a redundant round trip.
+ * One function for both users — the payload builder and `cache.ts`'s RES-03 file-tool skip — so the
+ * two cannot disagree about which names are file tools. A name in one place but not the other is
+ * either a skipped check or a redundant round trip.
+ *
+ * Memoised per `fileTools` object (a profile is built once and frozen), so the decision path does not
+ * rebuild a set on every tool call. Total: a taxonomy that cannot be read is an empty set, which
+ * makes nothing skippable.
  */
-export const NATIVE_FILE_TOOLS: ReadonlySet<string> = new Set([
-  ...PATH_DEFAULTING_TOOLS,
-  ...PATH_REQUIRED_TOOLS,
-]);
+export function nativeFileTools(fileTools: AgentFileTools): ReadonlySet<string> {
+  try {
+    if (fileTools === null || typeof fileTools !== "object") return NO_FILE_TOOLS;
+    const known = nativeFileToolsMemo.get(fileTools);
+    if (known !== undefined) return known;
+    const union = new Set<string>();
+    for (const name of fileTools.defaulting) if (typeof name === "string") union.add(name);
+    for (const name of fileTools.required) if (typeof name === "string") union.add(name);
+    nativeFileToolsMemo.set(fileTools, union);
+    return union;
+  } catch {
+    return NO_FILE_TOOLS;
+  }
+}
 
 /**
- * `metadata.file_path` for a tool call, or `undefined` when the tool has no file semantics
- * (`bash`, `powershell`, any custom/MCP tool) — those are evaluated on `command`.
+ * `metadata.file_path` for a tool call, or `undefined` when the tool has no file semantics (a shell
+ * tool, any custom/MCP tool) — those are evaluated on `command`.
+ *
+ * Which tools take a path, which of them default it to cwd, and which argument holds it all come from
+ * the profile's `fileTools`. `pathOf` reads unvalidated model arguments, so it is called inside a
+ * try/catch and a throw is treated as "no path given": a defaulting tool still gets cwd, a required
+ * tool gets `undefined`.
  */
 export function resolveFilePath(
   toolName: string,
   toolInput: Record<string, unknown>,
   cwd: string,
+  fileTools: AgentFileTools,
 ): string | undefined {
-  const isDefaulting = PATH_DEFAULTING.has(toolName);
-  if (!isDefaulting && !PATH_REQUIRED.has(toolName)) return undefined;
+  let isDefaulting: boolean;
+  try {
+    isDefaulting = fileTools.defaulting.has(toolName) === true;
+    if (!isDefaulting && fileTools.required.has(toolName) !== true) return undefined;
+  } catch {
+    // An unreadable taxonomy declares no file tools — the same answer `nativeFileTools` gives.
+    return undefined;
+  }
 
-  const path = toolInput.path;
+  let path: unknown;
+  try {
+    path = fileTools.pathOf(toolName, toolInput);
+  } catch {
+    path = undefined;
+  }
   if (typeof path === "string" && path.length > 0) return path;
   return isDefaulting ? cwd : undefined;
 }
@@ -306,7 +332,7 @@ export function buildPretoolPayload(
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
     tool_input: capToolInput(sanitizeToolInput(input.toolInput)),
   };
-  const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
+  const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
   if (filePath !== undefined) metadata.file_path = filePath;
 
   const capped = capCommand(input.command);

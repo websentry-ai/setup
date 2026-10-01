@@ -49,7 +49,8 @@ import {
 import { readSmallRegularFile } from "./safeRead.ts";
 import { parseFailureAction, parseTimestamp, parseToolsToCheck } from "./policyState.ts";
 import type { FailureAction, PolicySnapshot, PolicyState } from "./policyState.ts";
-import { NATIVE_FILE_TOOLS } from "./payload.ts";
+import { nativeFileTools } from "./payload.ts";
+import type { AgentFileTools } from "./profile.ts";
 
 /**
  * The on-disk record, snake_case so the file is diffable by eye against the Python hook's cache.
@@ -285,21 +286,26 @@ export function getFailureActionFromCache(
 /**
  * May this tool call skip the API entirely? Three conditions, all required:
  *
- *   1. the tool is one of the six native file tools — everything else (shell tools, MCP tools, an
- *      unknown name) is evaluated on `command` and is never skippable;
+ *   1. the tool is one of the profile's native file tools (`nativeFileTools(fileTools)`) —
+ *      everything else (shell tools, MCP tools, an unknown name) is evaluated on `command` and is
+ *      never skippable;
  *   2. the tool list is **tools-fresh**, not merely cached;
  *   3. the list does not contain this tool.
  *
  * Mirrors `unbound.py:3818-3826`, with condition 2 tightened to the tools-specific timestamp. Note
  * the comparison is exact: an unknown casing is an unknown tool, and Phase 7 registered pi's
  * lowercase names.
+ *
+ * The skip set is exactly what the profile declares, so a tool the profile does not list as a native
+ * file tool can never be skipped (T-12-16).
  */
 export function shouldSkipFileTool(
   toolName: string,
   cache: ToolsFreshness | undefined,
   now: number,
+  fileTools: AgentFileTools,
 ): boolean {
-  if (typeof toolName !== "string" || !NATIVE_FILE_TOOLS.has(toolName)) return false;
+  if (typeof toolName !== "string" || !nativeFileTools(fileTools).has(toolName)) return false;
   if (!isToolsFresh(cache, now)) return false;
   const tools = cache?.tools_to_check;
   if (!Array.isArray(tools)) return false;
@@ -318,10 +324,12 @@ export function shouldSkipFileToolFromState(
   toolName: string,
   state: Pick<PolicyState, "getToolsToCheck" | "getToolsSyncedAt">,
   now: number,
+  fileTools: AgentFileTools,
 ): boolean {
   return shouldSkipFileTool(
     toolName,
     { tools_synced_at: state.getToolsSyncedAt(), tools_to_check: state.getToolsToCheck() },
     now,
+    fileTools,
   );
 }

@@ -35,10 +35,14 @@ import {
   writeCache,
 } from "../src/cache.ts";
 import type { CachedPolicy, CacheIdentity } from "../src/cache.ts";
-import { NATIVE_FILE_TOOLS } from "../src/payload.ts";
+import { nativeFileTools } from "../src/payload.ts";
 import { createPolicyState } from "../src/policyState.ts";
 import { createFakeHome } from "./helpers/fakeHome.ts";
 import { TEST_KEY } from "./helpers/testKey.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
+
+const FILE_TOOLS = TEST_PROFILE.fileTools;
+const NATIVE_FILE_TOOLS = nativeFileTools(FILE_TOOLS);
 
 const GATEWAY = "https://api.getunbound.ai";
 const OTHER_GATEWAY = "https://api.getunbound.ai/tenant-a";
@@ -69,7 +73,7 @@ function fixture() {
   return { home, path, dir: dirname(path) };
 }
 
-/** The six names come from payload.ts; this file must never retype them. */
+/** The six names come from the injected profile; this file must never retype them. */
 const SOME_FILE_TOOL = [...NATIVE_FILE_TOOLS][0] as string;
 const OTHER_FILE_TOOL = [...NATIVE_FILE_TOOLS][1] as string;
 const SHELL_TOOL = "bash";
@@ -447,27 +451,27 @@ test("shouldSkipFileTool: only a native file tool, only when fresh, only when un
   const fresh: CachedPolicy = record({ tools_to_check: [SOME_FILE_TOOL], tools_synced_at: NOW });
 
   // The skippable case: a native file tool the org has no policy for.
-  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, fresh, NOW), true);
+  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, fresh, NOW, FILE_TOOLS), true);
   // Listed ⇒ it must be checked.
-  assert.equal(shouldSkipFileTool(SOME_FILE_TOOL, fresh, NOW), false);
+  assert.equal(shouldSkipFileTool(SOME_FILE_TOOL, fresh, NOW, FILE_TOOLS), false);
 
   // Stale ⇒ round-trip (which itself re-syncs the cache).
-  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, fresh, NOW + CACHE_TTL_MS + 1), false);
+  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, fresh, NOW + CACHE_TTL_MS + 1, FILE_TOOLS), false);
   // Never synced ⇒ round-trip, even though the record exists.
   const neverSynced: CachedPolicy = record({ tools_to_check: undefined, tools_synced_at: undefined });
-  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, neverSynced, NOW), false);
-  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, undefined, NOW), false);
+  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, neverSynced, NOW, FILE_TOOLS), false);
+  assert.equal(shouldSkipFileTool(OTHER_FILE_TOOL, undefined, NOW, FILE_TOOLS), false);
 
   // An empty list is an answer: every file tool is skippable.
   const noPolicies: CachedPolicy = record({ tools_to_check: [], tools_synced_at: NOW });
   for (const tool of NATIVE_FILE_TOOLS) {
-    assert.equal(shouldSkipFileTool(tool, noPolicies, NOW), true, tool);
+    assert.equal(shouldSkipFileTool(tool, noPolicies, NOW, FILE_TOOLS), true, tool);
   }
 
   // Shell and unknown tools are evaluated on `command` and are NEVER skippable, whatever the cache.
   for (const tool of [SHELL_TOOL, "powershell", "some_mcp_tool", "", "READ"]) {
-    assert.equal(shouldSkipFileTool(tool, noPolicies, NOW), false, tool);
-    assert.equal(shouldSkipFileTool(tool, fresh, NOW), false, tool);
+    assert.equal(shouldSkipFileTool(tool, noPolicies, NOW, FILE_TOOLS), false, tool);
+    assert.equal(shouldSkipFileTool(tool, fresh, NOW, FILE_TOOLS), false, tool);
   }
 });
 
@@ -507,7 +511,7 @@ test("a policy snapshot survives the whole round trip, including the empty-list 
 
       // And the point of it all: the skip decision is the same on both sides.
       assert.equal(
-        shouldSkipFileTool(OTHER_FILE_TOOL, onDisk, NOW),
+        shouldSkipFileTool(OTHER_FILE_TOOL, onDisk, NOW, FILE_TOOLS),
         !tools.includes(OTHER_FILE_TOOL),
       );
     } finally {

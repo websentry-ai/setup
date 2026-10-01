@@ -25,7 +25,6 @@ import {
 } from "../../core/src/constants.ts";
 import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
 import {
-  NATIVE_FILE_TOOLS,
   auditToolInput,
   buildPretoolPayload,
   resolveFilePath,
@@ -35,7 +34,7 @@ import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
-import { PI_PROFILE } from "./profile.ts";
+import { PI_NATIVE_FILE_TOOLS, PI_PROFILE } from "./profile.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import type { UiCtx } from "./ui.ts";
@@ -165,7 +164,7 @@ export async function decideToolCall(
     // `file_path` (§B3), so a call with neither is a guaranteed allow after a full round trip — and
     // pi awaits every call in a batch serially, so each pointless trip is felt N× (§F2). This covers
     // every custom/MCP tool that carries no command, not just an empty shell command (WR-04).
-    const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
+    const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd, PI_PROFILE.fileTools);
     if (command.trim() === "" && filePath === undefined) return undefined;
 
     // The audit projection, computed once for whichever branch below records the decision. Derived
@@ -196,8 +195,8 @@ export async function decideToolCall(
     // a custom tool is evaluated on its `command`, which no cached list can answer for.
     if (
       toolsConfirmed &&
-      NATIVE_FILE_TOOLS.has(event.toolName) &&
-      shouldSkipFileToolFromState(event.toolName, state, now)
+      PI_NATIVE_FILE_TOOLS.has(event.toolName) &&
+      shouldSkipFileToolFromState(event.toolName, state, now, PI_PROFILE.fileTools)
     ) {
       // Recorded, not silent: "we did not ask" is a different audit fact from "we asked and it was
       // allowed", and a turn log that showed them identically would make the cache invisible.

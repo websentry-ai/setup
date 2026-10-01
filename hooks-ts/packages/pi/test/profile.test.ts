@@ -18,8 +18,9 @@ import { join } from "node:path";
 import test from "node:test";
 
 import { TEST_PROFILE } from "../../core/test/helpers/testProfile.ts";
-import type { AgentProfile } from "../../core/src/profile.ts";
-import { PI_PROFILE } from "../src/profile.ts";
+import { nativeFileTools, resolveFilePath } from "../../core/src/payload.ts";
+import type { AgentFileTools, AgentProfile } from "../../core/src/profile.ts";
+import { PI_FILE_TOOLS, PI_NATIVE_FILE_TOOLS, PI_PROFILE } from "../src/profile.ts";
 
 const SCALAR_FIELDS = ["appLabel", "hookSource", "turnLogPath", "envApiKey", "versionMetadataKey"] as const;
 
@@ -216,4 +217,36 @@ test("PI_PROFILE functions return rather than throw on hostile input", () => {
     assert.doesNotThrow(() => PI_PROFILE.readAuth?.(agentDir, wrong(42)));
     assert.doesNotThrow(() => PI_PROFILE.readAuth?.(agentDir, wrong(input)));
   });
+});
+
+// --- the file-tool taxonomy, now owned by this package ------------------------------------------
+
+test("PI_NATIVE_FILE_TOOLS: exactly the six names the API's PI_NATIVE_FILE_TOOLS lists", () => {
+  // Spelled out, not derived: this list and the API's `taxonomy.ts` are a drift pair, and a name
+  // added on one side only is either a file tool sent with no path or a round trip that checks nothing.
+  assert.deepEqual([...PI_NATIVE_FILE_TOOLS].sort(), ["edit", "find", "grep", "ls", "read", "write"]);
+  assert.equal(PI_PROFILE.fileTools, PI_FILE_TOOLS, "the profile carries the exported taxonomy");
+  assert.equal(nativeFileTools(PI_PROFILE.fileTools), PI_NATIVE_FILE_TOOLS, "one set object, memoised per taxonomy");
+  assert.equal(PI_NATIVE_FILE_TOOLS.has("bash"), false, "a shell tool is evaluated on its command");
+});
+
+test("resolveFilePath: a pathOf that throws reads as no path given", () => {
+  const throwing: AgentFileTools = {
+    defaulting: PI_FILE_TOOLS.defaulting,
+    required: PI_FILE_TOOLS.required,
+    pathOf(): unknown {
+      throw new Error("hostile argument reader");
+    },
+  };
+  assert.equal(resolveFilePath("grep", { path: "/a" }, "/cwd", throwing), "/cwd", "a defaulting tool still gets cwd");
+  assert.equal(resolveFilePath("read", { path: "/a" }, "/cwd", throwing), undefined, "a required tool gets nothing");
+  assert.equal(resolveFilePath("bash", { path: "/a" }, "/cwd", throwing), undefined);
+});
+
+test("nativeFileTools / resolveFilePath: a taxonomy that cannot be read declares no file tools", () => {
+  assert.equal(nativeFileTools(wrong<AgentFileTools>(null)).size, 0);
+  assert.equal(nativeFileTools(wrong<AgentFileTools>({})).size, 0);
+  assert.equal(nativeFileTools(hostile<AgentFileTools>()).size, 0);
+  assert.equal(resolveFilePath("read", { path: "/a" }, "/cwd", hostile<AgentFileTools>()), undefined);
+  assert.equal(resolveFilePath("read", { path: "/a" }, "/cwd", wrong<AgentFileTools>(null)), undefined);
 });
