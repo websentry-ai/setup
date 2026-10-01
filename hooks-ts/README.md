@@ -54,9 +54,15 @@ Shipped knowingly, each with its owner and evidence, in
   sha256 and byte count; image parts are hash and bytes only. The turn log also carries the model's
   own text (16 KB cap, both ends kept), and tool input carries the allowlisted keys — `command`,
   `path`, `pattern` — that the pretool check is evaluated on. File bodies (`content`, `edits`) are
-  never in tool input. MCP calls made through `pi-mcp-adapter` are enforced on the gateway's MCP path
-  with their arguments; the remaining MCP gaps (`mcpScript`, no unknown-server scan, no `scriptHash`,
-  cold-cache resolution) are listed in [`../pi/README.md`](../pi/README.md).
+  never in tool input.
+- **MCP is enforced through pi-mcp-adapter's approval broker** (`pi-mcp-adapter:tool-approval-request`
+  on `pi.events`), for every origin the adapter brokers — proxy, direct, namespace, `mcpScript`,
+  resource and iframe — with the adapter's own resolution of server, tool and arguments (sent whole
+  up to 1 MB). It needs pi-mcp-adapter 2.21.0 or later; older adapters and other MCP bridges are
+  unenforced. On a deny the model sees the adapter's generic denial text, and the developer sees the
+  policy reason. The remaining MCP gaps (no unknown-server scan dispatch, no `scriptHash`, config
+  imports/plugins, and MCP usage analytics for allowed calls) are listed in
+  [`../pi/README.md`](../pi/README.md).
 - **Prompt templates are checked unexpanded.** `input` fires before expansion, so `/name args` is
   checked as the literal text typed, not as what it becomes.
 - **Slash commands never reach the `input` handler.** Built-ins and extension commands are

@@ -135,18 +135,16 @@ var PLACEHOLDER_SERIALS = [
   "123456789",
   "xxxxxxxx"
 ];
+var MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
 var MCP_PROXY_TOOL_NAME = "mcp";
 var MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
-var MCP_PROXY_NON_CALL_ACTIONS = [
-  "install",
-  "ui-messages",
-  "auth-start",
-  "auth-complete"
-];
+var MCP_BROKER_ID_PREFIX = "mcpb_";
+var MAX_INFLIGHT_MCP_CALLS = 64;
+var MAX_MCP_ARGS_BYTES = 1048576;
 var ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
 var MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
-var MCP_CACHE_FILE_NAME = "mcp-cache.json";
-var MAX_MCP_CACHE_BYTES = 2097152;
+var MCP_CONFIG_FLAG = "--mcp-config";
+var MAX_MCP_CONFIG_BYTES = 16777216;
 
 // packages/core/src/safeRead.ts
 import { lstatSync, readFileSync } from "node:fs";
@@ -175,23 +173,23 @@ function label(value) {
   return trimmed;
 }
 function withDeadline(promise, ms, fallback) {
-  return new Promise((resolve) => {
+  return new Promise((resolve2) => {
     let timer;
     try {
-      timer = setTimeout(() => resolve(fallback), ms);
+      timer = setTimeout(() => resolve2(fallback), ms);
       timer.unref?.();
     } catch {
-      resolve(fallback);
+      resolve2(fallback);
       return;
     }
     promise.then(
       (value) => {
         clearTimeout(timer);
-        resolve(value);
+        resolve2(value);
       },
       () => {
         clearTimeout(timer);
-        resolve(fallback);
+        resolve2(fallback);
       }
     );
   });
@@ -332,16 +330,16 @@ function probeToolPath(tool, env = process.env) {
     }
   }
 }
-var defaultExecFile = (file, args, opts) => new Promise((resolve) => {
+var defaultExecFile = (file, args, opts) => new Promise((resolve2) => {
   try {
     nodeExecFile(
       file,
       [...args],
       { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8", cwd: tmpdir() },
-      (error, stdout) => resolve(error === null && typeof stdout === "string" ? stdout : void 0)
+      (error, stdout) => resolve2(error === null && typeof stdout === "string" ? stdout : void 0)
     );
   } catch {
-    resolve(void 0);
+    resolve2(void 0);
   }
 });
 function firstValid(stdout) {
@@ -553,20 +551,20 @@ function createPolicyState() {
      *
      * Every field is re-validated. This object came off a file, so its types are claims.
      */
-    hydrate(snapshot) {
-      if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
+    hydrate(snapshot2) {
+      if (snapshot2 === null || typeof snapshot2 !== "object" || Array.isArray(snapshot2)) return;
       if (toolsSyncedAt === void 0) {
-        const tools = parseToolsToCheck(snapshot.tools_to_check);
-        const syncedAt = parseTimestamp(snapshot.tools_synced_at);
+        const tools = parseToolsToCheck(snapshot2.tools_to_check);
+        const syncedAt = parseTimestamp(snapshot2.tools_synced_at);
         if (tools !== void 0 && syncedAt !== void 0) {
           toolsToCheck = tools;
           toolsSyncedAt = syncedAt;
         }
       }
       if (fetchedAt === void 0) {
-        const action = parseFailureAction(snapshot.policy_check_failure_action);
+        const action = parseFailureAction(snapshot2.policy_check_failure_action);
         if (action !== void 0) failureAction = action;
-        const fetched = parseTimestamp(snapshot.fetched_at);
+        const fetched = parseTimestamp(snapshot2.fetched_at);
         if (fetched !== void 0) fetchedAt = fetched;
       }
     }
@@ -696,20 +694,48 @@ function withAccountIdentity(body, identity) {
   if (clean !== void 0) body.account_identity = clean;
   return body;
 }
-function capMcpArgs(args, maxBytes = MAX_TOOL_INPUT_BYTES) {
+var MCP_ARGS_TRUNCATION_MARKER = "\n...unbound: arguments truncated...\n";
+function mcpArgsForWire(args, maxBytes = MAX_MCP_ARGS_BYTES) {
+  try {
+    if (args === null || typeof args !== "object" || Array.isArray(args)) return { toolInput: {}, truncated: false };
+    const serialised = JSON.stringify(args);
+    if (typeof serialised !== "string") return { toolInput: { _unserializable: true }, truncated: true };
+    const originalBytes = Buffer.byteLength(serialised);
+    if (originalBytes <= maxBytes) return { toolInput: args, truncated: false };
+    const side = Math.max(1, Math.floor((maxBytes - MCP_ARGS_TRUNCATION_MARKER.length * 3) / 6));
+    return {
+      toolInput: {
+        _truncated_json: serialised.slice(0, side) + MCP_ARGS_TRUNCATION_MARKER + serialised.slice(-side)
+      },
+      truncated: true,
+      originalBytes
+    };
+  } catch {
+    return { toolInput: { _unserializable: true }, truncated: true };
+  }
+}
+function defineData(target, key, value) {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
+function auditMcpArgs(args, maxBytes = MAX_TOOL_INPUT_BYTES) {
   try {
     if (args === null || typeof args !== "object" || Array.isArray(args)) return {};
-    const serialised = JSON.stringify(args) ?? "";
+    const serialised = JSON.stringify(args);
+    if (typeof serialised !== "string") return { _truncated: true };
     const originalBytes = Buffer.byteLength(serialised);
-    if (originalBytes <= maxBytes) return args;
+    if (originalBytes <= maxBytes) {
+      const cloned = JSON.parse(serialised);
+      return cloned !== null && typeof cloned === "object" && !Array.isArray(cloned) ? cloned : {};
+    }
     const capped = { _truncated: true, _original_bytes: originalBytes };
     let usedBytes = Buffer.byteLength(JSON.stringify(capped));
-    for (const [key, raw] of Object.entries(args)) {
+    for (const key of Object.keys(args)) {
+      const raw = args[key];
       if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") continue;
       const value = typeof raw === "string" ? sliceToBytes(raw, MAX_TOOL_INPUT_VALUE_BYTES) : raw;
       const entryBytes = Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(value)) + 2;
       if (usedBytes + entryBytes > maxBytes) continue;
-      capped[key] = value;
+      defineData(capped, key, value);
       usedBytes += entryBytes;
     }
     return capped;
@@ -723,8 +749,14 @@ function buildPretoolPayload(input) {
   if (mcp !== void 0) {
     metadata.mcp_server = mcp.server;
     metadata.mcp_tool = mcp.tool;
-    metadata.tool_input = capMcpArgs(mcp.args);
+    const wire = mcpArgsForWire(mcp.args);
+    metadata.tool_input = wire.toolInput;
+    if (wire.truncated) {
+      metadata.tool_input_truncated = true;
+      if (wire.originalBytes !== void 0) metadata.tool_input_original_bytes = wire.originalBytes;
+    }
     if (mcp.serverConfig !== void 0) metadata.mcp_server_config = mcp.serverConfig;
+    if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
   } else {
     metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));
     const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
@@ -1115,7 +1147,9 @@ function redactLeaves(value, apiKey, depth) {
   const out = {};
   for (const [key, item] of Object.entries(value)) {
     const redacted = redactLeaves(item, apiKey, depth + 1);
-    if (redacted !== void 0) out[key] = redacted;
+    if (redacted !== void 0) {
+      Object.defineProperty(out, key, { value: redacted, enumerable: true, writable: true, configurable: true });
+    }
   }
   return out;
 }
@@ -1605,8 +1639,9 @@ function createTurnStore() {
       try {
         if (entry === null || typeof entry !== "object") return;
         while (record.results.length >= MAX_TURN_RESULTS) {
-          record.results.shift();
+          const evicted = record.results.shift();
           record.results_truncated = (record.results_truncated ?? 0) + 1;
+          if (typeof evicted?.content === "string") outputChars = Math.max(0, outputChars - evicted.content.length);
         }
         const stored = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
@@ -1616,7 +1651,10 @@ function createTurnStore() {
         };
         if (typeof entry.content_sha256 === "string") stored.content_sha256 = entry.content_sha256;
         if (entry.hash_skipped === true) stored.hash_skipped = true;
-        if (typeof entry.content === "string") {
+        const id = stored.tool_use_id;
+        const recorded = id !== "" && record.tool_calls.some((call) => call.tool_use_id === id);
+        if (!recorded) {
+        } else if (typeof entry.content === "string") {
           if (outputChars + entry.content.length > MAX_TURN_OUTPUT_CHARS) {
             stored.content_omitted = true;
           } else {
@@ -1823,26 +1861,6 @@ async function confirmWithTimeout(ctx, title, message, timeoutMs = CONFIRM_TIMEO
 }
 
 // packages/pi/src/decide.ts
-function mcpOf(deps, toolName, input, cwd) {
-  try {
-    const call = deps.resolveMcp?.(toolName, input, cwd);
-    if (call === null || typeof call !== "object") return void 0;
-    if (typeof call.server !== "string" || call.server === "") return void 0;
-    if (typeof call.tool !== "string" || call.tool === "") return void 0;
-    if (call.args === null || typeof call.args !== "object" || Array.isArray(call.args)) return void 0;
-    return call;
-  } catch {
-    return void 0;
-  }
-}
-function auditMcpArgs(args) {
-  try {
-    const cloned = JSON.parse(JSON.stringify(capMcpArgs(args)));
-    return cloned !== null && typeof cloned === "object" && !Array.isArray(cloned) ? cloned : {};
-  } catch {
-    return {};
-  }
-}
 function promptOf(deps) {
   try {
     const prompt = deps.currentPrompt?.();
@@ -1866,10 +1884,6 @@ async function decideToolCall(event, ctx, deps) {
     const shell = isShellCall(event);
     const command = shell ? event.input.command : "";
     const toolInput = event.input ?? {};
-    if (!shell && !NATIVE_FILE_TOOLS.has(event.toolName)) {
-      const mcp = mcpOf(deps, event.toolName, event.input, ctx.cwd);
-      if (mcp !== void 0) return await decideMcpCall(event, ctx, deps, mcp);
-    }
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === void 0) return void 0;
     const auditInput = auditToolInput(toolInput, command);
@@ -1915,33 +1929,59 @@ async function decideToolCall(event, ctx, deps) {
     return void 0;
   }
 }
-async function decideMcpCall(event, ctx, deps, mcp) {
-  const now = (deps.now ?? Date.now)();
-  const state = deps.state ?? policyState;
-  const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
-  const payload = buildPretoolPayload({
-    toolName: event.toolName,
-    command: "",
-    toolUseId: event.toolCallId,
-    toolInput: {},
-    cwd: ctx.cwd,
-    sessionId: ctx.sessionManager.getSessionId(),
-    model: ctx.model?.id,
-    clientEntrypoint: deps.entrypoint,
-    pullPolicies,
-    lastUserPrompt: promptOf(deps),
-    mcp,
-    ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
-  });
-  const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
-  const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
-  noteDecision(deps, {
-    tool_name: `mcp__${mcp.server}__${mcp.tool}`,
-    tool_use_id: event.toolCallId,
-    decision: outcome.kind,
-    tool_input: auditMcpArgs(mcp.args)
-  });
-  return await applyOutcome(outcome, ctx);
+async function decideMcpApproval(input, deps) {
+  try {
+    const { call } = input;
+    const toolName = `mcp__${call.server}__${call.tool}`;
+    const now = (deps.now ?? Date.now)();
+    const state = deps.state ?? policyState;
+    const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
+    const payload = buildPretoolPayload({
+      toolName,
+      command: "",
+      toolUseId: input.toolUseId,
+      toolInput: {},
+      cwd: input.cwd,
+      sessionId: input.sessionId,
+      model: input.model,
+      clientEntrypoint: deps.entrypoint,
+      pullPolicies,
+      lastUserPrompt: promptOf(deps),
+      mcp: call,
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
+    });
+    const ui = input.ui;
+    const hooks = deps.hooks ?? { notify: (message, level) => ui === void 0 ? void 0 : notifySafe(ui, message, level) };
+    const outcome = await deps.checker.checkTool(payload, toolName, hooks);
+    noteDecision(deps, {
+      tool_name: toolName,
+      tool_use_id: input.toolUseId,
+      decision: outcome.kind,
+      tool_input: auditMcpArgs(call.args)
+    });
+    switch (outcome.kind) {
+      case "allow":
+        return "abstain";
+      case "deny":
+        if (ui !== void 0) notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "error");
+        return "deny";
+      case "confirm": {
+        if (ui === void 0 || ui.hasUI !== true) {
+          if (ui !== void 0) notifySafe(ui, NO_UI_REASON, "warning");
+          return "deny";
+        }
+        notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "warning");
+        const accepted = await confirmWithTimeout(ui, CONFIRM_TITLE, CONFIRM_QUESTION);
+        return accepted ? "allow_once" : "deny";
+      }
+      case "unavailable":
+        if (ui !== void 0) notifySafe(ui, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
+        return "deny";
+    }
+    return "abstain";
+  } catch {
+    return "abstain";
+  }
 }
 async function applyOutcome(outcome, ctx) {
   switch (outcome.kind) {
@@ -1968,355 +2008,309 @@ async function applyOutcome(outcome, ctx) {
   return void 0;
 }
 
-// packages/pi/src/mcpResolve.ts
-import { createHash as createHash3 } from "node:crypto";
-import { lstatSync as lstatSync2 } from "node:fs";
-import { isAbsolute as isAbsolute3, join as join5 } from "node:path";
-var TOOL_PREFIXES = /* @__PURE__ */ new Set(["server", "none", "short", "mcp"]);
-var EMPTY_CONFIG = () => ({ servers: /* @__PURE__ */ new Map(), settings: {} });
-var NATIVE_TOOL_NAMES = /* @__PURE__ */ new Set([
-  "bash",
-  "powershell",
-  "read",
-  "write",
-  "edit",
-  "grep",
-  "find",
-  "ls"
-]);
-var BUILTIN_NAMES = /* @__PURE__ */ new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
-var NON_CALL_ACTIONS = new Set(MCP_PROXY_NON_CALL_ACTIONS);
-var ENCODED_SERVER_NAMESPACE_MARKER = "_mcpns_";
-var MAX_SERVER_NAMESPACE_LENGTH = 59;
-function encodeServerNamespace(name) {
-  return Array.from(name, (character) => {
-    if (character === "_") return "__";
-    return /^[A-Za-z0-9]$/.test(character) ? character : `_${character.codePointAt(0).toString(16)}_`;
-  }).join("");
-}
-function formatServerNamespace(serverName) {
-  const normalized = serverName.replace(/-/g, "_");
-  const safe = /^[A-Za-z0-9_]*$/.test(normalized) && !normalized.startsWith(ENCODED_SERVER_NAMESPACE_MARKER);
-  const body = safe ? normalized : encodeServerNamespace(normalized);
-  const namespace = safe ? body : `${ENCODED_SERVER_NAMESPACE_MARKER}${body}`;
-  if (namespace.length <= MAX_SERVER_NAMESPACE_LENGTH) return namespace;
-  const digest = createHash3("sha256").update(namespace, "utf8").digest("hex").slice(0, 16);
-  const hashPrefix = `${ENCODED_SERVER_NAMESPACE_MARKER}_h_`;
-  const head = body.slice(0, MAX_SERVER_NAMESPACE_LENGTH - hashPrefix.length - digest.length - 1);
-  return `${hashPrefix}${head}_${digest}`;
-}
-function sanitizeServerPrefix(serverName, preserveProviderValid = true) {
-  const validCharacters = preserveProviderValid ? /^[A-Za-z0-9_-]$/ : /^[A-Za-z0-9]$/;
-  return Array.from(
-    serverName,
-    (char) => validCharacters.test(char) ? char : `_${char.codePointAt(0).toString(16)}_`
-  ).join("");
-}
-function getServerPrefix(serverName, mode) {
-  if (mode === "none") return "";
-  if (mode === "short") {
-    let short = sanitizeServerPrefix(serverName.replace(/-?mcp$/i, ""));
-    if (!short) short = "mcp";
-    return short;
-  }
-  if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName)}`;
-  return sanitizeServerPrefix(serverName);
-}
-function formatToolName(toolName, serverName, prefix) {
-  const p = getServerPrefix(serverName, prefix);
-  const sanitized = toolName.replace(/\./g, "_");
-  if (p && sanitized.startsWith(`${p}_`) && sanitized.length > p.length + 1) {
-    return sanitized;
-  }
-  return p ? `${p}_${sanitized}` : sanitized;
-}
-function resolveToolPrefix(definition, globalPrefix) {
-  return definition?.toolPrefix ?? globalPrefix ?? "server";
-}
-function getLegacyServerPrefix(serverName, mode) {
-  if (mode === "none") return "";
-  if (mode === "short") return sanitizeServerPrefix(serverName.replace(/-?mcp$/i, ""), false) || "mcp";
-  if (mode === "mcp") return `mcp__${sanitizeServerPrefix(serverName, false)}`;
-  return sanitizeServerPrefix(serverName, false);
-}
-function formatLegacyToolName(toolName, serverName, prefix) {
-  const serverPrefix = getLegacyServerPrefix(serverName, prefix);
-  const sanitizedToolName = toolName.replace(/[.-]/g, "_");
-  return serverPrefix ? `${serverPrefix}_${sanitizedToolName}` : sanitizedToolName;
-}
-function getToolNameCandidates(toolName, serverName, prefix) {
-  const candidates = /* @__PURE__ */ new Set([
-    toolName,
-    formatToolName(toolName, serverName, prefix),
-    formatToolName(toolName, serverName, "server"),
-    formatToolName(toolName, serverName, "short"),
-    formatToolName(toolName, serverName, "mcp")
-  ]);
-  const legacyToolName = toolName.replace(/-/g, "_");
-  candidates.add(legacyToolName);
-  candidates.add(formatToolName(legacyToolName, serverName, prefix));
-  candidates.add(formatToolName(legacyToolName, serverName, "server"));
-  candidates.add(formatToolName(legacyToolName, serverName, "short"));
-  candidates.add(formatToolName(legacyToolName, serverName, "mcp"));
-  candidates.add(formatLegacyToolName(toolName, serverName, prefix));
-  candidates.add(formatLegacyToolName(toolName, serverName, "server"));
-  candidates.add(formatLegacyToolName(toolName, serverName, "short"));
-  candidates.add(formatLegacyToolName(toolName, serverName, "mcp"));
-  candidates.add(formatToolName(toolName, serverName, prefix).replace(/-/g, "_"));
-  candidates.add(formatToolName(toolName, serverName, "server").replace(/-/g, "_"));
-  candidates.add(formatToolName(toolName, serverName, "short").replace(/-/g, "_"));
-  candidates.add(formatToolName(toolName, serverName, "mcp").replace(/-/g, "_"));
-  return candidates;
-}
+// packages/pi/src/mcpBroker.ts
+import { randomBytes as randomBytes2 } from "node:crypto";
+var ANSWERS = /* @__PURE__ */ new Set(["allow_once", "deny", "abstain"]);
 function isRecord2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-function parseJson(text) {
-  if (text === void 0) return void 0;
+function snapshot(data) {
+  if (!isRecord2(data)) return void 0;
+  const claim = data.claim;
+  if (typeof claim !== "function") return void 0;
+  const serverName = data.serverName;
+  const originalToolName = data.originalToolName;
+  if (typeof serverName !== "string" || serverName === "") return void 0;
+  if (typeof originalToolName !== "string" || originalToolName === "") return void 0;
+  const prefixedToolName = typeof data.prefixedToolName === "string" ? data.prefixedToolName : "";
+  const args = isRecord2(data.args) ? data.args : {};
+  const origin = typeof data.origin === "string" ? data.origin : "";
+  const signal = data.signal;
+  return {
+    serverName,
+    originalToolName,
+    prefixedToolName,
+    args,
+    origin,
+    signal: signal instanceof AbortSignal ? signal : void 0,
+    claim: (handler) => claim.call(data, handler)
+  };
+}
+function createMcpApprovalListener(deps) {
+  return (data) => {
+    try {
+      const request = snapshot(data);
+      if (request === void 0) return;
+      if (!deps.active()) return;
+      const { claim, ...call } = request;
+      claim(async () => {
+        try {
+          if (call.signal?.aborted === true) return "abstain";
+          const answer = await deps.decide(call);
+          return typeof answer === "string" && ANSWERS.has(answer) ? answer : "abstain";
+        } catch {
+          return "abstain";
+        }
+      });
+    } catch {
+    }
+  };
+}
+function createInflightCalls(max) {
+  let entries = [];
+  const cap = Number.isFinite(max) && max > 0 ? Math.floor(max) : 1;
+  return {
+    remember(entry, sessionId) {
+      try {
+        if (typeof entry.toolCallId !== "string" || entry.toolCallId === "") return;
+        if (typeof entry.toolName !== "string" || entry.toolName === "") return;
+        let tool;
+        if (isRecord2(entry.input) && typeof entry.input.tool === "string") tool = entry.input.tool;
+        entries.push({
+          toolCallId: entry.toolCallId,
+          toolName: entry.toolName,
+          tool,
+          sessionId: typeof sessionId === "string" ? sessionId : ""
+        });
+        while (entries.length > cap) entries.shift();
+      } catch {
+      }
+    },
+    forget(toolCallId) {
+      try {
+        if (typeof toolCallId !== "string") return;
+        entries = entries.filter((entry) => entry.toolCallId !== toolCallId);
+      } catch {
+      }
+    },
+    keepSession(sessionId) {
+      try {
+        if (typeof sessionId !== "string" || sessionId === "") return;
+        entries = entries.filter((entry) => entry.sessionId === "" || entry.sessionId === sessionId);
+      } catch {
+      }
+    },
+    claim(prefixedToolName, originalToolName) {
+      try {
+        const index = entries.findIndex((entry) => {
+          if (prefixedToolName !== "" && entry.toolName === prefixedToolName) return true;
+          const wrapper = entry.toolName === MCP_PROXY_TOOL_NAME || entry.toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
+          return wrapper && entry.tool !== void 0 && (entry.tool === originalToolName || prefixedToolName !== "" && entry.tool === prefixedToolName);
+        });
+        if (index === -1) return void 0;
+        const [found] = entries.splice(index, 1);
+        return found?.toolCallId;
+      } catch {
+        return void 0;
+      }
+    },
+    size() {
+      return entries.length;
+    }
+  };
+}
+function mintBrokerId() {
+  return MCP_BROKER_ID_PREFIX + randomBytes2(10).toString("hex");
+}
+
+// packages/pi/src/mcpConfig.ts
+import { readFileSync as readFileSync3, statSync } from "node:fs";
+import { isAbsolute as isAbsolute3, join as join5, resolve } from "node:path";
+function isRecord3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function stripJsonComments(text) {
+  const out = [];
+  let pendingComma = -1;
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      let j = i + 1;
+      while (j < n) {
+        const d = text[j];
+        if (d === "\\") {
+          j += 2;
+          continue;
+        }
+        j += 1;
+        if (d === '"') break;
+      }
+      out.push(text.slice(i, Math.min(j, n)));
+      pendingComma = -1;
+      i = j;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      let j = i + 2;
+      while (j < n && text[j] !== "\n" && text[j] !== "\r") j += 1;
+      out.push(" ");
+      i = j;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      out.push(" ");
+      i = end === -1 ? n : end + 2;
+      continue;
+    }
+    if (c === ",") {
+      pendingComma = out.length;
+      out.push(c);
+      i += 1;
+      continue;
+    }
+    if (c === "}" || c === "]") {
+      if (pendingComma >= 0) out[pendingComma] = " ";
+      pendingComma = -1;
+      out.push(c);
+      i += 1;
+      continue;
+    }
+    if (c !== " " && c !== "	" && c !== "\n" && c !== "\r") pendingComma = -1;
+    out.push(c);
+    i += 1;
+  }
+  return out.join("");
+}
+function parseJsonc(raw) {
+  const text = raw.charCodeAt(0) === 65279 ? raw.slice(1) : raw;
+  return JSON.parse(stripJsonComments(text));
+}
+function mcpConfigOverride(argv) {
   try {
-    return JSON.parse(text);
+    if (!Array.isArray(argv)) return void 0;
+    let value;
+    for (let i = 0; i < argv.length; i += 1) {
+      const arg = argv[i];
+      if (arg === MCP_CONFIG_FLAG) {
+        const next = argv[i + 1];
+        if (typeof next === "string" && next !== "") value = next;
+      } else if (typeof arg === "string" && arg.startsWith(`${MCP_CONFIG_FLAG}=`)) {
+        const inline = arg.slice(MCP_CONFIG_FLAG.length + 1);
+        if (inline !== "") value = inline;
+      }
+    }
+    return value === void 0 ? void 0 : resolve(value);
   } catch {
     return void 0;
   }
 }
-function mcpConfigPaths(env, homeDir, cwd) {
+function mcpConfigSources(options, cwd) {
   try {
+    const env = options.env ?? {};
+    const homeDir = typeof options.homeDir === "string" ? options.homeDir : "";
     const agentDir = resolvePiAgentDir(env, homeDir);
-    const adapterFile = agentDir === void 0 ? void 0 : join5(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
-    const mode = env?.[ENV_PI_MCP_CONFIG_MODE];
+    const userPath = mcpConfigOverride(options.argv) ?? (agentDir === void 0 ? void 0 : join5(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME));
+    const mode = env[ENV_PI_MCP_CONFIG_MODE];
     if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") {
-      return adapterFile === void 0 ? [] : [adapterFile];
+      return userPath === void 0 ? [] : [userPath];
     }
-    const paths = [];
-    if (typeof homeDir === "string" && homeDir !== "" && isAbsolute3(homeDir)) {
-      paths.push(join5(homeDir, ".config", "mcp", "mcp.json"));
-      paths.push(join5(homeDir, ".agents", "mcp.json"));
-      paths.push(join5(homeDir, ".agents", "mcp", "mcp.json"));
+    const sources = [];
+    if (homeDir !== "" && isAbsolute3(homeDir)) {
+      for (const path of [
+        join5(homeDir, ".config", "mcp", "mcp.json"),
+        join5(homeDir, ".agents", "mcp.json"),
+        join5(homeDir, ".agents", "mcp", "mcp.json")
+      ]) {
+        if (path !== userPath) sources.push(path);
+      }
     }
-    if (adapterFile !== void 0) paths.push(adapterFile);
+    if (userPath !== void 0) sources.push(userPath);
     if (typeof cwd === "string" && cwd !== "" && isAbsolute3(cwd)) {
-      paths.push(join5(cwd, ".mcp.json"));
-      paths.push(join5(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
+      const project = join5(cwd, ".mcp.json");
+      if (project !== userPath) sources.push(project);
+      sources.push(join5(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
     }
-    return [...new Set(paths)];
+    return [...new Set(sources)];
   } catch {
     return [];
   }
 }
-function projectServer(raw) {
-  if (!isRecord2(raw)) return void 0;
-  const out = {};
-  if (typeof raw.url === "string") out.url = raw.url;
-  if (typeof raw.command === "string") out.command = raw.command;
-  if (Array.isArray(raw.args)) {
-    if (raw.args.every((arg) => typeof arg === "string")) out.args = [...raw.args];
-    else out.argsInvalid = true;
-  }
-  if (typeof raw.type === "string") out.type = raw.type;
-  if (typeof raw.toolPrefix === "string" && TOOL_PREFIXES.has(raw.toolPrefix)) {
-    out.toolPrefix = raw.toolPrefix;
-  }
-  if (typeof raw.disabled === "boolean") out.disabled = raw.disabled;
-  return out;
+function isMissing(error) {
+  const code = error?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
 }
-function mergeSource(target, parsed) {
-  if (!isRecord2(parsed)) return;
-  const servers = isRecord2(parsed.mcpServers) ? parsed.mcpServers : isRecord2(parsed["mcp-servers"]) ? parsed["mcp-servers"] : void 0;
-  if (servers !== void 0) {
-    for (const [name, raw] of Object.entries(servers)) {
-      const next = projectServer(raw);
-      if (next === void 0) continue;
-      const base = { ...target.servers.get(name) ?? {} };
-      if (typeof next.command === "string") delete base.url;
-      if (typeof next.url === "string") {
-        delete base.command;
-        delete base.args;
-      }
-      if (next.argsInvalid === true) delete base.args;
-      const { argsInvalid: _ignored, ...fields } = next;
-      target.servers.set(name, { ...base, ...fields });
-    }
-  }
-  const settings = parsed.settings;
-  if (isRecord2(settings)) {
-    if (typeof settings.toolPrefix === "string" && TOOL_PREFIXES.has(settings.toolPrefix)) {
-      target.settings.toolPrefix = settings.toolPrefix;
-    }
-    if (typeof settings.namespaceProxyTools === "boolean") {
-      target.settings.namespaceProxyTools = settings.namespaceProxyTools;
-    }
-  }
-}
-function readMcpAdapterConfig(env, homeDir, cwd) {
-  const config = EMPTY_CONFIG();
+function readSource(path) {
+  let size;
   try {
-    for (const path of mcpConfigPaths(env, homeDir, cwd)) {
-      mergeSource(config, parseJson(readSmallRegularFile(path, MAX_CONFIG_BYTES)));
-    }
-    return config;
-  } catch {
-    return EMPTY_CONFIG();
+    const stats = statSync(path);
+    if (!stats.isFile()) return { kind: "failed" };
+    size = stats.size;
+  } catch (error) {
+    return isMissing(error) ? { kind: "absent" } : { kind: "failed" };
   }
-}
-function readMcpCache(agentDir) {
-  const cache = /* @__PURE__ */ new Map();
+  if (!Number.isFinite(size) || size > MAX_MCP_CONFIG_BYTES) return { kind: "failed" };
   try {
-    if (typeof agentDir !== "string" || agentDir === "") return cache;
-    const parsed = parseJson(readSmallRegularFile(join5(agentDir, MCP_CACHE_FILE_NAME), MAX_MCP_CACHE_BYTES));
-    if (!isRecord2(parsed) || !isRecord2(parsed.servers)) return cache;
-    for (const [server, entry] of Object.entries(parsed.servers)) {
-      if (!isRecord2(entry) || !Array.isArray(entry.tools)) continue;
-      const names = [];
-      for (const tool of entry.tools) {
-        if (isRecord2(tool) && typeof tool.name === "string" && tool.name !== "") names.push(tool.name);
-      }
-      cache.set(server, names);
-    }
-    return cache;
+    const text = readFileSync3(path, "utf8");
+    const stripped = stripJsonComments(text.charCodeAt(0) === 65279 ? text.slice(1) : text);
+    if (stripped.trim() === "") return { kind: "absent" };
+    return { kind: "parsed", value: parseJsonc(text) };
   } catch {
-    return /* @__PURE__ */ new Map();
+    return { kind: "failed" };
   }
 }
-function projectServerConfig(def) {
-  if (def === void 0) return void 0;
-  if (typeof def.url === "string" && def.url !== "") {
-    return typeof def.type === "string" ? { url: def.url, type: def.type } : { url: def.url };
-  }
-  if (typeof def.command === "string" && def.command !== "") {
-    const out = { command: def.command };
-    if (Array.isArray(def.args)) out.args = [...def.args];
-    if (typeof def.type === "string") out.type = def.type;
-    return out;
-  }
+function serversOf(parsed) {
+  if (isRecord3(parsed.mcpServers)) return parsed.mcpServers;
+  if (isRecord3(parsed["mcp-servers"])) return parsed["mcp-servers"];
   return void 0;
 }
-function parseArgs(value) {
-  if (value === void 0 || value === "") return {};
-  let args = value;
-  if (typeof value === "string") {
-    try {
-      args = JSON.parse(value);
-    } catch {
-      return void 0;
-    }
-  }
-  return isRecord2(args) ? args : void 0;
-}
-function universeOf(config, cache) {
-  const names = /* @__PURE__ */ new Set([...config.servers.keys(), ...cache.keys()]);
-  const servers = [...names].filter((name) => config.servers.get(name)?.disabled !== true);
-  return { config, cache, servers };
-}
-function prefixOf(u, server) {
-  return resolveToolPrefix(u.config.servers.get(server), u.config.settings.toolPrefix);
-}
-function toolOnServer(u, server, requested) {
-  const prefix = prefixOf(u, server);
-  const tools = u.cache.get(server) ?? [];
-  const exact = tools.filter((tool) => formatToolName(tool, server, prefix) === requested);
-  if (exact.length > 0) return exact.length === 1 ? exact[0] : void 0;
-  const candidates = tools.filter((tool) => getToolNameCandidates(tool, server, prefix).has(requested));
-  if (candidates.length > 1) return void 0;
-  if (candidates.length === 1) return candidates[0];
-  const p = getServerPrefix(server, prefix);
-  if (p !== "" && requested.startsWith(`${p}_`) && requested.length > p.length + 1) {
-    return requested.slice(p.length + 1);
-  }
-  return requested;
-}
-function only(items) {
-  return items.length === 1 ? items[0] : void 0;
-}
-function resolveProxy(u, input) {
-  const tool = input.tool;
-  if (typeof tool !== "string" || tool === "") return void 0;
-  if (typeof input.action === "string" && NON_CALL_ACTIONS.has(input.action)) return void 0;
-  const args = parseArgs(input.args);
-  if (args === void 0) return void 0;
-  const requestedServer = input.server;
-  if (typeof requestedServer === "string" && requestedServer !== "") {
-    if (!u.servers.includes(requestedServer)) return void 0;
-    const original2 = toolOnServer(u, requestedServer, tool);
-    return original2 === void 0 ? void 0 : { server: requestedServer, tool: original2, args };
-  }
-  if (requestedServer !== void 0 && requestedServer !== "") return void 0;
-  const prefixed = [];
-  const original = [];
-  for (const server of u.servers) {
-    const prefix = prefixOf(u, server);
-    for (const name of u.cache.get(server) ?? []) {
-      if (formatToolName(name, server, prefix) === tool) prefixed.push({ server, tool: name });
-      if (name === tool) original.push({ server, tool: name });
-    }
-  }
-  if (prefixed.length > 1) return void 0;
-  if (prefixed.length === 1) return { ...prefixed[0], args };
-  if (original.length > 1) return void 0;
-  if (original.length === 1) return { ...original[0], args };
-  const scoped = u.servers.filter((server) => u.config.servers.has(server)).map((server) => ({ server, prefix: getServerPrefix(server, prefixOf(u, server)) })).filter(({ prefix }) => prefix.length > 0 && tool.startsWith(`${prefix}_`)).sort((a, b) => b.prefix.length - a.prefix.length);
-  if (scoped.length > 0) {
-    const longest = scoped[0].prefix.length;
-    const best = only(scoped.filter(({ prefix }) => prefix.length === longest));
-    if (best === void 0) return void 0;
-    const resolved = toolOnServer(u, best.server, tool);
-    return resolved === void 0 ? void 0 : { server: best.server, tool: resolved, args };
-  }
-  const candidates = [];
-  for (const server of u.servers) {
-    const prefix = prefixOf(u, server);
-    for (const name of u.cache.get(server) ?? []) {
-      if (getToolNameCandidates(name, server, prefix).has(tool)) candidates.push({ server, tool: name });
-    }
-  }
-  const match = only(candidates);
-  return match === void 0 ? void 0 : { ...match, args };
-}
-function namespaceOwners(u, toolName) {
-  if (u.config.settings.namespaceProxyTools === false) return [];
-  if (!toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX)) return [];
-  return u.servers.filter((server) => MCP_NAMESPACE_TOOL_PREFIX + formatServerNamespace(server) === toolName);
-}
-function directOwners(u, toolName) {
-  if (BUILTIN_NAMES.has(toolName)) return [];
-  const owners = [];
-  for (const server of u.servers) {
-    const prefix = prefixOf(u, server);
-    for (const name of u.cache.get(server) ?? []) {
-      if (formatToolName(name, server, prefix) === toolName) owners.push({ server, tool: name });
-    }
-  }
-  return owners;
-}
-function withConfig(u, call) {
-  const serverConfig = projectServerConfig(u.config.servers.get(call.server));
-  return serverConfig === void 0 ? { ...call } : { ...call, serverConfig };
-}
-function resolveMcpCall(toolName, input, config, cache) {
+function readMcpServers(options, cwd) {
   try {
-    if (typeof toolName !== "string" || toolName === "" || NATIVE_TOOL_NAMES.has(toolName)) return void 0;
-    const u = universeOf(config, cache);
-    if (u.servers.length === 0) return void 0;
-    if (toolName === MCP_PROXY_TOOL_NAME) {
-      if (!isRecord2(input)) return void 0;
-      const call = resolveProxy(u, input);
-      return call === void 0 ? void 0 : withConfig(u, call);
+    const merged = /* @__PURE__ */ new Map();
+    for (const path of mcpConfigSources(options, cwd)) {
+      const read = readSource(path);
+      if (read.kind === "absent") continue;
+      if (read.kind === "failed") return void 0;
+      const parsed = read.value;
+      if (!isRecord3(parsed)) continue;
+      if (Array.isArray(parsed.imports) && parsed.imports.length > 0) return void 0;
+      const settings = parsed.settings;
+      if (isRecord3(settings) && Array.isArray(settings.ancestorConfigRoots) && settings.ancestorConfigRoots.length > 0) {
+        return void 0;
+      }
+      const servers = serversOf(parsed);
+      if (servers === void 0) continue;
+      for (const name of Object.keys(servers)) {
+        const raw = servers[name];
+        if (!isRecord3(raw)) continue;
+        const base = { ...merged.get(name) ?? {} };
+        if (typeof raw.command === "string") delete base.url;
+        if (typeof raw.url === "string") {
+          delete base.command;
+          delete base.args;
+        }
+        if (typeof raw.url === "string") base.url = raw.url;
+        if (typeof raw.command === "string") base.command = raw.command;
+        if (Array.isArray(raw.args)) {
+          if (raw.args.every((arg) => typeof arg === "string")) base.args = [...raw.args];
+          else delete base.args;
+        }
+        if (typeof raw.type === "string") base.type = raw.type;
+        merged.set(name, base);
+      }
     }
-    const namespaces = namespaceOwners(u, toolName);
-    const directs = directOwners(u, toolName);
-    if (namespaces.length + directs.length !== 1) return void 0;
-    const namespaceServer = only(namespaces);
-    if (namespaceServer !== void 0) {
-      if (!isRecord2(input)) return void 0;
-      const tool = input.tool;
-      if (typeof tool !== "string" || tool === "") return void 0;
-      const args = parseArgs(input.args);
-      if (args === void 0) return void 0;
-      const original = toolOnServer(u, namespaceServer, tool);
-      return original === void 0 ? void 0 : withConfig(u, { server: namespaceServer, tool: original, args });
+    return merged;
+  } catch {
+    return void 0;
+  }
+}
+function projectServerConfig(servers, serverName) {
+  try {
+    if (servers === void 0 || typeof serverName !== "string" || serverName === "") return void 0;
+    if (!servers.has(serverName)) return void 0;
+    const def = servers.get(serverName);
+    if (typeof def.url === "string" && def.url !== "") {
+      return typeof def.type === "string" ? { url: def.url, type: def.type } : { url: def.url };
     }
-    const direct = only(directs);
-    if (direct === void 0) return void 0;
-    return withConfig(u, { server: direct.server, tool: direct.tool, args: isRecord2(input) ? input : {} });
+    if (typeof def.command === "string" && def.command !== "") {
+      const out = { command: def.command };
+      if (Array.isArray(def.args)) out.args = [...def.args];
+      if (typeof def.type === "string") out.type = def.type;
+      return out;
+    }
+    return void 0;
   } catch {
     return void 0;
   }
@@ -2325,7 +2319,7 @@ function signatureOf(paths) {
   const parts = [];
   for (const path of paths) {
     try {
-      const stats = lstatSync2(path);
+      const stats = statSync(path);
       parts.push(`${path}=${stats.mtimeMs}:${stats.size}:${stats.isFile() ? "f" : "x"}`);
     } catch {
       parts.push(`${path}=-`);
@@ -2333,30 +2327,18 @@ function signatureOf(paths) {
   }
   return parts.join("|");
 }
-function createMcpResolver(options) {
+function createMcpConfigReader(options) {
   let memo;
   return {
-    resolve(toolName, input, cwd) {
+    serverConfig(serverName, cwd) {
       try {
-        if (typeof toolName !== "string" || toolName === "" || NATIVE_TOOL_NAMES.has(toolName)) {
-          return void 0;
-        }
-        const env = options.env ?? {};
-        const homeDir = typeof options.homeDir === "string" ? options.homeDir : "";
         const safeCwd2 = typeof cwd === "string" ? cwd : "";
-        const agentDir = resolvePiAgentDir(env, homeDir);
-        const configPaths = mcpConfigPaths(env, homeDir, safeCwd2);
-        const cachePath = agentDir === void 0 ? void 0 : join5(agentDir, MCP_CACHE_FILE_NAME);
-        const signature = signatureOf(cachePath === void 0 ? configPaths : [...configPaths, cachePath]);
-        if (memo === void 0 || memo.cwd !== safeCwd2 || memo.signature !== signature) {
-          memo = {
-            cwd: safeCwd2,
-            signature,
-            config: readMcpAdapterConfig(env, homeDir, safeCwd2),
-            cache: readMcpCache(agentDir)
-          };
+        const sources = mcpConfigSources(options, safeCwd2);
+        const key = `${safeCwd2}\0${signatureOf(sources)}`;
+        if (memo === void 0 || memo.key !== key) {
+          memo = { key, servers: readMcpServers(options, safeCwd2) };
         }
-        return resolveMcpCall(toolName, input, memo.config, memo.cache);
+        return projectServerConfig(memo.servers, serverName);
       } catch {
         return void 0;
       }
@@ -2428,7 +2410,7 @@ function recordToolResult(event, store) {
 }
 
 // packages/pi/src/userBash.ts
-import { randomBytes as randomBytes2 } from "node:crypto";
+import { randomBytes as randomBytes3 } from "node:crypto";
 
 // packages/pi/src/bashResult.ts
 function denyBashResult(output) {
@@ -2437,7 +2419,7 @@ function denyBashResult(output) {
 
 // packages/pi/src/userBash.ts
 function newUserBashId() {
-  return USER_BASH_ID_PREFIX + randomBytes2(10).toString("hex");
+  return USER_BASH_ID_PREFIX + randomBytes3(10).toString("hex");
 }
 async function decideUserBash(event, ctx, deps) {
   try {
@@ -2526,9 +2508,9 @@ function makeCacheSync(apiKey, baseUrl, env = {}, homeDir = "") {
   const cachePath = resolveCachePath(env, homeDir);
   if (cachePath === void 0) return void 0;
   const fingerprint = keyFingerprint(apiKey);
-  return (snapshot) => {
+  return (snapshot2) => {
     void writeCache(cachePath, {
-      ...snapshot,
+      ...snapshot2,
       gateway_url: baseUrl,
       key_fingerprint: fingerprint
     });
@@ -2572,7 +2554,8 @@ function createExtension(overrides = {}) {
     makeChecker: overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
     entrypoint: overrides.entrypoint,
     heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate,
-    identity: overrides.identity ?? {}
+    identity: overrides.identity ?? {},
+    argv: overrides.argv ?? process.argv
   };
   const identityLoader = createAccountIdentityLoader({
     ...deps.identity,
@@ -2586,7 +2569,12 @@ function createExtension(overrides = {}) {
       return {};
     }
   }
-  const mcpResolver = createMcpResolver({ env, homeDir });
+  const mcpConfigReader = createMcpConfigReader({ env, homeDir, argv: deps.argv });
+  const inflight = createInflightCalls(MAX_INFLIGHT_MCP_CALLS);
+  let lastCtx;
+  const seeCtx = (ctx) => {
+    if (ctx !== null && typeof ctx === "object") lastCtx = ctx;
+  };
   let resolved;
   let notified = false;
   function init() {
@@ -2612,10 +2600,74 @@ function createExtension(overrides = {}) {
   function recordingActive(state) {
     return state.apiKey !== void 0 && state.client !== void 0 && !keyState.isInactive();
   }
+  function modelIdOf(ctx) {
+    try {
+      const id = ctx?.model?.id;
+      return typeof id === "string" ? id : void 0;
+    } catch {
+      return void 0;
+    }
+  }
+  function brokerActive() {
+    try {
+      const state = init();
+      return recordingActive(state) && state.checker !== void 0;
+    } catch {
+      return false;
+    }
+  }
+  async function decideBrokered(call) {
+    const state = init();
+    if (!recordingActive(state) || state.checker === void 0) return "abstain";
+    const ctx = lastCtx;
+    const sessionId = ctx === void 0 ? "" : sessionIdOf(ctx);
+    const cwd = ctx === void 0 ? "" : safeCwd(ctx);
+    const toolUseId = inflight.claim(call.prefixedToolName, call.originalToolName) ?? mintBrokerId();
+    const serverConfig = mcpConfigReader.serverConfig(call.serverName, cwd);
+    return decideMcpApproval(
+      {
+        call: {
+          server: call.serverName,
+          tool: call.originalToolName,
+          args: call.args,
+          ...call.origin === "" ? {} : { origin: call.origin },
+          ...serverConfig === void 0 ? {} : { serverConfig }
+        },
+        toolUseId,
+        cwd,
+        sessionId,
+        model: modelIdOf(ctx),
+        ui: ctx
+      },
+      {
+        checker: state.checker,
+        apiKey: state.apiKey,
+        entrypoint: state.entrypoint,
+        ...identityOption(),
+        currentPrompt: () => turnStore.currentPrompt(sessionId),
+        onDecision: (entry) => {
+          if (recordingActive(state)) turnStore.recordToolCall(entry, sessionId);
+        }
+      }
+    );
+  }
   return (pi) => {
+    try {
+      const events = pi.events;
+      if (events !== null && typeof events === "object" && typeof events.on === "function") {
+        events.on.call(
+          events,
+          MCP_TOOL_APPROVAL_REQUEST_EVENT,
+          createMcpApprovalListener({ active: brokerActive, decide: decideBrokered })
+        );
+      }
+    } catch {
+    }
     pi.on("session_start", async (_event, ctx) => {
       try {
         turnStore.reset(sessionIdOf(ctx));
+        inflight.keepSession(sessionIdOf(ctx));
+        seeCtx(ctx);
         const state = init();
         if (state.apiKey === void 0 && !notified) {
           notified = true;
@@ -2668,6 +2720,13 @@ function createExtension(overrides = {}) {
       try {
         const state = init();
         if (state.apiKey === void 0 || state.checker === void 0) return void 0;
+        seeCtx(ctx);
+        if (recordingActive(state) && !isShellCall(event) && !NATIVE_FILE_TOOLS.has(event.toolName)) {
+          inflight.remember(
+            { toolCallId: event.toolCallId, toolName: event.toolName, input: event.input },
+            sessionIdOf(ctx)
+          );
+        }
         return await decideToolCall(event, ctx, {
           checker: state.checker,
           apiKey: state.apiKey,
@@ -2679,9 +2738,6 @@ function createExtension(overrides = {}) {
           // The pretool `messages[0].content`, which the gateway writes its block/warn row from. A
           // cheap getter, not `snapshot()`: this runs on every evaluated tool call.
           currentPrompt: () => turnStore.currentPrompt(sessionIdOf(ctx)),
-          // An MCP call made through pi-mcp-adapter goes to the gateway's MCP path (Path 3) rather
-          // than taking the nothing-evaluable skip. `tool_call` only: no other event carries one.
-          resolveMcp: (name, input, cwd) => mcpResolver.resolve(name, input, cwd),
           // Re-checked here rather than above: `checkTool` may have latched the key on this very
           // call, and the turn that latched is one nothing will post.
           onDecision: (entry) => {
@@ -2692,8 +2748,10 @@ function createExtension(overrides = {}) {
         return void 0;
       }
     });
-    pi.on("tool_result", async (event, _ctx) => {
+    pi.on("tool_result", async (event, ctx) => {
       try {
+        seeCtx(ctx);
+        inflight.forget(event?.toolCallId);
         if (!recordingActive(init())) return void 0;
         recordToolResult(event, turnStore);
       } catch {
@@ -2721,6 +2779,7 @@ function createExtension(overrides = {}) {
     pi.on("user_bash", async (event, ctx) => {
       try {
         const state = init();
+        seeCtx(ctx);
         if (state.apiKey === void 0 || state.checker === void 0) return void 0;
         return await decideUserBash(event, ctx, {
           checker: state.checker,
@@ -2751,6 +2810,7 @@ function createExtension(overrides = {}) {
     pi.on("input", async (event, ctx) => {
       try {
         const state = init();
+        seeCtx(ctx);
         if (state.apiKey === void 0 || state.checker === void 0) return void 0;
         return await decideInput(event, ctx, {
           checker: state.checker,

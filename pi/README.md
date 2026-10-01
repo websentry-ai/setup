@@ -148,12 +148,21 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
 - **Every evaluated tool call** (`POST /v1/hooks/pretool`) carries the current turn's prompt as
   `messages[0].content`, capped at 8 KB with both ends kept. The gateway writes its block/warn row from
   that field, so a blocked command's row shows what was being asked.
-- **MCP calls made through `pi-mcp-adapter`** (the `mcp` proxy tool, a `mcp__<server>` namespace tool,
-  or a direct `<server>_<tool>` tool) are resolved to the server and tool the adapter will run and sent
-  to the gateway's MCP policy path as `mcp__<server>__<tool>`, with the call's arguments (capped at
-  16 KB) and the server's `url`, or `command` + `args`, read from the adapter's config files. The
-  server's `env`, `headers`, bearer tokens and OAuth settings are never read into the request.
-  A call that cannot be attributed to exactly one server and tool is not checked (as before).
+- **MCP calls made through `pi-mcp-adapter`** are enforced through the adapter's own approval broker
+  (the `pi-mcp-adapter:tool-approval-request` event), for every kind of MCP call the adapter makes:
+  the `mcp` proxy tool, `mcp__<server>` namespace tools, direct `<server>_<tool>` tools, `mcpScript`,
+  resource reads and MCP UI iframes. The adapter tells the extension exactly which server and tool it
+  is about to run and with which arguments; the extension sends that to the gateway's MCP policy path
+  as `mcp__<server>__<tool>`, with the arguments whole up to 1 MB (beyond that, their head and tail
+  with a `tool_input_truncated` flag), and the server's `url`, or `command` + `args`, read from the
+  adapter's config files. The server's `env`, `headers`, bearer tokens and OAuth settings are never
+  read. A `url` query string or an `args` entry is sent as written, as the Claude Code hook sends it,
+  so a credential placed there leaves with it. If any of those config files cannot be read, the
+  server config is left out rather than guessed.
+  - **On a deny**, the model sees the adapter's own generic denial; the developer sees the policy's
+    reason as a notice. A "warn" policy asks the developer to confirm; without a UI it denies.
+  - **Requires pi-mcp-adapter 2.21.0 or later.** Older adapters, other MCP bridges, and pi builds
+    without `pi.events` are not enforced for MCP.
 - **The turn log** (`POST /v1/hooks/pi`) carries each tool's text output, capped at 8 KB per result
   (head and tail kept) and 128 KB per turn, with bearer tokens and the Unbound key redacted, next to a
   sha256 and a byte count. Image output is never sent; it is represented by its hash and size only.
@@ -163,16 +172,12 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
 
 Known gaps:
 
-- `mcpScript` (a script that can call several MCP tools) is not enforced. The follow-up is the
-  adapter's own `pi-mcp-adapter:tool-approval-request` broker event.
 - There is no unknown-server scan dispatch. In an org that blocks unsanctioned MCP servers, a server no
   device has scanned yet is reported as "being scanned" for up to an hour and is not resolved by pi.
 - Local-script stdio servers (`node ./server.js`) get no `scriptHash`, so their fingerprint is null.
-- The adapter's config imports, plugins and opt-in ancestor files are not read; only the six standard
-  config files are.
-- With a cold or missing `mcp-cache.json`, only calls whose name starts with a configured server's
-  prefix can be resolved. Anything unresolved runs unenforced, which is the behaviour before this
-  change.
+- The adapter's config `imports`, plugins and opt-in ancestor files are not read. When a config file
+  uses `imports` or ancestor roots, or a server is only defined by a plugin, the server config is left
+  out. In an org that only allows sanctioned MCP servers, those calls are then denied as unknown.
 - Allowed pi MCP calls do not show up in MCP usage analytics yet; that needs a separate
   `ai-gateway-data` change to parse pi turn logs. Blocked and warned MCP calls do appear, through the
   gateway's block row.
