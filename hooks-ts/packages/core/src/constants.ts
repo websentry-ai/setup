@@ -215,6 +215,34 @@ export const MAX_HASH_BYTES = 4_194_304;
  */
 export const MAX_TURN_RESULTS = 500;
 /**
+ * The per-result cap on the tool OUTPUT text the turn log carries (`tool_response.content`), kept at
+ * **both ends** with `OUTPUT_TRUNCATION_MARKER` between: an error is usually at the tail, a header at
+ * the head, and a secret the server-side DLP should see can be at either. About 8 KB.
+ *
+ * This reverses HOOK-06's hash-only rule by explicit decision, so tool-output DLP and MCP output
+ * audit can fire for pi as they do for the Claude Code hook. Image parts are never captured.
+ */
+export const MAX_TOOL_OUTPUT_CHARS = 8192;
+/**
+ * The per-TURN budget for stored output text, about 128 KB. `MAX_TURN_RESULTS` × 8 KB is 4 MB of
+ * retained strings in the worst case; past this budget later results keep their hash and byte count
+ * but no text, and say so with `content_omitted: true`.
+ */
+export const MAX_TURN_OUTPUT_CHARS = 131_072;
+/**
+ * Spliced between the head and the tail of a capped tool output. Distinct from the command marker so
+ * a reader can tell which cap produced a splice; newlines for the same reason that one has them.
+ */
+export const OUTPUT_TRUNCATION_MARKER = "\n...unbound: output truncated...\n";
+/**
+ * Context redacted around each cut of a capped tool output (4 KB). The head and the tail are each
+ * redacted as a window of their kept size PLUS this margin, and only then cut, so a secret that
+ * straddles a cut is replaced whole before the cut can split it — without redacting a 100 MB output
+ * on the awaited `tool_result` path. A token longer than the margin can still straddle the outer
+ * edge of the tail window; server-side DLP is the backstop.
+ */
+export const OUTPUT_REDACTION_MARGIN_CHARS = 4096;
+/**
  * The same backstop for `tool_calls` (WR-04), and the path that made it necessary is not
  * hypothetical: `user_bash` records a tool call, and pi fires no `agent_end` for a bare `!cmd`
  * (RESEARCH §F3), so nothing calls `take()` and that entry lives for the whole session.
@@ -257,14 +285,19 @@ export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
 /**
  * The only `metadata.tool_input` keys that leave the machine (WR-04 / T-09-03).
  *
- * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a pi tool call
- * never takes that path), `:1201` (RepoGate only) and `:1594` (`buildSyntheticPattern`, which reads
+ * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a native pi
+ * tool call never takes that path), `:1201` (RepoGate only) and `:1594` (`buildSyntheticPattern`, which reads
  * `pattern` for grep/find and nothing else). File paths arrive as `metadata.file_path`, not from here
  * (§C4). So `content` (write) and `edits` (edit) are read by nothing at all, and forwarding them was
  * undeclared egress of file contents.
  *
  * **Widening this list is an egress decision, not a convenience.** A test spells the set out
  * independently so an addition cannot be slipped in as a formatting change.
+ *
+ * MCP arguments reach `metadata.tool_input` through the separate MCP branch in `payload.ts`
+ * (`mcpArgsForWire`, whole up to 512 KiB, body under 900 KiB), which is the deliberate, MCP-only egress widening: the
+ * gateway's MCP policies and input DLP evaluate exactly those arguments. This list still governs
+ * every native tool.
  */
 export const TOOL_INPUT_ALLOWLIST = [
   "path",
@@ -368,3 +401,58 @@ export const PLACEHOLDER_SERIALS: readonly string[] = [
   "not applicable", "not specified", "not available", "oem", "o.e.m.",
   "invalid", "123456789", "xxxxxxxx",
 ];
+
+// --- pi-mcp-adapter (MCP tool calls) ---------------------------------------------------------
+//
+// pi has no native MCP; MCP tools arrive through the `pi-mcp-adapter` extension. Enforcement rides
+// the adapter's own approval broker (>= 2.21.0), which hands us the exact server, tool and arguments
+// it is about to run. These are the adapter's own names, transcribed so nothing imports the adapter.
+
+/**
+ * The adapter's broker event (`types.ts MCP_TOOL_APPROVAL_REQUEST_EVENT`, README "Tool Approval").
+ * Emitted on `pi.events` for EVERY resolved MCP call — proxy, direct, `mcpScript`, resource, iframe.
+ */
+export const MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
+/** The adapter's proxy tool: `mcp({tool, args, server?})`. Used only to correlate audit ids. */
+export const MCP_PROXY_TOOL_NAME = "mcp";
+/** Namespace wrappers are `mcp__<namespace>`. Used only to correlate audit ids. */
+export const MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
+/**
+ * Prefix of the `tool_use_id` minted for a brokered call that no in-flight `tool_call` matched (an
+ * `mcpScript` call, a resource read, an iframe). Distinct from `toolu_…`/`ubash_…` so a row says so.
+ */
+export const MCP_BROKER_ID_PREFIX = "mcpb_";
+/** In-flight non-native tool calls remembered for audit correlation. Oldest dropped past this. */
+export const MAX_INFLIGHT_MCP_CALLS = 64;
+/**
+ * MCP arguments go on the wire whole up to this many serialised bytes (512 KiB), because the gateway's
+ * MCP input DLP and arg-based policies must see what the tool will receive. Beyond it the head and tail
+ * of the serialisation are sent, with `metadata.tool_input_truncated: true` — the middle of oversized
+ * arguments is NOT inspected.
+ */
+export const MAX_MCP_ARGS_BYTES = 524_288;
+/**
+ * The ceiling on a whole serialised pretool request body carrying MCP arguments (900 KiB). The
+ * ingress in front of ai-gateway rejects bodies over 1 MiB with a 413, which the checker treats as an
+ * API failure — a fail-open allow, and a breaker failure that can switch off checks for every tool.
+ * So the body is measured after the final serialisation and the arguments shrunk until it fits;
+ * a 413 is unreachable by construction (review CR-03).
+ */
+export const MAX_PRETOOL_BODY_BYTES = 921_600;
+/**
+ * How long an in-flight non-native `tool_call` stays claimable by a broker request (5 min). An entry
+ * whose `tool_result` never fires (a call blocked upstream) must not be claimed by an unrelated call
+ * later — audit correlation only.
+ */
+export const MCP_INFLIGHT_MAX_AGE_MS = 300_000;
+/** `PI_MCP_CONFIG_MODE=exclusive` makes the adapter read only its own config file. */
+export const ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
+/** The adapter's own config file, under the agent dir and under `<cwd>/.pi/`. */
+export const MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
+/** The pi CLI flag the adapter registers to replace that file. Its presence omits the config. */
+export const MCP_CONFIG_FLAG = "--mcp-config";
+/**
+ * The cap on one MCP config file (1 MiB; adapter configs are kilobytes). A file over it is "unknown",
+ * which omits `mcp_server_config` rather than guessing.
+ */
+export const MAX_MCP_CONFIG_BYTES = 1_048_576;

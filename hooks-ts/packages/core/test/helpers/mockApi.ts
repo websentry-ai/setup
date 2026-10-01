@@ -10,7 +10,8 @@
 //
 //   isAllowedToolName(tool_name,'pi') && (!!command || (PI_NATIVE_FILE_TOOLS.includes(tool_name) && !!file_path))
 //
-// Anything else falls through to a `no_policy` allow (`:1008-1012`). A mock that denies every
+// Anything else falls through to a `no_policy` allow (`:1008-1012`) — except a request naming an MCP
+// server in `metadata.mcp_server`, which the real API routes to its MCP path (Path 3) instead. A mock that denies every
 // request regardless would make a file-tool test that forgets `metadata.file_path` pass
 // VACUOUSLY - green locally, unenforced in production. Modelling the gate means such a test
 // fails instead. That is this model's entire purpose; do not "simplify" it away.
@@ -122,7 +123,10 @@ export function hasEvaluableInput(body: unknown): boolean {
     | null
     | undefined;
   if (isNonBlankString(data?.command)) return true;
-  const metadata = data?.metadata as { file_path?: unknown } | null | undefined;
+  const metadata = data?.metadata as { file_path?: unknown; mcp_server?: unknown } | null | undefined;
+  // Path 3 (`preToolUseHandler.ts:941+`): an explicit `metadata.mcp_server` routes the request to the
+  // MCP policy path, which evaluates without a command or a file path.
+  if (isNonBlankString(metadata?.mcp_server)) return true;
   return isNonBlankString(metadata?.file_path);
 }
 

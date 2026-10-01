@@ -19,6 +19,8 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { createApiClient } from "../../core/src/client.ts";
+import { TURNLOG_PATH } from "../../core/src/constants.ts";
+import { turnStore } from "../../core/src/turn.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import { createPolicyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
@@ -29,7 +31,13 @@ import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import type { DecideDeps } from "../src/decide.ts";
 import { createExtension } from "../src/index.ts";
 import { decideUserBash } from "../src/userBash.ts";
-import { createFakeClock, createFakeCtx, createFakeUserBashEvent } from "./helpers/fakeCtx.ts";
+import {
+  createFakeAgentEndEvent,
+  createFakeClock,
+  createFakeCtx,
+  createFakeInputEvent,
+  createFakeUserBashEvent,
+} from "./helpers/fakeCtx.ts";
 import type { FakeCtxOptions } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
@@ -350,6 +358,154 @@ test("HOOK-04 no API key: the registered handler is inert, with zero HTTP and no
 
     assert.equal(result, undefined, "no key means no opinion, never a block");
     assert.equal(api.requests.length, 0);
+  } finally {
+    home.cleanup();
+    await api.close();
+  }
+});
+
+// --- A `!cmd` is its own turn log --------------------------------------------------------------
+//
+// pi fires no `agent_end` for a typed command. It used to be recorded into the shared turn store,
+// where the NEXT agent turn posted it under that turn's prompt — a row attributing the developer's
+// own command to a conversation it had nothing to do with. The contract is now: one standalone
+// one-call `/v1/hooks/pi` POST, right after the decision, and the shared store untouched.
+
+type AnyHandler = (event: unknown, ctx: unknown) => unknown;
+
+const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+
+interface TurnLogBodyLike {
+  conversation_id?: string;
+  messages?: { content?: unknown; tool_use?: Record<string, unknown>[] }[];
+}
+
+async function keyedExtension(api: MockApi): Promise<{ handlers: Map<string, AnyHandler>; cleanup(): void }> {
+  const home = createFakeHome({});
+  const handlers = new Map<string, AnyHandler>();
+  const stub = {
+    on: (event: string, handler: AnyHandler) => {
+      handlers.set(event, handler);
+      return () => {};
+    },
+  };
+  await createExtension({
+    env: { UNBOUND_PI_API_KEY: TEST_KEY, UNBOUND_GATEWAY_URL: api.url },
+    homeDir: home.homeDir,
+    entrypoint: "pi/0.87.1",
+    heartbeatGate: { shouldSend: () => false, markSent: () => {} },
+  })(stub as unknown as ExtensionAPI);
+  return { handlers, cleanup: () => home.cleanup() };
+}
+
+function turnLogBodies(api: MockApi): TurnLogBodyLike[] {
+  return api.requests.filter((r) => r.path === TURNLOG_PATH).map((r) => r.body as TurnLogBodyLike);
+}
+
+test("a !cmd posts exactly one one-call turn log, without waiting for agent_end", async () => {
+  turnStore.take();
+  const api = await startMockApi({ mode: "allow" });
+  const f = await keyedExtension(api);
+  try {
+    const ctx = createFakeCtx({ sessionId: "sess-ubash-1" });
+    const result = await f.handlers.get("user_bash")?.(createFakeUserBashEvent("echo hi"), ctx);
+    assert.equal(result, undefined, "an allow still hands execution back to pi");
+    await sleep(60);
+
+    const logs = turnLogBodies(api);
+    assert.equal(logs.length, 1, "posted immediately — no agent_end fired");
+    const body = logs[0] as TurnLogBodyLike;
+    assert.equal(body.conversation_id, "sess-ubash-1");
+    assert.equal(body.messages?.[0]?.content, "", "a !cmd has no prompt, and none is invented");
+    const uses = body.messages?.[1]?.tool_use ?? [];
+    assert.equal(uses.length, 1, "one call");
+    assert.equal(uses[0]?.tool_name, "bash");
+    assert.ok(UBASH_ID.test(String(uses[0]?.tool_use_id)), "the generated ubash_ id");
+    assert.deepStrictEqual(uses[0]?.tool_input, { command: "echo hi" });
+
+    assert.deepStrictEqual(
+      turnStore.snapshot(),
+      { tool_calls: [], results: [] },
+      "the shared turn store is untouched by a !cmd",
+    );
+  } finally {
+    f.cleanup();
+    await api.close();
+  }
+});
+
+test("a !cmd is never merged into the next agent turn's log", async () => {
+  turnStore.take();
+  const api = await startMockApi({ mode: "allow" });
+  const f = await keyedExtension(api);
+  try {
+    const ctx = createFakeCtx({ sessionId: "sess-ubash-2" });
+    await f.handlers.get("user_bash")?.(createFakeUserBashEvent("echo standalone"), ctx);
+    await f.handlers.get("input")?.(createFakeInputEvent("now a real prompt"), ctx);
+    f.handlers.get("agent_end")?.(createFakeAgentEndEvent([]), ctx);
+    await sleep(60);
+
+    const logs = turnLogBodies(api);
+    assert.equal(logs.length, 2, "the !cmd row, then the agent turn");
+    const ubashId = String(logs[0]?.messages?.[1]?.tool_use?.[0]?.tool_use_id);
+    assert.ok(UBASH_ID.test(ubashId));
+    const agentTurn = logs[1] as TurnLogBodyLike;
+    assert.equal(agentTurn.messages?.[0]?.content, "now a real prompt");
+    assert.deepStrictEqual(agentTurn.messages?.[1]?.tool_use, [], "the agent turn made no calls");
+    assert.equal(JSON.stringify(agentTurn).includes(ubashId), false, "and does not carry the !cmd");
+  } finally {
+    f.cleanup();
+    await api.close();
+  }
+});
+
+test("a denied or confirmed !cmd returns the same result as before, and is still posted once", async () => {
+  turnStore.take();
+  for (const [mode, confirmResult] of [
+    ["deny", true],
+    ["ask", false],
+  ] as const) {
+    const api = await startMockApi({ mode });
+    const f = await keyedExtension(api);
+    try {
+      const ctx = createFakeCtx({ sessionId: "sess-ubash-3", hasUI: true, confirmResult });
+      const result = await f.handlers.get("user_bash")?.(createFakeUserBashEvent("cat /etc/shadow"), ctx);
+      assert.equal(isValidUserBashResult(result), true, `${mode}: still pi's own BashResult`);
+      assert.equal(
+        outputOf(result),
+        mode === "deny" ? `${DENY_PREFIX}Reading secrets is blocked.` : DECLINED,
+      );
+      await sleep(60);
+      const logs = turnLogBodies(api);
+      // The turn-log wire shape carries no `decision` key (the gateway's block row is the record of
+      // the verdict); what matters here is that the row exists, once, for the blocked command too.
+      assert.equal(logs.length, 1, `${mode}: one row`);
+      assert.ok(UBASH_ID.test(String(logs[0]?.messages?.[1]?.tool_use?.[0]?.tool_use_id)));
+    } finally {
+      f.cleanup();
+      await api.close();
+    }
+  }
+});
+
+test("no key: a !cmd posts nothing at all", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const home = createFakeHome({});
+  try {
+    const handlers = new Map<string, AnyHandler>();
+    const stub = { on: (event: string, handler: AnyHandler) => {
+      handlers.set(event, handler);
+      return () => {};
+    } };
+    await createExtension({
+      env: { UNBOUND_GATEWAY_URL: api.url },
+      homeDir: home.homeDir,
+      entrypoint: "pi/0.87.1",
+      heartbeatGate: { shouldSend: () => false, markSent: () => {} },
+    })(stub as unknown as ExtensionAPI);
+    await handlers.get("user_bash")?.(createFakeUserBashEvent("echo hi"), createFakeCtx());
+    await sleep(60);
+    assert.equal(api.requests.length, 0, "no pretool, no turn log");
   } finally {
     home.cleanup();
     await api.close();
