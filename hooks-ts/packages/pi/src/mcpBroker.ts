@@ -26,7 +26,8 @@
 // non-native calls (`InflightCalls`) with their name AND their serialised arguments — read both as a
 // wrapper (`input.tool` + `input.args`) and as a direct tool (the whole input), because a direct tool
 // under `toolPrefix: "mcp"` is named `mcp__<server>_<tool>` just like a wrapper — and the broker
-// handler claims the oldest entry whose name matches and whose arguments are equal (stable key order)
+// handler claims the oldest entry whose server, name and arguments all match (stable key order; the
+// proxy's server from `input.server`, a namespace wrapper's from its `mcp__<ns>` name)
 // — so two overlapping calls to the same tool with different arguments cannot swap ids. Entries
 // expire after `MCP_INFLIGHT_MAX_AGE_MS`. No match (an `mcpScript` call, a resource read, an iframe, a
 // direct tool whose arguments the adapter reshaped) mints an `mcpb_…` id, and that decision is posted
@@ -37,7 +38,7 @@
 // host-managed runtime) claimed before us, `claim()` returns `false`: the call is decided without
 // Unbound. That is reported once, through bypass telemetry, and no policy request is made.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 
 import { MCP_BROKER_ID_PREFIX, MCP_NAMESPACE_TOOL_PREFIX, MCP_PROXY_TOOL_NAME } from "../../core/src/constants.ts";
 import type { McpApprovalAnswer } from "./decide.ts";
@@ -190,11 +191,50 @@ function directArgsKey(input: unknown): string | undefined {
   return stableKey(isRecord(input) ? input : {});
 }
 
+// The adapter's namespace normalisation, ported verbatim (pi-mcp-adapter 4.0.0 `types.ts:546-566`,
+// `formatServerNamespace` + `encodeServerNamespace`). Used ONLY to compare a namespace wrapper's
+// `mcp__<ns>` with the broker's `serverName` for audit correlation — never for enforcement.
+const ENCODED_SERVER_NAMESPACE_MARKER = "_mcpns_";
+const MAX_SERVER_NAMESPACE_LENGTH = 59;
+
+function encodeServerNamespace(name: string): string {
+  return Array.from(name, (character) => {
+    if (character === "_") return "__";
+    return /^[A-Za-z0-9]$/.test(character) ? character : `_${character.codePointAt(0)!.toString(16)}_`;
+  }).join("");
+}
+
+export function formatServerNamespace(serverName: string): string {
+  const normalized = serverName.replace(/-/g, "_");
+  const safe = /^[A-Za-z0-9_]*$/.test(normalized) && !normalized.startsWith(ENCODED_SERVER_NAMESPACE_MARKER);
+  const body = safe ? normalized : encodeServerNamespace(normalized);
+  const namespace = safe ? body : `${ENCODED_SERVER_NAMESPACE_MARKER}${body}`;
+  if (namespace.length <= MAX_SERVER_NAMESPACE_LENGTH) return namespace;
+  const digest = createHash("sha256").update(namespace, "utf8").digest("hex").slice(0, 16);
+  const hashPrefix = `${ENCODED_SERVER_NAMESPACE_MARKER}_h_`;
+  const head = body.slice(0, MAX_SERVER_NAMESPACE_LENGTH - hashPrefix.length - digest.length - 1);
+  return `${hashPrefix}${head}_${digest}`;
+}
+
+/**
+ * Does a wrapper call's server match the broker's `serverName`? The proxy (`mcp`) pins it only when
+ * the call supplied `input.server` (absent ⇒ any server); a namespace wrapper `mcp__<ns>` pins it by
+ * `<ns> === formatServerNamespace(serverName)`. Without this, two overlapping calls to the same tool
+ * with the same arguments on DIFFERENT servers could swap ids.
+ */
+function wrapperServerMatches(entry: InflightEntry, serverName: string): boolean {
+  if (entry.toolName === MCP_PROXY_TOOL_NAME) return entry.server === undefined || entry.server === serverName;
+  const ns = entry.toolName.slice(MCP_NAMESPACE_TOOL_PREFIX.length);
+  return ns !== "" && ns === formatServerNamespace(serverName);
+}
+
 interface InflightEntry {
   toolCallId: string;
   toolName: string;
   /** `input.tool` for the proxy / namespace wrappers, when it is a string. */
   tool: string | undefined;
+  /** `input.server` for the proxy, when it is a non-empty string (absent ⇒ any server). */
+  server: string | undefined;
   /**
    * Both readings of the arguments, because the NAME cannot say which shape the call has: a direct
    * tool under `toolPrefix: "mcp"` is `mcp__<server>_<tool>`, which looks like a namespace wrapper
@@ -212,8 +252,8 @@ export interface InflightCalls {
   forget(toolCallId: unknown): void;
   /** Drop entries from any session other than `sessionId` (`""` = unknown: drops nothing). */
   keepSession(sessionId: string): void;
-  /** The oldest entry matching name AND arguments, consumed — or `undefined`. */
-  claim(prefixedToolName: string, originalToolName: string, args: unknown): string | undefined;
+  /** The oldest entry matching server, name AND arguments (FIFO within that key), consumed — or `undefined`. */
+  claim(serverName: string, prefixedToolName: string, originalToolName: string, args: unknown): string | undefined;
   size(): number;
 }
 
@@ -232,11 +272,16 @@ export function createInflightCalls(max: number, maxAgeMs: number, now: () => nu
         if (typeof entry.toolName !== "string" || entry.toolName === "") return;
         let tool: string | undefined;
         if (isRecord(entry.input) && typeof entry.input.tool === "string") tool = entry.input.tool;
+        let server: string | undefined;
+        if (isRecord(entry.input) && typeof entry.input.server === "string" && entry.input.server !== "") {
+          server = entry.input.server;
+        }
         expire();
         entries.push({
           toolCallId: entry.toolCallId,
           toolName: entry.toolName,
           tool,
+          server,
           directKey: directArgsKey(entry.input),
           wrapperKey: mayBeWrapper(entry.toolName) ? wrapperArgsKey(entry.input) : undefined,
           sessionId: typeof sessionId === "string" ? sessionId : "",
@@ -263,7 +308,7 @@ export function createInflightCalls(max: number, maxAgeMs: number, now: () => nu
         // Audit only.
       }
     },
-    claim(prefixedToolName, originalToolName, args) {
+    claim(serverName, prefixedToolName, originalToolName, args) {
       try {
         expire();
         const argsKey = stableKey(isRecord(args) ? args : {});
@@ -277,6 +322,7 @@ export function createInflightCalls(max: number, maxAgeMs: number, now: () => nu
           return (
             mayBeWrapper(entry.toolName) &&
             entry.wrapperKey === argsKey &&
+            wrapperServerMatches(entry, serverName) &&
             entry.tool !== undefined &&
             (entry.tool === originalToolName || (prefixedToolName !== "" && entry.tool === prefixedToolName))
           );

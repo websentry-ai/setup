@@ -450,9 +450,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     const ctx = lastCtx;
     const sessionId = ctx === undefined ? "" : sessionIdOf(ctx);
     const cwd = ctx === undefined ? "" : safeCwd(ctx);
-    // Audit only: the in-flight `tool_call` with this name AND these arguments, or a minted id. Never
-    // a verdict input.
-    const matchedId = inflight.claim(call.prefixedToolName, call.originalToolName, call.args);
+    // Audit only: the in-flight `tool_call` with this server, name AND these arguments, or a minted
+    // id. Never a verdict input.
+    const matchedId = inflight.claim(call.serverName, call.prefixedToolName, call.originalToolName, call.args);
     const toolUseId = matchedId ?? mintBrokerId();
     const serverConfig = mcpConfigReader.serverConfig(call.serverName, cwd);
     return decideMcpApproval(

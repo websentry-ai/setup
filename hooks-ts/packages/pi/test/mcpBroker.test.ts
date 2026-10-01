@@ -36,7 +36,7 @@ import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
-import { createInflightCalls, createMcpApprovalListener } from "../src/mcpBroker.ts";
+import { createInflightCalls, createMcpApprovalListener, formatServerNamespace } from "../src/mcpBroker.ts";
 import {
   createFakeAgentEndEvent,
   createFakeCtx,
@@ -792,10 +792,10 @@ test("in-flight entries expire by age", () => {
   const inflight = createInflightCalls(10, 60_000, () => now);
   inflight.remember({ toolCallId: "old", toolName: "github_x", input: {} }, "S");
   now += 61_000;
-  assert.equal(inflight.claim("github_x", "x", {}), undefined, "a stale entry is never claimed");
+  assert.equal(inflight.claim("github", "github_x", "x", {}), undefined, "a stale entry is never claimed");
   inflight.remember({ toolCallId: "fresh", toolName: "github_x", input: {} }, "S");
-  assert.equal(inflight.claim("github_x", "x", {}), "fresh");
-  assert.equal(inflight.claim("github_x", "x", { other: 1 }), undefined, "args must match too");
+  assert.equal(inflight.claim("github", "github_x", "x", {}), "fresh");
+  assert.equal(inflight.claim("github", "github_x", "x", { other: 1 }), undefined, "args must match too");
 });
 
 test("an unmatched brokered call posts its own one-call turn log and never enters the turn store", async () => {
@@ -870,6 +870,54 @@ test("PR #371: a direct tool under toolPrefix \"mcp\" (mcp__<server>_<tool>) cor
   } finally {
     await f.close();
   }
+});
+
+test("PR #371 round 2: overlapping proxy calls to different servers, same tool and args, keep their own ids", async () => {
+  const f = await fixture("allow");
+  try {
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("mcp", { tool: "search", server: "alpha", args: { q: "x" } }, "toolu_alpha"), f.ctx);
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("mcp", { tool: "search", server: "beta", args: { q: "x" } }, "toolu_beta"), f.ctx);
+    // beta reaches the broker first.
+    await brokerRequest(f.bus, { serverName: "beta", originalToolName: "search", prefixedToolName: "beta_search", args: { q: "x" } });
+    await brokerRequest(f.bus, { serverName: "alpha", originalToolName: "search", prefixedToolName: "alpha_search", args: { q: "x" } });
+    const ids = pretoolBodies(f.api).map((b) => [dataOf(b).metadata.mcp_server, dataOf(b).tool_use_id]);
+    assert.deepStrictEqual(ids, [["beta", "toolu_beta"], ["alpha", "toolu_alpha"]]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("PR #371 round 2: namespace wrappers on different servers correlate by the adapter's namespace", async () => {
+  const f = await fixture("allow");
+  try {
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("mcp__my_srv", { tool: "search", args: { q: "x" } }, "toolu_ns_my"), f.ctx);
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("mcp__other", { tool: "search", args: { q: "x" } }, "toolu_ns_other"), f.ctx);
+    await brokerRequest(f.bus, { serverName: "other", originalToolName: "search", prefixedToolName: "other_search", args: { q: "x" } });
+    // `my-srv` normalises to the namespace `my_srv` (dash ⇒ underscore), exactly as the adapter names it.
+    await brokerRequest(f.bus, { serverName: "my-srv", originalToolName: "search", prefixedToolName: "my-srv_search", args: { q: "x" } });
+    const ids = pretoolBodies(f.api).map((b) => [dataOf(b).metadata.mcp_server, dataOf(b).tool_use_id]);
+    assert.deepStrictEqual(ids, [["other", "toolu_ns_other"], ["my-srv", "toolu_ns_my"]]);
+  } finally {
+    await f.close();
+  }
+});
+
+test("PR #371 round 2: a proxy call without `server` still correlates (wildcard)", async () => {
+  const f = await fixture("allow");
+  try {
+    await f.handlers.get("tool_call")?.(createFakeToolCallEvent("mcp", { tool: "search", args: { q: "y" } }, "toolu_any"), f.ctx);
+    await brokerRequest(f.bus, { serverName: "gamma", originalToolName: "search", prefixedToolName: "gamma_search", args: { q: "y" } });
+    assert.equal(dataOf(pretoolBodies(f.api)[0]).tool_use_id, "toolu_any");
+  } finally {
+    await f.close();
+  }
+});
+
+test("formatServerNamespace mirrors the adapter (dash, unsafe chars, long names)", () => {
+  assert.equal(formatServerNamespace("my-srv"), "my_srv");
+  assert.equal(formatServerNamespace("a.b"), "_mcpns_a_2e_b");
+  const long = formatServerNamespace("s".repeat(80));
+  assert.ok(long.length <= 59 && long.startsWith("_mcpns__h_"));
 });
 
 // Must stay LAST: the key latch is permanent for this process.
