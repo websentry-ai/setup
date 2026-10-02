@@ -327,20 +327,36 @@ async function httpOk(method, path, body, extraHeaders = {}) {
 
 const budget = () => Math.max(1_000, args.timeoutMs - (Date.now() - started) - 2_000);
 
+/**
+ * Retry a request until the server is READY: no answer (not listening yet) and any 5xx (listening
+ * but still booting - v2 answers 503 for a few hundred ms) both mean "try again". The first answer
+ * below 500 is returned, with the not-ready statuses seen on the way. Only the readiness request is
+ * retried; nothing after it is.
+ */
+async function untilReady(request, label) {
+  const notReady = [];
+  const until = Date.now() + budget();
+  while (Date.now() < until) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      await fail(`opencode exited early (code=${child.exitCode}, signal=${child.signalCode}) while waiting for ${label}`);
+    }
+    const status = await request();
+    if (status !== undefined && status < 500) return { status, notReady };
+    if (status !== undefined && notReady[notReady.length - 1] !== status) notReady.push(status);
+    await sleep(250);
+  }
+  await fail(`the server never answered ${label} below 500 (not-ready statuses seen: ${JSON.stringify(notReady)})`);
+  return { status: undefined, notReady };
+}
+
 if (args.line === "v1") {
   // 1. The first HTTP request boots the instance for the cwd: server() runs (cold home: the CLI
   //    first npm-installs @opencode-ai/plugin into the config dir, so this can take a while).
-  let listening;
-  const until = Date.now() + budget();
-  while (Date.now() < until && listening === undefined) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      await fail(`opencode exited early (code=${child.exitCode}, signal=${child.signalCode})`);
-    }
-    listening = await httpOk("GET", "/session");
-    if (listening === undefined) await sleep(250);
-  }
-  if (listening === undefined) await fail("the server never answered GET /session");
-  console.log(`listening: GET /session -> ${listening} after ${Date.now() - started} ms`);
+  const ready = await untilReady(() => httpOk("GET", "/session"), "GET /session");
+  console.log(
+    `listening: GET /session -> ${ready.status} after ${Date.now() - started} ms` +
+      (ready.notReady.length > 0 ? ` (not ready before: ${ready.notReady.join(",")})` : ""),
+  );
 
   // 2. A session for the project directory: session.created reaches the plugin's `event`.
   const created = await httpOk("POST", `/session?directory=${encodeURIComponent(projectDir)}`, {});
@@ -381,17 +397,15 @@ if (args.line === "v1") {
   // on /v1/hooks/errors from a later macrotask.
   const auth = { authorization: `Basic ${Buffer.from(`opencode:${serverPassword}`).toString("base64")}` };
   const agentPath = `/api/agent?directory=${encodeURIComponent(projectDir)}`;
-  let answered;
-  const until = Date.now() + budget();
-  while (Date.now() < until && answered === undefined) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      await fail(`opencode exited early (code=${child.exitCode}, signal=${child.signalCode})`);
-    }
-    answered = await httpOk("GET", agentPath, undefined, { ...auth, "x-opencode-directory": projectDir });
-    if (answered === undefined) await sleep(250);
-  }
-  if (answered === undefined) await fail("the v2 server never answered GET /api/agent");
-  console.log(`listening: GET /api/agent -> ${answered} after ${Date.now() - started} ms`);
+  const ready = await untilReady(
+    () => httpOk("GET", agentPath, undefined, { ...auth, "x-opencode-directory": projectDir }),
+    "GET /api/agent",
+  );
+  const answered = ready.status;
+  console.log(
+    `listening: GET /api/agent -> ${answered} after ${Date.now() - started} ms` +
+      (ready.notReady.length > 0 ? ` (not ready before: ${ready.notReady.join(",")})` : ""),
+  );
   if (answered === 401) await fail("GET /api/agent answered 401: the basic-auth override was not honoured");
 
   const report = await waitFor(
