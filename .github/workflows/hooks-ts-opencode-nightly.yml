@@ -1,0 +1,149 @@
+name: hooks-ts-opencode-nightly
+
+# CORE-05: load the COMMITTED opencode plugin bundle (opencode/index.js) through the real opencode
+# loaders, every night, and smoke-run it under every runtime that may host it.
+#
+# Why nightly and why `@latest` (Pitfall 10): opencode auto-installs patch releases and its v2 line
+# changes weekly, so a bundle that loads today can stop loading tomorrow with no change on our side.
+# A load failure is only a log line on the host and the plugin is then simply absent - a silent
+# fail-open (Pitfall 3). The only defence is to load the real artifact through the real, current
+# loaders on a schedule, and to check the hand-written host types against the real package.
+#
+# No secrets, ever: each smoke script starts its own loopback mock gateway, uses a synthetic key,
+# points HOME/XDG at a temp dir and drops every UNBOUND_* variable. Nothing is published or
+# committed by this workflow. Every CLI/package is installed into $RUNNER_TEMP (or `--no-save`),
+# from the npm registry only.
+#
+# Jobs:
+#   import-smoke  Node 22, Node 26 and Bun import the committed bundle: export shape, every hook
+#                 total on garbage, a mock deny blocks bash, setup resolves.
+#   loader-v1     opencode-ai@latest (v1 line, the enforcing `server` entry): the headless recipe
+#                 (serve + POST /session) must yield the plugin's session_start heartbeat.
+#   loader-v2     @opencode/cli@latest (v2 line): the bundle loads and its inactive `setup` reports
+#                 api_family_inactive. Informational until Phase 14 (which owns v2 enforcement).
+#   types-v1      the adapter's hand-written host types against @opencode-ai/plugin@latest.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: hooks-ts
+
+jobs:
+  import-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [node22, node26, bun]
+        include:
+          - runtime: node22
+            node-version: 22
+          - runtime: node26
+            node-version: 26
+          - runtime: bun
+            node-version: 22
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: latest
+
+      - name: Import smoke (Node)
+        if: matrix.runtime != 'bun'
+        run: |
+          node --version
+          node scripts/opencode-import-smoke.mjs ../opencode/index.js
+
+      - name: Import smoke (Bun)
+        if: matrix.runtime == 'bun'
+        run: |
+          bun --version
+          bun scripts/opencode-import-smoke.mjs ../opencode/index.js
+
+  loader-v1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      - name: Install opencode-ai@latest into a temp prefix
+        run: |
+          npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/oc1" opencode-ai@latest
+          "$RUNNER_TEMP/oc1/node_modules/.bin/opencode" --version
+
+      - name: Loader smoke (v1)
+        run: |
+          node scripts/opencode-loader-smoke.mjs \
+            --cli "$RUNNER_TEMP/oc1/node_modules/.bin/opencode" \
+            --artifact ../opencode/index.js \
+            --line v1 \
+            --timeout-ms 240000
+
+  loader-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Phase 14 owns v2 enforcement. Until then this leg only proves the bundle loads on v2 and
+    # reports itself inactive; a red run is surfaced (the script prints the loader's log lines and
+    # the mock's requests) but does not fail the workflow.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      - name: Install @opencode/cli@latest into a temp prefix
+        run: |
+          npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/oc2" @opencode/cli@latest
+          "$RUNNER_TEMP/oc2/node_modules/.bin/opencode" --version
+
+      - name: Loader smoke (v2)
+        run: |
+          node scripts/opencode-loader-smoke.mjs \
+            --cli "$RUNNER_TEMP/oc2/node_modules/.bin/opencode" \
+            --artifact ../opencode/index.js \
+            --line v2 \
+            --timeout-ms 240000
+
+  types-v1:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hooks-ts/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # Type-only; --no-save keeps the lockfile untouched (the package is never a dependency).
+      - name: Install @opencode-ai/plugin@latest (types only)
+        run: |
+          npm install --no-save --no-audit --no-fund @opencode-ai/plugin@latest
+          npm ls @opencode-ai/plugin || true
+
+      - name: Host-type conformance
+        run: npx tsc -p packages/opencode/conformance/tsconfig.json
