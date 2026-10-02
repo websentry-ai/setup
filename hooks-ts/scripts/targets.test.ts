@@ -74,6 +74,23 @@ test("TARGETS holds the pi target, built from the pi package entry", () => {
   assert.ok(pi.banner.endsWith(" */"));
 });
 
+test("TARGETS holds the opencode target, built from the opencode package entry", () => {
+  const opencode = TARGETS.find((target) => target.name === "opencode");
+
+  assert.ok(opencode !== undefined, "the opencode target is gone from TARGETS");
+  assert.equal(opencode.entry, "packages/opencode/src/index.ts");
+  assert.equal(opencode.maxBytes, 262_144);
+  assert.ok(opencode.banner.startsWith("/**\n * GENERATED FILE - DO NOT EDIT."));
+  assert.ok(opencode.banner.endsWith(" */"));
+  // The opencode build test greps the whole output (banner included) for a Bun API access.
+  assert.doesNotMatch(opencode.banner, /\bBun\.[A-Za-z]/);
+  // pi stays first: its artifact and sidecar paths keep their place in every listing.
+  assert.deepEqual(
+    TARGETS.map((target) => target.name),
+    ["pi", "opencode"],
+  );
+});
+
 test("TARGETS names are unique, path-safe, and every entry file exists", () => {
   assert.ok(TARGETS.length > 0, "TARGETS is empty - nothing would be built or gated");
 

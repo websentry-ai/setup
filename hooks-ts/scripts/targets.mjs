@@ -36,8 +36,28 @@ const PI_BANNER = [
   " */",
 ].join("\n");
 
+// Note: the opencode banner must never contain the Bun global followed by a member access - the
+// opencode build test greps the output for it, and the banner is part of the output.
+const OPENCODE_BANNER = [
+  "/**",
+  " * GENERATED FILE - DO NOT EDIT.",
+  " * Built from unbound-hooks-ts (packages/core + packages/opencode) by scripts/build.mjs.",
+  " *",
+  " * Fail-open contract (opencode v1 `server` entry): when the Unbound API cannot be reached, times",
+  " * out, answers non-2xx or returns unparseable JSON, the tool call or prompt is ALLOWED. An error",
+  " * escaping `tool.execute.before` or `chat.message` would block, so every handler is total, and",
+  " * the only deliberate blocks are a policy deny, an approval-required verdict (opencode v1 has no",
+  " * native ask), or an org whose last successful response asked for block-on-failure.",
+  " *",
+  " * The v2 `setup` entry is present but INACTIVE: it enforces nothing and, on a v2 host only,",
+  " * reports itself inactive.",
+  " *",
+  " * Tested against opencode-ai 1.18.x (Bun-compiled CLI); also importable on Node >= 22.19.0.",
+  " */",
+].join("\n");
+
 /**
- * name     - the directory name, both under dist/ and at the repo root. Lowercase, path-safe.
+ * name     -the directory name, both under dist/ and at the repo root. Lowercase, path-safe.
  * entry    - the bundle's entry point, relative to hooks-ts/.
  * banner   - the comment esbuild puts at the top of the output.
  * maxBytes - the size ceiling `scripts/targets.build.test.ts` holds the built bundle under. A value
@@ -45,6 +65,12 @@ const PI_BANNER = [
  */
 export const TARGETS = Object.freeze([
   Object.freeze({ name: "pi", entry: "packages/pi/src/index.ts", banner: PI_BANNER, maxBytes: 204_800 }),
+  Object.freeze({
+    name: "opencode",
+    entry: "packages/opencode/src/index.ts",
+    banner: OPENCODE_BANNER,
+    maxBytes: 262_144,
+  }),
 ]);
 
 /** Where the metafiles go, relative to hooks-ts/. */
