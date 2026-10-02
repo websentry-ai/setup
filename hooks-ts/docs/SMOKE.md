@@ -282,3 +282,93 @@ highest-severity guard: against the real `refs/heads/main`, over the real networ
 installer refuses rather than installing something it cannot verify.
 
 Never record a real API key, admin token, device serial or customer identifier in this file.
+
+---
+
+## opencode
+
+Smokes for the opencode plugin (`opencode/index.js`, dual entry `{ id, server, setup }`). All of them
+run against the committed bytes and load the plugin through a real opencode CLI. Tested against
+`opencode-ai` 1.18.34 (v1 line, the enforcing `server` entry) and `@opencode/cli` 2.0.21 / 2.0.22
+(v2 line: load check only, Phase 14 owns v2 enforcement), Node `v22.22.2`.
+
+### Isolation
+
+Every run uses a scratch home. Nothing reads or writes the real `~/.config/opencode`,
+`~/.local/share/opencode` or `~/.unbound`.
+
+```bash
+T=<scratch dir>
+for v in $(env | cut -d= -f1 | grep '^UNBOUND_'); do unset $v; done
+export HOME=$T/home XDG_CONFIG_HOME=$T/home/.config XDG_DATA_HOME=$T/home/.local/share \
+       XDG_CACHE_HOME=$T/home/.cache XDG_STATE_HOME=$T/home/.local/state \
+       OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_LSP_DOWNLOAD=1 OPENCODE_DISABLE_SHARE=1 \
+       OPENCODE_DISABLE_CLAUDE_CODE=1 OPENCODE_DISABLE_EXTERNAL_SKILLS=1
+mkdir -p $XDG_CONFIG_HOME/opencode/plugins $T/proj
+cp opencode/index.js $XDG_CONFIG_HOME/opencode/plugins/unbound.js
+npm install --prefix $T/oc1 opencode-ai@1.18          # the CLI, outside the repo
+cd hooks-ts && npm run mock-api -- --agent opencode --port 8799 --mode <mode> &   # stderr = request log
+export UNBOUND_GATEWAY_URL=http://127.0.0.1:8799 UNBOUND_OPENCODE_API_KEY=test
+cd $T/proj && export PWD=$T/proj                       # opencode takes its project dir from PWD
+```
+
+On a cold home, the first start npm-installs `@opencode-ai/plugin` into the config dir, which takes
+5-40 s and needs registry access. Plugins load lazily on the first HTTP request for a directory.
+
+### Scripted smokes (no model, run by the nightly job too)
+
+```bash
+cd hooks-ts
+node scripts/opencode-import-smoke.mjs ../opencode/index.js         # also: bun scripts/...
+node scripts/opencode-loader-smoke.mjs --cli $T/oc1/node_modules/.bin/opencode \
+  --artifact ../opencode/index.js --line v1
+node scripts/opencode-loader-smoke.mjs --cli $T/oc2/node_modules/.bin/opencode \
+  --artifact ../opencode/index.js --line v2                         # @opencode/cli@latest
+```
+
+Both scripts build their own isolated home and an inline loopback mock. The v1 leg asserts the
+`session_start` heartbeat (`pre_tool_use_data.metadata.opencode_version`) and that no
+`failed to load plugin` line names `unbound.js`. The v2 leg authenticates with a random per-run
+`OPENCODE_SERVER_PASSWORD` and asserts the `api_family_inactive` report.
+
+### Model-free legs (`opencode serve`, no provider key)
+
+```bash
+$T/oc1/node_modules/.bin/opencode serve --hostname 127.0.0.1 --port 47310 --print-logs --log-level INFO 2>srv.err &
+SID=$(curl -s -XPOST "http://127.0.0.1:47310/session?directory=$T/proj" -H 'content-type: application/json' -d '{}' | jq -r .id)
+# prompt legs (--mode deny / --mode ask):
+curl -s -XPOST "http://127.0.0.1:47310/session/$SID/message?directory=$T/proj" -H 'content-type: application/json' \
+  -d '{"agent":"build","model":{"providerID":"openrouter","modelID":"openai/gpt-4.1-nano"},"parts":[{"type":"text","text":"Say hello."}]}'
+# user !cmd leg (--mode denyTools):
+curl -s -XPOST "http://127.0.0.1:47310/session/$SID/shell?directory=$T/proj" -H 'content-type: application/json' \
+  -d '{"agent":"build","model":{"providerID":"openrouter","modelID":"openai/gpt-4.1-nano"},"command":"echo unbound-shell > '$T'/shell-ran.txt"}'
+```
+
+The provider key is a dummy. A blocked prompt never reaches the model, and any leak past the
+block would fail on authentication instead of spending credit.
+
+### Live legs (`opencode run`, one short model turn each)
+
+```bash
+OPENROUTER_API_KEY=<provider key, child env only> \
+  $T/oc1/node_modules/.bin/opencode run --format json --model openrouter/openai/gpt-4.1-nano \
+  "Run the shell command: echo unbound-smoke (use the bash tool, then report its output)"
+```
+
+### Results
+
+| Leg | Mock mode | Evidence |
+|-----|-----------|----------|
+| Heartbeat (loader smoke v1) | inline allow | pretool `session_start`, `unbound_app_label` `opencode`, `client_entrypoint` `opencode/1.18.34`, `opencode_version` `1.18.34`; no load error |
+| v2 load (loader smoke v2) | inline | `/v1/hooks/errors` `opencode-hook hook api_family_inactive: v2_setup_inactive for tool=setup`; no heartbeat (v2 never calls `server`) |
+| `--pure` / `OPENCODE_PURE=1` | allow | no request reaches the mock: the plugin is silently not loaded |
+| 1 BLOCK (tool, live) | denyTools | tool part `bash` `status:error`, `error:"Blocked by Unbound policy: Smoke: tool calls are blocked."`; the model replied that the command "has been blocked by policy restrictions"; `run` exit 0; mock: `session_start`, `user_prompt`, `tool_use` `bash` `echo unbound-smoke`, `POST /v1/hooks/opencode` model `auto` |
+| 2 PROMPT | deny | HTTP 500 generic `UnknownError`; server log `error="Error: Blocked by Unbound policy: Reading secrets is blocked."`; 0 messages persisted (LLM not called); mock: `user_prompt` |
+| 3 APPROVAL (prompt) | ask | HTTP 500 generic; server log `Unbound policy requires approval for this action: Unusual command. opencode cannot show an approval prompt, so it was not run. ...`; 0 messages persisted. The tool-level approval path is covered by `before.test.ts` |
+| 4 TURN LOG + HEARTBEAT (live) | allow | `bash` completed, output `unbound-smoke`; mock: `session_start` (`opencode_version` 1.18.34), `user_prompt`, `tool_use` allow, one `POST /v1/hooks/opencode` model `auto` |
+| 5 FAIL-OPEN (live) | port 8799 closed (verified) | `bash` completed, output `unbound-smoke`; `run` exit 0 in 3982 ms |
+| 6 USER `!cmd` | denyTools | `POST /session/:id/shell` HTTP 500 generic; the marker file was NOT created; server log `Blocked by Unbound policy: Smoke: tool calls are blocked.`; mock `tool_use` `bash` with the user's command plus a turn log. Documented caveat: the transcript shows the user bash part as `completed` with empty output |
+
+Back-to-back `serve` restarts on the same scratch home sometimes stalled at config loading, before
+the instance (and the plugin) was created. A pause between runs avoided it. Because the stall
+happens before the plugin is evaluated, the plugin is not involved.
