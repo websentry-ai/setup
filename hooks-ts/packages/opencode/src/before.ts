@@ -90,6 +90,8 @@ async function mapBounded<T, R>(items: readonly T[], limit: number, fn: (item: T
 export async function decideBefore(input: unknown, output: unknown, ctx: BeforeContext): Promise<string | undefined> {
   try {
     const { runtime, record } = ctx;
+    // First thing: this call is model-issued, so `shell.env` must never check it again (HOOK-19).
+    runtime.markBeforeSeen(readString(input, "sessionID"), readString(input, "callID"));
     const resolved = runtime.init();
     const checker = resolved.checker;
     const scope = resolved.scope;

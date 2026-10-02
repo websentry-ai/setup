@@ -44,6 +44,7 @@ import type {
 } from "../../core/src/accountIdentity.ts";
 import { MAX_ASSISTANT_CHARS, MAX_TRACKED_INSTANCES, MAX_TRACKED_SESSIONS } from "../../core/src/constants.ts";
 import { createKeyedState } from "../../core/src/keyedState.ts";
+import { capCommand } from "../../core/src/payload.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import type { PolicySnapshot } from "../../core/src/policyState.ts";
@@ -69,6 +70,7 @@ import type { HooksLike, ServerFactory } from "./hostTypes.ts";
 import { chatMessage } from "./prompt.ts";
 import { OPENCODE_PROFILE, resolveOpencodeDataDir } from "./profile.ts";
 import { eventHandler, toolExecuteAfter } from "./record.ts";
+import { shellEnv } from "./userShell.ts";
 
 /** The token of THIS module copy. A second evaluated copy of the bundle has a different one. */
 const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
@@ -87,6 +89,8 @@ const MAX_IDS_PER_SESSION = 512;
 const MAX_MESSAGES_PER_SESSION = 256;
 /** The most assistant text parts kept per session between idles; the oldest is dropped first. */
 const MAX_ASSISTANT_PARTS = 32;
+/** The most bash commands stashed per session awaiting `shell.env`; the oldest is dropped first. */
+const MAX_SHELL_STASH_PER_SESSION = 32;
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -188,6 +192,16 @@ export interface Runtime {
   takeAssistantText(sessionID: string): string;
   /** Drop everything kept for a session (`session.deleted`). A pending turn is NOT posted. */
   releaseSession(sessionID: string): void;
+  /** Note that `tool.execute.before` ran for a call (so `shell.env` never re-checks it). */
+  markBeforeSeen(sessionID: string, callID: string): void;
+  /** Whether `tool.execute.before` ran for a call. */
+  beforeSeen(sessionID: string, callID: string): boolean;
+  /** Stash a bash part's command by callID (bounded, short-lived; latest non-empty wins). */
+  stashUserShell(sessionID: string, callID: string, command: string): void;
+  /** Take (and forget) a stashed bash command. */
+  takeUserShell(sessionID: string, callID: string): string | undefined;
+  /** Forget a stashed bash command (the part reached a final status). */
+  dropUserShell(sessionID: string, callID: string): void;
 }
 
 /** Read-only test seam, attached to the factory as a NON-enumerable `inspect` property. */
@@ -267,10 +281,20 @@ export interface SessionExtras {
   roles: Map<string, string>;
   /** partID → latest assistant text of that part, in first-seen order. */
   assistant: Map<string, string>;
+  /** Call ids that passed through `tool.execute.before` (model-issued). */
+  before: Set<string>;
+  /** callID → command of a bash part, until `shell.env` takes it or the part finishes. */
+  shell: Map<string, string>;
 }
 
 function freshExtras(): SessionExtras {
-  return { resulted: new Set<string>(), roles: new Map<string, string>(), assistant: new Map<string, string>() };
+  return {
+    resulted: new Set<string>(),
+    roles: new Map<string, string>(),
+    assistant: new Map<string, string>(),
+    before: new Set<string>(),
+    shell: new Map<string, string>(),
+  };
 }
 
 /** Set `key` in an insertion-ordered map, dropping the oldest past `max`. */
@@ -635,6 +659,50 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         // Nothing to release.
       }
     },
+    markBeforeSeen(sessionID: string, callID: string): void {
+      try {
+        if (sessionID === "" || callID === "") return;
+        boundedAdd(extras.get(sessionID).before, callID, MAX_IDS_PER_SESSION);
+        // A model call never needs its stashed command again.
+        extras.peek(sessionID)?.shell.delete(callID);
+      } catch {
+        // Unknown = not seen: at worst one extra check of a model bash call.
+      }
+    },
+    beforeSeen(sessionID: string, callID: string): boolean {
+      try {
+        return extras.peek(sessionID)?.before.has(callID) === true;
+      } catch {
+        return false;
+      }
+    },
+    stashUserShell(sessionID: string, callID: string, command: string): void {
+      try {
+        if (sessionID === "" || callID === "" || typeof command !== "string" || command === "") return;
+        const kept = extras.get(sessionID);
+        if (kept.before.has(callID)) return;
+        boundedSet(kept.shell, callID, capCommand(command).command, MAX_SHELL_STASH_PER_SESSION);
+      } catch {
+        // A missing stash is reported as `no_part` at `shell.env` time.
+      }
+    },
+    takeUserShell(sessionID: string, callID: string): string | undefined {
+      try {
+        const map = extras.peek(sessionID)?.shell;
+        const command = map?.get(callID);
+        map?.delete(callID);
+        return command;
+      } catch {
+        return undefined;
+      }
+    },
+    dropUserShell(sessionID: string, callID: string): void {
+      try {
+        extras.peek(sessionID)?.shell.delete(callID);
+      } catch {
+        // Bounded anyway.
+      }
+    },
     markResulted(sessionID: string, callID: string): boolean {
       try {
         if (sessionID === "" || callID === "") return false;
@@ -678,6 +746,9 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       "tool.execute.after": toolExecuteAfter({ runtime, record }),
       // The prompt check (V1-5 GO). Raises only through `block.ts`, and only on a verdict.
       "chat.message": chatMessage({ runtime, record }),
+      // User `!cmd` (V1-7 GO). Raises only through `block.ts`, only on a verdict, and never for a
+      // call that passed `tool.execute.before` (model bash is not checked twice).
+      "shell.env": shellEnv({ runtime, record }),
       // The bus. Never rejects (V1-4): every branch is guarded and nothing is awaited.
       event: eventHandler({ runtime, record }),
       // Called with the live merged config once per instance. Read-only (Pitfall 16): the object is

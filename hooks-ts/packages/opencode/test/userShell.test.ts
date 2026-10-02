@@ -123,6 +123,8 @@ test("the stashed command is consumed: a second shell.env for the same callID is
     await h.hook("shell.env")({ cwd: "/repo", sessionID: S, callID: "u3" }, { env: {} });
     await h.hook("shell.env")({ cwd: "/repo", sessionID: S, callID: "u3" }, { env: {} });
     assert.equal(pretoolRequests(mock).length, 1);
+    // The repeat finds nothing stashed: it is reported, never checked or blocked.
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_USER_SHELL_UNCHECKED).length === 1));
   } finally {
     h.cleanup();
   }
@@ -134,7 +136,7 @@ test("no key: shell.env resolves with zero requests", async () => {
     await h.emit("message.part.updated", bashPart("u4", "running", "cat .env"));
     assert.equal(await outcome(h.hook("shell.env")({ cwd: "/repo", sessionID: S, callID: "u4" }, { env: {} })), undefined);
     await tick();
-    assert.equal(mock.requests.length, 0);
+    assert.deepEqual(mock.requests.map((r) => r.path), []);
   } finally {
     h.cleanup();
   }

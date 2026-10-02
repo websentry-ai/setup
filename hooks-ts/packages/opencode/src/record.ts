@@ -95,12 +95,33 @@ function checkTamper(ctx: RecordContext, sessionID: string, callID: string, tool
   }
 }
 
-/** `message.part.updated` for a tool part: the error-path audit (HOOK-15). */
+/**
+ * HOOK-19 (V1-7): a bash part's command, stashed synchronously by callID so `shell.env` (which gets
+ * no command) can check a user `!cmd`. The user shell persists the part before `shell.env` fires;
+ * a final status drops the stash. `shell.env` reports `SIGNAL_USER_SHELL_UNCHECKED` when it finds
+ * nothing to check.
+ */
+function stashBash(sessionID: string, part: unknown, state: unknown, ctx: RecordContext): void {
+  try {
+    const callID = readString(part, "callID");
+    const status = readField(state, "status");
+    if (status === "completed" || status === "error") {
+      ctx.runtime.dropUserShell(sessionID, callID);
+      return;
+    }
+    ctx.runtime.stashUserShell(sessionID, callID, readString(readField(state, "input"), "command"));
+  } catch {
+    // Missing stash = `no_part` at `shell.env` time.
+  }
+}
+
+/** `message.part.updated` for a tool part: the bash stash (HOOK-19), then the error-path audit (HOOK-15). */
 function onToolPart(sessionID: string, part: unknown, ctx: RecordContext): void {
   const state = readField(part, "state");
+  const tool = readString(part, "tool");
+  if (tool === "bash") stashBash(sessionID, part, state, ctx);
   if (readField(state, "status") !== "error") return;
   const callID = readString(part, "callID");
-  const tool = readString(part, "tool");
   const error = readField(state, "error");
   recordResult(ctx, sessionID, callID, tool, true, [{ type: "text", text: typeof error === "string" ? error : "" }]);
 }
