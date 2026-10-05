@@ -365,7 +365,10 @@ def _write_augment_managed_settings(m) -> bool:
                 our_hook_exists = any(
                     hook.get("command", "") == our_command
                     for item in existing_config if isinstance(item, dict)
-                    for hook in item.get("hooks", [])
+                    # .get's default only covers a missing key, so a scalar
+                    # would be iterated and raise, aborting the write.
+                    for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+                    if isinstance(hook, dict)
                 )
                 if not our_hook_exists:
                     existing_config.extend(new_config)
@@ -383,7 +386,10 @@ def _write_augment_managed_settings(m) -> bool:
             for item in blocks:
                 if isinstance(item, dict) and any(
                         isinstance(hook, dict) and hook.get("command", "") == our_command
-                        for hook in item.get("hooks", [])):
+                        # .get's default only covers a missing key, so a scalar
+                        # would be iterated and raise, aborting the write.
+                        for hook in (item.get("hooks")
+                                     if isinstance(item.get("hooks"), list) else [])):
                     if not isinstance(item.get("metadata"), dict):
                         item["metadata"] = {}
                     item["metadata"].update(flags)

@@ -106,7 +106,9 @@ def _hook_command_matches(existing_cmd: str, hook_command: str, script_path: Pat
     by script path) OR references the /opt/unbound hook binary. Without the binary
     case a binary-install hook is never recognized, so clear leaves it behind and
     orphans the managed config. Mirrors augment/hooks/setup.py."""
-    if not existing_cmd:
+    if not isinstance(existing_cmd, str) or not existing_cmd:
+        # A non-string command is not ours, and the membership tests below
+        # raise on an int or a bool.
         return False
     if existing_cmd == hook_command:
         return True
@@ -1013,7 +1015,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
                 our_hook_exists = any(
                     _hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
                     for item in existing_config if isinstance(item, dict)
-                    for hook in item.get("hooks", [])
+                    # .get's default only covers a missing key, so a scalar
+                    # would be iterated and raise, aborting the write.
+                    for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+                    if isinstance(hook, dict)
                 )
                 if not our_hook_exists:
                     existing_config.extend(new_config)

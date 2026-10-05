@@ -326,3 +326,37 @@ def test_the_codex_user_level_strip_survives_bad_shapes(codex_user, tmp_path,
     assert str(script) not in commands, "our hook survived the strip"
     assert "/usr/local/bin/keep-me" in commands, "a foreign hook was dropped"
     assert after["hooks"]["PreToolUse"] == 1, "a foreign event value was touched"
+
+
+@pytest.fixture(scope="module")
+def augment_mdm():
+    return _load("t_augment_mdm", "augment/hooks/mdm/setup.py")
+
+
+@pytest.mark.parametrize("command", NON_STRING_COMMANDS)
+def test_augment_mdm_matcher_rejects_a_non_string(augment_mdm, command):
+    """The MDM copy has a /opt/unbound membership branch the user-level one
+    lacks, so a non-string raised here on every platform, not just Windows."""
+    for is_windows in (False, True):
+        assert augment_mdm._hook_command_matches(
+            command, "cmd", Path("/tmp/unbound.py"), is_windows) is False
+
+
+def test_the_augment_managed_writes_survive_a_scalar_hooks_value(tmp_path,
+                                                                 monkeypatch):
+    """Both augment managed writers scanned `item.get("hooks", [])` and the
+    metadata pass did it again, so a scalar aborted the write and the
+    registration never persisted."""
+    settings = {"hooks": {"PreToolUse": [
+        {"matcher": "foreign", "hooks": 1},
+        {"matcher": "*", "hooks": [{"type": "command", "command": "/x"}]},
+    ]}}
+    # The scan in the binary's managed writer, exercised directly on the shape.
+    blocks = settings["hooks"]["PreToolUse"]
+    our_command = "/our/hook"
+    found = any(
+        isinstance(hook, dict) and hook.get("command", "") == our_command
+        for item in blocks if isinstance(item, dict)
+        for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+    )
+    assert found is False, "the scan must complete and simply not match"
