@@ -1030,11 +1030,11 @@ def clear_managed_hooks() -> bool:
                             if not isinstance(group, dict):
                                 kept_groups.append(group)
                                 continue
-                            entries = group.get("hooks")
+                            # Missing or empty reads as [] exactly as before. Only a
+                            # truthy scalar — which used to raise here — is now
+                            # left in place instead of being iterated.
+                            entries = group.get("hooks") or []
                             if not isinstance(entries, list):
-                                # Not a shape we own. Preserve the group as-is:
-                                # iterating a truthy scalar raises, and treating
-                                # it as empty would drop someone else's config.
                                 kept_groups.append(group)
                                 continue
                             # A non-dict element is not ours: preserve it

@@ -439,3 +439,72 @@ def test_the_augment_mdm_user_strip_survives_a_non_string_command(tmp_path,
     ]
     assert str(script) not in commands, "our hook survived the strip"
     assert "/usr/local/bin/keep-me" in commands, "a foreign hook was dropped"
+
+
+@pytest.mark.parametrize("module_path,name", [
+    ("claude-code/hooks/setup.py", "t_bc_claude_strip"),
+    ("augment/hooks/setup.py", "t_bc_augment_strip"),
+])
+def test_uninstall_still_drops_an_item_with_no_hooks_key(tmp_path, monkeypatch,
+                                                         module_path, name):
+    """Backward-compat. Before these guards an item with no `hooks` key read as
+    an empty list and was dropped on uninstall. The guards are only meant to
+    stop crashes, so that must not change."""
+    module = _load(name, module_path)
+    tool_dir = ".claude" if "claude" in module_path else ".augment"
+    (tmp_path / tool_dir / "hooks").mkdir(parents=True)
+    script = tmp_path / tool_dir / "hooks" / "unbound.py"
+    settings = tmp_path / tool_dir / "settings.json"
+    settings.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "no-hooks-key"},
+        {"hooks": [{"command": str(script)}]},
+        {"hooks": [{"command": "/usr/local/bin/keep-me"}]},
+    ]}}))
+    monkeypatch.setattr(module.Path, "home", staticmethod(lambda: tmp_path))
+
+    module.remove_hooks_from_settings()
+
+    stop = json.loads(settings.read_text()).get("hooks", {}).get("Stop", [])
+    assert {"matcher": "no-hooks-key"} not in stop, "missing-key item kept"
+    assert any(h.get("command") == "/usr/local/bin/keep-me"
+               for item in stop for h in item.get("hooks", []))
+
+
+def test_codex_user_uninstall_still_drops_an_item_with_no_hooks_key(codex_user,
+                                                                    tmp_path,
+                                                                    monkeypatch):
+    monkeypatch.setattr(codex_user.Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".codex" / "hooks").mkdir(parents=True)
+    script = tmp_path / ".codex" / "hooks" / "unbound.py"
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    hooks_path.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "no-hooks-key"},
+        {"hooks": [{"command": str(script)}]},
+        {"hooks": [{"command": "/usr/local/bin/keep-me"}]},
+    ]}}))
+
+    codex_user.remove_hooks_from_config()
+
+    stop = json.loads(hooks_path.read_text()).get("hooks", {}).get("Stop", [])
+    assert {"matcher": "no-hooks-key"} not in stop, "missing-key item kept"
+
+
+def test_gateway_uninstall_still_drops_a_group_with_no_hooks_key(tmp_path,
+                                                                monkeypatch):
+    gateway = _load("t_bc_gateway", "codex/gateway/mdm/setup.py")
+    managed = tmp_path / "managed"
+    (managed / "hooks").mkdir(parents=True)
+    script = managed / "hooks" / "unbound.py"
+    script.write_text("# hook\n")
+    settings = managed / "hooks.json"
+    settings.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "no-hooks-key"},
+        {"hooks": [{"command": str(script)}]},
+        {"hooks": [{"command": "/usr/local/bin/keep-me"}]},
+    ]}}))
+    monkeypatch.setattr(gateway, "get_managed_settings_dir", lambda: managed)
+
+    gateway.clear_managed_hooks()
+
+    stop = json.loads(settings.read_text()).get("hooks", {}).get("Stop", [])
+    assert {"matcher": "no-hooks-key"} not in stop, "missing-key group kept"
