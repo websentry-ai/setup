@@ -690,12 +690,7 @@ def _setup_codex(opts):
     # setup. No managed write and no user-level strip (the install IS the user
     # registration).
     user_homes = m.get_all_user_homes()
-    # The vendored MDM module owns this: it pairs the hook script with the
-    # registration, reads hooks.json through a loader that refuses symlinks and
-    # non-regular files, and tells a file it was refused (undetermined) apart
-    # from one it read and found no hook in (not registered). A second
-    # implementation here drifted from all three.
-    state = m.detect_install_state()
+    state = _codex_detect_state(user_homes)
     installed = 0
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -716,6 +711,32 @@ def _setup_codex(opts):
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
+
+
+def _codex_detect_state(user_homes) -> str:
+    """Per-user analog of the python detect_install_state(): now that codex
+    registers in ~/.codex/hooks.json, install state is read from there.
+    'fresh' = no user has a hooks.json; 'persisted' = at least one references
+    this binary or the python-era unbound.py; 'tampered' otherwise."""
+    saw_json = False
+    saw_known_ref = False
+    try:
+        for _username, home_dir in user_homes:
+            p = home_dir / ".codex" / "hooks.json"
+            if p.exists():
+                saw_json = True
+                try:
+                    text = p.read_text(encoding="utf-8")
+                    if str(HOOK_BINARY) in text or "unbound.py" in text:
+                        saw_known_ref = True
+                except OSError:
+                    pass
+        if not saw_json:
+            return "fresh"
+        return "persisted" if saw_known_ref else "tampered"
+    except Exception as e:
+        print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
+        return None
 
 
 def _setup_cursor(opts):

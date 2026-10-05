@@ -1101,7 +1101,7 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     isn't stripped."""
     if not isinstance(cmd, str) or not cmd:
         # A non-string command is not ours, and must not raise: the membership
-        # tests below throw on an int or bool, and the caller turns that into
+        # tests below throw on an int or a bool, and the caller turns that into
         # "no answer" for every profile on the device.
         return False
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
@@ -1463,23 +1463,13 @@ def _load_hooks_json(hooks_path):
     nothing about the file. 'unusable' means the content is there and codex cannot
     load hooks out of it either, which is a fact about the install, not about us.
     """
-    # A symlink here is interference, not a file we were merely refused: setup
-    # only ever writes a regular file, and the merge will not write through a
-    # link, so one left in place means the hook is not reliably ours. Calling it
-    # 'refused' would omit install_state and let a device sit on a stale
-    # 'persisted' while nothing enforced anything.
-    try:
-        if os.path.islink(str(hooks_path)):
-            return 'unusable', None
-    except OSError:
-        return 'refused', None
     try:
         fd = os.open(str(hooks_path),
                      os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     except FileNotFoundError:
         return 'absent', None
     except OSError:
-        return 'refused', None
+        return 'refused', None  # includes a symlink refused by O_NOFOLLOW
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode):
@@ -1527,8 +1517,8 @@ def _hooks_still_registered(hooks_path):
 
 
 def _unbound_hook_registered(hooks_path, script_path):
-    """'script' or 'binary' for the form that registers OUR hook, False when
-    none does, None only when we declined to read the file. Both are truthy. Ownership uses the same rule the
+    """True when OUR hook is registered for this user, False when it is not, None
+    only when we declined to read the file. Ownership uses the same rule the
     uninstall strips by, so registration and removal cannot disagree about what is
     ours. Content codex cannot load hooks from counts as not registered, because
     that is exactly what it means for codex."""
@@ -1549,18 +1539,9 @@ def _unbound_hook_registered(hooks_path, script_path):
             # `or []` would iterate an int and abort detection for every
             # profile on the device, not just this one.
             for hook in hooks if isinstance(hooks, list) else []:
-                if not isinstance(hook, dict):
-                    continue
-                cmd = hook.get('command', '')
-                if not isinstance(cmd, str) or not cmd:
-                    continue
-                # Which form matched decides whether a per-user script is
-                # needed: a command naming the binary runs it directly, so
-                # there is no script to pair with.
-                if str(script_path) in cmd:
-                    return 'script'
-                if "/opt/unbound/" in cmd and "unbound-hook" in cmd:
-                    return 'binary'
+                if isinstance(hook, dict) and _is_unbound_hook_command(
+                        hook.get('command', ''), script_path):
+                    return True
     return False
 
 
@@ -2179,11 +2160,6 @@ def detect_install_state() -> Optional[str]:
                 # We declined to read it, so this profile is evidence of nothing.
                 # Never let the script stand in for the registration.
                 indeterminate = True
-                continue
-            if registered == 'binary':
-                # Pre-wrapper machines register the binary itself. The hook
-                # runs; there is no per-user script that needs to be there.
-                any_complete = True
                 continue
             if not script and not registered:
                 continue
