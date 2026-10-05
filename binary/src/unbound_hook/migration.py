@@ -9,6 +9,8 @@ replaces, so old and new never run side by side:
     ai.getunbound.discovery label in the system domain and must survive
   - the scheduled-scan wrapper and the GitHub-fetched install.sh under
     ~/.local/share/unbound/
+  - the system-domain ai.getunbound.coding-discovery daemon and a non-symlink
+    /usr/local/bin/unbound-hook script shim
   - user-mode hook registrations pointing at the python scripts (each MDM
     module's own stripper runs FIRST, so a registration is never left
     dangling at a file this sweep already deleted), then the leftover
@@ -32,12 +34,18 @@ already gone.
 """
 
 import subprocess
+import sys
 from pathlib import Path
 
 from ._loader import load_mdm_setup_module
 from ._resources import TOOLS
 
 LEGACY_AGENT_LABELS = ("ai.getunbound.scheduled", "ai.getunbound.discovery")
+
+# Python-era system-domain discovery daemon and the script shim it replaced.
+LEGACY_DAEMON_LABEL = "ai.getunbound.coding-discovery"
+LEGACY_DAEMON_PLIST = Path("/Library/LaunchDaemons/ai.getunbound.coding-discovery.plist")
+LEGACY_HOOK_SHIM = Path("/usr/local/bin/unbound-hook")
 
 # Python-era files inside each user's tool hooks dir.
 TOOL_USER_HOOKS_DIR = {
@@ -67,6 +75,32 @@ def _bootout_legacy_agents(username: str, uid: int, home: Path, log) -> None:
             )
         except Exception as e:
             log(f"[migration] bootout {label} for {username}: {e}")
+
+
+def _bootout_legacy_daemon(log) -> None:
+    try:
+        subprocess.run(
+            ["launchctl", "bootout", f"system/{LEGACY_DAEMON_LABEL}"],
+            capture_output=True, timeout=10,
+        )
+    except Exception as e:
+        log(f"[migration] bootout {LEGACY_DAEMON_LABEL}: {e}")
+
+
+def _sweep_system(log) -> bool:
+    """Remove python-era system-level leftovers; a symlinked shim is not ours to delete."""
+    if sys.platform == "darwin":
+        _bootout_legacy_daemon(log)
+    ok = True
+    for path in (LEGACY_DAEMON_PLIST, LEGACY_HOOK_SHIM):
+        try:
+            if path.is_file() and not path.is_symlink():
+                path.unlink()
+                log(f"[migration] removed {path}")
+        except OSError as e:
+            log(f"[migration] could not remove {path}: {e}")
+            ok = False
+    return ok
 
 
 def _sweep_user_home(home_str: str, tools) -> list:
@@ -117,7 +151,7 @@ def run_sweep(tools=TOOLS, log=print) -> tuple:
             # unbound.json, handled inside _sweep_user_home
         }
 
-        failed_users = []
+        failed_users = [] if _sweep_system(log) else ["system"]
         for username, home in m.get_all_user_homes():
             try:
                 uid = pwd.getpwnam(username).pw_uid
