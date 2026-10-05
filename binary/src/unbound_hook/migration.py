@@ -77,21 +77,24 @@ def _bootout_legacy_agents(username: str, uid: int, home: Path, log) -> None:
             log(f"[migration] bootout {label} for {username}: {e}")
 
 
-def _bootout_legacy_daemon(log) -> None:
+def _bootout_legacy_daemon(log) -> bool:
+    """True once the daemon is no longer loaded; `launchctl print` exits 0 only for a loaded job."""
+    target = f"system/{LEGACY_DAEMON_LABEL}"
     try:
-        subprocess.run(
-            ["launchctl", "bootout", f"system/{LEGACY_DAEMON_LABEL}"],
-            capture_output=True, timeout=10,
-        )
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=10)
+        loaded = subprocess.run(["launchctl", "print", target],
+                                capture_output=True, timeout=10).returncode == 0
     except Exception as e:
         log(f"[migration] bootout {LEGACY_DAEMON_LABEL}: {e}")
+        return False
+    if loaded:
+        log(f"[migration] {LEGACY_DAEMON_LABEL} still loaded after bootout")
+    return not loaded
 
 
 def _sweep_system(log) -> bool:
     """Remove python-era system-level leftovers; a symlinked shim is not ours to delete."""
-    if sys.platform == "darwin":
-        _bootout_legacy_daemon(log)
-    ok = True
+    ok = sys.platform != "darwin" or _bootout_legacy_daemon(log)
     for path in (LEGACY_DAEMON_PLIST, LEGACY_HOOK_SHIM):
         try:
             if path.is_file() and not path.is_symlink():
