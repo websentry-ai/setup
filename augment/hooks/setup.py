@@ -626,11 +626,11 @@ def remove_hooks_from_settings() -> str:
                     continue
                 new_config = []
                 for item in event_config:
-                    # A missing key reads as an empty list, exactly as before, so an item
-                    # with no hooks is still dropped. Only a value that used to crash the
-                    # loop — null or a scalar — is now left in place instead.
-                    if isinstance(item, dict) and isinstance(item.get("hooks", []), list):
-                        hooks = item.get("hooks", [])
+                    # Anything empty reads as [], exactly as on main, so such an item is
+                    # still dropped. Only a truthy non-list — which used to crash the loop —
+                    # is now left in place instead.
+                    if isinstance(item, dict) and isinstance(item.get("hooks") or [], list):
+                        hooks = item.get("hooks") or []
                         new_hooks = [h for h in hooks
                                      if not isinstance(h, dict)
                                      or not _is_unbound(h.get("command", ""))]

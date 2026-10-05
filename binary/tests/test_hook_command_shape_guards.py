@@ -508,3 +508,33 @@ def test_gateway_uninstall_still_drops_a_group_with_no_hooks_key(tmp_path,
 
     stop = json.loads(settings.read_text()).get("hooks", {}).get("Stop", [])
     assert {"matcher": "no-hooks-key"} not in stop, "missing-key group kept"
+
+
+
+@pytest.mark.parametrize("empty_value", ["", {}, None, 0, False])
+@pytest.mark.parametrize("module_path,name,tool_dir,fn", [
+    ("claude-code/hooks/setup.py", "t_bc2_claude", ".claude", "remove_hooks_from_settings"),
+    ("augment/hooks/setup.py", "t_bc2_augment", ".augment", "remove_hooks_from_settings"),
+    ("codex/hooks/setup.py", "t_bc2_codex", ".codex", "remove_hooks_from_config"),
+])
+def test_uninstall_drops_an_item_whose_hooks_value_is_empty(tmp_path, monkeypatch,
+                                                            module_path, name,
+                                                            tool_dir, fn, empty_value):
+    """Backward-compat. On main an empty `hooks` value ("" or {}) iterated as
+    nothing and the item was dropped. The guards must keep that, and only leave
+    in place the truthy non-lists that used to crash."""
+    module = _load(name, module_path)
+    (tmp_path / tool_dir / "hooks").mkdir(parents=True)
+    script = tmp_path / tool_dir / "hooks" / "unbound.py"
+    target = tmp_path / tool_dir / ("hooks.json" if "codex" in module_path else "settings.json")
+    target.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "empty", "hooks": empty_value},
+        {"hooks": [{"command": str(script)}]},
+        {"hooks": [{"command": "/usr/local/bin/keep-me"}]},
+    ]}}))
+    monkeypatch.setattr(module.Path, "home", staticmethod(lambda: tmp_path))
+
+    getattr(module, fn)()
+
+    stop = json.loads(target.read_text()).get("hooks", {}).get("Stop", [])
+    assert not any(isinstance(i, dict) and i.get("matcher") == "empty" for i in stop)
