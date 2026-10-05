@@ -713,27 +713,73 @@ def _setup_codex(opts):
     return ("configured", None)
 
 
-def _codex_detect_state(user_homes) -> str:
+def _codex_hook_registered(hooks_path: Path, wrapper: Path):
+    """True when OUR hook is registered for this user, False when it is not,
+    None only when we could not read or parse the file.
+
+    Ownership uses _command_targets_hook — the same rule the install merges by
+    and the uninstall strips by — so registration, removal and detection cannot
+    disagree about what is ours. HOOK_BINARY is accepted too, for machines
+    registered before the wrapper existed.
+    """
+    try:
+        config = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+    events = config.get("hooks") if isinstance(config, dict) else None
+    if not isinstance(events, dict):
+        return False
+    for entries in events.values():
+        for item in entries if isinstance(entries, list) else []:
+            if not isinstance(item, dict):
+                continue
+            for hook in item.get("hooks") or []:
+                if not isinstance(hook, dict):
+                    continue
+                cmd = hook.get("command", "")
+                if _command_targets_hook(cmd, wrapper) or _command_targets_hook(cmd, HOOK_BINARY):
+                    return True
+    return False
+
+
+def _codex_detect_state(user_homes):
     """Per-user analog of the python detect_install_state(): now that codex
     registers in ~/.codex/hooks.json, install state is read from there.
-    'fresh' = no user has a hooks.json; 'persisted' = at least one references
-    this binary or the python-era unbound.py; 'tampered' otherwise."""
+
+    'fresh' = no user has a hooks.json; 'persisted' = at least one registers our
+    hook; 'tampered' = at least one hooks.json exists and every one we could
+    read registers something else.
+
+    A hooks.json we could not read or parse is evidence of nothing, so it
+    returns None rather than 'tampered' — None omits install_state from the
+    report and leaves the stored state alone, where guessing reported a healthy
+    install as compromised on every single run. The python MDM detector draws
+    this same line for the same reason.
+    """
     saw_json = False
     saw_known_ref = False
+    indeterminate = False
     try:
         for _username, home_dir in user_homes:
-            p = home_dir / ".codex" / "hooks.json"
-            if p.exists():
-                saw_json = True
-                try:
-                    text = p.read_text(encoding="utf-8")
-                    if str(HOOK_BINARY) in text or "unbound.py" in text:
-                        saw_known_ref = True
-                except OSError:
-                    pass
+            hooks_path = home_dir / ".codex" / "hooks.json"
+            if not hooks_path.exists():
+                continue
+            saw_json = True
+            registered = _codex_hook_registered(
+                hooks_path, home_dir / ".codex" / "hooks" / "unbound.py")
+            if registered is None:
+                indeterminate = True
+            elif registered:
+                saw_known_ref = True
+        # Positive evidence wins: one profile registering our hook means the
+        # install is in place, whatever another profile's file looked like.
+        if saw_known_ref:
+            return "persisted"
+        if indeterminate:
+            return None
         if not saw_json:
             return "fresh"
-        return "persisted" if saw_known_ref else "tampered"
+        return "tampered"
     except Exception as e:
         print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
         return None
