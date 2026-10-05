@@ -1036,8 +1036,14 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             for item in blocks:
                 if not isinstance(item, dict):
                     continue
+                item_hooks = item.get("hooks")
+                if not isinstance(item_hooks, list):
+                    # .get's default only covers a missing key, so a scalar
+                    # would be iterated here and raise before the isinstance
+                    # filter below ever runs.
+                    continue
                 if any(_hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
-                       for hook in item.get("hooks", []) if isinstance(hook, dict)):
+                       for hook in item_hooks if isinstance(hook, dict)):
                     metadata = item.get("metadata")
                     if not isinstance(metadata, dict):
                         metadata = {}

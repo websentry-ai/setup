@@ -342,21 +342,80 @@ def test_augment_mdm_matcher_rejects_a_non_string(augment_mdm, command):
             command, "cmd", Path("/tmp/unbound.py"), is_windows) is False
 
 
-def test_the_augment_managed_writes_survive_a_scalar_hooks_value(tmp_path,
-                                                                 monkeypatch):
-    """Both augment managed writers scanned `item.get("hooks", [])` and the
-    metadata pass did it again, so a scalar aborted the write and the
-    registration never persisted."""
-    settings = {"hooks": {"PreToolUse": [
-        {"matcher": "foreign", "hooks": 1},
-        {"matcher": "*", "hooks": [{"type": "command", "command": "/x"}]},
-    ]}}
-    # The scan in the binary's managed writer, exercised directly on the shape.
-    blocks = settings["hooks"]["PreToolUse"]
-    our_command = "/our/hook"
-    found = any(
-        isinstance(hook, dict) and hook.get("command", "") == our_command
+def test_the_augment_mdm_install_survives_a_scalar_hooks_value(augment_mdm,
+                                                               tmp_path,
+                                                               monkeypatch):
+    """Calls the real writer, not a copy of its generator.
+
+    The previous version of this test rebuilt the guarded comprehension in the
+    test body, so it passed while setup_managed_hooks still aborted on the very
+    shape it was meant to cover.
+    """
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    settings = managed / "settings.json"
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "foreign", "hooks": 1},   # the shape that aborted the write
+    ]}}))
+
+    def fake_download(url, path):
+        # A real download leaves the file there; the writer checks for it.
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text("# hook\n")
+        return True
+
+    monkeypatch.setattr(augment_mdm, "get_managed_settings_dir", lambda: managed)
+    monkeypatch.setattr(augment_mdm, "download_file", fake_download)
+    monkeypatch.setattr(augment_mdm, "rewrite_gateway_url_in_file",
+                        lambda *a, **k: None)
+
+    assert augment_mdm.setup_managed_hooks() is True
+
+    after = json.loads(settings.read_text())
+    blocks = after["hooks"]["PreToolUse"]
+    assert {"matcher": "foreign", "hooks": 1} in blocks, "foreign item dropped"
+    registered = [
+        h.get("command")
         for item in blocks if isinstance(item, dict)
-        for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
-    )
-    assert found is False, "the scan must complete and simply not match"
+        for h in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+        if isinstance(h, dict)
+    ]
+    assert registered, "our hook was never registered"
+
+
+@pytest.mark.parametrize("module_path,name", [
+    ("claude-code/hooks/setup.py", "t_claude_user_strip"),
+    ("augment/hooks/setup.py", "t_augment_user_strip"),
+])
+def test_the_user_level_strips_survive_bad_shapes(tmp_path, monkeypatch,
+                                                  module_path, name):
+    """Both strips iterated the event value and called .get on every element,
+    so a malformed entry aborted the clean and left our hook behind."""
+    module = _load(name, module_path)
+    tool_dir = ".claude" if "claude" in module_path else ".augment"
+    (tmp_path / tool_dir).mkdir()
+    settings_path = tmp_path / tool_dir / "settings.json"
+    script = tmp_path / tool_dir / "hooks" / "unbound.py"
+    settings_path.write_text(json.dumps({"hooks": {
+        "PreToolUse": 1,                                   # non-list event
+        "Stop": [
+            "a-bare-string",                                # non-dict item
+            {"hooks": 1},                                   # scalar hooks
+            {"hooks": [{"command": str(script)}]},          # ours
+            {"hooks": [{"command": "/usr/local/bin/keep-me"}]},
+        ],
+    }}))
+    monkeypatch.setattr(module.Path, "home", staticmethod(lambda: tmp_path))
+
+    status = module.remove_hooks_from_settings()
+
+    after = json.loads(settings_path.read_text())
+    commands = [
+        h.get("command")
+        for item in after.get("hooks", {}).get("Stop", []) if isinstance(item, dict)
+        for h in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+        if isinstance(h, dict)
+    ]
+    assert status in ("cleared", "not_found"), status
+    assert str(script) not in commands, "our hook survived the strip"
+    assert "/usr/local/bin/keep-me" in commands, "a foreign hook was dropped"

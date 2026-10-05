@@ -626,9 +626,11 @@ def remove_hooks_from_settings() -> str:
                     continue
                 new_config = []
                 for item in event_config:
-                    if isinstance(item, dict):
-                        hooks = item.get("hooks", [])
-                        new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                    if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                        hooks = item["hooks"]
+                        new_hooks = [h for h in hooks
+                                     if not isinstance(h, dict)
+                                     or not _is_unbound(h.get("command", ""))]
                         removed_ours = new_hooks != hooks
                         if removed_ours:
                             modified = True
