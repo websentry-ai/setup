@@ -124,20 +124,53 @@ def test_a_non_string_command_does_not_blank_the_device(tmp_path, detect):
         assert detect([("u", home)]) == "tampered", bad
 
 
-def test_a_refused_hooks_json_is_undetermined(tmp_path, detect):
-    """A file we were refused says nothing either way, so install_state is
-    omitted and the stored value is left alone.
+def test_a_symlinked_hooks_json_is_tampered(tmp_path, detect):
+    """A symlink there is interference, not absent evidence.
 
-    Uses a symlink rather than chmod 000: the loader refuses symlinks whatever
-    the euid, and MDM setup runs as root, where a 0o000 file is still readable.
+    Setup only ever writes a regular file and the merge will not write through
+    a link, so a link left in place means nothing we control is enforcing.
+    Calling it undetermined would omit install_state and leave a device sitting
+    on a stale `persisted` while the hook was switched off.
     """
     home = _profile(tmp_path)
     _wrapper(home)
-    real = home / ".codex" / "real-hooks.json"
-    _register(home, str(home / ".codex" / "hooks" / "unbound.py"))
-    (home / ".codex" / "hooks.json").rename(real)
+    real = home / ".codex" / "elsewhere.json"
+    real.write_text(json.dumps({"hooks": {}}))
     (home / ".codex" / "hooks.json").symlink_to(real)
+    assert detect([("u", home)]) == "tampered"
+
+
+def test_a_genuinely_refused_file_is_undetermined(codex_module, detect, tmp_path,
+                                                  monkeypatch):
+    """A real permission failure says nothing either way, so install_state is
+    omitted and the stored value is left alone.
+
+    Forced rather than chmod 000: MDM setup runs as root, and root reads a
+    0o000 file, so a mode-based test would skip itself exactly where the
+    behaviour matters.
+    """
+    home = _profile(tmp_path)
+    _register(home, str(_wrapper(home)))
+    real_open = os.open
+
+    def refuse(path, *a, **kw):
+        if str(path).endswith("hooks.json"):
+            raise PermissionError(13, "refused")
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(codex_module.os, "open", refuse)
     assert detect([("u", home)]) is None
+
+
+def test_a_pre_wrapper_binary_registration_is_persisted(tmp_path, detect):
+    """Machines set up before the wrapper existed register the hook binary
+    directly. There is no per-user script to pair with and the hook still runs,
+    so requiring one would report them tampered forever."""
+    home = _profile(tmp_path)
+    from unbound_hook._resources import HOOK_BINARY
+    _register(home, f'"{HOOK_BINARY}" hook codex PreToolUse')
+    assert not (home / ".codex" / "hooks" / "unbound.py").exists()
+    assert detect([("u", home)]) == "persisted"
 
 
 def test_one_unenforced_profile_is_not_hidden_by_a_healthy_one(tmp_path, detect):
