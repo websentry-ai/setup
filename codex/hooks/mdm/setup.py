@@ -1099,7 +1099,10 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     install prefix and the binary name, so a foreign hook in a shared/Enterprise
     config that merely references some other unbound.py / mentions /opt/unbound/
     isn't stripped."""
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
+        # A non-string command is not ours, and must not raise: the membership
+        # tests below throw on an int or bool, and the caller turns that into
+        # "no answer" for every profile on the device.
         return False
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 

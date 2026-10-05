@@ -116,6 +116,13 @@ def test_a_non_string_command_does_not_blank_the_device(tmp_path, detect):
         {"matcher": "*", "hooks": [{"type": "command", "command": ["/x"]}]}]}}))
     assert detect([("u", home)]) == "tampered"
 
+    # An int or bool is the shape that actually raises in the matcher; a list
+    # happens to survive membership, so it does not cover this.
+    for bad in (1, True, 3.5, {}):
+        (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [{"type": "command", "command": bad}]}]}}))
+        assert detect([("u", home)]) == "tampered", bad
+
 
 def test_a_refused_hooks_json_is_undetermined(tmp_path, detect):
     """A file we were refused says nothing either way, so install_state is
