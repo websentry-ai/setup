@@ -1531,7 +1531,11 @@ def _unbound_hook_registered(hooks_path, script_path):
         for item in entries if isinstance(entries, list) else []:
             if not isinstance(item, dict):
                 continue
-            for hook in item.get('hooks') or []:
+            hooks = item.get('hooks')
+            # Shape-guard before iterating: a scalar here is truthy, so
+            # `or []` would iterate an int and abort detection for every
+            # profile on the device, not just this one.
+            for hook in hooks if isinstance(hooks, list) else []:
                 if isinstance(hook, dict) and _is_unbound_hook_command(
                         hook.get('command', ''), script_path):
                     return True

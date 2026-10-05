@@ -690,7 +690,12 @@ def _setup_codex(opts):
     # setup. No managed write and no user-level strip (the install IS the user
     # registration).
     user_homes = m.get_all_user_homes()
-    state = _codex_detect_state(user_homes)
+    # The vendored MDM module owns this: it pairs the hook script with the
+    # registration, reads hooks.json through a loader that refuses symlinks and
+    # non-regular files, and tells a file it was refused (undetermined) apart
+    # from one it read and found no hook in (not registered). A second
+    # implementation here drifted from all three.
+    state = m.detect_install_state()
     installed = 0
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -711,94 +716,6 @@ def _setup_codex(opts):
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
-
-
-def _codex_hook_registered(hooks_path: Path, wrapper: Path):
-    """True when OUR hook is registered for this user, False when it is not,
-    None only when we could not read the file at all.
-
-    The two failure modes are different evidence. A file we were refused is
-    evidence of nothing. A file we read that codex cannot load hooks from —
-    empty, truncated, not JSON — means the hook is not active for this user,
-    which is what 'not registered' means, so it must not read as undetermined:
-    emptying the file is otherwise a silent way to switch the hook off.
-
-    Ownership uses _command_targets_hook, the rule the install merges by and the
-    uninstall strips by, so registration, removal and detection cannot disagree
-    about what is ours. HOOK_BINARY counts too, for machines registered before
-    the wrapper existed.
-    """
-    try:
-        raw = hooks_path.read_bytes()
-    except OSError:
-        return None
-    try:
-        config = json.loads(raw.decode("utf-8"))
-    except ValueError:
-        # UnicodeDecodeError is a ValueError. Either way codex gets no hooks.
-        return False
-    events = config.get("hooks") if isinstance(config, dict) else None
-    if not isinstance(events, dict):
-        return False
-    for entries in events.values():
-        for item in entries if isinstance(entries, list) else []:
-            if not isinstance(item, dict):
-                continue
-            for hook in item.get("hooks") or []:
-                if not isinstance(hook, dict):
-                    continue
-                cmd = hook.get("command", "")
-                if _command_targets_hook(cmd, wrapper) or _command_targets_hook(cmd, HOOK_BINARY):
-                    return True
-    return False
-
-
-def _codex_detect_state(user_homes):
-    """Per-user analog of the python detect_install_state(): now that codex
-    registers in ~/.codex/hooks.json, install state is read from there.
-
-    'fresh' = no user has a hooks.json; 'persisted' = at least one registers our
-    hook; 'tampered' = at least one exists and none of the ones we could read
-    registers it; None = every hooks.json present was unreadable.
-
-    None omits install_state from the report, leaving the stored state alone,
-    because a file we were refused says nothing about whether the hook is
-    there. Reporting it as tampered instead makes a healthy install look
-    compromised on every run.
-
-    One profile that registers our hook outranks a sibling we were refused: it
-    is proof the install is in place, where the refusal is proof of nothing.
-    The python MDM detector ranks these the other way, letting any refusal win,
-    which keeps a device silent on the strength of one unreadable profile.
-    """
-    saw_json = False
-    saw_known_ref = False
-    saw_readable = False
-    try:
-        for _username, home_dir in user_homes:
-            hooks_path = home_dir / ".codex" / "hooks.json"
-            if not hooks_path.exists():
-                continue
-            saw_json = True
-            registered = _codex_hook_registered(
-                hooks_path, home_dir / ".codex" / "hooks" / "unbound.py")
-            if registered is None:
-                continue  # refused: evidence of nothing either way
-            saw_readable = True
-            if registered:
-                saw_known_ref = True
-        # Positive evidence wins: one profile registering our hook means the
-        # install is in place, whatever another profile's file looked like.
-        if saw_known_ref:
-            return "persisted"
-        if not saw_json:
-            return "fresh"
-        # A negative has to rest on a file we actually read. If every one was
-        # refused, the answer is unknown rather than tampered.
-        return "tampered" if saw_readable else None
-    except Exception as e:
-        print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
-        return None
 
 
 def _setup_cursor(opts):

@@ -1,143 +1,154 @@
-"""Codex install-state detection, for the binary install path.
+"""Codex install state as the binary setup reports it.
 
-The state this reports is what the backend stores and what the dashboard shows
-as Tampered. Guessing it wrong is not cosmetic: a wrong 'tampered' makes setup
-reassert the hook on every run, and each rewrite touches ~/.codex, which moves
-the config-dir age we use to tell an inert installer footprint from a tool in
-real use.
+The state here is what the backend stores and the dashboard shows as Tampered,
+so a wrong answer is not cosmetic: 719 of 720 Salesloft users sat at `tampered`
+with a lifetime count of 41,846 because a detector guessed.
 
-The case that matters most here is a hooks.json we cannot read. Our hook may
-well be registered in it, so the only honest answer is "no evidence" — None,
-which omits install_state from the report and leaves the stored state alone.
+The binary delegates to the vendored MDM module rather than carrying its own
+copy. These tests pin the behaviour through the binary's own module handle, so
+a future second implementation has to pass them before it can ship.
+
+Two cases carry the weight. A hooks.json we were refused is evidence of
+nothing, and reporting it as tampered made a healthy install look compromised
+on every run. A hooks.json we read that codex cannot load hooks from means the
+hook is not active, so it stays tampered — emptying the file is otherwise a
+silent way to switch the hook off.
 """
 
 from __future__ import annotations
 
 import json
 import os
-import stat
 
 import pytest
 
 from unbound_hook import setup_cmd
-from unbound_hook._resources import HOOK_BINARY
 
 
-def _profile(root, username="u"):
-    home = root / username
+@pytest.fixture
+def codex_module():
+    return setup_cmd._module("codex")
+
+
+@pytest.fixture
+def detect(codex_module, monkeypatch):
+    """Run the shipped detector over exactly the profiles a test builds."""
+    def _detect(homes):
+        monkeypatch.setattr(codex_module, "get_all_user_homes", lambda: homes)
+        return codex_module.detect_install_state()
+    return _detect
+
+
+def _profile(root, name="u"):
+    home = root / name
     (home / ".codex" / "hooks").mkdir(parents=True)
     return home
 
 
-def _install(home, command=None):
-    """Write what a healthy install leaves: the wrapper plus a hooks.json
-    registering it."""
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    wrapper.write_text(setup_cmd._codex_wrapper_source())
-    command = command if command is not None else str(wrapper)
+def _wrapper(home):
+    path = home / ".codex" / "hooks" / "unbound.py"
+    path.write_text(setup_cmd._codex_wrapper_source())
+    return path
+
+
+def _register(home, command):
     (home / ".codex" / "hooks.json").write_text(
-        json.dumps({"hooks": setup_cmd._codex_hooks_config(command)})
-    )
-    return wrapper
+        json.dumps({"hooks": setup_cmd._codex_hooks_config(command)}))
 
 
-def test_healthy_install_is_persisted(tmp_path):
+def test_healthy_install_is_persisted(tmp_path, detect):
     home = _profile(tmp_path)
-    _install(home)
-    assert setup_cmd._codex_detect_state([("u", home)]) == "persisted"
+    _register(home, str(_wrapper(home)))
+    assert detect([("u", home)]) == "persisted"
 
 
-def test_no_hooks_json_anywhere_is_fresh(tmp_path):
+def test_a_home_with_a_space_is_still_persisted(tmp_path, detect):
+    """/Users/Jane Doe is a real fleet shape. The registered command is the bare
+    wrapper path, so a check that tokenises it splits at the space and calls an
+    installer-written registration tampered on every run."""
+    home = _profile(tmp_path, "Jane Doe")
+    _register(home, str(_wrapper(home)))
+    assert detect([("Jane Doe", home)]) == "persisted"
+
+
+def test_a_malformed_nested_shape_does_not_blank_the_device(tmp_path, detect):
+    """{"hooks": 1} where a list belongs must come back tampered, not abort
+    detection for every profile on the device."""
     home = _profile(tmp_path)
-    assert setup_cmd._codex_detect_state([("u", home)]) == "fresh"
+    _wrapper(home)
+    (home / ".codex" / "hooks.json").write_text('{"hooks": {"PreToolUse": [{"hooks": 1}]}}')
+    assert detect([("u", home)]) == "tampered"
 
 
-def test_only_a_foreign_hook_is_tampered(tmp_path):
-    home = _profile(tmp_path)
-    (home / ".codex" / "hooks.json").write_text(json.dumps({
-        "hooks": {"PreToolUse": [
-            {"matcher": "*", "hooks": [
-                {"type": "command", "command": "/usr/local/bin/someone-else"}]}]}
-    }))
-    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
+def test_nothing_installed_is_fresh(tmp_path, detect):
+    assert detect([("u", _profile(tmp_path))]) == "fresh"
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can read a 0o000 file")
-def test_unreadable_hooks_json_is_undetermined_not_tampered(tmp_path):
-    """The regression: our hook IS registered, we just cannot read the file.
+def test_each_half_without_the_other_is_tampered(tmp_path, detect):
+    """Either artifact alone leaves codex unenforced for that user."""
+    only_script = _profile(tmp_path, "only_script")
+    _wrapper(only_script)
+    assert detect([("only_script", only_script)]) == "tampered"
 
-    Reporting 'tampered' here told the backend a healthy install was
-    compromised on every run, and setup then rewrote the hook each time.
+    only_entry = _profile(tmp_path, "only_entry")
+    _register(only_entry, str(only_entry / ".codex" / "hooks" / "unbound.py"))
+    assert detect([("only_entry", only_entry)]) == "tampered"
+
+
+def test_emptied_hooks_json_stays_tampered(tmp_path, detect):
+    """The bypass guard: emptying the file must not read as undetermined.
+
+    We can read it, and codex gets no hooks from it, so the hook is not active.
     """
     home = _profile(tmp_path)
-    hooks_path = home / ".codex" / "hooks.json"
-    _install(home)
-    os.chmod(hooks_path, 0o000)
-    try:
-        assert setup_cmd._codex_detect_state([("u", home)]) is None
-    finally:
-        os.chmod(hooks_path, stat.S_IRUSR | stat.S_IWUSR)
+    _wrapper(home)
+    for content in ("", '{"hooks": {"PreToolUse": ['):
+        (home / ".codex" / "hooks.json").write_text(content)
+        assert detect([("u", home)]) == "tampered", content
 
 
-def test_emptied_or_truncated_hooks_json_is_tampered(tmp_path):
-    """Emptying the file is a way to switch the hook off, so it must not read as
-    undetermined. We read it, codex gets no hooks from it, so the hook is not
-    active for this user — that is tampered, not unknown."""
+def test_a_non_string_command_does_not_blank_the_device(tmp_path, detect):
+    """A list where a command string belongs must not crash the detector into
+    reporting nothing for the whole device."""
     home = _profile(tmp_path)
-    hooks_path = home / ".codex" / "hooks.json"
-
-    hooks_path.write_text("")
-    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
-
-    hooks_path.write_text('{"hooks": {"PreToolUse": [')
-    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
-
-    hooks_path.write_bytes(b"\x00\x81\xfe")  # not even decodable
-    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
+    _wrapper(home)
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "*", "hooks": [{"type": "command", "command": ["/x"]}]}]}}))
+    assert detect([("u", home)]) == "tampered"
 
 
-def test_a_readable_profile_decides_even_when_another_is_refused(tmp_path):
-    """A negative rests on a file we read. One refused sibling must not turn a
-    real negative into unknown, or corrupting one profile would mask the rest."""
-    seen = _profile(tmp_path, "seen")
-    (seen / ".codex" / "hooks.json").write_text("")
-    refused = _profile(tmp_path, "refused")
-    refused_path = refused / ".codex" / "hooks.json"
-    _install(refused)
-    os.chmod(refused_path, 0o000)
-    try:
-        expected = "tampered" if os.geteuid() != 0 else "persisted"
-        assert setup_cmd._codex_detect_state(
-            [("seen", seen), ("refused", refused)]) == expected
-    finally:
-        os.chmod(refused_path, stat.S_IRUSR | stat.S_IWUSR)
+def test_a_refused_hooks_json_is_undetermined(tmp_path, detect):
+    """A file we were refused says nothing either way, so install_state is
+    omitted and the stored value is left alone.
 
-
-def test_hook_registered_against_the_binary_still_counts(tmp_path):
-    """Machines set up before the wrapper existed registered HOOK_BINARY
-    directly. They are installed, and must not read as tampered."""
+    Uses a symlink rather than chmod 000: the loader refuses symlinks whatever
+    the euid, and MDM setup runs as root, where a 0o000 file is still readable.
+    """
     home = _profile(tmp_path)
-    _install(home, command=str(HOOK_BINARY))
-    assert setup_cmd._codex_detect_state([("u", home)]) == "persisted"
+    _wrapper(home)
+    real = home / ".codex" / "real-hooks.json"
+    _register(home, str(home / ".codex" / "hooks" / "unbound.py"))
+    (home / ".codex" / "hooks.json").rename(real)
+    (home / ".codex" / "hooks.json").symlink_to(real)
+    assert detect([("u", home)]) is None
 
 
-def test_one_installed_profile_outweighs_an_unreadable_sibling(tmp_path):
-    """Positive evidence wins: a profile that registers our hook means the
-    install is in place, whatever another profile's file looked like."""
+def test_one_unenforced_profile_is_not_hidden_by_a_healthy_one(tmp_path, detect):
+    """A device where one user is unenforced is tampered, however healthy
+    another user looks — otherwise the dashboard calls it clean."""
     good = _profile(tmp_path, "good")
-    _install(good)
-    other = _profile(tmp_path, "other")
-    (other / ".codex" / "hooks.json").write_text("")
-    assert setup_cmd._codex_detect_state(
-        [("good", good), ("other", other)]) == "persisted"
+    _register(good, str(_wrapper(good)))
+    bad = _profile(tmp_path, "bad")
+    _wrapper(bad)  # script, never registered
+    assert detect([("good", good), ("bad", bad)]) == "tampered"
 
 
-def test_detection_uses_the_same_ownership_rule_as_the_merge(tmp_path):
-    """Registration, removal and detection must agree on what is ours, so a
-    command the merge treats as ours is never read as someone else's."""
-    home = _profile(tmp_path)
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    for command in (str(wrapper), f'"{wrapper}"', f'python3 "{wrapper}"'):
-        _install(home, command=command)
-        assert setup_cmd._command_targets_hook(command, wrapper), command
-        assert setup_cmd._codex_detect_state([("u", home)]) == "persisted", command
+def test_the_binary_does_not_carry_its_own_detector(tmp_path):
+    """The drift this suite exists to prevent: two implementations of the same
+    question, disagreeing on unreadable files, non-string commands and whether
+    the script has to be there at all."""
+    source = (setup_cmd.__file__ or "")
+    assert source, "setup_cmd has no file to inspect"
+    text = open(source, encoding="utf-8").read()
+    assert "def _codex_detect_state" not in text
+    assert "def _codex_hook_registered" not in text
