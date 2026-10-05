@@ -67,6 +67,23 @@ ENV_API_KEY = "UNBOUND_OPENCODE_API_KEY"
 # marker says this installer created it.
 INSTALLED_NAMES = (PLUGIN_NAME, SIDECAR_NAME)
 
+# Older or hand-placed copies of Unbound's plugin that opencode would load BESIDE ours:
+# it globs `*.{js,ts}` in both `plugins/` and the legacy `plugin/` directory. Relative to
+# the config dir. Only files recognised as Unbound's bundle are ever removed.
+STRAY_RELPATHS = (("plugin", "unbound.js"), ("plugins", "unbound.ts"), ("plugin", "unbound.ts"))
+UNBOUND_BUNDLE_MARKER = b"unbound-hooks-ts"
+BANNER_SCAN_BYTES = 4096
+
+# The file extensions opencode loads as plugins from `plugins/`.
+PLUGIN_SUFFIXES = (".js", ".ts")
+
+# The opencode config files a stale `plugin` entry could live in. Read, never written.
+OPENCODE_CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
+MAX_CONFIG_SCAN_BYTES = 1024 * 1024
+
+# Shown in the closing notes until the v2 plugin line enforces (Phase 14).
+V2_STATUS_NOTE = "OpenCode 2.x: the plugin loads but does not block yet."
+
 # Marks a publish-by-rename temp. The full name adds a pid and random bytes -- see
 # _unique_tmp_path -- so two concurrent writers can never share one temp file.
 TMP_MARKER = ".unbound-tmp"
@@ -337,6 +354,167 @@ def detect_install_state(path) -> str:
         return "fresh"
 
 
+def _is_unbound_bundle(path) -> bool:
+    """True for a REGULAR file (lstat, never following a link) whose first 4 KiB carry the
+    `unbound-hooks-ts` build banner. Anything we cannot read is not recognised."""
+    try:
+        st = os.lstat(str(path))
+        if not stat.S_ISREG(st.st_mode):
+            return False
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as f:
+            head = f.read(BANNER_SCAN_BYTES)
+        return UNBOUND_BUNDLE_MARKER in head
+    except OSError:
+        return False
+
+
+def remove_stray_copies(config_dir) -> bool:
+    """Delete Unbound copies opencode would load beside ours. True when none remains.
+
+    For `plugin/unbound.js`, `plugins/unbound.ts` and `plugin/unbound.ts`: a regular file
+    carrying Unbound's build banner is deleted and reported; a symlink is never followed or
+    removed; any other file is left byte-identical with a warning that opencode will load
+    it too. Our own `plugins/unbound.js` is not a stray, and no other name is ever touched.
+    """
+    base = Path(config_dir)
+    clean = True
+    for parts in STRAY_RELPATHS:
+        path = base.joinpath(*parts)
+        rel = "/".join(parts)
+        try:
+            st = os.lstat(str(path))
+        except OSError:
+            continue
+        if stat.S_ISLNK(st.st_mode):
+            print(f"⚠️  {path} is a symlink; left in place. If it points at a copy of the")
+            print("   Unbound plugin, opencode loads it as well as ours -- remove it by hand.")
+            continue
+        if _is_unbound_bundle(path):
+            try:
+                os.unlink(str(path))
+                print(f"🧹 Removed a stray Unbound copy at {rel} (opencode would load it twice).")
+            except OSError as e:
+                clean = False
+                print(f"⚠️  Could not remove the stray Unbound copy {path}: {e}")
+                print("   opencode will load it beside the new plugin; remove it by hand.")
+            continue
+        print(f"⚠️  {path} was left in place: it is not recognisably Unbound's,")
+        print("   and opencode will load it beside the Unbound plugin.")
+    return clean
+
+
+def _other_plugin_files(pdir) -> list:
+    """Every *.js / *.ts in plugins/ other than ours -- what opencode would also load."""
+    try:
+        names = os.listdir(str(pdir))
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n != PLUGIN_NAME and n.endswith(PLUGIN_SUFFIXES))
+
+
+def ensure_esm_marker(config_dir) -> str:
+    """Create `plugins/package.json` = {"type":"module"} when, and only when, it is safe.
+
+    Spike V1-4: under plain Node (not Bun) the ESM bundle fails to import when the nearest
+    package.json says commonjs; a nested {"type":"module"} in plugins/ fixes it. So:
+      * an existing plugins/package.json is never created over or modified;
+      * if plugins/ holds any other *.js / *.ts, nothing is created (a module-type flip
+        could break someone else's plugin) and a note is printed;
+      * otherwise it is created, and recorded in `.unbound-installed.json` FIRST, so
+        --clear can remove exactly what this installer created.
+    Returns "exists" | "skipped" | "created" | "failed". Never raises.
+    """
+    pdir = plugin_dir(config_dir)
+    pkg = pdir / "package.json"
+    if os.path.lexists(str(pkg)):
+        return "exists"
+    others = _other_plugin_files(pdir)
+    if others:
+        print(f"ℹ️  Not creating {pkg}: other plugins live there ({', '.join(others[:3])}).")
+        print('   If opencode runs on plain Node under a "type":"commonjs" package.json and the')
+        print('   plugin fails to load, add {"type":"module"} there yourself.')
+        return "skipped"
+    try:
+        pdir.mkdir(mode=0o755, parents=True, exist_ok=True)
+    except OSError as e:
+        debug_print(f"Could not create {pdir}: {e}")
+        return "failed"
+    created = _read_marker(config_dir)
+    if "package.json" not in created:
+        created.append("package.json")
+    if not atomic_write_text(marker_path(config_dir), json.dumps({"created": created}) + "\n",
+                             0o644, follow_symlink=False):
+        debug_print("Could not write the install marker; not creating package.json")
+        return "failed"
+    try:
+        # O_EXCL: if a package.json appeared since the check, it is not ours to replace.
+        fd = os.open(str(pkg), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(ESM_PACKAGE_JSON) + "\n")
+        return "created"
+    except OSError as e:
+        debug_print(f"Could not create {pkg}: {e}")
+        created.remove("package.json")
+        if created:
+            atomic_write_text(marker_path(config_dir), json.dumps({"created": created}) + "\n",
+                              0o644, follow_symlink=False)
+        else:
+            _clear_path(marker_path(config_dir), "install marker")
+        return "failed"
+
+
+def _plugin_entry_mentions_unbound(text: str) -> bool:
+    """Does a `"plugin"` key's value (array or string) mention unbound? Text scan only:
+    the file is JSONC (comments, trailing commas) and is never parsed-and-rewritten."""
+    idx = 0
+    while True:
+        idx = text.find('"plugin"', idx)
+        if idx < 0:
+            return False
+        rest = text[idx + len('"plugin"'):].lstrip()
+        idx += 1
+        if not rest.startswith(":"):
+            continue
+        value = rest[1:].lstrip()
+        if value.startswith("["):
+            end = value.find("]")
+            chunk = value[:end] if end >= 0 else value
+        elif value.startswith('"'):
+            end = value.find('"', 1)
+            chunk = value[:end] if end >= 0 else value
+        else:
+            continue
+        if "unbound" in chunk.lower():
+            return True
+
+
+def warn_on_config_plugin_entries(config_dir) -> list:
+    """Warn about a `plugin` entry naming unbound in opencode.json[c]. Read-only.
+
+    Such an entry loads a second copy beside `plugins/unbound.js`. The installer writes no
+    opencode config file, so it says so and leaves the edit to the user. Returns the paths
+    warned about.
+    """
+    warned = []
+    for name in OPENCODE_CONFIG_NAMES:
+        path = Path(config_dir) / name
+        try:
+            if not path.is_file():
+                continue
+            with open(path, "rb") as f:
+                text = f.read(MAX_CONFIG_SCAN_BYTES).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        if _plugin_entry_mentions_unbound(text):
+            warned.append(path)
+            print(f"⚠️  {path} has a \"plugin\" entry mentioning unbound. opencode would load")
+            print("   Unbound twice (that entry and plugins/unbound.js). This installer never")
+            print("   edits opencode config files; remove that entry by hand.")
+    return warned
+
+
 def _publish_bytes(target: Path, payload: bytes, mode: int = 0o644) -> bool:
     """Sibling temp + fsync + chmod + os.replace. Never truncates the target in place."""
     tmp = _unique_tmp_path(target)
@@ -418,6 +596,13 @@ def install_plugin(config_dir) -> Optional[str]:
         except OSError as e:
             print(f"❌ Could not create {pdir}: {e}")
             return None
+
+        # Order (chosen): only after verification passed, clean up strays and settle the
+        # ESM package.json BEFORE publishing ours, so a refused download touches nothing,
+        # and "other plugin files" is judged without our new file in the way. A stray that
+        # cannot be removed only warns: a double load is noisy, but ours still enforces.
+        remove_stray_copies(config_dir)
+        ensure_esm_marker(config_dir)
 
         payload = staged.read_bytes()
         if not _publish_bytes(target, payload, 0o644):
@@ -875,11 +1060,35 @@ def main() -> bool:
         print("⚠️  Could not report this install to the backend. Install-state reporting is")
         print("   best-effort; the plugin is installed and enforces regardless.")
 
+    warn_on_config_plugin_entries(config_dir)
+
     print("=" * 60)
     print("✅ Setup complete")
-    print("   Restart opencode (quit and relaunch the OpenCode desktop app) to load the plugin.")
+    print_closing_notes(config_dir, os.environ)
     print("=" * 60)
     return True
+
+
+def print_closing_notes(config_dir, env) -> None:
+    """Restart, remote-server, relocation, honest-scope, v2 and proxy notes."""
+    print("   Restart opencode (quit and relaunch the OpenCode desktop app) to load the plugin.")
+    print("   If you use `opencode serve`, `opencode attach` or the desktop app's background")
+    print("   service on another machine, run this setup on the machine where the server runs.")
+    override = _absolute_or_none(_expand_tilde(env.get(ENV_OPENCODE_CONFIG_DIR), str(Path.home())))
+    if override is not None:
+        print(f"   The plugin went to OPENCODE_CONFIG_DIR={override}. opencode must see the")
+        print("   same OPENCODE_CONFIG_DIR at run time, or it will not load the plugin.")
+    elif _absolute_or_none(env.get(ENV_XDG_CONFIG_HOME)) is not None:
+        print(f"   The plugin went under XDG_CONFIG_HOME ({config_dir}). opencode must see the")
+        print("   same XDG_CONFIG_HOME at run time, or it will not load the plugin.")
+    print("   Not tamper-proof: `opencode --pure`, OPENCODE_PURE=1, or pointing")
+    print("   XDG_CONFIG_HOME / OPENCODE_CONFIG_DIR elsewhere starts opencode without it.")
+    print(f"   {V2_STATUS_NOTE}")
+    proxy = env.get("HTTPS_PROXY") or env.get("https_proxy")
+    if proxy:
+        print("   HTTPS_PROXY is set: the plugin calls Unbound through opencode's own runtime")
+        print("   fetch, so a corporate proxy CA must be trusted by that runtime (for example")
+        print("   NODE_EXTRA_CA_CERTS), not only by your shell tools.")
 
 
 if __name__ == "__main__":
