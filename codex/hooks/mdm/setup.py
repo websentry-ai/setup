@@ -670,7 +670,10 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
-    if not command:
+    if not isinstance(command, str) or not command:
+        # A non-string command is not ours, and must not raise: the membership
+        # test and shlex below throw on an int, bool or list, and the callers
+        # turn that into an aborted strip or a device-wide "no answer".
         return False
     # Binary install: command invokes the /opt/unbound hook binary (require both
     # the prefix and the binary name so a foreign hook merely mentioning the path

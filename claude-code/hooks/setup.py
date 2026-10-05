@@ -500,7 +500,10 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, config_dir: Path = None)
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
-    if not command:
+    if not isinstance(command, str) or not command:
+        # A non-string command is not ours, and must not raise: the membership
+        # test and shlex below throw on an int, bool or list, and the callers
+        # turn that into an aborted strip or a device-wide "no answer".
         return False
     try:
         # posix=False on Windows: shlex still groups a quoted argument, so a home

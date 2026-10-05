@@ -1030,7 +1030,10 @@ def clear_managed_hooks() -> bool:
                             if not isinstance(group, dict):
                                 kept_groups.append(group)
                                 continue
-                            entries = group.get("hooks") or []
+                            entries = group.get("hooks")
+                            # Shape-guard: a truthy scalar here would be
+                            # iterated and raise, aborting the whole strip.
+                            entries = entries if isinstance(entries, list) else []
                             kept = [h for h in entries
                                     if str(h.get("command", "")).find(str(script_path)) == -1]
                             if kept != entries:
