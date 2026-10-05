@@ -643,10 +643,7 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
             settings["hooks"] = {}
         
         for event, new_config in hooks_config.items():
-            # A foreign non-list hooks[event] is left untouched — never clobber
-            # an org's own config in the shared settings file — and extending it
-            # raises.
-            if event in settings["hooks"] and isinstance(settings["hooks"][event], list):
+            if event in settings["hooks"]:
                 existing_config = settings["hooks"][event]
                 
                 our_hook_exists = False
@@ -666,7 +663,7 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)
-            elif event not in settings["hooks"]:
+            else:
                 settings["hooks"][event] = new_config
         
         with open(settings_path, 'w', encoding='utf-8') as f:

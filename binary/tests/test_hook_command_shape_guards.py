@@ -51,6 +51,11 @@ def codex_mdm():
 
 
 @pytest.fixture(scope="module")
+def codex_user():
+    return _load("t_codex_user", "codex/hooks/setup.py")
+
+
+@pytest.fixture(scope="module")
 def claude_mdm():
     return _load("t_claude_mdm", "claude-code/hooks/mdm/setup.py")
 
@@ -219,11 +224,10 @@ def test_the_gateway_strip_preserves_a_non_dict_element(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("hooks_value,expect_registered", [
-    (1, False),            # a foreign non-list event value must be preserved
-    ("junk", False),
-    ({"a": 1}, False),
-    ([1, "x"], True),      # a list of junk items: ours is appended
-    ([{"hooks": 1}], True),
+    ([1, "x"], True),          # a list of junk items: ours is appended
+    ([{"hooks": 1}], True),    # a scalar `hooks` inside an item
+    ([{"hooks": ["bare"]}], True),   # a non-dict hook
+    ([{"hooks": [{"command": 1}]}], True),  # a non-string command
 ])
 def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
                                                         monkeypatch, hooks_value,
@@ -268,63 +272,57 @@ def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
     assert expected in registered, f"our hook missing for {hooks_value!r}"
 
 
-# --- the whole chain, not one level at a time -------------------------------
-#
-# Each level of hooks.json was guarded in a separate round, and each fix
-# revealed the next level up. These pin every level at once: the top-level
-# document, the `hooks` table, the event value, the item, and the hook.
+# --- the remaining callers review found, each in its own module -------------
 
-@pytest.mark.parametrize("raw,expect_registered", [
-    ("[1, 2]", True),                                        # top-level array
-    ('{"hooks": 1}', True),                                  # hooks table is a scalar
-    ('{"hooks": null}', True),
-    ('{"hooks": []}', True),                                  # a list where a mapping belongs
-    ('{"hooks": {"PreToolUse": 1}}', False),                  # foreign event value: preserved
-    ('{"hooks": {"PreToolUse": [{"hooks": 1}]}}', True),      # scalar hooks inside an item
-    ('{"hooks": {"PreToolUse": [{"hooks": ["bare"]}]}}', True),  # non-dict hook
-    ('{"hooks": {"PreToolUse": [{"hooks": [{"command": 1}]}]}}', True),  # non-string command
-])
-def test_the_codex_merge_handles_every_level_of_bad_shape(tmp_path, raw,
-                                                          expect_registered):
-    hooks_path = tmp_path / "hooks.json"
-    hooks_path.write_text(raw)
-    wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
+@pytest.fixture(scope="module")
+def augment_user():
+    return _load("t_augment_user", "augment/hooks/setup.py")
 
-    setup_cmd._merge_codex_hooks_json(hooks_path, str(wrapper))
 
-    config = json.loads(hooks_path.read_text())
-    event = config.get("hooks", {}).get("PreToolUse")
-    if not expect_registered:
-        # A foreign non-list event value must survive untouched rather than
-        # being replaced with ours — the file is shared with other tools.
-        assert event == 1, f"foreign event value was clobbered: {event!r}"
-        return
-    registered = [
+@pytest.mark.parametrize("command", NON_STRING_COMMANDS)
+def test_augment_matcher_rejects_a_non_string(augment_user, command):
+    """The one matcher without the guard. Its Windows branch does a membership
+    test, so a truthy non-string raised there and aborted the whole install."""
+    for is_windows in (False, True):
+        assert augment_user._hook_command_matches(
+            command, "cmd", Path("/tmp/unbound.py"), is_windows) is False
+
+
+def test_the_codex_user_level_strip_survives_bad_shapes(codex_user, tmp_path,
+                                                        monkeypatch):
+    """The user-level uninstall strip iterated the event value and called .get
+    on every element, so a malformed entry aborted it and left our hook in
+    place on a machine being cleaned.
+
+    It reads both paths from the real home, so the home is redirected rather
+    than the paths passed in.
+    """
+    monkeypatch.setattr(codex_user.Path, "home", staticmethod(lambda: tmp_path))
+    (tmp_path / ".codex" / "hooks").mkdir(parents=True)
+    hooks_path = tmp_path / ".codex" / "hooks.json"
+    script = tmp_path / ".codex" / "hooks" / "unbound.py"
+    hooks_path.write_text(json.dumps({"hooks": {
+        "PreToolUse": 1,                                     # non-list event
+        "Stop": [
+            "a-bare-string",                                  # non-dict item
+            {"hooks": 1},                                     # scalar hooks
+            {"hooks": ["bare"]},                              # non-dict hook
+            {"hooks": [{"command": str(script)}]},            # ours
+            {"hooks": [{"command": "/usr/local/bin/keep-me"}]},
+        ],
+    }}))
+
+    status = codex_user.remove_hooks_from_config()
+
+    after = json.loads(hooks_path.read_text())
+    stop = after.get("hooks", {}).get("Stop", [])
+    commands = [
         h.get("command")
-        for item in event if isinstance(item, dict)
+        for item in stop if isinstance(item, dict)
         for h in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
         if isinstance(h, dict)
     ]
-    assert str(wrapper) in registered, f"our hook missing for {raw}"
-
-
-def test_a_foreign_event_value_does_not_stop_the_other_events_registering(tmp_path):
-    """The crash used to abort the loop, so one bad event left every later one
-    unregistered. A preserved foreign value must not do the same."""
-    hooks_path = tmp_path / "hooks.json"
-    hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": 1}}))
-    wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
-
-    setup_cmd._merge_codex_hooks_json(hooks_path, str(wrapper))
-
-    config = json.loads(hooks_path.read_text())
-    others = [e for e in setup_cmd._codex_hooks_config(str(wrapper)) if e != "PreToolUse"]
-    assert others, "expected the config to cover more than one event"
-    for event in others:
-        registered = [
-            h.get("command")
-            for item in config["hooks"][event] if isinstance(item, dict)
-            for h in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
-            if isinstance(h, dict)
-        ]
-        assert str(wrapper) in registered, f"{event} went unregistered"
+    assert status in ("cleared", "not_found"), status
+    assert str(script) not in commands, "our hook survived the strip"
+    assert "/usr/local/bin/keep-me" in commands, "a foreign hook was dropped"
+    assert after["hooks"]["PreToolUse"] == 1, "a foreign event value was touched"

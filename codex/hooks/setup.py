@@ -498,17 +498,11 @@ def configure_codex_hooks() -> bool:
             ]
         }
 
-        if not isinstance(config, dict):
-            # hooks.json held a list or a scalar. Nothing in it is a hook
-            # registration, and every later lookup assumes a mapping.
-            config = {}
-        if not isinstance(config.get("hooks"), dict):
+        if "hooks" not in config:
             config["hooks"] = {}
 
         for event, new_config in hooks_config.items():
-            # A foreign non-list hooks[event] is left untouched — never clobber
-            # another tool's config in a shared file — and extending it raises.
-            if event in config["hooks"] and isinstance(config["hooks"][event], list):
+            if event in config["hooks"]:
                 existing_config = config["hooks"][event]
 
                 our_hook_exists = False
@@ -528,7 +522,7 @@ def configure_codex_hooks() -> bool:
 
                 if not our_hook_exists:
                     config["hooks"][event].extend(new_config)
-            elif event not in config["hooks"]:
+            else:
                 config["hooks"][event] = new_config
 
         with open(hooks_path, 'w', encoding='utf-8') as f:
@@ -563,21 +557,24 @@ def remove_hooks_from_config() -> str:
         with open(hooks_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
 
-        if not isinstance(config, dict):
-            # hooks.json held a list or a scalar. Nothing in it is a hook
-            # registration, and every later lookup assumes a mapping.
-            config = {}
-        if not isinstance(config.get("hooks"), dict):
+        if "hooks" not in config:
             return "not_found"
 
         modified = False
         for event in list(config["hooks"].keys()):
             event_config = config["hooks"][event]
+            if not isinstance(event_config, list):
+                # Nothing of ours can be registered in a non-list, and
+                # iterating it raises — which aborted the strip and left our
+                # hook in place on a machine being cleaned.
+                continue
             new_config = []
             for item in event_config:
-                if isinstance(item, dict):
-                    hooks = item.get("hooks", [])
-                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                    hooks = item["hooks"]
+                    new_hooks = [h for h in hooks
+                                 if not isinstance(h, dict)
+                                 or not _is_unbound(h.get("command", ""))]
                     if new_hooks != hooks:
                         modified = True
                         debug_print(f"Removed unbound hook from {event}")

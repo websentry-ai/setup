@@ -1066,23 +1066,14 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
             ]
         }
 
-        if not isinstance(config, dict):
-            # hooks.json held a list or a scalar. Nothing in it is a hook
-            # registration, and every later lookup assumes a mapping.
-            config = {}
-        if not isinstance(config.get("hooks"), dict):
+        if "hooks" not in config:
             config["hooks"] = {}
 
         for event, new_config in hooks_config.items():
-            existing_config = config["hooks"].get(event)
-            if not isinstance(existing_config, list):
-                # Absent gets our list. A foreign non-list value is left
-                # untouched — never clobber another tool's config in a shared
-                # file — and extending it would raise, which aborted the merge
-                # and left the later events unregistered too.
-                if event not in config["hooks"]:
-                    config["hooks"][event] = list(new_config)
+            if event not in config["hooks"]:
+                config["hooks"][event] = new_config
                 continue
+            existing_config = config["hooks"][event]
             our_hook_exists = False
             for existing_item in existing_config:
                 if not isinstance(existing_item, dict):
