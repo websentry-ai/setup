@@ -643,14 +643,22 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
             settings["hooks"] = {}
         
         for event, new_config in hooks_config.items():
-            if event in settings["hooks"]:
+            # A foreign non-list hooks[event] is left untouched — never clobber
+            # an org's own config in the shared settings file — and extending it
+            # raises.
+            if event in settings["hooks"] and isinstance(settings["hooks"][event], list):
                 existing_config = settings["hooks"][event]
                 
                 our_hook_exists = False
                 for existing_item in existing_config:
                     if isinstance(existing_item, dict):
-                        existing_hooks = existing_item.get("hooks", [])
-                        for hook in existing_hooks:
+                        # .get's default only covers a missing key, so a
+                        # scalar would be iterated and raise, aborting the
+                        # merge and leaving our hook unregistered.
+                        existing_hooks = existing_item.get("hooks")
+                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                            if not isinstance(hook, dict):
+                                continue
                             existing_cmd = hook.get("command", "")
                             if _command_targets_hook(existing_cmd, script_path):
                                 our_hook_exists = True
@@ -658,9 +666,7 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)
-                # else:
-                #     print(f"  ✓ Unbound hook already configured for {event}")
-            else:
+            elif event not in settings["hooks"]:
                 settings["hooks"][event] = new_config
         
         with open(settings_path, 'w', encoding='utf-8') as f:

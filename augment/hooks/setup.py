@@ -522,7 +522,13 @@ def configure_augment_settings() -> bool:
                 our_hook_exists = False
                 for existing_item in existing_config:
                     if isinstance(existing_item, dict):
-                        for hook in existing_item.get("hooks", []):
+                        # .get's default only covers a missing key, so a
+                        # scalar would be iterated and raise, aborting the
+                        # merge and leaving our hook unregistered.
+                        existing_hooks = existing_item.get("hooks")
+                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                            if not isinstance(hook, dict):
+                                continue
                             if _hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows):
                                 our_hook_exists = True
                                 break
