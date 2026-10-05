@@ -223,18 +223,19 @@ def test_the_gateway_strip_preserves_a_non_dict_element(tmp_path, monkeypatch):
         h.get("command") for h in remaining if isinstance(h, dict)]
 
 
-@pytest.mark.parametrize("hooks_value,expect_registered", [
-    ([1, "x"], True),          # a list of junk items: ours is appended
-    ([{"hooks": 1}], True),    # a scalar `hooks` inside an item
-    ([{"hooks": ["bare"]}], True),   # a non-dict hook
-    ([{"hooks": [{"command": 1}]}], True),  # a non-string command
+@pytest.mark.parametrize("hooks_value", [
+    [1, "x"],                          # junk items in the event list
+    [{"hooks": 1}],                    # a scalar `hooks` inside an item
+    [{"hooks": ["bare"]}],             # a non-dict hook
+    [{"hooks": [{"command": 1}]}],     # a non-string command
 ])
 def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
-                                                        monkeypatch, hooks_value,
-                                                        expect_registered):
-    """The python MDM install merge carries the same loop as the binary's, and
-    had the same holes: a scalar event value, a scalar `hooks`, or a non-dict
-    element aborted it, so our hook never got registered for that user."""
+                                                        monkeypatch, hooks_value):
+    """Malformed entries inside an event's list no longer abort the python MDM
+    install merge, so our hook still gets registered for that user.
+
+    A non-list event value is deliberately not covered: it keeps main's
+    behaviour, because both ways of handling it are worse (see WEB-6057)."""
     home = tmp_path / "u"
     (home / ".codex" / "hooks").mkdir(parents=True)
     hooks_path = home / ".codex" / "hooks.json"
@@ -252,17 +253,6 @@ def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
     config = json.loads(hooks_path.read_text())
     event = config["hooks"]["PreToolUse"]
     expected = str(home / ".codex" / "hooks" / "unbound.py")
-    if not expect_registered:
-        assert event == hooks_value, f"foreign value clobbered: {event!r}"
-        # The merge must still have carried on to the other events.
-        other = next(e for e in config["hooks"] if e != "PreToolUse")
-        assert any(
-            h.get("command") == expected
-            for item in config["hooks"][other] if isinstance(item, dict)
-            for h in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
-            if isinstance(h, dict)
-        ), f"{other} went unregistered"
-        return
     registered = [
         h.get("command")
         for item in event if isinstance(item, dict)
@@ -417,5 +407,35 @@ def test_the_user_level_strips_survive_bad_shapes(tmp_path, monkeypatch,
         if isinstance(h, dict)
     ]
     assert status in ("cleared", "not_found"), status
+    assert str(script) not in commands, "our hook survived the strip"
+    assert "/usr/local/bin/keep-me" in commands, "a foreign hook was dropped"
+
+
+
+def test_the_augment_mdm_user_strip_survives_a_non_string_command(tmp_path,
+                                                                  monkeypatch):
+    """This strip has its own inline matcher, separate from the guarded one, and
+    its /opt/unbound branch raised on `{"command": 1}` — aborting the clean and
+    leaving our hook and script behind."""
+    module = _load("t_augment_mdm_strip", "augment/hooks/mdm/setup.py")
+    home = tmp_path / "u"
+    (home / ".augment" / "hooks").mkdir(parents=True)
+    script = home / ".augment" / "hooks" / "unbound.py"
+    script.write_text("# hook\n")
+    settings = home / ".augment" / "settings.json"
+    settings.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+        {"command": 1},
+        {"command": str(script)},
+        {"command": "/usr/local/bin/keep-me"},
+    ]}]}}))
+    monkeypatch.setattr(module, "_run_as_user", lambda username, fn, *a: fn())
+
+    module.remove_user_level_hooks_for_user("u", home)
+
+    commands = [
+        h.get("command")
+        for item in json.loads(settings.read_text()).get("hooks", {}).get("Stop", [])
+        for h in item.get("hooks", [])
+    ]
     assert str(script) not in commands, "our hook survived the strip"
     assert "/usr/local/bin/keep-me" in commands, "a foreign hook was dropped"

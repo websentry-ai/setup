@@ -794,6 +794,9 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     our_identities = {(r.get("toolName"), r.get("shellInputRegex")) for r in build_tool_permissions_block()}
 
     def _is_unbound(cmd: str) -> bool:
+        if not isinstance(cmd, str):
+            # Not ours, and the membership tests below raise on an int or bool.
+            return False
         return (cmd == hook_command
                 or (is_windows and bool(cmd) and hook_command in cmd)
                 or ("/opt/unbound/" in cmd and "unbound-hook" in cmd))
