@@ -77,17 +77,41 @@ def test_a_scalar_where_the_hooks_list_belongs_does_not_blank_the_device(tmp_pat
     assert detect([("u", home)]) == "tampered"
 
 
-def test_one_malformed_profile_does_not_discard_another_profiles_answer(tmp_path, detect):
-    """Why these shapes matter: the loop answers for the whole device, so a
-    malformed entry on one user used to discard what another user said — in
-    either order."""
-    healthy = _profile(tmp_path, "healthy")
-    _register(healthy, str(_script(healthy)))
-    malformed = _profile(tmp_path, "malformed")
-    _script(malformed)
-    _register(malformed, 1)
-    assert detect([("malformed", malformed), ("healthy", healthy)]) == "tampered"
-    assert detect([("healthy", healthy), ("malformed", malformed)]) == "tampered"
+def test_a_garbage_entry_does_not_discard_a_healthy_profiles_answer(tmp_path, detect):
+    """The case the guards exist for.
+
+    A garbage `hooks.json` with no script beside a healthy profile used to
+    raise, and the device answered None — throwing away the healthy answer that
+    should have cleared a stale stored `tampered`. The malformed profile is
+    itself no evidence (neither artifact is ours), so the healthy one decides.
+    """
+    good = _profile(tmp_path, "good")
+    _register(good, str(_script(good)))
+    junk = _profile(tmp_path, "junk")  # deliberately no script
+    _register(junk, 1)
+    assert detect([("junk", junk), ("good", good)]) == "persisted"
+    assert detect([("good", good), ("junk", junk)]) == "persisted"
+
+
+def test_a_garbage_entry_alone_is_fresh(tmp_path, detect):
+    """With no script and nothing of ours registered, the profile carries no
+    evidence either way — so a device with only that reads fresh, not a
+    device-wide None."""
+    junk = _profile(tmp_path, "junk")
+    _register(junk, 1)
+    assert detect([("junk", junk)]) == "fresh"
+
+
+def test_a_malformed_profile_does_not_hide_a_confirmed_tamper(tmp_path, detect):
+    """And in the other direction: a profile with the script but no hook of
+    ours is a real miss, and must still win over a healthy sibling."""
+    good = _profile(tmp_path, "good")
+    _register(good, str(_script(good)))
+    missed = _profile(tmp_path, "missed")
+    _script(missed)
+    _register(missed, 1)
+    assert detect([("missed", missed), ("good", good)]) == "tampered"
+    assert detect([("good", good), ("missed", missed)]) == "tampered"
 
 
 def test_a_foreign_command_is_still_not_ours(tmp_path, detect):
