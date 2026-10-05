@@ -132,6 +132,69 @@ def captured_reports(monkeypatch):
 
 
 @pytest.fixture
+def oc_mdm_setup():
+    """opencode/mdm/setup.py, loaded by repo-relative path."""
+    return load_module("opencode/mdm/setup.py")
+
+
+# --- MDM fakes: no real root, no real /Users or /home ------------------------------------
+
+
+def pw_row(name, uid, home):
+    """A pwd.getpwall() row, shaped exactly like the real thing."""
+    import pwd as real_pwd
+    return real_pwd.struct_passwd((name, "*", uid, uid, "", str(home), "/bin/zsh"))
+
+
+class FakePwd:
+    """Stands in for the `pwd` module so a test controls the machine's user list."""
+
+    def __init__(self, entries=(), raises=None):
+        self._entries = list(entries)
+        self._raises = raises
+
+    def getpwall(self):
+        if self._raises is not None:
+            raise self._raises
+        return list(self._entries)
+
+    def getpwnam(self, name):
+        for entry in self._entries:
+            if entry.pw_name == name:
+                return entry
+        raise KeyError(name)
+
+
+@pytest.fixture
+def fake_homes(tmp_path):
+    """Two user homes under a tmp `Users/` tree, shaped like an enumerated device."""
+    made = []
+    for name in ("alice", "bob"):
+        home = tmp_path / "Users" / name
+        home.mkdir(parents=True)
+        made.append((name, home))
+    return made
+
+
+@pytest.fixture
+def passthrough(oc_mdm_setup, monkeypatch):
+    """Run the in-home function in-process instead of behind a real privilege drop,
+    recording who it would have run as. That the drop happens at all is asserted
+    separately; a real fork+setuid needs root."""
+    calls = []
+
+    def _fake(username, fn, *args, **kwargs):
+        calls.append(username)
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(oc_mdm_setup, "_run_as_user", _fake)
+    return calls
+
+
+@pytest.fixture
 def fake_fetch(monkeypatch):
     """Answers the artifact + sidecar fetch offline, keyed on the full URL. An unmapped
     URL is a 404: download_file returns False, never raises."""
