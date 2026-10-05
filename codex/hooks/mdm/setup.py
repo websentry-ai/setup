@@ -1070,20 +1070,29 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
             config["hooks"] = {}
 
         for event, new_config in hooks_config.items():
-            if event in config["hooks"]:
-                existing_config = config["hooks"][event]
-                our_hook_exists = False
-                for existing_item in existing_config:
-                    if isinstance(existing_item, dict):
-                        for hook in existing_item.get("hooks", []):
-                            existing_cmd = hook.get("command", "")
-                            if _command_targets_hook(existing_cmd, script_path):
-                                our_hook_exists = True
-                                break
-                if not our_hook_exists:
-                    config["hooks"][event].extend(new_config)
-            else:
-                config["hooks"][event] = new_config
+            existing_config = config["hooks"].get(event)
+            if not isinstance(existing_config, list):
+                # Absent, or a value codex can load no hooks from. A scalar
+                # holds nothing of another tool's to preserve, and extending it
+                # raises — which aborted the merge and left the later events
+                # unregistered too.
+                config["hooks"][event] = list(new_config)
+                continue
+            our_hook_exists = False
+            for existing_item in existing_config:
+                if not isinstance(existing_item, dict):
+                    continue
+                # .get's default only applies to a missing key, so a scalar
+                # here would be iterated and raise before the command check ran.
+                existing_hooks = existing_item.get("hooks")
+                for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                    if not isinstance(hook, dict):
+                        continue
+                    if _command_targets_hook(hook.get("command", ""), script_path):
+                        our_hook_exists = True
+                        break
+            if not our_hook_exists:
+                existing_config.extend(new_config)
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(hooks_path), flags, 0o644)

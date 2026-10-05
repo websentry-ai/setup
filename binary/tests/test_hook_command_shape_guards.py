@@ -216,3 +216,56 @@ def test_the_gateway_strip_preserves_a_non_dict_element(tmp_path, monkeypatch):
     assert "a-bare-string" in remaining, "a foreign element was dropped"
     assert "/usr/local/bin/keep-me" in [
         h.get("command") for h in remaining if isinstance(h, dict)]
+
+
+def test_the_codex_merge_survives_a_scalar_event_value(tmp_path):
+    """One level up from the item shape: the *event* value itself being a
+    scalar made `.extend` raise, so the merge aborted and every later event
+    went unregistered too."""
+    hooks_path = tmp_path / "hooks.json"
+    wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
+    hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": 1}}))
+
+    setup_cmd._merge_codex_hooks_json(hooks_path, str(wrapper))
+
+    config = json.loads(hooks_path.read_text())
+    for event in setup_cmd._codex_hooks_config(str(wrapper)):
+        registered = [
+            h.get("command")
+            for item in config["hooks"][event] if isinstance(item, dict)
+            for h in item.get("hooks", []) if isinstance(h, dict)
+        ]
+        assert str(wrapper) in registered, f"{event} never got our hook"
+
+
+@pytest.mark.parametrize("hooks_value", [1, "junk", {"a": 1}, [1, "x"], [{"hooks": 1}]])
+def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
+                                                        monkeypatch, hooks_value):
+    """The python MDM install merge carries the same loop as the binary's, and
+    had the same holes: a scalar event value, a scalar `hooks`, or a non-dict
+    element aborted it, so our hook never got registered for that user."""
+    home = tmp_path / "u"
+    (home / ".codex" / "hooks").mkdir(parents=True)
+    hooks_path = home / ".codex" / "hooks.json"
+    hooks_path.write_text(json.dumps({"hooks": {"PreToolUse": hooks_value}}))
+
+    # The install privilege-drops; run the inner work as the current user.
+    monkeypatch.setattr(codex_mdm, "_run_as_user", lambda username, fn, *a: fn())
+    monkeypatch.setattr(codex_mdm, "download_file", lambda url, path: True)
+    monkeypatch.setattr(codex_mdm, "rewrite_gateway_url_in_file",
+                        lambda *a, **k: None)
+    (home / ".codex" / "hooks" / "unbound.py").write_text("# hook\n")
+
+    assert codex_mdm.configure_codex_hooks_for_user("u", home) is True
+
+    config = json.loads(hooks_path.read_text())
+    registered = [
+        h.get("command")
+        for item in config["hooks"]["PreToolUse"] if isinstance(item, dict)
+        # The foreign entries are preserved, so the assertion has to tolerate
+        # the same bad shapes the code under test does.
+        for h in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+        if isinstance(h, dict)
+    ]
+    expected = str(home / ".codex" / "hooks" / "unbound.py")
+    assert expected in registered, f"our hook missing for {hooks_value!r}"
