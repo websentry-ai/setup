@@ -600,6 +600,8 @@ jobs:
           set -euo pipefail
           tar -czf "out/$TAR_NAME" -C dist unbound-hook unbound-discovery
           (cd out && shasum -a 256 "$TAR_NAME" > "$TAR_NAME.sha256")
+          cp mdm/jamf-setup.sh out/
+          (cd out && shasum -a 256 jamf-setup.sh > jamf-setup.sh.sha256)
           ls -lh out/
 
       - name: Upload build artifacts (always, incl. dry-runs)
@@ -697,4 +699,4 @@ jobs:
           gh release create "runtime-v$VERSION" \
             --title "macOS runtime $VERSION" \
             --notes "$notes" \
-            out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh mdm/jamf-setup.sh
+            out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh out/jamf-setup.sh
