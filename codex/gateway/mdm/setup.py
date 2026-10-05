@@ -1031,11 +1031,17 @@ def clear_managed_hooks() -> bool:
                                 kept_groups.append(group)
                                 continue
                             entries = group.get("hooks")
-                            # Shape-guard: a truthy scalar here would be
-                            # iterated and raise, aborting the whole strip.
-                            entries = entries if isinstance(entries, list) else []
+                            if not isinstance(entries, list):
+                                # Not a shape we own. Preserve the group as-is:
+                                # iterating a truthy scalar raises, and treating
+                                # it as empty would drop someone else's config.
+                                kept_groups.append(group)
+                                continue
+                            # A non-dict element is not ours: preserve it
+                            # rather than calling .get on it and raising.
                             kept = [h for h in entries
-                                    if str(h.get("command", "")).find(str(script_path)) == -1]
+                                    if not isinstance(h, dict)
+                                    or str(h.get("command", "")).find(str(script_path)) == -1]
                             if kept != entries:
                                 changed = True
                             if kept:

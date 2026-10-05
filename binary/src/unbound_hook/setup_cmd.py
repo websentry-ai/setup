@@ -502,9 +502,15 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
         if event in config["hooks"]:
             existing_config = config["hooks"][event]
             our_hook_exists = False
-            for existing_item in existing_config:
+            for existing_item in existing_config if isinstance(existing_config, list) else []:
                 if isinstance(existing_item, dict):
-                    for hook in existing_item.get("hooks", []):
+                    # .get's default only applies to a missing key, so a scalar
+                    # here would be iterated and raise, aborting the merge
+                    # before the command check ever runs.
+                    existing_hooks = existing_item.get("hooks")
+                    for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                        if not isinstance(hook, dict):
+                            continue
                         if _command_targets_hook(hook.get("command", ""), Path(hook_command)):
                             our_hook_exists = True
                             break

@@ -157,3 +157,62 @@ def test_detection_survives_mixed_junk_beside_a_real_entry(codex_mdm, tmp_path,
     monkeypatch.setattr(codex_mdm, "get_all_user_homes",
                         lambda: [("u", home)])
     assert codex_mdm.detect_install_state() == "persisted"
+
+
+# --- the merge and the gateway strip: callers that raised before the matcher --
+
+def test_the_codex_merge_survives_a_scalar_hooks_value(tmp_path):
+    """`.get("hooks", [])` only defaults a *missing* key, so a scalar was
+    returned and iterated — the merge aborted before the command check ran, and
+    our hook never got registered for that user."""
+    hooks_path = tmp_path / "hooks.json"
+    wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
+    hooks_path.write_text(json.dumps({"hooks": {
+        "PreToolUse": [
+            {"matcher": "foreign", "hooks": 1},          # the shape that raised
+            {"matcher": "other", "hooks": ["not-a-dict"]},
+        ],
+    }}))
+
+    setup_cmd._merge_codex_hooks_json(hooks_path, str(wrapper))
+
+    config = json.loads(hooks_path.read_text())
+    commands = [
+        h.get("command")
+        for item in config["hooks"]["PreToolUse"]
+        if isinstance(item, dict) and isinstance(item.get("hooks"), list)
+        for h in item["hooks"] if isinstance(h, dict)
+    ]
+    assert str(wrapper) in commands, "our hook was never registered"
+    # The foreign entries are still there, untouched.
+    assert {"matcher": "foreign", "hooks": 1} in config["hooks"]["PreToolUse"]
+
+
+def test_the_gateway_strip_preserves_a_non_dict_element(tmp_path, monkeypatch):
+    """A non-dict element had `.get` called on it and raised AttributeError.
+    The surrounding handler swallowed that, the file was left alone, and our
+    hook stayed registered on a machine we were cleaning."""
+    gateway = _load("t_codex_gateway_mdm", "codex/gateway/mdm/setup.py")
+    managed = tmp_path / "managed"
+    (managed / "hooks").mkdir(parents=True)
+    script = managed / "hooks" / "unbound.py"
+    script.write_text("# hook\n")
+    settings = managed / "hooks.json"
+    settings.write_text(json.dumps({"hooks": {"Stop": [
+        {"matcher": "*", "hooks": [
+            "a-bare-string",                      # the element that raised
+            {"type": "command", "command": str(script)},
+            {"type": "command", "command": "/usr/local/bin/keep-me"},
+        ]},
+    ]}}))
+
+    monkeypatch.setattr(gateway, "get_managed_settings_dir", lambda: managed)
+    gateway.clear_managed_hooks()
+
+    after = json.loads(settings.read_text())
+    remaining = after.get("hooks", {}).get("Stop", [{}])[0].get("hooks", [])
+    assert str(script) not in [h.get("command") for h in remaining if isinstance(h, dict)], \
+        "our hook survived the strip"
+    assert "a-bare-string" in remaining, "a foreign element was dropped"
+    assert "/usr/local/bin/keep-me" in [
+        h.get("command") for h in remaining if isinstance(h, dict)]
