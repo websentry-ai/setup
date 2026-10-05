@@ -161,6 +161,42 @@ test("evaluateToolCall: the same call without mcp is skipped with zero checker c
   assert.equal(checker.payloads.length, 0);
 });
 
+test("evaluateToolCall: sendUnattributed sends the bare call with the raw tool name and no MCP keys", async () => {
+  const checker = recordingChecker({ kind: "deny", reason: "no" });
+  const verdict = await evaluateToolCall(
+    { ...mcpCall(), toolName: "runtime_added_tool", sendUnattributed: true },
+    deps(checker),
+  );
+  assert.deepEqual(verdict, { kind: "deny", reason: "no" });
+  assert.equal(checker.payloads.length, 1);
+  const body = checker.payloads[0]!;
+  assert.equal(body.pre_tool_use_data.tool_name, "runtime_added_tool");
+  assert.equal(body.pre_tool_use_data.command, "");
+  assert.equal("mcp_server" in metadataOf(body), false);
+  assert.equal("mcp_tool" in metadataOf(body), false);
+});
+
+test("evaluateToolCall: sendUnattributed with an over-length server still sends, without MCP keys", async () => {
+  const checker = recordingChecker();
+  const long = "s".repeat(MAX_MCP_NAME_CHARS + 1);
+  const verdict = await evaluateToolCall(
+    { ...mcpCall({ mcp: { server: long, tool: "x" } }), sendUnattributed: true },
+    deps(checker),
+  );
+  assert.deepEqual(verdict, { kind: "allow" });
+  assert.equal(checker.payloads.length, 1);
+  assert.equal("mcp_server" in metadataOf(checker.payloads[0]!), false);
+});
+
+test("evaluateToolCall: only sendUnattributed === true lifts the nothing-evaluable gate", async () => {
+  for (const flag of [false, 1, "true", null, undefined]) {
+    const checker = recordingChecker();
+    const verdict = await evaluateToolCall({ ...mcpCall(), sendUnattributed: flag } as ToolCallInput, deps(checker));
+    assert.deepEqual(verdict, { kind: "skip", why: "nothing-evaluable" }, String(flag));
+    assert.equal(checker.payloads.length, 0);
+  }
+});
+
 // --- Test 4: hostile mcp values -----------------------------------------------------------------
 
 test("evaluateToolCall: an unusable mcp value is treated as absent and the promise resolves", async () => {

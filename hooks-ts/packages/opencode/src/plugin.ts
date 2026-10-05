@@ -77,6 +77,10 @@ const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
 
 /** The most MCP server names kept per directory. A real config has a handful. */
 const MAX_MCP_SERVER_NAMES = 1024;
+/** At most one runtime MCP server-list refresh per directory in this window. */
+const MCP_REFRESH_INTERVAL_MS = 10_000;
+/** A runtime MCP server-list refresh that has not answered by then is ignored. */
+const MCP_REFRESH_TIMEOUT_MS = 2_000;
 /** The most allowed-call digests kept per session (HOOK-18); the oldest is dropped first. */
 const MAX_DIGESTS_PER_SESSION = 256;
 /** How far up a parent chain `rootOf` walks before it stops (a real chain is one or two deep). */
@@ -136,6 +140,13 @@ export interface DirectoryRecord {
   client: unknown;
   /** `Object.keys(config.mcp)` from the `config` hook, read-only snapshot. */
   mcpServerNames: string[];
+  /**
+   * Server names the host reported at runtime (`client.mcp.status()`), which also covers servers
+   * added through `POST /mcp` that never appear in the config. Refreshed lazily, never blocking.
+   */
+  liveMcpServerNames: string[];
+  /** When the last runtime refresh started (`deps.now()`), or `undefined` before the first one. */
+  mcpRefreshedAt: number | undefined;
 }
 
 /** The runtime one plugin copy shares across its directories. */
@@ -202,6 +213,13 @@ export interface Runtime {
   takeUserShell(sessionID: string, callID: string): string | undefined;
   /** Forget a stashed bash command (the part reached a final status). */
   dropUserShell(sessionID: string, callID: string): void;
+  /** Every MCP server name known for a directory: config order first, then runtime-only names. */
+  mcpServerNamesFor(record: DirectoryRecord): string[];
+  /**
+   * Ask the host for its live MCP server list (rate-limited, bounded, fire-and-forget). The current
+   * call never waits for it; a later call sees the result.
+   */
+  refreshMcpNames(record: DirectoryRecord): void;
 }
 
 /** Read-only test seam, attached to the factory as a NON-enumerable `inspect` property. */
@@ -253,6 +271,23 @@ function mcpServerNamesOf(cfg: unknown): string[] {
   }
 }
 
+/** The server names of a `client.mcp.status()` answer (`{ data: { <name>: status } }`). Total. */
+function liveMcpNamesOf(answer: unknown): string[] | undefined {
+  try {
+    if (answer === null || typeof answer !== "object") return undefined;
+    const data: unknown = (answer as { data?: unknown }).data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return undefined;
+    const names: string[] = [];
+    for (const key of Object.keys(data)) {
+      if (names.length >= MAX_MCP_SERVER_NAMES) break;
+      if (key !== "") names.push(key);
+    }
+    return names;
+  } catch {
+    return undefined;
+  }
+}
+
 /** Run `fn` on a later macrotask, unref'd, with every fault swallowed. */
 function later(fn: () => void): void {
   try {
@@ -285,6 +320,10 @@ export interface SessionExtras {
   before: Set<string>;
   /** callID → command of a bash part, until `shell.env` takes it or the part finishes. */
   shell: Map<string, string>;
+}
+
+function freshRecord(directory: string): DirectoryRecord {
+  return { directory, client: undefined, mcpServerNames: [], liveMcpServerNames: [], mcpRefreshedAt: undefined };
 }
 
 function freshExtras(): SessionExtras {
@@ -368,8 +407,8 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
   const records = createKeyedState<DirectoryRecord>({
     max: MAX_TRACKED_INSTANCES,
     normalizeKey: directoryKey,
-    create: (directory) => ({ directory, client: undefined, mcpServerNames: [] }),
-    fallback: () => ({ directory: "", client: undefined, mcpServerNames: [] }),
+    create: (directory) => freshRecord(directory),
+    fallback: () => freshRecord(""),
   });
 
   // Per-session bookkeeping: bounded sessions; every member is itself bounded.
@@ -703,6 +742,52 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         // Bounded anyway.
       }
     },
+    mcpServerNamesFor(record: DirectoryRecord): string[] {
+      try {
+        const names = [...record.mcpServerNames];
+        const seen = new Set(names);
+        for (const name of record.liveMcpServerNames) {
+          if (names.length >= MAX_MCP_SERVER_NAMES) break;
+          if (!seen.has(name)) {
+            seen.add(name);
+            names.push(name);
+          }
+        }
+        return names;
+      } catch {
+        return [];
+      }
+    },
+    refreshMcpNames(record: DirectoryRecord): void {
+      try {
+        const now = deps.now();
+        const last = record.mcpRefreshedAt;
+        if (last !== undefined && now - last < MCP_REFRESH_INTERVAL_MS) return;
+        record.mcpRefreshedAt = now;
+        // The SDK client is untrusted host input: every read is guarded, and its promise is raced
+        // against an unref'd timer, so a hung host costs nothing but a missed refresh.
+        const mcp: unknown = (record.client as { mcp?: unknown } | null | undefined)?.mcp;
+        const status: unknown = (mcp as { status?: unknown } | null | undefined)?.status;
+        if (typeof status !== "function") return;
+        const pending = Promise.resolve((status as (this: unknown) => unknown).call(mcp));
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), MCP_REFRESH_TIMEOUT_MS);
+          timer.unref?.();
+        });
+        void Promise.race([pending, timeout])
+          .then((answer) => {
+            const names = liveMcpNamesOf(answer);
+            if (names !== undefined) record.liveMcpServerNames = names;
+          })
+          .catch(() => undefined)
+          .finally(() => {
+            if (timer !== undefined) clearTimeout(timer);
+          });
+      } catch {
+        // A refresh is an optimisation; the call it was for is sent unattributed anyway.
+      }
+    },
     markResulted(sessionID: string, callID: string): boolean {
       try {
         if (sessionID === "" || callID === "") return false;
@@ -797,7 +882,8 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
 
       const record = records.get(directory);
       record.client = client;
-      record.mcpServerNames = [];
+      // The MCP names are NOT reset here (13-REVIEW BL-01 / WR-05): an existing record may still
+      // serve a live hook set, and the next `config` call replaces the config names anyway.
       return Promise.resolve(fullHooks(record));
     } catch {
       return Promise.resolve(degradedHooks());

@@ -79,6 +79,14 @@ export interface ToolCallInput {
    * evaluable. Validated inside; an unusable value is treated as absent.
    */
   mcp?: { server: string; tool: string };
+  /**
+   * Send this call even when it carries no command, no file path and no usable MCP attribution.
+   * For an adapter whose host can route a call to a tool server it could not attribute (an MCP
+   * server added at runtime, a name over the attribution cap): the server must still see the call,
+   * so it can log the attribution miss and apply whatever it can. Only `true` counts. Absent on
+   * every adapter that does not set it, so their wire behaviour is unchanged.
+   */
+  sendUnattributed?: boolean;
 }
 
 /** One user prompt, as the adapter sees it. Images and attachments have no field here on purpose. */
@@ -315,9 +323,11 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
     // Nothing to evaluate: the server's entry gate needs a non-blank command, a native-tool
     // `file_path`, or an explicitly attributed MCP server, so a call with none of them is a
     // guaranteed allow after a full round trip. This covers every custom tool that carries no
-    // command, not just an empty shell command (WR-04).
+    // command, not just an empty shell command (WR-04). An adapter that asks for an unattributed
+    // tool-server call to be sent anyway (`sendUnattributed`) bypasses this gate only.
     const filePath = resolveFilePath(toolName, toolInput, cwd, profile.fileTools);
-    if (command.trim() === "" && filePath === undefined && mcp === undefined) {
+    const sendUnattributed = source.sendUnattributed === true;
+    if (!sendUnattributed && command.trim() === "" && filePath === undefined && mcp === undefined) {
       return { kind: "skip", why: "nothing-evaluable" };
     }
 

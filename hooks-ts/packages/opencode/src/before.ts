@@ -22,12 +22,13 @@ import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
 import { evaluateToolCall, noteSafe } from "../../core/src/evaluate.ts";
 import type { EvaluateDeps, ToolCallInput, ToolEvaluation } from "../../core/src/evaluate.ts";
 import { block } from "./block.ts";
-import { auditToolInput } from "../../core/src/payload.ts";
+import { auditToolInput, normaliseMcp } from "../../core/src/payload.ts";
 import { PATCH_CONCURRENCY, SIGNAL_MCP_ATTRIBUTION_MISS, SIGNAL_PATCH_TARGETS_CAPPED } from "./constants.ts";
 import {
   applyPatchTargets,
   argsDigest,
   BUILTIN_TOOLS,
+  MCP_RESOURCE_TOOLS,
   mcpResourceTarget,
   resolveMcpTool,
   shellCommandOf,
@@ -133,13 +134,23 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     }
 
     // MCP (HOOK-13): attribution only from the call's own server argument (resource tools) or the
-    // longest configured server-name prefix; never by splitting the id. A non-built-in tool that
-    // matches no configured server is reported and evaluated without MCP metadata (core then skips
-    // it as nothing-evaluable unless it carries something else the server evaluates).
+    // longest known server-name prefix; never by splitting the id. Every call that goes to a tool
+    // server (any non-built-in id, and the MCP resource tools) is SENT, attributed or not
+    // (13-REVIEW BL-01): an MCP server added at runtime, a server name over the attribution cap, or a
+    // plugin tool still reaches the server, which logs the attribution miss and applies what it can.
+    // The miss is reported here too, whether or not any MCP server is configured.
     const builtin = BUILTIN_TOOLS.has(tool);
-    const mcp = mcpResourceTarget(tool, args) ?? (builtin ? undefined : resolveMcpTool(tool, record.mcpServerNames));
-    if (mcp === undefined && !builtin && record.mcpServerNames.length > 0) {
-      runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_MISS, tool, "unresolved");
+    const toolServerCall = tool !== "" && (!builtin || MCP_RESOURCE_TOOLS.has(tool));
+    const mcp =
+      mcpResourceTarget(tool, args) ??
+      (builtin || tool === "" ? undefined : resolveMcpTool(tool, runtime.mcpServerNamesFor(record)));
+    if (toolServerCall) {
+      const attributed = mcp !== undefined && normaliseMcp(mcp) !== undefined;
+      if (!attributed) {
+        runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_MISS, tool, mcp === undefined ? "unresolved" : "name_over_cap");
+        // A server added at runtime is only in the host's live list: refresh it for later calls.
+        if (mcp === undefined && !builtin) runtime.refreshMcpNames(record);
+      }
     }
 
     const identity: AccountIdentity | undefined = runtime.identity();
@@ -194,6 +205,7 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
         sessionId: sessionID,
         model,
         ...(mcp === undefined ? {} : { mcp }),
+        ...(toolServerCall ? { sendUnattributed: true } : {}),
       };
       verdict = await evaluateToolCall(call, evalDeps);
     }

@@ -311,24 +311,134 @@ test("MCP resource tools carry their server argument", async () => {
   }
 });
 
-test("an unresolved non-built-in tool with MCP configured is an attribution miss, never a guess", async () => {
+test("an unresolved non-built-in tool is sent bare (raw id, no MCP keys), reported, never a guess", async () => {
   const h = await harness("deny");
   try {
     await h.hooks.config?.({ mcp: { my: {}, my_server: {} } });
+    // The mock mirrors the server's entry gate: an unattributed call reaches the server, which logs
+    // the miss and answers no_policy (allow). What matters here is that the request is made.
     assert.equal(await outcome(h.before(call("other_tool"), { args: {} })), undefined);
     assert.ok(await waitFor(() => signalsOf(mock, "mcp_attribution_miss").length === 1));
-    assert.equal(pretoolRequests(mock).length, 0);
+    assert.equal(pretoolRequests(mock).length, 1);
+    const b = body(0);
+    assert.equal(b.pre_tool_use_data.tool_name, "other_tool");
+    assert.equal(b.pre_tool_use_data.command, "");
+    assert.equal("mcp_server" in metadataOf(b), false);
+    assert.equal("mcp_tool" in metadataOf(b), false);
   } finally {
     h.cleanup();
   }
 });
 
-test("with no MCP servers configured a custom tool is neither checked nor reported", async () => {
+test("with no MCP servers configured a custom tool is still sent and the miss still reported", async () => {
+  for (const cfg of [{}, undefined] as const) {
+    const h = await harness("allow");
+    try {
+      if (cfg !== undefined) await h.hooks.config?.(cfg);
+      assert.equal(await outcome(h.before(call("mytool"), { args: {} })), undefined);
+      assert.ok(await waitFor(() => signalsOf(mock, "mcp_attribution_miss").length === 1), "reported");
+      assert.equal(pretoolRequests(mock).length, 1);
+      assert.equal(body(0).pre_tool_use_data.tool_name, "mytool");
+    } finally {
+      h.cleanup();
+    }
+  }
+});
+
+test("a configured server name over the attribution cap is sent without MCP keys and reported", async () => {
+  const h = await harness("allow");
+  try {
+    const long = "s".repeat(257);
+    await h.hooks.config?.({ mcp: { [long]: {} } });
+    assert.equal(await outcome(h.before(call(`${long}_echo`), { args: {} })), undefined);
+    assert.equal(pretoolRequests(mock).length, 1);
+    assert.equal("mcp_server" in metadataOf(body(0)), false);
+    assert.ok(await waitFor(() => signalsOf(mock, "mcp_attribution_miss").length === 1));
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("a server added at runtime is learnt from client.mcp.status() for later calls", async () => {
+  mock.requests.length = 0;
+  mock.setMode("allow");
+  const t = makeDeps(mock);
+  try {
+    const server = createServerPlugin(t.deps);
+    const fake = makeFakeInput({ directory: "/repo" });
+    let statusCalls = 0;
+    const input = {
+      ...fake.input,
+      client: {
+        ...fake.input.client,
+        mcp: {
+          status(): Promise<unknown> {
+            statusCalls += 1;
+            return Promise.resolve({ data: { late: { status: "connected" } } });
+          },
+        },
+      },
+    };
+    const hooks = (await server(input)) as Hooks;
+    await hooks.config?.({ mcp: { cfgd: {} } });
+    const before = hooks["tool.execute.before"] as BeforeHook;
+    await before(call("late_echo"), { args: {} });
+    assert.equal("mcp_server" in metadataOf(body(0)), false, "first call: not yet known");
+    await tick(20);
+    await before(call("late_echo", "ses_root", "call_2"), { args: {} });
+    assert.equal(metadataOf(body(1)).mcp_server, "late");
+    assert.equal(metadataOf(body(1)).mcp_tool, "echo");
+    await before(call("other_x", "ses_root", "call_3"), { args: {} });
+    assert.equal(statusCalls, 1, "refresh is rate-limited");
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("a raising or hanging client.mcp.status() never affects the call", async () => {
+  for (const status of [
+    () => {
+      throw new Error("boom");
+    },
+    () => new Promise<unknown>(() => {}),
+    () => Promise.reject(new Error("no")),
+    5,
+  ]) {
+    mock.requests.length = 0;
+    mock.setMode("deny");
+    const t = makeDeps(mock);
+    try {
+      const fake = makeFakeInput({ directory: "/repo" });
+      const hooks = (await createServerPlugin(t.deps)({ ...fake.input, client: { ...fake.input.client, mcp: { status } } })) as Hooks;
+      await hooks.config?.({ mcp: { x: {} } });
+      const message = await outcome((hooks["tool.execute.before"] as BeforeHook)(call("z_y"), { args: {} }));
+      assert.equal(message, undefined);
+      assert.equal(pretoolRequests(mock).length, 1);
+    } finally {
+      t.cleanup();
+    }
+  }
+});
+
+test("server() for an existing directory keeps its MCP names until the next config", async () => {
+  const h = await harness("allow");
+  try {
+    await h.hooks.config?.({ mcp: { my: {} } });
+    await h.server(makeFakeInput({ directory: "/repo" }).input);
+    await h.before(call("my_tool"), { args: {} });
+    assert.equal(metadataOf(body(0)).mcp_server, "my");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("built-in tools that carry nothing evaluable are not sent", async () => {
   const h = await harness("deny");
   try {
-    await h.hooks.config?.({});
-    assert.equal(await outcome(h.before(call("mytool"), { args: {} })), undefined);
-    await tick(100);
+    for (const tool of ["webfetch", "websearch", "skill", "todowrite", "question", "execute", "invalid"]) {
+      assert.equal(await outcome(h.before(call(tool), { args: { url: "https://x" } })), undefined, tool);
+    }
+    await tick(50);
     assert.equal(pretoolRequests(mock).length, 0);
     assert.equal(signalsOf(mock, "mcp_attribution_miss").length, 0);
   } finally {
