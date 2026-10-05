@@ -79,14 +79,38 @@ def test_unreadable_hooks_json_is_undetermined_not_tampered(tmp_path):
         os.chmod(hooks_path, stat.S_IRUSR | stat.S_IWUSR)
 
 
-def test_unparseable_hooks_json_is_undetermined(tmp_path):
-    """A truncated or half-written file is evidence of nothing either."""
+def test_emptied_or_truncated_hooks_json_is_tampered(tmp_path):
+    """Emptying the file is a way to switch the hook off, so it must not read as
+    undetermined. We read it, codex gets no hooks from it, so the hook is not
+    active for this user — that is tampered, not unknown."""
     home = _profile(tmp_path)
-    (home / ".codex" / "hooks.json").write_text("")
-    assert setup_cmd._codex_detect_state([("u", home)]) is None
+    hooks_path = home / ".codex" / "hooks.json"
 
-    (home / ".codex" / "hooks.json").write_text('{"hooks": {"PreToolUse": [')
-    assert setup_cmd._codex_detect_state([("u", home)]) is None
+    hooks_path.write_text("")
+    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
+
+    hooks_path.write_text('{"hooks": {"PreToolUse": [')
+    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
+
+    hooks_path.write_bytes(b"\x00\x81\xfe")  # not even decodable
+    assert setup_cmd._codex_detect_state([("u", home)]) == "tampered"
+
+
+def test_a_readable_profile_decides_even_when_another_is_refused(tmp_path):
+    """A negative rests on a file we read. One refused sibling must not turn a
+    real negative into unknown, or corrupting one profile would mask the rest."""
+    seen = _profile(tmp_path, "seen")
+    (seen / ".codex" / "hooks.json").write_text("")
+    refused = _profile(tmp_path, "refused")
+    refused_path = refused / ".codex" / "hooks.json"
+    _install(refused)
+    os.chmod(refused_path, 0o000)
+    try:
+        expected = "tampered" if os.geteuid() != 0 else "persisted"
+        assert setup_cmd._codex_detect_state(
+            [("seen", seen), ("refused", refused)]) == expected
+    finally:
+        os.chmod(refused_path, stat.S_IRUSR | stat.S_IWUSR)
 
 
 def test_hook_registered_against_the_binary_still_counts(tmp_path):

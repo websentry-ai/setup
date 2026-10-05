@@ -715,17 +715,28 @@ def _setup_codex(opts):
 
 def _codex_hook_registered(hooks_path: Path, wrapper: Path):
     """True when OUR hook is registered for this user, False when it is not,
-    None only when we could not read or parse the file.
+    None only when we could not read the file at all.
 
-    Ownership uses _command_targets_hook — the same rule the install merges by
-    and the uninstall strips by — so registration, removal and detection cannot
-    disagree about what is ours. HOOK_BINARY is accepted too, for machines
-    registered before the wrapper existed.
+    The two failure modes are different evidence. A file we were refused is
+    evidence of nothing. A file we read that codex cannot load hooks from —
+    empty, truncated, not JSON — means the hook is not active for this user,
+    which is what 'not registered' means, so it must not read as undetermined:
+    emptying the file is otherwise a silent way to switch the hook off.
+
+    Ownership uses _command_targets_hook, the rule the install merges by and the
+    uninstall strips by, so registration, removal and detection cannot disagree
+    about what is ours. HOOK_BINARY counts too, for machines registered before
+    the wrapper existed.
     """
     try:
-        config = json.loads(hooks_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+        raw = hooks_path.read_bytes()
+    except OSError:
         return None
+    try:
+        config = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        # UnicodeDecodeError is a ValueError. Either way codex gets no hooks.
+        return False
     events = config.get("hooks") if isinstance(config, dict) else None
     if not isinstance(events, dict):
         return False
@@ -747,18 +758,22 @@ def _codex_detect_state(user_homes):
     registers in ~/.codex/hooks.json, install state is read from there.
 
     'fresh' = no user has a hooks.json; 'persisted' = at least one registers our
-    hook; 'tampered' = at least one hooks.json exists and every one we could
-    read registers something else.
+    hook; 'tampered' = at least one exists and none of the ones we could read
+    registers it; None = every hooks.json present was unreadable.
 
-    A hooks.json we could not read or parse is evidence of nothing, so it
-    returns None rather than 'tampered' — None omits install_state from the
-    report and leaves the stored state alone, where guessing reported a healthy
-    install as compromised on every single run. The python MDM detector draws
-    this same line for the same reason.
+    None omits install_state from the report, leaving the stored state alone,
+    because a file we were refused says nothing about whether the hook is
+    there. Reporting it as tampered instead makes a healthy install look
+    compromised on every run.
+
+    One profile that registers our hook outranks a sibling we were refused: it
+    is proof the install is in place, where the refusal is proof of nothing.
+    The python MDM detector ranks these the other way, letting any refusal win,
+    which keeps a device silent on the strength of one unreadable profile.
     """
     saw_json = False
     saw_known_ref = False
-    indeterminate = False
+    saw_readable = False
     try:
         for _username, home_dir in user_homes:
             hooks_path = home_dir / ".codex" / "hooks.json"
@@ -768,18 +783,19 @@ def _codex_detect_state(user_homes):
             registered = _codex_hook_registered(
                 hooks_path, home_dir / ".codex" / "hooks" / "unbound.py")
             if registered is None:
-                indeterminate = True
-            elif registered:
+                continue  # refused: evidence of nothing either way
+            saw_readable = True
+            if registered:
                 saw_known_ref = True
         # Positive evidence wins: one profile registering our hook means the
         # install is in place, whatever another profile's file looked like.
         if saw_known_ref:
             return "persisted"
-        if indeterminate:
-            return None
         if not saw_json:
             return "fresh"
-        return "tampered"
+        # A negative has to rest on a file we actually read. If every one was
+        # refused, the answer is unknown rather than tampered.
+        return "tampered" if saw_readable else None
     except Exception as e:
         print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
         return None
