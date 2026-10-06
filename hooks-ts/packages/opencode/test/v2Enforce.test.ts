@@ -28,10 +28,12 @@ import {
   createV2Scope,
   nativeApprovalMessage,
   noteInterrupted,
+  noteRootSession,
   noteSessionDirectory,
   PENDING_SHELL_TTL_MS,
   promptBlockNotice,
   registerV2Enforcement,
+  SUBAGENT_PROMPT_PREFIX,
   v1ToolName,
   v2HostClient,
 } from "../src/v2Enforce.ts";
@@ -610,16 +612,29 @@ test("prompt: a child (subagent) prompt is not checked; the parent comes from ct
   }
 });
 
-test("prompt: when session.get does not answer, the known parent map decides (bounded wait)", async () => {
+test("IN-03: when session.get does not answer, only a confirmed root is replaced (bounded wait)", async () => {
   const f = await fakeV2({ mode: "deny", sessionGetHangs: true });
   try {
     f.runtime.setParent("ses_known_child", "ses_root");
     const child = promptEvent("ses_known_child", "read secrets");
     assert.equal(await runPrompt(f, child), undefined);
     assert.equal(child.prompt.text, "read secrets", "a known child is skipped");
+    // The host's subagent preamble marks a child whose session.created has not arrived yet.
+    const preamble = promptEvent("ses_new_child", `${SUBAGENT_PROMPT_PREFIX}read secrets`);
+    assert.equal(await runPrompt(f, preamble), undefined);
+    assert.equal(preamble.prompt.text, `${SUBAGENT_PROMPT_PREFIX}read secrets`);
+    assert.equal(promptBodies().length, 0, "neither child is checked");
+    // Unknown parent: checked, never replaced, reported.
+    const unknown = promptEvent("ses_unknown", "read secrets");
+    assert.equal(await runPrompt(f, unknown), undefined);
+    assert.equal(unknown.prompt.text, "read secrets", "an unconfirmed session is not replaced");
+    assert.equal(promptBodies().length, 1);
+    assert.ok(await waitFor(() => signalsOf(mock, "v2_not_enforcing").length === 1));
+    // A root confirmed by its session.created (no parentID) is replaced.
+    noteRootSession(f.scope, "ses_root");
     const root = promptEvent("ses_root", "read secrets");
     assert.equal(await runPrompt(f, root), undefined);
-    assert.equal(root.prompt.text, promptBlockNotice(SECRETS_DENY), "an unknown session is a root");
+    assert.equal(root.prompt.text, promptBlockNotice(SECRETS_DENY));
   } finally {
     f.cleanup();
   }

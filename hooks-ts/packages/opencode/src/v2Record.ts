@@ -51,6 +51,7 @@ import {
   createV2Registrations,
   createV2Scope,
   noteInterrupted,
+  noteRootSession,
   noteSessionDirectory,
   V2_BUILTIN_TOOLS,
   V2_CODE_MODE_TOOL,
@@ -193,9 +194,10 @@ export function registerV2Recording(
             const location = readField(data, "location");
             const eventLocation = readField(event, "location");
             const dir = readString(location, "directory") || readString(eventLocation, "directory") || directory;
-            noteSessionDirectory(scope, sessionID, dir);
             const version = readField(data, "version") ?? readField(app, "version");
             const parentID = readField(data, "parentID");
+            noteSessionDirectory(scope, sessionID, dir);
+            if (typeof parentID !== "string" || parentID === "") noteRootSession(scope, sessionID);
             noteModel(sessionID, readField(data, "model"));
             emit("session.created", {
               sessionID,

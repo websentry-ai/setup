@@ -179,6 +179,8 @@ export interface V2Scope {
    * from then on a built-in call's block is raised from `execute.before` instead.
    */
   evaluateWithoutSource: boolean;
+  /** Sessions whose `session.created` arrived without a `parentID` (bounded, insertion-ordered). */
+  readonly confirmedRoots: Set<string>;
 }
 
 /** A fresh, empty scope; `directories` is the caller's live registration set when it has one. */
@@ -191,7 +193,24 @@ export function createV2Scope(directories: Set<string> = new Set<string>()): V2S
     seenEvents: new Set<string>(),
     seenHookInputs: new Map<string, WeakSet<object>>(),
     evaluateWithoutSource: false,
+    confirmedRoots: new Set<string>(),
   };
+}
+
+/** A `session.created` without a `parentID`: the session is a root (bounded). Total. */
+export function noteRootSession(scope: V2Scope, sessionID: unknown): void {
+  try {
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    scope.confirmedRoots.delete(sessionID);
+    scope.confirmedRoots.add(sessionID);
+    while (scope.confirmedRoots.size > MAX_CONFIRMED_ROOTS) {
+      const oldest = scope.confirmedRoots.values().next().value;
+      if (oldest === undefined) break;
+      scope.confirmedRoots.delete(oldest);
+    }
+  } catch {
+    // Unconfirmed: the prompt is checked, never replaced.
+  }
 }
 
 /** Remember a session's location (bounded). Total. */
@@ -354,6 +373,10 @@ function modelShellCwd(input: unknown, sessionID: string, directory: string, sco
 }
 
 const APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
+/** The text opencode 2.x puts before a subagent's prompt (14-SPIKES child-session probe). */
+export const SUBAGENT_PROMPT_PREFIX = "You are a subagent spawned by another session.\n";
+/** The most sessions remembered as confirmed roots. */
+const MAX_CONFIRMED_ROOTS = 1024;
 const PROMPT_BLOCK_TAIL =
   "(Unbound replaced the user's message because a policy blocked it; the original was not sent. " +
   "Tell the user their message was blocked by Unbound policy and do nothing else.)";
@@ -758,12 +781,22 @@ export function registerV2Enforcement(
         const prompt = readField(event, "prompt");
         const text = readField(prompt, "text");
         // Root vs child (14-SPIKES child-session probe): a child's prompt fires BEFORE its
-        // `session.created`, so the parent comes from `ctx.session.get`; `runtime.isChild` (filled
-        // from events) is the fallback inside `decidePrompt`.
+        // `session.created`, so the parent comes from `ctx.session.get`. A prompt is treated as a
+        // root only when that is confirmed (IN-03): `get` answered without a `parentID`, or the
+        // session's `session.created` arrived without one. A known child (or a prompt carrying the
+        // host's subagent preamble) is not checked; an unconfirmed one is checked, never replaced.
         const info = await sessionInfo(sessionID);
+        let root: boolean;
         if (info !== undefined) {
           runtime.setParent(sessionID, readField(info, "parentID"));
           noteSessionDirectory(scope, sessionID, readString(readField(info, "location"), "directory"));
+          root = !runtime.isChild(sessionID);
+        } else if (runtime.isChild(sessionID)) {
+          return;
+        } else if (typeof text === "string" && text.startsWith(SUBAGENT_PROMPT_PREFIX)) {
+          return;
+        } else {
+          root = sessionID !== "" && scope.confirmedRoots.has(sessionID);
         }
         const model = readField(info, "model");
         const providerID = readString(model, "providerID");
@@ -774,6 +807,12 @@ export function registerV2Enforcement(
 
         const message = await decidePrompt(input, output, { runtime, record: record() });
         if (message === undefined) return;
+        if (!root) {
+          // Not known to be a root: the host did not say. A subagent prompt must never be replaced,
+          // so this one is left as it is and the would-be block is reported.
+          runtime.reportSignal(SIGNAL_V2_NOT_ENFORCING, "prompt", "parent_unknown");
+          return;
+        }
         if (capabilities.prompt === "block") {
           const target = prompt as Record<string, unknown>;
           target.text = promptBlockNotice(message);
