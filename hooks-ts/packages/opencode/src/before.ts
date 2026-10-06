@@ -12,14 +12,20 @@
 //     sends `filePath` as `metadata.file_path` and a differing `path` stays visible in `tool_input`;
 //   * `grep` / `glob`: `path` (defaults to cwd) plus `pattern` / `include`;
 //   * `apply_patch`: ONE request per header path (`{filePath: target}`), at most
-//     `PATCH_CONCURRENCY` in flight, strictest verdict wins (T-13-22); a patch naming more than
-//     `MAX_PATCH_TARGETS` files is blocked without a request (13-REVIEW BL-02).
+//     `PATCH_CONCURRENCY` in flight, strictest verdict wins (T-13-22), all under ONE shared
+//     deadline (13-REVIEW WR-02); a patch naming more than `MAX_PATCH_TARGETS` files is blocked
+//     without a request (13-REVIEW BL-02).
 //
 // `output.args` is only read and digested here, never reassigned or mutated (Pitfall 5): the digest
 // is compared with the executed args in 13-06 (HOOK-18).
 
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
-import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
+import {
+  EVALUATE_DEADLINE_ERROR_CLASS,
+  EVALUATE_DEADLINE_SLACK_MS,
+  NO_KEY_NOTICE,
+  PRETOOL_TIMEOUT_MS,
+} from "../../core/src/constants.ts";
 import { evaluateToolCall, noteSafe } from "../../core/src/evaluate.ts";
 import type { EvaluateDeps, ToolCallInput, ToolEvaluation } from "../../core/src/evaluate.ts";
 import { block } from "./block.ts";
@@ -54,6 +60,8 @@ export interface BeforeContext {
 }
 
 const APPLY_PATCH_TOOL = "apply_patch";
+/** `setTimeout` treats a larger delay as 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
 
 /** Why an `apply_patch` naming more files than `MAX_PATCH_TARGETS` is refused (13-REVIEW BL-02). */
 export const PATCH_TOO_LARGE_REASON =
@@ -78,21 +86,89 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Run `fn` over `items` with at most `limit` in flight; results in input order. Total. */
-async function mapBounded<T, R>(items: readonly T[], limit: number, fn: (item: T) => Promise<R>): Promise<R[]> {
-  const results: R[] = new Array<R>(items.length);
+/** What `fanOut` needs besides the checks themselves. */
+interface FanOutDeps {
+  /** The ONE deadline for the whole fan-out; resolved like core's per-check deadline. */
+  deadlineMs: number | undefined;
+  /** The org's last-known `policy_check_failure_action` (`"block"` = fail-closed). */
+  failureAction(): string | undefined;
+  /** Where an expired fan-out is reported, like core reports an expired single check. */
+  telemetry: EvaluateDeps["telemetry"];
+  /** Receives the one audit entry an expired fan-out leaves. */
+  onDecision: EvaluateDeps["onDecision"];
+  /** The checker label (`toolName`) and the call id the expiry is reported and recorded under. */
+  label: string;
+  callID: string;
+}
+
+/** Core's per-check deadline rule: a positive finite override, else `PRETOOL_TIMEOUT_MS` + slack. */
+function fanOutDeadlineMs(raw: number | undefined): number {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.min(raw, MAX_TIMER_MS);
+  return PRETOOL_TIMEOUT_MS + EVALUATE_DEADLINE_SLACK_MS;
+}
+
+/**
+ * Run the checks for `items` (at most `limit` in flight) under ONE shared deadline and return the
+ * strictest verdict (13-REVIEW WR-02). Without the shared deadline every check carried its own 20 s
+ * bound, so a slow gateway could hold a 200-file patch for about ⌈200 / 8⌉ × 20 s.
+ *
+ * On expiry no further check is started, and the answer is the strictest of the verdicts already in
+ * plus the org's failure action for the rest: `unavailable` for a fail-closed org, else `allow`. A
+ * deny that already arrived therefore still blocks. The expiry is reported as core reports an expired
+ * single check (`reportBypass`, `EvaluateDeadline`, `blocked` for a fail-closed org) and recorded once.
+ * Total: resolves for any input.
+ */
+async function fanOut<T>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<ToolEvaluation>,
+  deps: FanOutDeps,
+): Promise<ToolEvaluation> {
+  const results: ToolEvaluation[] = [];
   let next = 0;
+  let expired = false;
   const worker = async (): Promise<void> => {
-    while (next < items.length) {
+    while (!expired && next < items.length) {
       const index = next;
       next += 1;
-      results[index] = await fn(items[index] as T);
+      const verdict = await fn(items[index] as T).catch((): ToolEvaluation => ({ kind: "allow" }));
+      if (!expired) results.push(verdict);
     }
   };
+  const deadlineMs = fanOutDeadlineMs(deps.deadlineMs);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  // Not unref'd, like core's own deadline: while a check is outstanding this timer IS the bound.
+  const timedOut = new Promise<"timed-out">((resolve) => {
+    timer = setTimeout(() => resolve("timed-out"), deadlineMs);
+  });
   const workers: Promise<void>[] = [];
   for (let i = 0; i < Math.max(1, Math.min(limit, items.length)); i += 1) workers.push(worker());
-  await Promise.all(workers);
-  return results;
+  const done = Promise.all(workers).then(() => "done" as const, () => "done" as const);
+  const raced = await Promise.race([done, timedOut]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (raced === "done") return strictest(results);
+
+  expired = true;
+  const blocked = deps.failureAction() === "block";
+  const rest: ToolEvaluation = blocked ? { kind: "unavailable" } : { kind: "allow" };
+  noteSafe(() =>
+    deps.telemetry?.reportBypass({
+      errorClass: EVALUATE_DEADLINE_ERROR_CLASS,
+      toolName: deps.label,
+      elapsedMs: deadlineMs,
+      blocked,
+    }),
+  );
+  const verdict = strictest([...results, rest]);
+  noteSafe(() =>
+    deps.onDecision?.({
+      tool_name: deps.label,
+      tool_use_id: deps.callID,
+      decision: verdict.kind,
+      tool_input: auditToolInput({}, "", OPENCODE_PROFILE.extraToolInputKeys),
+    }),
+  );
+  return verdict;
 }
 
 /**
@@ -208,21 +284,31 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
         if (message !== undefined) void notify(record.client, message, "error");
         return message;
       }
-      const verdicts = await mapBounded(targets, PATCH_CONCURRENCY, (target) =>
-        evaluateToolCall(
-          {
-            toolName: APPLY_PATCH_TOOL,
-            toolCallId: callID,
-            command: "",
-            toolInput: { filePath: target },
-            cwd: directory,
-            sessionId: sessionID,
-            model,
-          },
-          evalDeps,
-        ),
+      verdict = await fanOut(
+        targets,
+        PATCH_CONCURRENCY,
+        (target) =>
+          evaluateToolCall(
+            {
+              toolName: APPLY_PATCH_TOOL,
+              toolCallId: callID,
+              command: "",
+              toolInput: { filePath: target },
+              cwd: directory,
+              sessionId: sessionID,
+              model,
+            },
+            evalDeps,
+          ),
+        {
+          deadlineMs,
+          failureAction: () => scope.policy.getFailureAction(),
+          telemetry: resolved.telemetry,
+          onDecision: evalDeps.onDecision,
+          label: APPLY_PATCH_TOOL,
+          callID,
+        },
       );
-      verdict = strictest(verdicts);
     } else {
       const call: ToolCallInput = {
         toolName: tool,

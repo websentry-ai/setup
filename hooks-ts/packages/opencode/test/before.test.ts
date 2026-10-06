@@ -13,12 +13,14 @@ import { PATCH_TOO_LARGE_REASON } from "../src/before.ts";
 import { createServerPlugin } from "../src/plugin.ts";
 import type { Deps } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage, blockingMessage, strictest } from "../src/verdicts.ts";
+import { createScopedStates } from "../../core/src/scopedState.ts";
 import {
   makeDeps,
   makeFakeInput,
   pretoolRequests,
   signalsOf,
   startOpencodeMock,
+  TEST_KEY,
   tick,
   waitFor,
 } from "./helpers/fakeHost.ts";
@@ -272,6 +274,76 @@ test("apply_patch naming exactly 1024 files is checked file by file", async () =
     lines.push("*** End Patch");
     assert.equal(await outcome(h.before(call("apply_patch"), { args: { patchText: lines.join("\n") } })), undefined);
     assert.equal(seen.length, 1024);
+  } finally {
+    h.cleanup();
+  }
+});
+
+/** A patch naming `n` junk files, optionally with `.env` first. */
+function junkPatch(n: number, envFirst = false): string {
+  const lines = ["*** Begin Patch"];
+  if (envFirst) lines.push("*** Update File: .env", "@@", "-A=1", "+A=2");
+  for (let i = 0; i < n; i += 1) lines.push(`*** Add File: junk/${i}.txt`, "+x");
+  lines.push("*** End Patch");
+  return lines.join("\n");
+}
+
+/** Denies `.env` at once and never answers for any other file. */
+function hangingChecker(seen: PretoolRequestBody[]): PolicyChecker {
+  return {
+    checkTool(payload: PretoolRequestBody) {
+      seen.push(payload);
+      const filePath = (payload.pre_tool_use_data.metadata as Record<string, unknown>).file_path;
+      if (typeof filePath === "string" && filePath.endsWith(".env")) {
+        return Promise.resolve({ kind: "deny", reason: "No env edits." });
+      }
+      return new Promise(() => {});
+    },
+  };
+}
+
+test("apply_patch: one shared deadline bounds the whole fan-out and fails open (WR-02)", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const h = await harness("allow", { deps: { makeChecker: () => hangingChecker(seen), deadlineMs: 200 } });
+  try {
+    const started = Date.now();
+    const message = await outcome(h.before(call("apply_patch", "ses_d", "call_d"), { args: { patchText: junkPatch(40) } }));
+    const elapsed = Date.now() - started;
+    assert.equal(message, undefined, "a cold (fail-open) org allows on expiry");
+    // Per-check deadlines alone would take ⌈40 / 8⌉ × 200 ms = 1 s.
+    assert.ok(elapsed < 600, `bounded by one deadline, took ${elapsed} ms`);
+    assert.ok(seen.length < 40, `no new check after expiry (${seen.length} started)`);
+    assert.ok(
+      await waitFor(() => signalsOf(mock, "bypassed_due_to_failure").some((r) => JSON.stringify(r.body).includes("apply_patch"))),
+      "the expiry is reported as a fail-open bypass for apply_patch",
+    );
+    const turn = h.server.inspect.turn("ses_d");
+    assert.ok(turn.tool_calls.some((c) => c.tool_name === "apply_patch" && c.decision === "allow"), "expiry recorded");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("apply_patch: a deny that arrived before the shared deadline still blocks (WR-02)", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const h = await harness("allow", { deps: { makeChecker: () => hangingChecker(seen), deadlineMs: 200 } });
+  try {
+    const message = await outcome(h.before(call("apply_patch"), { args: { patchText: junkPatch(20, true) } }));
+    assert.equal(message, `${DENY_PREFIX}No env edits.`);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("apply_patch: a fail-closed org blocks on the shared deadline and reports a blocked failure (WR-02)", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const scopes = createScopedStates();
+  scopes.forScope(mock.url, TEST_KEY).policy.recordSuccess({ policy_check_failure_action: "block" } as never);
+  const h = await harness("allow", { deps: { makeChecker: () => hangingChecker(seen), deadlineMs: 200, scopes } });
+  try {
+    const message = await outcome(h.before(call("apply_patch"), { args: { patchText: junkPatch(20) } }));
+    assert.equal(message, ENGINE_UNAVAILABLE_REASON);
+    assert.ok(await waitFor(() => signalsOf(mock, "blocked_due_to_failure").length >= 1));
   } finally {
     h.cleanup();
   }
