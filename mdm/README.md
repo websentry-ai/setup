@@ -8,6 +8,8 @@ Runs all five MDM setup steps for an admin device enrollment in one shot:
 4. **GitHub Copilot** MDM setup
 5. **Coding-discovery** scan (separate repo)
 
+**Pi Coding Agent** MDM setup also runs, before the discovery scan, but only when pi is detected on the device: the `pi` binary on `PATH`, in a machine bin directory or in any user's bin directories, or `.pi/agent/auth.json` / `.pi/agent/sessions` in any user's home. A device without pi skips the step; that is reported as skipped, not as a failure. Every other tool installs unconditionally. This applies on Windows too, since `onboard.ps1` forwards to `onboard.py`. `--clear` / `-Clear` always runs Pi's clear step, because a device whose pi was uninstalled still carries the extension and the key export.
+
 Every step uses `--api-key` (the admin MDM key). The discovery scan authenticates as the device's owner, whose key is resolved from the hardware serial, so no separate discovery key is needed. `--discovery-key` / `-DiscoveryKey` is still accepted so existing MDM policies keep working, but it is ignored.
 
 Each step runs in its own subprocess; a failure in one does not abort the others. A summary at the end lists which steps succeeded and which failed.
