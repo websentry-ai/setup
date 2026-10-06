@@ -53,6 +53,8 @@ export const SIGNAL_PATCH_TARGETS_CAPPED = "patch_targets_capped";
 export const SIGNAL_V2_STATUS = "v2_status";
 /** A v2 capability runs audit-only (its verdict was NO-GO); reported once per process. */
 export const SIGNAL_V2_NOT_ENFORCING = "v2_not_enforcing";
+/** A v2 user prompt would have been blocked but the prompt capability is warn-only; once per session. */
+export const SIGNAL_V2_PROMPT_WARN_ONLY = "v2_prompt_warn_only";
 
 // --- v2 capabilities (14-SPIKES.md `## Verdicts`, @opencode/cli 2.0.22) --------------------------
 

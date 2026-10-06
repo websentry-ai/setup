@@ -38,16 +38,20 @@ import type { BeforeDecision } from "./before.ts";
 import { block } from "./block.ts";
 import {
   SIGNAL_V2_NOT_ENFORCING,
+  SIGNAL_V2_PROMPT_WARN_ONLY,
   V2_CAPABILITIES,
 } from "./constants.ts";
 import type { V2Capabilities } from "./constants.ts";
 import type {
   V2ContextLike,
   V2PermissionEvaluate,
+  V2SessionInfo,
+  V2SessionPrompt,
   V2ToolBefore,
 } from "./hostTypesV2.ts";
 import { mcpCandidates } from "./narrow.ts";
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
+import { decidePrompt } from "./prompt.ts";
 import { APPROVAL_PREFIX } from "./verdicts.ts";
 
 /** v2's shell tool (v1 `bash`). */
@@ -75,12 +79,20 @@ export const V2_BUILTIN_TOOLS: ReadonlySet<string> = new Set([
 
 /** The most call decisions kept per registration; the oldest is dropped first. */
 const MAX_PENDING_CALLS = 1024;
+/** How long the prompt hook waits for `ctx.session.get` before falling back (it answered in ~6 ms). */
+const SESSION_GET_TIMEOUT_MS = 1_000;
 /** How long a non-built-in call waits for the host's MCP server list before it is checked anyway. */
 const MCP_LIST_TIMEOUT_MS = 1_000;
 /** At most one awaited MCP server-list read per directory in this window. */
 const MCP_LIST_INTERVAL_MS = 10_000;
+/** The most sessions remembered for the once-per-session warn-only report. */
+const MAX_WARNED_SESSIONS = 1024;
 
 const APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
+const PROMPT_BLOCK_TAIL =
+  "(Unbound replaced the user's message because a policy blocked it; the original was not sent. " +
+  "Tell the user their message was blocked by Unbound policy and do nothing else.)";
+
 function readField(value: unknown, key: string): unknown {
   try {
     if (value === null || typeof value !== "object") return undefined;
@@ -112,6 +124,12 @@ export function nativeApprovalMessage(reason?: unknown): string {
   } catch {
     return `${APPROVAL_PREFIX}. ${APPROVAL_NATIVE_TAIL}`;
   }
+}
+
+/** The text a blocked prompt is replaced with (HV2-05): the verdict, then what the model should do. */
+export function promptBlockNotice(message: string): string {
+  const text = typeof message === "string" && message !== "" ? message : "Blocked by Unbound policy.";
+  return `${text}\n\n${PROMPT_BLOCK_TAIL}`;
 }
 
 /**
@@ -207,6 +225,7 @@ export function registerV2Enforcement(
   try {
     const directory = readString(readField(ctx, "location"), "directory");
     const pending = new Map<string, PendingCall>();
+    const warned = new Set<string>();
 
     const keyOf = (sessionID: string, callID: string): string => `${sessionID}\u0000${callID}`;
     const remember = (key: string, call: PendingCall): void => {
@@ -314,6 +333,65 @@ export function registerV2Enforcement(
       }
     };
 
+    /** The session info (`parentID`, `model`) for a prompt, bounded; `undefined` when unknown. */
+    const sessionInfo = async (sessionID: string): Promise<V2SessionInfo | undefined> => {
+      try {
+        const session = ctx.session;
+        const get = readField(session, "get");
+        if (typeof get !== "function" || sessionID === "") return undefined;
+        const answer = await bounded(
+          Promise.resolve((get as (this: unknown, input: unknown) => unknown).call(session, { sessionID })),
+          SESSION_GET_TIMEOUT_MS,
+        );
+        return answer !== null && typeof answer === "object" ? (answer as V2SessionInfo) : undefined;
+      } catch {
+        return undefined;
+      }
+    };
+
+    /** The prompt check (HV2-05). Mutates the prompt only on a would-block verdict. Total. */
+    const handlePrompt = async (event: V2SessionPrompt): Promise<void> => {
+      try {
+        const sessionID = readString(event, "sessionID");
+        const prompt = readField(event, "prompt");
+        const text = readField(prompt, "text");
+        // Root vs child (14-SPIKES child-session probe): a child's prompt fires BEFORE its
+        // `session.created`, so the parent comes from `ctx.session.get`; `runtime.isChild` (filled
+        // from events) is the fallback inside `decidePrompt`.
+        const info = await sessionInfo(sessionID);
+        if (info !== undefined) runtime.setParent(sessionID, readField(info, "parentID"));
+        const model = readField(info, "model");
+        const providerID = readString(model, "providerID");
+        const modelID = readString(model, "id");
+        const input =
+          providerID !== "" && modelID !== "" ? { sessionID, model: { providerID, modelID } } : { sessionID };
+        const output = { parts: typeof text === "string" ? [{ type: "text", text }] : [] };
+
+        const message = await decidePrompt(input, output, { runtime, record: record() });
+        if (message === undefined) return;
+        if (capabilities.prompt === "block") {
+          const target = prompt as Record<string, unknown>;
+          target.text = promptBlockNotice(message);
+          if ("files" in target) target.files = [];
+          if ("agents" in target) target.agents = [];
+          if ("skills" in target) target.skills = [];
+          return;
+        }
+        // Warn-only: checked and reported, never blocked; once per session.
+        if (sessionID !== "" && !warned.has(sessionID)) {
+          warned.add(sessionID);
+          while (warned.size > MAX_WARNED_SESSIONS) {
+            const oldest = warned.values().next().value;
+            if (oldest === undefined) break;
+            warned.delete(oldest);
+          }
+          runtime.reportSignal(SIGNAL_V2_PROMPT_WARN_ONLY, "prompt", "would_block");
+        }
+      } catch {
+        // Allow.
+      }
+    };
+
     const tool = ctx.tool;
     if (tool !== undefined && typeof tool.hook === "function") {
       // The raise happens outside the decision's guard, and only with a verdict message.
@@ -327,6 +405,12 @@ export function registerV2Enforcement(
     const permission = ctx.permission;
     if (permission !== undefined && typeof permission.hook === "function") {
       void Promise.resolve(permission.hook("evaluate", (event: V2PermissionEvaluate) => applyEvaluate(event))).catch(
+        () => undefined,
+      );
+    }
+    const session = ctx.session;
+    if (session !== undefined && typeof session.hook === "function") {
+      void Promise.resolve(session.hook("prompt", (event: V2SessionPrompt) => handlePrompt(event))).catch(
         () => undefined,
       );
     }
