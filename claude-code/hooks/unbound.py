@@ -4850,6 +4850,11 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         if not all(_safe_skill_segment(segment) for segment in segments):
             return None
 
+        # A Cowork run loads skills from Claude Desktop's own tree, never from Claude Code's dirs.
+        session = _desktop_session_dir({'cwd': cwd}) if cwd else None
+        if session is not None:
+            return _cowork_skill_path(name, session)
+
         # Plugin skills ("<plugin>:<name>") live outside the project tree.
         if prefix and '/' not in prefix:
             plugins_dir = CLAUDE_PLUGIN_CACHE_DIR.parent
@@ -4906,6 +4911,17 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
     except Exception:
         return None
+
+
+def _cowork_skill_path(name: str, session: Path) -> Optional[str]:
+    """The SKILL.md a Cowork run used: the newest copy in its org's plugins or the
+    skills bundle, which is the copy the discovery scanner reports for the name."""
+    root = session.parent.parent.parent
+    candidates = list(session.parent.glob('rpm/**/skills/%s/SKILL.md' % name))
+    candidates += list((root / 'skills-plugin').glob('**/skills/%s/SKILL.md' % name))
+    if not candidates:
+        return None
+    return str(max(candidates, key=lambda c: (c.stat().st_mtime, str(c))))
 
 
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
