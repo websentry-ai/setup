@@ -17,34 +17,41 @@ unless a row says otherwise.
 - The installer never writes an opencode config file (`opencode.json` and friends stay untouched).
 - `server()` does no I/O. The API key, gateway URL and policy cache are resolved lazily on the
   first hook call. A fault while the plugin starts gives an allow-everything hook set that reports
-  `init_degraded`; it never loads silently empty.
+  `init_degraded`; it never loads silently empty. A fault while resolving the key, gateway or
+  checker on a hook call allows the call, shows its own notice ("could not start"), reports
+  `init_degraded` (detail `resolve_fault`) once, and is retried after a few seconds.
 - Without an Unbound API key the plugin sends nothing and shows one notice per project directory.
+  It looks for a key again about every 30 s, so a key added later takes effect without a restart.
 
 ## Enforced on opencode 1.18.x (v1)
 
 | What | How it behaves |
 |---|---|
-| Every model-issued tool call (`tool.execute.before`) | Evaluated by the Unbound policy engine before it runs. Built-in shell and file tools (`bash`, `read`, `write`, `edit`, `grep`, `glob`, `lsp`), custom tools and MCP tools all go through the same path. |
-| MCP tools | Attributed to a server by the longest configured MCP server-name prefix (or the call's own server argument for resource tools), never by splitting the tool id. A non-built-in tool that matches no configured server is reported as `mcp_attribution_miss`. |
+| Model-issued shell and file tools (`tool.execute.before`) | `bash` and the file tools `read`, `write`, `edit`, `grep`, `glob`, `lsp` and `apply_patch` are evaluated by the Unbound policy engine before they run. |
+| MCP tools | Sent for evaluation with an explicit server and tool, attributed by the configured (or live, `client.mcp.status()`) MCP server names, or by the call's own server argument for resource tools; never by splitting the tool id. When more than one configured server could have produced the tool id (sanitised names can collide), the call is checked once per candidate server and the strictest verdict wins; this is reported as `mcp_attribution_ambiguous`. A non-built-in tool that matches no known server is still sent, with its raw id and no MCP attribution, and reported as `mcp_attribution_miss` (also when no MCP server is configured). |
+| Custom (plugin-defined) tools | Sent with their raw tool id and no MCP attribution. The server has no evaluation path for them today: it logs the call (an attribution miss) and allows it. So a custom tool runs unchecked, but it is visible server-side. |
+| `webfetch`, `websearch`, `skill` | **Not sent.** The server has no evaluation path for these tools under `opencode`, so a URL-fetch or search policy cannot apply to them. They run unchecked. The same holds for `todowrite`, `question`, `plan_exit`, `invalid` and the outer Code Mode `execute` call (the MCP calls made inside it are checked one by one). |
 | Tools inside subagents | A subagent's own tool calls are checked like the root session's. |
-| `apply_patch` | Checked once per file named in the patch; the strictest verdict wins. |
+| `apply_patch` | Checked once per file named in the patch; the strictest verdict wins. All the per-file checks of one call share a single deadline (see below). A patch that names more than 1024 files is blocked without a check ("patch too large to verify"). |
 | Deny | The model receives the deny text verbatim: `Blocked by Unbound policy: <reason>` (spike V1-1). The turn continues and the model can explain or choose another approach. A toast shows the same text. |
 | Approval required | Blocked with its own approval sentence: v1 has no native approval prompt, so the action does not run and the model is told to ask an Unbound admin. |
-| Root-session user prompts (`chat.message`) | The non-synthetic text the user typed is checked before it is persisted or sent to the model (spike V1-5). On a block the reason is toasted first. Host-generated (`synthetic`) text and prompts in subagent sessions are not checked. **Caveat:** `opencode run` and synchronous API callers see only a generic `Unexpected server error`; the reason is in the toast and the server log. |
+| Root-session user prompts (`chat.message`) | The non-synthetic text the user typed is checked before it is persisted or sent to the model (spike V1-5). A slash command that runs as a subtask arrives as the command template with the user's arguments filled in, and that text is checked the same way. On a block the reason is toasted first. Host-generated (`synthetic`) text and prompts in subagent sessions are not checked. **Caveat:** `opencode run` and synchronous API callers see only a generic `Unexpected server error`; the reason is in the toast and the server log. |
 | User `!cmd` (`shell.env`) | Checked through the same path as a model `bash` call (spike V1-7). The command is recovered from the bash part opencode persists just before it spawns the shell. A model bash call that already passed `tool.execute.before` is never checked twice. **Caveats:** the HTTP caller gets a generic 500 `UnknownError`; the session transcript records the blocked command as `completed` with empty output (it did not run); TUI rendering of a blocked `!cmd` is not yet human-verified. A `shell.env` call that finds no bash part to check is allowed and reported as `user_shell_unchecked`. |
 | `task` (subagent launch) | Audited, never denied: a deny there would strand the subtask. Each tool call inside the subagent is enforced on its own. |
-| Unreachable or failing Unbound API | **Fail-open**: the call is allowed and the bypass is reported. Each check is bounded by a 20 s deadline; after repeated failures a per-gateway breaker opens and later calls skip the request for a while (one notice). |
+| Unreachable or failing Unbound API | **Fail-open**: the call is allowed and the bypass is reported. Each tool call's check is bounded by a 20 s deadline. That deadline is the plugin's own: opencode 1.18.x puts no time limit on a plugin hook (spike V1-3). An `apply_patch` (one check per file) or an ambiguous MCP call (one check per candidate server) runs all its checks under one shared deadline; on expiry no further check starts, a deny already received still blocks, and otherwise the org's failure action decides. After repeated failures a per-gateway breaker opens and later calls skip the request for a while (one notice). |
 | Fail-closed orgs | When the org's last successful response asked for `policy_check_failure_action: block`, a failed check blocks with `Unbound policy engine unavailable — please retry`. |
 | Revoked API key | One notice; after that the plugin stops every request (checks, audits, turn logs, signals) for that key. |
 
 ## Recorded
 
-- **Tool results, hash-only.** Every tool result (successful, failed or blocked) is recorded once per
-  call as a sha256 plus byte count. Tool output never leaves the device in clear; it is never logged
-  locally either.
+- **Tool results, hash-only.** Every model-issued tool result (successful, failed or blocked) is
+  recorded once per call as a sha256 plus byte count. Tool output never leaves the device in clear;
+  it is never logged locally either. The result of a user `!cmd` is not recorded (the check of the
+  command is).
 - **Turn log.** When a root session goes idle, one turn log is posted (model `auto`) with the prompt,
   the tool calls of the turn including those made inside its subagents, and the assistant's text.
-  Subagent idles post nothing; a deleted session's pending state is dropped, not posted.
+  The turn log carries the user prompt and the assistant's text in clear (capped). Subagent idles
+  post nothing; a deleted session's pending state is dropped, not posted.
 - **Heartbeat.** On a new root session, at most once per project directory per cache TTL, carrying
   the opencode version (`metadata.opencode_version`). Requests use `client_entrypoint`
   `opencode/<version>` once the version is known.
@@ -60,7 +67,7 @@ unless a row says otherwise.
 |---|---|
 | User `!cmd` | **Enforced** (see above), with the documented caveats. |
 | `` !`cmd` `` inside custom command templates | Not hooked. Template shell expansion does not go through a hook the plugin can block. |
-| The integrated terminal (PTY) | Not hooked. Commands typed into a PTY session are invisible to plugins. |
+| The integrated terminal (PTY) | Not hooked. Opening a PTY fires `shell.env` with only a working directory (no session, no command), which the plugin ignores; the commands typed into it are invisible to plugins. |
 | Processes opencode starts from config | Not hooked: MCP server processes, LSP servers and formatters are spawned from configuration, not as tool calls. The MCP *tool calls* themselves are enforced. |
 | Remote `opencode attach` | Plugins run where the opencode server runs. Install the plugin on the server host; a client that attaches remotely is covered only if the server has it. |
 | opencode v2 (desktop / CLI 2.x) | The `setup` entry is present but **inactive** in this line: nothing is enforced on a v2 host. When it detects a v2 host it reports `api_family_inactive`. On a 1.18.x host, which also calls `setup`, it stays silent because the v1 `server` entry is the active one. |
@@ -74,6 +81,8 @@ unless a row says otherwise.
 | `XDG_CONFIG_HOME`, `HOME` or `OPENCODE_CONFIG_DIR` pointing elsewhere | opencode looks for global plugins in a different directory, so an installed `plugins/unbound.js` is not loaded (source-read; not live-verified). |
 | `OPENCODE_PERMISSION` | Changes opencode's own permission rules (for example, turning its approval prompts off). Not a bypass of Unbound checks, which run regardless, but it removes opencode's own second line of defence. |
 | Another plugin changing tool arguments after the Unbound check | Not prevented. Detected after execution and reported as `args_changed_after_check`. |
+| Project-level plugins from a cloned repository (`.opencode/plugins/`) | opencode loads them automatically, in the same process as the Unbound plugin. They can change tool arguments after the check, or otherwise interfere with it. A value planted in the plugin's double-load slot does not switch enforcement off: the plugin keeps enforcing and reports `sentinel_tampered`. Only a forged copy of the exact installed build's marker (which means reading the installed file) makes it stand down as a duplicate. |
+| API key changes | A key that changes or is removed while opencode runs takes effect only after an opencode restart. (A key added where none was found is picked up within about 30 s.) |
 | A hook that fails or times out | Fail-open by design (except fail-closed orgs). This is the general limitation of hook-based enforcement, not specific to opencode. |
 
 ## Signals
@@ -87,10 +96,12 @@ them blocks anything.
 | `bypassed_due_to_failure` | A check failed (timeout, connection error, non-2xx, unparseable body) and the call was allowed. |
 | `blocked_due_to_failure` | A check failed for a fail-closed org and the call was blocked. |
 | `turn_log_failed` | The turn log for an idle root session could not be posted. |
-| `duplicate_load` | A second copy of the plugin loaded into the same process (for example one in `plugin/` and one in `plugins/`). The second copy does nothing. |
-| `init_degraded` | The plugin factory faulted; the allow-everything hook set is serving. |
-| `mcp_attribution_miss` | A non-built-in tool matched no configured MCP server name. |
-| `patch_targets_capped` | An `apply_patch` named more files than the per-call cap; files past the cap were not checked. |
+| `duplicate_load` | A second copy of the same plugin build loaded into the same process (for example one in `plugin/` and one in `plugins/`). The second copy does nothing. |
+| `sentinel_tampered` | The double-load slot held something other than a copy of this build (a planted value, an accessor, another build). The plugin keeps enforcing. |
+| `init_degraded` | The plugin factory faulted and the allow-everything hook set is serving (detail `factory_fault`), or resolving the key, gateway or checker faulted and is being retried (detail `resolve_fault`). |
+| `mcp_attribution_miss` | A non-built-in tool matched no known MCP server name; it was sent without MCP attribution. |
+| `mcp_attribution_ambiguous` | More than one configured MCP server could have produced the tool id; the call was checked once per candidate. |
+| `patch_targets_capped` | An `apply_patch` named more files than the per-call cap (1024); the call was blocked. |
 | `args_changed_after_check` | A tool's arguments at execution differed from the ones checked. |
 | `user_shell_unchecked` | `shell.env` fired for a call with no bash part to check (detail `no_part`); the command was allowed. |
 | `api_family_inactive` | The v2 entry was loaded on a v2 host, where this line enforces nothing. |
