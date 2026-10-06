@@ -4,7 +4,7 @@
 //
 //   * opencode 1.18.x embeds the v2 core plugin host and calls `setup(ctx)` once per process, in the
 //     SAME process where the v1 `server` entry is the one enforcing. Its ctx has no `tool`,
-//     `permission` or `session` key. On that host this function is a pure no-op: no report, no I/O,
+//     `permission`, `session` or `event` key; activation needs all four. On that host this function is a pure no-op: no report, no I/O,
 //     no interaction with the `server` sentinel (Phase 13 rule, unchanged).
 //   * `@opencode/cli` 2.x calls `setup(ctx)` once per directory and never calls `server`. There it
 //     registers the decision handlers (v2Enforce.ts: tool calls through `permission.evaluate`, native
@@ -84,11 +84,18 @@ export function v2StatusDetail(capabilities: V2Capabilities): string {
   ].join("/");
 }
 
-/** Does this ctx come from a real v2 host (not 1.18's embedded core host)? Total. */
+/** The ctx domains a real v2 host passes and 1.18's embedded core host lacks (14-SPIKES HV2-01). */
+const V2_CONTEXT_KEYS = ["tool", "permission", "session", "event"] as const;
+
+/**
+ * Does this ctx come from a real v2 host (not 1.18's embedded core host)? All of `tool`,
+ * `permission`, `session` and `event` must be present (14-SPIKES Decision HV2-01): a 1.18.x ctx that
+ * ever gained one of them must stay inert next to the v1 `server` entry. Total.
+ */
 function isV2Context(ctx: unknown): boolean {
   try {
     if (ctx === null || typeof ctx !== "object") return false;
-    return ("tool" in ctx && "permission" in ctx) || "session" in ctx;
+    return V2_CONTEXT_KEYS.every((key) => key in ctx);
   } catch {
     return false;
   }

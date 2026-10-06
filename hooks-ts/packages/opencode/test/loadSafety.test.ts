@@ -488,7 +488,14 @@ test("setup is inert on a 1.18 ctx and on garbage: resolves undefined, reports n
   const t = makeDeps(mock);
   try {
     const setup = createSetupV2({ ...t.deps, sentinelKey: Symbol("v2-test") });
-    for (const ctx of [null, undefined, {}, 42, v118Ctx(), hostile()]) {
+    // IN-02: a ctx with only some of the v2 domains (e.g. a 1.18.x that gained one) stays inert too.
+    const partial = [
+      { ...v118Ctx(), session: {} },
+      { ...v118Ctx(), tool: {}, permission: {} },
+      { ...v118Ctx(), tool: {}, permission: {}, session: {} },
+      { ...v118Ctx(), session: {}, event: {} },
+    ];
+    for (const ctx of [null, undefined, {}, 42, v118Ctx(), hostile(), ...partial]) {
       const pending = setup(ctx);
       assert.ok(pending instanceof Promise);
       assert.equal(await pending, undefined);
@@ -503,7 +510,7 @@ test("setup is inert on a 1.18 ctx and on garbage: resolves undefined, reports n
 
 test("setup on a v2 ctx reports one v2_status per process, never api_family_inactive", async () => {
   // 14-CONTEXT: the `api_family_inactive` report is replaced by the per-capability `v2_status`.
-  for (const ctx of [{ ...v118Ctx(), tool: {}, permission: {} }, { session: {} }]) {
+  for (const ctx of [{ ...v118Ctx(), tool: {}, permission: {}, session: {}, event: {} }, { tool: {}, permission: {}, session: {}, event: {} }]) {
     resetMock();
     const t = makeDeps(mock);
     const sentinelKey = Symbol("v2-test");
@@ -541,7 +548,7 @@ test("setup does not claim or disturb the server sentinel", async () => {
   try {
     const setupKey = Symbol("v2-test");
     const setup = createSetupV2({ ...t.deps, sentinelKey: setupKey });
-    await setup({ tool: {}, permission: {} });
+    assert.equal(typeof (await setup({ tool: {}, permission: {}, session: {}, event: {} })), "function", "active");
     const hooks = hooksOf(await createServerPlugin(t.deps)(makeFakeInput({ directory: "/repo" }).input));
     assert.equal(typeof hooks.config, "function");
     await tick(50);
