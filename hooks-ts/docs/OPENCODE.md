@@ -15,7 +15,18 @@ unless a row says otherwise; the **v2 line (opencode desktop / CLI 2.0.x)** has 
 - Installed as one file:
   `${OPENCODE_CONFIG_DIR:-${XDG_CONFIG_HOME:-~/.config}/opencode}/plugins/unbound.js`.
   opencode loads plugins at startup, so a **restart is required** after install or update.
-- The installer never writes an opencode config file (`opencode.json` and friends stay untouched).
+- The per-user installer never writes an opencode config file (`opencode.json` and friends stay
+  untouched). The MDM installer additionally writes one plugin entry into opencode's
+  system-managed `opencode.json` on 1.x. That entry references a root-owned copy of the plugin, so
+  every account on the machine loads it.
+- **Managed and per-user copy side by side (1.x).** Both copies load in every opencode process, and
+  the seat is enforced either way:
+  - When they are the same build, one copy enforces and the other stands down. The second copy
+    reports `duplicate_load` once per process (an informational signal, not an alert).
+  - When a later per-user install puts a newer build next to an older managed copy, both copies
+    enforce, so each call is checked twice. `duplicate_load` with detail `other_build` is reported
+    instead of `sentinel_tampered`. This lasts until the next MDM push brings the managed copy to
+    the same build.
 - `server()` does no I/O. The API key, gateway URL and policy cache are resolved lazily on the
   first hook call. A fault while the plugin starts gives an allow-everything hook set that reports
   `init_degraded`; it never loads silently empty. A fault while resolving the key, gateway or
