@@ -56,9 +56,12 @@ TOOL_USER_HOOKS_DIR = {
     "augment": ".augment/hooks",
 }
 STALE_HOOK_FILES = ("unbound.py", ".self_update_check", ".self_update.lock")
-# Copilot's serving path (unbound.py, referenced by unbound.json) is replaced
-# by its adapter post-write; the sweep only clears its self-update state.
-COPILOT_SWEEP_FILES = (".self_update_check", ".self_update.lock")
+# Tools whose adapter rewrites the user-level hook in place: copilot replaces
+# unbound.py after writing unbound.json, and codex's binary install IS
+# ~/.codex/hooks/unbound.py + its hooks.json entry. The sweep must not strip
+# either, or every setup run sees the hook missing and reports codex tampered.
+IN_PLACE_TOOLS = ("copilot", "codex")
+SELF_UPDATE_FILES = (".self_update_check", ".self_update.lock")
 
 # Remote-fetch artifacts under ~/.local/share/unbound/.
 REMOTE_FETCH_FILES = ("install.sh", "run-scheduled.sh")
@@ -119,7 +122,7 @@ def _sweep_user_home(home_str: str, tools) -> list:
         candidates.append(home / ".local" / "share" / "unbound" / name)
     for tool in tools:
         hooks_dir = TOOL_USER_HOOKS_DIR[tool]
-        names = COPILOT_SWEEP_FILES if tool == "copilot" else STALE_HOOK_FILES
+        names = SELF_UPDATE_FILES if tool in IN_PLACE_TOOLS else STALE_HOOK_FILES
         for name in names:
             candidates.append(home / hooks_dir / name)
     for path in candidates:
@@ -148,10 +151,9 @@ def run_sweep(tools=TOOLS, log=print) -> tuple:
         strippers = {
             "claude-code": m.remove_user_level_hooks_for_user,
             "cursor": load_mdm_setup_module("cursor").remove_user_level_hooks,
-            "codex": load_mdm_setup_module("codex").remove_user_level_hooks_for_user,
             "augment": load_mdm_setup_module("augment").remove_user_level_hooks_for_user,
-            # copilot has no separate user-mode registration store beyond
-            # unbound.json, handled inside _sweep_user_home
+            # copilot and codex are IN_PLACE_TOOLS: their user-level hook is
+            # the current install (clear_setup removes it on uninstall)
         }
 
         failed_users = [] if _sweep_system(log) else ["system"]

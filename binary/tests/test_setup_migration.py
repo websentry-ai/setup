@@ -423,8 +423,11 @@ def _assert_swept(home: Path, tmp: Path):
     assert not (home / "Library" / "LaunchAgents" / "ai.getunbound.discovery.plist").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".local" / "share" / "unbound" / "run-scheduled.sh").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks", ".augment/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".augment/hooks"):
         assert not (home / d / "unbound.py").exists()
+    # codex's unbound.py is its hook target in both eras; the codex adapter
+    # overwrites it in place, so the sweep leaves it alone
+    assert (home / ".codex" / "hooks" / "unbound.py").exists()
     for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
@@ -665,6 +668,76 @@ def test_sweep_keeps_binary_era_copilot_registration(env):
     status, _ = migration.run_sweep(log=lambda *_: None)
     assert status == "configured"
     assert (hooks_dir / "unbound.json").read_text() == binary_json
+
+
+def _codex_states(env):
+    return [k["install_state"] for a, k in env["notified"] if a[1] == "codex"]
+
+
+def _codex_registrations(home: Path):
+    hooks = json.loads((home / ".codex" / "hooks.json").read_text()).get("hooks", {})
+    wrapper = str(home / ".codex" / "hooks" / "unbound.py")
+    return {ev: [h["command"] for grp in groups for h in grp.get("hooks", [])
+                 if setup_cmd._command_targets_hook(h.get("command", ""), Path(wrapper))]
+            for ev, groups in hooks.items()}
+
+
+def test_codex_rerun_reports_persisted_not_tampered(env):
+    """The sweep runs before the codex adapter. If it strips codex's user-level
+    hook, every re-run sees it missing and reports a healthy install as
+    tampered, then reinstalls it."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "persisted", "persisted"]
+
+
+def test_sweep_keeps_the_binary_codex_install(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    before = (wrapper.read_text(), hooks_json.read_text())
+    status, _ = migration.run_sweep(log=lambda *_: None)
+    assert status == "configured"
+    assert (wrapper.read_text(), hooks_json.read_text()) == before
+
+
+@pytest.mark.parametrize("python_era_command", [
+    "{script}",              # python user-level installer
+    '"{script}"',            # python MDM installer
+    'python3 "{script}"',
+])
+def test_python_era_codex_install_upgrades_in_place(env, python_era_command):
+    """A python-era codex hook is the same file + hooks.json entry the binary
+    writes, so setup upgrades it in place: one registration per event, the
+    file becomes the binary wrapper, and the run reports persisted."""
+    home = env["home"]
+    script = home / ".codex" / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"hooks": [
+            {"type": "command", "command": python_era_command.format(script=script)}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]}],
+    }}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted"]
+    assert "os.execv" in script.read_text()
+    regs = _codex_registrations(home)
+    assert all(len(cmds) == 1 for cmds in regs.values()), regs
+    stop = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["Stop"]
+    assert any(h["command"] == "/usr/local/bin/other-hook"
+               for grp in stop for h in grp["hooks"])
+
+
+def test_codex_clear_still_removes_the_binary_install(env):
+    """Uninstall doesn't rely on the sweep for codex: clear_setup strips it."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert env["modules"]["codex"].clear_setup() is True
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    if hooks_json.exists():
+        assert not any(_codex_registrations(env["home"]).values())
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
