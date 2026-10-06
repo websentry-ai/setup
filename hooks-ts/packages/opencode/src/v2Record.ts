@@ -45,7 +45,8 @@ import type {
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
 import { handleEvent, outputParts, recordResult, sanitizeHostVersion, toolExecuteAfter } from "./record.ts";
 import type { RecordContext } from "./record.ts";
-import { V2_BUILTIN_TOOLS, V2_CODE_MODE_TOOL, v1ToolName } from "./v2Enforce.ts";
+import { createV2Scope, noteInterrupted, V2_BUILTIN_TOOLS, V2_CODE_MODE_TOOL, v1ToolName } from "./v2Enforce.ts";
+import type { V2Scope } from "./v2Enforce.ts";
 
 /** HV2-06 is GO on 2.0.22: no recording piece is missing. A PARTIAL host would list them here. */
 export const V2_RECORDING_GAPS: readonly string[] = Object.freeze([]);
@@ -83,6 +84,16 @@ export function v2ProviderIdentity(provider: string | undefined): AgentAuthSumma
   }
 }
 
+/** `runtime.deps.now()`, or `Date.now()` when it is unusable. Total. */
+function nowOf(runtime: Runtime): number {
+  try {
+    const value = runtime.deps.now();
+    return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+  } catch {
+    return Date.now();
+  }
+}
+
 /** Insertion-ordered bounded map write. */
 function remember<V>(map: Map<string, V>, key: string, value: V): void {
   map.delete(key);
@@ -112,6 +123,7 @@ export function registerV2Recording(
   ctx: V2ContextLike,
   runtime: Runtime,
   recordFor: (directory: string) => DirectoryRecord,
+  scope: V2Scope = createV2Scope(),
 ): (() => void) | undefined {
   let controller: AbortController | undefined;
   let stopped = false;
@@ -192,8 +204,12 @@ export function registerV2Recording(
             });
             return;
           }
-          case "session.execution.succeeded":
           case "session.execution.interrupted":
+            // A call of this session still being decided will not spawn: no shell mark (CR-01).
+            noteInterrupted(scope, sessionID, nowOf(runtime));
+            emit("session.idle", { sessionID });
+            return;
+          case "session.execution.succeeded":
           case "session.execution.failed":
             emit("session.idle", { sessionID });
             return;

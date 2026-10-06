@@ -24,10 +24,18 @@
 //     (`POST /api/session/:id/shell`) fires only `shell.create.before {command, cwd, …}`, before the
 //     spawn, with no session or call id; a raise there is an empty HTTP 500 and nothing spawns
 //     (14-SPIKES V2-10). The same hook also fires for the MODEL's `shell` tool, after its
-//     `execute.before` and before its `evaluate`, so `execute.before(shell)` marks its command
-//     (bounded, short-lived, consumed once) and a matching spawn is not checked again. Any other
-//     command is a user command, checked as `bash` through v1's `checkUserCommand` (userShell.ts)
-//     and raised through `block.ts` on a would-block verdict (no native approval exists there).
+//     `execute.before` and before its `evaluate`, so `execute.before(shell)` marks its command once
+//     its decision is in, immediately before it returns (nothing is awaited between that return and
+//     the host's spawn hook for the same call). A mark is bounded, lives a few seconds, is bound to
+//     the command AND the working directory, is consumed once, and is dropped when its session is
+//     interrupted; a call whose session was interrupted while it was being decided never marks.
+//     The host also tells the spawns apart by `timeout`: the model tool spawns with its own
+//     (non-zero) timeout, the user routes with `0` (re-observed on 2.0.24). So a spawn with
+//     `timeout: 0` never consumes a mark, and a DENIED call's mark (it is still spawned through
+//     `create.before` before `evaluate` refuses it) is consumed only by a spawn with a positive
+//     timeout. Any other spawn is a user command, checked as `bash` through v1's `checkUserCommand`
+//     (userShell.ts) and raised through `block.ts` on a would-block verdict (no native approval
+//     exists there).
 //
 // v2 naming (14-SPIKES V2-11): `shell` is v1 `bash`, `subagent` is v1 `task` (audited, never denied,
 // as on v1), file tools carry `path` (the opencode profile already reads it), and `execute` is the
@@ -41,6 +49,9 @@
 // Every handler is total: a fault allows. Nothing here awaits anything unbounded beyond the core
 // decision itself (which carries core's deadline).
 
+import { isAbsolute, resolve } from "node:path";
+
+import { directoryKey } from "../../core/src/sessionState.ts";
 import { sanitizeReason } from "../../core/src/verdict.ts";
 import { decideBeforeVerdict } from "./before.ts";
 import type { BeforeDecision } from "./before.ts";
@@ -100,12 +111,80 @@ const MCP_LIST_INTERVAL_MS = 10_000;
 const MAX_WARNED_SESSIONS = 1024;
 /** The most model shell commands awaiting their `shell.create.before`. */
 const MAX_PENDING_SHELLS = 256;
+/** The most sessions whose last interrupt time is remembered. */
+const MAX_INTERRUPTED_SESSIONS = 1024;
 /**
- * How long a model shell command stays marked. The spawn hook follows `execute.before` once its
- * decision is in (core's deadline is ~20 s); a mark that outlives this is dropped, so a stale one
- * can never exempt a later user command.
+ * How long a model shell command stays marked. The mark is set only once the call's decision is in,
+ * immediately before `execute.before` returns, and the host's spawn hook for that call follows with
+ * nothing awaited in between (only later plugins' before hooks). A mark that outlives this is
+ * dropped: the model's spawn is then checked once more (never skipped), and a stale mark can never
+ * exempt a later user command.
  */
-const PENDING_SHELL_TTL_MS = 60_000;
+export const PENDING_SHELL_TTL_MS = 5_000;
+
+/** One model `shell` call whose spawn hook may follow (set once its decision is in). */
+export interface ModelShellMark {
+  command: string;
+  /** The directory the call spawns in (`directoryKey`), or `""` when unknown (command-only match). */
+  cwd: string;
+  /** When the mark was set (`deps.now()`). */
+  at: number;
+  sessionID: string;
+  /**
+   * The call was decided deny / unavailable: `evaluate` refuses it after its spawn hook ran, so only
+   * the tool's own spawn (a positive `timeout`) may consume the mark, never a user route.
+   */
+  denied: boolean;
+}
+
+/** Process-wide v2 state every directory's registrations share (v2.ts keeps one per process). */
+export interface V2Scope {
+  /** Model shell commands awaiting their `shell.create.before`, oldest first (bounded). */
+  readonly modelShells: ModelShellMark[];
+  /** session id → when it was last interrupted (bounded, insertion-ordered). */
+  readonly interrupted: Map<string, number>;
+}
+
+/** A fresh, empty scope. */
+export function createV2Scope(): V2Scope {
+  return { modelShells: [], interrupted: new Map<string, number>() };
+}
+
+/**
+ * A session was interrupted (`session.execution.interrupted`): its pending model shell marks are
+ * dropped, and a call of that session still being decided will not mark (its spawn never comes).
+ * Total.
+ */
+export function noteInterrupted(scope: V2Scope, sessionID: string, at: number): void {
+  try {
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    scope.interrupted.delete(sessionID);
+    scope.interrupted.set(sessionID, at);
+    while (scope.interrupted.size > MAX_INTERRUPTED_SESSIONS) {
+      const oldest = scope.interrupted.keys().next().value;
+      if (oldest === undefined) break;
+      scope.interrupted.delete(oldest);
+    }
+    for (let i = scope.modelShells.length - 1; i >= 0; i -= 1) {
+      if (scope.modelShells[i]?.sessionID === sessionID) scope.modelShells.splice(i, 1);
+    }
+  } catch {
+    // A mark we could not drop expires on its own.
+  }
+}
+
+/** The directory a model shell call spawns in: an absolute `workdir`, a relative one under `directory`, else `directory`. */
+function modelShellCwd(input: unknown, directory: string): string {
+  try {
+    const workdir = readField(input, "workdir");
+    if (typeof workdir === "string" && workdir !== "") {
+      return directoryKey(isAbsolute(workdir) ? workdir : resolve(directory, workdir)) ?? "";
+    }
+    return directoryKey(directory) ?? "";
+  } catch {
+    return "";
+  }
+}
 
 const APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
 const PROMPT_BLOCK_TAIL =
@@ -229,6 +308,14 @@ interface PendingCall {
 
 const NO_DECISION: BeforeDecision = Object.freeze({ message: undefined, kind: undefined });
 
+/** What one `execute.before` concluded: the message to raise with, and the verdict kind. */
+interface ToolCallOutcome {
+  raise: string | undefined;
+  kind: BeforeDecision["kind"];
+}
+
+const NO_OUTCOME: ToolCallOutcome = Object.freeze({ raise: undefined, kind: undefined });
+
 /**
  * Register the v2 decision handlers on `ctx` (one `setup` = one directory, 14-SPIKES V2-12).
  * `recordFor` gives the directory record the v1 decision code reads (client, MCP names, notices).
@@ -241,13 +328,13 @@ export function registerV2Enforcement(
   runtime: Runtime,
   recordFor: (directory: string) => DirectoryRecord,
   capabilities: V2Capabilities = V2_CAPABILITIES,
+  scope: V2Scope = createV2Scope(),
 ): boolean {
   try {
     const directory = readString(readField(ctx, "location"), "directory");
     const pending = new Map<string, PendingCall>();
     const warned = new Set<string>();
-    /** Model shell commands seen in `execute.before`, oldest first: `[command, marked at]`. */
-    const modelShells: Array<[string, number]> = [];
+    const modelShells = scope.modelShells;
     let userShellSeq = 0;
 
     const nowSafe = (): number => {
@@ -258,26 +345,57 @@ export function registerV2Enforcement(
         return Date.now();
       }
     };
-    /** Mark a model shell call's command (synchronously, before its decision is awaited). Total. */
-    const markModelShell = (event: unknown): void => {
+    /**
+     * Mark a model shell call's command once its decision is in (CR-01): called right before
+     * `execute.before` returns, never for a call that raised, and never when the call's session was
+     * interrupted while it was being decided (its spawn will not come). Total.
+     */
+    const markModelShell = (event: unknown, kind: BeforeDecision["kind"], started: number): void => {
       try {
         if (readString(event, "tool") !== V2_SHELL_TOOL) return;
-        const command = readString(readField(event, "input"), "command");
+        const input = readField(event, "input");
+        const command = readString(input, "command");
         if (command === "") return;
-        modelShells.push([command, nowSafe()]);
+        const sessionID = readString(event, "sessionID");
+        const interruptedAt = sessionID === "" ? undefined : scope.interrupted.get(sessionID);
+        if (interruptedAt !== undefined && interruptedAt >= started) return;
+        modelShells.push({
+          command,
+          cwd: modelShellCwd(input, directory),
+          at: nowSafe(),
+          sessionID,
+          denied: kind === "deny" || kind === "unavailable",
+        });
         while (modelShells.length > MAX_PENDING_SHELLS) modelShells.shift();
       } catch {
         // Unmarked: at worst the model's spawn is checked once more as a user command.
       }
     };
-    /** Consume a live mark for `command`: true when this spawn is the model's own shell call. */
-    const takeModelShell = (command: string): boolean => {
-      const now = nowSafe();
-      while (modelShells.length > 0 && now - (modelShells[0]?.[1] ?? now) > PENDING_SHELL_TTL_MS) modelShells.shift();
-      const index = modelShells.findIndex(([marked]) => marked === command);
-      if (index < 0) return false;
-      modelShells.splice(index, 1);
-      return true;
+    /**
+     * Consume a live mark for this spawn: true when it is the model's own shell call. The command
+     * must match, and the directory too when both are known. A `timeout: 0` spawn (a user route on
+     * 2.0.24) never consumes a mark; a denied call's mark needs a positive timeout (the tool's own
+     * spawn). Total: a fault is "not the model's" (checked).
+     */
+    const takeModelShell = (command: string, cwdRaw: string, timeout: unknown): boolean => {
+      try {
+        const now = nowSafe();
+        while (modelShells.length > 0 && now - (modelShells[0]?.at ?? now) > PENDING_SHELL_TTL_MS) modelShells.shift();
+        if (timeout === 0) return false;
+        const cwd = directoryKey(cwdRaw) ?? "";
+        const toolSpawn = typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0;
+        const index = modelShells.findIndex(
+          (mark) =>
+            mark.command === command &&
+            (mark.cwd === "" || cwd === "" || mark.cwd === cwd) &&
+            (!mark.denied || toolSpawn),
+        );
+        if (index < 0) return false;
+        modelShells.splice(index, 1);
+        return true;
+      } catch {
+        return false;
+      }
     };
 
     const keyOf = (sessionID: string, callID: string): string => `${sessionID}\u0000${callID}`;
@@ -309,16 +427,17 @@ export function registerV2Enforcement(
 
     /**
      * The decision for one `execute.before`: the message to RAISE with (non-built-in tools under an
-     * enforcing MCP capability only), or `undefined`. Built-in decisions are kept for `evaluate`.
+     * enforcing MCP capability only), or `undefined`, plus the verdict kind it came from. Built-in
+     * decisions are kept for `evaluate`.
      */
-    const decideToolCall = async (event: V2ToolBefore): Promise<string | undefined> => {
+    const decideToolCall = async (event: V2ToolBefore): Promise<ToolCallOutcome> => {
       try {
         const tool = readString(event, "tool");
         const sessionID = readString(event, "sessionID");
         const callID = readString(event, "id");
-        if (tool === "" || tool === V2_CODE_MODE_TOOL) return undefined;
+        if (tool === "" || tool === V2_CODE_MODE_TOOL) return NO_OUTCOME;
         const builtin = V2_BUILTIN_TOOLS.has(tool);
-        if (!builtin && capabilities.mcp === "none") return undefined;
+        if (!builtin && capabilities.mcp === "none") return NO_OUTCOME;
 
         const rec = record();
         if (!builtin) await learnMcpNames(tool, rec);
@@ -329,22 +448,22 @@ export function registerV2Enforcement(
         ).catch((): BeforeDecision => NO_DECISION);
         if (builtin && sessionID !== "" && callID !== "") remember(keyOf(sessionID, callID), { decision, asked: false });
 
-        const { message } = await decision;
-        if (message === undefined) return undefined;
+        const { message, kind } = await decision;
+        if (message === undefined) return { raise: undefined, kind };
         if (capabilities.tools === "audit") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool, "tools");
-          return undefined;
+          return { raise: undefined, kind };
         }
-        if (builtin) return undefined;
+        if (builtin) return { raise: undefined, kind };
         if (capabilities.mcp !== "enforce") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool, "mcp");
-          return undefined;
+          return { raise: undefined, kind };
         }
         // deny / unavailable → the verdict text; confirm → the v1 approval sentence (MCP ask is
         // unproven on v2, so it blocks as on v1).
-        return message;
+        return { raise: message, kind };
       } catch {
-        return undefined;
+        return NO_OUTCOME;
       }
     };
 
@@ -449,7 +568,7 @@ export function registerV2Enforcement(
     const decideUserShell = async (event: V2ShellCreateBefore): Promise<string | undefined> => {
       try {
         const command = readString(event, "command");
-        if (command === "" || takeModelShell(command)) return undefined;
+        if (command === "" || takeModelShell(command, readString(event, "cwd"), readField(event, "timeout"))) return undefined;
         userShellSeq += 1;
         const callID = `v2_${nowSafe().toString(36)}_${userShellSeq}`;
         const message = await checkUserCommand(command, readString(event, "cwd"), "", callID, {
@@ -472,10 +591,13 @@ export function registerV2Enforcement(
       // The raise happens outside the decision's guard, and only with a verdict message.
       void Promise.resolve(
         tool.hook("execute.before", async (event: V2ToolBefore): Promise<void> => {
-          // Synchronous, before any await: the spawn hook of this very call may follow.
-          markModelShell(event);
-          const message = await decideToolCall(event).catch(() => undefined);
+          const started = nowSafe();
+          const outcome = await decideToolCall(event).catch((): ToolCallOutcome => NO_OUTCOME);
+          const message = outcome.raise;
           if (typeof message === "string" && message.length > 0) block(message);
+          // Only now, with the decision in and right before returning: the host's spawn hook for
+          // THIS call follows with nothing awaited in between (CR-01).
+          markModelShell(event, outcome.kind, started);
         }),
       ).catch(() => undefined);
     }

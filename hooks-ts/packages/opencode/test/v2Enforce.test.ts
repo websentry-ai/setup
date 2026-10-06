@@ -22,12 +22,16 @@ import { createRuntime } from "../src/plugin.ts";
 import type { Deps, Runtime } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage } from "../src/verdicts.ts";
 import {
+  createV2Scope,
   nativeApprovalMessage,
+  noteInterrupted,
+  PENDING_SHELL_TTL_MS,
   promptBlockNotice,
   registerV2Enforcement,
   v1ToolName,
   v2HostClient,
 } from "../src/v2Enforce.ts";
+import type { V2Scope } from "../src/v2Enforce.ts";
 import { makeDeps, pretoolRequests, signalsOf, startOpencodeMock, tick, waitFor } from "./helpers/fakeHost.ts";
 
 let mock: MockApi;
@@ -49,6 +53,7 @@ interface FakeV2 {
   ctx: V2ContextLike;
   handlers: Map<string, Handler>;
   runtime: Runtime;
+  scope: V2Scope;
   cleanup(): void;
 }
 
@@ -103,8 +108,9 @@ async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
   for (const key of opts.omit ?? []) delete full[key];
   const ctx = full as unknown as V2ContextLike;
   const caps: V2Capabilities = { ...V2_CAPABILITIES, ...(opts.capabilities ?? {}) };
-  registerV2Enforcement(ctx, handle.runtime, (dir) => handle.recordFor(dir, v2HostClient(ctx, dir)), caps);
-  return { ctx, handlers, runtime: handle.runtime, cleanup: t.cleanup };
+  const scope = createV2Scope();
+  registerV2Enforcement(ctx, handle.runtime, (dir) => handle.recordFor(dir, v2HostClient(ctx, dir)), caps, scope);
+  return { ctx, handlers, runtime: handle.runtime, scope, cleanup: t.cleanup };
 }
 
 const ACTION: Record<string, string> = { shell: "shell", write: "edit", edit: "edit", read: "read", subagent: "subagent" };
@@ -652,20 +658,34 @@ test("prompt: fail-open (API down, no key) leaves the prompt untouched; hostile 
 
 // --- user `!cmd` shell (shell.create.before, deferred-items 14-03 #1) -----------------------------
 
-/** A `shell.create.before` input as 14-SPIKES V2-10 recorded it: no session id, no call id. */
-function shellCreate(command: string, cwd = DIRECTORY): Record<string, unknown> {
-  return { command, cwd, timeout: 120_000, shell: "/bin/zsh", env: { PATH: "/usr/bin" } };
+/**
+ * A `shell.create.before` input as 14-SPIKES V2-10 recorded it: no session id, no call id. The user
+ * routes (`!cmd`, `POST /api/shell`) spawn with `timeout: 0`; the model's `shell` tool with its own
+ * timeout (120000 by default), as re-observed on 2.0.24.
+ */
+function shellCreate(command: string, cwd = DIRECTORY, timeout = 0): Record<string, unknown> {
+  return { command, cwd, timeout, shell: "/bin/zsh", env: { PATH: "/usr/bin" } };
 }
 
-async function userShell(f: FakeV2, command: string, cwd?: string): Promise<string | undefined> {
+async function spawnHook(f: FakeV2, input: unknown): Promise<string | undefined> {
   const handler = f.handlers.get("shell.create.before");
   assert.ok(handler !== undefined, "shell.create.before registered");
   try {
-    await handler(shellCreate(command, cwd));
+    await handler(input);
     return undefined;
   } catch (err) {
     return (err as Error).message;
   }
+}
+
+/** A user `!cmd` spawn (`timeout: 0`). */
+async function userShell(f: FakeV2, command: string, cwd?: string): Promise<string | undefined> {
+  return spawnHook(f, shellCreate(command, cwd, 0));
+}
+
+/** The spawn hook of a model `shell` tool call (positive timeout). */
+async function modelSpawn(f: FakeV2, command: string, cwd?: string): Promise<string | undefined> {
+  return spawnHook(f, shellCreate(command, cwd, 120_000));
 }
 
 test("user shell: an unseen command is checked as bash through the v1 path and raised on deny", async () => {
@@ -705,10 +725,10 @@ test("user shell: an allowed command runs; the model's shell call is never check
     const r = await toolCall(f, "shell", { command: "echo hi" }, { id: "call_m" });
     assert.equal(r.raised, undefined);
     assert.equal(toolBodies().length, 2);
-    assert.equal(await userShell(f, "echo hi"), undefined);
+    assert.equal(await modelSpawn(f, "echo hi"), undefined);
     assert.equal(toolBodies().length, 2, "the model call's spawn is not checked again");
-    // The pending mark is consumed once: the same command typed by the user afterwards is checked.
-    assert.equal(await userShell(f, "echo hi"), undefined);
+    // The pending mark is consumed once: another spawn of the same command is checked.
+    assert.equal(await modelSpawn(f, "echo hi"), undefined);
     assert.equal(toolBodies().length, 3);
   } finally {
     f.cleanup();
@@ -721,10 +741,122 @@ test("user shell: a model shell that will be denied at evaluate is not raised fr
     const before = f.handlers.get("tool.execute.before");
     await before?.({ tool: "shell", sessionID: "ses_root", agent: "build", messageID: "m", id: "call_d", input: { command: "cat .env" } });
     // Host order (V2-10): execute.before → shell.create.before → evaluate.
-    assert.equal(await userShell(f, "cat .env"), undefined);
+    assert.equal(await modelSpawn(f, "cat .env"), undefined);
     assert.equal(toolBodies().length, 1);
     const evaluated = await evaluateAgain(f, "ses_root", "call_d");
     assert.equal(evaluated.effect, "deny");
+  } finally {
+    f.cleanup();
+  }
+});
+
+// --- CR-01: the dedupe mark is set only once the model call's decision is in --------------------
+
+/** Start a model `shell` call's `execute.before` without awaiting it. */
+function startModelShell(f: FakeV2, command: string, id: string, extra: Record<string, unknown> = {}): Promise<unknown> {
+  const before = f.handlers.get("tool.execute.before");
+  assert.ok(before !== undefined);
+  return Promise.resolve(
+    before({ tool: "shell", sessionID: "ses_root", agent: "build", messageID: "m", id, input: { command, ...extra } }),
+  ).catch((err: unknown) => err);
+}
+
+test("CR-01: a user !cmd with the same text sent while the model's check is in flight IS checked", async () => {
+  const f = await fakeV2({ mode: "hang", deps: { deadlineMs: 400 } });
+  try {
+    const model = startModelShell(f, "cat .env", "call_inflight");
+    await tick(50);
+    mock.setMode("deny");
+    // The user's spawn arrives while the model's check is still pending: nothing is marked yet.
+    assert.equal(await userShell(f, "cat .env"), SECRETS_DENY, "checked and raised");
+    // Even a tool-like spawn (positive timeout) is checked while nothing is marked.
+    assert.equal(await modelSpawn(f, "cat .env"), SECRETS_DENY);
+    await model;
+    assert.equal(toolBodies().filter((b) => b.pre_tool_use_data.command === "cat .env").length, 3);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("CR-01: a user command after a denied model call IS checked (the denied call's mark is the tool's own)", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    await startModelShell(f, "cat .env", "call_denied");
+    // No model spawn follows (it failed before Shell.create, or another plugin raised).
+    assert.equal(await userShell(f, "cat .env"), SECRETS_DENY, "the user's own command is checked");
+    assert.equal(toolBodies().length, 2);
+    // The model's own spawn (positive timeout) still consumes the denied call's mark: not checked
+    // again, and evaluate refuses the call with permission.rejected.
+    assert.equal(await modelSpawn(f, "cat .env"), undefined);
+    assert.equal(toolBodies().length, 2);
+    assert.equal((await evaluateAgain(f, "ses_root", "call_denied")).effect, "deny");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("CR-01: a call whose session was interrupted while being decided never marks", async () => {
+  const f = await fakeV2({ mode: "hang", deps: { deadlineMs: 300 } });
+  try {
+    const model = startModelShell(f, "echo hi", "call_interrupted");
+    await tick(50);
+    noteInterrupted(f.scope, "ses_root", f.runtime.deps.now());
+    await model; // the check times out and allows; the host already aborted the call
+    assert.equal(f.scope.modelShells.length, 0, "no mark for an interrupted call");
+    mock.setMode("deny");
+    assert.equal(await modelSpawn(f, "echo hi"), SECRETS_DENY, "a later spawn of the command is checked");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("CR-01: an interrupt drops the session's pending marks", async () => {
+  const f = await fakeV2({ mode: "allow" });
+  try {
+    await startModelShell(f, "echo hi", "call_a");
+    assert.equal(f.scope.modelShells.length, 1);
+    noteInterrupted(f.scope, "ses_root", f.runtime.deps.now());
+    assert.equal(f.scope.modelShells.length, 0);
+    assert.equal(await modelSpawn(f, "echo hi"), undefined);
+    assert.equal(toolBodies().length, 2, "checked: the mark was dropped");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("CR-01: a mark lives only a few seconds and is bound to the working directory", async () => {
+  let clock = 1_000_000;
+  const f = await fakeV2({ mode: "allow", deps: { now: () => clock } });
+  try {
+    assert.ok(PENDING_SHELL_TTL_MS <= 10_000, "a few seconds");
+    // Another directory: not the model's spawn.
+    await startModelShell(f, "make", "call_w", { workdir: "/w" });
+    assert.equal(await modelSpawn(f, "make", DIRECTORY), undefined);
+    assert.equal(toolBodies().length, 2, "a spawn in another directory is checked");
+    assert.equal(await modelSpawn(f, "make", "/w"), undefined);
+    assert.equal(toolBodies().length, 2, "the spawn in the call's own workdir is the model's");
+    // A relative workdir resolves under the project directory.
+    await startModelShell(f, "make", "call_rel", { workdir: "sub" });
+    assert.equal(await modelSpawn(f, "make", `${DIRECTORY}/sub`), undefined);
+    assert.equal(toolBodies().length, 3);
+    // Expiry.
+    await startModelShell(f, "make", "call_late");
+    clock += PENDING_SHELL_TTL_MS + 1;
+    assert.equal(await modelSpawn(f, "make"), undefined);
+    assert.equal(toolBodies().length, 5, "a stale mark exempts nothing");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("CR-01: a user !cmd (timeout 0) never consumes a model mark", async () => {
+  const f = await fakeV2({ mode: "allow" });
+  try {
+    await startModelShell(f, "echo hi", "call_u");
+    assert.equal(await userShell(f, "echo hi"), undefined);
+    assert.equal(toolBodies().length, 2, "the user's command is checked even with a live mark");
+    assert.equal(await modelSpawn(f, "echo hi"), undefined);
+    assert.equal(toolBodies().length, 2, "the mark is still there for the model's own spawn");
   } finally {
     f.cleanup();
   }

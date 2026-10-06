@@ -37,7 +37,8 @@ import type { V2Capabilities } from "./constants.ts";
 import type { V2Cleanup, V2ContextLike } from "./hostTypesV2.ts";
 import { BUILD_TOKEN, createRuntime } from "./plugin.ts";
 import type { Deps, DirectoryRecord, RuntimeHandle } from "./plugin.ts";
-import { registerV2Enforcement, v2HostClient } from "./v2Enforce.ts";
+import { createV2Scope, registerV2Enforcement, v2HostClient } from "./v2Enforce.ts";
+import type { V2Scope } from "./v2Enforce.ts";
 import { registerV2Recording, V2_RECORDING_GAPS, v2ProviderIdentity } from "./v2Record.ts";
 
 /** The `globalThis` slot key of the process-wide v2 state. */
@@ -62,6 +63,8 @@ interface SharedV2 {
   /** Directories whose handlers are registered (until their cleanup runs). */
   directories: Set<string>;
   statusReported: boolean;
+  /** Model shell marks and interrupts, shared by every directory's handlers. */
+  scope: V2Scope;
 }
 
 /**
@@ -128,7 +131,7 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
     const { capabilities: _capabilities, sentinelKey: _sentinelKey, ...deps } = source;
     // HV2-07 PROVIDER-LEVEL: the identity reader reads nothing; the provider id is the label.
     const handle = createRuntime({ ...deps, readAuth: (_dataDir, provider) => v2ProviderIdentity(provider) });
-    return { handle, capabilities, directories: new Set<string>(), statusReported: false };
+    return { handle, capabilities, directories: new Set<string>(), statusReported: false, scope: createV2Scope() };
   }
 
   /** Put a frozen holder of `shared` in the slot: non-writable, non-configurable, non-enumerable. */
@@ -224,8 +227,8 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
         // connect, 14-SPIKES V2-3): the decision side reads the live list when it needs it.
         handle.recordFor(directory, client, []);
         const recordFor = (dir: string): DirectoryRecord => handle.recordFor(dir, client);
-        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities);
-        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor) : undefined;
+        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities, shared.scope);
+        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor, shared.scope) : undefined;
         if (stopRecording === undefined) {
           later(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
         }
