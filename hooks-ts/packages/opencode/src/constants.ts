@@ -40,11 +40,11 @@ export const SIGNAL_ARGS_CHANGED = "args_changed_after_check";
 export const SIGNAL_USER_SHELL_UNCHECKED = "user_shell_unchecked";
 /** The v2 entry was loaded on a host whose v2 hook family is not active (or the reverse). */
 export const SIGNAL_API_FAMILY_INACTIVE = "api_family_inactive";
-/** An apply_patch named more distinct files than `MAX_PATCH_TARGETS`. */
+/** An apply_patch named more distinct files than `MAX_PATCH_TARGETS` (and was blocked). */
 export const SIGNAL_PATCH_TARGETS_CAPPED = "patch_targets_capped";
 
 // --- limits -------------------------------------------------------------------------------------
-/** The most distinct files one apply_patch is checked for; past it the cap is signalled. */
+/** The most distinct files one apply_patch is checked for; a patch naming more is blocked. */
 export const MAX_PATCH_TARGETS = 1024;
 /** How many per-file apply_patch checks run at once. */
 export const PATCH_CONCURRENCY = 8;

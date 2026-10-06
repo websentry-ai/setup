@@ -121,7 +121,7 @@ export function shellCwdOf(args: unknown, directory: string): string {
  * in first-seen order. The same superset rule as the server: a header is accepted on any line and
  * after leading whitespace, the rest of the line is trimmed, CRLF is accepted. A malformed patch can
  * only add targets, never hide one. Past `MAX_PATCH_TARGETS` distinct paths the list stops and
- * `capped` is true, so the adapter can signal it rather than silently check a prefix.
+ * `capped` is true, so the adapter can refuse the patch rather than silently check a prefix.
  */
 export function applyPatchTargets(patchText: unknown): { targets: string[]; capped: boolean } {
   try {

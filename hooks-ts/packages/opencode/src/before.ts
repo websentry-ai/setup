@@ -12,7 +12,8 @@
 //     sends `filePath` as `metadata.file_path` and a differing `path` stays visible in `tool_input`;
 //   * `grep` / `glob`: `path` (defaults to cwd) plus `pattern` / `include`;
 //   * `apply_patch`: ONE request per header path (`{filePath: target}`), at most
-//     `PATCH_CONCURRENCY` in flight, strictest verdict wins (T-13-22).
+//     `PATCH_CONCURRENCY` in flight, strictest verdict wins (T-13-22); a patch naming more than
+//     `MAX_PATCH_TARGETS` files is blocked without a request (13-REVIEW BL-02).
 //
 // `output.args` is only read and digested here, never reassigned or mutated (Pitfall 5): the digest
 // is compared with the executed args in 13-06 (HOOK-18).
@@ -23,7 +24,12 @@ import { evaluateToolCall, noteSafe } from "../../core/src/evaluate.ts";
 import type { EvaluateDeps, ToolCallInput, ToolEvaluation } from "../../core/src/evaluate.ts";
 import { block } from "./block.ts";
 import { auditToolInput, normaliseMcp } from "../../core/src/payload.ts";
-import { PATCH_CONCURRENCY, SIGNAL_MCP_ATTRIBUTION_MISS, SIGNAL_PATCH_TARGETS_CAPPED } from "./constants.ts";
+import {
+  MAX_PATCH_TARGETS,
+  PATCH_CONCURRENCY,
+  SIGNAL_MCP_ATTRIBUTION_MISS,
+  SIGNAL_PATCH_TARGETS_CAPPED,
+} from "./constants.ts";
 import {
   applyPatchTargets,
   argsDigest,
@@ -48,6 +54,11 @@ export interface BeforeContext {
 }
 
 const APPLY_PATCH_TOOL = "apply_patch";
+
+/** Why an `apply_patch` naming more files than `MAX_PATCH_TARGETS` is refused (13-REVIEW BL-02). */
+export const PATCH_TOO_LARGE_REASON =
+  `patch too large to verify: it names more than ${MAX_PATCH_TARGETS} files, ` +
+  "so some of them could not be checked. Split it into smaller patches.";
 
 function readField(value: unknown, key: string): unknown {
   try {
@@ -179,7 +190,24 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     let verdict: ToolEvaluation;
     if (tool === APPLY_PATCH_TOOL) {
       const { targets, capped } = applyPatchTargets(args.patchText);
-      if (capped) runtime.reportSignal(SIGNAL_PATCH_TARGETS_CAPPED, tool, "capped");
+      if (capped) {
+        // 13-REVIEW BL-02: files past the cap would run unchecked (opencode applies the whole patch),
+        // so a patch naming more files than can be verified is refused outright. A deliberate,
+        // deterministic verdict on the model's own input, not an error path; no request is made.
+        runtime.reportSignal(SIGNAL_PATCH_TARGETS_CAPPED, tool, "blocked");
+        verdict = { kind: "deny", reason: PATCH_TOO_LARGE_REASON };
+        noteSafe(() =>
+          evalDeps.onDecision?.({
+            tool_name: APPLY_PATCH_TOOL,
+            tool_use_id: callID,
+            decision: "deny",
+            tool_input: auditToolInput({}, "", OPENCODE_PROFILE.extraToolInputKeys),
+          }),
+        );
+        const message = blockingMessage(verdict);
+        if (message !== undefined) void notify(record.client, message, "error");
+        return message;
+      }
       const verdicts = await mapBounded(targets, PATCH_CONCURRENCY, (target) =>
         evaluateToolCall(
           {

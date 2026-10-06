@@ -9,6 +9,7 @@ import { DENY_PREFIX, ENGINE_UNAVAILABLE_REASON, NO_KEY_NOTICE } from "../../cor
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import type { PretoolRequestBody } from "../../core/src/types.ts";
 import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
+import { PATCH_TOO_LARGE_REASON } from "../src/before.ts";
 import { createServerPlugin } from "../src/plugin.ts";
 import type { Deps } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage, blockingMessage, strictest } from "../src/verdicts.ts";
@@ -237,6 +238,40 @@ test("apply_patch: only an allowed file resolves; no headers makes no check", as
     assert.equal(await outcome(h.before(call("apply_patch", "ses_root", "call_2"), { args: { patchText: "no headers" } })), undefined);
     assert.equal(await outcome(h.before(call("apply_patch", "ses_root", "call_3"), { args: {} })), undefined);
     assert.equal(seen.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("apply_patch naming 1025 files (last one protected) is blocked without any request", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const h = await harness("allow", { deps: { makeChecker: () => patchChecker(seen) } });
+  try {
+    const lines = ["*** Begin Patch"];
+    for (let i = 0; i < 1024; i += 1) lines.push(`*** Add File: junk/${i}.txt`, "+x");
+    lines.push("*** Update File: .env", "@@", "-A=1", "+A=2", "*** End Patch");
+    const message = await outcome(h.before(call("apply_patch", "ses_p", "call_p"), { args: { patchText: lines.join("\n") } }));
+    assert.equal(message, `${DENY_PREFIX}${PATCH_TOO_LARGE_REASON}`);
+    assert.match(message ?? "", /patch too large to verify/);
+    assert.equal(seen.length, 0, "no per-file check is made");
+    assert.ok(await waitFor(() => signalsOf(mock, "patch_targets_capped").length === 1));
+    assert.ok(h.fake.toasts.some((t) => t.variant === "error"));
+    const turn = h.server.inspect.turn("ses_p");
+    assert.equal(turn.tool_calls[0]?.decision, "deny");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("apply_patch naming exactly 1024 files is checked file by file", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const h = await harness("allow", { deps: { makeChecker: () => patchChecker(seen) } });
+  try {
+    const lines = ["*** Begin Patch"];
+    for (let i = 0; i < 1024; i += 1) lines.push(`*** Add File: junk/${i}.txt`, "+x");
+    lines.push("*** End Patch");
+    assert.equal(await outcome(h.before(call("apply_patch"), { args: { patchText: lines.join("\n") } })), undefined);
+    assert.equal(seen.length, 1024);
   } finally {
     h.cleanup();
   }
