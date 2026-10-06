@@ -5,7 +5,8 @@ Author: Sumit Badsara
 This page states what the Unbound opencode plugin enforces, what it only records, what it does not
 see at all, and which switches turn it off. It is written so install copy and the Connect tile can
 quote it without overclaiming. Everything below is about the **v1 plugin line (opencode 1.18.x)**
-unless a row says otherwise.
+unless a row says otherwise; the **v2 line (opencode desktop / CLI 2.0.x)** has its own section,
+`## opencode v2`.
 
 ## What it is
 
@@ -42,6 +43,34 @@ unless a row says otherwise.
 | Fail-closed orgs | When the org's last successful response asked for `policy_check_failure_action: block`, a failed check blocks with `Unbound policy engine unavailable — please retry`. |
 | Revoked API key | One notice; after that the plugin stops every request (checks, audits, turn logs, signals) for that key. |
 
+## opencode v2 (desktop / CLI 2.0.x)
+
+The same bundle enforces on opencode 2.0.x through its `setup` entry. Each row below follows the
+verdict of the Phase 14 spikes (planning record `14-SPIKES.md`, tested on `@opencode/cli` 2.0.22;
+the loader smoke runs on the current 2.0.x). Every decision is made by the same policy path as v1;
+only the way it is applied differs.
+
+| Capability | Status on v2 | Evidence |
+|---|---|---|
+| Bundle loading (HV2-01) | Loads: one bundle for both lines | HV2-01 GO. opencode 2.x calls `setup` once per project directory and never calls `server`; the plugin keeps one runtime per process. On 1.18.x, which also calls `setup`, it stays inert. The nightly `loader-v2` job is required. |
+| Tool calls (HV2-02) | Enforced (through opencode's permission hook) | HV2-02 GO. The check runs in `tool.execute.before`. Its verdict is applied in `permission.evaluate`: a deny sets the permission effect to deny with the verdict text, and the model receives `Blocked by Unbound policy: <reason>` verbatim (`permission.rejected`); the turn continues. Tool names follow v2: `shell` is checked as `bash`, file tools read `path`, `write` is checked as `write`. `subagent` (v1 `task`) is audited, never denied. Tool coverage is otherwise the same as v1: `webfetch`, `websearch`, `skill` and `question` are not sent. A host or user rule that already denies is never loosened. |
+| Approval required (HV2-03) | Native approval prompt | HV2-03 NATIVE. An approval verdict sets the permission effect to `ask` with `Unbound policy requires approval: <reason>. Approve it only if you expect it.`, so opencode shows its own approval. Reject prevents execution; allow-once runs it (proven through the API). |
+| MCP tools (HV2-04) | Enforced (raised from `tool.execute.before`) | HV2-04 GO. MCP ids reach the hooks as `<server>_<tool>`. They are attributed against the host's live server list (`ctx.mcp.list()`) and checked like v1. A blocked call is raised from `tool.execute.before`, because a permission deny on an MCP id replaces the reason with "Unable to execute"; the model gets the verdict text verbatim. In Code Mode (the default), each inner MCP call is checked on its own. An approval verdict on an MCP tool blocks with the v1 approval sentence: a native approval for MCP was not exercised. |
+| User prompts (HV2-05) | Blocked (the prompt is replaced with a block notice) | HV2-05 BLOCK. A root prompt that would be blocked is replaced before it is persisted or sent: its text becomes the verdict plus a notice telling the model to tell the user the message was blocked, and its attached files, agents and skills are cleared. The original text never reaches the model. Subagent prompts are not checked (the parent comes from `ctx.session.get`). **Caveat:** the notice, not the typed text, is what the transcript shows. |
+| User `!cmd` shell (V2-10) | Checked, raised on a block (with caveats) | V2-10 PROVEN. A user shell (`POST /api/session/:id/shell`) fires `shell.create.before` before anything spawns. The command is checked as `bash` through the same path as v1's `!cmd`; a deny or an approval verdict prevents the spawn. The model's own `shell` calls fire the same hook; each is recognised by its command and not checked twice. **Caveats:** the caller sees an empty HTTP 500 and nothing is persisted, and no notice is shown (no v2 toast channel is proven). The hook carries no session, so the check is sent with an empty conversation id and is not part of any turn log. A user command identical to a model `shell` command that is still pending (at most 60 s, once) is taken for the model's and not checked again. A model command that another plugin rewrites is checked a second time as a user command. |
+| Audit, turn log, heartbeat (HV2-06) | Recorded from v2 events | HV2-06 GO. Heartbeat on a root `session.created`, carrying the host version (`data.version`, else `ctx.app.version`). Turn log on `session.execution.succeeded` / `interrupted` (`session.idle` never fires on 2.0.x), with the prompt, the turn's tool calls (subagents rolled in) and the assistant text from `session.text.ended`. Tool results are hash-only, from `tool.execute.after` and `session.tool.failed`, once per call; Code Mode inner results are numbered under the shared call id. Model from `session.step.started` / `session.model.request`. Tokens and cost are not sent (as on v1). |
+| Account identity (HV2-07) | Provider-level only (credential store not read) | HV2-07 PROVIDER-LEVEL. `auth_mode` is the session's provider id from `session.model.request` (for example `openrouter`), plus the device serial. opencode 2.x keeps credentials in its own database; the plugin never opens it, and no account email or plan is sent. |
+
+**v2 status signal.** Once per process the plugin reports `v2_status` with every capability, for
+example `tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce`.
+A seat whose tool calls ran audit-only would also report `v2_not_enforcing`. The shipped build
+enforces every capability above.
+
+**Pending human verification (desktop 2.x UI):** native approval card rendering; deny rendering for a
+built-in tool and an MCP tool; what the user sees for a replaced prompt; a blocked user `!cmd`; Esc /
+stop on a hung check; toast visibility; native approval on an MCP tool; the `skill` tool with a real
+skill.
+
 ## Recorded
 
 - **Tool results, hash-only.** Every model-issued tool result (successful, failed or blocked) is
@@ -70,7 +99,7 @@ unless a row says otherwise.
 | The integrated terminal (PTY) | Not hooked. Opening a PTY fires `shell.env` with only a working directory (no session, no command), which the plugin ignores; the commands typed into it are invisible to plugins. |
 | Processes opencode starts from config | Not hooked: MCP server processes, LSP servers and formatters are spawned from configuration, not as tool calls. The MCP *tool calls* themselves are enforced. |
 | Remote `opencode attach` | Plugins run where the opencode server runs. Install the plugin on the server host; a client that attaches remotely is covered only if the server has it. |
-| opencode v2 (desktop / CLI 2.x) | The `setup` entry is present but **inactive** in this line: nothing is enforced on a v2 host. When it detects a v2 host it reports `api_family_inactive`. On a 1.18.x host, which also calls `setup`, it stays silent because the v1 `server` entry is the active one. |
+| opencode v2 (desktop / CLI 2.x) | **Enforced** through the `setup` entry; see `## opencode v2`. On a 1.18.x host, which also calls `setup`, it stays inert because the v1 `server` entry is the active one. |
 | Tool-output content inspection (DLP) | Out of scope, as on pi: output is recorded hash-only. |
 
 ## Bypasses
@@ -78,7 +107,9 @@ unless a row says otherwise.
 | Switch | Effect |
 |---|---|
 | `opencode --pure` / `OPENCODE_PURE=1` | Plugins are not loaded at all: the module is not even evaluated, and nothing is logged (spike V1-10). Nothing is enforced or recorded. |
-| `XDG_CONFIG_HOME`, `HOME` or `OPENCODE_CONFIG_DIR` pointing elsewhere | opencode looks for global plugins in a different directory, so an installed `plugins/unbound.js` is not loaded (source-read; not live-verified). |
+| `XDG_CONFIG_HOME`, `HOME` or `OPENCODE_CONFIG_DIR` pointing elsewhere | opencode looks for global plugins in a different directory, so an installed `plugins/unbound.js` is not loaded (v1: source-read; not live-verified). |
+| `OPENCODE_CONFIG_DIR` on v2 | On opencode 2.x it **replaces** the XDG config dir rather than adding to it (spike V2-7): while it is set, plugins and `opencode.json` in `~/.config/opencode` are ignored. The installer must write into it when it is set. |
+| Other plugin directories on v2 | `~/.claude/plugins` and `~/.agents/plugins` are not plugin directories on opencode 2.x (spike V2-6): a copy placed there is not loaded. |
 | `OPENCODE_PERMISSION` | Changes opencode's own permission rules (for example, turning its approval prompts off). Not a bypass of Unbound checks, which run regardless, but it removes opencode's own second line of defence. |
 | Another plugin changing tool arguments after the Unbound check | Not prevented. Detected after execution and reported as `args_changed_after_check`. |
 | Project-level plugins from a cloned repository (`.opencode/plugins/`) | opencode loads them automatically, in the same process as the Unbound plugin. They can change tool arguments after the check, or otherwise interfere with it. A value planted in the plugin's double-load slot does not switch enforcement off: the plugin keeps enforcing and reports `sentinel_tampered`. Only a forged copy of the exact installed build's marker (which means reading the installed file) makes it stand down as a duplicate. |
@@ -96,15 +127,18 @@ them blocks anything.
 | `bypassed_due_to_failure` | A check failed (timeout, connection error, non-2xx, unparseable body) and the call was allowed. |
 | `blocked_due_to_failure` | A check failed for a fail-closed org and the call was blocked. |
 | `turn_log_failed` | The turn log for an idle root session could not be posted. |
-| `duplicate_load` | A second copy of the same plugin build loaded into the same process (for example one in `plugin/` and one in `plugins/`). The second copy does nothing. |
-| `sentinel_tampered` | The double-load slot held something other than a copy of this build (a planted value, an accessor, another build). The plugin keeps enforcing. |
-| `init_degraded` | The plugin factory faulted and the allow-everything hook set is serving (detail `factory_fault`), or resolving the key, gateway or checker faulted and is being retried (detail `resolve_fault`). |
+| `duplicate_load` | A second copy of the same plugin build loaded into the same process (for example one in `plugin/` and one in `plugins/`). The second copy does nothing. On v2 (tool `setup`, detail `second_copy`): `setup` ran again for a directory that already has the plugin's handlers. |
+| `sentinel_tampered` | The double-load slot held something other than a copy of this build (a planted value, an accessor, another build). The plugin keeps enforcing. The v2 entry has its own slot with the same rule. |
+| `init_degraded` | The plugin factory faulted and the allow-everything hook set is serving (detail `factory_fault`), or resolving the key, gateway or checker faulted and is being retried (detail `resolve_fault`). On v2, registering the handlers on the host faulted (detail `registration_fault`); what was registered stays, the rest is not registered. |
 | `mcp_attribution_miss` | A non-built-in tool matched no known MCP server name; it was sent without MCP attribution. |
 | `mcp_attribution_ambiguous` | More than one configured MCP server could have produced the tool id; the call was checked once per candidate. |
 | `patch_targets_capped` | An `apply_patch` named more files than the per-call cap (1024); the call was blocked. |
 | `args_changed_after_check` | A tool's arguments at execution differed from the ones checked. |
 | `user_shell_unchecked` | `shell.env` fired for a call with no bash part to check (detail `no_part`); the command was allowed. |
-| `api_family_inactive` | The v2 entry was loaded on a v2 host, where this line enforces nothing. |
+| `v2_status` | Once per process on an opencode 2.x host (tool `setup`): the per-capability status, `tools:<enforce\|audit>/ask:<native\|deny\|audit>/mcp:<enforce\|audit\|none>/prompt:<block\|warn>/recording:<full\|partial>/identity:<provider\|none>/shell:<enforce\|audit\|none>`. |
+| `v2_not_enforcing` | On v2, a capability built audit-only found a call it would have blocked, or tool calls are audit-only for the whole seat. Not sent by the shipped build unless a capability is switched to audit. |
+| `v2_prompt_warn_only` | On v2 with the prompt capability warn-only, a prompt would have been blocked (once per session). Not sent by the shipped build (prompts are blocked). |
+| `api_family_inactive` | No longer sent by this bundle (replaced by `v2_status`). |
 
 ## Spike outcomes
 
@@ -122,3 +156,20 @@ Results of the live spikes in the Phase 13 planning record (`13-SPIKES.md`):
 | V1-9 multiple directories | PROVEN on `serve`: one module, one hook set per directory. |
 | V1-10 `--pure` | PROVEN: plugins are skipped entirely. |
 | V1-11 toast | PROVEN callable; visibility in the TUI pending human verification. |
+
+Results of the v2 spikes in the Phase 14 planning record (`14-SPIKES.md`, `@opencode/cli` 2.0.22):
+
+| Spike | Result |
+|---|---|
+| V2-1 bundle on both lines | PROVEN: the committed dual-entry bundle loads on 2.x (`setup` called) and on 1.18.x. |
+| V2-2 deny lever | PROVEN: a permission deny with a message reaches the model verbatim for every built-in tool that asserts a permission; a raise from `tool.execute.before` also works. Two live turns confirmed the block. |
+| V2-3 MCP | PROVEN: ids `<server>_<tool>` reach the hooks (Code Mode and direct); a raise blocks with the reason, a permission deny drops it. |
+| V2-4 prompt block | PROVEN: replacing the prompt text keeps the original from the model; a raise also blocks, with an empty HTTP 500. |
+| V2-5 events | PROVEN: session, execution, text, step, tool and permission events carry what recording needs; `session.idle` is never emitted. |
+| V2-6 other plugin dirs | DISPROVEN: `~/.claude/plugins` and `~/.agents/plugins` are not loaded. |
+| V2-7 `OPENCODE_CONFIG_DIR` | PROVEN: it replaces the XDG config dir. |
+| V2-8 credential storage | PROVEN (shape only): credentials live in opencode's database; nothing needs them. |
+| V2-9 hook hang | PROVEN: no host-side hook timeout; the plugin's deadline is mandatory, and interrupting the session recovers it. |
+| V2-10 user shell | PROVEN: `shell.create.before` fires before the spawn; a raise there prevents it (empty HTTP 500, nothing persisted). |
+| V2-11 tool names | PROVEN: `shell`, `subagent`, `path`; no `bash`, `task` or `apply_patch`. |
+| V2-12 directories | PROVEN: `setup` runs once per directory; the module is re-evaluated per directory with `globalThis` shared. |
