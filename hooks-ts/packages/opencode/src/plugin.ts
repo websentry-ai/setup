@@ -182,6 +182,8 @@ export interface DirectoryRecord {
   mcpRefreshedAt: number | undefined;
   /** The init-error notice (WR-03) was shown for this directory. */
   initErrorNoticeShown: boolean;
+  /** Bumped by every `server()` call for the directory; only the latest hook set may release. */
+  generation: number;
 }
 
 /** The runtime one plugin copy shares across its directories. */
@@ -383,6 +385,7 @@ function freshRecord(directory: string): DirectoryRecord {
     liveMcpServerNames: [],
     mcpRefreshedAt: undefined,
     initErrorNoticeShown: false,
+    generation: 0,
   };
 }
 
@@ -939,7 +942,7 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     };
   }
 
-  function fullHooks(record: DirectoryRecord): HooksLike {
+  function fullHooks(record: DirectoryRecord, generation: number): HooksLike {
     return {
       // The enforcement path. The handler raises only through `block.ts`, and only on a verdict.
       "tool.execute.before": toolExecuteBefore({ runtime, record }),
@@ -967,9 +970,12 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         }
       },
       // Instance teardown: drop this directory's state. A pending turn is never posted from here.
+      // Only the LATEST hook set of the directory releases it (13-REVIEW WR-05): a late dispose of an
+      // instance that a newer `server()` call superseded, or of a record already replaced after an
+      // earlier release, must not drop the live instance's record, heartbeat gate or no-key latch.
       dispose: async () => {
         try {
-          if (record.directory !== "") {
+          if (record.directory !== "" && record.generation === generation && records.peek(record.directory) === record) {
             instances.release(record.directory);
             records.release(record.directory);
           }
@@ -1060,7 +1066,9 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       record.client = client;
       // The MCP names are NOT reset here (13-REVIEW BL-01 / WR-05): an existing record may still
       // serve a live hook set, and the next `config` call replaces the config names anyway.
-      return Promise.resolve(fullHooks(record));
+      // The generation makes this the hook set that owns the record's release (WR-05).
+      record.generation += 1;
+      return Promise.resolve(fullHooks(record, record.generation));
     } catch {
       return Promise.resolve(degradedHooks());
     }

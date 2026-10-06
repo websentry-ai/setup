@@ -15,6 +15,7 @@ import { after, before, test } from "node:test";
 
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
+import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
 import { createModuleToken, createServerPlugin } from "../src/plugin.ts";
 import { createSetupV2 } from "../src/v2.ts";
 import {
@@ -429,6 +430,41 @@ test("dispose releases the directory's state and resolves", async () => {
     assert.equal(await hooks.dispose?.(), undefined);
     assert.equal(server.inspect.instance("/repo"), undefined);
     assert.equal(await hooks.dispose?.(), undefined, "a second dispose is harmless");
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("a late dispose of a superseded instance does not release the live one's state (WR-05)", async () => {
+  resetMock();
+  const t = makeDeps(mock, { withKey: false });
+  try {
+    const server = createServerPlugin(t.deps);
+    const oldFake = makeFakeInput({ directory: "/repo" });
+    const oldHooks = hooksOf(await server(oldFake.input));
+    const newFake = makeFakeInput({ directory: "/repo" });
+    const newHooks = hooksOf(await server(newFake.input));
+    const bash = (id: string): Promise<unknown> | undefined =>
+      newHooks["tool.execute.before"]?.({ tool: "bash", sessionID: "s", callID: id }, { args: { command: "ls" } });
+    await bash("c1");
+    await tick();
+    assert.equal(newFake.toasts.filter((x) => x.message === NO_KEY_NOTICE).length, 1);
+
+    assert.equal(await oldHooks.dispose?.(), undefined);
+    assert.notEqual(server.inspect.instance("/repo"), undefined, "the live instance keeps its record");
+    await bash("c2");
+    await tick();
+    assert.equal(newFake.toasts.filter((x) => x.message === NO_KEY_NOTICE).length, 1, "its no-key latch survived");
+
+    assert.equal(await newHooks.dispose?.(), undefined);
+    assert.equal(server.inspect.instance("/repo"), undefined, "the latest instance's dispose releases");
+
+    // After a release and a fresh server(), a repeated dispose of the old set is still a no-op.
+    const fresh = hooksOf(await server(makeFakeInput({ directory: "/repo" }).input));
+    assert.equal(await newHooks.dispose?.(), undefined);
+    assert.notEqual(server.inspect.instance("/repo"), undefined, "a stale record never releases its successor");
+    assert.equal(await fresh.dispose?.(), undefined);
+    assert.equal(server.inspect.instance("/repo"), undefined);
   } finally {
     t.cleanup();
   }
