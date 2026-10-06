@@ -572,20 +572,23 @@ def _pi_listdir(path, errors) -> list:
         return []
 
 
-def _account_homes(system, errors) -> list:
+def _account_homes(system) -> list:
     """Home directories from the account database, which is where pi/mdm/setup.py
     finds the users it installs for. A listing of the users root alone misses a home
     that is not its direct child, such as /home/DOMAIN/alice. Windows has no such
-    database to read; its profile directories are the list. A database that cannot
-    be read is recorded in `errors`: some homes may have gone unseen."""
+    database to read; its profile directories are the list.
+
+    A database that cannot be read yields nothing and is NOT counted as a place that
+    could not be inspected. pi/mdm/setup.py reads the same database and finds no
+    homes during the same outage, so forcing the Pi step would only fail the
+    enrollment of a device that may never have had pi."""
     prefix = PI_HOME_PREFIXES.get(system)
     if not prefix:
         return []
     try:
         import pwd
         entries = pwd.getpwall()
-    except Exception as e:
-        errors.append(e)
+    except Exception:
         return []
     return [entry.pw_dir for entry in entries if (entry.pw_dir or "").startswith(prefix)]
 
@@ -606,7 +609,7 @@ def all_user_homes(system=None, users_root=None, account_homes=None, errors=None
         else:
             users_root = "/home"
     if account_homes is None:
-        account_homes = _account_homes(system, errors)
+        account_homes = _account_homes(system)
     skip = PI_SKIP_HOME_NAMES.get(system, ())
 
     candidates = list(account_homes)

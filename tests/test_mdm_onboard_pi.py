@@ -302,13 +302,14 @@ def test_account_homes_come_from_under_the_platform_prefix_only(monkeypatch):
                ("/home/alice", "/home/DOMAIN/bob", "/var/lib/postgres", "/root", "")]
     monkeypatch.setattr(pwd, "getpwall", lambda: entries)
 
-    assert onboard._account_homes("linux", []) == ["/home/alice", "/home/DOMAIN/bob"]
-    assert onboard._account_homes("darwin", []) == []
-    assert onboard._account_homes("windows", []) == []
+    assert onboard._account_homes("linux") == ["/home/alice", "/home/DOMAIN/bob"]
+    assert onboard._account_homes("darwin") == []
+    assert onboard._account_homes("windows") == []
 
 
-def test_an_account_database_that_cannot_be_read_is_not_a_device_without_pi(monkeypatch, tmp_path):
-    """Homes may have gone unseen, so "nothing found" is not an answer."""
+def test_an_account_database_outage_does_not_force_the_pi_step(monkeypatch, tmp_path):
+    """pi/mdm/setup.py reads the same database, finds no homes during the same outage
+    and fails. Forcing the step would fail the enrollment of a device without pi."""
     import pwd
 
     def _broken():
@@ -320,11 +321,9 @@ def test_an_account_database_that_cannot_be_read_is_not_a_device_without_pi(monk
     monkeypatch.setenv("PATH", str(tmp_path / "empty"))
     monkeypatch.setattr(onboard, "PI_MACHINE_BIN_DIRS", ())
 
-    errors = []
-    assert onboard._account_homes("linux", errors) == []
-    assert len(errors) == 1
-    with pytest.raises(OSError):
-        onboard.pi_detected(system="linux")
+    assert onboard._account_homes("linux") == []
+    assert onboard.pi_detected(system="linux") is False
+    assert onboard.should_install_pi() is False
 
 
 def test_a_broken_detector_leans_towards_installing(monkeypatch, capsys):
