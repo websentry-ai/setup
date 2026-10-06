@@ -26,6 +26,7 @@ import type {
   V2BusEvent,
   V2ContextLike,
   V2HookCallback,
+  V2McpListInput,
   V2McpStatusChangedData,
   V2PermissionEvaluate,
   V2SessionCreatedData,
@@ -97,5 +98,12 @@ export type RegistersModelRequest = Assert<
 export type RegistersShellCreate = Assert<
   Extends<V2HookCallback<V2ShellCreateBefore>, HostCallback<ShellHooks["create.before"]>>
 >;
+/**
+ * The argument the adapter passes to `ctx.mcp.list` is one the host's `McpApi.list` accepts, and the
+ * answer carries `data[].name` (14-REVIEW WR-06).
+ */
+type HostMcpList = Plugin.Context["mcp"]["list"];
+export type PassesMcpListInput = Assert<Extends<V2McpListInput, NonNullable<Parameters<HostMcpList>[0]>>>;
+export type HostMcpListNames = Assert<Extends<Awaited<ReturnType<HostMcpList>>["data"][number]["name"], string>>;
 /** The `setup` the module exports is a valid `Plugin.setup`. */
 export type ModuleShape = Assert<Extends<{ id: string; setup: V2SetupEntry }, Plugin.Plugin>>;

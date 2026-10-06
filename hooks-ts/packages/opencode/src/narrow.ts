@@ -172,7 +172,12 @@ export function applyPatchDeletedPaths(patchText: unknown): Set<string> {
 
 // --- MCP ----------------------------------------------------------------------------------------
 
-/** opencode's MCP key sanitiser, exactly: `oc:opencode/src/mcp/catalog.ts:117`. */
+/**
+ * opencode's MCP key sanitiser, exactly: `oc:opencode/src/mcp/catalog.ts:117` (1.x). The 2.x CLI
+ * uses the same rule for its `<server>_<tool>` hook ids (2.0.24 binary:
+ * `e.replace(/[^a-zA-Z0-9_-]/g,"_")`; a server named `my-server.v2` gives `my-server_v2_<tool>`,
+ * 14-REVIEW WR-06 probe).
+ */
 export function sanitizeMcpName(value: string): string {
   return typeof value === "string" ? value.replace(/[^a-zA-Z0-9_-]/g, "_") : "";
 }

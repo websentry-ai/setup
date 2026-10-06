@@ -241,9 +241,14 @@ export interface V2EventDomainLike {
   subscribe(options?: { signal?: AbortSignal }): AsyncIterable<V2BusEvent>;
 }
 
+/** The argument the adapter passes to `ctx.mcp.list` (`McpListInput`, `npm:@opencode/client` 2.0.24). */
+export interface V2McpListInput {
+  location?: { directory?: string };
+}
+
 export interface V2McpDomainLike {
   /** `McpApi.list` → `{ data: [{ name, status }] }` (empty before servers connect, `log:` V2-3). */
-  list(input?: { location?: { directory?: string } }): Promise<{ data: Array<{ name: string }> }>;
+  list(input?: V2McpListInput): Promise<{ data: Array<{ name: string }> }>;
 }
 
 /** `App` (`npm:@opencode/plugin/dist/app.d.ts`). */

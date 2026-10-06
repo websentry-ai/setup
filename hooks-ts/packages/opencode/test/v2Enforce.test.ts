@@ -18,6 +18,7 @@ import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import { V2_CAPABILITIES } from "../src/constants.ts";
 import type { V2Capabilities } from "../src/constants.ts";
 import type { V2ContextLike } from "../src/hostTypesV2.ts";
+import { mcpCandidates } from "../src/narrow.ts";
 import { createRuntime } from "../src/plugin.ts";
 import type { Deps, Runtime } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage } from "../src/verdicts.ts";
@@ -989,4 +990,52 @@ test("WR-03: the session map is bounded", () => {
   assert.ok(scope.sessionDirs.size <= 1024);
   noteSessionDirectory(scope, "s", "relative/dir");
   assert.equal(scope.sessionDirs.has("s"), false, "only absolute directories");
+});
+
+// --- WR-06: MCP names on 2.x ---------------------------------------------------------------------
+
+test("WR-06: a server name the host sanitises (`my-server.v2` → `my-server_v2_<tool>`) is attributed", async () => {
+  assert.deepEqual(mcpCandidates("my-server_v2_echo_marker", ["my-server.v2"]), [{ server: "my-server.v2", tool: "echo_marker" }]);
+  const f = await fakeV2({ mode: "deny", mcpServers: ["my-server.v2"] });
+  try {
+    const r = await toolCall(f, "my-server_v2_echo_marker", { n: "1" });
+    assert.equal(r.raised, SECRETS_DENY);
+    assert.equal(metadataOf(toolBodies()[0]).mcp_server, "my-server.v2");
+    assert.equal(metadataOf(toolBodies()[0]).mcp_tool, "echo_marker");
+    assert.equal(signalsOf(mock, "mcp_attribution_miss").length, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("WR-06: ctx.mcp.list is called with {location:{directory}}, and without arguments when that yields no list", async () => {
+  const calls: unknown[] = [];
+  const scopedOk = {
+    mcp: {
+      list: async (input?: unknown) => {
+        calls.push(input);
+        return { data: [{ name: "a" }] };
+      },
+    },
+  } as unknown as V2ContextLike;
+  assert.deepEqual(await v2HostClient(scopedOk, "/repo").mcp.status(), { data: { a: true } });
+  assert.deepEqual(calls, [{ location: { directory: "/repo" } }]);
+
+  for (const scopedAnswer of ["reject", "no-data"] as const) {
+    const seen: unknown[] = [];
+    const fallback = {
+      mcp: {
+        list: async (input?: unknown) => {
+          seen.push(input);
+          if (input !== undefined) {
+            if (scopedAnswer === "reject") throw new Error("Expected object");
+            return {};
+          }
+          return { data: [{ name: "b" }] };
+        },
+      },
+    } as unknown as V2ContextLike;
+    assert.deepEqual(await v2HostClient(fallback, "/repo").mcp.status(), { data: { b: true } }, scopedAnswer);
+    assert.deepEqual(seen, [{ location: { directory: "/repo" } }, undefined], scopedAnswer);
+  }
 });

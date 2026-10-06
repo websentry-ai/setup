@@ -413,16 +413,25 @@ export function v2HostClient(ctx: V2ContextLike, directory: string): { mcp: { st
   };
 }
 
-/** `ctx.mcp.list()` server names, or `undefined` when unavailable. Total. */
+/**
+ * `ctx.mcp.list()` server names, or `undefined` when unavailable. Total.
+ *
+ * The argument is `McpListInput` (`{location?: {directory?}}`, `@opencode/client` 2.0.24
+ * `generated/types.d.ts`; checked in `conformance/v2.ts`). A 2.0.24 host answers the scoped call with
+ * the location's servers (14-REVIEW WR-06 probe). If a host ever rejects it or answers without a
+ * server list, the unscoped call is tried once before giving up.
+ */
 async function listMcpNames(ctx: V2ContextLike, directory: string): Promise<string[] | undefined> {
+  const scoped = directory === "" ? undefined : await listMcpNamesWith(ctx, { location: { directory } });
+  return scoped ?? (await listMcpNamesWith(ctx, undefined));
+}
+
+async function listMcpNamesWith(ctx: V2ContextLike, input: unknown): Promise<string[] | undefined> {
   try {
     const mcp = ctx.mcp;
     const list = readField(mcp, "list");
     if (typeof list !== "function") return undefined;
-    const answer: unknown = await (list as (this: unknown, input?: unknown) => unknown).call(
-      mcp,
-      directory === "" ? undefined : { location: { directory } },
-    );
+    const answer: unknown = await (list as (this: unknown, input?: unknown) => unknown).call(mcp, input);
     const data = readField(answer, "data");
     if (!Array.isArray(data)) return undefined;
     const names: string[] = [];
