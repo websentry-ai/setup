@@ -12,6 +12,8 @@ many tools ship a module named `setup`, so a bare import would pick whichever
 directory wins sys.path.
 """
 
+import builtins
+import io
 import json
 import os
 from pathlib import Path
@@ -79,6 +81,57 @@ def _isolated_home(tmp_path, monkeypatch):
     assert str(Path.home()).startswith(str(tmp_path)), "Path.home() escaped the tmp dir"
     yield OcHome(home)
     assert str(Path.home()).startswith(str(tmp_path)), "Path.home() escaped the tmp dir"
+
+
+# opencode's system managed config dirs (packages/opencode/src/config/managed.ts). No test may
+# ever write, open or remove anything under them: the MDM installer's managed-reference step is
+# pointed at a tmp dir through OPENCODE_TEST_MANAGED_CONFIG_DIR, exactly as opencode honours it.
+SYSTEM_MANAGED_DIRS = ("/Library/Application Support/opencode", "/etc/opencode")
+_GUARDED_OS_CALLS = ("open", "mkdir", "makedirs", "replace", "rename", "unlink", "remove",
+                     "rmdir", "chmod", "chown", "lchown")
+
+
+def _touches_system_managed_dir(path) -> bool:
+    if isinstance(path, int) or path is None:
+        return False
+    try:
+        raw = os.fspath(path)
+    except TypeError:
+        return False
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    full = os.path.normpath(os.path.join(os.getcwd(), raw)) if not os.path.isabs(raw) else os.path.normpath(raw)
+    return any(full == d or full.startswith(d + "/") for d in SYSTEM_MANAGED_DIRS)
+
+
+def _guarded(fn):
+    def wrapped(path, *args, **kwargs):
+        if _touches_system_managed_dir(path):
+            raise AssertionError(f"a test reached the system managed opencode dir: {path!r}")
+        return fn(path, *args, **kwargs)
+    wrapped.__wrapped__ = fn
+    return wrapped
+
+
+@pytest.fixture(autouse=True)
+def _no_system_managed_dir(tmp_path, monkeypatch):
+    """Every test: managed dir = tmp, and the real system managed dirs are unreachable."""
+    managed = tmp_path / "managed-opencode"
+    monkeypatch.setenv("OPENCODE_TEST_MANAGED_CONFIG_DIR", str(managed))
+    for name in _GUARDED_OS_CALLS:
+        original = getattr(os, name)
+        wrapper = _guarded(original)
+        monkeypatch.setattr(os, name, wrapper)
+        # Capability sets are keyed on function identity (`os.open in os.supports_dir_fd`);
+        # the wrapper must keep every capability the original has.
+        for cap in ("supports_dir_fd", "supports_fd", "supports_follow_symlinks",
+                    "supports_effective_ids"):
+            caps = getattr(os, cap, None)
+            if isinstance(caps, set) and original in caps:
+                monkeypatch.setattr(os, cap, caps | {wrapper})
+    monkeypatch.setattr(builtins, "open", _guarded(builtins.open))
+    monkeypatch.setattr(io, "open", _guarded(io.open))
+    yield managed
 
 
 @pytest.fixture
