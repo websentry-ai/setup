@@ -11,8 +11,9 @@
 //     the provider-level identity.
 //   * `session.text.ended {sessionID, assistantMessageID, ordinal, text}` → an assistant
 //     `message.updated` plus a text `message.part.updated` (one part per message + ordinal).
-//   * `session.execution.succeeded` / `session.execution.interrupted {sessionID}` → `session.idle`:
-//     the turn end on 2.0.22, where `session.idle` is never emitted.
+//   * `session.execution.succeeded` / `interrupted` / `failed {sessionID}` → `session.idle`: the
+//     turn end on 2.0.x, where `session.idle` is never emitted. `failed` (a provider error, observed
+//     on 2.0.24 in 14-05) must end the turn too, or its record would roll into the next one.
 //   * `session.tool.input.started {id, name}` → the call's tool name (the only tool event with one);
 //     `session.tool.failed {id, error}` → an errored tool part (hash-only, one result per call).
 //   * `session.step.started {model}` → the session's model; `mcp.status.changed` → the next
@@ -193,6 +194,7 @@ export function registerV2Recording(
           }
           case "session.execution.succeeded":
           case "session.execution.interrupted":
+          case "session.execution.failed":
             emit("session.idle", { sessionID });
             return;
           case "session.deleted":
