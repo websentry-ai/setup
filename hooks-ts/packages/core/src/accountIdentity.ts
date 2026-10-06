@@ -227,6 +227,10 @@ export function buildAccountIdentity(input: BuildIdentityInput): AccountIdentity
       } else {
         identity.auth_mode = AUTH_MODE_API_KEY;
       }
+    } else {
+      // No credential was read: a host-reported label is all there is to say about the mode.
+      const mode = label(auth.authMode);
+      if (mode !== undefined) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== undefined && isValidSerial(serial)) identity.device_serial = serial;

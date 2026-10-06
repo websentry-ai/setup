@@ -378,7 +378,9 @@ test("hostile events and hook inputs never reject; stop ends the subscription", 
   const f = await fakeV2();
   const boom = new Proxy({}, { get: () => { throw new Error("boom"); } });
   try {
-    for (const event of [null, 5, "x", boom, { type: 5 }, { type: "session.created", data: boom }, { type: "session.text.ended", data: null }]) {
+    // (A bare Proxy cannot be yielded from an async generator: `yield` awaits its `then`.)
+    const raising = { get type(): string { throw new Error("boom"); } };
+    for (const event of [null, 5, "x", raising, { type: 5 }, { type: "session.created", data: boom }, { type: "session.text.ended", data: null }]) {
       f.stream.push(event);
     }
     await tick(20);

@@ -57,7 +57,7 @@ export function outputParts(output: unknown): unknown[] {
 }
 
 /** Record one result for a call, once per callID, hash-only. Total. */
-function recordResult(ctx: RecordContext, sessionID: string, callID: string, tool: string, isError: boolean, parts: unknown[]): void {
+export function recordResult(ctx: RecordContext, sessionID: string, callID: string, tool: string, isError: boolean, parts: unknown[]): void {
   try {
     const { runtime } = ctx;
     if (sessionID === "" || callID === "") return;

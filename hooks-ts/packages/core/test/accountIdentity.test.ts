@@ -396,3 +396,17 @@ test("the Windows PowerShell path honours SystemRoot and falls back to C:\\Windo
     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   );
 });
+
+test("buildAccountIdentity: a host-reported authMode labels a store-less sign-in, never overrides a credential", () => {
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "openrouter", hasCredential: false, anthropicOAuth: false, authMode: "openrouter" } }),
+    { auth_mode: "openrouter" },
+  );
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "x", hasCredential: true, anthropicOAuth: false, authMode: "x" } }),
+    { auth_mode: "api_key" },
+  );
+  for (const bad of ["", "   ", "y".repeat(500), 5 as unknown as string]) {
+    assert.equal(buildAccountIdentity({ auth: { provider: "p", hasCredential: false, anthropicOAuth: false, authMode: bad } }), undefined);
+  }
+});
