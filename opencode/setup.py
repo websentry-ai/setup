@@ -81,8 +81,10 @@ PLUGIN_SUFFIXES = (".js", ".ts")
 OPENCODE_CONFIG_NAMES = ("opencode.json", "opencode.jsonc")
 MAX_CONFIG_SCAN_BYTES = 1024 * 1024
 
-# Shown in the closing notes until the v2 plugin line enforces (Phase 14).
-V2_STATUS_NOTE = "OpenCode 2.x: the plugin loads but does not block yet."
+# The v2 line (OpenCode 2.x / desktop) enforces since Phase 14 (hooks-ts/docs/OPENCODE.md,
+# "opencode v2"). Kept identical in both installers; the bypass notes print separately.
+V2_STATUS_NOTE = ("OpenCode 2.x is enforced: tool calls, MCP, prompts and the user shell are "
+                  "checked, and approvals use OpenCode's native approval prompt.")
 
 # Marks a publish-by-rename temp. The full name adds a pid and random bytes -- see
 # _unique_tmp_path -- so two concurrent writers can never share one temp file.

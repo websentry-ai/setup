@@ -99,6 +99,10 @@ class TestTheRun:
         assert "opencode serve" in out and "--pure" in out and "OPENCODE_PURE" in out
         assert oc_mdm_setup.V2_STATUS_NOTE in out
 
+    def test_the_v2_note_matches_the_user_installer(self, oc_mdm_setup, oc_setup):
+        assert oc_mdm_setup.V2_STATUS_NOTE == oc_setup.V2_STATUS_NOTE
+        assert "is enforced" in oc_mdm_setup.V2_STATUS_NOTE
+
     def test_the_source_reports_mdm_once_and_never_the_telemetry_endpoint(self, oc_mdm_setup):
         src = Path(oc_mdm_setup.__file__).read_text()
         assert src.count('install_mode="mdm"') == 1

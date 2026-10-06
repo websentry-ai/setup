@@ -67,6 +67,14 @@ class TestHappyPath:
         assert oc_setup.V2_STATUS_NOTE in out
         assert "OpenCode 2.x" in oc_setup.V2_STATUS_NOTE
 
+    def test_the_v2_note_says_enforced_not_load_only(self, oc_setup):
+        # Phase 14 shipped an enforcing v2 entry (14-05): the note must not undersell it.
+        note = oc_setup.V2_STATUS_NOTE
+        assert "is enforced" in note
+        for capability in ("tool calls", "approval", "MCP", "prompts", "shell"):
+            assert capability in note
+        assert "does not block" not in note
+
     def test_no_proxy_note_without_a_proxy(self, oc_setup, oc_home, run_main, capsys):
         run_main("--api-key", "k")
         assert "HTTPS_PROXY" not in capsys.readouterr().out
@@ -79,6 +87,19 @@ class TestHappyPath:
 
 
 class TestRelocatedConfigDir:
+    def test_opencode_config_dir_beats_xdg_config_home(self, oc_setup, oc_home, run_main,
+                                                       monkeypatch, tmp_path):
+        # On 2.x OPENCODE_CONFIG_DIR REPLACES the XDG dir (14-SPIKES V2-7), so the plugin
+        # must land there even when XDG_CONFIG_HOME is set too.
+        base = tmp_path / "oc-v2-dir"
+        xdg = tmp_path / "xdg"
+        monkeypatch.setenv("OPENCODE_CONFIG_DIR", str(base))
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg))
+        assert run_main("--api-key", "k") is True
+        assert (base / "plugins" / "unbound.js").read_bytes() == ARTIFACT
+        assert not (xdg / "opencode").exists()
+        assert not oc_home.config_dir.exists()
+
     def test_opencode_config_dir_is_named_in_the_output(self, oc_setup, oc_home, run_main,
                                                          monkeypatch, tmp_path, capsys):
         base = tmp_path / "custom-oc"

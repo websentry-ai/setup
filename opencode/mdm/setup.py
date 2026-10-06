@@ -127,8 +127,10 @@ BANNER_SCAN_BYTES = 4096
 PLUGIN_SUFFIXES = (".js", ".ts")
 ESM_PACKAGE_JSON = {"type": "module"}
 
-# Shown in the closing notes until the v2 plugin line enforces (Phase 14).
-V2_STATUS_NOTE = "OpenCode 2.x: the plugin loads but does not block yet."
+# The v2 line (OpenCode 2.x / desktop) enforces since Phase 14 (hooks-ts/docs/OPENCODE.md,
+# "opencode v2"). Kept identical in both installers; the bypass notes print separately.
+V2_STATUS_NOTE = ("OpenCode 2.x is enforced: tool calls, MCP, prompts and the user shell are "
+                  "checked, and approvals use OpenCode's native approval prompt.")
 
 # Exactly the files this installer always writes; package.json is added only when the
 # marker says this installer created it.
