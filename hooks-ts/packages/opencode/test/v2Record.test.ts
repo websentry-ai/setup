@@ -268,6 +268,26 @@ test("an interrupted turn also posts; a child turn end posts nothing", async () 
   }
 });
 
+test("a failed turn (session.execution.failed, e.g. a provider error) also posts, so nothing lingers into the next turn", async () => {
+  const f = await fakeV2();
+  try {
+    await f.emit("session.created", { sessionID: "s1", version: "2.0.22" });
+    await promptAndShell(f, "s1", "call_f");
+    await f.emit("session.execution.failed", { sessionID: "s1", error: { type: "provider.auth", message: "401" } });
+    assert.ok(await waitFor(() => turnLogs().length === 1));
+    assert.ok(JSON.stringify(turnLogs()[0]?.body).includes('"tool_use_id":"call_f"'));
+    // The next turn starts clean: its log does not repeat the failed turn's call.
+    await promptAndShell(f, "s1", "call_g");
+    await f.emit("session.execution.succeeded", { sessionID: "s1" });
+    assert.ok(await waitFor(() => turnLogs().length === 2));
+    const second = JSON.stringify(turnLogs()[1]?.body);
+    assert.ok(second.includes('"tool_use_id":"call_g"'));
+    assert.equal(second.includes('"tool_use_id":"call_f"'), false);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("a denied call is recorded once although execute.after(error) and session.tool.failed both arrive", async () => {
   const f = await fakeV2({ mode: "deny" });
   try {
