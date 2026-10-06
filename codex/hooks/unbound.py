@@ -23,10 +23,12 @@ from urllib.parse import unquote, urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# Codex keeps its own files under CODEX_HOME (default ~/.codex); the hook's files stay in ~/.codex/hooks.
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+CODEX_AUTH_PATH = CODEX_HOME / "auth.json"
 # Shared with the cursor and claude-code hooks, so one probe serves all three.
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
-CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
+CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
