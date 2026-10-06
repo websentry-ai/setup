@@ -156,6 +156,22 @@ class TestCoworkGuardIsStructural(_CoworkTree):
 
 class TestCoworkBundleScope(_CoworkTree):
 
+    def test_shared_bundle_used_when_the_accounts_own_lacks_the_skill(self):
+        _write(self.root / "skills-plugin" / "acct-1" / "org-1" / "skills" / "docx" / "SKILL.md", "# docx")
+        shared = self.bundle("b1", "xlsx")
+        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(shared))
+
+    def test_another_orgs_bundle_is_never_used(self):
+        (self.root / "acct-2" / "org-9").mkdir(parents=True)
+        shared = self.bundle("b1", "xlsx", age=3600)
+        _write(self.root / "skills-plugin" / "acct-2" / "org-9" / "skills" / "xlsx" / "SKILL.md", "# theirs")
+        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(shared))
+
+    def test_only_another_orgs_bundle_resolves_nothing(self):
+        (self.root / "acct-2" / "org-9").mkdir(parents=True)
+        _write(self.root / "skills-plugin" / "acct-2" / "org-9" / "skills" / "xlsx" / "SKILL.md", "# theirs")
+        self.assertIsNone(self.resolve("anthropic-skills:xlsx"))
+
     def test_the_sessions_own_account_bundle_wins_over_a_newer_one_elsewhere(self):
         mine = _write(self.root / "skills-plugin" / "acct-1" / "org-1" / "skills" / "xlsx" / "SKILL.md", "# mine", 3600)
         _write(self.root / "skills-plugin" / "acct-2" / "org-9" / "skills" / "xlsx" / "SKILL.md", "# theirs")
