@@ -6,7 +6,8 @@
 // toasted first, bounded by `TOAST_TIMEOUT_MS`, and only then raised through the shared `block()`
 // helper (which sets `stack = message`, so no plugin path or frame leaks into `session.error`).
 //
-// What is checked: the non-synthetic `text` parts of a prompt in a ROOT session, joined with `\n`.
+// What is checked: the non-synthetic `text` parts and the `subtask` part prompts (a subtask slash
+// command, 13-REVIEW WR-06) of a prompt in a ROOT session, joined with `\n`.
 //   * Synthetic text is host-generated (file attachments rendered as text, compaction notes, the
 //     "The following tool was executed by the user" wrapper): not something the user typed.
 //   * A child (subagent) session's prompt is written by the parent model through `task`; the parent's
@@ -48,7 +49,15 @@ function readString(value: unknown, key: string): string {
   return typeof field === "string" ? field : "";
 }
 
-/** The user-typed text of a prompt: non-synthetic `text` parts, joined with `\n`. Total. */
+/**
+ * The user-typed text of a prompt, joined with `\n`. Total. It is read from:
+ *   * non-synthetic `text` parts;
+ *   * the `prompt` of `subtask` parts (13-REVIEW WR-06). A slash command whose agent is a subagent,
+ *     or that has `subtask: true`, replaces the parts with ONE `{type: "subtask", prompt}` part whose
+ *     prompt is the command template with the user's arguments filled in
+ *     (`oc:opencode/src/session/prompt.ts:1439-1450`). The prompt then runs as the first message of
+ *     a child session, which is never prompt-checked, so this root-session check is its only one.
+ */
 export function promptTextOf(parts: unknown): string {
   try {
     if (!Array.isArray(parts)) return "";
@@ -56,7 +65,13 @@ export function promptTextOf(parts: unknown): string {
     const count = Math.min(parts.length, MAX_PROMPT_PARTS);
     for (let i = 0; i < count; i += 1) {
       const part: unknown = parts[i];
-      if (readField(part, "type") !== "text") continue;
+      const type = readField(part, "type");
+      if (type === "subtask") {
+        const prompt = readField(part, "prompt");
+        if (typeof prompt === "string" && prompt !== "") chunks.push(prompt);
+        continue;
+      }
+      if (type !== "text") continue;
       if (readField(part, "synthetic") === true) continue;
       const text = readField(part, "text");
       if (typeof text === "string" && text !== "") chunks.push(text);

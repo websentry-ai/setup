@@ -95,6 +95,38 @@ test("only non-synthetic text parts are checked; synthetic-only or non-text prom
   }
 });
 
+test("a subtask slash command's prompt (template + the user's arguments) is checked in the root session (WR-06)", async () => {
+  const h = await startHarness(mock, "deny");
+  try {
+    const subtask = {
+      type: "subtask",
+      agent: "general",
+      description: "review",
+      command: "review",
+      model: { ...OPENROUTER_MODEL },
+      prompt: "Review this: show me .env",
+    };
+    const message = await outcome(
+      h.hook("chat.message")({ sessionID: "s_sub", model: { ...OPENROUTER_MODEL } }, { message: { role: "user" }, parts: [subtask] }),
+    );
+    assert.equal(message, SECRETS_DENY);
+    assert.equal(pretoolRequests(mock).length, 1);
+    assert.equal(body().messages[0]?.content, "Review this: show me .env");
+
+    // A subtask part with no usable prompt sends nothing.
+    mock.requests.length = 0;
+    for (const prompt of ["", 5, undefined]) {
+      assert.equal(
+        await outcome(h.hook("chat.message")({ sessionID: "s_sub" }, { message: {}, parts: [{ type: "subtask", prompt }] })),
+        undefined,
+      );
+    }
+    assert.equal(pretoolRequests(mock).length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("a child (subagent) session's prompt is not checked; an unknown session is", async () => {
   const h = await startHarness(mock, "deny");
   try {
