@@ -390,16 +390,66 @@ test("approvalMessage is approval-specific and sanitised", () => {
 
 // --- MCP attribution (HOOK-13) ------------------------------------------------------------------
 
-test("MCP: longest configured prefix → explicit mcp_server / mcp_tool, and the deny applies", async () => {
+test("MCP: a configured prefix → explicit mcp_server / mcp_tool, and the deny applies", async () => {
   const h = await harness("deny");
   try {
-    await h.hooks.config?.({ mcp: { my: {}, my_server: {} } });
+    await h.hooks.config?.({ mcp: { my_server: {}, other: {} } });
     const message = await outcome(h.before(call("my_server_list_files"), { args: {} }));
     assert.equal(message, SECRETS_DENY);
+    assert.equal(pretoolRequests(mock).length, 1);
     const m = metadataOf(body(0));
     assert.equal(m.mcp_server, "my_server");
     assert.equal(m.mcp_tool, "list_files");
     assert.equal(body(0).pre_tool_use_data.tool_name, "my_server_list_files");
+    await tick(20);
+    assert.equal(signalsOf(mock, "mcp_attribution_ambiguous").length, 0);
+  } finally {
+    h.cleanup();
+  }
+});
+
+/** Denies only calls attributed to MCP server `server`. */
+function serverChecker(server: string, seen: PretoolRequestBody[]): PolicyChecker {
+  return {
+    async checkTool(payload: PretoolRequestBody) {
+      seen.push(payload);
+      const m = payload.pre_tool_use_data.metadata as Record<string, unknown>;
+      return m.mcp_server === server ? { kind: "deny", reason: `No ${server}.` } : { kind: "allow" };
+    },
+  };
+}
+
+test("MCP: a key two configured servers could produce is checked for each, strictest wins (WR-01)", async () => {
+  for (const denied of ["github", "github_create"]) {
+    const seen: PretoolRequestBody[] = [];
+    const h = await harness("allow", { deps: { makeChecker: () => serverChecker(denied, seen) } });
+    try {
+      // `github` + `create_issue` and `github_create` + `issue` both give `github_create_issue`.
+      await h.hooks.config?.({ mcp: { github: {}, github_create: {} } });
+      const message = await outcome(h.before(call("github_create_issue"), { args: {} }));
+      assert.equal(message, `${DENY_PREFIX}No ${denied}.`, `a policy on ${denied} applies`);
+      const attributions = seen
+        .map((p) => {
+          const m = p.pre_tool_use_data.metadata as Record<string, unknown>;
+          return `${String(m.mcp_server)}/${String(m.mcp_tool)}`;
+        })
+        .sort();
+      assert.deepEqual(attributions, ["github/create_issue", "github_create/issue"]);
+      assert.ok(await waitFor(() => signalsOf(mock, "mcp_attribution_ambiguous").length === 1), "reported");
+      assert.equal(signalsOf(mock, "mcp_attribution_miss").length, 0);
+    } finally {
+      h.cleanup();
+    }
+  }
+});
+
+test("MCP: names that sanitise alike are both candidates (WR-01)", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const h = await harness("allow", { deps: { makeChecker: () => serverChecker("a.b", seen) } });
+  try {
+    await h.hooks.config?.({ mcp: { a_b: {}, "a.b": {} } });
+    assert.equal(await outcome(h.before(call("a_b_run"), { args: {} })), `${DENY_PREFIX}No a.b.`);
+    assert.equal(seen.length, 2);
   } finally {
     h.cleanup();
   }

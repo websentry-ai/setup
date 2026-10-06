@@ -15,6 +15,7 @@ import {
   applyPatchTargets,
   argsDigest,
   mcpResourceTarget,
+  mcpCandidates,
   resolveMcpTool,
   sanitizeMcpName,
   shellCommandOf,
@@ -131,6 +132,22 @@ test("resolveMcpTool: two names that sanitise identically resolve to the smaller
   // opencode's own key collides the same way: both servers register `a_b_<tool>`.
   assert.deepEqual(resolveMcpTool("a_b_t", ["a_b", "a.b", "a@b"]), { server: "a.b", tool: "t" });
   assert.deepEqual(resolveMcpTool("a_b_t", ["a@b", "a.b"]), { server: "a.b", tool: "t" });
+});
+
+test("mcpCandidates: every server that could produce the id, longest prefix first (WR-01)", () => {
+  assert.deepEqual(mcpCandidates("github_create_issue", ["github", "github_create", "gh"]), [
+    { server: "github_create", tool: "issue" },
+    { server: "github", tool: "create_issue" },
+  ]);
+  assert.deepEqual(mcpCandidates("a_b_t", ["a@b", "a_b", "a.b", "a_b"]), [
+    { server: "a.b", tool: "t" },
+    { server: "a@b", tool: "t" },
+    { server: "a_b", tool: "t" },
+  ]);
+  assert.deepEqual(mcpCandidates("my_", ["my"]), []);
+  assert.deepEqual(mcpCandidates("x_y", wrong(null)), []);
+  assert.deepEqual(mcpCandidates("x_y", hostile()), []);
+  assert.deepEqual(mcpCandidates(wrong(5), ["x"]), []);
 });
 
 test("mcpResourceTarget: the server arg of the three MCP resource tools", () => {

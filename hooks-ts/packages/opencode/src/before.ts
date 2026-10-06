@@ -33,6 +33,7 @@ import { auditToolInput, normaliseMcp } from "../../core/src/payload.ts";
 import {
   MAX_PATCH_TARGETS,
   PATCH_CONCURRENCY,
+  SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS,
   SIGNAL_MCP_ATTRIBUTION_MISS,
   SIGNAL_PATCH_TARGETS_CAPPED,
 } from "./constants.ts";
@@ -41,8 +42,8 @@ import {
   argsDigest,
   BUILTIN_TOOLS,
   MCP_RESOURCE_TOOLS,
+  mcpCandidates,
   mcpResourceTarget,
-  resolveMcpTool,
   shellCommandOf,
   shellCwdOf,
   SHELL_TOOLS,
@@ -228,9 +229,16 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     // The miss is reported here too, whether or not any MCP server is configured.
     const builtin = BUILTIN_TOOLS.has(tool);
     const toolServerCall = tool !== "" && (!builtin || MCP_RESOURCE_TOOLS.has(tool));
-    const mcp =
-      mcpResourceTarget(tool, args) ??
-      (builtin || tool === "" ? undefined : resolveMcpTool(tool, runtime.mcpServerNamesFor(record)));
+    const resourceMcp = mcpResourceTarget(tool, args);
+    // 13-REVIEW WR-01: sanitised keys can collide (`github` + `create_issue` and `github_create` +
+    // `issue` both give `github_create_issue`), and opencode keeps whichever client registered last,
+    // which the adapter cannot see. So every server that could have produced the id is a candidate.
+    const candidates =
+      resourceMcp !== undefined || builtin || tool === "" ? [] : mcpCandidates(tool, runtime.mcpServerNamesFor(record));
+    const mcp = resourceMcp ?? candidates[0];
+    if (candidates.length > 1) {
+      runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS, tool, `candidates_${candidates.length}`);
+    }
     if (toolServerCall) {
       const attributed = mcp !== undefined && normaliseMcp(mcp) !== undefined;
       if (!attributed) {
@@ -306,6 +314,36 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
           telemetry: resolved.telemetry,
           onDecision: evalDeps.onDecision,
           label: APPLY_PATCH_TOOL,
+          callID,
+        },
+      );
+    } else if (candidates.length > 1) {
+      // Ambiguous MCP attribution (WR-01): check the call once per candidate server, under one shared
+      // deadline, and let the strictest verdict decide, so a policy on any of them applies.
+      verdict = await fanOut(
+        candidates,
+        PATCH_CONCURRENCY,
+        (candidate) =>
+          evaluateToolCall(
+            {
+              toolName: tool,
+              toolCallId: callID,
+              command: "",
+              toolInput: args,
+              cwd: directory,
+              sessionId: sessionID,
+              model,
+              mcp: candidate,
+              sendUnattributed: true,
+            },
+            evalDeps,
+          ),
+        {
+          deadlineMs,
+          failureAction: () => scope.policy.getFailureAction(),
+          telemetry: resolved.telemetry,
+          onDecision: evalDeps.onDecision,
+          label: tool,
           callID,
         },
       );

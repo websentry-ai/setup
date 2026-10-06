@@ -164,26 +164,33 @@ export function resolveMcpTool(
   toolId: string,
   serverNames: readonly string[],
 ): { server: string; tool: string } | undefined {
+  return mcpCandidates(toolId, serverNames)[0];
+}
+
+/**
+ * EVERY configured server that could have produced this tool id (13-REVIEW WR-01): each name whose
+ * `sanitize(name) + "_"` starts the id and leaves a non-empty remainder, distinct by name, ordered
+ * longest prefix first, then by name. opencode keeps the LAST client to register a colliding key
+ * (`oc:mcp/index.ts:684`), which the adapter cannot observe, so with more than one candidate the
+ * caller checks each attribution and takes the strictest verdict. Total; `[]` for no match.
+ */
+export function mcpCandidates(toolId: string, serverNames: readonly string[]): Array<{ server: string; tool: string }> {
   try {
-    if (typeof toolId !== "string" || toolId === "" || !Array.isArray(serverNames)) return undefined;
-    let best: { server: string; prefixLength: number } | undefined;
+    if (typeof toolId !== "string" || toolId === "" || !Array.isArray(serverNames)) return [];
+    const found = new Map<string, number>();
     const count = Math.min(serverNames.length, MAX_MCP_SERVERS);
     for (let i = 0; i < count; i += 1) {
       const name: unknown = serverNames[i];
-      if (typeof name !== "string" || name === "") continue;
+      if (typeof name !== "string" || name === "" || found.has(name)) continue;
       const prefix = `${sanitizeMcpName(name)}_`;
       if (toolId.length <= prefix.length || !toolId.startsWith(prefix)) continue;
-      if (
-        best === undefined ||
-        prefix.length > best.prefixLength ||
-        (prefix.length === best.prefixLength && name < best.server)
-      ) {
-        best = { server: name, prefixLength: prefix.length };
-      }
+      found.set(name, prefix.length);
     }
-    return best === undefined ? undefined : { server: best.server, tool: toolId.slice(best.prefixLength) };
+    return [...found.entries()]
+      .sort(([a, la], [b, lb]) => (la !== lb ? lb - la : a < b ? -1 : a > b ? 1 : 0))
+      .map(([server, prefixLength]) => ({ server, tool: toolId.slice(prefixLength) }));
   } catch {
-    return undefined;
+    return [];
   }
 }
 

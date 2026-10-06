@@ -34,6 +34,8 @@ export const SIGNAL_DUPLICATE_LOAD = "duplicate_load";
 export const SIGNAL_INIT_DEGRADED = "init_degraded";
 /** A tool looked like MCP but could not be attributed to a configured server. */
 export const SIGNAL_MCP_ATTRIBUTION_MISS = "mcp_attribution_miss";
+/** More than one configured MCP server could have produced a tool id; every candidate was checked. */
+export const SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS = "mcp_attribution_ambiguous";
 /** Tool arguments changed between the check and execution. */
 export const SIGNAL_ARGS_CHANGED = "args_changed_after_check";
 /** A user shell command ran without a check. */
