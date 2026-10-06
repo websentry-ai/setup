@@ -9,6 +9,13 @@ Unbound MDM onboarding — runs all six steps in one shot:
   5. Augment MDM setup
   6. Coding-discovery scan
 
+Pi Coding Agent MDM setup also runs, after the tool steps and before the
+discovery scan, but only on a device where pi is detected: the `pi` binary on
+PATH, in a machine bin dir or in any user's bin dirs, or `.pi/agent/auth.json` /
+`.pi/agent/sessions` in any user's home. A device without pi skips it, which is
+reported as skipped and is not a failure. Every other tool installs
+unconditionally.
+
 Every step uses --api-key (the admin MDM key). The discovery scan authenticates
 as the device's owner, whose key is resolved from the hardware serial, so no
 separate discovery key is needed. --discovery-key is still accepted so existing
@@ -40,6 +47,9 @@ Claude Code only:
 To clear MDM setup for the four tools (no discovery — it's a one-shot scan,
 nothing to clear; backfill is also skipped because there's nothing to seed):
   sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --clear
+
+The Pi clear step always runs, detected or not: a device whose pi was
+uninstalled still carries the extension and the rc export.
 
 Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
@@ -88,6 +98,22 @@ TOOLS = [
     ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True,  False),
     ("Augment",        f"{_RAW_SETUP}/augment/hooks/mdm/setup.py",     False, False),
 ]
+
+# Pi is deliberately NOT a row in TOOLS: it is the one step that runs only where
+# pi is present, because pi/mdm/setup.py installs into every user home without
+# checking. Same tuple shape as a TOOLS row.
+PI_TOOL = ("Pi Coding Agent", f"{_RAW_SETUP}/pi/mdm/setup.py", False, False)
+PI_BIN_NAME = "pi"
+# Files only pi itself writes. Never `.pi/agent/extensions/unbound/`: Unbound's own
+# installer creates that, so it would make every onboarded device look like it has pi.
+PI_MARKERS = (".pi/agent/auth.json", ".pi/agent/sessions")
+# Where a per-user CLI lands, relative to a home. PATH alone is not enough: under
+# sudo and under MDM it is a minimal system PATH that lacks these.
+PI_HOME_BIN_DIRS = (".local/bin", ".bun/bin", ".npm-global/bin", ".volta/bin", ".yarn/bin",
+                    "AppData/Roaming/npm", "AppData/Local/Microsoft/WinGet/Links")
+PI_MACHINE_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/snap/bin")
+# Not real accounts; nothing to detect in them.
+PI_SKIP_HOME_NAMES = ("Shared", "Guest", "Public", "Default", "Default User", "All Users")
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
@@ -509,6 +535,85 @@ def tool_arguments(mdm_args, supports_backfill, supports_skip_settings,
     return args
 
 
+def all_user_homes(system=None, users_root=None) -> list:
+    """Every real user's home on this device, plus the home of whoever is running
+    this. The tools belong to users other than root, so detection has to look in
+    all of them. An unreadable root or entry contributes nothing."""
+    system = system or platform.system().lower()
+    if users_root is None:
+        if system == "windows":
+            users_root = os.environ.get("SystemDrive", "C:") + os.sep + "Users"
+        elif system == "darwin":
+            users_root = "/Users"
+        else:
+            users_root = "/home"
+    homes = [os.path.expanduser("~")]
+    try:
+        names = sorted(os.listdir(users_root))
+    except OSError:
+        names = []
+    for name in names:
+        if name.startswith(".") or name in PI_SKIP_HOME_NAMES:
+            continue
+        home = os.path.join(users_root, name)
+        if os.path.isdir(home) and home not in homes:
+            homes.append(home)
+    return homes
+
+
+def pi_detected(homes=None, path_dirs=None, machine_bin_dirs=None, system=None) -> bool:
+    """True when the Pi Coding Agent is present for any user on this device: its
+    binary in a bin dir, or a file pi writes for itself in a home. Existence checks
+    only -- this runs as root over paths any local user can create, so nothing
+    found is ever opened, read or executed."""
+    system = system or platform.system().lower()
+    if homes is None:
+        homes = all_user_homes(system)
+    if path_dirs is None:
+        path_dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    if machine_bin_dirs is None:
+        machine_bin_dirs = () if system == "windows" else PI_MACHINE_BIN_DIRS
+
+    bin_dirs = list(path_dirs) + list(machine_bin_dirs)
+    for home in homes:
+        for rel in PI_HOME_BIN_DIRS:
+            bin_dirs.append(os.path.join(home, *rel.split("/")))
+        # nvm keeps one bin dir per installed Node version.
+        nvm = os.path.join(home, ".nvm", "versions", "node")
+        try:
+            versions = os.listdir(nvm)
+        except OSError:
+            versions = []
+        for version in versions:
+            bin_dirs.append(os.path.join(nvm, version, "bin"))
+
+    if system == "windows":
+        names = [PI_BIN_NAME + ext for ext in (".exe", ".cmd", ".ps1", "")]
+    else:
+        names = [PI_BIN_NAME]
+    for bin_dir in bin_dirs:
+        for name in names:
+            if os.path.exists(os.path.join(bin_dir, name)):
+                return True
+
+    for home in homes:
+        for rel in PI_MARKERS:
+            if os.path.exists(os.path.join(home, *rel.split("/"))):
+                return True
+    return False
+
+
+def should_install_pi() -> bool:
+    """Whether the Pi step runs on install. A detector that breaks must lean towards
+    governing: skipping would leave a pi that may well be there with no extension."""
+    try:
+        return pi_detected()
+    except Exception as e:
+        print(f"Warning: could not tell whether pi is installed ({e}); "
+              "setting up the Pi Coding Agent anyway.", file=sys.stderr)
+        return True
+
+
 def _stdout_never_raises() -> None:
     """MDM gives this a non-console pipe, which on Windows defaults to cp1252 and
     raises UnicodeEncodeError on the first non-ASCII status line."""
@@ -565,6 +670,20 @@ def main() -> int:
         if not run_tool(name, url, tool_args):
             failures.append(name)
 
+    # Pi installs only where pi is detected. --clear never asks: a device whose pi
+    # was uninstalled still carries the extension and the rc export.
+    pi_name, pi_url, pi_backfill, pi_skip_settings = PI_TOOL
+    pi_skipped = False
+    if is_clear or should_install_pi():
+        print(f"\n{'=' * 60}\n[{pi_name}] MDM setup\n{'=' * 60}\n")
+        pi_args = tool_arguments(mdm_args, pi_backfill, pi_skip_settings, skip_managed_settings)
+        if not run_tool(pi_name, pi_url, pi_args):
+            failures.append(pi_name)
+    else:
+        pi_skipped = True
+        print(f"\n[{pi_name}] pi was not detected on this device; skipping its setup. "
+              "This is not a failure.")
+
     # Discovery is a one-shot scan — skip it on --clear (nothing to remove).
     discovery_skipped = False
     if not is_clear:
@@ -584,6 +703,7 @@ def main() -> int:
         print("Re-run the failed step's individual command to retry.")
         return 1
     steps = [name for name, *_ in TOOLS]
+    steps.append(f"{pi_name} (skipped)" if pi_skipped else pi_name)
     if not is_clear:
         steps.append("Discovery (skipped)" if discovery_skipped else "Discovery")
     print(f"✅ MDM onboarding complete: {', '.join(steps)}")
