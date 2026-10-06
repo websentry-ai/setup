@@ -19,6 +19,16 @@ install_succeeded=0
 
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'; }
 
+# Same rule as normalize_url in each tool's setup.py: default to https, no trailing slash.
+normalize_url() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  [[ -n "$v" ]] || return 0
+  [[ "$v" == http://* || "$v" == https://* ]] || v="https://$v"
+  while [[ "$v" == */ ]]; do v="${v%/}"; done
+  printf '%s' "$v"
+}
+
 # shellcheck disable=SC2329  # invoked from the EXIT trap
 report() {
   local serial version body http_code
@@ -29,7 +39,7 @@ report() {
     "$(json_escape "$version")" "$(json_escape "$(hostname)")" \
     "$(json_escape "$(sw_vers -productVersion)")" "$(date +%s)")"
   http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
-    -X POST "${BACKEND_URL}/api/v1/automations/mdm/install-report/" \
+    -X POST "$(normalize_url "$BACKEND_URL")/api/v1/automations/mdm/install-report/" \
     -H 'Content-Type: application/json' \
     -H "X-API-KEY: ${API_KEY}" \
     -d "$body" 2>/dev/null)" || http_code="000"
