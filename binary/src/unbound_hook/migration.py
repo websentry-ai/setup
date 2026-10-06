@@ -14,7 +14,8 @@ replaces, so old and new never run side by side:
   - user-mode hook registrations pointing at the python scripts (each MDM
     module's own stripper runs FIRST, so a registration is never left
     dangling at a file this sweep already deleted), then the leftover
-    unbound.py + .self_update_check/.self_update.lock files as a catch-all
+    unbound.py + .self_update_check/.self_update.lock files as a catch-all;
+    copilot and codex are exceptions, see below
 
 Deliberately NOT swept here — anything that is still the live serving path
 until the per-tool setup adapter replaces it. Each adapter removes its own
@@ -25,6 +26,9 @@ before, so a deferred component leaves python-era coverage intact:
   - copilot's per-user unbound.json AND unbound.py (the copilot adapter,
     after writing the binary-era unbound.json — unbound.json IS copilot's
     registration, so sweeping it would unhook copilot on a deferral)
+  - codex's per-user ~/.codex/hooks/unbound.py and its hooks.json entry —
+    the binary install lives at the same path, so the codex adapter
+    overwrites it in place; sweeping it made every run report tampered
 
 Never touched: ~/.unbound/config.json (api key + urls survive migration).
 

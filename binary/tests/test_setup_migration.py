@@ -670,6 +670,21 @@ def test_sweep_keeps_binary_era_copilot_registration(env):
     assert (hooks_dir / "unbound.json").read_text() == binary_json
 
 
+CODEX_EVENTS = {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"}
+
+
+def _plant_python_era_codex(home: Path, command: str):
+    script = home / ".codex" / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"hooks": [
+            {"type": "command", "command": command.format(script=script)}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]}],
+    }}))
+    return script
+
+
 def _codex_states(env):
     return [k["install_state"] for a, k in env["notified"] if a[1] == "codex"]
 
@@ -712,22 +727,28 @@ def test_python_era_codex_install_upgrades_in_place(env, python_era_command):
     writes, so setup upgrades it in place: one registration per event, the
     file becomes the binary wrapper, and the run reports persisted."""
     home = env["home"]
-    script = home / ".codex" / "hooks" / "unbound.py"
-    script.parent.mkdir(parents=True)
-    script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
-    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
-        "PreToolUse": [{"hooks": [
-            {"type": "command", "command": python_era_command.format(script=script)}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]}],
-    }}))
+    script = _plant_python_era_codex(home, python_era_command)
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env) == ["persisted"]
     assert "os.execv" in script.read_text()
     regs = _codex_registrations(home)
+    assert set(regs) == CODEX_EVENTS
     assert all(len(cmds) == 1 for cmds in regs.values()), regs
     stop = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["Stop"]
     assert any(h["command"] == "/usr/local/bin/other-hook"
                for grp in stop for h in grp["hooks"])
+
+
+def test_codex_deferred_keeps_python_era(env, monkeypatch):
+    """A codex deferral (MDM key fetch fails) must leave the python-era hook
+    and its registration intact until a successful re-run replaces them."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, '"{script}"')
+    before = (script.read_text(), (home / ".codex" / "hooks.json").read_text())
+    monkeypatch.setattr(env["modules"]["codex"], "fetch_api_key_from_mdm",
+                        lambda *a: None)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert (script.read_text(), (home / ".codex" / "hooks.json").read_text()) == before
 
 
 def test_codex_clear_still_removes_the_binary_install(env):
