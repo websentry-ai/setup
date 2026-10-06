@@ -20,6 +20,15 @@
 //     reaches the provider (HV2-05 BLOCK lever=session.prompt-mutate). No raise: a raise there is an
 //     empty HTTP 500 for the client.
 //
+//   * **User `!cmd` shell — a raise from `shell.hook("create.before")`.** The user shell route
+//     (`POST /api/session/:id/shell`) fires only `shell.create.before {command, cwd, …}`, before the
+//     spawn, with no session or call id; a raise there is an empty HTTP 500 and nothing spawns
+//     (14-SPIKES V2-10). The same hook also fires for the MODEL's `shell` tool, after its
+//     `execute.before` and before its `evaluate`, so `execute.before(shell)` marks its command
+//     (bounded, short-lived, consumed once) and a matching spawn is not checked again. Any other
+//     command is a user command, checked as `bash` through v1's `checkUserCommand` (userShell.ts)
+//     and raised through `block.ts` on a would-block verdict (no native approval exists there).
+//
 // v2 naming (14-SPIKES V2-11): `shell` is v1 `bash`, `subagent` is v1 `task` (audited, never denied,
 // as on v1), file tools carry `path` (the opencode profile already reads it), and `execute` is the
 // Code Mode wrapper, which never asserts itself: each inner MCP call reaches `tool.execute.before`
@@ -47,11 +56,13 @@ import type {
   V2PermissionEvaluate,
   V2SessionInfo,
   V2SessionPrompt,
+  V2ShellCreateBefore,
   V2ToolBefore,
 } from "./hostTypesV2.ts";
 import { mcpCandidates } from "./narrow.ts";
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
 import { decidePrompt } from "./prompt.ts";
+import { checkUserCommand } from "./userShell.ts";
 import { APPROVAL_PREFIX } from "./verdicts.ts";
 
 /** v2's shell tool (v1 `bash`). */
@@ -87,6 +98,14 @@ const MCP_LIST_TIMEOUT_MS = 1_000;
 const MCP_LIST_INTERVAL_MS = 10_000;
 /** The most sessions remembered for the once-per-session warn-only report. */
 const MAX_WARNED_SESSIONS = 1024;
+/** The most model shell commands awaiting their `shell.create.before`. */
+const MAX_PENDING_SHELLS = 256;
+/**
+ * How long a model shell command stays marked. The spawn hook follows `execute.before` once its
+ * decision is in (core's deadline is ~20 s); a mark that outlives this is dropped, so a stale one
+ * can never exempt a later user command.
+ */
+const PENDING_SHELL_TTL_MS = 60_000;
 
 const APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
 const PROMPT_BLOCK_TAIL =
@@ -214,18 +233,52 @@ const NO_DECISION: BeforeDecision = Object.freeze({ message: undefined, kind: un
  * Register the v2 decision handlers on `ctx` (one `setup` = one directory, 14-SPIKES V2-12).
  * `recordFor` gives the directory record the v1 decision code reads (client, MCP names, notices).
  * Registers nothing for a capability whose value is `"none"`, and nothing at all without the
- * `tool` / `permission` / `session` domains. Never raises; a registration that rejects is ignored.
+ * `tool` / `permission` / `session` / `shell` domains. Never raises; a registration that rejects is
+ * ignored. Returns false when registering raised (the rest was not registered), else true.
  */
 export function registerV2Enforcement(
   ctx: V2ContextLike,
   runtime: Runtime,
   recordFor: (directory: string) => DirectoryRecord,
   capabilities: V2Capabilities = V2_CAPABILITIES,
-): void {
+): boolean {
   try {
     const directory = readString(readField(ctx, "location"), "directory");
     const pending = new Map<string, PendingCall>();
     const warned = new Set<string>();
+    /** Model shell commands seen in `execute.before`, oldest first: `[command, marked at]`. */
+    const modelShells: Array<[string, number]> = [];
+    let userShellSeq = 0;
+
+    const nowSafe = (): number => {
+      try {
+        const value = runtime.deps.now();
+        return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+      } catch {
+        return Date.now();
+      }
+    };
+    /** Mark a model shell call's command (synchronously, before its decision is awaited). Total. */
+    const markModelShell = (event: unknown): void => {
+      try {
+        if (readString(event, "tool") !== V2_SHELL_TOOL) return;
+        const command = readString(readField(event, "input"), "command");
+        if (command === "") return;
+        modelShells.push([command, nowSafe()]);
+        while (modelShells.length > MAX_PENDING_SHELLS) modelShells.shift();
+      } catch {
+        // Unmarked: at worst the model's spawn is checked once more as a user command.
+      }
+    };
+    /** Consume a live mark for `command`: true when this spawn is the model's own shell call. */
+    const takeModelShell = (command: string): boolean => {
+      const now = nowSafe();
+      while (modelShells.length > 0 && now - (modelShells[0]?.[1] ?? now) > PENDING_SHELL_TTL_MS) modelShells.shift();
+      const index = modelShells.findIndex(([marked]) => marked === command);
+      if (index < 0) return false;
+      modelShells.splice(index, 1);
+      return true;
+    };
 
     const keyOf = (sessionID: string, callID: string): string => `${sessionID}\u0000${callID}`;
     const remember = (key: string, call: PendingCall): void => {
@@ -392,11 +445,35 @@ export function registerV2Enforcement(
       }
     };
 
+    /** A user `!cmd`: the message to RAISE with (enforcing), or `undefined`. Total. */
+    const decideUserShell = async (event: V2ShellCreateBefore): Promise<string | undefined> => {
+      try {
+        const command = readString(event, "command");
+        if (command === "" || takeModelShell(command)) return undefined;
+        userShellSeq += 1;
+        const callID = `v2_${nowSafe().toString(36)}_${userShellSeq}`;
+        const message = await checkUserCommand(command, readString(event, "cwd"), "", callID, {
+          runtime,
+          record: record(),
+        });
+        if (message === undefined) return undefined;
+        if (capabilities.userShell !== "enforce") {
+          runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, "bash", "user_shell");
+          return undefined;
+        }
+        return message;
+      } catch {
+        return undefined;
+      }
+    };
+
     const tool = ctx.tool;
     if (tool !== undefined && typeof tool.hook === "function") {
       // The raise happens outside the decision's guard, and only with a verdict message.
       void Promise.resolve(
         tool.hook("execute.before", async (event: V2ToolBefore): Promise<void> => {
+          // Synchronous, before any await: the spawn hook of this very call may follow.
+          markModelShell(event);
           const message = await decideToolCall(event).catch(() => undefined);
           if (typeof message === "string" && message.length > 0) block(message);
         }),
@@ -414,7 +491,19 @@ export function registerV2Enforcement(
         () => undefined,
       );
     }
+    const shell = ctx.shell;
+    if (capabilities.userShell !== "none" && shell !== undefined && typeof shell.hook === "function") {
+      void Promise.resolve(
+        shell.hook("create.before", async (event: V2ShellCreateBefore): Promise<void> => {
+          const message = await decideUserShell(event).catch(() => undefined);
+          if (typeof message === "string" && message.length > 0) block(message);
+        }),
+      ).catch(() => undefined);
+    }
+    return true;
   } catch {
-    // Registration is best-effort; a host that refuses a hook leaves that capability unregistered.
+    // Registration is best-effort; a host that refuses a hook leaves the rest unregistered, and the
+    // caller (setup) reports it.
+    return false;
   }
 }

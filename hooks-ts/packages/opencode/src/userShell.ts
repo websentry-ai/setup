@@ -12,6 +12,9 @@
 // nothing stashed is reported as `user_shell_unchecked` (detail `no_part`) and allowed. One with no
 // session or call id (a spawn we cannot correlate) is left alone.
 //
+// `checkUserCommand` is the one decision path for a user command; the v2 entry's
+// `shell.create.before` handler (v2Enforce.ts) calls it too.
+//
 // Caveats (documented in docs/OPENCODE.md): the caller sees a generic HTTP 500 `UnknownError`, and
 // the session transcript records the blocked command as `completed` with empty output. The reason is
 // toasted (bounded) before the raise, as for prompts. `output.env` is never touched.
@@ -47,7 +50,7 @@ function readString(value: unknown, key: string): string {
  */
 export async function decideUserShell(input: unknown, ctx: UserShellContext): Promise<string | undefined> {
   try {
-    const { runtime, record } = ctx;
+    const { runtime } = ctx;
     const sessionID = readString(input, "sessionID");
     const callID = readString(input, "callID");
     if (sessionID === "" || callID === "") return undefined;
@@ -65,8 +68,34 @@ export async function decideUserShell(input: unknown, ctx: UserShellContext): Pr
       return undefined;
     }
 
-    const cwdRaw = readString(input, "cwd");
-    const cwd = cwdRaw.startsWith("/") ? cwdRaw : record.directory;
+    return await checkUserCommand(command, readString(input, "cwd"), sessionID, callID, ctx);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Check one user shell command through core's `evaluateToolCall`, exactly like a model bash call
+ * (`toolCallId` = `USER_BASH_ID_PREFIX` + `callID`). Shared by v1 `shell.env` and the v2
+ * `shell.create.before` handler (v2Enforce.ts), which knows no session (`sessionID` = `""`: the
+ * decision is then not recorded into any turn). A relative or missing cwd is the instance directory.
+ * Returns the message to block with, or `undefined`. Total: any fault allows.
+ */
+export async function checkUserCommand(
+  command: string,
+  cwdRaw: string,
+  sessionID: string,
+  callID: string,
+  ctx: UserShellContext,
+): Promise<string | undefined> {
+  try {
+    const { runtime, record } = ctx;
+    if (typeof command !== "string" || command === "") return undefined;
+    const resolved = runtime.init();
+    const checker = resolved.checker;
+    const scope = resolved.scope;
+    if (checker === undefined || scope === undefined) return undefined;
+    const cwd = typeof cwdRaw === "string" && cwdRaw.startsWith("/") ? cwdRaw : record.directory;
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
     const evalDeps: EvaluateDeps = {
@@ -83,7 +112,7 @@ export async function decideUserShell(input: unknown, ctx: UserShellContext): Pr
         },
       },
       onDecision: (entry) => {
-        if (runtime.recordingActive()) runtime.turnFor(sessionID).recordToolCall(entry, sessionID);
+        if (sessionID !== "" && runtime.recordingActive()) runtime.turnFor(sessionID).recordToolCall(entry, sessionID);
       },
       ...(identity === undefined ? {} : { accountIdentity: identity }),
     };
@@ -95,13 +124,13 @@ export async function decideUserShell(input: unknown, ctx: UserShellContext): Pr
         toolInput: {},
         cwd,
         sessionId: sessionID,
-        model: runtime.modelFor(sessionID),
+        model: sessionID === "" ? undefined : runtime.modelFor(sessionID),
       },
       evalDeps,
     );
     const message = blockingMessage(verdict);
     if (message === undefined) return undefined;
-    // The HTTP caller only sees a generic 500 (V1-7): the toast is the clean channel.
+    // The HTTP caller only sees a generic 500 (V1-7, V2-10): the toast is the clean channel.
     await notify(record.client, message, verdict.kind === "confirm" ? "warning" : "error");
     return message;
   } catch {

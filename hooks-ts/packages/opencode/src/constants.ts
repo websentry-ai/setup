@@ -72,6 +72,12 @@ export interface V2Capabilities {
   readonly recording: "full" | "partial";
   /** HV2-07: PROVIDER-LEVEL → "provider", NONE → "none". */
   readonly identity: "provider" | "none";
+  /**
+   * The user `!cmd` shell (14-SPIKES V2-10 PROVEN: `shell.create.before` fires before spawn; a raise
+   * there is an HTTP 500 and nothing spawns). "enforce" → checked and raised on a would-block
+   * verdict; "audit" → checked and reported; "none" → not hooked.
+   */
+  readonly userShell: "enforce" | "audit" | "none";
 }
 
 export const V2_CAPABILITIES: V2Capabilities = Object.freeze({
@@ -87,6 +93,8 @@ export const V2_CAPABILITIES: V2Capabilities = Object.freeze({
   recording: "full",
   /** HV2-07 PROVIDER-LEVEL source=session.model.request.model.providerID. */
   identity: "provider",
+  /** V2-10: user shell checked in shell.create.before, raised on a would-block verdict. */
+  userShell: "enforce",
 });
 
 // --- notices ------------------------------------------------------------------------------------
