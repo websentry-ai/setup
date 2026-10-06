@@ -439,3 +439,21 @@ test("buildPretoolPayload: the body is a plain JSON-serialisable object", () => 
   const roundTripped = JSON.parse(JSON.stringify(body));
   assert.deepEqual(roundTripped, body);
 });
+
+test("buildPretoolPayload: patchOperation 'delete' rides metadata.patch_operation, after every other key", () => {
+  const input = bashInput({ toolName: "apply_patch", command: "", toolInput: { filePath: "/r/gone.ts" } });
+  const body = buildPretoolPayload({ ...input, patchOperation: "delete" }, TEST_PROFILE);
+  const metadata = body.pre_tool_use_data.metadata as Record<string, unknown>;
+  assert.equal(metadata.patch_operation, "delete");
+  const keys = Object.keys(metadata);
+  assert.equal(keys[keys.length - 1], "patch_operation", "appended last, so a body without it is byte-identical");
+  // Absent (or anything but exactly "delete") leaves the key out entirely.
+  for (const value of [undefined, "", "Delete", "update", 1, null]) {
+    const other = buildPretoolPayload({ ...input, patchOperation: value as "delete" | undefined }, TEST_PROFILE);
+    assert.equal("patch_operation" in other.pre_tool_use_data.metadata, false, String(value));
+  }
+  assert.deepEqual(
+    JSON.stringify(buildPretoolPayload(input, TEST_PROFILE)),
+    JSON.stringify(buildPretoolPayload({ ...input, patchOperation: undefined }, TEST_PROFILE)),
+  );
+});

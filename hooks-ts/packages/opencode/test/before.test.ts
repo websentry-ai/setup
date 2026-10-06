@@ -231,6 +231,40 @@ test("apply_patch: one check per header path, strictest wins", async () => {
   }
 });
 
+test("apply_patch: a per-file delete request carries metadata.patch_operation 'delete' (Phase 11 contract)", async () => {
+  const seen: PretoolRequestBody[] = [];
+  const h = await harness("allow", { deps: { makeChecker: () => patchChecker(seen) } });
+  try {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: src/a.ts",
+      "@@",
+      "-a",
+      "+b",
+      "*** Delete File: src/gone.ts",
+      "*** Add File: src/new.ts",
+      "+x",
+      "*** End Patch",
+    ].join("\n");
+    assert.equal(await outcome(h.before(call("apply_patch"), { args: { patchText: patch } })), undefined);
+    assert.equal(seen.length, 3);
+    const byPath = new Map(seen.map((p) => {
+      const m = p.pre_tool_use_data.metadata as Record<string, unknown>;
+      return [m.file_path, m] as const;
+    }));
+    assert.equal(byPath.get("src/gone.ts")?.patch_operation, "delete");
+    assert.equal(byPath.get("src/gone.ts")?.file_path, "src/gone.ts", "file_path matches the deleted target");
+    assert.equal("patch_operation" in (byPath.get("src/a.ts") ?? {}), false);
+    assert.equal("patch_operation" in (byPath.get("src/new.ts") ?? {}), false);
+    // No per-file request carries the patch text itself.
+    for (const p of seen) {
+      assert.equal(JSON.stringify(p).includes("*** Delete File"), false);
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("apply_patch: only an allowed file resolves; no headers makes no check", async () => {
   const seen: PretoolRequestBody[] = [];
   const h = await harness("allow", { deps: { makeChecker: () => patchChecker(seen) } });

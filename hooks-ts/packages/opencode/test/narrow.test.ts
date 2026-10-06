@@ -12,6 +12,7 @@ import {
   PATCH_HEADER_PREFIXES,
   SHELL_TOOLS,
   TASK_TOOL,
+  applyPatchDeletedPaths,
   applyPatchTargets,
   argsDigest,
   mcpResourceTarget,
@@ -234,4 +235,21 @@ test("argsDigest: a shared (non-cyclic) reference is fine", () => {
   const shared = { x: 1 };
   assert.match(argsDigest({ a: shared, b: shared }) ?? "", /^[0-9a-f]{64}$/);
   assert.equal(argsDigest({ a: shared, b: shared }), argsDigest({ a: { x: 1 }, b: { x: 1 } }));
+});
+
+test("applyPatchDeletedPaths: the paths named on a Delete File header, nothing else", () => {
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: a.ts",
+    "  *** Delete File:  gone.ts  ",
+    "*** Add File: new.ts",
+    "*** Delete File: also/gone.ts\r",
+    "*** Delete File:   ",
+    "*** End Patch",
+  ].join("\n");
+  assert.deepEqual([...applyPatchDeletedPaths(patch)].sort(), ["also/gone.ts", "gone.ts"]);
+  assert.deepEqual([...applyPatchDeletedPaths("*** Update File: a.ts")], []);
+  for (const value of [undefined, null, 5, {}, hostile<object>()]) {
+    assert.deepEqual([...applyPatchDeletedPaths(wrong(value))], []);
+  }
 });
