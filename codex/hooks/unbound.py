@@ -3255,14 +3255,69 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
 
 
-# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+# --- Bash calls in scope for the repo gate: a segment's command word runs a git command that changes the repository, or writes the working tree; anything unclassifiable is not gated ---
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 _SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
-# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
-_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+# Creating or appending redirect plus its target; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])\s*([^\s;|&<>()]*)')
+# Redirect targets that discard or echo output instead of creating a file: `2>/dev/null` is a read.
+_NULL_REDIRECT_TARGETS = frozenset({'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'})
+
+# --- Git commands: only ones that change the repository are gated; any subcommand not listed here is treated as a change ---
+# Global options that take the next word as their value, so `git -C dir status` still reads as `status`.
+_GIT_OPTIONS_WITH_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env'})
+# Subcommands that only read the repository, whatever their flags (`--output=<file>` aside).
+_GIT_READ_SUBCOMMANDS = frozenset({
+    'status', 'diff', 'log', 'show', 'blame', 'annotate', 'grep', 'shortlog',
+    'describe', 'show-branch', 'whatchanged', 'range-diff', 'cherry', 'merge-base',
+    'name-rev', 'version', 'help', 'ls-remote',
+    'rev-parse', 'rev-list', 'ls-files', 'ls-tree', 'cat-file', 'diff-files',
+    'diff-index', 'diff-tree', 'for-each-ref', 'show-ref', 'check-ignore',
+    'check-attr', 'count-objects', 'verify-commit', 'verify-tag', 'var',
+})
+# Subcommands that read only in their listing forms: the first positional word must be one of these (None = none given).
+_GIT_LISTING_ACTIONS = {
+    'remote': frozenset({None, 'show', 'get-url'}),
+    'stash': frozenset({'list', 'show'}),
+    'worktree': frozenset({'list'}),
+    'reflog': frozenset({None, 'show', 'exists'}),
+    'submodule': frozenset({None, 'status', 'summary'}),
+    'notes': frozenset({None, 'list', 'show'}),
+    'sparse-checkout': frozenset({'list'}),
+}
+# `git branch` / `git tag` list unless given a name without a listing flag, or a flag that changes refs.
+_GIT_BRANCH_WRITE_FLAGS = frozenset({
+    '-d', '-D', '--delete', '-m', '-M', '--move', '-c', '-C', '--copy', '-f', '--force',
+    '-u', '--set-upstream-to', '--unset-upstream', '--edit-description',
+    '-t', '--track', '--no-track', '--create-reflog',
+})
+_GIT_BRANCH_LIST_FLAGS = frozenset({
+    '-l', '--list', '-a', '--all', '-r', '--remotes', '--contains', '--no-contains',
+    '--merged', '--no-merged', '--points-at', '--show-current',
+})
+_GIT_TAG_WRITE_FLAGS = frozenset({
+    '-d', '--delete', '-a', '--annotate', '-s', '--sign', '-u', '--local-user',
+    '-f', '--force', '-m', '--message', '-F', '--file', '-e', '--edit',
+})
+_GIT_TAG_LIST_FLAGS = frozenset({
+    '-l', '--list', '-v', '--verify', '--contains', '--no-contains', '--merged',
+    '--no-merged', '--points-at',
+})
+# `git config` reads with these; setting, unsetting or editing a value is a change.
+_GIT_CONFIG_READ_FLAGS = frozenset({
+    '--get', '--get-all', '--get-regexp', '--get-urlmatch', '--get-color',
+    '--get-colorbool', '-l', '--list',
+})
+_GIT_CONFIG_READ_ACTIONS = frozenset({'get', 'list'})
+_GIT_CONFIG_WRITE_FLAGS = frozenset({
+    '--add', '--unset', '--unset-all', '--replace-all', '--rename-section',
+    '--remove-section', '-e', '--edit',
+})
+# A redirect operator on its own (`>`, `2>>`), whose next word is its target rather than an argument.
+_REDIRECT_OPERATOR_RE = re.compile(r'^\d*[<>]{1,2}&?\d*$')
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -3309,14 +3364,76 @@ def _segment_writes(words):
     return False
 
 
-def _is_git_command(command):
-    """Whether any segment of `command` directly invokes git; False on any error."""
+def _git_subcommand(words):
+    """(subcommand, args) of a git invocation, skipping global options such as `-C dir`; (None, []) when none is named."""
+    i = 1
+    while i < len(words):
+        word = words[i]
+        if word in _GIT_OPTIONS_WITH_VALUE:
+            i += 2
+        elif word.startswith('-'):
+            i += 1
+        else:
+            return word, words[i + 1:]
+    return None, []
+
+
+def _git_args(args):
+    """(flags, positionals) of git arguments, dropping redirections and their targets; `--x=y` flags keep only `--x`."""
+    flags, positionals, skip = set(), [], False
+    for arg in args:
+        if skip:
+            skip = False
+        elif _REDIRECT_OPERATOR_RE.match(arg):
+            skip = True
+        elif '>' in arg or '<' in arg or not arg:
+            continue
+        elif arg.startswith('-'):
+            flags.add(arg.split('=', 1)[0])
+        else:
+            positionals.append(arg)
+    return flags, positionals
+
+
+def _git_listing_reads(subcommand, flags, positionals):
+    """Whether a listing-capable subcommand runs only in a read form."""
+    first = positionals[0] if positionals else None
+    if subcommand in _GIT_LISTING_ACTIONS:
+        return first in _GIT_LISTING_ACTIONS[subcommand]
+    if subcommand == 'branch':
+        return not (flags & _GIT_BRANCH_WRITE_FLAGS) and (not positionals or bool(flags & _GIT_BRANCH_LIST_FLAGS))
+    if subcommand == 'tag':
+        return not (flags & _GIT_TAG_WRITE_FLAGS) and (not positionals or bool(flags & _GIT_TAG_LIST_FLAGS))
+    if subcommand == 'config':
+        if flags & _GIT_CONFIG_WRITE_FLAGS:
+            return False
+        return bool(flags & _GIT_CONFIG_READ_FLAGS) or first in _GIT_CONFIG_READ_ACTIONS or len(positionals) == 1
+    if subcommand == 'symbolic-ref':
+        return not (flags & {'-d', '--delete'}) and len(positionals) <= 1
+    return False
+
+
+def _git_segment_writes(words):
+    """Whether a git invocation can change the repository; an unknown subcommand counts as a change."""
+    subcommand, args = _git_subcommand(words)
+    if subcommand is None:
+        return False
+    flags, positionals = _git_args(args)
+    if '--output' in flags:
+        return True
+    if subcommand in _GIT_READ_SUBCOMMANDS:
+        return False
+    return not _git_listing_reads(subcommand, flags, positionals)
+
+
+def _is_git_write_command(command):
+    """Whether any segment of `command` directly runs a git command that changes the repository; False on any error."""
     try:
         if not isinstance(command, str) or 'git' not in command:
             return False
         for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
             words = _segment_words(segment)
-            if words and os.path.basename(words[0]) == 'git':
+            if words and os.path.basename(words[0]) == 'git' and _git_segment_writes(words):
                 return True
         return False
     except Exception:
@@ -3324,12 +3441,12 @@ def _is_git_command(command):
 
 
 def _is_shell_write_command(command):
-    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    """Whether `command` mutates the working tree: a write command word in any segment, or a redirect into a file (not /dev/null). False on any error."""
     try:
         if not isinstance(command, str) or not command:
             return False
         masked = _mask_quoted_runs(command)
-        if _REDIRECT_RE.search(masked):
+        if any(m.group(1) not in _NULL_REDIRECT_TARGETS for m in _REDIRECT_RE.finditer(masked)):
             return True
         for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
             words = _segment_words(segment)
@@ -3360,9 +3477,9 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
     return None
 
 
-# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
+# --- Repository-scope gate: blocks writes, git changes and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
 
-# Write tools, git commands and shell writes only; apply_patch is Codex's only write tool, and conversation and every other shell command (ls, cat, npm test) are ungated.
+# Write tools, git commands that change the repository and shell writes only; read-only git (status, diff, log) is ungated; apply_patch is Codex's only write tool, and conversation and every other shell command (ls, cat, npm test) are ungated.
 _REPO_GATE_WRITE_TOOLS = frozenset({'apply_patch'})
 _REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
 _REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
@@ -3394,9 +3511,9 @@ def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
 
 
 def _repo_gate_applies(tool_name, command):
-    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it changes the repository through git or writes."""
     if tool_name in _REPO_GATE_SHELL_TOOLS:
-        return _is_git_command(command) or _is_shell_write_command(command)
+        return _is_git_write_command(command) or _is_shell_write_command(command)
     return tool_name in _REPO_GATE_WRITE_TOOLS
 
 
