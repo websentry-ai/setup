@@ -286,3 +286,22 @@ def test_jamf_clear_ignores_parameter_11(sandbox):
     assert result.returncode == 0, result.stderr
     assert "UNBOUND_CLEAR_OK" in result.stdout
     assert sandbox.hook_calls() == [["clear"]]
+
+
+@pytest.mark.parametrize("backend, expected", [
+    ("backend.example.com", "https://backend.example.com"),
+    ("https://backend.example.com/", "https://backend.example.com"),
+])
+def test_install_report_url_is_normalized_like_setup(sandbox, backend, expected):
+    _setup_argv(sandbox, "--api-key", "K", "--backend-url", backend)
+    reports = [c for c in sandbox.curl_calls() if any("install-report" in a for a in c)]
+    assert len(reports) == 1
+    assert f"{expected}/api/v1/automations/mdm/install-report/" in reports[0]
+
+
+def test_failure_report_url_is_normalized_too(sandbox):
+    result = sandbox.run("--backend-url", "backend.example.com/", "--api-key", "K", "--frontend-url", "-x")
+    assert result.returncode == 2
+    reports = [c for c in sandbox.curl_calls() if any("install-report" in a for a in c)]
+    assert len(reports) == 1
+    assert "https://backend.example.com/api/v1/automations/mdm/install-report/" in reports[0]

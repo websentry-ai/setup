@@ -182,3 +182,16 @@ def test_clear_tears_down_without_network(sandbox, key):
     assert sandbox.hook_calls() == [["clear"]]
     assert not sandbox.prefix.exists()
     assert sandbox.curl_calls() == []
+
+
+@pytest.mark.parametrize("backend, expected", [
+    ("backend.example.com", "https://backend.example.com"),
+    ("https://backend.example.com/", "https://backend.example.com"),
+    ("  backend.example.com//  ", "https://backend.example.com"),
+    ("http://backend.example.com", "http://backend.example.com"),
+])
+def test_report_url_is_normalized_like_setup(sandbox, backend, expected):
+    argv = _setup_argv(sandbox, *jamf("K", "", backend))
+    [call] = sandbox.curl_calls()
+    assert f"{expected}/api/v1/automations/mdm/install-report/" in call
+    assert argv[argv.index("--backend-url") + 1] == backend
