@@ -1639,7 +1639,8 @@ async function evaluateToolCall(call, deps) {
     const profile = deps.profile;
     const mcp = normaliseMcp(source.mcp);
     const filePath = resolveFilePath(toolName, toolInput, cwd, profile.fileTools);
-    if (command.trim() === "" && filePath === void 0 && mcp === void 0) {
+    const sendUnattributed = source.sendUnattributed === true;
+    if (!sendUnattributed && command.trim() === "" && filePath === void 0 && mcp === void 0) {
       return { kind: "skip", why: "nothing-evaluable" };
     }
     const extraKeys = profileExtraToolInputKeys(profile);

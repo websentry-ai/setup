@@ -28,12 +28,15 @@ var AUTH_FILE_NAME = "auth.json";
 var XDG_CONFIG_DEFAULT_SEGMENTS = [".config"];
 var XDG_DATA_DEFAULT_SEGMENTS = [".local", "share"];
 var SIGNAL_DUPLICATE_LOAD = "duplicate_load";
+var SIGNAL_SENTINEL_TAMPERED = "sentinel_tampered";
 var SIGNAL_INIT_DEGRADED = "init_degraded";
 var SIGNAL_MCP_ATTRIBUTION_MISS = "mcp_attribution_miss";
+var SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS = "mcp_attribution_ambiguous";
 var SIGNAL_ARGS_CHANGED = "args_changed_after_check";
 var SIGNAL_USER_SHELL_UNCHECKED = "user_shell_unchecked";
 var SIGNAL_API_FAMILY_INACTIVE = "api_family_inactive";
 var SIGNAL_PATCH_TARGETS_CAPPED = "patch_targets_capped";
+var INIT_ERROR_NOTICE = "Unbound: the policy plugin could not start (configuration error) \u2014 tool calls are not checked; it retries automatically";
 var MAX_PATCH_TARGETS = 1024;
 var PATCH_CONCURRENCY = 8;
 var TOAST_TIMEOUT_MS = 1e3;
@@ -1841,7 +1844,8 @@ async function evaluateToolCall(call, deps) {
     const profile = deps.profile;
     const mcp = normaliseMcp(source.mcp);
     const filePath = resolveFilePath(toolName, toolInput, cwd, profile.fileTools);
-    if (command.trim() === "" && filePath === void 0 && mcp === void 0) {
+    const sendUnattributed = source.sendUnattributed === true;
+    if (!sendUnattributed && command.trim() === "" && filePath === void 0 && mcp === void 0) {
       return { kind: "skip", why: "nothing-evaluable" };
     }
     const extraKeys = profileExtraToolInputKeys(profile);
@@ -2024,23 +2028,21 @@ function applyPatchTargets(patchText) {
 function sanitizeMcpName(value) {
   return typeof value === "string" ? value.replace(/[^a-zA-Z0-9_-]/g, "_") : "";
 }
-function resolveMcpTool(toolId, serverNames) {
+function mcpCandidates(toolId, serverNames) {
   try {
-    if (typeof toolId !== "string" || toolId === "" || !Array.isArray(serverNames)) return void 0;
-    let best;
+    if (typeof toolId !== "string" || toolId === "" || !Array.isArray(serverNames)) return [];
+    const found = /* @__PURE__ */ new Map();
     const count = Math.min(serverNames.length, MAX_MCP_SERVERS);
     for (let i = 0; i < count; i += 1) {
       const name = serverNames[i];
-      if (typeof name !== "string" || name === "") continue;
+      if (typeof name !== "string" || name === "" || found.has(name)) continue;
       const prefix = `${sanitizeMcpName(name)}_`;
       if (toolId.length <= prefix.length || !toolId.startsWith(prefix)) continue;
-      if (best === void 0 || prefix.length > best.prefixLength || prefix.length === best.prefixLength && name < best.server) {
-        best = { server: name, prefixLength: prefix.length };
-      }
+      found.set(name, prefix.length);
     }
-    return best === void 0 ? void 0 : { server: best.server, tool: toolId.slice(best.prefixLength) };
+    return [...found.entries()].sort(([a, la], [b, lb]) => la !== lb ? lb - la : a < b ? -1 : a > b ? 1 : 0).map(([server, prefixLength]) => ({ server, tool: toolId.slice(prefixLength) }));
   } catch {
-    return void 0;
+    return [];
   }
 }
 function mcpResourceTarget(tool, args) {
@@ -2298,6 +2300,8 @@ function strictest(list) {
 
 // packages/opencode/src/before.ts
 var APPLY_PATCH_TOOL = "apply_patch";
+var MAX_TIMER_MS2 = 2147483647;
+var PATCH_TOO_LARGE_REASON = `patch too large to verify: it names more than ${MAX_PATCH_TARGETS} files, so some of them could not be checked. Split it into smaller patches.`;
 function readField3(value, key) {
   try {
     if (value === null || typeof value !== "object") return void 0;
@@ -2313,20 +2317,54 @@ function readString(value, key) {
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
-async function mapBounded(items, limit, fn) {
-  const results = new Array(items.length);
+function fanOutDeadlineMs(raw) {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.min(raw, MAX_TIMER_MS2);
+  return PRETOOL_TIMEOUT_MS + EVALUATE_DEADLINE_SLACK_MS;
+}
+async function fanOut(items, limit, fn, deps) {
+  const results = [];
   let next = 0;
+  let expired = false;
   const worker = async () => {
-    while (next < items.length) {
+    while (!expired && next < items.length) {
       const index = next;
       next += 1;
-      results[index] = await fn(items[index]);
+      const verdict2 = await fn(items[index]).catch(() => ({ kind: "allow" }));
+      if (!expired) results.push(verdict2);
     }
   };
+  const deadlineMs = fanOutDeadlineMs(deps.deadlineMs);
+  let timer;
+  const timedOut = new Promise((resolve2) => {
+    timer = setTimeout(() => resolve2("timed-out"), deadlineMs);
+  });
   const workers = [];
   for (let i = 0; i < Math.max(1, Math.min(limit, items.length)); i += 1) workers.push(worker());
-  await Promise.all(workers);
-  return results;
+  const done = Promise.all(workers).then(() => "done", () => "done");
+  const raced = await Promise.race([done, timedOut]);
+  if (timer !== void 0) clearTimeout(timer);
+  if (raced === "done") return strictest(results);
+  expired = true;
+  const blocked = deps.failureAction() === "block";
+  const rest = blocked ? { kind: "unavailable" } : { kind: "allow" };
+  noteSafe(
+    () => deps.telemetry?.reportBypass({
+      errorClass: EVALUATE_DEADLINE_ERROR_CLASS,
+      toolName: deps.label,
+      elapsedMs: deadlineMs,
+      blocked
+    })
+  );
+  const verdict = strictest([...results, rest]);
+  noteSafe(
+    () => deps.onDecision?.({
+      tool_name: deps.label,
+      tool_use_id: deps.callID,
+      decision: verdict.kind,
+      tool_input: auditToolInput({}, "", OPENCODE_PROFILE.extraToolInputKeys)
+    })
+  );
+  return verdict;
 }
 async function decideBefore(input, output, ctx) {
   try {
@@ -2336,6 +2374,13 @@ async function decideBefore(input, output, ctx) {
     const checker = resolved.checker;
     const scope = resolved.scope;
     if (checker === void 0 || scope === void 0) {
+      if (resolved.status === "init_error") {
+        if (!record.initErrorNoticeShown) {
+          record.initErrorNoticeShown = true;
+          void notify2(record.client, INIT_ERROR_NOTICE, "warning");
+        }
+        return void 0;
+      }
       const instance = runtime.instances.forDirectory(record.directory);
       if (!instance.noKeyNoticeShown) {
         instance.noKeyNoticeShown = true;
@@ -2366,9 +2411,19 @@ async function decideBefore(input, output, ctx) {
       return void 0;
     }
     const builtin = BUILTIN_TOOLS.has(tool);
-    const mcp = mcpResourceTarget(tool, args) ?? (builtin ? void 0 : resolveMcpTool(tool, record.mcpServerNames));
-    if (mcp === void 0 && !builtin && record.mcpServerNames.length > 0) {
-      runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_MISS, tool, "unresolved");
+    const toolServerCall = tool !== "" && (!builtin || MCP_RESOURCE_TOOLS.has(tool));
+    const resourceMcp = mcpResourceTarget(tool, args);
+    const candidates = resourceMcp !== void 0 || builtin || tool === "" ? [] : mcpCandidates(tool, runtime.mcpServerNamesFor(record));
+    const mcp = resourceMcp ?? candidates[0];
+    if (candidates.length > 1) {
+      runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS, tool, `candidates_${candidates.length}`);
+    }
+    if (toolServerCall) {
+      const attributed = mcp !== void 0 && normaliseMcp(mcp) !== void 0;
+      if (!attributed) {
+        runtime.reportSignal(SIGNAL_MCP_ATTRIBUTION_MISS, tool, mcp === void 0 ? "unresolved" : "name_over_cap");
+        if (mcp === void 0 && !builtin) runtime.refreshMcpNames(record);
+      }
     }
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
@@ -2395,8 +2450,22 @@ async function decideBefore(input, output, ctx) {
     let verdict;
     if (tool === APPLY_PATCH_TOOL) {
       const { targets, capped } = applyPatchTargets(args.patchText);
-      if (capped) runtime.reportSignal(SIGNAL_PATCH_TARGETS_CAPPED, tool, "capped");
-      const verdicts = await mapBounded(
+      if (capped) {
+        runtime.reportSignal(SIGNAL_PATCH_TARGETS_CAPPED, tool, "blocked");
+        verdict = { kind: "deny", reason: PATCH_TOO_LARGE_REASON };
+        noteSafe(
+          () => evalDeps.onDecision?.({
+            tool_name: APPLY_PATCH_TOOL,
+            tool_use_id: callID,
+            decision: "deny",
+            tool_input: auditToolInput({}, "", OPENCODE_PROFILE.extraToolInputKeys)
+          })
+        );
+        const message2 = blockingMessage(verdict);
+        if (message2 !== void 0) void notify2(record.client, message2, "error");
+        return message2;
+      }
+      verdict = await fanOut(
         targets,
         PATCH_CONCURRENCY,
         (target) => evaluateToolCall(
@@ -2410,9 +2479,43 @@ async function decideBefore(input, output, ctx) {
             model
           },
           evalDeps
-        )
+        ),
+        {
+          deadlineMs,
+          failureAction: () => scope.policy.getFailureAction(),
+          telemetry: resolved.telemetry,
+          onDecision: evalDeps.onDecision,
+          label: APPLY_PATCH_TOOL,
+          callID
+        }
       );
-      verdict = strictest(verdicts);
+    } else if (candidates.length > 1) {
+      verdict = await fanOut(
+        candidates,
+        PATCH_CONCURRENCY,
+        (candidate) => evaluateToolCall(
+          {
+            toolName: tool,
+            toolCallId: callID,
+            command: "",
+            toolInput: args,
+            cwd: directory,
+            sessionId: sessionID,
+            model,
+            mcp: candidate,
+            sendUnattributed: true
+          },
+          evalDeps
+        ),
+        {
+          deadlineMs,
+          failureAction: () => scope.policy.getFailureAction(),
+          telemetry: resolved.telemetry,
+          onDecision: evalDeps.onDecision,
+          label: tool,
+          callID
+        }
+      );
     } else {
       const call = {
         toolName: tool,
@@ -2422,7 +2525,8 @@ async function decideBefore(input, output, ctx) {
         cwd: SHELL_TOOLS.has(tool) ? shellCwdOf(args, directory) : directory,
         sessionId: sessionID,
         model,
-        ...mcp === void 0 ? {} : { mcp }
+        ...mcp === void 0 ? {} : { mcp },
+        ...toolServerCall ? { sendUnattributed: true } : {}
       };
       verdict = await evaluateToolCall(call, evalDeps);
     }
@@ -2466,7 +2570,13 @@ function promptTextOf(parts) {
     const count = Math.min(parts.length, MAX_PROMPT_PARTS);
     for (let i = 0; i < count; i += 1) {
       const part = parts[i];
-      if (readField4(part, "type") !== "text") continue;
+      const type = readField4(part, "type");
+      if (type === "subtask") {
+        const prompt = readField4(part, "prompt");
+        if (typeof prompt === "string" && prompt !== "") chunks.push(prompt);
+        continue;
+      }
+      if (type !== "text") continue;
       if (readField4(part, "synthetic") === true) continue;
       const text = readField4(part, "text");
       if (typeof text === "string" && text !== "") chunks.push(text);
@@ -2942,8 +3052,14 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var MODULE_TOKEN = Object.freeze({ module: "unbound.opencode" });
+var BUILD_TOKEN = true ? "0337cacce5dc42cba738b1a232abf35c" : "source";
+function createModuleToken(buildToken = BUILD_TOKEN) {
+  return Object.freeze({ module: SENTINEL_KEY, build: buildToken });
+}
+var MODULE_TOKEN = createModuleToken();
 var MAX_MCP_SERVER_NAMES = 1024;
+var MCP_REFRESH_INTERVAL_MS = 1e4;
+var MCP_REFRESH_TIMEOUT_MS = 2e3;
 var MAX_DIGESTS_PER_SESSION = 256;
 var MAX_PARENT_DEPTH = 8;
 var MAX_MODEL_CHARS = 256;
@@ -2951,7 +3067,21 @@ var MAX_IDS_PER_SESSION = 512;
 var MAX_MESSAGES_PER_SESSION = 256;
 var MAX_ASSISTANT_PARTS = 32;
 var MAX_SHELL_STASH_PER_SESSION = 32;
-var INERT = Object.freeze({
+var INIT_RETRY_MS = 5e3;
+var NO_KEY_RETRY_MS = 3e4;
+var NO_KEY = Object.freeze({
+  status: "no_key",
+  apiKey: void 0,
+  baseUrl: void 0,
+  scope: void 0,
+  client: void 0,
+  checker: void 0,
+  telemetry: void 0,
+  signals: void 0,
+  cacheSync: void 0
+});
+var INIT_ERROR = Object.freeze({
+  status: "init_error",
   apiKey: void 0,
   baseUrl: void 0,
   scope: void 0,
@@ -2983,6 +3113,21 @@ function mcpServerNamesOf(cfg) {
     return [];
   }
 }
+function liveMcpNamesOf(answer) {
+  try {
+    if (answer === null || typeof answer !== "object") return void 0;
+    const data = answer.data;
+    if (data === null || typeof data !== "object" || Array.isArray(data)) return void 0;
+    const names = [];
+    for (const key of Object.keys(data)) {
+      if (names.length >= MAX_MCP_SERVER_NAMES) break;
+      if (key !== "") names.push(key);
+    }
+    return names;
+  } catch {
+    return void 0;
+  }
+}
 function later(fn) {
   try {
     const timer = setTimeout(() => {
@@ -2994,6 +3139,17 @@ function later(fn) {
     timer.unref?.();
   } catch {
   }
+}
+function freshRecord(directory) {
+  return {
+    directory,
+    client: void 0,
+    mcpServerNames: [],
+    liveMcpServerNames: [],
+    mcpRefreshedAt: void 0,
+    initErrorNoticeShown: false,
+    generation: 0
+  };
 }
 function freshExtras() {
   return {
@@ -3048,7 +3204,8 @@ function createServerPlugin(overrides = {}) {
     ...source.deadlineMs === void 0 ? {} : { deadlineMs: source.deadlineMs },
     ...source.signalIntervalMs === void 0 ? {} : { signalIntervalMs: source.signalIntervalMs },
     sentinelKey: typeof source.sentinelKey === "symbol" ? source.sentinelKey : Symbol.for(SENTINEL_KEY),
-    moduleToken: source.moduleToken ?? MODULE_TOKEN
+    moduleToken: source.moduleToken ?? MODULE_TOKEN,
+    buildToken: typeof source.buildToken === "string" && source.buildToken !== "" ? source.buildToken : BUILD_TOKEN
   });
   const breakers = createBreakerRegistry({ now: deps.now });
   const sessions = createSessionStates();
@@ -3056,8 +3213,8 @@ function createServerPlugin(overrides = {}) {
   const records = createKeyedState({
     max: MAX_TRACKED_INSTANCES,
     normalizeKey: directoryKey,
-    create: (directory) => ({ directory, client: void 0, mcpServerNames: [] }),
-    fallback: () => ({ directory: "", client: void 0, mcpServerNames: [] })
+    create: (directory) => freshRecord(directory),
+    fallback: () => freshRecord("")
   });
   const extras = createKeyedState({
     max: MAX_TRACKED_SESSIONS,
@@ -3070,6 +3227,7 @@ function createServerPlugin(overrides = {}) {
     fallback: () => /* @__PURE__ */ new Map()
   });
   let resolved;
+  let retryAt = 0;
   let resolveCount = 0;
   let identityLoader;
   function loaderOf() {
@@ -3085,12 +3243,14 @@ function createServerPlugin(overrides = {}) {
     return identityLoader;
   }
   const reportedOnce = /* @__PURE__ */ new Set();
-  function resolveNow() {
+  function resolveNow(progress) {
     const env = source.env ?? process.env;
     const homeDir = "homeDir" in source && typeof source.homeDir === "string" ? source.homeDir : safeHomeDir();
     const apiKey = resolveApiKey(env, homeDir, OPENCODE_PROFILE);
-    if (apiKey === void 0) return INERT;
+    if (apiKey === void 0) return NO_KEY;
+    progress.apiKey = apiKey;
     const baseUrl = resolveGatewayUrl(env, homeDir);
+    progress.baseUrl = baseUrl;
     const scope = deps.scopes.forScope(baseUrl, apiKey);
     const fingerprint = keyFingerprint(apiKey);
     const cachePath = resolveCachePath(env, homeDir, OPENCODE_PROFILE);
@@ -3131,7 +3291,34 @@ function createServerPlugin(overrides = {}) {
       onSync: cacheSync,
       now: deps.now
     });
-    return { apiKey, baseUrl, scope, client, checker, telemetry, signals, cacheSync };
+    return { status: "active", apiKey, baseUrl, scope, client, checker, telemetry, signals, cacheSync };
+  }
+  let initFaultReported = false;
+  function reportInitFault(progress) {
+    if (initFaultReported) return;
+    initFaultReported = true;
+    const { apiKey, baseUrl } = progress;
+    if (apiKey === void 0 || baseUrl === void 0) return;
+    later(() => {
+      const client = createApiClient({
+        baseUrl,
+        apiKey,
+        profile: OPENCODE_PROFILE,
+        ...deps.timeouts?.errorsMs === void 0 ? {} : { errorsTimeoutMs: deps.timeouts.errorsMs }
+      });
+      createSignalReporter({ client, profile: OPENCODE_PROFILE, apiKey, now: deps.now }).report(SIGNAL_INIT_DEGRADED, {
+        toolName: "init",
+        detail: "resolve_fault"
+      });
+    });
+  }
+  function nowSafe() {
+    try {
+      const value = deps.now();
+      return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+    } catch {
+      return Date.now();
+    }
   }
   const runtime = {
     deps,
@@ -3139,12 +3326,19 @@ function createServerPlugin(overrides = {}) {
     instances,
     hostVersion: void 0,
     init() {
-      if (resolved === void 0) {
-        resolveCount += 1;
+      const now = nowSafe();
+      if (resolved !== void 0 && (resolved.status === "active" || now < retryAt)) return resolved;
+      resolveCount += 1;
+      const progress = {};
+      try {
+        resolved = resolveNow(progress);
+        if (resolved.status !== "active") retryAt = now + NO_KEY_RETRY_MS;
+      } catch {
+        resolved = INIT_ERROR;
+        retryAt = now + INIT_RETRY_MS;
         try {
-          resolved = resolveNow();
+          reportInitFault(progress);
         } catch {
-          resolved = INERT;
         }
       }
       return resolved;
@@ -3351,6 +3545,46 @@ function createServerPlugin(overrides = {}) {
       } catch {
       }
     },
+    mcpServerNamesFor(record) {
+      try {
+        const names = [...record.mcpServerNames];
+        const seen = new Set(names);
+        for (const name of record.liveMcpServerNames) {
+          if (names.length >= MAX_MCP_SERVER_NAMES) break;
+          if (!seen.has(name)) {
+            seen.add(name);
+            names.push(name);
+          }
+        }
+        return names;
+      } catch {
+        return [];
+      }
+    },
+    refreshMcpNames(record) {
+      try {
+        const now = deps.now();
+        const last = record.mcpRefreshedAt;
+        if (last !== void 0 && now - last < MCP_REFRESH_INTERVAL_MS) return;
+        record.mcpRefreshedAt = now;
+        const mcp = record.client?.mcp;
+        const status = mcp?.status;
+        if (typeof status !== "function") return;
+        const pending = Promise.resolve(status.call(mcp));
+        let timer;
+        const timeout = new Promise((resolve2) => {
+          timer = setTimeout(() => resolve2(void 0), MCP_REFRESH_TIMEOUT_MS);
+          timer.unref?.();
+        });
+        void Promise.race([pending, timeout]).then((answer) => {
+          const names = liveMcpNamesOf(answer);
+          if (names !== void 0) record.liveMcpServerNames = names;
+        }).catch(() => void 0).finally(() => {
+          if (timer !== void 0) clearTimeout(timer);
+        });
+      } catch {
+      }
+    },
     markResulted(sessionID, callID) {
       try {
         if (sessionID === "" || callID === "") return false;
@@ -3381,7 +3615,7 @@ function createServerPlugin(overrides = {}) {
       }
     };
   }
-  function fullHooks(record) {
+  function fullHooks(record, generation) {
     return {
       // The enforcement path. The handler raises only through `block.ts`, and only on a verdict.
       "tool.execute.before": toolExecuteBefore({ runtime, record }),
@@ -3407,9 +3641,12 @@ function createServerPlugin(overrides = {}) {
         }
       },
       // Instance teardown: drop this directory's state. A pending turn is never posted from here.
+      // Only the LATEST hook set of the directory releases it (13-REVIEW WR-05): a late dispose of an
+      // instance that a newer `server()` call superseded, or of a record already replaced after an
+      // earlier release, must not drop the live instance's record, heartbeat gate or no-key latch.
       dispose: async () => {
         try {
-          if (record.directory !== "") {
+          if (record.directory !== "" && record.generation === generation && records.peek(record.directory) === record) {
             instances.release(record.directory);
             records.release(record.directory);
           }
@@ -3418,22 +3655,67 @@ function createServerPlugin(overrides = {}) {
       }
     };
   }
+  function claimSentinel() {
+    try {
+      Object.defineProperty(globalThis, deps.sentinelKey, {
+        value: deps.moduleToken,
+        writable: false,
+        configurable: false,
+        enumerable: false
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  function sentinelHolder() {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(globalThis, deps.sentinelKey);
+      if (desc === void 0) return "free";
+      if (!("value" in desc)) return { foreign: "accessor" };
+      const holder = desc.value;
+      if (holder === deps.moduleToken) return "mine";
+      if (holder === null || typeof holder !== "object") return { foreign: "foreign_value" };
+      const own = (key) => {
+        const d = Object.getOwnPropertyDescriptor(holder, key);
+        return d !== void 0 && "value" in d ? d.value : void 0;
+      };
+      if (own("module") !== SENTINEL_KEY) return { foreign: "foreign_value" };
+      if (own("build") !== deps.buildToken) return { foreign: "other_build" };
+      if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
+        return { foreign: "forged_holder" };
+      }
+      return "duplicate";
+    } catch {
+      return { foreign: "unreadable" };
+    }
+  }
   const factory = (input, _options) => {
     try {
-      const slot = globalThis;
-      const holder = slot[deps.sentinelKey];
-      if (holder !== void 0 && holder !== deps.moduleToken) {
+      const holder = sentinelHolder();
+      if (holder === "duplicate") {
         later(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, "server", "second_copy"));
         return Promise.resolve({});
       }
-      if (holder === void 0) slot[deps.sentinelKey] = deps.moduleToken;
+      if (holder === "free") {
+        claimSentinel();
+      } else if (holder !== "mine") {
+        let configurable = false;
+        try {
+          configurable = Object.getOwnPropertyDescriptor(globalThis, deps.sentinelKey)?.configurable === true;
+        } catch {
+        }
+        if (configurable) claimSentinel();
+        const detail = holder.foreign;
+        later(() => runtime.reportOnce(SIGNAL_SENTINEL_TAMPERED, "server", detail));
+      }
       const host = input !== null && typeof input === "object" ? input : {};
       const directory = host.directory;
       const client = host.client;
       const record = records.get(directory);
       record.client = client;
-      record.mcpServerNames = [];
-      return Promise.resolve(fullHooks(record));
+      record.generation += 1;
+      return Promise.resolve(fullHooks(record, record.generation));
     } catch {
       return Promise.resolve(degradedHooks());
     }
