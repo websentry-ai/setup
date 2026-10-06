@@ -470,8 +470,12 @@ test("identity is provider-level: auth.json in the data dir is not read", async 
     // The second call carries the settled identity.
     await tick(20);
     await a.handlers.get("tool.execute.before")?.({ tool: "shell", sessionID: "s1", agent: "b", messageID: "m", id: "c2", input: { command: "ls" } });
-    const last = pretoolRequests(mock).at(-1)?.body as { account_identity?: Record<string, unknown> };
-    assert.deepEqual(last.account_identity, { auth_mode: "anthropic" });
+    // WR-05: no auth mode on v2, and the provider id never leaves the device (no serial in tests).
+    for (const r of pretoolRequests(mock)) {
+      const body = r.body as { account_identity?: Record<string, unknown> };
+      assert.equal(body.account_identity, undefined);
+      assert.equal(JSON.stringify(body).includes('"auth_mode"'), false);
+    }
   } finally {
     t.cleanup();
   }

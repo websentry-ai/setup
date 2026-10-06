@@ -63,7 +63,7 @@ export const V2_RECORDING_GAPS: readonly string[] = Object.freeze([]);
 
 /** The most call ids whose tool name (or after-count) is remembered; the oldest is dropped first. */
 const MAX_TRACKED_CALLS = 1024;
-/** A provider id we pass on as an auth-mode label: a plain token. */
+/** A provider id the identity loader is started with: a plain token (kept in the process). */
 const PROVIDER_ID = /^[A-Za-z0-9._-]{1,64}$/;
 
 function readField(value: unknown, key: string): unknown {
@@ -81,14 +81,16 @@ function readString(value: unknown, key: string): string {
 }
 
 /**
- * The `readAuth` override of the v2 entry (HV2-07 PROVIDER-LEVEL): the provider id the host reported
- * becomes the auth-mode label; nothing is read from disk. `undefined` for anything that is not a
- * plain provider id. Pure and total.
+ * The `readAuth` override of the v2 entry (HV2-07 PROVIDER-LEVEL): nothing is read from disk. The
+ * provider id stays in the process; no auth mode is claimed (14-REVIEW WR-05): v2 never says whether
+ * a sign-in is an API key or an Anthropic subscription, and a provider id is not an auth mode. So the
+ * identity carries only the device serial. `undefined` for anything that is not a plain provider id.
+ * Pure and total.
  */
 export function v2ProviderIdentity(provider: string | undefined): AgentAuthSummary | undefined {
   try {
     if (typeof provider !== "string" || !PROVIDER_ID.test(provider)) return undefined;
-    return { provider, hasCredential: false, anthropicOAuth: false, authMode: provider };
+    return { provider, hasCredential: false, anthropicOAuth: false };
   } catch {
     return undefined;
   }

@@ -355,6 +355,8 @@ test("Code Mode: inner MCP calls sharing the outer id each get a result, and no 
 
 test("identity is provider-level from session.model.request; the credential store is never read", async () => {
   const f = await fakeV2({
+    // A machine id as the device serial, so the settled identity is observable.
+    deps: { identity: { platform: "linux", execFile: async () => undefined, readFile: () => "machine-id-1234" } },
     prepareHome: (home) => {
       // An Anthropic OAuth sign-in in the v1 credential file: the v2 entry must not read it.
       const dir = join(home, ".local", "share", "opencode");
@@ -366,7 +368,8 @@ test("identity is provider-level from session.model.request; the credential stor
     const modelRequest = hook(f, "session.model.request");
     await modelRequest({ sessionID: "s1", agent: "build", model: { id: "claude-x", providerID: "anthropic", variant: "default" }, kind: "primary", headers: {} });
     assert.ok(await waitFor(() => f.handle.runtime.identity() !== undefined));
-    assert.deepEqual(f.handle.runtime.identity(), { auth_mode: "anthropic" });
+    // WR-05: no auth mode (the OAuth file is not read, and a provider id is not an auth mode).
+    assert.deepEqual(f.handle.runtime.identity(), { device_serial: "machine-id-1234" });
     assert.equal(f.handle.runtime.modelFor("s1"), "anthropic/claude-x");
   } finally {
     f.cleanup();
@@ -374,11 +377,11 @@ test("identity is provider-level from session.model.request; the credential stor
 });
 
 test("v2ProviderIdentity reads nothing and answers only for a plain provider id", () => {
+  // WR-05: no auth mode is claimed on v2 (it is not knowable); the provider id stays in-process.
   assert.deepEqual(v2ProviderIdentity("openrouter"), {
     provider: "openrouter",
     hasCredential: false,
     anthropicOAuth: false,
-    authMode: "openrouter",
   });
   for (const bad of [undefined, "", "  ", "a b", "x".repeat(65), 5, null]) {
     assert.equal(v2ProviderIdentity(bad as string | undefined), undefined, String(bad));

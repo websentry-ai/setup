@@ -398,9 +398,33 @@ test("the Windows PowerShell path honours SystemRoot and falls back to C:\\Windo
 });
 
 test("buildAccountIdentity: a host-reported authMode labels a store-less sign-in, never overrides a credential", () => {
+  // WR-05: only the shared vocabulary leaves the device.
   assert.deepEqual(
-    buildAccountIdentity({ auth: { provider: "openrouter", hasCredential: false, anthropicOAuth: false, authMode: "openrouter" } }),
-    { auth_mode: "openrouter" },
+    buildAccountIdentity({ auth: { provider: "openrouter", hasCredential: false, anthropicOAuth: false, authMode: "api_key" } }),
+    { auth_mode: "api_key" },
+  );
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "anthropic", hasCredential: false, anthropicOAuth: false, authMode: "subscription" } }),
+    { auth_mode: "subscription" },
+  );
+  // A provider id, a custom provider name, or `subscription` for a non-Anthropic provider: omitted.
+  for (const [provider, authMode] of [
+    ["openrouter", "openrouter"],
+    ["anthropic", "anthropic"],
+    ["corp-proxy", "corp-proxy"],
+    ["openrouter", "subscription"],
+    [undefined, "subscription"],
+  ] as const) {
+    assert.equal(
+      buildAccountIdentity({ auth: { provider, hasCredential: false, anthropicOAuth: false, authMode } }),
+      undefined,
+      `${provider}/${authMode}`,
+    );
+  }
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "corp-proxy", hasCredential: false, anthropicOAuth: false, authMode: "corp-proxy" }, deviceSerial: "C02XYZ" }),
+    { device_serial: "C02XYZ" },
+    "the serial still goes, the provider name never does",
   );
   assert.deepEqual(
     buildAccountIdentity({ auth: { provider: "x", hasCredential: true, anthropicOAuth: false, authMode: "x" } }),

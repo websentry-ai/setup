@@ -30,6 +30,7 @@ import {
   ANTHROPIC_OAUTH_BETA_HEADER,
   ANTHROPIC_OAUTH_BETA_VALUE,
   ANTHROPIC_PROFILE_URL,
+  ANTHROPIC_PROVIDER_ID,
   AUTH_MODE_API_KEY,
   AUTH_MODE_SUBSCRIPTION,
   LINUX_MACHINE_ID_PATHS,
@@ -228,9 +229,12 @@ export function buildAccountIdentity(input: BuildIdentityInput): AccountIdentity
         identity.auth_mode = AUTH_MODE_API_KEY;
       }
     } else {
-      // No credential was read: a host-reported label is all there is to say about the mode.
+      // No credential was read: a host-reported label is all there is to say about the mode. Only
+      // the shared vocabulary leaves the device (14-REVIEW WR-05): `api_key`, or `subscription` for
+      // an Anthropic sign-in. Anything else (a provider id, a custom provider name) is omitted.
       const mode = label(auth.authMode);
-      if (mode !== undefined) identity.auth_mode = mode;
+      if (mode === AUTH_MODE_API_KEY) identity.auth_mode = mode;
+      else if (mode === AUTH_MODE_SUBSCRIPTION && auth.provider === ANTHROPIC_PROVIDER_ID) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== undefined && isValidSerial(serial)) identity.device_serial = serial;

@@ -37,8 +37,9 @@ export interface AgentAuthSummary {
   /** that entry is an Anthropic subscription (OAuth) sign-in */
   anthropicOAuth: boolean;
   /**
-   * A host-reported auth-mode label, for an adapter that reads no credential store at all (opencode
-   * 2.x: the session's provider id). Used as `auth_mode` only when `hasCredential` is false.
+   * A host-reported auth-mode label, for an adapter that reads no credential store at all. Used as
+   * `auth_mode` only when `hasCredential` is false, and only within the shared vocabulary:
+   * `api_key`, or `subscription` with `provider` Anthropic. Any other value is never sent.
    */
   authMode?: string;
   /** in memory only, for the one profile request */
