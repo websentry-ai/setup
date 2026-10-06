@@ -34,8 +34,26 @@ var SIGNAL_MCP_ATTRIBUTION_MISS = "mcp_attribution_miss";
 var SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS = "mcp_attribution_ambiguous";
 var SIGNAL_ARGS_CHANGED = "args_changed_after_check";
 var SIGNAL_USER_SHELL_UNCHECKED = "user_shell_unchecked";
-var SIGNAL_API_FAMILY_INACTIVE = "api_family_inactive";
 var SIGNAL_PATCH_TARGETS_CAPPED = "patch_targets_capped";
+var SIGNAL_V2_STATUS = "v2_status";
+var SIGNAL_V2_NOT_ENFORCING = "v2_not_enforcing";
+var SIGNAL_V2_PROMPT_WARN_ONLY = "v2_prompt_warn_only";
+var V2_CAPABILITIES = Object.freeze({
+  /** HV2-02 GO lever=both (permission.evaluate deny + message; an execute.before raise for MCP). */
+  tools: "enforce",
+  /** HV2-03 NATIVE (`effect = "ask"` → opencode's own pending permission; reject prevents execution). */
+  ask: "native",
+  /** HV2-04 GO (MCP ids `<server>_<tool>` reach execute.before and evaluate). */
+  mcp: "enforce",
+  /** HV2-05 BLOCK lever=session.prompt-mutate. */
+  prompt: "block",
+  /** HV2-06 GO (session.created / execution.succeeded / text.ended / step.ended events). */
+  recording: "full",
+  /** HV2-07 PROVIDER-LEVEL source=session.model.request.model.providerID. */
+  identity: "provider",
+  /** V2-10: user shell checked in shell.create.before, raised on a would-block verdict. */
+  userShell: "enforce"
+});
 var INIT_ERROR_NOTICE = "Unbound: the policy plugin could not start (configuration error) \u2014 tool calls are not checked; it retries automatically";
 var MAX_PATCH_TARGETS = 1024;
 var PATCH_CONCURRENCY = 8;
@@ -668,6 +686,7 @@ function buildPretoolPayload(input, profile) {
     metadata.mcp_server = mcp.server;
     if (mcp.tool !== void 0) metadata.mcp_tool = mcp.tool;
   }
+  if (input.patchOperation === "delete") metadata.patch_operation = "delete";
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
     // server never matches the tool and enforcement silently disappears.
@@ -1025,6 +1044,9 @@ function buildAccountIdentity(input) {
       } else {
         identity.auth_mode = AUTH_MODE_API_KEY;
       }
+    } else {
+      const mode = label(auth.authMode);
+      if (mode !== void 0) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== void 0 && isValidSerial(serial)) identity.device_serial = serial;
@@ -1875,7 +1897,8 @@ async function evaluateToolCall(call, deps) {
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
-      ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }
+      ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } },
+      ...source.patchOperation === "delete" ? { patchOperation: "delete" } : {}
     }, profile);
     const outcome = await check(payload, toolName, deps, state);
     if (outcome === void 0) return { kind: "allow" };
@@ -2023,6 +2046,24 @@ function applyPatchTargets(patchText) {
     return { targets: [...seen], capped: false };
   } catch {
     return { targets: [], capped: false };
+  }
+}
+var PATCH_DELETE_PREFIX = "*** Delete File:";
+function applyPatchDeletedPaths(patchText) {
+  const deleted = /* @__PURE__ */ new Set();
+  try {
+    if (typeof patchText !== "string" || patchText === "") return deleted;
+    for (const raw of patchText.split(/\r?\n/)) {
+      const line = raw.trimStart();
+      if (!line.startsWith(PATCH_DELETE_PREFIX)) continue;
+      const path = line.slice(PATCH_DELETE_PREFIX.length).trim();
+      if (path === "") continue;
+      if (deleted.size >= MAX_PATCH_TARGETS) break;
+      deleted.add(path);
+    }
+    return deleted;
+  } catch {
+    return deleted;
   }
 }
 function sanitizeMcpName(value) {
@@ -2366,7 +2407,16 @@ async function fanOut(items, limit, fn, deps) {
   );
   return verdict;
 }
-async function decideBefore(input, output, ctx) {
+var NO_DECISION = Object.freeze({ message: void 0, kind: void 0 });
+function reasonOf(verdict) {
+  try {
+    const reason = verdict.reason;
+    return typeof reason === "string" && reason !== "" ? reason : void 0;
+  } catch {
+    return void 0;
+  }
+}
+async function decideBeforeVerdict(input, output, ctx) {
   try {
     const { runtime, record } = ctx;
     runtime.markBeforeSeen(readString(input, "sessionID"), readString(input, "callID"));
@@ -2379,14 +2429,14 @@ async function decideBefore(input, output, ctx) {
           record.initErrorNoticeShown = true;
           void notify2(record.client, INIT_ERROR_NOTICE, "warning");
         }
-        return void 0;
+        return NO_DECISION;
       }
       const instance = runtime.instances.forDirectory(record.directory);
       if (!instance.noKeyNoticeShown) {
         instance.noKeyNoticeShown = true;
         void notify2(record.client, NO_KEY_NOTICE, "info");
       }
-      return void 0;
+      return NO_DECISION;
     }
     const tool = readString(input, "tool");
     const sessionID = readString(input, "sessionID");
@@ -2408,7 +2458,7 @@ async function decideBefore(input, output, ctx) {
           )
         );
       }
-      return void 0;
+      return NO_DECISION;
     }
     const builtin = BUILTIN_TOOLS.has(tool);
     const toolServerCall = tool !== "" && (!builtin || MCP_RESOURCE_TOOLS.has(tool));
@@ -2463,8 +2513,9 @@ async function decideBefore(input, output, ctx) {
         );
         const message2 = blockingMessage(verdict);
         if (message2 !== void 0) void notify2(record.client, message2, "error");
-        return message2;
+        return { message: message2, kind: "deny", reason: PATCH_TOO_LARGE_REASON };
       }
+      const deleted = applyPatchDeletedPaths(args.patchText);
       verdict = await fanOut(
         targets,
         PATCH_CONCURRENCY,
@@ -2476,7 +2527,8 @@ async function decideBefore(input, output, ctx) {
             toolInput: { filePath: target },
             cwd: directory,
             sessionId: sessionID,
-            model
+            model,
+            ...deleted.has(target) ? { patchOperation: "delete" } : {}
           },
           evalDeps
         ),
@@ -2533,11 +2585,19 @@ async function decideBefore(input, output, ctx) {
     const message = blockingMessage(verdict);
     if (message === void 0) {
       runtime.rememberDigest(sessionID, callID, argsDigest(rawArgs));
-      return void 0;
+      return { message: void 0, kind: verdict.kind };
     }
     if (verdict.kind === "deny") void notify2(record.client, message, "error");
     else if (verdict.kind === "confirm") void notify2(record.client, message, "warning");
-    return message;
+    const reason = reasonOf(verdict);
+    return reason === void 0 ? { message, kind: verdict.kind } : { message, kind: verdict.kind, reason };
+  } catch {
+    return NO_DECISION;
+  }
+}
+async function decideBefore(input, output, ctx) {
+  try {
+    return (await decideBeforeVerdict(input, output, ctx)).message;
   } catch {
     return void 0;
   }
@@ -2988,7 +3048,7 @@ function readString4(value, key) {
 }
 async function decideUserShell(input, ctx) {
   try {
-    const { runtime, record } = ctx;
+    const { runtime } = ctx;
     const sessionID = readString4(input, "sessionID");
     const callID = readString4(input, "callID");
     if (sessionID === "" || callID === "") return void 0;
@@ -3002,8 +3062,20 @@ async function decideUserShell(input, ctx) {
       runtime.reportSignal(SIGNAL_USER_SHELL_UNCHECKED, "bash", "no_part");
       return void 0;
     }
-    const cwdRaw = readString4(input, "cwd");
-    const cwd = cwdRaw.startsWith("/") ? cwdRaw : record.directory;
+    return await checkUserCommand(command, readString4(input, "cwd"), sessionID, callID, ctx);
+  } catch {
+    return void 0;
+  }
+}
+async function checkUserCommand(command, cwdRaw, sessionID, callID, ctx) {
+  try {
+    const { runtime, record } = ctx;
+    if (typeof command !== "string" || command === "") return void 0;
+    const resolved = runtime.init();
+    const checker = resolved.checker;
+    const scope = resolved.scope;
+    if (checker === void 0 || scope === void 0) return void 0;
+    const cwd = typeof cwdRaw === "string" && cwdRaw.startsWith("/") ? cwdRaw : record.directory;
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
     const evalDeps = {
@@ -3020,7 +3092,7 @@ async function decideUserShell(input, ctx) {
         }
       },
       onDecision: (entry) => {
-        if (runtime.recordingActive()) runtime.turnFor(sessionID).recordToolCall(entry, sessionID);
+        if (sessionID !== "" && runtime.recordingActive()) runtime.turnFor(sessionID).recordToolCall(entry, sessionID);
       },
       ...identity === void 0 ? {} : { accountIdentity: identity }
     };
@@ -3032,7 +3104,7 @@ async function decideUserShell(input, ctx) {
         toolInput: {},
         cwd,
         sessionId: sessionID,
-        model: runtime.modelFor(sessionID)
+        model: sessionID === "" ? void 0 : runtime.modelFor(sessionID)
       },
       evalDeps
     );
@@ -3052,7 +3124,7 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "0337cacce5dc42cba738b1a232abf35c" : "source";
+var BUILD_TOKEN = true ? "4694db7e7a1cc2b21de9c7520820896e" : "source";
 function createModuleToken(buildToken = BUILD_TOKEN) {
   return Object.freeze({ module: SENTINEL_KEY, build: buildToken });
 }
@@ -3107,6 +3179,18 @@ function mcpServerNamesOf(cfg) {
     for (const key of Object.keys(mcp)) {
       if (names.length >= MAX_MCP_SERVER_NAMES) break;
       if (typeof key === "string" && key !== "") names.push(key);
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+function mcpServerNamesFromList(list) {
+  try {
+    const names = [];
+    for (const name of list) {
+      if (names.length >= MAX_MCP_SERVER_NAMES) break;
+      if (typeof name === "string" && name !== "" && !names.includes(name)) names.push(name);
     }
     return names;
   } catch {
@@ -3194,7 +3278,7 @@ function rollUp(store, root) {
     snapshot: () => store.snapshot()
   };
 }
-function createServerPlugin(overrides = {}) {
+function createRuntime(overrides = {}) {
   const source = overrides ?? {};
   const deps = Object.freeze({
     scopes: source.scopes ?? createScopedStates(),
@@ -3237,7 +3321,7 @@ function createServerPlugin(overrides = {}) {
       identityLoader = createAccountIdentityLoader({
         ...source.identity ?? {},
         agentDir: resolveOpencodeDataDir(env, homeDir),
-        readAuth: (dataDir, provider) => readOpencodeAuthSummary(dataDir, provider, env)
+        readAuth: typeof source.readAuth === "function" ? source.readAuth : (dataDir, provider) => readOpencodeAuthSummary(dataDir, provider, env)
       });
     }
     return identityLoader;
@@ -3597,6 +3681,24 @@ function createServerPlugin(overrides = {}) {
       }
     }
   };
+  return {
+    runtime,
+    recordFor(directory, client, mcpServerNames) {
+      const record = records.get(directory);
+      record.client = client;
+      if (Array.isArray(mcpServerNames)) record.mcpServerNames = mcpServerNamesFromList(mcpServerNames);
+      return record;
+    },
+    peekRecord: (directory) => records.peek(directory),
+    releaseRecord: (directory) => records.release(directory),
+    resolveCount: () => resolveCount,
+    hasChecker: () => resolved?.checker !== void 0
+  };
+}
+function createServerPlugin(overrides = {}) {
+  const handle = createRuntime(overrides);
+  const { runtime } = handle;
+  const deps = runtime.deps;
   function degradedHooks() {
     later(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, "server", "factory_fault"));
     return {
@@ -3646,9 +3748,9 @@ function createServerPlugin(overrides = {}) {
       // earlier release, must not drop the live instance's record, heartbeat gate or no-key latch.
       dispose: async () => {
         try {
-          if (record.directory !== "" && record.generation === generation && records.peek(record.directory) === record) {
-            instances.release(record.directory);
-            records.release(record.directory);
+          if (record.directory !== "" && record.generation === generation && handle.peekRecord(record.directory) === record) {
+            runtime.instances.release(record.directory);
+            handle.releaseRecord(record.directory);
           }
         } catch {
         }
@@ -3712,8 +3814,7 @@ function createServerPlugin(overrides = {}) {
       const host = input !== null && typeof input === "object" ? input : {};
       const directory = host.directory;
       const client = host.client;
-      const record = records.get(directory);
-      record.client = client;
+      const record = handle.recordFor(directory, client);
       record.generation += 1;
       return Promise.resolve(fullHooks(record, record.generation));
     } catch {
@@ -3721,24 +3822,591 @@ function createServerPlugin(overrides = {}) {
     }
   };
   const inspector = {
-    resolveCount: () => resolveCount,
-    hasChecker: () => resolved?.checker !== void 0,
+    resolveCount: () => handle.resolveCount(),
+    hasChecker: () => handle.hasChecker(),
     instance(dir) {
-      const record = records.peek(dir);
+      const record = handle.peekRecord(dir);
       return record === void 0 ? void 0 : { directory: record.directory, mcpServerNames: [...record.mcpServerNames] };
     },
-    turn: (sessionID) => sessions.forSession(sessionID).turn.snapshot(),
+    turn: (sessionID) => runtime.sessions.forSession(sessionID).turn.snapshot(),
     runtime: () => runtime
   };
   Object.defineProperty(factory, "inspect", { value: inspector, enumerable: false });
   return factory;
 }
 
+// packages/opencode/src/v2Enforce.ts
+var V2_SHELL_TOOL = "shell";
+var V2_SUBAGENT_TOOL = "subagent";
+var V2_CODE_MODE_TOOL = "execute";
+var V2_BUILTIN_TOOLS = /* @__PURE__ */ new Set([
+  "edit",
+  "glob",
+  "grep",
+  "question",
+  "read",
+  V2_SHELL_TOOL,
+  "skill",
+  V2_SUBAGENT_TOOL,
+  "webfetch",
+  "websearch",
+  "write",
+  V2_CODE_MODE_TOOL
+]);
+var MAX_PENDING_CALLS = 1024;
+var SESSION_GET_TIMEOUT_MS = 1e3;
+var MCP_LIST_TIMEOUT_MS = 1e3;
+var MCP_LIST_INTERVAL_MS = 1e4;
+var MAX_WARNED_SESSIONS = 1024;
+var MAX_PENDING_SHELLS = 256;
+var PENDING_SHELL_TTL_MS = 6e4;
+var APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
+var PROMPT_BLOCK_TAIL = "(Unbound replaced the user's message because a policy blocked it; the original was not sent. Tell the user their message was blocked by Unbound policy and do nothing else.)";
+function readField6(value, key) {
+  try {
+    if (value === null || typeof value !== "object") return void 0;
+    return value[key];
+  } catch {
+    return void 0;
+  }
+}
+function readString5(value, key) {
+  const field = readField6(value, key);
+  return typeof field === "string" ? field : "";
+}
+function v1ToolName(tool) {
+  if (tool === V2_SHELL_TOOL) return "bash";
+  if (tool === V2_SUBAGENT_TOOL) return "task";
+  return typeof tool === "string" ? tool : "";
+}
+function nativeApprovalMessage(reason) {
+  try {
+    const clean = sanitizeReason(reason)?.trim();
+    if (clean === void 0 || clean === "") return `${APPROVAL_PREFIX}. ${APPROVAL_NATIVE_TAIL}`;
+    const end = /[.!?]$/.test(clean) ? "" : ".";
+    return `${APPROVAL_PREFIX}: ${clean}${end} ${APPROVAL_NATIVE_TAIL}`;
+  } catch {
+    return `${APPROVAL_PREFIX}. ${APPROVAL_NATIVE_TAIL}`;
+  }
+}
+function promptBlockNotice(message) {
+  const text = typeof message === "string" && message !== "" ? message : "Blocked by Unbound policy.";
+  return `${text}
+
+${PROMPT_BLOCK_TAIL}`;
+}
+function v2HostClient(ctx, directory) {
+  return {
+    mcp: {
+      status: async () => {
+        try {
+          const names = await listMcpNames(ctx, directory);
+          if (names === void 0) return void 0;
+          const data = {};
+          for (const name of names) data[name] = true;
+          return { data };
+        } catch {
+          return void 0;
+        }
+      }
+    }
+  };
+}
+async function listMcpNames(ctx, directory) {
+  try {
+    const mcp = ctx.mcp;
+    const list = readField6(mcp, "list");
+    if (typeof list !== "function") return void 0;
+    const answer = await list.call(
+      mcp,
+      directory === "" ? void 0 : { location: { directory } }
+    );
+    const data = readField6(answer, "data");
+    if (!Array.isArray(data)) return void 0;
+    const names = [];
+    for (const server of data.slice(0, 1024)) {
+      const name = readString5(server, "name");
+      if (name !== "" && !names.includes(name)) names.push(name);
+    }
+    return names;
+  } catch {
+    return void 0;
+  }
+}
+function bounded(promise, ms) {
+  return new Promise((resolve2) => {
+    let timer;
+    try {
+      timer = setTimeout(() => resolve2(void 0), ms);
+      timer.unref?.();
+    } catch {
+    }
+    promise.then(
+      (value) => {
+        if (timer !== void 0) clearTimeout(timer);
+        resolve2(value);
+      },
+      () => {
+        if (timer !== void 0) clearTimeout(timer);
+        resolve2(void 0);
+      }
+    );
+  });
+}
+var NO_DECISION2 = Object.freeze({ message: void 0, kind: void 0 });
+function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABILITIES) {
+  try {
+    const directory = readString5(readField6(ctx, "location"), "directory");
+    const pending = /* @__PURE__ */ new Map();
+    const warned = /* @__PURE__ */ new Set();
+    const modelShells = [];
+    let userShellSeq = 0;
+    const nowSafe = () => {
+      try {
+        const value = runtime.deps.now();
+        return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+      } catch {
+        return Date.now();
+      }
+    };
+    const markModelShell = (event) => {
+      try {
+        if (readString5(event, "tool") !== V2_SHELL_TOOL) return;
+        const command = readString5(readField6(event, "input"), "command");
+        if (command === "") return;
+        modelShells.push([command, nowSafe()]);
+        while (modelShells.length > MAX_PENDING_SHELLS) modelShells.shift();
+      } catch {
+      }
+    };
+    const takeModelShell = (command) => {
+      const now = nowSafe();
+      while (modelShells.length > 0 && now - (modelShells[0]?.[1] ?? now) > PENDING_SHELL_TTL_MS) modelShells.shift();
+      const index = modelShells.findIndex(([marked]) => marked === command);
+      if (index < 0) return false;
+      modelShells.splice(index, 1);
+      return true;
+    };
+    const keyOf = (sessionID, callID) => `${sessionID}\0${callID}`;
+    const remember2 = (key, call) => {
+      pending.delete(key);
+      pending.set(key, call);
+      while (pending.size > MAX_PENDING_CALLS) {
+        const oldest = pending.keys().next().value;
+        if (oldest === void 0) break;
+        pending.delete(oldest);
+      }
+    };
+    const record = () => recordFor(directory);
+    const learnMcpNames = async (tool2, rec) => {
+      try {
+        if (mcpCandidates(tool2, runtime.mcpServerNamesFor(rec)).length > 0) return;
+        const now = runtime.deps.now();
+        const last = rec.mcpRefreshedAt;
+        if (last !== void 0 && now - last < MCP_LIST_INTERVAL_MS) return;
+        rec.mcpRefreshedAt = now;
+        const names = await bounded(listMcpNames(ctx, directory), MCP_LIST_TIMEOUT_MS);
+        if (names !== void 0) rec.liveMcpServerNames = names;
+      } catch {
+      }
+    };
+    const decideToolCall = async (event) => {
+      try {
+        const tool2 = readString5(event, "tool");
+        const sessionID = readString5(event, "sessionID");
+        const callID = readString5(event, "id");
+        if (tool2 === "" || tool2 === V2_CODE_MODE_TOOL) return void 0;
+        const builtin = V2_BUILTIN_TOOLS.has(tool2);
+        if (!builtin && capabilities.mcp === "none") return void 0;
+        const rec = record();
+        if (!builtin) await learnMcpNames(tool2, rec);
+        const decision = decideBeforeVerdict(
+          { tool: v1ToolName(tool2), sessionID, callID },
+          { args: readField6(event, "input") },
+          { runtime, record: rec }
+        ).catch(() => NO_DECISION2);
+        if (builtin && sessionID !== "" && callID !== "") remember2(keyOf(sessionID, callID), { decision, asked: false });
+        const { message } = await decision;
+        if (message === void 0) return void 0;
+        if (capabilities.tools === "audit") {
+          runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool2, "tools");
+          return void 0;
+        }
+        if (builtin) return void 0;
+        if (capabilities.mcp !== "enforce") {
+          runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool2, "mcp");
+          return void 0;
+        }
+        return message;
+      } catch {
+        return void 0;
+      }
+    };
+    const applyEvaluate = async (event) => {
+      try {
+        const source = readField6(event, "source");
+        const callID = readString5(source, "id");
+        const sessionID = readString5(event, "sessionID");
+        if (callID === "" || sessionID === "") return;
+        const call = pending.get(keyOf(sessionID, callID));
+        if (call === void 0) return;
+        const decision = await call.decision;
+        if (decision.message === void 0) return;
+        if (capabilities.tools === "audit") return;
+        if (readField6(event, "effect") === "deny") return;
+        if (decision.kind === "confirm") {
+          if (capabilities.ask === "native") {
+            if (call.asked) return;
+            call.asked = true;
+            event.effect = "ask";
+            event.message = nativeApprovalMessage(decision.reason);
+            return;
+          }
+          if (capabilities.ask === "deny") {
+            event.effect = "deny";
+            event.message = decision.message;
+            return;
+          }
+          runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, readString5(event, "action"), "ask");
+          return;
+        }
+        event.effect = "deny";
+        event.message = decision.message;
+      } catch {
+      }
+    };
+    const sessionInfo = async (sessionID) => {
+      try {
+        const session2 = ctx.session;
+        const get = readField6(session2, "get");
+        if (typeof get !== "function" || sessionID === "") return void 0;
+        const answer = await bounded(
+          Promise.resolve(get.call(session2, { sessionID })),
+          SESSION_GET_TIMEOUT_MS
+        );
+        return answer !== null && typeof answer === "object" ? answer : void 0;
+      } catch {
+        return void 0;
+      }
+    };
+    const handlePrompt = async (event) => {
+      try {
+        const sessionID = readString5(event, "sessionID");
+        const prompt = readField6(event, "prompt");
+        const text = readField6(prompt, "text");
+        const info = await sessionInfo(sessionID);
+        if (info !== void 0) runtime.setParent(sessionID, readField6(info, "parentID"));
+        const model = readField6(info, "model");
+        const providerID = readString5(model, "providerID");
+        const modelID = readString5(model, "id");
+        const input = providerID !== "" && modelID !== "" ? { sessionID, model: { providerID, modelID } } : { sessionID };
+        const output = { parts: typeof text === "string" ? [{ type: "text", text }] : [] };
+        const message = await decidePrompt(input, output, { runtime, record: record() });
+        if (message === void 0) return;
+        if (capabilities.prompt === "block") {
+          const target = prompt;
+          target.text = promptBlockNotice(message);
+          if ("files" in target) target.files = [];
+          if ("agents" in target) target.agents = [];
+          if ("skills" in target) target.skills = [];
+          return;
+        }
+        if (sessionID !== "" && !warned.has(sessionID)) {
+          warned.add(sessionID);
+          while (warned.size > MAX_WARNED_SESSIONS) {
+            const oldest = warned.values().next().value;
+            if (oldest === void 0) break;
+            warned.delete(oldest);
+          }
+          runtime.reportSignal(SIGNAL_V2_PROMPT_WARN_ONLY, "prompt", "would_block");
+        }
+      } catch {
+      }
+    };
+    const decideUserShell2 = async (event) => {
+      try {
+        const command = readString5(event, "command");
+        if (command === "" || takeModelShell(command)) return void 0;
+        userShellSeq += 1;
+        const callID = `v2_${nowSafe().toString(36)}_${userShellSeq}`;
+        const message = await checkUserCommand(command, readString5(event, "cwd"), "", callID, {
+          runtime,
+          record: record()
+        });
+        if (message === void 0) return void 0;
+        if (capabilities.userShell !== "enforce") {
+          runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, "bash", "user_shell");
+          return void 0;
+        }
+        return message;
+      } catch {
+        return void 0;
+      }
+    };
+    const tool = ctx.tool;
+    if (tool !== void 0 && typeof tool.hook === "function") {
+      void Promise.resolve(
+        tool.hook("execute.before", async (event) => {
+          markModelShell(event);
+          const message = await decideToolCall(event).catch(() => void 0);
+          if (typeof message === "string" && message.length > 0) block(message);
+        })
+      ).catch(() => void 0);
+    }
+    const permission = ctx.permission;
+    if (permission !== void 0 && typeof permission.hook === "function") {
+      void Promise.resolve(permission.hook("evaluate", (event) => applyEvaluate(event))).catch(
+        () => void 0
+      );
+    }
+    const session = ctx.session;
+    if (session !== void 0 && typeof session.hook === "function") {
+      void Promise.resolve(session.hook("prompt", (event) => handlePrompt(event))).catch(
+        () => void 0
+      );
+    }
+    const shell = ctx.shell;
+    if (capabilities.userShell !== "none" && shell !== void 0 && typeof shell.hook === "function") {
+      void Promise.resolve(
+        shell.hook("create.before", async (event) => {
+          const message = await decideUserShell2(event).catch(() => void 0);
+          if (typeof message === "string" && message.length > 0) block(message);
+        })
+      ).catch(() => void 0);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// packages/opencode/src/v2Record.ts
+var V2_RECORDING_GAPS = Object.freeze([]);
+var MAX_TRACKED_CALLS = 1024;
+var PROVIDER_ID = /^[A-Za-z0-9._-]{1,64}$/;
+function readField7(value, key) {
+  try {
+    if (value === null || typeof value !== "object") return void 0;
+    return value[key];
+  } catch {
+    return void 0;
+  }
+}
+function readString6(value, key) {
+  const field = readField7(value, key);
+  return typeof field === "string" ? field : "";
+}
+function v2ProviderIdentity(provider) {
+  try {
+    if (typeof provider !== "string" || !PROVIDER_ID.test(provider)) return void 0;
+    return { provider, hasCredential: false, anthropicOAuth: false, authMode: provider };
+  } catch {
+    return void 0;
+  }
+}
+function remember(map, key, value) {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > MAX_TRACKED_CALLS) {
+    const oldest = map.keys().next().value;
+    if (oldest === void 0) break;
+    map.delete(oldest);
+  }
+}
+function modelOf2(model) {
+  const provider = readString6(model, "providerID");
+  const id = readString6(model, "id");
+  if (provider === "" || id === "") return void 0;
+  return { provider, model: `${provider}/${id}` };
+}
+function registerV2Recording(ctx, runtime, recordFor) {
+  let controller;
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+    try {
+      controller?.abort();
+    } catch {
+    }
+  };
+  try {
+    const directory = readString6(readField7(ctx, "location"), "directory");
+    const app = readField7(ctx, "app");
+    const appVersion = sanitizeHostVersion(readField7(app, "version"));
+    if (appVersion !== void 0 && runtime.hostVersion === void 0) runtime.hostVersion = appVersion;
+    const toolNames = /* @__PURE__ */ new Map();
+    const afterCounts = /* @__PURE__ */ new Map();
+    const keyOf = (sessionID, id) => `${sessionID}\0${id}`;
+    const context = () => ({ runtime, record: recordFor(directory) });
+    const emit = (type, properties) => {
+      handleEvent({ event: { type, properties } }, context());
+    };
+    const noteModel = (sessionID, model) => {
+      try {
+        const found = modelOf2(model);
+        if (found === void 0) return;
+        if (sessionID !== "") runtime.setModel(sessionID, found.model);
+        runtime.startIdentity(found.provider);
+      } catch {
+      }
+    };
+    const recordError = (sessionID, callID, tool2, message) => {
+      emit("message.part.updated", {
+        sessionID,
+        part: { type: "tool", tool: tool2, callID, sessionID, state: { status: "error", error: message } }
+      });
+    };
+    const onEvent = (event) => {
+      try {
+        const type = readString6(event, "type");
+        const data = readField7(event, "data");
+        const sessionID = readString6(data, "sessionID");
+        switch (type) {
+          case "session.created": {
+            const location = readField7(data, "location");
+            const eventLocation = readField7(event, "location");
+            const dir = readString6(location, "directory") || readString6(eventLocation, "directory") || directory;
+            const version = readField7(data, "version") ?? readField7(app, "version");
+            const parentID = readField7(data, "parentID");
+            noteModel(sessionID, readField7(data, "model"));
+            emit("session.created", {
+              sessionID,
+              info: { id: sessionID, directory: dir, version, ...typeof parentID === "string" ? { parentID } : {} }
+            });
+            return;
+          }
+          case "session.step.started":
+            noteModel(sessionID, readField7(data, "model"));
+            return;
+          case "session.text.ended": {
+            const messageID = readString6(data, "assistantMessageID");
+            const text = readField7(data, "text");
+            const ordinal = readField7(data, "ordinal");
+            if (messageID === "" || typeof text !== "string") return;
+            emit("message.updated", { sessionID, info: { id: messageID, sessionID, role: "assistant" } });
+            emit("message.part.updated", {
+              sessionID,
+              part: { id: `${messageID}:${typeof ordinal === "number" ? ordinal : 0}`, sessionID, messageID, type: "text", text }
+            });
+            return;
+          }
+          case "session.execution.succeeded":
+          case "session.execution.interrupted":
+            emit("session.idle", { sessionID });
+            return;
+          case "session.deleted":
+            emit("session.deleted", { sessionID });
+            return;
+          case "session.tool.input.started": {
+            const id = readString6(data, "id");
+            const name = readString6(data, "name");
+            if (id !== "" && name !== "") remember(toolNames, keyOf(sessionID, id), name);
+            return;
+          }
+          case "session.tool.failed": {
+            const id = readString6(data, "id");
+            if (sessionID === "" || id === "") return;
+            const name = toolNames.get(keyOf(sessionID, id)) ?? "";
+            if (name === V2_CODE_MODE_TOOL) return;
+            const error = readField7(data, "error");
+            recordError(sessionID, id, v1ToolName(name), readString6(error, "message"));
+            return;
+          }
+          case "mcp.status.changed":
+            recordFor(directory).mcpRefreshedAt = void 0;
+            return;
+          default:
+            return;
+        }
+      } catch {
+      }
+    };
+    const afterHandler = async (event) => {
+      try {
+        const tool2 = readString6(event, "tool");
+        const sessionID = readString6(event, "sessionID");
+        const id = readString6(event, "id");
+        if (tool2 === "" || tool2 === V2_CODE_MODE_TOOL || sessionID === "" || id === "") return;
+        const name = v1ToolName(tool2);
+        const status = readField7(event, "status");
+        let callID = id;
+        if (!V2_BUILTIN_TOOLS.has(tool2)) {
+          const key = keyOf(sessionID, id);
+          const seen = afterCounts.get(key) ?? 0;
+          remember(afterCounts, key, seen + 1);
+          if (seen > 0) callID = `${id}#${seen}`;
+        }
+        if (status === "error") {
+          const error = readField7(readField7(event, "error"), "error");
+          recordError(sessionID, callID, name, readString6(error, "reason") || readString6(error, "_tag"));
+          return;
+        }
+        if (callID !== id) {
+          recordResult(context(), sessionID, callID, name, false, outputParts(readField7(event, "result")));
+          return;
+        }
+        await toolExecuteAfter(context())(
+          { tool: name, sessionID, callID: id, args: readField7(event, "input") },
+          { output: readField7(event, "result") }
+        );
+      } catch {
+      }
+    };
+    const modelRequest = async (event) => {
+      try {
+        const kind = readField7(event, "kind");
+        if (kind !== void 0 && kind !== "primary") {
+          runtime.startIdentity(readString6(readField7(event, "model"), "providerID") || void 0);
+          return;
+        }
+        noteModel(readString6(event, "sessionID"), readField7(event, "model"));
+      } catch {
+      }
+    };
+    const tool = ctx.tool;
+    if (tool !== void 0 && typeof tool.hook === "function") {
+      void Promise.resolve(tool.hook("execute.after", afterHandler)).catch(() => void 0);
+    }
+    const session = ctx.session;
+    if (session !== void 0 && typeof session.hook === "function") {
+      void Promise.resolve(session.hook("model.request", modelRequest)).catch(() => void 0);
+    }
+    const events = ctx.event;
+    if (events !== void 0 && typeof events.subscribe === "function") {
+      controller = new AbortController();
+      const iterable = events.subscribe({ signal: controller.signal });
+      void (async () => {
+        try {
+          for await (const event of iterable) {
+            if (stopped) break;
+            onEvent(event);
+          }
+        } catch {
+        }
+      })().catch(() => void 0);
+    }
+    return stop;
+  } catch {
+    stop();
+    return void 0;
+  }
+}
+
 // packages/opencode/src/v2.ts
-import { homedir as homedir2 } from "node:os";
 var SETUP_SENTINEL_KEY = `${SENTINEL_KEY}.v2-setup`;
 var SETUP_TOOL_LABEL = "setup";
-var SETUP_INACTIVE_DETAIL = "v2_setup_inactive";
+function v2StatusDetail(capabilities) {
+  const gaps = V2_RECORDING_GAPS.length > 0 ? "." + V2_RECORDING_GAPS.join(".") : "";
+  return [
+    `tools:${capabilities.tools}`,
+    `ask:${capabilities.ask}`,
+    `mcp:${capabilities.mcp}`,
+    `prompt:${capabilities.prompt}`,
+    `recording:${capabilities.recording}${gaps}`,
+    `identity:${capabilities.identity}`,
+    `shell:${capabilities.userShell}`
+  ].join("/");
+}
 function isV2Context(ctx) {
   try {
     if (ctx === null || typeof ctx !== "object") return false;
@@ -3747,48 +4415,140 @@ function isV2Context(ctx) {
     return false;
   }
 }
+function readField8(value, key) {
+  try {
+    if (value === null || typeof value !== "object") return void 0;
+    return value[key];
+  } catch {
+    return void 0;
+  }
+}
+function later2(fn) {
+  try {
+    const timer = setTimeout(() => {
+      try {
+        fn();
+      } catch {
+      }
+    }, 0);
+    timer.unref?.();
+  } catch {
+  }
+}
 function createSetupV2(overrides = {}) {
   const source = overrides ?? {};
-  const sentinelKey = typeof source.sentinelKey === "symbol" ? source.sentinelKey : Symbol.for(SETUP_SENTINEL_KEY);
-  function reportInactive() {
-    const env = source.env ?? process.env;
-    let homeDir = "";
+  const slotKey = typeof source.sentinelKey === "symbol" ? source.sentinelKey : Symbol.for(SETUP_SENTINEL_KEY);
+  const buildToken = typeof source.buildToken === "string" && source.buildToken !== "" ? source.buildToken : BUILD_TOKEN;
+  const capabilities = source.capabilities ?? V2_CAPABILITIES;
+  let local;
+  function freshShared() {
+    const { capabilities: _capabilities, sentinelKey: _sentinelKey, ...deps } = source;
+    const handle = createRuntime({ ...deps, readAuth: (_dataDir, provider) => v2ProviderIdentity(provider) });
+    return { handle, capabilities, directories: /* @__PURE__ */ new Set(), statusReported: false };
+  }
+  function claim(shared) {
     try {
-      homeDir = typeof source.homeDir === "string" ? source.homeDir : homedir2();
+      Object.defineProperty(globalThis, slotKey, {
+        value: Object.freeze({ module: SETUP_SENTINEL_KEY, build: buildToken, shared }),
+        writable: false,
+        configurable: false,
+        enumerable: false
+      });
     } catch {
-      homeDir = "";
     }
-    const apiKey = resolveApiKey(env, homeDir, OPENCODE_PROFILE);
-    if (apiKey === void 0) return;
-    const baseUrl = resolveGatewayUrl(env, homeDir);
-    const errorsMs = source.timeouts?.errorsMs;
-    const client = createApiClient({
-      baseUrl,
-      apiKey,
-      profile: OPENCODE_PROFILE,
-      ...errorsMs === void 0 ? {} : { errorsTimeoutMs: errorsMs }
-    });
-    createSignalReporter({ client, profile: OPENCODE_PROFILE, apiKey }).report(SIGNAL_API_FAMILY_INACTIVE, {
-      toolName: SETUP_TOOL_LABEL,
-      detail: SETUP_INACTIVE_DETAIL
+  }
+  function acquire() {
+    let foreign;
+    let configurable = false;
+    try {
+      const desc = Object.getOwnPropertyDescriptor(globalThis, slotKey);
+      if (desc === void 0) {
+        const shared = freshShared();
+        claim(shared);
+        return { shared };
+      }
+      configurable = desc.configurable === true;
+      if (!("value" in desc)) {
+        foreign = "accessor";
+      } else {
+        const holder = desc.value;
+        const own = (key) => {
+          const d = holder !== null && typeof holder === "object" ? Object.getOwnPropertyDescriptor(holder, key) : void 0;
+          return d !== void 0 && "value" in d ? d.value : void 0;
+        };
+        const shared = own("shared");
+        if (holder === null || typeof holder !== "object" || own("module") !== SETUP_SENTINEL_KEY) {
+          foreign = "foreign_value";
+        } else if (own("build") !== buildToken) {
+          foreign = "other_build";
+        } else if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
+          foreign = "forged_holder";
+        } else if (shared === void 0 || shared === null || typeof shared !== "object" || !(shared.directories instanceof Set)) {
+          foreign = "forged_holder";
+        } else {
+          return { shared };
+        }
+      }
+    } catch {
+      foreign = "unreadable";
+    }
+    if (local === void 0) local = freshShared();
+    if (configurable) claim(local);
+    return { shared: local, tampered: foreign };
+  }
+  function reportStatus(shared) {
+    if (shared.statusReported) return;
+    shared.statusReported = true;
+    const runtime = shared.handle.runtime;
+    const detail = v2StatusDetail(shared.capabilities);
+    later2(() => {
+      runtime.reportOnce(SIGNAL_V2_STATUS, SETUP_TOOL_LABEL, detail);
+      if (shared.capabilities.tools === "audit") runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, SETUP_TOOL_LABEL, "tools");
     });
   }
   return (ctx) => {
     try {
       if (!isV2Context(ctx)) return Promise.resolve(void 0);
-      const slot = globalThis;
-      if (slot[sentinelKey] !== void 0) return Promise.resolve(void 0);
-      slot[sentinelKey] = true;
-      const timer = setTimeout(() => {
+      const { shared, tampered } = acquire();
+      const handle = shared.handle;
+      const runtime = handle.runtime;
+      if (tampered !== void 0) later2(() => runtime.reportOnce(SIGNAL_SENTINEL_TAMPERED, SETUP_TOOL_LABEL, tampered));
+      const v2 = ctx;
+      const rawDirectory = readField8(readField8(v2, "location"), "directory");
+      const directory = typeof rawDirectory === "string" ? rawDirectory : "";
+      const key = directoryKey(directory) ?? "";
+      if (shared.directories.has(key)) {
+        later2(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, SETUP_TOOL_LABEL, "second_copy"));
+        return Promise.resolve(void 0);
+      }
+      shared.directories.add(key);
+      reportStatus(shared);
+      let stopRecording;
+      try {
+        const client = v2HostClient(v2, directory);
+        handle.recordFor(directory, client, []);
+        const recordFor = (dir) => handle.recordFor(dir, client);
+        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities);
+        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor) : void 0;
+        if (stopRecording === void 0) {
+          later2(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
+        }
+      } catch {
+        later2(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
+      }
+      const cleanup = async () => {
         try {
-          reportInactive();
+          stopRecording?.();
+          shared.directories.delete(key);
+          runtime.instances.release(directory);
+          handle.releaseRecord(directory);
         } catch {
         }
-      }, 0);
-      timer.unref?.();
+      };
+      return Promise.resolve(cleanup);
     } catch {
+      return Promise.resolve(void 0);
     }
-    return Promise.resolve(void 0);
   };
 }
 var setupV2 = createSetupV2();
