@@ -1,0 +1,509 @@
+// The v2 decision side (14-03) against a hand-built fake v2 ctx that records the registered handlers
+// and invokes them with the event shapes 14-SPIKES.md recorded on @opencode/cli 2.0.22:
+//
+//   * tool calls run `tool.execute.before` → `permission.evaluate` (same call id in `source.id`);
+//   * a raise from `execute.before` ends the call (evaluate never fires), as on the real host;
+//   * `evaluate` input is mutable (`effect`, `message`).
+//
+// Every branch is tested for BOTH sides of each verdict (the shipped `V2_CAPABILITIES` picks one,
+// a later host may need the other): HV2-02 enforce/audit, HV2-03 native/deny/audit, HV2-04
+// enforce/audit/none.
+
+import assert from "node:assert/strict";
+import { after, before, test } from "node:test";
+
+import { DENY_PREFIX } from "../../core/src/constants.ts";
+import type { PretoolRequestBody } from "../../core/src/types.ts";
+import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
+import { V2_CAPABILITIES } from "../src/constants.ts";
+import type { V2Capabilities } from "../src/constants.ts";
+import type { V2ContextLike } from "../src/hostTypesV2.ts";
+import { createRuntime } from "../src/plugin.ts";
+import type { Deps, Runtime } from "../src/plugin.ts";
+import { APPROVAL_PREFIX, approvalMessage } from "../src/verdicts.ts";
+import { nativeApprovalMessage, registerV2Enforcement, v1ToolName, v2HostClient } from "../src/v2Enforce.ts";
+import { makeDeps, pretoolRequests, signalsOf, startOpencodeMock, tick, waitFor } from "./helpers/fakeHost.ts";
+
+let mock: MockApi;
+
+before(async () => {
+  mock = await startOpencodeMock("allow");
+});
+
+after(async () => {
+  await mock.close();
+});
+
+const SECRETS_DENY = `${DENY_PREFIX}Reading secrets is blocked.`;
+const DIRECTORY = "/repo";
+
+type Handler = (event: unknown) => Promise<void> | void;
+
+interface FakeV2 {
+  ctx: V2ContextLike;
+  handlers: Map<string, Handler>;
+  runtime: Runtime;
+  cleanup(): void;
+}
+
+interface FakeOptions {
+  mode?: MockMode;
+  capabilities?: Partial<V2Capabilities>;
+  deps?: Partial<Deps> & { withKey?: boolean };
+  mcpServers?: string[];
+  parents?: Record<string, string>;
+  /** `ctx.session.get` never answers. */
+  sessionGetHangs?: boolean;
+  /** The ctx has none of these domains. */
+  omit?: Array<"tool" | "permission" | "session">;
+}
+
+async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
+  mock.requests.length = 0;
+  mock.setMode(opts.mode ?? "allow");
+  mock.setErrorsMode("ok");
+  const t = makeDeps(mock, { signalIntervalMs: 0, ...(opts.deps ?? {}) });
+  const handle = createRuntime(t.deps);
+  const handlers = new Map<string, Handler>();
+  const domain = (name: string) => ({
+    hook: async (hook: string, cb: Handler) => {
+      handlers.set(`${name}.${hook}`, cb);
+      return { dispose: async () => undefined };
+    },
+  });
+  const parents = opts.parents ?? {};
+  const servers = opts.mcpServers ?? [];
+  const full: Record<string, unknown> = {
+    app: { name: "cli", version: "2.0.22", channel: "latest" },
+    location: { directory: DIRECTORY },
+    tool: domain("tool"),
+    permission: domain("permission"),
+    session: {
+      ...domain("session"),
+      get: (input: { sessionID: string }) =>
+        opts.sessionGetHangs === true
+          ? new Promise(() => {})
+          : Promise.resolve({
+              id: input.sessionID,
+              ...(parents[input.sessionID] === undefined ? {} : { parentID: parents[input.sessionID] }),
+              model: { id: "openai/gpt-4.1-nano", providerID: "openrouter", variant: "default" },
+            }),
+    },
+    mcp: {
+      list: async () => ({ data: servers.map((name) => ({ name, status: { status: "connected" } })) }),
+    },
+  };
+  for (const key of opts.omit ?? []) delete full[key];
+  const ctx = full as unknown as V2ContextLike;
+  const caps: V2Capabilities = { ...V2_CAPABILITIES, ...(opts.capabilities ?? {}) };
+  registerV2Enforcement(ctx, handle.runtime, (dir) => handle.recordFor(dir, v2HostClient(ctx, dir)), caps);
+  return { ctx, handlers, runtime: handle.runtime, cleanup: t.cleanup };
+}
+
+const ACTION: Record<string, string> = { shell: "shell", write: "edit", edit: "edit", read: "read", subagent: "subagent" };
+
+interface CallResult {
+  /** The message a raise from `execute.before` carried (the call never reached evaluate). */
+  raised: string | undefined;
+  /** Whether evaluate ran (the host only asserts after `execute.before` resolved). */
+  evaluated: boolean;
+  effect: string;
+  message: string | undefined;
+}
+
+/** Drive one model tool call through the fake host: execute.before, then evaluate. */
+async function toolCall(
+  f: FakeV2,
+  tool: string,
+  input: unknown,
+  ids: { sessionID?: string; id?: string; effect?: "allow" | "deny" | "ask" } = {},
+): Promise<CallResult> {
+  const sessionID = ids.sessionID ?? "ses_root";
+  const id = ids.id ?? "call_1";
+  const beforeHook = f.handlers.get("tool.execute.before");
+  assert.ok(beforeHook !== undefined, "execute.before registered");
+  try {
+    await beforeHook({ tool, sessionID, agent: "build", messageID: "msg_1", id, input });
+  } catch (err) {
+    return { raised: (err as Error).message, evaluated: false, effect: "allow", message: undefined };
+  }
+  const evaluate = f.handlers.get("permission.evaluate");
+  assert.ok(evaluate !== undefined, "evaluate registered");
+  const event: { effect: string; message?: string } & Record<string, unknown> = {
+    sessionID,
+    agent: "build",
+    action: ACTION[tool] ?? tool,
+    resources: ["*"],
+    source: { type: "tool", messageID: "msg_1", id },
+    effect: ids.effect ?? "allow",
+  };
+  await evaluate(event);
+  return { raised: undefined, evaluated: true, effect: event.effect, message: event.message };
+}
+
+/** One more evaluate for an already-decided call (a second assertion of the same call). */
+async function evaluateAgain(f: FakeV2, sessionID: string, id: string, action = "shell"): Promise<{ effect: string; message?: string }> {
+  const event: { effect: string; message?: string } & Record<string, unknown> = {
+    sessionID,
+    action,
+    resources: ["*"],
+    source: { type: "tool", messageID: "msg_1", id },
+    effect: "allow",
+  };
+  await f.handlers.get("permission.evaluate")?.(event);
+  return { effect: event.effect, ...(event.message === undefined ? {} : { message: event.message }) };
+}
+
+function toolBodies(): PretoolRequestBody[] {
+  return pretoolRequests(mock)
+    .map((r) => r.body as PretoolRequestBody)
+    .filter((b) => b.event_name === "tool_use");
+}
+
+function metadataOf(b: PretoolRequestBody | undefined): Record<string, unknown> {
+  return (b?.pre_tool_use_data.metadata ?? {}) as Record<string, unknown>;
+}
+
+// --- naming ---------------------------------------------------------------------------------------
+
+test("v2 tool ids map onto the v1 decision names: shell → bash, subagent → task", () => {
+  assert.equal(v1ToolName("shell"), "bash");
+  assert.equal(v1ToolName("subagent"), "task");
+  assert.equal(v1ToolName("write"), "write");
+  assert.equal(v1ToolName("github_create_issue"), "github_create_issue");
+});
+
+test("registers execute.before and evaluate on a v2 ctx; nothing and no raise without the domains", async () => {
+  const f = await fakeV2();
+  try {
+    assert.ok(f.handlers.has("tool.execute.before"));
+    assert.ok(f.handlers.has("permission.evaluate"));
+  } finally {
+    f.cleanup();
+  }
+  const t = makeDeps(mock);
+  try {
+    const { runtime } = createRuntime(t.deps);
+    registerV2Enforcement({} as V2ContextLike, runtime, () => createRuntime(t.deps).recordFor("/repo", undefined));
+    registerV2Enforcement(null as unknown as V2ContextLike, runtime, () => createRuntime(t.deps).recordFor("/repo", undefined));
+    const raising = {
+      get tool(): never {
+        throw new Error("hostile ctx");
+      },
+    } as unknown as V2ContextLike;
+    registerV2Enforcement(raising, runtime, () => createRuntime(t.deps).recordFor("/repo", undefined));
+  } finally {
+    t.cleanup();
+  }
+});
+
+// --- HV2-02 tool calls --------------------------------------------------------------------------
+
+test("GO: a denied shell call is refused at evaluate with the verbatim verdict text, never raised", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const r = await toolCall(f, "shell", { command: "cat secrets.txt", workdir: "/w" });
+    assert.equal(r.raised, undefined, "no raise for a built-in tool");
+    assert.equal(r.effect, "deny");
+    assert.equal(r.message, SECRETS_DENY);
+    const bodies = toolBodies();
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]?.pre_tool_use_data.tool_name, "bash");
+    assert.equal(bodies[0]?.pre_tool_use_data.command, "cat secrets.txt");
+    assert.equal(bodies[0]?.pre_tool_use_data.tool_use_id, "call_1");
+    assert.equal(metadataOf(bodies[0]).cwd, "/w");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("GO: write/read/edit carry `path`; a deny applies through evaluate (write asserts action edit)", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    for (const [i, tool] of ["write", "read", "edit"].entries()) {
+      const r = await toolCall(f, tool, { path: "src/a.ts", content: "x" }, { id: `call_${i}` });
+      assert.equal(r.effect, "deny", tool);
+      assert.equal(r.message, SECRETS_DENY, tool);
+    }
+    const names = toolBodies().map((b) => b.pre_tool_use_data.tool_name);
+    assert.deepEqual(names, ["write", "read", "edit"]);
+    assert.ok(toolBodies().every((b) => JSON.stringify(b).includes("src/a.ts")), "path reaches the wire");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("GO: an allowed call leaves effect and message untouched and never raises", async () => {
+  const f = await fakeV2({ mode: "allow" });
+  try {
+    const r = await toolCall(f, "shell", { command: "ls" });
+    assert.equal(r.raised, undefined);
+    assert.equal(r.effect, "allow");
+    assert.equal(r.message, undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("evaluate never re-checks: one request per call, and an unknown call id is left untouched", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    await toolCall(f, "shell", { command: "cat secrets.txt" }, { id: "call_a" });
+    const again = await evaluateAgain(f, "ses_root", "call_a");
+    assert.equal(again.effect, "deny", "a second assertion of the same denied call is denied too");
+    const unknown = await evaluateAgain(f, "ses_root", "call_never_seen");
+    assert.equal(unknown.effect, "allow");
+    assert.equal(toolBodies().length, 1, "decided once in execute.before");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("never loosens: a host deny stays a deny whatever the verdict", async () => {
+  for (const mode of ["allow", "ask"] as const) {
+    const f = await fakeV2({ mode });
+    try {
+      const r = await toolCall(f, "shell", { command: "ls" }, { effect: "deny" });
+      assert.equal(r.effect, "deny", mode);
+      assert.equal(r.message, undefined, mode);
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
+test("NO-GO (tools: audit): a deny is decided and recorded, never applied; v2_not_enforcing once", async () => {
+  const f = await fakeV2({ mode: "deny", capabilities: { tools: "audit" } });
+  try {
+    const a = await toolCall(f, "shell", { command: "cat secrets.txt" }, { id: "c1" });
+    const b = await toolCall(f, "shell", { command: "cat secrets.txt" }, { id: "c2" });
+    for (const r of [a, b]) {
+      assert.equal(r.raised, undefined);
+      assert.equal(r.effect, "allow");
+      assert.equal(r.message, undefined);
+    }
+    assert.equal(toolBodies().length, 2, "both calls checked");
+    const recorded = f.runtime.sessions.forSession("ses_root").turn.snapshot().tool_calls;
+    assert.deepEqual(
+      recorded.map((c) => c.decision),
+      ["deny", "deny"],
+    );
+    assert.ok(await waitFor(() => signalsOf(mock, "v2_not_enforcing").length === 1));
+    await tick(100);
+    assert.equal(signalsOf(mock, "v2_not_enforcing").length, 1, "once per runtime");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("NO-GO (tools: audit) also never raises for an MCP deny", async () => {
+  const f = await fakeV2({ mode: "deny", capabilities: { tools: "audit" }, mcpServers: ["github"] });
+  try {
+    const r = await toolCall(f, "github_create_issue", { title: "x" });
+    assert.equal(r.raised, undefined);
+    assert.equal(toolBodies().length, 1);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("subagent is audited, never sent and never denied (v1 task parity)", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const r = await toolCall(f, "subagent", { agent: "general", prompt: "do it", description: "d" });
+    assert.equal(r.raised, undefined);
+    assert.equal(r.effect, "allow");
+    assert.equal(toolBodies().length, 0);
+    const recorded = f.runtime.sessions.forSession("ses_root").turn.snapshot().tool_calls;
+    assert.equal(recorded[0]?.tool_name, "task");
+    assert.equal(recorded[0]?.decision, "audited");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("the Code Mode wrapper `execute` is not checked itself (its inner MCP calls are)", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const r = await toolCall(f, "execute", { code: "return 1" });
+    assert.equal(r.raised, undefined);
+    assert.equal(r.effect, "allow");
+    assert.equal(toolBodies().length, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("fail-open: API down or no key leaves every call untouched and never raises", async () => {
+  const down = await fakeV2({ mode: "500", mcpServers: ["github"] });
+  try {
+    const r = await toolCall(down, "shell", { command: "cat secrets.txt" });
+    assert.equal(r.effect, "allow");
+    const m = await toolCall(down, "github_create_issue", { title: "x" }, { id: "c2" });
+    assert.equal(m.raised, undefined);
+  } finally {
+    down.cleanup();
+  }
+  const noKey = await fakeV2({ mode: "deny", deps: { withKey: false }, mcpServers: ["github"] });
+  try {
+    const r = await toolCall(noKey, "shell", { command: "cat secrets.txt" });
+    assert.equal(r.effect, "allow");
+    const m = await toolCall(noKey, "github_create_issue", { title: "x" }, { id: "c2" });
+    assert.equal(m.raised, undefined);
+    assert.equal(pretoolRequests(mock).length, 0);
+  } finally {
+    noKey.cleanup();
+  }
+});
+
+test("handlers never raise on hostile events", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const before = f.handlers.get("tool.execute.before");
+    const evaluate = f.handlers.get("permission.evaluate");
+    for (const event of [null, undefined, 1, "x", {}, { tool: 5 }, { source: null }, { source: { id: 3 } }]) {
+      await before?.(event);
+      await evaluate?.(event);
+    }
+    const throwing = {
+      get tool(): never {
+        throw new Error("boom");
+      },
+    };
+    await before?.(throwing);
+    await evaluate?.({
+      sessionID: "s",
+      get source(): never {
+        throw new Error("boom");
+      },
+    });
+  } finally {
+    f.cleanup();
+  }
+});
+
+// --- HV2-03 ask -----------------------------------------------------------------------------------
+
+test("ask NATIVE: a confirm verdict asks through opencode's own approval, once per call", async () => {
+  const f = await fakeV2({ mode: "ask" });
+  try {
+    const r = await toolCall(f, "shell", { command: "rm -rf build" });
+    assert.equal(r.raised, undefined);
+    assert.equal(r.effect, "ask");
+    assert.equal(r.message, nativeApprovalMessage("Unusual command."));
+    assert.ok(r.message?.startsWith(APPROVAL_PREFIX));
+    assert.ok(!r.message?.includes("cannot show an approval prompt"), "no v1 'cannot ask' tail");
+    const again = await evaluateAgain(f, "ses_root", "call_1");
+    assert.equal(again.effect, "allow", "one approval card per call");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("ask DENY-AS-V1: a confirm verdict denies with the v1 approval sentence", async () => {
+  const f = await fakeV2({ mode: "approval", capabilities: { ask: "deny" } });
+  try {
+    const r = await toolCall(f, "shell", { command: "rm -rf build" });
+    assert.equal(r.effect, "deny");
+    assert.equal(r.message, approvalMessage("Needs admin approval."));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("ask AUDIT: a confirm verdict is left untouched and reported not-enforcing", async () => {
+  const f = await fakeV2({ mode: "ask", capabilities: { ask: "audit" } });
+  try {
+    const r = await toolCall(f, "shell", { command: "rm -rf build" });
+    assert.equal(r.effect, "allow");
+    assert.equal(r.message, undefined);
+    assert.ok(await waitFor(() => signalsOf(mock, "v2_not_enforcing").length === 1));
+  } finally {
+    f.cleanup();
+  }
+});
+
+// --- HV2-04 MCP ---------------------------------------------------------------------------------
+
+test("MCP GO: `<server>_<tool>` is attributed from the host's server list and a deny raises with the reason", async () => {
+  const f = await fakeV2({ mode: "deny", mcpServers: ["spikemcp"] });
+  try {
+    const r = await toolCall(f, "spikemcp_echo_marker", { n: "1" });
+    assert.equal(r.raised, SECRETS_DENY, "raised with the verbatim verdict text");
+    assert.equal(r.evaluated, false);
+    const b = toolBodies()[0];
+    assert.equal(metadataOf(b).mcp_server, "spikemcp");
+    assert.equal(metadataOf(b).mcp_tool, "echo_marker");
+    assert.equal(signalsOf(mock, "mcp_attribution_miss").length, 0);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("MCP GO: an allowed MCP call resolves and is never raised", async () => {
+  const f = await fakeV2({ mode: "allow", mcpServers: ["spikemcp"] });
+  try {
+    const r = await toolCall(f, "spikemcp_echo_marker", { n: "1" });
+    assert.equal(r.raised, undefined);
+    assert.equal(r.effect, "allow");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("MCP GO: an ask on an MCP id blocks with the v1 approval sentence (MCP ask unproven)", async () => {
+  const f = await fakeV2({ mode: "ask", mcpServers: ["spikemcp"] });
+  try {
+    const r = await toolCall(f, "spikemcp_echo_marker", { n: "1" });
+    assert.equal(r.raised, approvalMessage("Unusual command."));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("MCP: an unresolvable non-built-in id is still sent and reports mcp_attribution_miss", async () => {
+  const f = await fakeV2({ mode: "allow", mcpServers: [] });
+  try {
+    const r = await toolCall(f, "mystery_tool", { a: 1 });
+    assert.equal(r.raised, undefined);
+    assert.equal(toolBodies().length, 1);
+    assert.equal("mcp_server" in metadataOf(toolBodies()[0]), false);
+    assert.ok(await waitFor(() => signalsOf(mock, "mcp_attribution_miss").length === 1));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("MCP AUDIT: a deny is decided and recorded, never raised; v2_not_enforcing reported", async () => {
+  const f = await fakeV2({ mode: "deny", mcpServers: ["spikemcp"], capabilities: { mcp: "audit" } });
+  try {
+    const r = await toolCall(f, "spikemcp_echo_marker", { n: "1" });
+    assert.equal(r.raised, undefined);
+    assert.equal(r.effect, "allow");
+    assert.equal(metadataOf(toolBodies()[0]).mcp_server, "spikemcp");
+    assert.ok(await waitFor(() => signalsOf(mock, "v2_not_enforcing").length === 1));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("MCP NONE: non-built-in calls are not checked at all; built-ins still are", async () => {
+  const f = await fakeV2({ mode: "deny", mcpServers: ["spikemcp"], capabilities: { mcp: "none" } });
+  try {
+    const r = await toolCall(f, "spikemcp_echo_marker", { n: "1" });
+    assert.equal(r.raised, undefined);
+    assert.equal(toolBodies().length, 0);
+    const s = await toolCall(f, "shell", { command: "cat secrets.txt" }, { id: "c2" });
+    assert.equal(s.effect, "deny");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("v2HostClient answers mcp.status() from ctx.mcp.list() in the v1 shape", async () => {
+  const ctx = {
+    mcp: { list: async () => ({ data: [{ name: "a", status: {} }, { name: "b" }, { nope: 1 }] }) },
+  } as unknown as V2ContextLike;
+  assert.deepEqual(await v2HostClient(ctx, "/repo").mcp.status(), { data: { a: true, b: true } });
+  assert.equal(await v2HostClient({} as V2ContextLike, "/repo").mcp.status(), undefined);
+});
