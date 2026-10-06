@@ -70,13 +70,18 @@ interface FakeOptions {
   sessionGetHangs?: boolean;
   /** The ctx has none of these domains. */
   omit?: Array<"tool" | "permission" | "session" | "shell">;
+  /** A dedicated mock (default: the shared one, whose mode is reset). */
+  api?: MockApi;
 }
 
 async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
-  mock.requests.length = 0;
-  mock.setMode(opts.mode ?? "allow");
-  mock.setErrorsMode("ok");
-  const t = makeDeps(mock, { signalIntervalMs: 0, ...(opts.deps ?? {}) });
+  const api = opts.api ?? mock;
+  if (opts.api === undefined) {
+    mock.requests.length = 0;
+    mock.setMode(opts.mode ?? "allow");
+    mock.setErrorsMode("ok");
+  }
+  const t = makeDeps(api, { signalIntervalMs: 0, ...(opts.deps ?? {}) });
   const handle = createRuntime(t.deps);
   const handlers = new Map<string, Handler>();
   const domain = (name: string) => ({
@@ -862,6 +867,40 @@ test("CR-01: a user !cmd (timeout 0) never consumes a model mark", async () => {
     assert.equal(toolBodies().length, 2, "the mark is still there for the model's own spawn");
   } finally {
     f.cleanup();
+  }
+});
+
+test("WR-04: a fail-closed `unavailable` never blocks a spawn without a session id (reported); a policy deny still does", async () => {
+  const own = await startOpencodeMock("failBlock");
+  const f = await fakeV2({
+    api: own,
+    deps: { deadlineMs: 300, timeouts: { pretoolMs: 200, errorsMs: 1000, turnLogMs: 1000 } },
+  });
+  try {
+    // Prime the org's failure action (fail-closed) with one allowed model call.
+    const primed = await toolCall(f, "read", { path: "a.txt" }, { id: "call_prime" });
+    assert.equal(primed.effect, "allow");
+    // The gateway now hangs: the user-route spawn is `unavailable` and must not be blocked.
+    assert.equal(await userShell(f, "make build"), undefined, "no fail-closed raise from the spawn hook");
+    assert.ok(await waitFor(() => signalsOf(own, "user_shell_unchecked").length === 1, 3000));
+    // The model's own call still fails closed through its permission step.
+    const model = await toolCall(f, "shell", { command: "make build" }, { id: "call_m" });
+    assert.equal(model.effect, "deny");
+  } finally {
+    f.cleanup();
+    await own.close();
+  }
+});
+
+test("WR-04: every unmarked spawn is still checked; a deny or approval verdict on it blocks", async () => {
+  for (const [mode, prefix] of [["deny", DENY_PREFIX], ["ask", APPROVAL_PREFIX]] as const) {
+    const f = await fakeV2({ mode });
+    try {
+      const terminal = { command: "cat .env", cwd: DIRECTORY, timeout: 0, shell: "/bin/zsh", env: {} };
+      assert.ok((await spawnHook(f, terminal))?.startsWith(prefix), mode);
+    } finally {
+      f.cleanup();
+    }
   }
 });
 

@@ -57,6 +57,7 @@ import { decideBeforeVerdict } from "./before.ts";
 import type { BeforeDecision } from "./before.ts";
 import { block } from "./block.ts";
 import {
+  SIGNAL_USER_SHELL_UNCHECKED,
   SIGNAL_V2_NOT_ENFORCING,
   SIGNAL_V2_PROMPT_WARN_ONLY,
   V2_CAPABILITIES,
@@ -73,7 +74,7 @@ import type {
 import { mcpCandidates } from "./narrow.ts";
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
 import { decidePrompt } from "./prompt.ts";
-import { checkUserCommand } from "./userShell.ts";
+import { checkUserCommandVerdict } from "./userShell.ts";
 import { APPROVAL_PREFIX } from "./verdicts.ts";
 
 /** v2's shell tool (v1 `bash`). */
@@ -734,11 +735,19 @@ export function registerV2Enforcement(
         if (command === "" || takeModelShell(command, readString(event, "cwd"), readField(event, "timeout"))) return undefined;
         userShellSeq += 1;
         const callID = `v2_${nowSafe().toString(36)}_${userShellSeq}`;
-        const message = await checkUserCommand(command, readString(event, "cwd"), "", callID, {
+        const { message, kind } = await checkUserCommandVerdict(command, readString(event, "cwd"), "", callID, {
           runtime,
           record: record(),
         });
         if (message === undefined) return undefined;
+        // WR-04: the spawn hook cannot tell a user `!cmd` from the non-session `POST /api/shell` (same
+        // input, `timeout: 0`, no session id; 2.0.24). A policy verdict (deny, approval) on the
+        // command still blocks it, but a fail-closed `unavailable` never blocks a spawn that carries
+        // no session id: it is reported instead.
+        if (kind === "unavailable") {
+          runtime.reportSignal(SIGNAL_USER_SHELL_UNCHECKED, "bash", "unavailable_not_applied");
+          return undefined;
+        }
         if (capabilities.userShell !== "enforce") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, "bash", "user_shell");
           return undefined;

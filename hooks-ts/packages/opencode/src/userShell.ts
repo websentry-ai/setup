@@ -21,7 +21,7 @@
 
 import { USER_BASH_ID_PREFIX } from "../../core/src/constants.ts";
 import { evaluateToolCall } from "../../core/src/evaluate.ts";
-import type { EvaluateDeps } from "../../core/src/evaluate.ts";
+import type { EvaluateDeps, ToolEvaluation } from "../../core/src/evaluate.ts";
 import { block } from "./block.ts";
 import { SIGNAL_USER_SHELL_UNCHECKED } from "./constants.ts";
 import { notify } from "./notify.ts";
@@ -74,6 +74,14 @@ export async function decideUserShell(input: unknown, ctx: UserShellContext): Pr
   }
 }
 
+/** What a user command check concluded: the message to block with, and the verdict kind. */
+export interface UserCommandDecision {
+  message: string | undefined;
+  kind: ToolEvaluation["kind"] | undefined;
+}
+
+const NO_USER_DECISION: UserCommandDecision = Object.freeze({ message: undefined, kind: undefined });
+
 /**
  * Check one user shell command through core's `evaluateToolCall`, exactly like a model bash call
  * (`toolCallId` = `USER_BASH_ID_PREFIX` + `callID`). Shared by v1 `shell.env` and the v2
@@ -89,12 +97,27 @@ export async function checkUserCommand(
   ctx: UserShellContext,
 ): Promise<string | undefined> {
   try {
+    return (await checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx)).message;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `checkUserCommand` with the verdict kind (the v2 spawn hook treats `unavailable` apart). Total. */
+export async function checkUserCommandVerdict(
+  command: string,
+  cwdRaw: string,
+  sessionID: string,
+  callID: string,
+  ctx: UserShellContext,
+): Promise<UserCommandDecision> {
+  try {
     const { runtime, record } = ctx;
-    if (typeof command !== "string" || command === "") return undefined;
+    if (typeof command !== "string" || command === "") return NO_USER_DECISION;
     const resolved = runtime.init();
     const checker = resolved.checker;
     const scope = resolved.scope;
-    if (checker === undefined || scope === undefined) return undefined;
+    if (checker === undefined || scope === undefined) return NO_USER_DECISION;
     const cwd = typeof cwdRaw === "string" && cwdRaw.startsWith("/") ? cwdRaw : record.directory;
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
@@ -129,12 +152,12 @@ export async function checkUserCommand(
       evalDeps,
     );
     const message = blockingMessage(verdict);
-    if (message === undefined) return undefined;
+    if (message === undefined) return { message: undefined, kind: verdict.kind };
     // The HTTP caller only sees a generic 500 (V1-7, V2-10): the toast is the clean channel.
     await notify(record.client, message, verdict.kind === "confirm" ? "warning" : "error");
-    return message;
+    return { message, kind: verdict.kind };
   } catch {
-    return undefined;
+    return NO_USER_DECISION;
   }
 }
 
