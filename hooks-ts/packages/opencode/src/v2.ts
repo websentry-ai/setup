@@ -131,7 +131,8 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
     const { capabilities: _capabilities, sentinelKey: _sentinelKey, ...deps } = source;
     // HV2-07 PROVIDER-LEVEL: the identity reader reads nothing; the provider id is the label.
     const handle = createRuntime({ ...deps, readAuth: (_dataDir, provider) => v2ProviderIdentity(provider) });
-    return { handle, capabilities, directories: new Set<string>(), statusReported: false, scope: createV2Scope() };
+    const directories = new Set<string>();
+    return { handle, capabilities, directories, statusReported: false, scope: createV2Scope(directories) };
   }
 
   /** Put a frozen holder of `shared` in the slot: non-writable, non-configurable, non-enumerable. */

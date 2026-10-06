@@ -28,6 +28,7 @@ import { registerV2Recording, V2_RECORDING_GAPS, v2ProviderIdentity } from "../s
 import { makeDeps, pretoolRequests, signalsOf, startOpencodeMock, tick, waitFor } from "./helpers/fakeHost.ts";
 
 let mock: MockApi;
+let eventSeq = 0;
 
 before(async () => {
   mock = await startOpencodeMock("allow");
@@ -141,7 +142,9 @@ async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
     stream,
     homeDir: t.homeDir,
     emit: async (type, data) => {
-      stream.push({ id: `evt_${type}`, type, created: Date.now(), location: { directory: DIRECTORY }, data });
+      // Real hosts give every event its own id (`evt_…`); the adapter de-duplicates by it (WR-03).
+      eventSeq += 1;
+      stream.push({ id: `evt_${eventSeq}_${type}`, type, created: Date.now(), location: { directory: DIRECTORY }, data });
       await tick(5);
     },
     cleanup() {

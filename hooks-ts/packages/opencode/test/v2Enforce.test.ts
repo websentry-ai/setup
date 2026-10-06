@@ -22,9 +22,12 @@ import { createRuntime } from "../src/plugin.ts";
 import type { Deps, Runtime } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage } from "../src/verdicts.ts";
 import {
+  claimEvent,
+  claimHookInput,
   createV2Scope,
   nativeApprovalMessage,
   noteInterrupted,
+  noteSessionDirectory,
   PENDING_SHELL_TTL_MS,
   promptBlockNotice,
   registerV2Enforcement,
@@ -905,4 +908,46 @@ test("user shell AUDIT: checked and reported, never raised; NONE: not registered
   } finally {
     h.cleanup();
   }
+});
+
+// --- WR-03: directory awareness (events are delivered to every registration on 2.0.24) ----------
+
+test("WR-03 claimEvent: another registered directory's event is skipped; unknown ownership is claimed once", () => {
+  const directories = new Set<string>(["/proj", "/proj2"]);
+  const scope = createV2Scope(directories);
+  const ev = (id: string, extra: Record<string, unknown>) => ({ id, type: "session.text.ended", ...extra });
+  // Owned by its location.
+  assert.equal(claimEvent(scope, "/proj", ev("e1", { location: { directory: "/proj2" }, data: {} })), false);
+  assert.equal(claimEvent(scope, "/proj2", ev("e1", { location: { directory: "/proj2" }, data: {} })), true);
+  assert.equal(claimEvent(scope, "/proj2", ev("e1", { location: { directory: "/proj2" }, data: {} })), false, "once");
+  // A location that has no registration: exactly one registration takes it.
+  assert.equal(claimEvent(scope, "/proj", ev("e2", { location: { directory: "/elsewhere" }, data: {} })), true);
+  assert.equal(claimEvent(scope, "/proj2", ev("e2", { location: { directory: "/elsewhere" }, data: {} })), false);
+  // No location: the session's directory decides, else the first claim.
+  noteSessionDirectory(scope, "ses_b", "/proj2");
+  assert.equal(claimEvent(scope, "/proj", ev("e3", { data: { sessionID: "ses_b" } })), false);
+  assert.equal(claimEvent(scope, "/proj2", ev("e3", { data: { sessionID: "ses_b" } })), true);
+  assert.equal(claimEvent(scope, "/proj2", ev("e4", { data: { sessionID: "ses_unknown" } })), true);
+  assert.equal(claimEvent(scope, "/proj", ev("e4", { data: { sessionID: "ses_unknown" } })), false);
+  // No id: handled (cannot be de-duplicated); hostile input: handled.
+  assert.equal(claimEvent(scope, "/proj", { type: "x", data: {} }), true);
+  assert.equal(claimEvent(scope, "/proj", null), true);
+});
+
+test("WR-03 claimHookInput: one hook input object is decided once process-wide, per hook name", () => {
+  const scope = createV2Scope();
+  const input = { tool: "shell" };
+  assert.equal(claimHookInput(scope, "tool.execute.before", input), true);
+  assert.equal(claimHookInput(scope, "tool.execute.before", input), false);
+  assert.equal(claimHookInput(scope, "tool.execute.after", input), true, "another hook is its own call");
+  assert.equal(claimHookInput(scope, "tool.execute.before", { tool: "shell" }), true, "a copy is a new call");
+  assert.equal(claimHookInput(scope, "tool.execute.before", null), true);
+});
+
+test("WR-03: the session map is bounded", () => {
+  const scope = createV2Scope();
+  for (let i = 0; i < 1100; i += 1) noteSessionDirectory(scope, `s${i}`, "/proj");
+  assert.ok(scope.sessionDirs.size <= 1024);
+  noteSessionDirectory(scope, "s", "relative/dir");
+  assert.equal(scope.sessionDirs.has("s"), false, "only absolute directories");
 });

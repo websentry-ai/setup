@@ -137,17 +137,121 @@ export interface ModelShellMark {
   denied: boolean;
 }
 
-/** Process-wide v2 state every directory's registrations share (v2.ts keeps one per process). */
+/** The most sessions whose directory is remembered, and the most event ids kept for de-duplication. */
+const MAX_SESSION_DIRS = 1024;
+const MAX_SEEN_EVENTS = 4096;
+
+/**
+ * Process-wide v2 state every directory's registrations share (v2.ts keeps one per process).
+ *
+ * Directory awareness (WR-03), as observed on 2.0.24 with two directories in one process: hook
+ * callbacks (`tool`, `permission`, `session.prompt`, `shell`) fire only in the registration of the
+ * call's own location, but `ctx.event.subscribe()` delivers EVERY location's events to every
+ * registration. So:
+ *
+ *   * an event is handled by the registration of its own location (`event.location.directory`, else
+ *     the session's directory from `session.created` / `ctx.session.get`), and by exactly one
+ *     registration when its owner cannot be told (`claimEvent`, by event id);
+ *   * a hook input object is decided once process-wide (`claimHookInput`), so a host that ever fired
+ *     one call's hooks in every registration would still check it once. A hook call is never skipped
+ *     because of the session map: that map can be stale (a session can move to another location),
+ *     and a wrong skip would let a call run unchecked;
+ *   * model shell marks are process-wide, so no directory's user-shell handler raises for a command
+ *     another directory's before hook marked.
+ */
 export interface V2Scope {
   /** Model shell commands awaiting their `shell.create.before`, oldest first (bounded). */
   readonly modelShells: ModelShellMark[];
   /** session id → when it was last interrupted (bounded, insertion-ordered). */
   readonly interrupted: Map<string, number>;
+  /** `directoryKey`s of the directories with live registrations (v2.ts's set). */
+  readonly directories: Set<string>;
+  /** session id → `directoryKey` of its location (bounded, insertion-ordered; latest wins). */
+  readonly sessionDirs: Map<string, string>;
+  /** Event ids already handled by some registration (bounded, insertion-ordered). */
+  readonly seenEvents: Set<string>;
+  /** Per hook name: the input objects some registration already handled. */
+  readonly seenHookInputs: Map<string, WeakSet<object>>;
 }
 
-/** A fresh, empty scope. */
-export function createV2Scope(): V2Scope {
-  return { modelShells: [], interrupted: new Map<string, number>() };
+/** A fresh, empty scope; `directories` is the caller's live registration set when it has one. */
+export function createV2Scope(directories: Set<string> = new Set<string>()): V2Scope {
+  return {
+    modelShells: [],
+    interrupted: new Map<string, number>(),
+    directories,
+    sessionDirs: new Map<string, string>(),
+    seenEvents: new Set<string>(),
+    seenHookInputs: new Map<string, WeakSet<object>>(),
+  };
+}
+
+/** Remember a session's location (bounded). Total. */
+export function noteSessionDirectory(scope: V2Scope, sessionID: unknown, directory: unknown): void {
+  try {
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    const key = directoryKey(directory);
+    if (key === undefined) return;
+    scope.sessionDirs.delete(sessionID);
+    scope.sessionDirs.set(sessionID, key);
+    while (scope.sessionDirs.size > MAX_SESSION_DIRS) {
+      const oldest = scope.sessionDirs.keys().next().value;
+      if (oldest === undefined) break;
+      scope.sessionDirs.delete(oldest);
+    }
+  } catch {
+    // Unknown location: the event falls back to the id claim.
+  }
+}
+
+/**
+ * Claim one hook input for this registration: true the first time the object is seen process-wide
+ * (and for anything that is not an object), false when another registration already handled the
+ * very same call. Total: a fault claims (the call is checked).
+ */
+export function claimHookInput(scope: V2Scope, hook: string, input: unknown): boolean {
+  try {
+    if (input === null || typeof input !== "object") return true;
+    let seen = scope.seenHookInputs.get(hook);
+    if (seen === undefined) {
+      seen = new WeakSet<object>();
+      scope.seenHookInputs.set(hook, seen);
+    }
+    if (seen.has(input)) return false;
+    seen.add(input);
+    return true;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Should the registration for `ownDirectory` handle this bus event? Not when the event belongs to
+ * ANOTHER directory that has its own live registration (its location, else its session's); else
+ * exactly one registration handles it (claimed by event id). Total: a fault handles it.
+ */
+export function claimEvent(scope: V2Scope, ownDirectory: string, event: unknown): boolean {
+  try {
+    const own = directoryKey(ownDirectory);
+    const data = readField(event, "data");
+    const located =
+      directoryKey(readString(readField(event, "location"), "directory")) ??
+      directoryKey(readString(readField(data, "location"), "directory"));
+    const owner = located ?? scope.sessionDirs.get(readString(data, "sessionID"));
+    if (owner !== undefined && owner !== own && scope.directories.has(owner)) return false;
+    const id = readString(event, "id");
+    if (id === "") return true;
+    if (scope.seenEvents.has(id)) return false;
+    scope.seenEvents.add(id);
+    while (scope.seenEvents.size > MAX_SEEN_EVENTS) {
+      const oldest = scope.seenEvents.values().next().value;
+      if (oldest === undefined) break;
+      scope.seenEvents.delete(oldest);
+    }
+    return true;
+  } catch {
+    return true;
+  }
 }
 
 /**
@@ -223,14 +327,19 @@ export function createV2Registrations(): V2Registrations {
   };
 }
 
-/** The directory a model shell call spawns in: an absolute `workdir`, a relative one under `directory`, else `directory`. */
-function modelShellCwd(input: unknown, directory: string): string {
+/**
+ * The directory a model shell call spawns in: an absolute `workdir`; else the session's directory
+ * (`scope.sessionDirs`), or this registration's when it is the only one, with a relative `workdir`
+ * resolved under it. `""` (command-only match) when the base is ambiguous. Total.
+ */
+function modelShellCwd(input: unknown, sessionID: string, directory: string, scope: V2Scope): string {
   try {
     const workdir = readField(input, "workdir");
-    if (typeof workdir === "string" && workdir !== "") {
-      return directoryKey(isAbsolute(workdir) ? workdir : resolve(directory, workdir)) ?? "";
-    }
-    return directoryKey(directory) ?? "";
+    if (typeof workdir === "string" && workdir !== "" && isAbsolute(workdir)) return directoryKey(workdir) ?? "";
+    const base = scope.sessionDirs.get(sessionID) ?? (scope.directories.size > 1 ? undefined : directoryKey(directory));
+    if (base === undefined) return "";
+    if (typeof workdir === "string" && workdir !== "") return directoryKey(resolve(base, workdir)) ?? "";
+    return base;
   } catch {
     return "";
   }
@@ -412,7 +521,7 @@ export function registerV2Enforcement(
         if (interruptedAt !== undefined && interruptedAt >= started) return;
         modelShells.push({
           command,
-          cwd: modelShellCwd(input, directory),
+          cwd: modelShellCwd(input, sessionID, directory, scope),
           at: nowSafe(),
           sessionID,
           denied: kind === "deny" || kind === "unavailable",
@@ -582,7 +691,10 @@ export function registerV2Enforcement(
         // `session.created`, so the parent comes from `ctx.session.get`; `runtime.isChild` (filled
         // from events) is the fallback inside `decidePrompt`.
         const info = await sessionInfo(sessionID);
-        if (info !== undefined) runtime.setParent(sessionID, readField(info, "parentID"));
+        if (info !== undefined) {
+          runtime.setParent(sessionID, readField(info, "parentID"));
+          noteSessionDirectory(scope, sessionID, readString(readField(info, "location"), "directory"));
+        }
         const model = readField(info, "model");
         const providerID = readString(model, "providerID");
         const modelID = readString(model, "id");
@@ -642,6 +754,7 @@ export function registerV2Enforcement(
       // The raise happens outside the decision's guard, and only with a verdict message.
       registrations.track(
         tool.hook("execute.before", async (event: V2ToolBefore): Promise<void> => {
+          if (!claimHookInput(scope, "tool.execute.before", event)) return;
           const started = nowSafe();
           const outcome = await decideToolCall(event).catch((): ToolCallOutcome => NO_OUTCOME);
           const message = outcome.raise;
@@ -654,16 +767,25 @@ export function registerV2Enforcement(
     }
     const permission = ctx.permission;
     if (permission !== undefined && typeof permission.hook === "function") {
-      registrations.track(permission.hook("evaluate", (event: V2PermissionEvaluate) => applyEvaluate(event)));
+      registrations.track(
+        permission.hook("evaluate", async (event: V2PermissionEvaluate): Promise<void> => {
+          if (claimHookInput(scope, "permission.evaluate", event)) await applyEvaluate(event);
+        }),
+      );
     }
     const session = ctx.session;
     if (session !== undefined && typeof session.hook === "function") {
-      registrations.track(session.hook("prompt", (event: V2SessionPrompt) => handlePrompt(event)));
+      registrations.track(
+        session.hook("prompt", async (event: V2SessionPrompt): Promise<void> => {
+          if (claimHookInput(scope, "session.prompt", event)) await handlePrompt(event);
+        }),
+      );
     }
     const shell = ctx.shell;
     if (capabilities.userShell !== "none" && shell !== undefined && typeof shell.hook === "function") {
       registrations.track(
         shell.hook("create.before", async (event: V2ShellCreateBefore): Promise<void> => {
+          if (!claimHookInput(scope, "shell.create.before", event)) return;
           const message = await decideUserShell(event).catch(() => undefined);
           if (typeof message === "string" && message.length > 0) block(message);
         }),

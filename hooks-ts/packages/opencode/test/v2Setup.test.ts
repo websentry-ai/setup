@@ -266,6 +266,134 @@ test("WR-02: a registration that resolves after the cleanup is disposed as it ar
   }
 });
 
+/**
+ * One process hosting several directories. As observed on 2.0.24, `event.subscribe()` delivers
+ * EVERY location's events to every registration. `globalHooks` simulates a host that would also
+ * fire one call's hooks in every registration (with the same input object, or a copy per callback).
+ */
+function sharedHost(): {
+  ctxFor(directory: string): Record<string, unknown>;
+  fire(hook: string, event: Record<string, unknown>, opts?: { copy?: boolean }): Promise<string | undefined>;
+  publish(event: unknown): void;
+} {
+  const live = new Map<string, Set<Handler>>();
+  const subscribers = new Set<(event: unknown) => void>();
+  const domain = (name: string) => ({
+    hook: async (hook: string, cb: Handler) => {
+      const key = `${name}.${hook}`;
+      const set = live.get(key) ?? new Set<Handler>();
+      live.set(key, set);
+      set.add(cb);
+      return { dispose: async () => void set.delete(cb) };
+    },
+  });
+  return {
+    ctxFor(directory: string) {
+      return {
+        app: { name: "cli", version: "2.0.24", channel: "latest" },
+        location: { directory },
+        tool: domain("tool"),
+        permission: domain("permission"),
+        session: { ...domain("session"), get: async (i: { sessionID: string }) => ({ id: i.sessionID }) },
+        shell: domain("shell"),
+        mcp: { list: async () => ({ data: [] }) },
+        event: {
+          subscribe: (options?: { signal?: AbortSignal }) => {
+            const queue: unknown[] = [];
+            let wake: (() => void) | undefined;
+            const push = (e: unknown): void => {
+              queue.push(e);
+              wake?.();
+            };
+            subscribers.add(push);
+            options?.signal?.addEventListener("abort", () => {
+              subscribers.delete(push);
+              wake?.();
+            });
+            return {
+              async *[Symbol.asyncIterator]() {
+                while (options?.signal?.aborted !== true) {
+                  if (queue.length === 0) await new Promise<void>((r) => (wake = r));
+                  while (queue.length > 0) yield queue.shift();
+                }
+              },
+            };
+          },
+        },
+      };
+    },
+    async fire(hook, event, opts = {}) {
+      try {
+        for (const cb of [...(live.get(hook) ?? [])]) await cb(opts.copy === true ? structuredClone(event) : event);
+        return undefined;
+      } catch (err) {
+        return (err as Error).message;
+      }
+    },
+    publish(event) {
+      for (const push of [...subscribers]) push(event);
+    },
+  };
+}
+
+function heartbeats(): number {
+  return pretoolRequests(mock).filter((r) => (r.body as { event_name?: string }).event_name === "session_start").length;
+}
+
+test("WR-03: with two directories every event reaches both registrations, and each is handled by one", async () => {
+  resetMock();
+  const t = makeDeps(mock);
+  try {
+    const setup = createSetupV2({ ...t.deps, sentinelKey: Symbol("v2-setup-test") });
+    const host = sharedHost();
+    await setup(host.ctxFor("/proj"));
+    await setup(host.ctxFor("/proj2"));
+    await tick(5);
+    // A root session in /proj2: delivered to both subscriptions (2.0.24), one heartbeat.
+    host.publish({ id: "evt_1", type: "session.created", location: { directory: "/proj2" }, data: { sessionID: "ses_b", location: { directory: "/proj2" }, version: "2.0.24" } });
+    // An event with no location and an unknown session: handled by exactly one registration.
+    host.publish({ id: "evt_2", type: "session.created", data: { sessionID: "ses_c", version: "2.0.24" } });
+    assert.ok(await waitFor(() => heartbeats() >= 1));
+    await tick(100);
+    // evt_1 → /proj2 (its owner) once; evt_2 → whichever single registration claimed it.
+    const dirs = pretoolRequests(mock)
+      .map((r) => (r.body as { pre_tool_use_data?: { metadata?: { cwd?: string } } }).pre_tool_use_data?.metadata?.cwd)
+      .filter((d) => d !== undefined);
+    assert.equal(dirs.filter((d) => d === "/proj2").length, 1);
+    assert.ok(dirs.length <= 2, JSON.stringify(dirs));
+  } finally {
+    t.cleanup();
+  }
+});
+
+for (const copy of [false, true]) {
+  test(`WR-03: hooks fired in every registration (${copy ? "a copy each" : "same object"}) never raise on a model call; ${copy ? "no false block" : "checked once"}`, async () => {
+    resetMock();
+    const t = makeDeps(mock);
+    try {
+      const setup = createSetupV2({ ...t.deps, sentinelKey: Symbol("v2-setup-test") });
+      const host = sharedHost();
+      await setup(host.ctxFor("/proj"));
+      await setup(host.ctxFor("/proj2"));
+      await tick(5);
+      mock.setMode("allow");
+      const before = { tool: "shell", sessionID: "s1", agent: "b", messageID: "m", id: "c1", input: { command: "make test" } };
+      assert.equal(await host.fire("tool.execute.before", before, { copy }), undefined);
+      // The model's own spawn reaches both user-shell handlers: neither checks it as a user command.
+      const spawn = { command: "make test", cwd: "/proj", timeout: 120_000, shell: "/bin/zsh", env: {} };
+      mock.setMode("deny");
+      assert.equal(await host.fire("shell.create.before", spawn, { copy }), undefined, "never raised");
+      const checks = pretoolRequests(mock).filter((r) => (r.body as { event_name?: string }).event_name === "tool_use");
+      assert.equal(checks.length, copy ? 2 : 1, copy ? "a copy per callback cannot be told apart: decided twice, never blocked" : "decided once");
+      // A real user command is still checked and raised.
+      const user = { command: "cat .env", cwd: "/proj2", timeout: 0, shell: "/bin/zsh", env: {} };
+      assert.ok((await host.fire("shell.create.before", user, { copy }))?.startsWith("Blocked by Unbound policy"));
+    } finally {
+      t.cleanup();
+    }
+  });
+}
+
 test("an audit-only tools capability also reports v2_not_enforcing once", async () => {
   resetMock();
   const t = makeDeps(mock);

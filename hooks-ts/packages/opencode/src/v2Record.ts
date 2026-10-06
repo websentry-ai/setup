@@ -46,9 +46,12 @@ import type { DirectoryRecord, Runtime } from "./plugin.ts";
 import { handleEvent, outputParts, recordResult, sanitizeHostVersion, toolExecuteAfter } from "./record.ts";
 import type { RecordContext } from "./record.ts";
 import {
+  claimEvent,
+  claimHookInput,
   createV2Registrations,
   createV2Scope,
   noteInterrupted,
+  noteSessionDirectory,
   V2_BUILTIN_TOOLS,
   V2_CODE_MODE_TOOL,
   v1ToolName,
@@ -188,6 +191,7 @@ export function registerV2Recording(
             const location = readField(data, "location");
             const eventLocation = readField(event, "location");
             const dir = readString(location, "directory") || readString(eventLocation, "directory") || directory;
+            noteSessionDirectory(scope, sessionID, dir);
             const version = readField(data, "version") ?? readField(app, "version");
             const parentID = readField(data, "parentID");
             noteModel(sessionID, readField(data, "model"));
@@ -253,6 +257,7 @@ export function registerV2Recording(
 
     const afterHandler = async (event: V2ToolAfter): Promise<void> => {
       try {
+        if (!claimHookInput(scope, "tool.execute.after", event)) return;
         const tool = readString(event, "tool");
         const sessionID = readString(event, "sessionID");
         const id = readString(event, "id");
@@ -288,6 +293,7 @@ export function registerV2Recording(
 
     const modelRequest = async (event: V2SessionModelRequest): Promise<void> => {
       try {
+        if (!claimHookInput(scope, "session.model.request", event)) return;
         const kind = readField(event, "kind");
         if (kind !== undefined && kind !== "primary") {
           // A title / compaction call names the same provider; it never sets the session's model.
@@ -317,7 +323,9 @@ export function registerV2Recording(
         try {
           for await (const event of iterable as AsyncIterable<V2BusEvent>) {
             if (stopped) break;
-            onEvent(event);
+            // Every registration receives every location's events (2.0.24): handle only our own,
+            // and an event of unknown ownership in exactly one registration (WR-03).
+            if (claimEvent(scope, directory, event)) onEvent(event);
           }
         } catch {
           // The stream ended badly: recording stops, enforcement is unaffected.
