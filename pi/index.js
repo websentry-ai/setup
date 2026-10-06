@@ -253,7 +253,8 @@ function buildAccountIdentity(input) {
       }
     } else {
       const mode = label(auth.authMode);
-      if (mode !== void 0) identity.auth_mode = mode;
+      if (mode === AUTH_MODE_API_KEY) identity.auth_mode = mode;
+      else if (mode === AUTH_MODE_SUBSCRIPTION && auth.provider === ANTHROPIC_PROVIDER_ID) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== void 0 && isValidSerial(serial)) identity.device_serial = serial;

@@ -130,6 +130,7 @@ var BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again \u2014 enforc
 var KEY_REJECTED_NOTICE = "Unbound: API key rejected \u2014 enforcement inactive";
 var KEY_REJECTED_BLOCK_REASON = "Unbound API key rejected \u2014 this organisation enforces fail-closed; contact your admin";
 var MAX_AUTH_FILE_BYTES = 65536;
+var ANTHROPIC_PROVIDER_ID = "anthropic";
 var ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 var ANTHROPIC_OAUTH_BETA_HEADER = "anthropic-beta";
 var ANTHROPIC_OAUTH_BETA_VALUE = "oauth-2025-04-20";
@@ -945,23 +946,23 @@ function label(value) {
   return trimmed;
 }
 function withDeadline(promise, ms, fallback) {
-  return new Promise((resolve2) => {
+  return new Promise((resolve3) => {
     let timer;
     try {
-      timer = setTimeout(() => resolve2(fallback), ms);
+      timer = setTimeout(() => resolve3(fallback), ms);
       timer.unref?.();
     } catch {
-      resolve2(fallback);
+      resolve3(fallback);
       return;
     }
     promise.then(
       (value) => {
         clearTimeout(timer);
-        resolve2(value);
+        resolve3(value);
       },
       () => {
         clearTimeout(timer);
-        resolve2(fallback);
+        resolve3(fallback);
       }
     );
   });
@@ -1046,7 +1047,8 @@ function buildAccountIdentity(input) {
       }
     } else {
       const mode = label(auth.authMode);
-      if (mode !== void 0) identity.auth_mode = mode;
+      if (mode === AUTH_MODE_API_KEY) identity.auth_mode = mode;
+      else if (mode === AUTH_MODE_SUBSCRIPTION && auth.provider === ANTHROPIC_PROVIDER_ID) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== void 0 && isValidSerial(serial)) identity.device_serial = serial;
@@ -1070,16 +1072,16 @@ function probeToolPath(tool, env = process.env) {
     }
   }
 }
-var defaultExecFile = (file, args, opts) => new Promise((resolve2) => {
+var defaultExecFile = (file, args, opts) => new Promise((resolve3) => {
   try {
     nodeExecFile(
       file,
       [...args],
       { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8", cwd: tmpdir() },
-      (error, stdout) => resolve2(error === null && typeof stdout === "string" ? stdout : void 0)
+      (error, stdout) => resolve3(error === null && typeof stdout === "string" ? stdout : void 0)
     );
   } catch {
-    resolve2(void 0);
+    resolve3(void 0);
   }
 });
 function firstValid(stdout) {
@@ -1811,14 +1813,14 @@ function safeHooks(hooks) {
   };
 }
 function raceDeadline(start, deadlineMs) {
-  return new Promise((resolve2) => {
+  return new Promise((resolve3) => {
     let done = false;
     let timer;
     const finish = (result) => {
       if (done) return;
       done = true;
       if (timer !== void 0) clearTimeout(timer);
-      resolve2(result);
+      resolve3(result);
     };
     try {
       timer = setTimeout(() => finish({ state: "timed-out" }), deadlineMs);
@@ -2172,11 +2174,11 @@ function notify2(client, message, level) {
     const show = showToastOf(client);
     if (show === void 0 || typeof message !== "string" || message === "") return Promise.resolve();
     const toast = Promise.resolve(show({ body: { message, variant: level, title: TOAST_TITLE } }));
-    return new Promise((resolve2) => {
+    return new Promise((resolve3) => {
       let timer;
       const done = () => {
         if (timer !== void 0) clearTimeout(timer);
-        resolve2();
+        resolve3();
       };
       try {
         timer = setTimeout(done, TOAST_TIMEOUT_MS);
@@ -2376,8 +2378,8 @@ async function fanOut(items, limit, fn, deps) {
   };
   const deadlineMs = fanOutDeadlineMs(deps.deadlineMs);
   let timer;
-  const timedOut = new Promise((resolve2) => {
-    timer = setTimeout(() => resolve2("timed-out"), deadlineMs);
+  const timedOut = new Promise((resolve3) => {
+    timer = setTimeout(() => resolve3("timed-out"), deadlineMs);
   });
   const workers = [];
   for (let i = 0; i < Math.max(1, Math.min(limit, items.length)); i += 1) workers.push(worker());
@@ -3067,14 +3069,22 @@ async function decideUserShell(input, ctx) {
     return void 0;
   }
 }
+var NO_USER_DECISION = Object.freeze({ message: void 0, kind: void 0 });
 async function checkUserCommand(command, cwdRaw, sessionID, callID, ctx) {
   try {
+    return (await checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx)).message;
+  } catch {
+    return void 0;
+  }
+}
+async function checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx) {
+  try {
     const { runtime, record } = ctx;
-    if (typeof command !== "string" || command === "") return void 0;
+    if (typeof command !== "string" || command === "") return NO_USER_DECISION;
     const resolved = runtime.init();
     const checker = resolved.checker;
     const scope = resolved.scope;
-    if (checker === void 0 || scope === void 0) return void 0;
+    if (checker === void 0 || scope === void 0) return NO_USER_DECISION;
     const cwd = typeof cwdRaw === "string" && cwdRaw.startsWith("/") ? cwdRaw : record.directory;
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
@@ -3109,11 +3119,11 @@ async function checkUserCommand(command, cwdRaw, sessionID, callID, ctx) {
       evalDeps
     );
     const message = blockingMessage(verdict);
-    if (message === void 0) return void 0;
+    if (message === void 0) return { message: void 0, kind: verdict.kind };
     await notify2(record.client, message, verdict.kind === "confirm" ? "warning" : "error");
-    return message;
+    return { message, kind: verdict.kind };
   } catch {
-    return void 0;
+    return NO_USER_DECISION;
   }
 }
 function shellEnv(ctx) {
@@ -3124,7 +3134,10 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "d9cf12d5e9bd2eca528e81055a3ebf29" : "source";
+var BUILD_TOKEN = true ? "f031fa1ef21673872a70a66e1acdb817" : "source";
+function isBuildToken(value) {
+  return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
+}
 function createModuleToken(buildToken = BUILD_TOKEN) {
   return Object.freeze({ module: SENTINEL_KEY, build: buildToken });
 }
@@ -3656,8 +3669,8 @@ function createRuntime(overrides = {}) {
         if (typeof status !== "function") return;
         const pending = Promise.resolve(status.call(mcp));
         let timer;
-        const timeout = new Promise((resolve2) => {
-          timer = setTimeout(() => resolve2(void 0), MCP_REFRESH_TIMEOUT_MS);
+        const timeout = new Promise((resolve3) => {
+          timer = setTimeout(() => resolve3(void 0), MCP_REFRESH_TIMEOUT_MS);
           timer.unref?.();
         });
         void Promise.race([pending, timeout]).then((answer) => {
@@ -3783,10 +3796,11 @@ function createServerPlugin(overrides = {}) {
         return d !== void 0 && "value" in d ? d.value : void 0;
       };
       if (own("module") !== SENTINEL_KEY) return { foreign: "foreign_value" };
-      if (own("build") !== deps.buildToken) return { foreign: "other_build" };
-      if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
-        return { foreign: "forged_holder" };
+      const wellFormed = desc.writable === false && desc.configurable === false && Object.isFrozen(holder);
+      if (own("build") !== deps.buildToken) {
+        return wellFormed && isBuildToken(own("build")) ? "other_build" : { foreign: "other_build" };
       }
+      if (!wellFormed) return { foreign: "forged_holder" };
       return "duplicate";
     } catch {
       return { foreign: "unreadable" };
@@ -3801,6 +3815,8 @@ function createServerPlugin(overrides = {}) {
       }
       if (holder === "free") {
         claimSentinel();
+      } else if (holder === "other_build") {
+        later(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, "server", "other_build"));
       } else if (holder !== "mine") {
         let configurable = false;
         try {
@@ -3836,6 +3852,7 @@ function createServerPlugin(overrides = {}) {
 }
 
 // packages/opencode/src/v2Enforce.ts
+import { isAbsolute as isAbsolute6, resolve as resolve2 } from "node:path";
 var V2_SHELL_TOOL = "shell";
 var V2_SUBAGENT_TOOL = "subagent";
 var V2_CODE_MODE_TOOL = "execute";
@@ -3859,8 +3876,200 @@ var MCP_LIST_TIMEOUT_MS = 1e3;
 var MCP_LIST_INTERVAL_MS = 1e4;
 var MAX_WARNED_SESSIONS = 1024;
 var MAX_PENDING_SHELLS = 256;
-var PENDING_SHELL_TTL_MS = 6e4;
+var MAX_INTERRUPTED_SESSIONS = 1024;
+var PENDING_SHELL_TTL_MS = 5e3;
+var MAX_SESSION_DIRS = 1024;
+var MAX_SEEN_EVENTS = 4096;
+var MAX_CODE_MODE_CALLS = 1024;
+var MAX_OPEN_INNER_CALLS = 256;
+function openCodeModeCall(scope, sessionID, callID) {
+  try {
+    if (sessionID === "" || callID === "") return callID;
+    const key = `${sessionID}\0${callID}`;
+    const entry = scope.codeMode.get(key) ?? { next: 0, open: [], overlapped: false };
+    scope.codeMode.delete(key);
+    scope.codeMode.set(key, entry);
+    while (scope.codeMode.size > MAX_CODE_MODE_CALLS) {
+      const oldest = scope.codeMode.keys().next().value;
+      if (oldest === void 0) break;
+      scope.codeMode.delete(oldest);
+    }
+    const id = entry.next === 0 ? callID : `${callID}#${entry.next}`;
+    entry.next += 1;
+    entry.open.push(id);
+    while (entry.open.length > MAX_OPEN_INNER_CALLS) entry.open.shift();
+    if (entry.open.length > 1) entry.overlapped = true;
+    return id;
+  } catch {
+    return callID;
+  }
+}
+function closeCodeModeCall(scope, sessionID, callID, numbered) {
+  try {
+    const open = scope.codeMode.get(`${sessionID}\0${callID}`)?.open;
+    const index = open?.indexOf(numbered) ?? -1;
+    if (open !== void 0 && index >= 0) open.splice(index, 1);
+  } catch {
+  }
+}
+function takeCodeModeResult(scope, sessionID, callID) {
+  try {
+    const entry = scope.codeMode.get(`${sessionID}\0${callID}`);
+    if (entry === void 0 || entry.open.length === 0) return void 0;
+    const concurrent = entry.overlapped || entry.open.length > 1;
+    const numbered = entry.open.shift();
+    if (entry.open.length === 0) entry.overlapped = false;
+    return numbered === void 0 ? void 0 : { callID: numbered, concurrent };
+  } catch {
+    return void 0;
+  }
+}
+function noteActivity(scope) {
+  try {
+    scope.onActivity?.();
+  } catch {
+  }
+}
+function createV2Scope(directories = /* @__PURE__ */ new Set()) {
+  return {
+    modelShells: [],
+    interrupted: /* @__PURE__ */ new Map(),
+    directories,
+    sessionDirs: /* @__PURE__ */ new Map(),
+    seenEvents: /* @__PURE__ */ new Set(),
+    seenHookInputs: /* @__PURE__ */ new Map(),
+    evaluateWithoutSource: false,
+    confirmedRoots: /* @__PURE__ */ new Set(),
+    onActivity: void 0,
+    codeMode: /* @__PURE__ */ new Map()
+  };
+}
+function noteRootSession(scope, sessionID) {
+  try {
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    scope.confirmedRoots.delete(sessionID);
+    scope.confirmedRoots.add(sessionID);
+    while (scope.confirmedRoots.size > MAX_CONFIRMED_ROOTS) {
+      const oldest = scope.confirmedRoots.values().next().value;
+      if (oldest === void 0) break;
+      scope.confirmedRoots.delete(oldest);
+    }
+  } catch {
+  }
+}
+function noteSessionDirectory(scope, sessionID, directory) {
+  try {
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    const key = directoryKey(directory);
+    if (key === void 0) return;
+    scope.sessionDirs.delete(sessionID);
+    scope.sessionDirs.set(sessionID, key);
+    while (scope.sessionDirs.size > MAX_SESSION_DIRS) {
+      const oldest = scope.sessionDirs.keys().next().value;
+      if (oldest === void 0) break;
+      scope.sessionDirs.delete(oldest);
+    }
+  } catch {
+  }
+}
+function claimHookInput(scope, hook, input) {
+  try {
+    if (input === null || typeof input !== "object") return true;
+    let seen = scope.seenHookInputs.get(hook);
+    if (seen === void 0) {
+      seen = /* @__PURE__ */ new WeakSet();
+      scope.seenHookInputs.set(hook, seen);
+    }
+    if (seen.has(input)) return false;
+    seen.add(input);
+    return true;
+  } catch {
+    return true;
+  }
+}
+function claimEvent(scope, ownDirectory, event) {
+  try {
+    const own = directoryKey(ownDirectory);
+    const data = readField6(event, "data");
+    const located = directoryKey(readString5(readField6(event, "location"), "directory")) ?? directoryKey(readString5(readField6(data, "location"), "directory"));
+    const owner = located ?? scope.sessionDirs.get(readString5(data, "sessionID"));
+    if (owner !== void 0 && owner !== own && scope.directories.has(owner)) return false;
+    const id = readString5(event, "id");
+    if (id === "") return true;
+    if (scope.seenEvents.has(id)) return false;
+    scope.seenEvents.add(id);
+    while (scope.seenEvents.size > MAX_SEEN_EVENTS) {
+      const oldest = scope.seenEvents.values().next().value;
+      if (oldest === void 0) break;
+      scope.seenEvents.delete(oldest);
+    }
+    return true;
+  } catch {
+    return true;
+  }
+}
+function noteInterrupted(scope, sessionID, at) {
+  try {
+    if (typeof sessionID !== "string" || sessionID === "") return;
+    scope.interrupted.delete(sessionID);
+    scope.interrupted.set(sessionID, at);
+    while (scope.interrupted.size > MAX_INTERRUPTED_SESSIONS) {
+      const oldest = scope.interrupted.keys().next().value;
+      if (oldest === void 0) break;
+      scope.interrupted.delete(oldest);
+    }
+    for (let i = scope.modelShells.length - 1; i >= 0; i -= 1) {
+      if (scope.modelShells[i]?.sessionID === sessionID) scope.modelShells.splice(i, 1);
+    }
+  } catch {
+  }
+}
+function disposeOne(registration) {
+  try {
+    const dispose = readField6(registration, "dispose");
+    if (typeof dispose !== "function") return;
+    void Promise.resolve(dispose.call(registration)).catch(() => void 0);
+  } catch {
+  }
+}
+function createV2Registrations() {
+  const kept = [];
+  let disposed = false;
+  return {
+    track(registration) {
+      try {
+        void Promise.resolve(registration).then(
+          (handle) => {
+            if (disposed) disposeOne(handle);
+            else kept.push(handle);
+          },
+          () => void 0
+        );
+      } catch {
+      }
+    },
+    dispose() {
+      disposed = true;
+      for (const handle of kept.splice(0, kept.length)) disposeOne(handle);
+    },
+    size: () => kept.length
+  };
+}
+function modelShellCwd(input, sessionID, directory, scope) {
+  try {
+    const workdir = readField6(input, "workdir");
+    if (typeof workdir === "string" && workdir !== "" && isAbsolute6(workdir)) return directoryKey(workdir) ?? "";
+    const base = scope.sessionDirs.get(sessionID) ?? (scope.directories.size > 1 ? void 0 : directoryKey(directory));
+    if (base === void 0) return "";
+    if (typeof workdir === "string" && workdir !== "") return directoryKey(resolve2(base, workdir)) ?? "";
+    return base;
+  } catch {
+    return "";
+  }
+}
 var APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
+var SUBAGENT_PROMPT_PREFIX = "You are a subagent spawned by another session.\n";
+var MAX_CONFIRMED_ROOTS = 1024;
 var PROMPT_BLOCK_TAIL = "(Unbound replaced the user's message because a policy blocked it; the original was not sent. Tell the user their message was blocked by Unbound policy and do nothing else.)";
 function readField6(value, key) {
   try {
@@ -3913,14 +4122,15 @@ function v2HostClient(ctx, directory) {
   };
 }
 async function listMcpNames(ctx, directory) {
+  const scoped = directory === "" ? void 0 : await listMcpNamesWith(ctx, { location: { directory } });
+  return scoped ?? await listMcpNamesWith(ctx, void 0);
+}
+async function listMcpNamesWith(ctx, input) {
   try {
     const mcp = ctx.mcp;
     const list = readField6(mcp, "list");
     if (typeof list !== "function") return void 0;
-    const answer = await list.call(
-      mcp,
-      directory === "" ? void 0 : { location: { directory } }
-    );
+    const answer = await list.call(mcp, input);
     const data = readField6(answer, "data");
     if (!Array.isArray(data)) return void 0;
     const names = [];
@@ -3934,32 +4144,36 @@ async function listMcpNames(ctx, directory) {
   }
 }
 function bounded(promise, ms) {
-  return new Promise((resolve2) => {
+  return new Promise((resolve3) => {
     let timer;
     try {
-      timer = setTimeout(() => resolve2(void 0), ms);
+      timer = setTimeout(() => resolve3(void 0), ms);
       timer.unref?.();
     } catch {
     }
     promise.then(
       (value) => {
         if (timer !== void 0) clearTimeout(timer);
-        resolve2(value);
+        resolve3(value);
       },
       () => {
         if (timer !== void 0) clearTimeout(timer);
-        resolve2(void 0);
+        resolve3(void 0);
       }
     );
   });
 }
+function permissionActionOf(tool) {
+  return tool === "write" ? "edit" : tool;
+}
 var NO_DECISION2 = Object.freeze({ message: void 0, kind: void 0 });
-function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABILITIES) {
+var NO_OUTCOME = Object.freeze({ raise: void 0, kind: void 0 });
+function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABILITIES, scope = createV2Scope(), registrations = createV2Registrations()) {
   try {
     const directory = readString5(readField6(ctx, "location"), "directory");
     const pending = /* @__PURE__ */ new Map();
     const warned = /* @__PURE__ */ new Set();
-    const modelShells = [];
+    const modelShells = scope.modelShells;
     let userShellSeq = 0;
     const nowSafe = () => {
       try {
@@ -3969,23 +4183,42 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
         return Date.now();
       }
     };
-    const markModelShell = (event) => {
+    const markModelShell = (event, kind, started) => {
       try {
         if (readString5(event, "tool") !== V2_SHELL_TOOL) return;
-        const command = readString5(readField6(event, "input"), "command");
+        const input = readField6(event, "input");
+        const command = readString5(input, "command");
         if (command === "") return;
-        modelShells.push([command, nowSafe()]);
+        const sessionID = readString5(event, "sessionID");
+        const interruptedAt = sessionID === "" ? void 0 : scope.interrupted.get(sessionID);
+        if (interruptedAt !== void 0 && interruptedAt >= started) return;
+        modelShells.push({
+          command,
+          cwd: modelShellCwd(input, sessionID, directory, scope),
+          at: nowSafe(),
+          sessionID,
+          denied: kind === "deny" || kind === "unavailable"
+        });
         while (modelShells.length > MAX_PENDING_SHELLS) modelShells.shift();
       } catch {
       }
     };
-    const takeModelShell = (command) => {
-      const now = nowSafe();
-      while (modelShells.length > 0 && now - (modelShells[0]?.[1] ?? now) > PENDING_SHELL_TTL_MS) modelShells.shift();
-      const index = modelShells.findIndex(([marked]) => marked === command);
-      if (index < 0) return false;
-      modelShells.splice(index, 1);
-      return true;
+    const takeModelShell = (command, cwdRaw, timeout) => {
+      try {
+        const now = nowSafe();
+        while (modelShells.length > 0 && now - (modelShells[0]?.at ?? now) > PENDING_SHELL_TTL_MS) modelShells.shift();
+        if (timeout === 0) return false;
+        const cwd = directoryKey(cwdRaw) ?? "";
+        const toolSpawn = typeof timeout === "number" && Number.isFinite(timeout) && timeout > 0;
+        const index = modelShells.findIndex(
+          (mark) => mark.command === command && (mark.cwd === "" || cwd === "" || mark.cwd === cwd) && (!mark.denied || toolSpawn)
+        );
+        if (index < 0) return false;
+        modelShells.splice(index, 1);
+        return true;
+      } catch {
+        return false;
+      }
     };
     const keyOf = (sessionID, callID) => `${sessionID}\0${callID}`;
     const remember2 = (key, call) => {
@@ -4015,31 +4248,35 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
         const tool2 = readString5(event, "tool");
         const sessionID = readString5(event, "sessionID");
         const callID = readString5(event, "id");
-        if (tool2 === "" || tool2 === V2_CODE_MODE_TOOL) return void 0;
+        if (tool2 === "" || tool2 === V2_CODE_MODE_TOOL) return NO_OUTCOME;
         const builtin = V2_BUILTIN_TOOLS.has(tool2);
-        if (!builtin && capabilities.mcp === "none") return void 0;
+        if (!builtin && capabilities.mcp === "none") return NO_OUTCOME;
         const rec = record();
         if (!builtin) await learnMcpNames(tool2, rec);
+        const numbered = builtin ? callID : openCodeModeCall(scope, sessionID, callID);
         const decision = decideBeforeVerdict(
-          { tool: v1ToolName(tool2), sessionID, callID },
+          { tool: v1ToolName(tool2), sessionID, callID: numbered },
           { args: readField6(event, "input") },
           { runtime, record: rec }
         ).catch(() => NO_DECISION2);
-        if (builtin && sessionID !== "" && callID !== "") remember2(keyOf(sessionID, callID), { decision, asked: false });
-        const { message } = await decision;
-        if (message === void 0) return void 0;
+        const correlatable = sessionID !== "" && callID !== "" && !scope.evaluateWithoutSource;
+        if (builtin && sessionID !== "" && callID !== "") {
+          remember2(keyOf(sessionID, callID), { decision, asked: false, action: permissionActionOf(tool2) });
+        }
+        const { message, kind } = await decision;
+        if (message === void 0) return { raise: void 0, kind };
         if (capabilities.tools === "audit") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool2, "tools");
-          return void 0;
+          return { raise: void 0, kind };
         }
-        if (builtin) return void 0;
+        if (builtin) return { raise: correlatable ? void 0 : message, kind };
         if (capabilities.mcp !== "enforce") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool2, "mcp");
-          return void 0;
+          return { raise: void 0, kind };
         }
-        return message;
+        return { raise: message, kind, numbered };
       } catch {
-        return void 0;
+        return NO_OUTCOME;
       }
     };
     const applyEvaluate = async (event) => {
@@ -4047,7 +4284,11 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
         const source = readField6(event, "source");
         const callID = readString5(source, "id");
         const sessionID = readString5(event, "sessionID");
-        if (callID === "" || sessionID === "") return;
+        if (callID === "") {
+          await applyUncorrelated(event, sessionID);
+          return;
+        }
+        if (sessionID === "") return;
         const call = pending.get(keyOf(sessionID, callID));
         if (call === void 0) return;
         const decision = await call.decision;
@@ -4075,6 +4316,33 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
       } catch {
       }
     };
+    const applyUncorrelated = async (event, sessionID) => {
+      try {
+        if (!scope.evaluateWithoutSource) {
+          scope.evaluateWithoutSource = true;
+          runtime.reportOnce(SIGNAL_INIT_DEGRADED, "permission.evaluate", "evaluate_no_source");
+        }
+        if (sessionID === "" || capabilities.tools === "audit") return;
+        if (readField6(event, "effect") === "deny") return;
+        const action = readString5(event, "action");
+        const prefix = `${sessionID}\0`;
+        const matched = [];
+        for (const [key, call] of pending) {
+          if (key.startsWith(prefix) && call.action === action) matched.push([key, call]);
+        }
+        let strictest2;
+        for (const [key, call] of matched) {
+          const decision = await call.decision;
+          if (decision.message === void 0) continue;
+          pending.delete(key);
+          if (strictest2 === void 0 || strictest2.kind === "confirm" && decision.kind !== "confirm") strictest2 = decision;
+        }
+        if (strictest2?.message === void 0) return;
+        event.effect = "deny";
+        event.message = strictest2.message;
+      } catch {
+      }
+    };
     const sessionInfo = async (sessionID) => {
       try {
         const session2 = ctx.session;
@@ -4095,7 +4363,18 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
         const prompt = readField6(event, "prompt");
         const text = readField6(prompt, "text");
         const info = await sessionInfo(sessionID);
-        if (info !== void 0) runtime.setParent(sessionID, readField6(info, "parentID"));
+        let root;
+        if (info !== void 0) {
+          runtime.setParent(sessionID, readField6(info, "parentID"));
+          noteSessionDirectory(scope, sessionID, readString5(readField6(info, "location"), "directory"));
+          root = !runtime.isChild(sessionID);
+        } else if (runtime.isChild(sessionID)) {
+          return;
+        } else if (typeof text === "string" && text.startsWith(SUBAGENT_PROMPT_PREFIX)) {
+          return;
+        } else {
+          root = sessionID !== "" && scope.confirmedRoots.has(sessionID);
+        }
         const model = readField6(info, "model");
         const providerID = readString5(model, "providerID");
         const modelID = readString5(model, "id");
@@ -4103,12 +4382,24 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
         const output = { parts: typeof text === "string" ? [{ type: "text", text }] : [] };
         const message = await decidePrompt(input, output, { runtime, record: record() });
         if (message === void 0) return;
+        if (!root) {
+          runtime.reportSignal(SIGNAL_V2_NOT_ENFORCING, "prompt", "parent_unknown");
+          return;
+        }
         if (capabilities.prompt === "block") {
-          const target = prompt;
-          target.text = promptBlockNotice(message);
-          if ("files" in target) target.files = [];
-          if ("agents" in target) target.agents = [];
-          if ("skills" in target) target.skills = [];
+          const notice = promptBlockNotice(message);
+          let replaced = false;
+          try {
+            const target = prompt;
+            target.text = notice;
+            if ("files" in target) target.files = [];
+            if ("agents" in target) target.agents = [];
+            if ("skills" in target) target.skills = [];
+            replaced = target.text === notice;
+          } catch {
+            replaced = false;
+          }
+          if (!replaced) runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, "prompt", "prompt_mutate_failed");
           return;
         }
         if (sessionID !== "" && !warned.has(sessionID)) {
@@ -4126,14 +4417,18 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
     const decideUserShell2 = async (event) => {
       try {
         const command = readString5(event, "command");
-        if (command === "" || takeModelShell(command)) return void 0;
+        if (command === "" || takeModelShell(command, readString5(event, "cwd"), readField6(event, "timeout"))) return void 0;
         userShellSeq += 1;
         const callID = `v2_${nowSafe().toString(36)}_${userShellSeq}`;
-        const message = await checkUserCommand(command, readString5(event, "cwd"), "", callID, {
+        const { message, kind } = await checkUserCommandVerdict(command, readString5(event, "cwd"), "", callID, {
           runtime,
           record: record()
         });
         if (message === void 0) return void 0;
+        if (kind === "unavailable") {
+          runtime.reportSignal(SIGNAL_USER_SHELL_UNCHECKED, "bash", "unavailable_not_applied");
+          return void 0;
+        }
         if (capabilities.userShell !== "enforce") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, "bash", "user_shell");
           return void 0;
@@ -4145,34 +4440,50 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
     };
     const tool = ctx.tool;
     if (tool !== void 0 && typeof tool.hook === "function") {
-      void Promise.resolve(
+      registrations.track(
         tool.hook("execute.before", async (event) => {
-          markModelShell(event);
-          const message = await decideToolCall(event).catch(() => void 0);
-          if (typeof message === "string" && message.length > 0) block(message);
+          if (!claimHookInput(scope, "tool.execute.before", event)) return;
+          noteActivity(scope);
+          const started = nowSafe();
+          const outcome = await decideToolCall(event).catch(() => NO_OUTCOME);
+          const message = outcome.raise;
+          if (typeof message === "string" && message.length > 0) {
+            if (outcome.numbered !== void 0) {
+              closeCodeModeCall(scope, readString5(event, "sessionID"), readString5(event, "id"), outcome.numbered);
+            }
+            block(message);
+          }
+          markModelShell(event, outcome.kind, started);
         })
-      ).catch(() => void 0);
+      );
     }
     const permission = ctx.permission;
     if (permission !== void 0 && typeof permission.hook === "function") {
-      void Promise.resolve(permission.hook("evaluate", (event) => applyEvaluate(event))).catch(
-        () => void 0
+      registrations.track(
+        permission.hook("evaluate", async (event) => {
+          if (claimHookInput(scope, "permission.evaluate", event)) await applyEvaluate(event);
+        })
       );
     }
     const session = ctx.session;
     if (session !== void 0 && typeof session.hook === "function") {
-      void Promise.resolve(session.hook("prompt", (event) => handlePrompt(event))).catch(
-        () => void 0
+      registrations.track(
+        session.hook("prompt", async (event) => {
+          if (!claimHookInput(scope, "session.prompt", event)) return;
+          noteActivity(scope);
+          await handlePrompt(event);
+        })
       );
     }
     const shell = ctx.shell;
     if (capabilities.userShell !== "none" && shell !== void 0 && typeof shell.hook === "function") {
-      void Promise.resolve(
+      registrations.track(
         shell.hook("create.before", async (event) => {
+          if (!claimHookInput(scope, "shell.create.before", event)) return;
           const message = await decideUserShell2(event).catch(() => void 0);
           if (typeof message === "string" && message.length > 0) block(message);
         })
-      ).catch(() => void 0);
+      );
     }
     return true;
   } catch {
@@ -4199,9 +4510,17 @@ function readString6(value, key) {
 function v2ProviderIdentity(provider) {
   try {
     if (typeof provider !== "string" || !PROVIDER_ID.test(provider)) return void 0;
-    return { provider, hasCredential: false, anthropicOAuth: false, authMode: provider };
+    return { provider, hasCredential: false, anthropicOAuth: false };
   } catch {
     return void 0;
+  }
+}
+function nowOf(runtime) {
+  try {
+    const value = runtime.deps.now();
+    return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+  } catch {
+    return Date.now();
   }
 }
 function remember(map, key, value) {
@@ -4219,7 +4538,7 @@ function modelOf2(model) {
   if (provider === "" || id === "") return void 0;
   return { provider, model: `${provider}/${id}` };
 }
-function registerV2Recording(ctx, runtime, recordFor) {
+function registerV2Recording(ctx, runtime, recordFor, scope = createV2Scope(), registrations = createV2Registrations()) {
   let controller;
   let stopped = false;
   const stop = () => {
@@ -4268,6 +4587,8 @@ function registerV2Recording(ctx, runtime, recordFor) {
             const dir = readString6(location, "directory") || readString6(eventLocation, "directory") || directory;
             const version = readField7(data, "version") ?? readField7(app, "version");
             const parentID = readField7(data, "parentID");
+            noteSessionDirectory(scope, sessionID, dir);
+            if (typeof parentID !== "string" || parentID === "") noteRootSession(scope, sessionID);
             noteModel(sessionID, readField7(data, "model"));
             emit("session.created", {
               sessionID,
@@ -4290,8 +4611,11 @@ function registerV2Recording(ctx, runtime, recordFor) {
             });
             return;
           }
-          case "session.execution.succeeded":
           case "session.execution.interrupted":
+            noteInterrupted(scope, sessionID, nowOf(runtime));
+            emit("session.idle", { sessionID });
+            return;
+          case "session.execution.succeeded":
           case "session.execution.failed":
             emit("session.idle", { sessionID });
             return;
@@ -4324,6 +4648,7 @@ function registerV2Recording(ctx, runtime, recordFor) {
     };
     const afterHandler = async (event) => {
       try {
+        if (!claimHookInput(scope, "tool.execute.after", event)) return;
         const tool2 = readString6(event, "tool");
         const sessionID = readString6(event, "sessionID");
         const id = readString6(event, "id");
@@ -4331,23 +4656,35 @@ function registerV2Recording(ctx, runtime, recordFor) {
         const name = v1ToolName(tool2);
         const status = readField7(event, "status");
         let callID = id;
+        let compare = true;
         if (!V2_BUILTIN_TOOLS.has(tool2)) {
-          const key = keyOf(sessionID, id);
-          const seen = afterCounts.get(key) ?? 0;
-          remember(afterCounts, key, seen + 1);
-          if (seen > 0) callID = `${id}#${seen}`;
+          const taken = takeCodeModeResult(scope, sessionID, id);
+          if (taken !== void 0) {
+            callID = taken.callID;
+            compare = !taken.concurrent;
+          } else {
+            const key = keyOf(sessionID, id);
+            const seen = afterCounts.get(key) ?? 0;
+            remember(afterCounts, key, seen + 1);
+            if (seen > 0) {
+              callID = `${id}#${seen}`;
+              compare = false;
+            }
+          }
         }
         if (status === "error") {
+          runtime.takeDigest(sessionID, callID);
           const error = readField7(readField7(event, "error"), "error");
           recordError(sessionID, callID, name, readString6(error, "reason") || readString6(error, "_tag"));
           return;
         }
-        if (callID !== id) {
+        if (!compare) {
+          runtime.takeDigest(sessionID, callID);
           recordResult(context(), sessionID, callID, name, false, outputParts(readField7(event, "result")));
           return;
         }
         await toolExecuteAfter(context())(
-          { tool: name, sessionID, callID: id, args: readField7(event, "input") },
+          { tool: name, sessionID, callID, args: readField7(event, "input") },
           { output: readField7(event, "result") }
         );
       } catch {
@@ -4355,6 +4692,7 @@ function registerV2Recording(ctx, runtime, recordFor) {
     };
     const modelRequest = async (event) => {
       try {
+        if (!claimHookInput(scope, "session.model.request", event)) return;
         const kind = readField7(event, "kind");
         if (kind !== void 0 && kind !== "primary") {
           runtime.startIdentity(readString6(readField7(event, "model"), "providerID") || void 0);
@@ -4366,11 +4704,11 @@ function registerV2Recording(ctx, runtime, recordFor) {
     };
     const tool = ctx.tool;
     if (tool !== void 0 && typeof tool.hook === "function") {
-      void Promise.resolve(tool.hook("execute.after", afterHandler)).catch(() => void 0);
+      registrations.track(tool.hook("execute.after", afterHandler));
     }
     const session = ctx.session;
     if (session !== void 0 && typeof session.hook === "function") {
-      void Promise.resolve(session.hook("model.request", modelRequest)).catch(() => void 0);
+      registrations.track(session.hook("model.request", modelRequest));
     }
     const events = ctx.event;
     if (events !== void 0 && typeof events.subscribe === "function") {
@@ -4380,7 +4718,7 @@ function registerV2Recording(ctx, runtime, recordFor) {
         try {
           for await (const event of iterable) {
             if (stopped) break;
-            onEvent(event);
+            if (claimEvent(scope, directory, event)) onEvent(event);
           }
         } catch {
         }
@@ -4408,10 +4746,11 @@ function v2StatusDetail(capabilities) {
     `shell:${capabilities.userShell}`
   ].join("/");
 }
+var V2_CONTEXT_KEYS = ["tool", "permission", "session", "event"];
 function isV2Context(ctx) {
   try {
     if (ctx === null || typeof ctx !== "object") return false;
-    return "tool" in ctx && "permission" in ctx || "session" in ctx;
+    return V2_CONTEXT_KEYS.every((key) => key in ctx);
   } catch {
     return false;
   }
@@ -4445,7 +4784,17 @@ function createSetupV2(overrides = {}) {
   function freshShared() {
     const { capabilities: _capabilities, sentinelKey: _sentinelKey, ...deps } = source;
     const handle = createRuntime({ ...deps, readAuth: (_dataDir, provider) => v2ProviderIdentity(provider) });
-    return { handle, capabilities, directories: /* @__PURE__ */ new Set(), statusReported: false };
+    const directories = /* @__PURE__ */ new Set();
+    const shared = {
+      handle,
+      capabilities,
+      directories,
+      statusReported: false,
+      statusPending: false,
+      scope: createV2Scope(directories)
+    };
+    shared.scope.onActivity = () => reportStatus(shared);
+    return shared;
   }
   function claim(shared) {
     try {
@@ -4481,6 +4830,11 @@ function createSetupV2(overrides = {}) {
         if (holder === null || typeof holder !== "object" || own("module") !== SETUP_SENTINEL_KEY) {
           foreign = "foreign_value";
         } else if (own("build") !== buildToken) {
+          const wellFormed = desc.writable === false && desc.configurable === false && Object.isFrozen(holder);
+          if (wellFormed && isBuildToken(own("build"))) {
+            if (local === void 0) local = freshShared();
+            return { shared: local, otherBuild: true };
+          }
           foreign = "other_build";
         } else if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
           foreign = "forged_holder";
@@ -4498,11 +4852,14 @@ function createSetupV2(overrides = {}) {
     return { shared: local, tampered: foreign };
   }
   function reportStatus(shared) {
-    if (shared.statusReported) return;
-    shared.statusReported = true;
+    if (shared.statusReported || shared.statusPending) return;
+    shared.statusPending = true;
     const runtime = shared.handle.runtime;
     const detail = v2StatusDetail(shared.capabilities);
     later2(() => {
+      shared.statusPending = false;
+      if (shared.statusReported || runtime.init().signals === void 0) return;
+      shared.statusReported = true;
       runtime.reportOnce(SIGNAL_V2_STATUS, SETUP_TOOL_LABEL, detail);
       if (shared.capabilities.tools === "audit") runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, SETUP_TOOL_LABEL, "tools");
     });
@@ -4510,10 +4867,11 @@ function createSetupV2(overrides = {}) {
   return (ctx) => {
     try {
       if (!isV2Context(ctx)) return Promise.resolve(void 0);
-      const { shared, tampered } = acquire();
+      const { shared, tampered, otherBuild } = acquire();
       const handle = shared.handle;
       const runtime = handle.runtime;
       if (tampered !== void 0) later2(() => runtime.reportOnce(SIGNAL_SENTINEL_TAMPERED, SETUP_TOOL_LABEL, tampered));
+      if (otherBuild === true) later2(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, SETUP_TOOL_LABEL, "other_build"));
       const v2 = ctx;
       const rawDirectory = readField8(readField8(v2, "location"), "directory");
       const directory = typeof rawDirectory === "string" ? rawDirectory : "";
@@ -4525,19 +4883,27 @@ function createSetupV2(overrides = {}) {
       shared.directories.add(key);
       reportStatus(shared);
       let stopRecording;
+      const registrations = createV2Registrations();
       try {
         const client = v2HostClient(v2, directory);
         handle.recordFor(directory, client, []);
         const recordFor = (dir) => handle.recordFor(dir, client);
-        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities);
-        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor) : void 0;
+        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities, shared.scope, registrations);
+        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor, shared.scope, registrations) : void 0;
         if (stopRecording === void 0) {
           later2(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
         }
       } catch {
         later2(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
       }
+      let cleaned = false;
       const cleanup = async () => {
+        if (cleaned) return;
+        cleaned = true;
+        try {
+          registrations.dispose();
+        } catch {
+        }
         try {
           stopRecording?.();
           shared.directories.delete(key);
