@@ -4838,7 +4838,8 @@ def _skill_content_hash(skill_path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[str]:
+def _resolve_skill_path(skill: Optional[str], cwd: Optional[str],
+                        transcript_path: Optional[str] = None) -> Optional[str]:
     """Absolute path of the invoked skill's SKILL.md. The tool call carries only
     the skill name, so map it back on device — the backend joins this against
     the skills discovery already reported. None when it can't be resolved."""
@@ -4851,9 +4852,9 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
             return None
 
         # A Cowork run loads skills from Claude Desktop's own tree, never from Claude Code's dirs.
-        session = _desktop_session_dir({'cwd': cwd}) if cwd else None
+        session = _desktop_session_dir({'cwd': cwd, 'transcript_path': transcript_path})
         if session is not None:
-            return _cowork_skill_path(name, session)
+            return _cowork_skill_path(prefix, name, session)
 
         # Plugin skills ("<plugin>:<name>") live outside the project tree.
         if prefix and '/' not in prefix:
@@ -4913,15 +4914,29 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
 
 
-def _cowork_skill_path(name: str, session: Path) -> Optional[str]:
-    """The SKILL.md a Cowork run used: the newest copy in its org's plugins or the
-    skills bundle, which is the copy the discovery scanner reports for the name."""
-    root = session.parent.parent.parent
-    candidates = list(session.parent.glob('rpm/**/skills/%s/SKILL.md' % name))
-    candidates += list((root / 'skills-plugin').glob('**/skills/%s/SKILL.md' % name))
-    if not candidates:
+COWORK_BUNDLED_SKILLS_PREFIX = 'anthropic-skills'
+
+
+def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
+    """The SKILL.md a Cowork run used: the session's own copy, else the newest version
+    from the one source shipping the name — the bundle for anthropic-skills, an org
+    plugin for any other prefix. Two sources with the name is ambiguous: None."""
+    own = session / '.claude' / 'skills' / name / 'SKILL.md'
+    if own.is_file():
+        return str(own)
+    sources = {}
+    if prefix in ('', COWORK_BUNDLED_SKILLS_PREFIX):
+        root = session.parent.parent.parent
+        for path in (root / 'skills-plugin').glob('**/skills/%s/SKILL.md' % name):
+            sources.setdefault('bundle', []).append(path)
+    if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
+        rpm = session.parent / 'rpm'
+        for path in rpm.glob('*/**/skills/%s/SKILL.md' % name):
+            sources.setdefault(path.relative_to(rpm).parts[0], []).append(path)
+    if len(sources) != 1:
         return None
-    return str(max(candidates, key=lambda c: (c.stat().st_mtime, str(c))))
+    (copies,) = sources.values()
+    return str(max(copies, key=lambda c: (c.stat().st_mtime, str(c))))
 
 
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
@@ -4992,7 +5007,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 skill = tool_input.get('skill')
                 tool_use_entry['skill_name'] = skill
                 skill_path = _resolve_skill_path(
-                    skill, event.get('cwd') or prompt_cwd or cwd)
+                    skill, event.get('cwd') or prompt_cwd or cwd, event.get('transcript_path'))
                 if skill_path:
                     tool_use_entry['skill_path'] = skill_path
                     tool_use_entry['content_hash'] = _skill_content_hash(skill_path)

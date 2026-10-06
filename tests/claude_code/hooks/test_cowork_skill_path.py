@@ -43,12 +43,12 @@ class _CoworkTree(unittest.TestCase):
     def bundle(self, bundle, name, text="# bundled", age=0):
         return _write(self.root / "skills-plugin" / bundle / "v" / "skills" / name / "SKILL.md", text, age)
 
-    def plugin(self, name, text="# plugin", org=None, age=0):
+    def plugin(self, name, text="# plugin", org=None, age=0, plugin="plugin_01"):
         base = org or self.org
-        return _write(base / "rpm" / "plugin_01" / "skills" / name / "SKILL.md", text, age)
+        return _write(base / "rpm" / plugin / "skills" / name / "SKILL.md", text, age)
 
-    def resolve(self, skill, cwd=None):
-        return unbound._resolve_skill_path(skill, str(cwd or self.cwd))
+    def resolve(self, skill, cwd=None, transcript_path=None):
+        return unbound._resolve_skill_path(skill, str(cwd or self.cwd), transcript_path)
 
 
 class TestCoworkSkillResolution(_CoworkTree):
@@ -83,6 +83,46 @@ class TestCoworkSkillResolution(_CoworkTree):
             self.assertIsNone(self.resolve("xlsx"))
             cowork_copy = self.bundle("b1", "xlsx")
             self.assertEqual(self.resolve("xlsx"), str(cowork_copy))
+
+
+class TestCoworkSkillIdentity(_CoworkTree):
+    """The prefix names the skill's source; a run is never tied to a different skill
+    that merely shares its name."""
+
+    def test_bundled_prefix_ignores_a_newer_org_plugin_of_the_same_name(self):
+        bundled = self.bundle("b1", "xlsx", age=3600)
+        self.plugin("xlsx")
+        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(bundled))
+
+    def test_plugin_prefix_ignores_the_bundle(self):
+        self.bundle("b1", "review")
+        plugin = self.plugin("review", age=3600)
+        self.assertEqual(self.resolve("gtm-skills:review"), str(plugin))
+
+    def test_two_org_plugins_sharing_a_name_resolve_nothing(self):
+        self.plugin("review", plugin="plugin_01")
+        self.plugin("review", plugin="plugin_02")
+        self.assertIsNone(self.resolve("gtm-skills:review"))
+
+    def test_bare_name_in_bundle_and_plugin_resolves_nothing(self):
+        self.bundle("b1", "review")
+        self.plugin("review")
+        self.assertIsNone(self.resolve("review"))
+
+    def test_the_sessions_own_copy_wins(self):
+        self.bundle("b1", "xlsx")
+        own = _write(self.cwd.parent / ".claude" / "skills" / "xlsx" / "SKILL.md", "# mine", age=3600)
+        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(own))
+
+    def test_session_found_from_the_transcript_when_cwd_is_elsewhere(self):
+        skill = self.bundle("b1", "xlsx")
+        elsewhere = Path(self._tmp.name) / "picked-folder"
+        elsewhere.mkdir()
+        transcript = self.cwd.parent / ".claude" / "projects" / "p" / "s1.jsonl"
+        _write(transcript, "{}")
+        self.assertEqual(
+            self.resolve("anthropic-skills:xlsx", cwd=elsewhere, transcript_path=str(transcript)),
+            str(skill))
 
 
 class TestCoworkSkillRunCarriesPathAndHash(_CoworkTree):
