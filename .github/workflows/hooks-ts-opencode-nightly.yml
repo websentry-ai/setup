@@ -18,7 +18,9 @@ name: hooks-ts-opencode-nightly
 #   import-smoke  Node 22, Node 26 and Bun import the committed bundle: export shape, every hook
 #                 total on garbage, a mock deny blocks bash, setup resolves.
 #   loader-v1     opencode-ai@latest (v1 line, the enforcing `server` entry): the headless recipe
-#                 (serve + POST /session) must yield the plugin's session_start heartbeat.
+#                 (serve + POST /session) must yield the plugin's session_start heartbeat, and a
+#                 model-free REAL block must hold: `POST /session/:id/shell` with a command the mock
+#                 denies must reach the mock as a bash tool_use and must not run (no marker file).
 #   loader-v2     @opencode/cli@latest (v2 line): the bundle loads and its inactive `setup` reports
 #                 api_family_inactive. Informational until Phase 14 (which owns v2 enforcement).
 #   types-v1      the adapter's hand-written host types against @opencode-ai/plugin@latest.

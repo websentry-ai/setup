@@ -21,6 +21,9 @@
 //      "opencode"` and a non-empty `pre_tool_use_data.metadata.opencode_version` (the plugin's heartbeat), AND no
 //      `failed to load plugin` line names unbound.js. The v1 host must NOT produce an
 //      `api_family_inactive` report (its embedded v2 core host's `setup` call must stay inert).
+//      Then a REAL, model-free block: `POST /session/:id/shell` runs a user shell command that the
+//      mock denies (every tool_use is denied); pass = the mock saw the `bash` tool_use with that
+//      command AND the command's marker file was never created (13-REVIEW WR-07, spike V1-7).
 //   v2 (@opencode/cli 2.x): an authenticated `GET /api/agent?directory=<proj>` (basic auth with a
 //      random per-run `OPENCODE_SERVER_PASSWORD`, never printed) makes the CLI load plugins and
 //      call `setup(ctx)`; it never calls `server`. Pass = the
@@ -310,6 +313,28 @@ async function waitFor(predicate, label, ms) {
   return undefined;
 }
 
+/** Like `httpOk`, but also returns the parsed JSON body (`undefined` when it is not JSON). */
+async function httpJson(method, path, body) {
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}${path}`, {
+      method,
+      headers: body === undefined ? {} : { "content-type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body),
+      signal: AbortSignal.timeout(30_000),
+    });
+    const text = await res.text();
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = undefined;
+    }
+    return { status: res.status, json };
+  } catch {
+    return { status: undefined, json: undefined };
+  }
+}
+
 async function httpOk(method, path, body, extraHeaders = {}) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
@@ -359,9 +384,13 @@ if (args.line === "v1") {
   );
 
   // 2. A session for the project directory: session.created reaches the plugin's `event`.
-  const created = await httpOk("POST", `/session?directory=${encodeURIComponent(projectDir)}`, {});
+  const dirQuery = `directory=${encodeURIComponent(projectDir)}`;
+  const createdRes = await httpJson("POST", `/session?${dirQuery}`, {});
+  const created = createdRes.status;
   console.log(`POST /session -> ${created}`);
   if (created !== 200) await fail(`POST /session answered ${created}`);
+  const sessionID = typeof createdRes.json?.id === "string" ? createdRes.json.id : undefined;
+  if (sessionID === undefined) await fail("POST /session returned no session id");
 
   const heartbeat = await waitFor(
     () =>
@@ -376,6 +405,36 @@ if (args.line === "v1") {
     "the plugin's session_start heartbeat at the mock",
     budget(),
   );
+  // 3. A REAL block on the real host, with no model (13-REVIEW WR-07; spike V1-7). The user-shell
+  //    route `POST /session/:id/shell` publishes the bash part, then fires `shell.env`, where the
+  //    plugin checks the command; the mock denies every tool_use (the repo mock's `denyTools`
+  //    behaviour), so the plugin must throw and opencode must not spawn the command. The model ref
+  //    is only stamped on the messages; no provider is called. Pass = the mock saw a tool_use for
+  //    `bash` with exactly this command AND the marker file does not exist.
+  const marker = join(projectDir, "ran.txt");
+  const shellCommand = `echo smoke > ${marker}`;
+  const shellRes = await httpJson("POST", `/session/${encodeURIComponent(sessionID)}/shell?${dirQuery}`, {
+    agent: "build",
+    model: { providerID: "smoke", modelID: "smoke" },
+    command: shellCommand,
+  });
+  console.log(`POST /session/:id/shell -> ${shellRes.status} (a blocked user shell answers a generic 500)`);
+  const denied = await waitFor(
+    () =>
+      requests.find(
+        (r) =>
+          r.path === "/v1/hooks/pretool" &&
+          r.body?.event_name === "tool_use" &&
+          r.body?.pre_tool_use_data?.tool_name === "bash" &&
+          r.body?.pre_tool_use_data?.command === shellCommand,
+      ),
+    "the plugin's tool_use check of the user shell command at the mock",
+    budget(),
+  );
+  // The spawn would have happened by now; give a slow host a moment before asserting the absence.
+  await sleep(1_500);
+  if (existsSync(marker)) await fail(`the denied user shell command ran: ${marker} exists`);
+
   // Give a deferred (wrong) v2 report a moment to show up before asserting its absence.
   await sleep(1_000);
   const failures = loadFailures();
@@ -387,6 +446,9 @@ if (args.line === "v1") {
   console.log(
     `heartbeat: event_name=${heartbeat.body.event_name} unbound_app_label=${heartbeat.body.unbound_app_label} ` +
       `opencode_version=${heartbeat.body.pre_tool_use_data.metadata.opencode_version} client_entrypoint=${heartbeat.body.client_entrypoint}`,
+  );
+  console.log(
+    `real block: tool_use tool_name=${denied.body.pre_tool_use_data.tool_name} denied by the mock; ${marker} was not created`,
   );
   console.log(`mock requests: ${JSON.stringify(summarizeRequests())}`);
   console.log(`no "failed to load plugin" line names unbound.js; no api_family_inactive report`);
