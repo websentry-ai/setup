@@ -7,6 +7,7 @@ import { startMockApi } from "../../../core/test/helpers/mockApi.ts";
 import type { CapturedRequest, MockApi, MockMode } from "../../../core/test/helpers/mockApi.ts";
 import { TEST_KEY } from "../../../core/test/helpers/testKey.ts";
 import { createScopedStates } from "../../../core/src/scopedState.ts";
+import { createModuleToken } from "../../src/plugin.ts";
 import type { Deps } from "../../src/plugin.ts";
 
 export { TEST_KEY };
@@ -92,7 +93,7 @@ export function makeDeps(
     scopes: createScopedStates(),
     timeouts: { pretoolMs: 2000, errorsMs: 2000, turnLogMs: 2000 },
     sentinelKey,
-    moduleToken: {},
+    moduleToken: createModuleToken(),
     // No real serial probe in tests: an unknown platform probes nothing and settles at once.
     identity: { platform: "unbound-test" },
     ...rest,
@@ -102,7 +103,13 @@ export function makeDeps(
     homeDir: home.homeDir,
     cleanup() {
       home.cleanup();
-      delete (globalThis as Record<symbol, unknown>)[sentinelKey];
+      // A claimed slot is non-configurable (WR-04) and cannot be deleted; its key is private to
+      // this test, so leaving it is harmless.
+      try {
+        delete (globalThis as Record<symbol, unknown>)[sentinelKey];
+      } catch {
+        // Non-configurable.
+      }
     },
   };
 }

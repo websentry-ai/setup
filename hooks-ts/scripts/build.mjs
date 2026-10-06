@@ -13,16 +13,45 @@
 //
 // The option set is the same for every target; only the entry, the output path and the banner come
 // from the table.
+//
+// `__UNBOUND_OPENCODE_BUILD__` is defined for every target as a content hash of the sources the
+// bundle is built from (`packages/core/src` + `packages/<name>/src`): deterministic, so a rebuild
+// of unchanged sources is byte-identical, and different for any source change. The opencode double-
+// load sentinel uses it to tell another copy of the same build from a value a foreign plugin planted
+// (13-REVIEW WR-04). A target whose sources never name it is unaffected.
 import * as esbuild from "esbuild";
+import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 
 import { META_DIR, TARGETS, distFileOf, metaFileOf } from "./targets.mjs";
+
+/** Every `.ts` file under `dir` (relative to hooks-ts/), sorted, as `/`-joined relative paths. */
+function filesUnder(dir) {
+  const out = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = `${dir}/${entry.name}`;
+    if (entry.isDirectory()) out.push(...filesUnder(path));
+    else if (entry.isFile() && entry.name.endsWith(".ts")) out.push(path);
+  }
+  return out.sort();
+}
+
+/** sha256 over (path, content) of the target's sources; the first 32 hex characters. */
+function buildTokenOf(target) {
+  const hash = createHash("sha256");
+  for (const file of [...filesUnder("packages/core/src"), ...filesUnder(`packages/${target.name}/src`)]) {
+    hash.update(file).update("\0").update(readFileSync(file)).update("\0");
+  }
+  return hash.digest("hex").slice(0, 32);
+}
 
 let failed = false;
 
 for (const target of TARGETS) {
   try {
     const result = await esbuild.build({
+      define: { __UNBOUND_OPENCODE_BUILD__: JSON.stringify(buildTokenOf(target)) },
       entryPoints: [target.entry],
       bundle: true,
       platform: "node",

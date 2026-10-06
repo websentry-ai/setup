@@ -15,10 +15,14 @@
 //     allows everything and reports `init_degraded` — server-visible, never a silent empty load.
 //   * **One copy per process.** `plugin/` and `plugins/` can both hold a copy (Pitfall 15). The
 //     sentinel `globalThis[Symbol.for("unbound.opencode")]` holds the MODULE token of the first copy
-//     to load; a second copy gets `{}` and reports `duplicate_load`. The same copy serving another
-//     directory is not a duplicate: opencode calls `server()` once per project directory while the
-//     module is evaluated once (13-SPIKES.md V1-9), so the sentinel keys on the module, never on a
-//     call count.
+//     to load, defined non-writable / non-configurable / non-enumerable; a second copy of the SAME
+//     build gets `{}` and reports `duplicate_load`. The same copy serving another directory is not a
+//     duplicate: opencode calls `server()` once per project directory while the module is evaluated
+//     once (13-SPIKES.md V1-9), so the sentinel keys on the module, never on a call count. Anything
+//     else found in the slot (a project plugin can plant one) never disables this copy: it keeps
+//     enforcing and reports `sentinel_tampered` (13-REVIEW WR-04). v2 re-evaluates the module per
+//     directory (14-SPIKES.md V2-12) but never calls `server()`, so this sentinel is v1-only; a v2
+//     guard must not key on a per-evaluation token.
 //   * **State is scoped, never process-global.** One opencode process serves several projects.
 //     Policy memory and the revoked-key latch come from core's `createScopedStates()` (per gateway
 //     URL + key fingerprint, 12-REVIEW.md WR-03), the breaker from `createBreakerRegistry().forUrl`,
@@ -67,6 +71,7 @@ import {
   SENTINEL_KEY,
   SIGNAL_DUPLICATE_LOAD,
   SIGNAL_INIT_DEGRADED,
+  SIGNAL_SENTINEL_TAMPERED,
   UNKNOWN_ENTRYPOINT,
 } from "./constants.ts";
 import type { HooksLike, ServerFactory } from "./hostTypes.ts";
@@ -75,8 +80,22 @@ import { OPENCODE_PROFILE, resolveOpencodeDataDir } from "./profile.ts";
 import { eventHandler, toolExecuteAfter } from "./record.ts";
 import { shellEnv } from "./userShell.ts";
 
+// The build's own token: a content hash of the bundle's sources, injected by `scripts/build.mjs`
+// (esbuild `define`). Unbuilt source (tests) gets `"source"`. It is not a secret: it only means that
+// a foreign plugin has to read the installed bundle to forge a holder (13-REVIEW WR-04).
+declare const __UNBOUND_OPENCODE_BUILD__: string | undefined;
+export const BUILD_TOKEN: string =
+  typeof __UNBOUND_OPENCODE_BUILD__ === "string" && __UNBOUND_OPENCODE_BUILD__ !== ""
+    ? __UNBOUND_OPENCODE_BUILD__
+    : "source";
+
+/** A copy's sentinel holder: frozen, branded with the module key and the build token. */
+export function createModuleToken(buildToken: string = BUILD_TOKEN): object {
+  return Object.freeze({ module: SENTINEL_KEY, build: buildToken });
+}
+
 /** The token of THIS module copy. A second evaluated copy of the bundle has a different one. */
-const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
+const MODULE_TOKEN: object = createModuleToken();
 
 /** The most MCP server names kept per directory. A real config has a handful. */
 const MAX_MCP_SERVER_NAMES = 1024;
@@ -117,8 +136,10 @@ export interface Deps {
   identity?: Partial<Omit<AccountIdentityLoaderOptions, "agentDir" | "readAuth">>;
   /** The `globalThis` slot of the double-load sentinel. Default `Symbol.for(SENTINEL_KEY)`. */
   sentinelKey: symbol;
-  /** This copy's identity in that slot. Default: the module token. */
+  /** This copy's identity in that slot. Default: the module token (`createModuleToken()`). */
   moduleToken: object;
+  /** The build token a genuine holder must carry. Default: `BUILD_TOKEN`. */
+  buildToken: string;
 }
 
 /**
@@ -438,6 +459,7 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     ...(source.signalIntervalMs === undefined ? {} : { signalIntervalMs: source.signalIntervalMs }),
     sentinelKey: typeof source.sentinelKey === "symbol" ? source.sentinelKey : Symbol.for(SENTINEL_KEY),
     moduleToken: source.moduleToken ?? MODULE_TOKEN,
+    buildToken: typeof source.buildToken === "string" && source.buildToken !== "" ? source.buildToken : BUILD_TOKEN,
   });
 
   const breakers = createBreakerRegistry({ now: deps.now });
@@ -958,15 +980,75 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     };
   }
 
+  /** Define the sentinel slot as this copy's: non-writable, non-configurable, non-enumerable. */
+  function claimSentinel(): boolean {
+    try {
+      Object.defineProperty(globalThis, deps.sentinelKey, {
+        value: deps.moduleToken,
+        writable: false,
+        configurable: false,
+        enumerable: false,
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Who holds the sentinel slot (13-REVIEW WR-04). Only `"duplicate"` makes this copy stand down,
+   * and only a holder that looks exactly like another copy of THIS build can produce it: a data
+   * property that is non-writable and non-configurable, holding a frozen object whose own `module`
+   * is the sentinel key and whose own `build` is this build's token. Anything else in the slot (a
+   * value a project plugin planted, an accessor, another build) is `"foreign"`: this copy keeps
+   * enforcing and reports `sentinel_tampered`. Getters are never invoked.
+   */
+  function sentinelHolder(): "free" | "mine" | "duplicate" | { foreign: string } {
+    try {
+      const desc = Object.getOwnPropertyDescriptor(globalThis, deps.sentinelKey);
+      if (desc === undefined) return "free";
+      if (!("value" in desc)) return { foreign: "accessor" };
+      const holder: unknown = desc.value;
+      if (holder === deps.moduleToken) return "mine";
+      if (holder === null || typeof holder !== "object") return { foreign: "foreign_value" };
+      const own = (key: string): unknown => {
+        const d = Object.getOwnPropertyDescriptor(holder, key);
+        return d !== undefined && "value" in d ? d.value : undefined;
+      };
+      if (own("module") !== SENTINEL_KEY) return { foreign: "foreign_value" };
+      if (own("build") !== deps.buildToken) return { foreign: "other_build" };
+      if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
+        return { foreign: "forged_holder" };
+      }
+      return "duplicate";
+    } catch {
+      // A holder whose traps raise (a planted Proxy) must not push this copy into the degraded set.
+      return { foreign: "unreadable" };
+    }
+  }
+
   const factory = (input: unknown, _options?: unknown): Promise<HooksLike> => {
     try {
-      const slot = globalThis as unknown as Record<symbol, unknown>;
-      const holder = slot[deps.sentinelKey];
-      if (holder !== undefined && holder !== deps.moduleToken) {
+      const holder = sentinelHolder();
+      if (holder === "duplicate") {
         later(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, "server", "second_copy"));
         return Promise.resolve({});
       }
-      if (holder === undefined) slot[deps.sentinelKey] = deps.moduleToken;
+      if (holder === "free") {
+        claimSentinel();
+      } else if (holder !== "mine") {
+        // Not another copy of this build: never a reason to stand down. Take the slot back when it
+        // can be taken (so later directories and copies see this copy), and keep enforcing either way.
+        let configurable = false;
+        try {
+          configurable = Object.getOwnPropertyDescriptor(globalThis, deps.sentinelKey)?.configurable === true;
+        } catch {
+          // Leave the slot alone.
+        }
+        if (configurable) claimSentinel();
+        const detail = holder.foreign;
+        later(() => runtime.reportOnce(SIGNAL_SENTINEL_TAMPERED, "server", detail));
+      }
 
       // Deliberately NOT read behind a guard: a host input whose getters raise is a broken host, and
       // the catch below turns it into the degraded, reporting set rather than a silently empty one.

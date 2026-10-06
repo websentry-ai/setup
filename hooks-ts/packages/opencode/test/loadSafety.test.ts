@@ -15,12 +15,13 @@ import { after, before, test } from "node:test";
 
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
-import { createServerPlugin } from "../src/plugin.ts";
+import { createModuleToken, createServerPlugin } from "../src/plugin.ts";
 import { createSetupV2 } from "../src/v2.ts";
 import {
   SIGNAL_API_FAMILY_INACTIVE,
   SIGNAL_DUPLICATE_LOAD,
   SIGNAL_INIT_DEGRADED,
+  SIGNAL_SENTINEL_TAMPERED,
 } from "../src/constants.ts";
 import {
   makeDeps,
@@ -188,8 +189,8 @@ test("a second module copy on the same sentinel gets {} and reports duplicate_lo
   resetMock();
   const t = makeDeps(mock);
   try {
-    const first = createServerPlugin({ ...t.deps, moduleToken: {} });
-    const second = createServerPlugin({ ...t.deps, moduleToken: {} });
+    const first = createServerPlugin({ ...t.deps, moduleToken: createModuleToken() });
+    const second = createServerPlugin({ ...t.deps, moduleToken: createModuleToken() });
     const a = hooksOf(await first(makeFakeInput({ directory: "/repo" }).input));
     assert.equal(typeof a.config, "function");
     const b = await second(makeFakeInput({ directory: "/repo" }).input);
@@ -198,6 +199,106 @@ test("a second module copy on the same sentinel gets {} and reports duplicate_lo
     assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length >= 1));
     await tick();
     assert.equal(signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length, 1);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("the claimed sentinel slot is non-writable, non-configurable and non-enumerable (WR-04)", async () => {
+  resetMock();
+  const t = makeDeps(mock);
+  try {
+    const token = createModuleToken();
+    await createServerPlugin({ ...t.deps, moduleToken: token })(makeFakeInput({ directory: "/repo" }).input);
+    const key = t.deps.sentinelKey as symbol;
+    const desc = Object.getOwnPropertyDescriptor(globalThis, key);
+    assert.equal(desc?.value, token);
+    assert.equal(desc?.writable, false);
+    assert.equal(desc?.configurable, false);
+    assert.equal(desc?.enumerable, false);
+    assert.throws(() => {
+      (globalThis as Record<symbol, unknown>)[key] = {};
+    }, TypeError);
+    assert.equal(Object.getOwnPropertyDescriptor(globalThis, key)?.value, token, "a later overwrite fails");
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("a value a foreign plugin planted in the slot never disables enforcement; sentinel_tampered (WR-04)", async () => {
+  const key = (): symbol => Symbol("unbound.opencode.tamper");
+  const planted: Array<[string, (k: symbol) => void]> = [
+    ["plain object", (k) => void ((globalThis as Record<symbol, unknown>)[k] = { module: "unbound.opencode" })],
+    ["true", (k) => void ((globalThis as Record<symbol, unknown>)[k] = true)],
+    [
+      "frozen non-configurable, wrong build",
+      (k) =>
+        Object.defineProperty(globalThis, k, {
+          value: Object.freeze({ module: "unbound.opencode", build: "guess" }),
+          writable: false,
+          configurable: false,
+        }),
+    ],
+    [
+      "right build but writable",
+      (k) => void ((globalThis as Record<symbol, unknown>)[k] = Object.freeze({ module: "unbound.opencode", build: "source" })),
+    ],
+    ["accessor", (k) => Object.defineProperty(globalThis, k, { get: () => ({}), configurable: true })],
+    [
+      "raising proxy",
+      (k) =>
+        Object.defineProperty(globalThis, k, {
+          value: new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error("trap"); } }),
+          writable: false,
+          configurable: false,
+        }),
+    ],
+  ];
+  for (const [label, plant] of planted) {
+    resetMock();
+    mock.setMode("deny");
+    const sentinelKey = key();
+    plant(sentinelKey);
+    const t = makeDeps(mock, { sentinelKey });
+    try {
+      const server = createServerPlugin(t.deps);
+      const hooks = hooksOf(await server(makeFakeInput({ directory: "/repo" }).input));
+      assert.equal(typeof hooks["tool.execute.before"], "function", `${label}: full hook set`);
+      assert.equal(typeof hooks.config, "function", `${label}: not the degraded set`);
+      await assert.rejects(
+        hooks["tool.execute.before"]?.({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "cat .env" } }) ??
+          Promise.resolve(),
+        /Blocked by Unbound policy/,
+        `${label}: still enforcing`,
+      );
+      // A second directory on the same copy still enforces too.
+      const other = hooksOf(await server(makeFakeInput({ directory: "/other" }).input));
+      assert.equal(typeof other.config, "function", `${label}: second directory enforces`);
+      assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_SENTINEL_TAMPERED).length === 1), `${label}: reported`);
+      await tick();
+      assert.equal(signalsOf(mock, SIGNAL_SENTINEL_TAMPERED).length, 1, `${label}: once`);
+      assert.equal(signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length, 0, `${label}: not a duplicate`);
+    } finally {
+      t.cleanup();
+    }
+  }
+});
+
+test("a configurable planted value is taken back, so a later copy of this build stands down (WR-04)", async () => {
+  resetMock();
+  const sentinelKey = Symbol("unbound.opencode.reclaim");
+  (globalThis as Record<symbol, unknown>)[sentinelKey] = { evil: true };
+  const t = makeDeps(mock, { sentinelKey });
+  try {
+    const mine = createModuleToken();
+    await createServerPlugin({ ...t.deps, moduleToken: mine })(makeFakeInput({ directory: "/repo" }).input);
+    assert.equal(Object.getOwnPropertyDescriptor(globalThis, sentinelKey)?.value, mine);
+    const second = await createServerPlugin({ ...t.deps, moduleToken: createModuleToken() })(
+      makeFakeInput({ directory: "/repo" }).input,
+    );
+    assert.deepEqual(Object.keys(second), []);
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_SENTINEL_TAMPERED).length === 1));
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length === 1));
   } finally {
     t.cleanup();
   }

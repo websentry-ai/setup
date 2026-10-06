@@ -30,6 +30,8 @@ export const XDG_DATA_DEFAULT_SEGMENTS = [".local", "share"] as const;
 // --- signal categories (core's signal reporter; observations, never enforcement outcomes) -------
 /** A second copy of the plugin loaded into the same process. */
 export const SIGNAL_DUPLICATE_LOAD = "duplicate_load";
+/** The double-load sentinel slot held something other than a copy of this build; still enforcing. */
+export const SIGNAL_SENTINEL_TAMPERED = "sentinel_tampered";
 /** Plugin init could not complete fully and runs degraded. */
 export const SIGNAL_INIT_DEGRADED = "init_degraded";
 /** A tool looked like MCP but could not be attributed to a configured server. */
