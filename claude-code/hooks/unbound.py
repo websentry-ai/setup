@@ -4852,9 +4852,12 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str],
             return None
 
         # A Cowork run loads skills from Claude Desktop's own tree, never from Claude Code's dirs.
-        session = _desktop_session_dir({'cwd': cwd, 'transcript_path': transcript_path})
+        session = (_desktop_session_dir({'cwd': cwd, 'transcript_path': transcript_path})
+                   or _cowork_session_from_transcript(transcript_path))
         if session is not None:
             return _cowork_skill_path(prefix, name, session)
+        if any(_COWORK_SESSIONS_DIRNAME in (value or '') for value in (cwd, transcript_path)):
+            return None
 
         # Plugin skills ("<plugin>:<name>") live outside the project tree.
         if prefix and '/' not in prefix:
@@ -4917,12 +4920,39 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str],
 COWORK_BUNDLED_SKILLS_PREFIX = 'anthropic-skills'
 
 
+def _cowork_session_from_transcript(transcript_path: Optional[str]) -> Optional[Path]:
+    """The Cowork session of a run working in a folder the user picked. Its transcript
+    sits in a temp dir, under a project slug that is the session's outputs path with
+    every non-alphanumeric turned into '-'. None unless exactly one session matches."""
+    slug = Path(transcript_path).parent.name if transcript_path else ''
+    if 'local-agent-mode-sessions' not in slug:
+        return None
+    try:
+        matches = [session
+                   for base in _claude_desktop_support_dirs()
+                   for session in (base / _COWORK_SESSIONS_DIRNAME).glob('*/*/local_*/')
+                   if slug.startswith(re.sub(r'[^A-Za-z0-9]', '-', str(session)) + '-')]
+    except Exception:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _plugin_manifest_name(plugin: Path) -> Optional[str]:
+    """The name a plugin declares in .claude-plugin/plugin.json, which is the prefix
+    its skills are invoked under. None when it has no readable manifest."""
+    try:
+        name = json.loads((plugin / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8')).get('name')
+        return name if isinstance(name, str) else None
+    except Exception:
+        return None
+
+
 def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
-    """The SKILL.md a Cowork run used: the session's own copy, else the newest version
-    from the one source shipping the name — the bundle for anthropic-skills, an org
-    plugin for any other prefix. Two sources with the name is ambiguous: None."""
+    """The SKILL.md a Cowork run used: the session's own copy for a bare name, else the
+    newest version from the one source shipping the name — the bundle for anthropic-skills, the org
+    plugin declaring any other prefix. No source, or two, resolves nothing."""
     own = session / '.claude' / 'skills' / name / 'SKILL.md'
-    if own.is_file():
+    if not prefix and own.is_file():
         return str(own)
     sources = {}
     if prefix in ('', COWORK_BUNDLED_SKILLS_PREFIX):
@@ -4930,9 +4960,11 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         for path in (root / 'skills-plugin').glob('**/skills/%s/SKILL.md' % name):
             sources.setdefault('bundle', []).append(path)
     if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
-        rpm = session.parent / 'rpm'
-        for path in rpm.glob('*/**/skills/%s/SKILL.md' % name):
-            sources.setdefault(path.relative_to(rpm).parts[0], []).append(path)
+        for plugin in (session.parent / 'rpm').glob('*/'):
+            if prefix and _plugin_manifest_name(plugin) != prefix:
+                continue
+            for path in plugin.glob('**/skills/%s/SKILL.md' % name):
+                sources.setdefault(plugin.name, []).append(path)
     if len(sources) != 1:
         return None
     (copies,) = sources.values()
@@ -4947,6 +4979,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
     prompt_cwd = None
     session_id = None
+    transcript_path = None
     permission_mode = None
     # Per-tool-use project resolution state: the persistent shell starts at
     # the session cwd; origin lookups are cached per repo root.
@@ -4959,6 +4992,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if not session_id:
             session_id = event.get('session_id')
+        transcript_path = transcript_path or event.get('transcript_path')
 
         if not permission_mode:
             permission_mode = event.get('permission_mode')
@@ -5007,7 +5041,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 skill = tool_input.get('skill')
                 tool_use_entry['skill_name'] = skill
                 skill_path = _resolve_skill_path(
-                    skill, event.get('cwd') or prompt_cwd or cwd, event.get('transcript_path'))
+                    skill, event.get('cwd') or prompt_cwd or cwd, transcript_path)
                 if skill_path:
                     tool_use_entry['skill_path'] = skill_path
                     tool_use_entry['content_hash'] = _skill_content_hash(skill_path)
@@ -5040,7 +5074,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if '/' in typed_skill or '\\' in typed_skill or '..' in typed_skill:
             # A skill name is a bare identifier; anything path-shaped is not one.
             continue
-        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd, transcript_path)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,

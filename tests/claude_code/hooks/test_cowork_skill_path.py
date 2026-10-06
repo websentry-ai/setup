@@ -7,6 +7,7 @@ and no hash, so the backend could never tie it to a discovered body.
 
 import hashlib
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -43,9 +44,10 @@ class _CoworkTree(unittest.TestCase):
     def bundle(self, bundle, name, text="# bundled", age=0):
         return _write(self.root / "skills-plugin" / bundle / "v" / "skills" / name / "SKILL.md", text, age)
 
-    def plugin(self, name, text="# plugin", org=None, age=0, plugin="plugin_01"):
-        base = org or self.org
-        return _write(base / "rpm" / plugin / "skills" / name / "SKILL.md", text, age)
+    def plugin(self, name, text="# plugin", org=None, age=0, plugin="plugin_01", declares="gtm-skills"):
+        root = (org or self.org) / "rpm" / plugin
+        _write(root / ".claude-plugin" / "plugin.json", '{"name": "%s"}' % declares)
+        return _write(root / "skills" / name / "SKILL.md", text, age)
 
     def resolve(self, skill, cwd=None, transcript_path=None):
         return unbound._resolve_skill_path(skill, str(cwd or self.cwd), transcript_path)
@@ -99,6 +101,15 @@ class TestCoworkSkillIdentity(_CoworkTree):
         plugin = self.plugin("review", age=3600)
         self.assertEqual(self.resolve("gtm-skills:review"), str(plugin))
 
+    def test_prefix_resolves_only_the_plugin_that_declares_it(self):
+        self.plugin("review", plugin="plugin_01", declares="other-skills")
+        mine = self.plugin("review", plugin="plugin_02", age=3600)
+        self.assertEqual(self.resolve("gtm-skills:review"), str(mine))
+
+    def test_prefix_no_plugin_declares_resolves_nothing(self):
+        self.plugin("review", declares="other-skills")
+        self.assertIsNone(self.resolve("gtm-skills:review"))
+
     def test_two_org_plugins_sharing_a_name_resolve_nothing(self):
         self.plugin("review", plugin="plugin_01")
         self.plugin("review", plugin="plugin_02")
@@ -109,10 +120,15 @@ class TestCoworkSkillIdentity(_CoworkTree):
         self.plugin("review")
         self.assertIsNone(self.resolve("review"))
 
-    def test_the_sessions_own_copy_wins(self):
+    def test_the_sessions_own_copy_wins_for_a_bare_name(self):
         self.bundle("b1", "xlsx")
         own = _write(self.cwd.parent / ".claude" / "skills" / "xlsx" / "SKILL.md", "# mine", age=3600)
-        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(own))
+        self.assertEqual(self.resolve("xlsx"), str(own))
+
+    def test_a_prefixed_call_never_takes_the_sessions_own_copy(self):
+        bundled = self.bundle("b1", "xlsx", age=3600)
+        _write(self.cwd.parent / ".claude" / "skills" / "xlsx" / "SKILL.md", "# mine")
+        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(bundled))
 
     def test_session_found_from_the_transcript_when_cwd_is_elsewhere(self):
         skill = self.bundle("b1", "xlsx")
@@ -123,6 +139,44 @@ class TestCoworkSkillIdentity(_CoworkTree):
         self.assertEqual(
             self.resolve("anthropic-skills:xlsx", cwd=elsewhere, transcript_path=str(transcript)),
             str(skill))
+
+
+class TestCoworkRunInAPickedFolder(_CoworkTree):
+    """A run working in a folder the user picked: cwd is outside the sandbox and the
+    transcript sits in a temp dir, named by a slug of the session's outputs path."""
+
+    def transcript(self):
+        slug = re.sub(r"[^A-Za-z0-9]", "-", str(self.cwd))
+        return str(Path(self._tmp.name) / "claude-hostloop-plugins" / "h" / "projects" / slug / "s.jsonl")
+
+    def test_session_recovered_from_the_temp_transcript_slug(self):
+        skill = self.bundle("b1", "xlsx")
+        picked = Path(self._tmp.name) / "picked"
+        picked.mkdir()
+        self.assertEqual(
+            self.resolve("anthropic-skills:xlsx", cwd=picked, transcript_path=self.transcript()),
+            str(skill))
+
+    def test_a_slug_naming_no_real_session_resolves_nothing(self):
+        self.bundle("b1", "xlsx")
+        fake = str(Path(self._tmp.name) / "projects" / "-x-local-agent-mode-sessions-a-b-local-zz-outputs" / "s.jsonl")
+        picked = Path(self._tmp.name) / "picked"
+        picked.mkdir()
+        self.assertIsNone(self.resolve("xlsx", cwd=picked, transcript_path=fake))
+
+    def test_typed_skill_uses_the_session_transcript(self):
+        content = "---\nname: xlsx\n---\nMake spreadsheets.\n"
+        skill = self.bundle("b1", "xlsx", content)
+        picked = Path(self._tmp.name) / "picked"
+        picked.mkdir()
+        prompt = {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(picked),
+                  "transcript_path": self.transcript(), "prompt": "/xlsx build it"}
+        exchange = unbound.build_llm_exchange(
+            [{"timestamp": "2026-10-06T10:00:00Z", "session_id": "s1", "event": prompt}],
+            stop_assistant_message="done", cwd=str(picked))
+        tool_uses = [t for m in exchange["messages"] for t in m.get("tool_use", [])]
+        entry = next(t for t in tool_uses if t["tool_name"] == "Skill")
+        self.assertEqual(entry["skill_path"], str(skill))
 
 
 class TestCoworkSkillRunCarriesPathAndHash(_CoworkTree):
