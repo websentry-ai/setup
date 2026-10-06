@@ -107,6 +107,13 @@ export interface PretoolPayloadInput {
    * `MAX_MCP_NAME_CHARS`; `mcp_tool` only alongside a valid `mcp_server`.
    */
   mcp?: { server: string; tool: string };
+  /**
+   * The file operation of a per-file request that carries no patch text (an adapter that fans a
+   * multi-file patch out into one request per file). Only `"delete"` is defined: it becomes
+   * `metadata.patch_operation`, so the server classifies the target as a file deletion. Appended
+   * after every other metadata key, so a body without it is byte-identical to before.
+   */
+  patchOperation?: "delete";
 }
 
 /**

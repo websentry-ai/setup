@@ -87,6 +87,12 @@ export interface ToolCallInput {
    * every adapter that does not set it, so their wire behaviour is unchanged.
    */
   sendUnattributed?: boolean;
+  /**
+   * `"delete"` for a per-file request whose target the call deletes (sent as
+   * `metadata.patch_operation`). Only that exact value counts; absent on every adapter that does not
+   * set it, so their wire behaviour is unchanged.
+   */
+  patchOperation?: "delete";
 }
 
 /** One user prompt, as the adapter sees it. Images and attachments have no field here on purpose. */
@@ -396,6 +402,7 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
       pullPolicies,
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
       ...(mcp === undefined ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }),
+      ...(source.patchOperation === "delete" ? { patchOperation: "delete" as const } : {}),
     }, profile);
 
     const outcome = await check(payload, toolName, deps, state);

@@ -406,6 +406,8 @@ export function buildPretoolPayload(
     metadata.mcp_server = mcp.server;
     if (mcp.tool !== undefined) metadata.mcp_tool = mcp.tool;
   }
+  // A per-file request with no patch text states its operation; only an exact "delete" is sent.
+  if (input.patchOperation === "delete") metadata.patch_operation = "delete";
 
   const preToolUseData: PreToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the

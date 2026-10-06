@@ -11,7 +11,8 @@
 //   * `read` / `write` / `edit` / `lsp`: the real tool-input object, so core's profile taxonomy
 //     sends `filePath` as `metadata.file_path` and a differing `path` stays visible in `tool_input`;
 //   * `grep` / `glob`: `path` (defaults to cwd) plus `pattern` / `include`;
-//   * `apply_patch`: ONE request per header path (`{filePath: target}`), at most
+//   * `apply_patch`: ONE request per header path (`{filePath: target}`, plus
+//     `metadata.patch_operation: "delete"` for a `*** Delete File:` target), at most
 //     `PATCH_CONCURRENCY` in flight, strictest verdict wins (T-13-22), all under ONE shared
 //     deadline (13-REVIEW WR-02); a patch naming more than `MAX_PATCH_TARGETS` files is blocked
 //     without a request (13-REVIEW BL-02).
@@ -39,6 +40,7 @@ import {
   SIGNAL_PATCH_TARGETS_CAPPED,
 } from "./constants.ts";
 import {
+  applyPatchDeletedPaths,
   applyPatchTargets,
   argsDigest,
   BUILTIN_TOOLS,
@@ -324,6 +326,9 @@ export async function decideBeforeVerdict(input: unknown, output: unknown, ctx: 
         if (message !== undefined) void notify(record.client, message, "error");
         return { message, kind: "deny", reason: PATCH_TOO_LARGE_REASON };
       }
+      // A per-file request carries no patch text, so a deleted target says so itself (ai-gateway
+      // Phase 11 contract: `metadata.patch_operation: "delete"`, else it is classified as a write).
+      const deleted = applyPatchDeletedPaths(args.patchText);
       verdict = await fanOut(
         targets,
         PATCH_CONCURRENCY,
@@ -337,6 +342,7 @@ export async function decideBeforeVerdict(input: unknown, output: unknown, ctx: 
               cwd: directory,
               sessionId: sessionID,
               model,
+              ...(deleted.has(target) ? { patchOperation: "delete" as const } : {}),
             },
             evalDeps,
           ),

@@ -143,6 +143,33 @@ export function applyPatchTargets(patchText: unknown): { targets: string[]; capp
   }
 }
 
+/** The header that names a file the patch deletes. */
+const PATCH_DELETE_PREFIX = "*** Delete File:";
+
+/**
+ * The paths an `apply_patch` text names on a `*** Delete File:` header, parsed exactly like
+ * `applyPatchTargets` (any line, leading whitespace, trimmed rest, CRLF). The per-file fan-out sends
+ * no patch text, so the server can only learn that a target is deleted from the request itself
+ * (`metadata.patch_operation: "delete"`, ai-gateway Phase 11 contract). Total; empty for anything else.
+ */
+export function applyPatchDeletedPaths(patchText: unknown): Set<string> {
+  const deleted = new Set<string>();
+  try {
+    if (typeof patchText !== "string" || patchText === "") return deleted;
+    for (const raw of patchText.split(/\r?\n/)) {
+      const line = raw.trimStart();
+      if (!line.startsWith(PATCH_DELETE_PREFIX)) continue;
+      const path = line.slice(PATCH_DELETE_PREFIX.length).trim();
+      if (path === "") continue;
+      if (deleted.size >= MAX_PATCH_TARGETS) break;
+      deleted.add(path);
+    }
+    return deleted;
+  } catch {
+    return deleted;
+  }
+}
+
 // --- MCP ----------------------------------------------------------------------------------------
 
 /** opencode's MCP key sanitiser, exactly: `oc:opencode/src/mcp/catalog.ts:117`. */
