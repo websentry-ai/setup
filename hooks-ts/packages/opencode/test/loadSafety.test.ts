@@ -7,8 +7,9 @@
 //     copy serving several directories is not a duplicate;
 //   * key, gateway and checker resolve lazily on the first hook, once per plugin copy;
 //   * `config` snapshots MCP server names read-only; `dispose` releases the directory;
-//   * the v2 `setup` entry is inert on a 1.18 host (whose embedded core host also calls it) and only
-//     reports `api_family_inactive`, once, when it sees a real v2 ctx.
+//   * the v2 `setup` entry is inert on a 1.18 host (whose embedded core host also calls it); on a real
+//     v2 ctx it is active and reports one `v2_status` per process (never `api_family_inactive`, which
+//     14-CONTEXT replaced). The active entry's wiring is tested in v2Setup.test.ts.
 
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
@@ -23,6 +24,7 @@ import {
   SIGNAL_DUPLICATE_LOAD,
   SIGNAL_INIT_DEGRADED,
   SIGNAL_SENTINEL_TAMPERED,
+  SIGNAL_V2_STATUS,
 } from "../src/constants.ts";
 import {
   makeDeps,
@@ -499,30 +501,30 @@ test("setup is inert on a 1.18 ctx and on garbage: resolves undefined, reports n
   }
 });
 
-test("setup on a v2 ctx reports api_family_inactive once per process, never enforcing", async () => {
+test("setup on a v2 ctx reports one v2_status per process, never api_family_inactive", async () => {
+  // 14-CONTEXT: the `api_family_inactive` report is replaced by the per-capability `v2_status`.
   for (const ctx of [{ ...v118Ctx(), tool: {}, permission: {} }, { session: {} }]) {
     resetMock();
     const t = makeDeps(mock);
     const sentinelKey = Symbol("v2-test");
     try {
       const setup = createSetupV2({ ...t.deps, sentinelKey });
-      assert.equal(await setup(ctx), undefined);
-      assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_API_FAMILY_INACTIVE).length === 1));
-      const body = signalsOf(mock, SIGNAL_API_FAMILY_INACTIVE)[0]?.body as {
+      assert.equal(typeof (await setup(ctx)), "function", "an active setup returns its cleanup");
+      assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_V2_STATUS).length === 1));
+      const body = signalsOf(mock, SIGNAL_V2_STATUS)[0]?.body as {
         hook_source?: string;
         errors?: Array<{ message?: string }>;
       };
       assert.equal(body.hook_source, "opencode-hook");
-      assert.match(body.errors?.[0]?.message ?? "", /v2_setup_inactive/);
-      assert.match(body.errors?.[0]?.message ?? "", /tool=setup/);
-      // A second call, and a second copy on the same slot, report nothing more.
+      assert.match(body.errors?.[0]?.message ?? "", /tools=enforce;ask=native;mcp=enforce;prompt=block;recording=full;identity=provider;shell=enforce/);
+      // A second call, and a second copy on the same slot, for the same directory register and report nothing more.
       assert.equal(await setup(ctx), undefined);
       assert.equal(await createSetupV2({ ...t.deps, sentinelKey })(ctx), undefined);
       await tick(100);
-      assert.equal(signalsOf(mock, SIGNAL_API_FAMILY_INACTIVE).length, 1);
+      assert.equal(signalsOf(mock, SIGNAL_V2_STATUS).length, 1);
+      assert.equal(signalsOf(mock, SIGNAL_API_FAMILY_INACTIVE).length, 0);
       assert.equal(pretoolRequests(mock).length, 0);
     } finally {
-      delete (globalThis as Record<symbol, unknown>)[sentinelKey];
       t.cleanup();
     }
   }
@@ -539,7 +541,11 @@ test("setup does not claim or disturb the server sentinel", async () => {
     assert.equal(typeof hooks.config, "function");
     await tick(50);
     assert.equal(signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length, 0);
-    delete (globalThis as Record<symbol, unknown>)[setupKey];
+    try {
+      delete (globalThis as Record<symbol, unknown>)[setupKey];
+    } catch {
+      // The active setup's slot is non-configurable (like the server sentinel); its key is private.
+    }
   } finally {
     t.cleanup();
   }
