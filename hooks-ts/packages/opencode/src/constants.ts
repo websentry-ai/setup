@@ -46,6 +46,46 @@ export const SIGNAL_USER_SHELL_UNCHECKED = "user_shell_unchecked";
 export const SIGNAL_API_FAMILY_INACTIVE = "api_family_inactive";
 /** An apply_patch named more distinct files than `MAX_PATCH_TARGETS` (and was blocked). */
 export const SIGNAL_PATCH_TARGETS_CAPPED = "patch_targets_capped";
+/**
+ * One report per process of the v2 entry's per-capability status (`V2_CAPABILITIES`). Replaces the
+ * `api_family_inactive` report on a v2 host (14-CONTEXT Go/no-go mapping).
+ */
+export const SIGNAL_V2_STATUS = "v2_status";
+/** A v2 capability runs audit-only (its verdict was NO-GO); reported once per process. */
+export const SIGNAL_V2_NOT_ENFORCING = "v2_not_enforcing";
+
+// --- v2 capabilities (14-SPIKES.md `## Verdicts`, @opencode/cli 2.0.22) --------------------------
+
+/** What the v2 entry does per capability. Each value is the branch its spike verdict selected. */
+export interface V2Capabilities {
+  /** HV2-02: GO → "enforce", NO-GO → "audit". */
+  readonly tools: "enforce" | "audit";
+  /** HV2-03: NATIVE → "native", DENY-AS-V1 → "deny", AUDIT → "audit". */
+  readonly ask: "native" | "deny" | "audit";
+  /** HV2-04: GO → "enforce", AUDIT → "audit", NO-GO → "none". */
+  readonly mcp: "enforce" | "audit" | "none";
+  /** HV2-05: BLOCK → "block", WARN-ONLY → "warn". */
+  readonly prompt: "block" | "warn";
+  /** HV2-06: GO → "full", PARTIAL → "partial". */
+  readonly recording: "full" | "partial";
+  /** HV2-07: PROVIDER-LEVEL → "provider", NONE → "none". */
+  readonly identity: "provider" | "none";
+}
+
+export const V2_CAPABILITIES: V2Capabilities = Object.freeze({
+  /** HV2-02 GO lever=both (permission.evaluate deny + message; execute.before throw for MCP). */
+  tools: "enforce",
+  /** HV2-03 NATIVE (`effect = "ask"` → opencode's own pending permission; reject prevents execution). */
+  ask: "native",
+  /** HV2-04 GO (MCP ids `<server>_<tool>` reach execute.before and evaluate). */
+  mcp: "enforce",
+  /** HV2-05 BLOCK lever=session.prompt-mutate. */
+  prompt: "block",
+  /** HV2-06 GO (session.created / execution.succeeded / text.ended / step.ended events). */
+  recording: "full",
+  /** HV2-07 PROVIDER-LEVEL source=session.model.request.model.providerID. */
+  identity: "provider",
+});
 
 // --- notices ------------------------------------------------------------------------------------
 /** Shown once per directory when resolving the key / gateway / checker raised (13-REVIEW WR-03). */
