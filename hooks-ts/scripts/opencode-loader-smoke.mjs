@@ -35,7 +35,13 @@
 //          `opencode_version` is the CLI's own version;
 //        * REALLY block a user shell, model-free: `POST /api/session/:id/shell` with a command the
 //          mock denies must reach the mock as a `bash` tool_use and must not run (no marker file);
-//          v2 answers a blocked user shell with an empty HTTP 500 (14-SPIKES V2-10).
+//          v2 answers a blocked user shell with an empty HTTP 500 (14-SPIKES V2-10);
+//        * REALLY block through the levers every v2 enforcement depends on (14-REVIEW WR-01), with a
+//          loopback fake provider scripting the model's tool calls (no key, no model): a built-in
+//          `shell` call denied through `permission.evaluate` (`permission.rejected` + our reason
+//          reach the provider, the command does not run, it is checked once), a Code Mode MCP call
+//          raised from `tool.execute.before` (server `smoke-mcp.v2`, sanitised by opencode), and a
+//          prompt replaced through `session.prompt` (the original text never reaches the provider).
 //
 // The child process GROUP is always killed on exit. On failure the last 50 lines of the isolated
 // opencode logs (paths inside the temp home only) and the mock's request list are printed. Lines
@@ -44,7 +50,7 @@
 
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -105,6 +111,98 @@ for (const name of Object.keys(process.env)) {
 
 /** @type {{ method: string, path: string, body: any }[]} */
 const requests = [];
+/** The v2 prompt leg's text marker: the mock denies a prompt carrying it; it must never reach the provider. */
+const PROMPT_MARKER = "UNBOUND-SMOKE-PROMPT-MARKER";
+/** The v2 MCP leg's server name: it contains characters opencode sanitises (`smoke-mcp_v2_<tool>`). */
+const MCP_SERVER = "smoke-mcp.v2";
+const MCP_SANITISED = "smoke-mcp_v2";
+
+// --- the v2 model-free legs: a loopback OpenAI-compatible provider and a stdio MCP server ----------
+//
+// 14-01 harness, inlined. The provider answers the first request of a turn that offers tools with
+// the leg's scripted tool call, and every other request with short text; it keeps every request body
+// so the smoke can assert what reached "the model". The MCP server has one tool, `echo_marker`, which
+// writes `<proj>/mcp-ran-<n>.txt`.
+
+/** @type {any[]} */
+const providerBodies = [];
+/** @type {{ tool: string, args: object } | undefined} */
+let providerScript;
+let providerCalls = 0;
+
+const provider = createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", () => {
+    let body;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      body = {};
+    }
+    providerCalls += 1;
+    if ((req.url ?? "").includes("/models")) {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: [{ id: "fake-model", object: "model" }] }));
+      return;
+    }
+    providerBodies.push(body);
+    const messages = Array.isArray(body?.messages) ? body.messages : [];
+    const last = messages[messages.length - 1];
+    const hasTools = Array.isArray(body?.tools) && body.tools.length > 0;
+    const call = hasTools && last?.role !== "tool" && providerScript !== undefined ? providerScript : undefined;
+    if (call !== undefined) providerScript = undefined; // one tool call per leg
+    const id = `chatcmpl-${providerCalls}`;
+    const created = Math.floor(Date.now() / 1000);
+    const base = { id, object: "chat.completion.chunk", created, model: body?.model };
+    const deltas = call
+      ? [
+          { role: "assistant", content: null, tool_calls: [{ index: 0, id: `call_smoke_${providerCalls}`, type: "function", function: { name: call.tool, arguments: "" } }] },
+          { tool_calls: [{ index: 0, function: { arguments: JSON.stringify(call.args) } }] },
+        ]
+      : [{ role: "assistant", content: last?.role === "tool" ? "done after tool" : "ok" }];
+    if (body?.stream) {
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      for (const delta of deltas) res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ ...base, choices: [], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+      res.end("data: [DONE]\n\n");
+      return;
+    }
+    const message = call
+      ? { role: "assistant", content: null, tool_calls: [{ id: `call_smoke_${providerCalls}`, type: "function", function: { name: call.tool, arguments: JSON.stringify(call.args) } }] }
+      : { role: "assistant", content: deltas[0].content };
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ id, object: "chat.completion", created, model: body?.model, choices: [{ index: 0, message, finish_reason: call ? "tool_calls" : "stop" }] }));
+  });
+});
+
+const MCP_SERVER_SOURCE = `
+const { writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+let buf = "";
+const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+process.stdin.on("data", (c) => {
+  buf += c.toString("utf8");
+  let i;
+  while ((i = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, i).trim();
+    buf = buf.slice(i + 1);
+    if (!line) continue;
+    let m;
+    try { m = JSON.parse(line); } catch { continue; }
+    if (m.id === undefined) continue;
+    if (m.method === "initialize") send({ jsonrpc: "2.0", id: m.id, result: { protocolVersion: (m.params && m.params.protocolVersion) || "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "smoke", version: "0.0.1" } } });
+    else if (m.method === "tools/list") send({ jsonrpc: "2.0", id: m.id, result: { tools: [{ name: "echo_marker", description: "Writes a marker file.", inputSchema: { type: "object", properties: { n: { type: "string" } }, required: ["n"] } }] } });
+    else if (m.method === "tools/call") {
+      const n = String((m.params && m.params.arguments && m.params.arguments.n) || "x").replace(/[^A-Za-z0-9_-]/g, "");
+      writeFileSync(join(process.argv[2], "mcp-ran-" + n + ".txt"), "ran\\n");
+      send({ jsonrpc: "2.0", id: m.id, result: { content: [{ type: "text", text: "written " + n }] } });
+    } else if (m.method === "ping") send({ jsonrpc: "2.0", id: m.id, result: {} });
+    else send({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: "method not found" } });
+  }
+});
+`;
 
 const mock = createServer((req, res) => {
   const chunks = [];
@@ -120,10 +218,13 @@ const mock = createServer((req, res) => {
     requests.push({ method: req.method ?? "", path, body });
     let payload = {};
     if (req.method === "POST" && path === "/v1/hooks/pretool") {
+      // Every tool_use is denied; a user prompt carrying PROMPT_MARKER is denied (v2 prompt leg).
       payload =
         body?.event_name === "tool_use"
           ? { decision: "deny", reason: "smoke" }
-          : { decision: "allow", policy_check_failure_action: "allow" };
+          : body?.event_name === "user_prompt" && JSON.stringify(body).includes(PROMPT_MARKER)
+            ? { decision: "deny", reason: "smoke prompt" }
+            : { decision: "allow", policy_check_failure_action: "allow" };
     }
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(payload));
@@ -175,11 +276,13 @@ async function cleanup() {
     // The leader may be gone while a grandchild lives on in the group.
     killGroup("SIGKILL");
   }
-  try {
-    mock.closeAllConnections?.();
-    mock.close();
-  } catch {
-    // best effort
+  for (const server of [mock, provider]) {
+    try {
+      server.closeAllConnections?.();
+      server.close();
+    } catch {
+      // best effort
+    }
   }
   if (!args.keep) {
     try {
@@ -273,6 +376,31 @@ const overall = setTimeout(() => {
 if (!existsSync(cliPath)) await fail(`CLI not found: ${cliPath}`);
 if (!existsSync(artifactPath)) await fail(`artifact not found: ${artifactPath}`);
 copyFileSync(artifactPath, join(pluginsDir, "unbound.js"));
+
+if (args.line === "v2") {
+  // The model-free legs' fake provider and MCP server (v2 config schema, 14-SPIKES "Config").
+  await new Promise((ok, ko) => {
+    provider.on("error", ko);
+    provider.listen(0, "127.0.0.1", ok);
+  });
+  const mcpScript = join(tempRoot, "mcp-server.cjs");
+  writeFileSync(mcpScript, MCP_SERVER_SOURCE);
+  writeFileSync(
+    join(xdg.XDG_CONFIG_HOME, "opencode", "opencode.json"),
+    JSON.stringify({
+      providers: {
+        fake: {
+          name: "Fake",
+          package: "@opencode/ai/providers/openai-compatible",
+          settings: { baseURL: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: "dummy-not-a-secret" },
+          models: { "fake-model": { name: "Fake Model", capabilities: { tools: true } } },
+        },
+      },
+      model: "fake/fake-model",
+      mcp: { servers: { [MCP_SERVER]: { type: "local", command: [process.execPath, mcpScript, projectDir] } } },
+    }),
+  );
+}
 
 const port = await freePort();
 const serverPassword = randomBytes(24).toString("hex");
@@ -541,6 +669,73 @@ if (args.line === "v1") {
   );
   await sleep(1_500);
   if (existsSync(marker)) await fail(`the denied v2 user shell command ran: ${marker} exists`);
+
+  // 4. Model-free REAL blocks on the levers every v2 enforcement depends on (14-REVIEW WR-01), with
+  //    the fake provider scripting the model's tool calls:
+  //      a. a built-in `shell` call denied through the PERMISSION hook: it must not run, the
+  //         provider's follow-up must carry `permission.rejected` with our reason, and the call must
+  //         have been checked exactly once (the tool's own spawn is not re-checked as a user shell);
+  //      b. an MCP call (Code Mode) raised from `tool.execute.before`: the server name `smoke-mcp.v2`
+  //         is sanitised by opencode, so this also proves the attribution; it must not run and the
+  //         reason must reach the provider;
+  //      c. a prompt replaced through the PROMPT hook: the provider must receive the block notice
+  //         and never the original text.
+  const modelRef = { id: "fake-model", providerID: "fake" };
+  const dirQuery = `directory=${encodeURIComponent(projectDir)}`;
+  const turn = async (label, script, text) => {
+    const created = await httpJson("POST", "/api/session", { location: { directory: projectDir }, model: modelRef }, dirHeaders);
+    const id = idOf(created.json) ?? idOf(created.json?.data);
+    if (id === undefined) await fail(`${label}: POST /api/session answered ${created.status} without a session id`);
+    providerScript = script;
+    const from = providerBodies.length;
+    const prompted = await httpJson("POST", `/api/session/${encodeURIComponent(id)}/prompt`, { text }, dirHeaders);
+    if (prompted.status !== 200) await fail(`${label}: POST /prompt answered ${prompted.status}`);
+    const waited = await httpOk("POST", `/api/experimental/session/${encodeURIComponent(id)}/wait`, {}, dirHeaders);
+    if (waited !== 204 && waited !== 200) await fail(`${label}: the turn did not end (wait answered ${waited})`);
+    providerScript = undefined;
+    return JSON.stringify(providerBodies.slice(from));
+  };
+  const toolUses = (name) =>
+    requests.filter((r) => r.path === "/v1/hooks/pretool" && r.body?.event_name === "tool_use" && r.body?.pre_tool_use_data?.tool_name === name);
+
+  // a. built-in, permission hook
+  const shellMarker = join(projectDir, "ran-model-shell.txt");
+  const modelCommand = `echo model > ${shellMarker}`;
+  const sentA = await turn("built-in deny", { tool: "shell", args: { command: modelCommand } }, "run the command");
+  if (existsSync(shellMarker)) await fail(`the denied model shell call ran: ${shellMarker} exists`);
+  if (!sentA.includes("permission.rejected") || !sentA.includes("Blocked by Unbound policy: smoke")) {
+    await fail("the provider did not receive permission.rejected with the Unbound reason for the denied shell call");
+  }
+  const modelChecks = toolUses("bash").filter((r) => r.body?.pre_tool_use_data?.command === modelCommand);
+  if (modelChecks.length !== 1) await fail(`the model shell call was checked ${modelChecks.length} times (expected once)`);
+
+  // b. MCP, raise from tool.execute.before (Code Mode)
+  let connected = false;
+  for (let i = 0; i < 60 && !connected; i += 1) {
+    const listed = await httpJson("GET", `/api/mcp?${dirQuery}`, undefined, dirHeaders);
+    connected = JSON.stringify(listed.json ?? "").includes('"connected"');
+    if (!connected) await sleep(250);
+  }
+  if (!connected) await fail(`the smoke MCP server ${MCP_SERVER} never connected`);
+  const mcpMarker = join(projectDir, "mcp-ran-m1.txt");
+  const sentB = await turn("MCP raise", { tool: "execute", args: { code: `return await tools["${MCP_SANITISED}"].echo_marker({ n: "m1" })` } }, "call the tool");
+  if (existsSync(mcpMarker)) await fail(`the denied MCP call ran: ${mcpMarker} exists`);
+  const mcpCheck = toolUses(`${MCP_SANITISED}_echo_marker`)[0];
+  if (mcpCheck === undefined) await fail("the MCP call was never checked");
+  const mcpMeta = mcpCheck.body?.pre_tool_use_data?.metadata ?? {};
+  if (mcpMeta.mcp_server !== MCP_SERVER || mcpMeta.mcp_tool !== "echo_marker") {
+    await fail(`the MCP call was not attributed to ${MCP_SERVER}/echo_marker: ${JSON.stringify({ server: mcpMeta.mcp_server, tool: mcpMeta.mcp_tool })}`);
+  }
+  if (!sentB.includes("Blocked by Unbound policy: smoke")) await fail("the MCP block reason did not reach the provider");
+
+  // c. prompt, replaced through the prompt hook
+  const sentC = await turn("prompt block", undefined, `${PROMPT_MARKER} please help`);
+  if (sentC.includes(PROMPT_MARKER)) await fail("the blocked prompt's original text reached the provider");
+  if (!sentC.includes("Blocked by Unbound policy: smoke prompt")) await fail("the provider did not receive the prompt block notice");
+  console.log(
+    `model-free legs: built-in shell denied via permission.rejected (checked once); MCP ${MCP_SANITISED}_echo_marker ` +
+      `attributed to ${MCP_SERVER} and raised; prompt replaced by the block notice`,
+  );
 
   // Give a second (wrong) status report a moment to show up before counting.
   await sleep(1_000);
