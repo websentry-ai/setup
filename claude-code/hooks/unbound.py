@@ -4931,10 +4931,16 @@ def _cowork_session_from_transcript(transcript_path: Optional[str]) -> Optional[
         matches = [session
                    for base in _claude_desktop_support_dirs()
                    for session in (base / _COWORK_SESSIONS_DIRNAME).glob('*/*/local_*')
-                   if session.is_dir() and slug.startswith(re.sub(r'[^A-Za-z0-9]', '-', str(session)) + '-')]
+                   if session.is_dir() and _is_slug_of(slug, session / 'outputs')]
     except Exception:
         return None
     return matches[0] if len(matches) == 1 else None
+
+
+def _is_slug_of(slug: str, path: Path) -> bool:
+    """True when ``slug`` names ``path`` or a folder inside it."""
+    base = re.sub(r'[^A-Za-z0-9]', '-', str(path))
+    return slug == base or slug.startswith(base + '-')
 
 
 def _plugin_manifest_name(plugin: Path) -> Optional[str]:

@@ -157,6 +157,19 @@ class TestCoworkRunInAPickedFolder(_CoworkTree):
             self.resolve("anthropic-skills:xlsx", cwd=picked, transcript_path=self.transcript()),
             str(skill))
 
+    def test_a_longer_session_id_never_matches_a_shorter_one(self):
+        skill = self.bundle("b1", "xlsx")
+        longer = self.org / "local_abc_extra" / "outputs"
+        longer.mkdir(parents=True)
+        picked = Path(self._tmp.name) / "picked"
+        picked.mkdir()
+        transcript = str(Path(self._tmp.name) / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(longer)) / "s.jsonl")
+        self.assertEqual(self.resolve("anthropic-skills:xlsx", cwd=picked, transcript_path=transcript), str(skill))
+        # Only the shorter session left: the longer one's transcript names no session.
+        longer.rmdir()
+        longer.parent.rmdir()
+        self.assertIsNone(self.resolve("anthropic-skills:xlsx", cwd=picked, transcript_path=transcript))
+
     def test_a_slug_naming_no_real_session_resolves_nothing(self):
         self.bundle("b1", "xlsx")
         fake = str(Path(self._tmp.name) / "projects" / "-x-local-agent-mode-sessions-a-b-local-zz-outputs" / "s.jsonl")
