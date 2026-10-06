@@ -251,6 +251,9 @@ function buildAccountIdentity(input) {
       } else {
         identity.auth_mode = AUTH_MODE_API_KEY;
       }
+    } else {
+      const mode = label(auth.authMode);
+      if (mode !== void 0) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== void 0 && isValidSerial(serial)) identity.device_serial = serial;
@@ -711,6 +714,7 @@ function buildPretoolPayload(input, profile) {
     metadata.mcp_server = mcp.server;
     if (mcp.tool !== void 0) metadata.mcp_tool = mcp.tool;
   }
+  if (input.patchOperation === "delete") metadata.patch_operation = "delete";
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
     // server never matches the tool and enforcement silently disappears.
@@ -1670,7 +1674,8 @@ async function evaluateToolCall(call, deps) {
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
-      ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }
+      ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } },
+      ...source.patchOperation === "delete" ? { patchOperation: "delete" } : {}
     }, profile);
     const outcome = await check(payload, toolName, deps, state);
     if (outcome === void 0) return { kind: "allow" };
