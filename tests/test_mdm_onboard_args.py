@@ -11,6 +11,13 @@ from tests.conftest import load_module
 onboard = load_module("mdm/onboard.py")
 
 
+@pytest.fixture(autouse=True)
+def _no_pi_on_this_machine(monkeypatch):
+    # The Pi step is covered in test_mdm_onboard_pi.py; these must not depend on
+    # whether the machine running them has pi.
+    monkeypatch.setattr(onboard, "pi_detected", lambda: False)
+
+
 @pytest.mark.parametrize("argv", [
     ["--api-key", "K", "--discovery-key", "STALE"],
     ["--api-key", "K", "--discovery-key"],

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from unbound_hook import migration, setup_cmd
+from unbound_hook import clear_cmd, migration, setup_cmd
 from unbound_hook._loader import load_mdm_setup_module
 from unbound_hook._resources import HOOK_BINARY
 
@@ -423,8 +423,11 @@ def _assert_swept(home: Path, tmp: Path):
     assert not (home / "Library" / "LaunchAgents" / "ai.getunbound.discovery.plist").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".local" / "share" / "unbound" / "run-scheduled.sh").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks", ".augment/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".augment/hooks"):
         assert not (home / d / "unbound.py").exists()
+    # codex's unbound.py is its hook target in both eras; the codex adapter
+    # overwrites it in place, so the sweep leaves it alone
+    assert (home / ".codex" / "hooks" / "unbound.py").exists()
     for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
@@ -665,6 +668,144 @@ def test_sweep_keeps_binary_era_copilot_registration(env):
     status, _ = migration.run_sweep(log=lambda *_: None)
     assert status == "configured"
     assert (hooks_dir / "unbound.json").read_text() == binary_json
+
+
+CODEX_EVENTS = {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"}
+
+
+def _plant_python_era_codex(home: Path, command: str):
+    script = home / ".codex" / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"hooks": [
+            {"type": "command", "command": command.format(script=script)}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]}],
+    }}))
+    return script
+
+
+def _codex_states(env):
+    return [k["install_state"] for a, k in env["notified"] if a[1] == "codex"]
+
+
+def _codex_registrations(home: Path):
+    hooks = json.loads((home / ".codex" / "hooks.json").read_text()).get("hooks", {})
+    wrapper = str(home / ".codex" / "hooks" / "unbound.py")
+    return {ev: [h["command"] for grp in groups for h in grp.get("hooks", [])
+                 if setup_cmd._command_targets_hook(h.get("command", ""), Path(wrapper))]
+            for ev, groups in hooks.items()}
+
+
+def test_codex_rerun_reports_persisted_not_tampered(env):
+    """The sweep runs before the codex adapter. If it strips codex's user-level
+    hook, every re-run sees it missing and reports a healthy install as
+    tampered, then reinstalls it."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "persisted", "persisted"]
+
+
+def test_sweep_keeps_the_binary_codex_install(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    before = (wrapper.read_text(), hooks_json.read_text())
+    status, _ = migration.run_sweep(log=lambda *_: None)
+    assert status == "configured"
+    assert (wrapper.read_text(), hooks_json.read_text()) == before
+
+
+@pytest.mark.parametrize("python_era_command", [
+    "{script}",              # python user-level installer
+    '"{script}"',            # python MDM installer
+    'python3 "{script}"',
+])
+def test_python_era_codex_install_upgrades_in_place(env, python_era_command):
+    """A python-era codex hook is the same file + hooks.json entry the binary
+    writes, so setup upgrades it in place: one registration per event, the
+    file becomes the binary wrapper, and the run reports persisted."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, python_era_command)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted"]
+    assert "os.execv" in script.read_text()
+    regs = _codex_registrations(home)
+    assert set(regs) == CODEX_EVENTS
+    assert all(len(cmds) == 1 for cmds in regs.values()), regs
+    stop = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["Stop"]
+    assert any(h["command"] == "/usr/local/bin/other-hook"
+               for grp in stop for h in grp["hooks"])
+
+
+def test_codex_deferred_keeps_python_era(env, monkeypatch):
+    """A codex deferral (MDM key fetch fails) must leave the python-era hook
+    and its registration intact until a successful re-run replaces them."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, '"{script}"')
+    before = (script.read_text(), (home / ".codex" / "hooks.json").read_text())
+    monkeypatch.setattr(env["modules"]["codex"], "fetch_api_key_from_mdm",
+                        lambda *a: None)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert (script.read_text(), (home / ".codex" / "hooks.json").read_text()) == before
+
+
+def test_codex_clear_still_removes_the_binary_install(env):
+    """Uninstall doesn't rely on the sweep for codex: clear_setup strips it."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert env["modules"]["codex"].clear_setup() is True
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    if hooks_json.exists():
+        assert not any(_codex_registrations(env["home"]).values())
+
+
+def test_codex_replaces_a_symlink_at_its_hook_path(env):
+    """The sweep used to delete a symlinked ~/.codex/hooks/unbound.py before the
+    adapter's O_NOFOLLOW write; now the adapter replaces the link itself, never
+    writing through it."""
+    target = env["tmp"] / "elsewhere.py"
+    target.write_text("# not ours\n")
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.symlink_to(target)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert not wrapper.is_symlink() and "os.execv" in wrapper.read_text()
+    assert target.read_text() == "# not ours\n"
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
+@pytest.mark.parametrize("shape", ["corrupt", "symlink"])
+def test_codex_defers_on_an_unusable_hooks_json(env, shape):
+    """A hooks.json we can't safely merge into defers codex without touching it
+    (or writing through a link), and the other tools still configure."""
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json.parent.mkdir(parents=True)
+    if shape == "corrupt":
+        hooks_json.write_text("{not json")
+        watched = hooks_json
+    else:
+        watched = env["tmp"] / "dotfiles-hooks.json"
+        watched.write_text(json.dumps({"hooks": {}}))
+        hooks_json.symlink_to(watched)
+    before = watched.read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert watched.read_text() == before
+    assert not _codex_states(env)
+    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
+
+
+def test_clear_command_removes_the_codex_install(env, monkeypatch):
+    """`unbound-hook clear` runs the sweep after each clear_setup; with codex no
+    longer swept, its own clear_setup must still leave nothing behind."""
+    monkeypatch.setattr(env["modules"]["copilot"], "managed_settings_path",
+                        lambda: env["tmp"] / "managed-copilot" / "managed-settings.json")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert clear_cmd.run([]) == 0
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    assert not hooks_json.exists() or not any(_codex_registrations(env["home"]).values())
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---

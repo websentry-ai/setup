@@ -95,9 +95,15 @@ Runs first inside `setup` (and after `clear`); idempotent, existence-guarded:
   `ai.getunbound.discovery` label in the system domain and must survive
 - remove `~/.local/share/unbound/{install.sh,run-scheduled.sh}`, stale
   `unbound.py` + `.self_update_check`/`.self_update.lock` in each tool's
-  hooks dir, and the managed (system) `unbound.py` copies
+  hooks dir
 - strip user-mode hook registrations via each module's own stripper
   (user-authored hooks survive)
+- **copilot and codex keep their user-level hook**: it is the live install,
+  rewritten in place by their adapters (only `.self_update_*` is swept);
+  `clear_setup` removes it on uninstall
+- managed (system) `unbound.py` copies are removed by the claude-code,
+  cursor and augment adapters after their settings write succeeds, never by
+  the sweep (codex writes no managed settings, so it leaves its copy)
 - `~/.unbound/config.json` is never touched
 
 ## backfill / clear
