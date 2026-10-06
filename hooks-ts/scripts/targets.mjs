@@ -57,7 +57,7 @@ const OPENCODE_BANNER = [
 ].join("\n");
 
 /**
- * name     -the directory name, both under dist/ and at the repo root. Lowercase, path-safe.
+ * name     - the directory name, both under dist/ and at the repo root. Lowercase, path-safe.
  * entry    - the bundle's entry point, relative to hooks-ts/.
  * banner   - the comment esbuild puts at the top of the output.
  * maxBytes - the size ceiling `scripts/targets.build.test.ts` holds the built bundle under. A value
