@@ -3124,7 +3124,7 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "4694db7e7a1cc2b21de9c7520820896e" : "source";
+var BUILD_TOKEN = true ? "d9cf12d5e9bd2eca528e81055a3ebf29" : "source";
 function createModuleToken(buildToken = BUILD_TOKEN) {
   return Object.freeze({ module: SENTINEL_KEY, build: buildToken });
 }
@@ -4292,6 +4292,7 @@ function registerV2Recording(ctx, runtime, recordFor) {
           }
           case "session.execution.succeeded":
           case "session.execution.interrupted":
+          case "session.execution.failed":
             emit("session.idle", { sessionID });
             return;
           case "session.deleted":
