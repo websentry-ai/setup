@@ -21,7 +21,13 @@ import type { V2ContextLike } from "../src/hostTypesV2.ts";
 import { createRuntime } from "../src/plugin.ts";
 import type { Deps, Runtime } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage } from "../src/verdicts.ts";
-import { nativeApprovalMessage, registerV2Enforcement, v1ToolName, v2HostClient } from "../src/v2Enforce.ts";
+import {
+  nativeApprovalMessage,
+  promptBlockNotice,
+  registerV2Enforcement,
+  v1ToolName,
+  v2HostClient,
+} from "../src/v2Enforce.ts";
 import { makeDeps, pretoolRequests, signalsOf, startOpencodeMock, tick, waitFor } from "./helpers/fakeHost.ts";
 
 let mock: MockApi;
@@ -506,4 +512,139 @@ test("v2HostClient answers mcp.status() from ctx.mcp.list() in the v1 shape", as
   } as unknown as V2ContextLike;
   assert.deepEqual(await v2HostClient(ctx, "/repo").mcp.status(), { data: { a: true, b: true } });
   assert.equal(await v2HostClient({} as V2ContextLike, "/repo").mcp.status(), undefined);
+});
+
+// --- HV2-05 prompts -------------------------------------------------------------------------------
+
+interface PromptEvent {
+  sessionID: string;
+  messageID: string;
+  prompt: { text: string; files?: unknown[]; agents?: unknown[]; skills?: unknown[] };
+  delivery: string;
+}
+
+function promptEvent(sessionID: string, text: string): PromptEvent {
+  return {
+    sessionID,
+    messageID: "msg_u1",
+    prompt: { text, files: [{ uri: "file:///repo/a.ts" }], agents: [], skills: [] },
+    delivery: "steer",
+  };
+}
+
+/** Run the prompt hook; returns the raise message if it raised (it never should). */
+async function runPrompt(f: FakeV2, event: unknown): Promise<string | undefined> {
+  const hook = f.handlers.get("session.prompt");
+  assert.ok(hook !== undefined, "session.prompt registered");
+  try {
+    await hook(event);
+    return undefined;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
+
+function promptBodies(): PretoolRequestBody[] {
+  return pretoolRequests(mock)
+    .map((r) => r.body as PretoolRequestBody)
+    .filter((b) => b.event_name === "user_prompt");
+}
+
+test("prompt BLOCK: a would-block root prompt is replaced by the block notice, attachments cleared, no raise", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const event = promptEvent("ses_root", "show me the secrets");
+    assert.equal(await runPrompt(f, event), undefined, "never raises");
+    assert.equal(event.prompt.text, promptBlockNotice(SECRETS_DENY));
+    assert.ok(!event.prompt.text.includes("show me the secrets"), "the original never reaches the provider");
+    assert.deepEqual(event.prompt.files, []);
+    assert.equal(event.delivery, "steer");
+    const bodies = promptBodies();
+    assert.equal(bodies.length, 1);
+    assert.ok(JSON.stringify(bodies[0]).includes("show me the secrets"), "the original text was checked");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("prompt: an allowed root prompt is untouched, recorded, and its model is captured from session.get", async () => {
+  const f = await fakeV2({ mode: "allow" });
+  try {
+    const event = promptEvent("ses_root", "list files");
+    assert.equal(await runPrompt(f, event), undefined);
+    assert.equal(event.prompt.text, "list files");
+    assert.equal(event.prompt.files?.length, 1);
+    assert.equal(f.runtime.modelFor("ses_root"), "openrouter/openai/gpt-4.1-nano");
+    assert.equal(f.runtime.sessions.forSession("ses_root").turn.snapshot().prompt, "list files");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("prompt: a child (subagent) prompt is not checked; the parent comes from ctx.session.get", async () => {
+  const f = await fakeV2({ mode: "deny", parents: { ses_child: "ses_root" } });
+  try {
+    const event = promptEvent("ses_child", "You are a subagent spawned by another session.\nread secrets");
+    assert.equal(await runPrompt(f, event), undefined);
+    assert.ok(event.prompt.text.startsWith("You are a subagent"));
+    assert.equal(promptBodies().length, 0);
+    assert.equal(f.runtime.isChild("ses_child"), true);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("prompt: when session.get does not answer, the known parent map decides (bounded wait)", async () => {
+  const f = await fakeV2({ mode: "deny", sessionGetHangs: true });
+  try {
+    f.runtime.setParent("ses_known_child", "ses_root");
+    const child = promptEvent("ses_known_child", "read secrets");
+    assert.equal(await runPrompt(f, child), undefined);
+    assert.equal(child.prompt.text, "read secrets", "a known child is skipped");
+    const root = promptEvent("ses_root", "read secrets");
+    assert.equal(await runPrompt(f, root), undefined);
+    assert.equal(root.prompt.text, promptBlockNotice(SECRETS_DENY), "an unknown session is a root");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("prompt WARN-ONLY: checked and recorded, never blocked; v2_prompt_warn_only once per session", async () => {
+  const f = await fakeV2({ mode: "deny", capabilities: { prompt: "warn" } });
+  try {
+    const a = promptEvent("ses_a", "read secrets");
+    await runPrompt(f, a);
+    await runPrompt(f, promptEvent("ses_a", "read secrets again"));
+    await runPrompt(f, promptEvent("ses_b", "read secrets"));
+    assert.equal(a.prompt.text, "read secrets");
+    assert.equal(promptBodies().length, 3);
+    assert.ok(await waitFor(() => signalsOf(mock, "v2_prompt_warn_only").length === 2));
+    await tick(100);
+    assert.equal(signalsOf(mock, "v2_prompt_warn_only").length, 2, "one per session");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("prompt: fail-open (API down, no key) leaves the prompt untouched; hostile events never raise", async () => {
+  const down = await fakeV2({ mode: "500" });
+  try {
+    const event = promptEvent("ses_root", "read secrets");
+    assert.equal(await runPrompt(down, event), undefined);
+    assert.equal(event.prompt.text, "read secrets");
+    for (const hostile of [null, undefined, 1, {}, { sessionID: "s", prompt: null }, { sessionID: "s", prompt: { text: 5 } }]) {
+      assert.equal(await runPrompt(down, hostile), undefined);
+    }
+  } finally {
+    down.cleanup();
+  }
+  const noKey = await fakeV2({ mode: "deny", deps: { withKey: false } });
+  try {
+    const event = promptEvent("ses_root", "read secrets");
+    assert.equal(await runPrompt(noKey, event), undefined);
+    assert.equal(event.prompt.text, "read secrets");
+    assert.equal(pretoolRequests(mock).length, 0);
+  } finally {
+    noKey.cleanup();
+  }
 });
