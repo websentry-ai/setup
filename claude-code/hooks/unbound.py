@@ -4856,7 +4856,7 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str],
                    or _cowork_session_from_transcript(transcript_path))
         if session is not None:
             return _cowork_skill_path(prefix, name, session)
-        if any(_COWORK_SESSIONS_DIRNAME in (value or '') for value in (cwd, transcript_path)):
+        if _names_cowork_tree(cwd) or _names_cowork_tree(transcript_path):
             return None
 
         # Plugin skills ("<plugin>:<name>") live outside the project tree.
@@ -4937,6 +4937,22 @@ def _cowork_session_from_transcript(transcript_path: Optional[str]) -> Optional[
     return matches[0] if len(matches) == 1 else None
 
 
+def _names_cowork_tree(value: Optional[str]) -> bool:
+    """True when ``value`` sits under Claude Desktop's Cowork sessions tree, or is a temp
+    transcript whose slug names it. A folder that merely shares the name is not."""
+    if not value or _COWORK_SESSIONS_DIRNAME not in value:
+        return False
+    try:
+        candidate = Path(value).resolve()
+        for base in _claude_desktop_support_dirs():
+            root = base / _COWORK_SESSIONS_DIRNAME
+            if root.resolve() in candidate.parents or _is_slug_of(candidate.parent.name, root):
+                return True
+    except Exception:
+        return False
+    return False
+
+
 def _is_slug_of(slug: str, path: Path) -> bool:
     """True when ``slug`` names ``path`` or a folder inside it."""
     base = re.sub(r'[^A-Za-z0-9]', '-', str(path))
@@ -4962,8 +4978,10 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         return str(own)
     sources = {}
     if prefix in ('', COWORK_BUNDLED_SKILLS_PREFIX):
-        root = session.parent.parent.parent
-        for path in (root / 'skills-plugin').glob('**/skills/%s/SKILL.md' % name):
+        bundles = session.parent.parent.parent / 'skills-plugin'
+        # Prefer this session's own account/org bundle when the app keeps one.
+        scoped = bundles / session.parent.parent.name / session.parent.name
+        for path in (scoped if scoped.is_dir() else bundles).glob('**/skills/%s/SKILL.md' % name):
             sources.setdefault('bundle', []).append(path)
     if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
         for plugin in (session.parent / 'rpm').glob('*'):

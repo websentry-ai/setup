@@ -141,6 +141,27 @@ class TestCoworkSkillIdentity(_CoworkTree):
             str(skill))
 
 
+class TestCoworkGuardIsStructural(_CoworkTree):
+    """Only Claude Desktop's real sessions tree marks a run as Cowork, never a folder name."""
+
+    def test_claude_code_in_a_folder_merely_named_like_cowork_keeps_its_skills(self):
+        cc_skills = Path(self._tmp.name) / "cc" / "skills"
+        _write(cc_skills / "review" / "SKILL.md", "# review")
+        repo = Path(self._tmp.name) / "work" / "local-agent-mode-sessions-tools"
+        repo.mkdir(parents=True)
+        with patch.object(unbound, "CLAUDE_SKILLS_ROOT", cc_skills):
+            self.assertEqual(unbound._resolve_skill_path("review", str(repo)),
+                             str(cc_skills / "review" / "SKILL.md"))
+
+
+class TestCoworkBundleScope(_CoworkTree):
+
+    def test_the_sessions_own_account_bundle_wins_over_a_newer_one_elsewhere(self):
+        mine = _write(self.root / "skills-plugin" / "acct-1" / "org-1" / "skills" / "xlsx" / "SKILL.md", "# mine", 3600)
+        _write(self.root / "skills-plugin" / "acct-2" / "org-9" / "skills" / "xlsx" / "SKILL.md", "# theirs")
+        self.assertEqual(self.resolve("anthropic-skills:xlsx"), str(mine))
+
+
 class TestCoworkRunInAPickedFolder(_CoworkTree):
     """A run working in a folder the user picked: cwd is outside the sandbox and the
     transcript sits in a temp dir, named by a slug of the session's outputs path."""
@@ -172,7 +193,8 @@ class TestCoworkRunInAPickedFolder(_CoworkTree):
 
     def test_a_slug_naming_no_real_session_resolves_nothing(self):
         self.bundle("b1", "xlsx")
-        fake = str(Path(self._tmp.name) / "projects" / "-x-local-agent-mode-sessions-a-b-local-zz-outputs" / "s.jsonl")
+        slug = re.sub(r"[^A-Za-z0-9]", "-", str(self.root / "a" / "b" / "local_zz" / "outputs"))
+        fake = str(Path(self._tmp.name) / "projects" / slug / "s.jsonl")
         picked = Path(self._tmp.name) / "picked"
         picked.mkdir()
         self.assertIsNone(self.resolve("xlsx", cwd=picked, transcript_path=fake))
