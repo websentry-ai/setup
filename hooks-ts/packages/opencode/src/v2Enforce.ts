@@ -814,11 +814,21 @@ export function registerV2Enforcement(
           return;
         }
         if (capabilities.prompt === "block") {
-          const target = prompt as Record<string, unknown>;
-          target.text = promptBlockNotice(message);
-          if ("files" in target) target.files = [];
-          if ("agents" in target) target.agents = [];
-          if ("skills" in target) target.skills = [];
+          const notice = promptBlockNotice(message);
+          let replaced = false;
+          try {
+            const target = prompt as Record<string, unknown>;
+            target.text = notice;
+            if ("files" in target) target.files = [];
+            if ("agents" in target) target.agents = [];
+            if ("skills" in target) target.skills = [];
+            replaced = target.text === notice;
+          } catch {
+            replaced = false;
+          }
+          // A prompt the host handed over unmodifiable (frozen, a setter that ignores the write) is
+          // not blocked: never silently (IN-04).
+          if (!replaced) runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, "prompt", "prompt_mutate_failed");
           return;
         }
         // Warn-only: checked and reported, never blocked; once per session.

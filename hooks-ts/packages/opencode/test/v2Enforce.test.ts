@@ -640,6 +640,25 @@ test("IN-03: when session.get does not answer, only a confirmed root is replaced
   }
 });
 
+test("IN-04: a prompt the host hands over unmodifiable is reported, never silently allowed", async () => {
+  for (const make of [
+    (text: string) => Object.freeze({ text }),
+    (text: string) => ({ get text() { return text; }, set text(_v: string) { /* ignored */ } }),
+  ]) {
+    const f = await fakeV2({ mode: "deny" });
+    try {
+      const event = { sessionID: "ses_root", messageID: "m", prompt: make("read secrets"), delivery: "steer" };
+      assert.equal(await runPrompt(f, event), undefined, "never raises");
+      assert.equal(event.prompt.text, "read secrets");
+      assert.ok(await waitFor(() => signalsOf(mock, "v2_not_enforcing").length === 1));
+      const body = signalsOf(mock, "v2_not_enforcing")[0]?.body as { errors?: Array<{ message?: string }> };
+      assert.ok((body.errors?.[0]?.message ?? "").includes("prompt_mutate_failed"));
+    } finally {
+      f.cleanup();
+    }
+  }
+});
+
 test("prompt WARN-ONLY: checked and recorded, never blocked; v2_prompt_warn_only once per session", async () => {
   const f = await fakeV2({ mode: "deny", capabilities: { prompt: "warn" } });
   try {
