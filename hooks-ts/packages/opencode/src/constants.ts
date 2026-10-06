@@ -45,6 +45,11 @@ export const SIGNAL_API_FAMILY_INACTIVE = "api_family_inactive";
 /** An apply_patch named more distinct files than `MAX_PATCH_TARGETS` (and was blocked). */
 export const SIGNAL_PATCH_TARGETS_CAPPED = "patch_targets_capped";
 
+// --- notices ------------------------------------------------------------------------------------
+/** Shown once per directory when resolving the key / gateway / checker raised (13-REVIEW WR-03). */
+export const INIT_ERROR_NOTICE =
+  "Unbound: the policy plugin could not start (configuration error) — tool calls are not checked; it retries automatically";
+
 // --- limits -------------------------------------------------------------------------------------
 /** The most distinct files one apply_patch is checked for; a patch naming more is blocked. */
 export const MAX_PATCH_TARGETS = 1024;

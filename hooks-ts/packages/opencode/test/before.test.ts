@@ -10,7 +10,8 @@ import type { PolicyChecker } from "../../core/src/policy.ts";
 import type { PretoolRequestBody } from "../../core/src/types.ts";
 import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import { PATCH_TOO_LARGE_REASON } from "../src/before.ts";
-import { createServerPlugin } from "../src/plugin.ts";
+import { INIT_ERROR_NOTICE } from "../src/constants.ts";
+import { createServerPlugin, INIT_RETRY_MS, NO_KEY_RETRY_MS } from "../src/plugin.ts";
 import type { Deps } from "../src/plugin.ts";
 import { APPROVAL_PREFIX, approvalMessage, blockingMessage, strictest } from "../src/verdicts.ts";
 import { createScopedStates } from "../../core/src/scopedState.ts";
@@ -661,6 +662,96 @@ test("a 500 or a malformed answer fails open and reports a bypass", async () => 
     } finally {
       h.cleanup();
     }
+  }
+});
+
+// --- init fault / late key (WR-03) --------------------------------------------------------------
+
+function denyChecker(): PolicyChecker {
+  return { checkTool: async () => ({ kind: "deny", reason: "Reading secrets is blocked." }) };
+}
+
+test("a resolution fault is degraded, not 'no key': own notice, one init_degraded, retried after a backoff", async () => {
+  mock.requests.length = 0;
+  mock.setMode("allow");
+  let clock = 1_000_000;
+  let attempts = 0;
+  const t = makeDeps(mock, {
+    now: () => clock,
+    makeChecker: () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("bad gateway url");
+      return denyChecker();
+    },
+  });
+  try {
+    const server = createServerPlugin(t.deps);
+    const fake = makeFakeInput({ directory: "/repo" });
+    const before = ((await server(fake.input)) as Hooks)["tool.execute.before"] as BeforeHook;
+    const bash = { args: { command: "cat .env" } };
+    assert.equal(await outcome(before(call("bash"), bash)), undefined, "a fault allows");
+    assert.equal(await outcome(before(call("bash", "ses_root", "call_2"), bash)), undefined, "still within the backoff");
+    assert.equal(server.inspect.resolveCount(), 1, "not re-resolved inside the backoff");
+    await tick();
+    assert.equal(fake.toasts.filter((x) => x.message === INIT_ERROR_NOTICE).length, 1);
+    assert.equal(fake.toasts.filter((x) => x.message === NO_KEY_NOTICE).length, 0, "never the misleading no-key text");
+    assert.ok(await waitFor(() => signalsOf(mock, "init_degraded").length === 1));
+    assert.ok(JSON.stringify(signalsOf(mock, "init_degraded")[0]?.body).includes("resolve_fault"));
+
+    clock += INIT_RETRY_MS;
+    assert.equal(await outcome(before(call("bash", "ses_root", "call_3"), bash)), SECRETS_DENY, "recovered without a restart");
+    assert.equal(server.inspect.resolveCount(), 2);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("a fault that persists is reported once and retried at each backoff", async () => {
+  mock.requests.length = 0;
+  mock.setMode("allow");
+  let clock = 1_000_000;
+  const t = makeDeps(mock, {
+    now: () => clock,
+    makeChecker: () => {
+      throw new Error("still broken");
+    },
+  });
+  try {
+    const server = createServerPlugin(t.deps);
+    const fake = makeFakeInput({ directory: "/repo" });
+    const before = ((await server(fake.input)) as Hooks)["tool.execute.before"] as BeforeHook;
+    for (let i = 0; i < 3; i += 1) {
+      assert.equal(await outcome(before(call("bash", "ses_root", `call_${i}`), { args: { command: "ls" } })), undefined);
+      clock += INIT_RETRY_MS;
+    }
+    assert.equal(server.inspect.resolveCount(), 3);
+    await tick(100);
+    assert.equal(signalsOf(mock, "init_degraded").length, 1);
+    assert.equal(fake.toasts.filter((x) => x.message === INIT_ERROR_NOTICE).length, 1);
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("a key added after start is picked up without a restart", async () => {
+  mock.requests.length = 0;
+  mock.setMode("deny");
+  let clock = 1_000_000;
+  const t = makeDeps(mock, { withKey: false, now: () => clock });
+  try {
+    const server = createServerPlugin(t.deps);
+    const fake = makeFakeInput({ directory: "/repo" });
+    const before = ((await server(fake.input)) as Hooks)["tool.execute.before"] as BeforeHook;
+    const bash = { args: { command: "cat .env" } };
+    assert.equal(await outcome(before(call("bash"), bash)), undefined);
+    (t.deps.env as NodeJS.ProcessEnv).UNBOUND_OPENCODE_API_KEY = TEST_KEY;
+    assert.equal(await outcome(before(call("bash", "ses_root", "call_2"), bash)), undefined, "not re-read on every call");
+    assert.equal(pretoolRequests(mock).length, 0);
+    clock += NO_KEY_RETRY_MS;
+    assert.equal(await outcome(before(call("bash", "ses_root", "call_3"), bash)), SECRETS_DENY);
+    assert.equal(pretoolRequests(mock).length, 1);
+  } finally {
+    t.cleanup();
   }
 });
 

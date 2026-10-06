@@ -25,7 +25,10 @@
 //     the turn record from `createSessionStates()` (by session id) and the heartbeat gate / no-key
 //     latch from `createInstanceStates()` (by absolute directory). "Once" behaviour in those
 //     registries needs an absolute directory and a non-empty session id (12-03 notes).
-//   * **Without an API key it does nothing** but show one notice per directory (13-05).
+//   * **Without an API key it does nothing** but show one notice per directory (13-05), and looks
+//     for a key again every `NO_KEY_RETRY_MS`, so a key added later works without a restart. A fault
+//     while resolving is not "no key": it shows its own notice, reports `init_degraded` once and is
+//     retried after `INIT_RETRY_MS` (13-REVIEW WR-03).
 //
 // Module scope holds only the module token; everything else is per factory.
 
@@ -118,8 +121,17 @@ export interface Deps {
   moduleToken: object;
 }
 
-/** What `init()` resolved. Every member is absent exactly when no key resolved (inactive). */
+/**
+ * What `init()` resolved. Every member below `status` is absent unless `status` is `"active"`.
+ *
+ *   * `active`     — a key resolved and every piece was built; cached for the copy's lifetime.
+ *   * `no_key`     — no key found anywhere. Re-resolved after `NO_KEY_RETRY_MS`, so a key added to
+ *                    `~/.unbound/config.json` later is picked up without restarting opencode.
+ *   * `init_error` — something raised while resolving (13-REVIEW WR-03). Re-resolved after
+ *                    `INIT_RETRY_MS`; reported once as `init_degraded` / `resolve_fault`.
+ */
 export interface Resolved {
+  status: "active" | "no_key" | "init_error";
   apiKey: string | undefined;
   baseUrl: string | undefined;
   /** The (gateway, key) scope: hand `scope.policy` to `evaluateToolCall`, `scope.key` to latches. */
@@ -147,6 +159,8 @@ export interface DirectoryRecord {
   liveMcpServerNames: string[];
   /** When the last runtime refresh started (`deps.now()`), or `undefined` before the first one. */
   mcpRefreshedAt: number | undefined;
+  /** The init-error notice (WR-03) was shown for this directory. */
+  initErrorNoticeShown: boolean;
 }
 
 /** The runtime one plugin copy shares across its directories. */
@@ -224,7 +238,7 @@ export interface Runtime {
 
 /** Read-only test seam, attached to the factory as a NON-enumerable `inspect` property. */
 export interface PluginInspector {
-  /** How many times `init()` actually resolved (0 or 1). */
+  /** How many times `init()` actually resolved: 1 once active; more only after no-key / fault retries. */
   resolveCount(): number;
   hasChecker(): boolean;
   instance(dir: string): { directory: string; mcpServerNames: string[] } | undefined;
@@ -235,7 +249,25 @@ export interface PluginInspector {
 
 export type ServerPlugin = ServerFactory & { readonly inspect: PluginInspector };
 
-const INERT: Resolved = Object.freeze({
+/** How long a resolution that raised is kept before the next hook call tries again. */
+export const INIT_RETRY_MS = 5_000;
+/** How long "no key found" is kept before the next hook call looks again. */
+export const NO_KEY_RETRY_MS = 30_000;
+
+const NO_KEY: Resolved = Object.freeze({
+  status: "no_key",
+  apiKey: undefined,
+  baseUrl: undefined,
+  scope: undefined,
+  client: undefined,
+  checker: undefined,
+  telemetry: undefined,
+  signals: undefined,
+  cacheSync: undefined,
+});
+
+const INIT_ERROR: Resolved = Object.freeze({
+  status: "init_error",
   apiKey: undefined,
   baseUrl: undefined,
   scope: undefined,
@@ -323,7 +355,14 @@ export interface SessionExtras {
 }
 
 function freshRecord(directory: string): DirectoryRecord {
-  return { directory, client: undefined, mcpServerNames: [], liveMcpServerNames: [], mcpRefreshedAt: undefined };
+  return {
+    directory,
+    client: undefined,
+    mcpServerNames: [],
+    liveMcpServerNames: [],
+    mcpRefreshedAt: undefined,
+    initErrorNoticeShown: false,
+  };
 }
 
 function freshExtras(): SessionExtras {
@@ -426,6 +465,8 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
   });
 
   let resolved: Resolved | undefined;
+  /** When a non-active `resolved` may be re-resolved (`deps.now()` time). */
+  let retryAt = 0;
   let resolveCount = 0;
   let identityLoader: AccountIdentityLoader | undefined;
 
@@ -444,12 +485,20 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
   }
   const reportedOnce = new Set<string>();
 
-  function resolveNow(): Resolved {
+  /** What a resolution learnt before it raised, so the fault can still be reported. */
+  interface Progress {
+    apiKey?: string;
+    baseUrl?: string;
+  }
+
+  function resolveNow(progress: Progress): Resolved {
     const env: NodeJS.ProcessEnv = source.env ?? process.env;
     const homeDir: string = "homeDir" in source && typeof source.homeDir === "string" ? source.homeDir : safeHomeDir();
     const apiKey = resolveApiKey(env, homeDir, OPENCODE_PROFILE);
-    if (apiKey === undefined) return INERT;
+    if (apiKey === undefined) return NO_KEY;
+    progress.apiKey = apiKey;
     const baseUrl = resolveGatewayUrl(env, homeDir);
+    progress.baseUrl = baseUrl;
     const scope = deps.scopes.forScope(baseUrl, apiKey);
     const fingerprint = keyFingerprint(apiKey);
     const cachePath = resolveCachePath(env, homeDir, OPENCODE_PROFILE);
@@ -502,7 +551,42 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
             onSync: cacheSync,
             now: deps.now,
           });
-    return { apiKey, baseUrl, scope, client, checker, telemetry, signals, cacheSync };
+    return { status: "active", apiKey, baseUrl, scope, client, checker, telemetry, signals, cacheSync };
+  }
+
+  let initFaultReported = false;
+
+  /**
+   * Best-effort `init_degraded` / `resolve_fault`, once per plugin copy, through a client built only
+   * from what resolved before the fault. If even that client cannot be built (the fault was in it),
+   * there is nobody to tell, and the user still sees the init-error notice. Deferred and total.
+   */
+  function reportInitFault(progress: Progress): void {
+    if (initFaultReported) return;
+    initFaultReported = true;
+    const { apiKey, baseUrl } = progress;
+    if (apiKey === undefined || baseUrl === undefined) return;
+    later(() => {
+      const client = createApiClient({
+        baseUrl,
+        apiKey,
+        profile: OPENCODE_PROFILE,
+        ...(deps.timeouts?.errorsMs === undefined ? {} : { errorsTimeoutMs: deps.timeouts.errorsMs }),
+      });
+      createSignalReporter({ client, profile: OPENCODE_PROFILE, apiKey, now: deps.now }).report(SIGNAL_INIT_DEGRADED, {
+        toolName: "init",
+        detail: "resolve_fault",
+      });
+    });
+  }
+
+  function nowSafe(): number {
+    try {
+      const value = deps.now();
+      return typeof value === "number" && Number.isFinite(value) ? value : Date.now();
+    } catch {
+      return Date.now();
+    }
   }
 
   const runtime: Runtime = {
@@ -511,14 +595,24 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     instances,
     hostVersion: undefined,
     init(): Resolved {
-      if (resolved === undefined) {
-        resolveCount += 1;
+      // `active` is kept for the copy's lifetime. `no_key` and `init_error` are kept only until
+      // their retry time (13-REVIEW WR-03), so neither latches the plugin inactive for the life of
+      // the process, and a broken home directory is still not re-read on every tool call.
+      const now = nowSafe();
+      if (resolved !== undefined && (resolved.status === "active" || now < retryAt)) return resolved;
+      resolveCount += 1;
+      const progress: Progress = {};
+      try {
+        resolved = resolveNow(progress);
+        if (resolved.status !== "active") retryAt = now + NO_KEY_RETRY_MS;
+      } catch {
+        // A fault while resolving allows, never blocks: degraded, reported once, retried soon.
+        resolved = INIT_ERROR;
+        retryAt = now + INIT_RETRY_MS;
         try {
-          resolved = resolveNow();
+          reportInitFault(progress);
         } catch {
-          // A fault while resolving is an inactive plugin, never a block. Cached, so a broken home
-          // directory is not re-read on every tool call.
-          resolved = INERT;
+          // A report is never worth a fault.
         }
       }
       return resolved;

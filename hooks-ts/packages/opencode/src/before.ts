@@ -31,6 +31,7 @@ import type { EvaluateDeps, ToolCallInput, ToolEvaluation } from "../../core/src
 import { block } from "./block.ts";
 import { auditToolInput, normaliseMcp } from "../../core/src/payload.ts";
 import {
+  INIT_ERROR_NOTICE,
   MAX_PATCH_TARGETS,
   PATCH_CONCURRENCY,
   SIGNAL_MCP_ATTRIBUTION_AMBIGUOUS,
@@ -184,8 +185,16 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     const resolved = runtime.init();
     const checker = resolved.checker;
     const scope = resolved.scope;
-    // No key ⇒ inert (RES-06): no request, no verdict, one notice per directory.
+    // No key ⇒ inert (RES-06); a resolution fault ⇒ degraded (WR-03). Either way: no request, no
+    // verdict, and one notice per directory that names the actual cause.
     if (checker === undefined || scope === undefined) {
+      if (resolved.status === "init_error") {
+        if (!record.initErrorNoticeShown) {
+          record.initErrorNoticeShown = true;
+          void notify(record.client, INIT_ERROR_NOTICE, "warning");
+        }
+        return undefined;
+      }
       const instance = runtime.instances.forDirectory(record.directory);
       if (!instance.noKeyNoticeShown) {
         instance.noKeyNoticeShown = true;
