@@ -655,6 +655,7 @@ if (args.line === "v1") {
   const shellCommand = `echo smoke > ${marker}`;
   const shellRes = await httpJson("POST", `/api/session/${encodeURIComponent(sessionID)}/shell`, { command: shellCommand }, dirHeaders);
   console.log(`POST /api/session/:id/shell -> ${shellRes.status} (a blocked user shell answers an empty 500)`);
+  if (shellRes.status !== 500) await fail(`a blocked v2 user shell answered ${shellRes.status}, not the HTTP 500 of a raise`);
   const denied = await waitFor(
     () =>
       requests.find(

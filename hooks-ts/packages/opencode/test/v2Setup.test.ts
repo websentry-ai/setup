@@ -477,6 +477,27 @@ test("a foreign value in the slot does not stop enforcement: registers and repor
   }
 });
 
+test("IN-07: another genuine build in the v2 slot keeps enforcing and reports duplicate_load other_build", async () => {
+  resetMock();
+  const t = makeDeps(mock);
+  const sentinelKey = Symbol("v2-setup-test");
+  try {
+    // The older build's holder, as its own setup left it (module re-evaluated after an upgrade).
+    await createSetupV2({ ...t.deps, sentinelKey, buildToken: "0123456789abcdef0123456789abcdef" })(fakeCtx("/old").ctx);
+    const a = fakeCtx("/repo");
+    assert.equal(typeof (await createSetupV2({ ...t.deps, sentinelKey, buildToken: "fedcba9876543210fedcba9876543210" })(a.ctx)), "function");
+    await tick(5);
+    assert.equal(a.handlers.size, ALL_HOOKS.length, "registered: this build enforces too");
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length === 1));
+    const body = signalsOf(mock, SIGNAL_DUPLICATE_LOAD)[0]?.body as { errors?: Array<{ message?: string }> };
+    assert.ok((body.errors?.[0]?.message ?? "").includes("other_build"), body.errors?.[0]?.message);
+    await tick(50);
+    assert.equal(signalsOf(mock, SIGNAL_SENTINEL_TAMPERED).length, 0);
+  } finally {
+    t.cleanup();
+  }
+});
+
 test("identity is provider-level: auth.json in the data dir is not read", async () => {
   resetMock();
   const t = makeDeps(mock);

@@ -90,6 +90,16 @@ export const BUILD_TOKEN: string =
     ? __UNBOUND_OPENCODE_BUILD__
     : "source";
 
+/**
+ * Does `value` look like a build token `scripts/build.mjs` defines (the first 32 hex characters of a
+ * sha256 of the sources)? A frozen, non-configurable holder carrying one that is not ours is another
+ * genuine build of this plugin (an in-place upgrade, or a managed copy beside a newer user copy), not
+ * tampering (14-REVIEW IN-07).
+ */
+export function isBuildToken(value: unknown): boolean {
+  return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
+}
+
 /** A copy's sentinel holder: frozen, branded with the module key and the build token. */
 export function createModuleToken(buildToken: string = BUILD_TOKEN): object {
   return Object.freeze({ module: SENTINEL_KEY, build: buildToken });
@@ -1076,7 +1086,7 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
    * value a project plugin planted, an accessor, another build) is `"foreign"`: this copy keeps
    * enforcing and reports `sentinel_tampered`. Getters are never invoked.
    */
-  function sentinelHolder(): "free" | "mine" | "duplicate" | { foreign: string } {
+  function sentinelHolder(): "free" | "mine" | "duplicate" | "other_build" | { foreign: string } {
     try {
       const desc = Object.getOwnPropertyDescriptor(globalThis, deps.sentinelKey);
       if (desc === undefined) return "free";
@@ -1089,10 +1099,12 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
         return d !== undefined && "value" in d ? d.value : undefined;
       };
       if (own("module") !== SENTINEL_KEY) return { foreign: "foreign_value" };
-      if (own("build") !== deps.buildToken) return { foreign: "other_build" };
-      if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
-        return { foreign: "forged_holder" };
+      const wellFormed = desc.writable === false && desc.configurable === false && Object.isFrozen(holder);
+      if (own("build") !== deps.buildToken) {
+        // Another genuine build (IN-07): both copies enforce; reported as information, not tampering.
+        return wellFormed && isBuildToken(own("build")) ? "other_build" : { foreign: "other_build" };
       }
+      if (!wellFormed) return { foreign: "forged_holder" };
       return "duplicate";
     } catch {
       // A holder whose traps raise (a planted Proxy) must not push this copy into the degraded set.
@@ -1109,6 +1121,11 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       }
       if (holder === "free") {
         claimSentinel();
+      } else if (holder === "other_build") {
+        // Another build of this plugin holds the slot (an in-place upgrade, or a managed copy beside
+        // a newer user copy). It cannot be taken back (non-configurable); this copy keeps enforcing,
+        // so each call is checked by both until one of them goes.
+        later(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, "server", "other_build"));
       } else if (holder !== "mine") {
         // Not another copy of this build: never a reason to stand down. Take the slot back when it
         // can be taken (so later directories and copies see this copy), and keep enforcing either way.

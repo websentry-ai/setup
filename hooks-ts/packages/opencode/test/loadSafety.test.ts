@@ -287,6 +287,34 @@ test("a value a foreign plugin planted in the slot never disables enforcement; s
   }
 });
 
+test("IN-07: another genuine build in the slot (an in-place upgrade) keeps enforcing and reports duplicate_load other_build", async () => {
+  resetMock();
+  mock.setMode("deny");
+  const sentinelKey = Symbol("unbound.opencode.upgrade");
+  Object.defineProperty(globalThis, sentinelKey, {
+    value: Object.freeze({ module: "unbound.opencode", build: "0123456789abcdef0123456789abcdef" }),
+    writable: false,
+    configurable: false,
+  });
+  const t = makeDeps(mock, { sentinelKey });
+  try {
+    const hooks = hooksOf(await createServerPlugin(t.deps)(makeFakeInput({ directory: "/repo" }).input));
+    await assert.rejects(
+      hooks["tool.execute.before"]?.({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "cat .env" } }) ??
+        Promise.resolve(),
+      /Blocked by Unbound policy/,
+      "still enforcing",
+    );
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_DUPLICATE_LOAD).length === 1));
+    await tick();
+    const body = signalsOf(mock, SIGNAL_DUPLICATE_LOAD)[0]?.body as { errors?: Array<{ message?: string }> };
+    assert.ok((body.errors?.[0]?.message ?? "").includes("other_build"), body.errors?.[0]?.message);
+    assert.equal(signalsOf(mock, SIGNAL_SENTINEL_TAMPERED).length, 0, "not reported as tampering");
+  } finally {
+    t.cleanup();
+  }
+});
+
 test("a configurable planted value is taken back, so a later copy of this build stands down (WR-04)", async () => {
   resetMock();
   const sentinelKey = Symbol("unbound.opencode.reclaim");

@@ -30,6 +30,7 @@ import type {
   V2McpStatusChangedData,
   V2PermissionEvaluate,
   V2SessionCreatedData,
+  V2SessionExecutionFailedData,
   V2SessionExecutionInterruptedData,
   V2SessionExecutionSucceededData,
   V2SessionModelRequest,
@@ -73,6 +74,7 @@ export type HostPassesExecSucceeded = Assert<Extends<DataOf<"session.execution.s
 export type HostPassesExecInterrupted = Assert<
   Extends<DataOf<"session.execution.interrupted">, V2SessionExecutionInterruptedData>
 >;
+export type HostPassesExecFailed = Assert<Extends<DataOf<"session.execution.failed">, V2SessionExecutionFailedData>>;
 export type HostPassesTextEnded = Assert<Extends<DataOf<"session.text.ended">, V2SessionTextEndedData>>;
 export type HostPassesStepStarted = Assert<Extends<DataOf<"session.step.started">, V2SessionStepStartedData>>;
 export type HostPassesStepEnded = Assert<Extends<DataOf<"session.step.ended">, V2SessionStepEndedData>>;

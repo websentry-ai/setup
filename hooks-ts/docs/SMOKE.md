@@ -336,7 +336,7 @@ Both scripts build their own isolated home and an inline loopback mock.
 - **v2 leg:** authenticates with a random per-run `OPENCODE_SERVER_PASSWORD`, then:
   - asserts exactly one `v2_status` report whose detail is the shipped capability set (`EXPECTED_V2_STATUS`);
   - asserts a `session_start` heartbeat with the CLI's own version for a model-free `POST /api/session`;
-  - asserts a real user-shell block through `POST /api/session/:id/shell`: an empty HTTP 500, the mock saw the `bash` tool_use, and the marker file was not created;
+  - asserts a real user-shell block through `POST /api/session/:id/shell`: the route answers HTTP 500 (its body is empty on 2.0.x; the status is what the smoke checks), the mock saw the `bash` tool_use, and the marker file was not created;
   - drives three model-free turns through a loopback OpenAI-compatible provider (scripted tool calls, no key) and a tiny stdio MCP server, both inlined in the script:
     - a built-in `shell` call denied through the permission hook: the command did not run, the provider's follow-up carries `permission.rejected` with `Blocked by Unbound policy: smoke`, and the call was checked exactly once;
     - a Code Mode MCP call on a server named `smoke-mcp.v2` (opencode sanitises it to `smoke-mcp_v2_echo_marker`): attributed to `smoke-mcp.v2` / `echo_marker`, raised from `tool.execute.before`, not run, and the reason reached the provider;

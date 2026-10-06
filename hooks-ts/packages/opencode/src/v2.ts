@@ -17,8 +17,9 @@
 // One runtime per PROCESS (14-SPIKES V2-12): the host re-evaluates the module for every directory
 // but shares `globalThis`, so the runtime lives in a `globalThis` slot keyed by the build token,
 // with the server sentinel's tamper rule (13-REVIEW WR-04): only a genuine holder of THIS build is
-// shared; anything else in the slot is reported as `sentinel_tampered` and this copy keeps enforcing
-// on its own runtime. A directory that already has handlers registered gets nothing more (a second
+// shared. A well-formed holder of ANOTHER build (an in-place upgrade) is reported as
+// `duplicate_load` (detail `other_build`); anything else in the slot as `sentinel_tampered`. Either
+// way this copy keeps enforcing on its own runtime. A directory that already has handlers registered gets nothing more (a second
 // copy of the plugin, or a repeated call), reported as `duplicate_load`.
 //
 // Never raises, never rejects, never awaits I/O: every report is sent from a later macrotask.
@@ -35,7 +36,7 @@ import {
 } from "./constants.ts";
 import type { V2Capabilities } from "./constants.ts";
 import type { V2Cleanup, V2ContextLike } from "./hostTypesV2.ts";
-import { BUILD_TOKEN, createRuntime } from "./plugin.ts";
+import { BUILD_TOKEN, createRuntime, isBuildToken } from "./plugin.ts";
 import type { Deps, DirectoryRecord, RuntimeHandle } from "./plugin.ts";
 import { createV2Registrations, createV2Scope, registerV2Enforcement, v2HostClient } from "./v2Enforce.ts";
 import type { V2Scope } from "./v2Enforce.ts";
@@ -170,7 +171,7 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
   }
 
   /** The process state to use, and why the slot was not shared when it was not. Getters never run. */
-  function acquire(): { shared: SharedV2; tampered?: string } {
+  function acquire(): { shared: SharedV2; tampered?: string; otherBuild?: true } {
     let foreign: string;
     let configurable = false;
     try {
@@ -193,6 +194,12 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
         if (holder === null || typeof holder !== "object" || own("module") !== SETUP_SENTINEL_KEY) {
           foreign = "foreign_value";
         } else if (own("build") !== buildToken) {
+          const wellFormed = desc.writable === false && desc.configurable === false && Object.isFrozen(holder);
+          if (wellFormed && isBuildToken(own("build"))) {
+            // Another genuine build (IN-07): this copy runs on its own state; information only.
+            if (local === undefined) local = freshShared();
+            return { shared: local, otherBuild: true };
+          }
           foreign = "other_build";
         } else if (desc.writable !== false || desc.configurable !== false || !Object.isFrozen(holder)) {
           foreign = "forged_holder";
@@ -233,10 +240,11 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
   return (ctx: unknown): Promise<V2Cleanup | undefined> => {
     try {
       if (!isV2Context(ctx)) return Promise.resolve(undefined);
-      const { shared, tampered } = acquire();
+      const { shared, tampered, otherBuild } = acquire();
       const handle = shared.handle;
       const runtime = handle.runtime;
       if (tampered !== undefined) later(() => runtime.reportOnce(SIGNAL_SENTINEL_TAMPERED, SETUP_TOOL_LABEL, tampered));
+      if (otherBuild === true) later(() => runtime.reportOnce(SIGNAL_DUPLICATE_LOAD, SETUP_TOOL_LABEL, "other_build"));
 
       const v2 = ctx as V2ContextLike;
       const rawDirectory = readField(readField(v2, "location"), "directory");

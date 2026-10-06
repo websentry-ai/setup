@@ -156,6 +156,14 @@ export interface V2SessionExecutionInterruptedData {
   sessionID: string;
 }
 
+/**
+ * `session.execution.failed` `data`: also a turn end (a provider error, observed on 2.0.24 in 14-05).
+ * The turn log needs its `sessionID`.
+ */
+export interface V2SessionExecutionFailedData {
+  sessionID: string;
+}
+
 /** `session.text.ended` `data`: the assistant text of one text part. */
 export interface V2SessionTextEndedData {
   sessionID: string;
