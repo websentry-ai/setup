@@ -13,8 +13,9 @@ Pi Coding Agent MDM setup also runs, after the tool steps and before the
 discovery scan, but only on a device where pi is detected: the `pi` binary on
 PATH, in a machine bin dir or in any user's bin dirs, or `.pi/agent/auth.json` /
 `.pi/agent/sessions` in any user's home. A device without pi skips it, which is
-reported as skipped and is not a failure. Every other tool installs
-unconditionally.
+reported as skipped and is not a failure. A device where that could not be
+checked (a home that cannot be read, say) gets Pi set up. Every other tool
+installs unconditionally.
 
 Every step uses --api-key (the admin MDM key). The discovery scan authenticates
 as the device's owner, whose key is resolved from the hardware serial, so no
@@ -60,6 +61,7 @@ import os
 import platform
 import random
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -108,12 +110,22 @@ PI_BIN_NAME = "pi"
 # installer creates that, so it would make every onboarded device look like it has pi.
 PI_MARKERS = (".pi/agent/auth.json", ".pi/agent/sessions")
 # Where a per-user CLI lands, relative to a home. PATH alone is not enough: under
-# sudo and under MDM it is a minimal system PATH that lacks these.
-PI_HOME_BIN_DIRS = (".local/bin", ".bun/bin", ".npm-global/bin", ".volta/bin", ".yarn/bin",
-                    "AppData/Roaming/npm", "AppData/Local/Microsoft/WinGet/Links")
+# sudo and under MDM it is a minimal system PATH that lacks these. `.pi/agent/bin`
+# is where pi's own installer puts the binary.
+PI_HOME_BIN_DIRS = (".pi/agent/bin", ".local/bin", ".bun/bin", ".npm-global/bin", ".volta/bin",
+                    ".yarn/bin", "AppData/Roaming/npm", "AppData/Local/Microsoft/WinGet/Links")
 PI_MACHINE_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/snap/bin")
-# Not real accounts; nothing to detect in them.
-PI_SKIP_HOME_NAMES = ("Shared", "Guest", "Public", "Default", "Default User", "All Users")
+# Dirs the OS package manager owns, where a bare `pi` may be another program: Debian
+# and Ubuntu ship a digits-of-pi calculator at /usr/bin/pi.
+PI_OS_PACKAGE_BIN_DIRS = ("/usr/bin", "/bin")
+# Where account homes live, as pi/mdm/setup.py requires before it installs into one.
+PI_HOME_PREFIXES = {"darwin": "/Users/", "linux": "/home/"}
+# Directories under the users root that are not accounts. Linux has no entry: a user
+# named Shared or Guest there is a real one, and pi/mdm/setup.py installs for them.
+PI_SKIP_HOME_NAMES = {
+    "darwin": ("Shared", "Guest"),
+    "windows": ("Public", "Default", "Default User", "All Users"),
+}
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
@@ -535,11 +547,57 @@ def tool_arguments(mdm_args, supports_backfill, supports_skip_settings,
     return args
 
 
-def all_user_homes(system=None, users_root=None) -> list:
+def _pi_stat(path, errors):
+    """os.stat that tells "not there" from "could not look". A path that is absent
+    returns None. Anything else that stops the look (no permission, an I/O error) is
+    recorded in `errors`, so a device where pi could not be ruled out is not reported
+    as a device without pi."""
+    try:
+        return os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as e:
+        errors.append(e)
+        return None
+
+
+def _pi_listdir(path, errors) -> list:
+    """os.listdir with the same split as _pi_stat."""
+    try:
+        return sorted(os.listdir(path))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError as e:
+        errors.append(e)
+        return []
+
+
+def _account_homes(system, errors) -> list:
+    """Home directories from the account database, which is where pi/mdm/setup.py
+    finds the users it installs for. A listing of the users root alone misses a home
+    that is not its direct child, such as /home/DOMAIN/alice. Windows has no such
+    database to read; its profile directories are the list. A database that cannot
+    be read is recorded in `errors`: some homes may have gone unseen."""
+    prefix = PI_HOME_PREFIXES.get(system)
+    if not prefix:
+        return []
+    try:
+        import pwd
+        entries = pwd.getpwall()
+    except Exception as e:
+        errors.append(e)
+        return []
+    return [entry.pw_dir for entry in entries if (entry.pw_dir or "").startswith(prefix)]
+
+
+def all_user_homes(system=None, users_root=None, account_homes=None, errors=None) -> list:
     """Every real user's home on this device, plus the home of whoever is running
     this. The tools belong to users other than root, so detection has to look in
-    all of them. An unreadable root or entry contributes nothing."""
+    all of them: every home the account database names, and every directory under
+    the users root for accounts the database does not enumerate."""
     system = system or platform.system().lower()
+    if errors is None:
+        errors = []
     if users_root is None:
         if system == "windows":
             users_root = os.environ.get("SystemDrive", "C:") + os.sep + "Users"
@@ -547,32 +605,45 @@ def all_user_homes(system=None, users_root=None) -> list:
             users_root = "/Users"
         else:
             users_root = "/home"
+    if account_homes is None:
+        account_homes = _account_homes(system, errors)
+    skip = PI_SKIP_HOME_NAMES.get(system, ())
+
+    candidates = list(account_homes)
+    for name in _pi_listdir(users_root, errors):
+        if not name.startswith("."):
+            candidates.append(os.path.join(users_root, name))
+
     homes = [os.path.expanduser("~")]
-    try:
-        names = sorted(os.listdir(users_root))
-    except OSError:
-        names = []
-    for name in names:
-        if name.startswith(".") or name in PI_SKIP_HOME_NAMES:
+    for home in candidates:
+        if os.path.basename(home.rstrip("/" + os.sep)) in skip or home in homes:
             continue
-        home = os.path.join(users_root, name)
-        if os.path.isdir(home) and home not in homes:
+        found = _pi_stat(home, errors)
+        if found is not None and stat.S_ISDIR(found.st_mode):
             homes.append(home)
     return homes
 
 
-def pi_detected(homes=None, path_dirs=None, machine_bin_dirs=None, system=None) -> bool:
+def pi_detected(homes=None, path_dirs=None, machine_bin_dirs=None, system=None,
+                os_package_bin_dirs=None) -> bool:
     """True when the Pi Coding Agent is present for any user on this device: its
     binary in a bin dir, or a file pi writes for itself in a home. Existence checks
     only -- this runs as root over paths any local user can create, so nothing
-    found is ever opened, read or executed."""
+    found is ever opened, read or executed.
+
+    Raises when nothing was found but some place could not be inspected, so the
+    caller sets Pi up instead of reporting a device that may well have it as clean."""
     system = system or platform.system().lower()
+    errors = []
     if homes is None:
-        homes = all_user_homes(system)
+        homes = all_user_homes(system, errors=errors)
     if path_dirs is None:
         path_dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
     if machine_bin_dirs is None:
         machine_bin_dirs = () if system == "windows" else PI_MACHINE_BIN_DIRS
+    if os_package_bin_dirs is None:
+        os_package_bin_dirs = () if system == "windows" else PI_OS_PACKAGE_BIN_DIRS
+    os_owned = set(os.path.realpath(d) for d in os_package_bin_dirs)
 
     bin_dirs = list(path_dirs) + list(machine_bin_dirs)
     for home in homes:
@@ -580,11 +651,7 @@ def pi_detected(homes=None, path_dirs=None, machine_bin_dirs=None, system=None) 
             bin_dirs.append(os.path.join(home, *rel.split("/")))
         # nvm keeps one bin dir per installed Node version.
         nvm = os.path.join(home, ".nvm", "versions", "node")
-        try:
-            versions = os.listdir(nvm)
-        except OSError:
-            versions = []
-        for version in versions:
+        for version in _pi_listdir(nvm, errors):
             bin_dirs.append(os.path.join(nvm, version, "bin"))
 
     if system == "windows":
@@ -592,14 +659,23 @@ def pi_detected(homes=None, path_dirs=None, machine_bin_dirs=None, system=None) 
     else:
         names = [PI_BIN_NAME]
     for bin_dir in bin_dirs:
+        # In a dir the OS package manager owns, a regular file named `pi` is the
+        # OS's own program. npm links the agent in, so there only a symlink counts.
+        links_only = os.path.realpath(bin_dir) in os_owned
         for name in names:
-            if os.path.exists(os.path.join(bin_dir, name)):
+            path = os.path.join(bin_dir, name)
+            if _pi_stat(path, errors) is None:
+                continue
+            if not links_only or os.path.islink(path):
                 return True
 
     for home in homes:
         for rel in PI_MARKERS:
-            if os.path.exists(os.path.join(home, *rel.split("/"))):
+            if _pi_stat(os.path.join(home, *rel.split("/")), errors) is not None:
                 return True
+
+    if errors:
+        raise errors[0]
     return False
 
 

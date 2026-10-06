@@ -21,11 +21,30 @@ def _touch(path):
     return path
 
 
-def _detect(homes, path_dirs=(), machine_bin_dirs=(), system="darwin"):
+def _link(path, target):
+    os.makedirs(os.path.dirname(str(path)), exist_ok=True)
+    os.symlink(str(target), str(path))
+    return path
+
+
+def _stat_failing_under(monkeypatch, blocked, error=PermissionError):
+    """Make every os.stat under `blocked` fail the way an unreadable home does."""
+    real_stat = os.stat
+
+    def _stat(path, *args, **kwargs):
+        if str(path).startswith(str(blocked)):
+            raise error(13, "Permission denied", str(path))
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(onboard.os, "stat", _stat)
+
+
+def _detect(homes, path_dirs=(), machine_bin_dirs=(), system="darwin", os_package_bin_dirs=()):
     return onboard.pi_detected(homes=[str(h) for h in homes],
                                path_dirs=[str(d) for d in path_dirs],
                                machine_bin_dirs=[str(d) for d in machine_bin_dirs],
-                               system=system)
+                               system=system,
+                               os_package_bin_dirs=[str(d) for d in os_package_bin_dirs])
 
 
 @pytest.fixture
@@ -56,6 +75,7 @@ def test_a_sessions_directory_is_a_signal(home):
 
 
 @pytest.mark.parametrize("rel", [
+    ".pi/agent/bin/pi",   # where pi's own installer puts it
     ".local/bin/pi",
     ".bun/bin/pi",
     ".npm-global/bin/pi",
@@ -74,8 +94,43 @@ def test_the_binary_on_path_is_a_signal(home, tmp_path):
 
 
 def test_the_binary_in_a_machine_bin_dir_is_a_signal(home, tmp_path):
-    _touch(tmp_path / "homebrew" / "pi")
-    assert _detect([home], machine_bin_dirs=[tmp_path / "homebrew"]) is True
+    _touch(tmp_path / "local-bin" / "pi")
+    assert _detect([home], machine_bin_dirs=[tmp_path / "local-bin"]) is True
+
+
+def test_a_plain_file_named_pi_in_an_os_package_dir_is_not_the_agent(home, tmp_path):
+    """Debian and Ubuntu ship a digits-of-pi calculator at /usr/bin/pi. A regular file
+    in a dir the OS package manager owns is the OS's own program."""
+    usr_bin = tmp_path / "usr-bin"
+    _touch(usr_bin / "pi")
+    assert _detect([home], machine_bin_dirs=[usr_bin], os_package_bin_dirs=[usr_bin]) is False
+    assert _detect([home], path_dirs=[usr_bin], os_package_bin_dirs=[usr_bin]) is False
+
+
+def test_the_agent_linked_into_an_os_package_dir_is_a_signal(home, tmp_path):
+    """npm with its prefix at /usr links the agent into /usr/bin."""
+    usr_bin = tmp_path / "usr-bin"
+    cli = _touch(tmp_path / "usr-lib" / "node_modules" / "pi-coding-agent" / "dist" / "cli.js")
+    _link(usr_bin / "pi", cli)
+    assert _detect([home], machine_bin_dirs=[usr_bin], os_package_bin_dirs=[usr_bin]) is True
+
+
+def test_an_os_package_dir_reached_through_a_link_is_still_one(home, tmp_path):
+    """/bin is a link to /usr/bin on a merged-usr system."""
+    usr_bin = tmp_path / "usr-bin"
+    _touch(usr_bin / "pi")
+    _link(tmp_path / "bin", usr_bin)
+    assert _detect([home], path_dirs=[tmp_path / "bin"], os_package_bin_dirs=[usr_bin]) is False
+
+
+def test_a_link_whose_target_is_gone_is_not_a_signal(home, tmp_path):
+    _link(tmp_path / "local-bin" / "pi", tmp_path / "uninstalled" / "cli.js")
+    assert _detect([home], machine_bin_dirs=[tmp_path / "local-bin"]) is False
+
+
+def test_the_real_os_package_dirs_are_the_default():
+    assert onboard.PI_OS_PACKAGE_BIN_DIRS == ("/usr/bin", "/bin")
+    assert set(onboard.PI_OS_PACKAGE_BIN_DIRS) & set(onboard.PI_MACHINE_BIN_DIRS) == {"/usr/bin"}
 
 
 def test_unbounds_own_extension_is_never_a_signal(home):
@@ -110,15 +165,73 @@ def test_every_home_is_checked_not_just_the_first(home, tmp_path):
 def test_machine_bin_dirs_are_not_consulted_on_windows(monkeypatch, home):
     """The default is empty there; a POSIX path that happened to exist must not count."""
     seen = []
-    real_exists = os.path.exists
+    real_stat = os.stat
 
-    def _exists(path):
-        seen.append(path)
-        return real_exists(path)
+    def _stat(path, *args, **kwargs):
+        seen.append(str(path))
+        return real_stat(path, *args, **kwargs)
 
-    monkeypatch.setattr(onboard.os.path, "exists", _exists)
+    monkeypatch.setattr(onboard.os, "stat", _stat)
     assert onboard.pi_detected(homes=[str(home)], path_dirs=[], system="windows") is False
-    assert not any(str(p).startswith("/opt/homebrew") for p in seen)
+    assert seen and not any(p.startswith("/opt/homebrew") for p in seen)
+
+
+# ---- a place that could not be inspected ----
+
+def test_an_unreadable_home_is_not_reported_as_a_device_without_pi(monkeypatch, home, tmp_path):
+    """Absent and unreadable are different answers. Reporting the second as the first
+    skipped the install on exactly the devices where nothing could be ruled out."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    _stat_failing_under(monkeypatch, locked)
+
+    with pytest.raises(PermissionError):
+        _detect([home, locked])
+
+
+def test_an_io_error_is_treated_like_an_unreadable_home(monkeypatch, home, tmp_path):
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    _stat_failing_under(monkeypatch, broken, error=OSError)
+
+    with pytest.raises(OSError):
+        _detect([home, broken])
+
+
+def test_a_signal_found_elsewhere_wins_over_an_unreadable_home(monkeypatch, home, tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    _touch(home / ".pi" / "agent" / "auth.json")
+    _stat_failing_under(monkeypatch, locked)
+
+    assert _detect([home, locked]) is True
+
+
+def test_an_unreadable_home_makes_the_pi_step_run(monkeypatch, capsys, home, tmp_path):
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    _stat_failing_under(monkeypatch, locked)
+    monkeypatch.setattr(onboard, "all_user_homes", lambda *a, **k: [str(home), str(locked)])
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(onboard, "PI_MACHINE_BIN_DIRS", ())
+
+    assert onboard.should_install_pi() is True
+    assert "setting up the Pi Coding Agent anyway" in capsys.readouterr().err
+
+
+def test_an_unlistable_nvm_dir_is_not_reported_as_absent(monkeypatch, home):
+    nvm = home / ".nvm" / "versions" / "node"
+    nvm.mkdir(parents=True)
+    real_listdir = os.listdir
+
+    def _listdir(path):
+        if str(path) == str(nvm):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_listdir(path)
+
+    monkeypatch.setattr(onboard.os, "listdir", _listdir)
+    with pytest.raises(PermissionError):
+        _detect([home])
 
 
 def test_all_user_homes_lists_real_accounts_only(tmp_path):
@@ -127,7 +240,7 @@ def test_all_user_homes_lists_real_accounts_only(tmp_path):
         (root / name).mkdir(parents=True)
     _touch(root / "a-plain-file")
 
-    homes = onboard.all_user_homes(system="darwin", users_root=str(root))
+    homes = onboard.all_user_homes(system="darwin", users_root=str(root), account_homes=[])
 
     assert str(root / "alice") in homes
     assert str(root / "bob") in homes
@@ -137,8 +250,81 @@ def test_all_user_homes_lists_real_accounts_only(tmp_path):
 
 
 def test_all_user_homes_survives_a_missing_users_root(tmp_path):
-    homes = onboard.all_user_homes(system="linux", users_root=str(tmp_path / "nope"))
+    homes = onboard.all_user_homes(system="linux", users_root=str(tmp_path / "nope"),
+                                   account_homes=[])
     assert homes == [os.path.expanduser("~")]
+
+
+def test_a_home_that_is_not_a_direct_child_of_the_users_root_is_found(tmp_path):
+    """/home/DOMAIN/alice: pi/mdm/setup.py installs for that account, so detection
+    has to look there too. A listing of /home sees only DOMAIN."""
+    root = tmp_path / "home"
+    alice = root / "DOMAIN" / "alice"
+    _touch(alice / ".pi" / "agent" / "auth.json")
+
+    listed_only = onboard.all_user_homes(system="linux", users_root=str(root), account_homes=[])
+    assert str(alice) not in listed_only
+    assert _detect(listed_only[1:]) is False
+
+    homes = onboard.all_user_homes(system="linux", users_root=str(root),
+                                   account_homes=[str(alice)])
+    assert str(alice) in homes
+    assert _detect(homes[1:]) is True
+
+
+def test_linux_users_named_shared_or_guest_are_real_accounts(tmp_path):
+    """pi/mdm/setup.py skips those names on macOS only."""
+    root = tmp_path / "home"
+    for name in ("Shared", "Guest", "alice"):
+        (root / name).mkdir(parents=True)
+
+    linux = onboard.all_user_homes(system="linux", users_root=str(root), account_homes=[])
+    assert {str(root / "Shared"), str(root / "Guest"), str(root / "alice")} <= set(linux)
+
+    mac = onboard.all_user_homes(system="darwin", users_root=str(root),
+                                 account_homes=[str(root / "Guest")])
+    assert str(root / "alice") in mac
+    assert str(root / "Shared") not in mac and str(root / "Guest") not in mac
+
+
+def test_an_account_home_that_does_not_exist_is_dropped(tmp_path):
+    homes = onboard.all_user_homes(system="linux", users_root=str(tmp_path / "home"),
+                                   account_homes=[str(tmp_path / "home" / "ghost")])
+    assert homes == [os.path.expanduser("~")]
+
+
+def test_account_homes_come_from_under_the_platform_prefix_only(monkeypatch):
+    """The same rule pi/mdm/setup.py applies before it installs into a home."""
+    import pwd
+    import types
+
+    entries = [types.SimpleNamespace(pw_dir=d) for d in
+               ("/home/alice", "/home/DOMAIN/bob", "/var/lib/postgres", "/root", "")]
+    monkeypatch.setattr(pwd, "getpwall", lambda: entries)
+
+    assert onboard._account_homes("linux", []) == ["/home/alice", "/home/DOMAIN/bob"]
+    assert onboard._account_homes("darwin", []) == []
+    assert onboard._account_homes("windows", []) == []
+
+
+def test_an_account_database_that_cannot_be_read_is_not_a_device_without_pi(monkeypatch, tmp_path):
+    """Homes may have gone unseen, so "nothing found" is not an answer."""
+    import pwd
+
+    def _broken():
+        raise OSError("directory service is down")
+
+    monkeypatch.setattr(pwd, "getpwall", _broken)
+    monkeypatch.setattr(onboard.os, "listdir", lambda path: [])
+    monkeypatch.setattr(onboard.os.path, "expanduser", lambda path: str(tmp_path))
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    monkeypatch.setattr(onboard, "PI_MACHINE_BIN_DIRS", ())
+
+    errors = []
+    assert onboard._account_homes("linux", errors) == []
+    assert len(errors) == 1
+    with pytest.raises(OSError):
+        onboard.pi_detected(system="linux")
 
 
 def test_a_broken_detector_leans_towards_installing(monkeypatch, capsys):
