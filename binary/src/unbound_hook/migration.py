@@ -21,8 +21,9 @@ Deliberately NOT swept here — anything that is still the live serving path
 until the per-tool setup adapter replaces it. Each adapter removes its own
 python-era files immediately after its settings write succeeds, never
 before, so a deferred component leaves python-era coverage intact:
-  - the managed/system unbound.py copies (claude-code / codex / cursor
-    adapters, after the managed-settings rewrite)
+  - the managed/system unbound.py copies (claude-code / cursor / augment
+    adapters, after the managed-settings rewrite; codex writes no managed
+    settings and leaves its inert managed copy)
   - copilot's per-user unbound.json AND unbound.py (the copilot adapter,
     after writing the binary-era unbound.json — unbound.json IS copilot's
     registration, so sweeping it would unhook copilot on a deferral)

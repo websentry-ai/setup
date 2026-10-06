@@ -101,8 +101,9 @@ Runs first inside `setup` (and after `clear`); idempotent, existence-guarded:
 - **copilot and codex keep their user-level hook**: it is the live install,
   rewritten in place by their adapters (only `.self_update_*` is swept);
   `clear_setup` removes it on uninstall
-- managed (system) `unbound.py` copies are removed by each adapter after
-  its settings write succeeds, never by the sweep
+- managed (system) `unbound.py` copies are removed by the claude-code,
+  cursor and augment adapters after their settings write succeeds, never by
+  the sweep (codex writes no managed settings, so it leaves its copy)
 - `~/.unbound/config.json` is never touched
 
 ## backfill / clear
