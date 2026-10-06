@@ -57,6 +57,7 @@ import { decideBeforeVerdict } from "./before.ts";
 import type { BeforeDecision } from "./before.ts";
 import { block } from "./block.ts";
 import {
+  SIGNAL_INIT_DEGRADED,
   SIGNAL_USER_SHELL_UNCHECKED,
   SIGNAL_V2_NOT_ENFORCING,
   SIGNAL_V2_PROMPT_WARN_ONLY,
@@ -173,6 +174,11 @@ export interface V2Scope {
   readonly seenEvents: Set<string>;
   /** Per hook name: the input objects some registration already handled. */
   readonly seenHookInputs: Map<string, WeakSet<object>>;
+  /**
+   * The host asserted a permission with no `source` (WR-07): the evaluate correlation is broken, so
+   * from then on a built-in call's block is raised from `execute.before` instead.
+   */
+  evaluateWithoutSource: boolean;
 }
 
 /** A fresh, empty scope; `directories` is the caller's live registration set when it has one. */
@@ -184,6 +190,7 @@ export function createV2Scope(directories: Set<string> = new Set<string>()): V2S
     sessionDirs: new Map<string, string>(),
     seenEvents: new Set<string>(),
     seenHookInputs: new Map<string, WeakSet<object>>(),
+    evaluateWithoutSource: false,
   };
 }
 
@@ -473,6 +480,13 @@ interface PendingCall {
   decision: Promise<BeforeDecision>;
   /** A native approval was already requested for this call (one card per call). */
   asked: boolean;
+  /** The permission action the host asserts for this tool (`write` asserts `edit`). */
+  action: string;
+}
+
+/** The permission action a v2 built-in tool asserts (14-SPIKES V2-2 table). */
+function permissionActionOf(tool: string): string {
+  return tool === "write" ? "edit" : tool;
 }
 
 const NO_DECISION: BeforeDecision = Object.freeze({ message: undefined, kind: undefined });
@@ -616,7 +630,14 @@ export function registerV2Enforcement(
           { args: readField(event, "input") },
           { runtime, record: rec },
         ).catch((): BeforeDecision => NO_DECISION);
-        if (builtin && sessionID !== "" && callID !== "") remember(keyOf(sessionID, callID), { decision, asked: false });
+        // A built-in decision is applied at `evaluate`, found by session + call id. Without either
+        // id (a call from outside the provider loop), or once the host was seen asserting without
+        // a `source`, it cannot be found there: the block is raised here instead (WR-07; a raise
+        // from `execute.before` is proven to block built-ins, 14-SPIKES V2-2).
+        const correlatable = sessionID !== "" && callID !== "" && !scope.evaluateWithoutSource;
+        if (builtin && sessionID !== "" && callID !== "") {
+          remember(keyOf(sessionID, callID), { decision, asked: false, action: permissionActionOf(tool) });
+        }
 
         const { message, kind } = await decision;
         if (message === undefined) return { raise: undefined, kind };
@@ -624,7 +645,7 @@ export function registerV2Enforcement(
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool, "tools");
           return { raise: undefined, kind };
         }
-        if (builtin) return { raise: undefined, kind };
+        if (builtin) return { raise: correlatable ? undefined : message, kind };
         if (capabilities.mcp !== "enforce") {
           runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, tool, "mcp");
           return { raise: undefined, kind };
@@ -643,7 +664,11 @@ export function registerV2Enforcement(
         const source = readField(event, "source");
         const callID = readString(source, "id");
         const sessionID = readString(event, "sessionID");
-        if (callID === "" || sessionID === "") return;
+        if (callID === "") {
+          await applyUncorrelated(event, sessionID);
+          return;
+        }
+        if (sessionID === "") return;
         const call = pending.get(keyOf(sessionID, callID));
         if (call === undefined) return;
         const decision = await call.decision;
@@ -670,6 +695,41 @@ export function registerV2Enforcement(
         // deny, unavailable (fail-closed org): refuse with the verdict text.
         event.effect = "deny";
         event.message = decision.message;
+      } catch {
+        // Allow.
+      }
+    };
+
+    /**
+     * An `evaluate` with no `source` (WR-07; never seen on 2.0.22 / 2.0.24). Reported once; from then
+     * on built-in blocks are raised from `execute.before`. For this assertion, the strictest kept
+     * verdict of the same session and permission action is applied (only ever tightens), and those
+     * calls are consumed. Total.
+     */
+    const applyUncorrelated = async (event: V2PermissionEvaluate, sessionID: string): Promise<void> => {
+      try {
+        if (!scope.evaluateWithoutSource) {
+          scope.evaluateWithoutSource = true;
+          runtime.reportOnce(SIGNAL_INIT_DEGRADED, "permission.evaluate", "evaluate_no_source");
+        }
+        if (sessionID === "" || capabilities.tools === "audit") return;
+        if (readField(event, "effect") === "deny") return;
+        const action = readString(event, "action");
+        const prefix = `${sessionID}\u0000`;
+        const matched: Array<[string, PendingCall]> = [];
+        for (const [key, call] of pending) {
+          if (key.startsWith(prefix) && call.action === action) matched.push([key, call]);
+        }
+        let strictest: BeforeDecision | undefined;
+        for (const [key, call] of matched) {
+          const decision = await call.decision;
+          if (decision.message === undefined) continue;
+          pending.delete(key);
+          if (strictest === undefined || (strictest.kind === "confirm" && decision.kind !== "confirm")) strictest = decision;
+        }
+        if (strictest?.message === undefined) return;
+        event.effect = "deny";
+        event.message = strictest.message;
       } catch {
         // Allow.
       }

@@ -1039,3 +1039,79 @@ test("WR-06: ctx.mcp.list is called with {location:{directory}}, and without arg
     assert.deepEqual(seen, [{ location: { directory: "/repo" } }, undefined], scopedAnswer);
   }
 });
+
+// --- WR-07: a built-in decision that evaluate cannot find is raised instead -----------------------
+
+test("WR-07: a built-in call with an empty session id or call id is blocked by a raise from execute.before", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    for (const ids of [{ sessionID: "" }, { id: "" }]) {
+      const r = await toolCall(f, "shell", { command: "cat secrets.txt" }, ids);
+      assert.equal(r.raised, SECRETS_DENY, JSON.stringify(ids));
+    }
+    const allowed = await fakeV2({ mode: "allow" });
+    try {
+      assert.equal((await toolCall(allowed, "read", { path: "a" }, { sessionID: "" })).raised, undefined, "never on allow");
+    } finally {
+      allowed.cleanup();
+    }
+  } finally {
+    f.cleanup();
+  }
+  const ask = await fakeV2({ mode: "ask" });
+  try {
+    const r = await toolCall(ask, "shell", { command: "rm -rf build" }, { id: "" });
+    assert.equal(r.raised, approvalMessage("Unusual command."), "an approval cannot be native without a call id");
+  } finally {
+    ask.cleanup();
+  }
+  const audit = await fakeV2({ mode: "deny", capabilities: { tools: "audit" } });
+  try {
+    assert.equal((await toolCall(audit, "shell", { command: "cat secrets.txt" }, { id: "" })).raised, undefined, "audit-only never raises");
+  } finally {
+    audit.cleanup();
+  }
+});
+
+test("WR-07: an evaluate with no source applies the session's kept block for that action, then built-ins raise", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const before = f.handlers.get("tool.execute.before");
+    await before?.({ tool: "write", sessionID: "ses_root", agent: "build", messageID: "m", id: "call_w", input: { path: "a.ts", content: "x" } });
+    const sourceless: { effect: string; message?: string } & Record<string, unknown> = {
+      sessionID: "ses_root",
+      action: "edit",
+      resources: ["a.ts"],
+      effect: "allow",
+    };
+    await f.handlers.get("permission.evaluate")?.(sourceless);
+    assert.equal(sourceless.effect, "deny");
+    assert.equal(sourceless.message, SECRETS_DENY);
+    assert.ok(await waitFor(() => signalsOf(mock, "init_degraded").length === 1));
+    // From now on the correlation is not trusted: the next built-in block is raised.
+    const next = await toolCall(f, "shell", { command: "cat secrets.txt" }, { id: "call_next" });
+    assert.equal(next.raised, SECRETS_DENY);
+    // An allowed call still never raises.
+    mock.setMode("allow");
+    assert.equal((await toolCall(f, "read", { path: "b" }, { id: "call_ok" })).raised, undefined);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("WR-07: a sourceless evaluate for another action or session leaves the effect alone", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    await f.handlers.get("tool.execute.before")?.({ tool: "shell", sessionID: "ses_root", agent: "b", messageID: "m", id: "c1", input: { command: "cat x" } });
+    for (const event of [
+      { sessionID: "ses_root", action: "read", resources: ["*"], effect: "allow" },
+      { sessionID: "ses_other", action: "shell", resources: ["*"], effect: "allow" },
+      { sessionID: "", action: "shell", resources: ["*"], effect: "allow" },
+    ]) {
+      await f.handlers.get("permission.evaluate")?.(event);
+      assert.equal(event.effect, "allow", JSON.stringify(event));
+    }
+  } finally {
+    f.cleanup();
+  }
+});
