@@ -39,7 +39,15 @@ class _Gateway(BaseHTTPRequestHandler):
         pass
 
 
-@unittest.skipUnless(sys.platform == "darwin", "Cowork's tree is read from ~/Library on macOS")
+def _support_dir(home):
+    """Where the hook looks for Claude Desktop on this OS (APPDATA is redirected on Windows)."""
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "Claude"
+    if sys.platform == "win32":
+        return home / "AppData" / "Roaming" / "Claude"
+    return home / ".config" / "Claude"
+
+
 class CoworkHookE2E(unittest.TestCase):
 
     @classmethod
@@ -56,16 +64,19 @@ class CoworkHookE2E(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name).resolve()
-        self.org = self.home / "Library" / "Application Support" / "Claude" / "local-agent-mode-sessions" / "acct" / "org"
+        self.org = _support_dir(self.home) / "local-agent-mode-sessions" / "acct" / "org"
         self.session = self.org / "local_e2e"
         self.outputs = self.session / "outputs"
         self.outputs.mkdir(parents=True)
-        self.env = {
-            "PATH": os.environ.get("PATH", ""),
-            "HOME": str(self.home),
-            "UNBOUND_GATEWAY_URL": "http://127.0.0.1:%d" % self.server.server_address[1],
-            "UNBOUND_CLAUDE_API_KEY": "test-key",
-        }
+        self.env = dict(
+            os.environ,
+            HOME=str(self.home), USERPROFILE=str(self.home),
+            APPDATA=str(self.home / "AppData" / "Roaming"),
+            UNBOUND_GATEWAY_URL="http://127.0.0.1:%d" % self.server.server_address[1],
+            UNBOUND_CLAUDE_API_KEY="test-key",
+        )
+        for key in ("CLAUDE_CONFIG_DIR", "UNBOUND_HOOK_TOOL"):
+            self.env.pop(key, None)
 
     def write(self, path, text):
         path.parent.mkdir(parents=True, exist_ok=True)
