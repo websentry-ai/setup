@@ -106,6 +106,5 @@ git tag runtime-v0.1.0 && git push origin runtime-v0.1.0
 
 Dry-run without a tag: Actions → release-macos-runtime → Run workflow.
 The `builder` input selects PyInstaller (default) or Nuitka (WEB-4804
-bake-off); Nuitka artifacts carry a `-nuitka` suffix in the pkg/tar/Actions
-artifact names so both builders' outputs can sit side by side for the EDR
-rehearsal. Tag releases ignore the input and always build with PyInstaller.
+bake-off); both builders publish the same pkg/tar/Actions artifact names.
+Tag releases ignore the input and always build with PyInstaller.
