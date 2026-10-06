@@ -19,29 +19,40 @@
 //      smoke waits for the port, then `POST /session?directory=<proj>` (no model needed). Pass =
 //      the mock receives a pretool `event_name: "session_start"` with `unbound_app_label:
 //      "opencode"` and a non-empty `pre_tool_use_data.metadata.opencode_version` (the plugin's heartbeat), AND no
-//      `failed to load plugin` line names unbound.js. The v1 host must NOT produce an
-//      `api_family_inactive` report (its embedded v2 core host's `setup` call must stay inert).
+//      `failed to load plugin` line names unbound.js. The v1 host must NOT produce a `v2_status`
+//      (or the retired `api_family_inactive`) report: its embedded v2 core host's `setup` call must
+//      stay inert.
 //      Then a REAL, model-free block: `POST /session/:id/shell` runs a user shell command that the
 //      mock denies (every tool_use is denied); pass = the mock saw the `bash` tool_use with that
 //      command AND the command's marker file was never created (13-REVIEW WR-07, spike V1-7).
 //   v2 (@opencode/cli 2.x): an authenticated `GET /api/agent?directory=<proj>` (basic auth with a
 //      random per-run `OPENCODE_SERVER_PASSWORD`, never printed) makes the CLI load plugins and
-//      call `setup(ctx)`; it never calls `server`. Pass = the
-//      mock receives a `/v1/hooks/errors` report naming `api_family_inactive`. Phase 14 owns v2
-//      enforcement; this leg only proves the bundle loads there and says it is inactive.
+//      call `setup(ctx)`; it never calls `server`. The active v2 entry (Phase 14) must then:
+//        * report exactly ONE `v2_status` on `/v1/hooks/errors` whose detail is the shipped
+//          capability set (`EXPECTED_V2_STATUS`, kept equal to `v2StatusDetail(V2_CAPABILITIES)` by
+//          packages/opencode/test/v2Setup.test.ts), and no `api_family_inactive`;
+//        * send a `session_start` heartbeat for `POST /api/session` (model-free) whose
+//          `opencode_version` is the CLI's own version;
+//        * REALLY block a user shell, model-free: `POST /api/session/:id/shell` with a command the
+//          mock denies must reach the mock as a `bash` tool_use and must not run (no marker file);
+//          v2 answers a blocked user shell with an empty HTTP 500 (14-SPIKES V2-10).
 //
 // The child process GROUP is always killed on exit. On failure the last 50 lines of the isolated
 // opencode logs (paths inside the temp home only) and the mock's request list are printed. Lines
 // mentioning a password (the v2 server prints a generated basic-auth password) are elided.
 // Plain ESM, `node:` built-ins only: runs unchanged under Node and Bun.
 
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { createServer } from "node:http";
 import { createServer as createNetServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+
+/** The v2 entry's `v2_status` detail for the shipped `V2_CAPABILITIES` (14-SPIKES verdicts). */
+export const EXPECTED_V2_STATUS =
+  "tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce";
 
 // --- arguments ------------------------------------------------------------------------------------
 
@@ -314,11 +325,11 @@ async function waitFor(predicate, label, ms) {
 }
 
 /** Like `httpOk`, but also returns the parsed JSON body (`undefined` when it is not JSON). */
-async function httpJson(method, path, body) {
+async function httpJson(method, path, body, extraHeaders = {}) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}${path}`, {
       method,
-      headers: body === undefined ? {} : { "content-type": "application/json" },
+      headers: { ...(body === undefined ? {} : { "content-type": "application/json" }), ...extraHeaders },
       body: body === undefined ? undefined : JSON.stringify(body),
       signal: AbortSignal.timeout(30_000),
     });
@@ -441,6 +452,8 @@ if (args.line === "v1") {
   if (failures.length > 0) await fail(`load failure logged:\n${failures.join("\n")}`);
   const inactive = requests.filter((r) => JSON.stringify(r.body ?? {}).includes("api_family_inactive"));
   if (inactive.length > 0) await fail("a v1 host produced an api_family_inactive report (setup must be inert on 1.18)");
+  const v2Status = requests.filter((r) => JSON.stringify(r.body ?? {}).includes("v2_status"));
+  if (v2Status.length > 0) await fail("a v1 host produced a v2_status report (setup must be inert on 1.18)");
 
   clearTimeout(overall);
   console.log(
@@ -451,18 +464,24 @@ if (args.line === "v1") {
     `real block: tool_use tool_name=${denied.body.pre_tool_use_data.tool_name} denied by the mock; ${marker} was not created`,
   );
   console.log(`mock requests: ${JSON.stringify(summarizeRequests())}`);
-  console.log(`no "failed to load plugin" line names unbound.js; no api_family_inactive report`);
+  console.log(`no "failed to load plugin" line names unbound.js; no v2_status and no api_family_inactive report`);
   console.log(`OK line=v1 (${Date.now() - started} ms)`);
 } else {
   // v2: plugins load lazily too, when an authenticated API request boots the location services for
-  // a directory (13-SPIKES V2-1 run); setup(ctx) runs then, and the inactive-family report arrives
-  // on /v1/hooks/errors from a later macrotask.
+  // a directory (13-SPIKES V2-1 run); setup(ctx) runs then, and the v2_status report arrives on
+  // /v1/hooks/errors from a later macrotask.
+  let cliVersion = "";
+  try {
+    const printed = execFileSync(cliPath, ["--version"], { env, encoding: "utf8", timeout: 30_000 });
+    cliVersion = (/(\d+\.\d+\.\d+[0-9A-Za-z.+-]*)/.exec(printed) ?? [])[1] ?? "";
+  } catch {
+    cliVersion = "";
+  }
+  if (cliVersion === "") await fail("could not read the CLI version (`--version`)");
   const auth = { authorization: `Basic ${Buffer.from(`opencode:${serverPassword}`).toString("base64")}` };
+  const dirHeaders = { ...auth, "x-opencode-directory": projectDir };
   const agentPath = `/api/agent?directory=${encodeURIComponent(projectDir)}`;
-  const ready = await untilReady(
-    () => httpOk("GET", agentPath, undefined, { ...auth, "x-opencode-directory": projectDir }),
-    "GET /api/agent",
-  );
+  const ready = await untilReady(() => httpOk("GET", agentPath, undefined, dirHeaders), "GET /api/agent");
   const answered = ready.status;
   console.log(
     `listening: GET /api/agent -> ${answered} after ${Date.now() - started} ms` +
@@ -470,21 +489,77 @@ if (args.line === "v1") {
   );
   if (answered === 401) await fail("GET /api/agent answered 401: the basic-auth override was not honoured");
 
-  const report = await waitFor(
+  const isStatus = (r) => r.path === "/v1/hooks/errors" && JSON.stringify(r.body ?? {}).includes("v2_status");
+  const report = await waitFor(() => requests.find(isStatus), "the v2_status report at the mock", budget());
+  const statusMessage = String(report.body?.errors?.[0]?.message ?? "");
+  if (!statusMessage.includes(`v2_status: ${EXPECTED_V2_STATUS} for tool=setup`)) {
+    await fail(`v2_status detail differs from the shipped capabilities: ${JSON.stringify(statusMessage)}`);
+  }
+
+  // 2. A session (no model call): session.created reaches the plugin's event subscription.
+  const createdRes = await httpJson("POST", "/api/session", { location: { directory: projectDir } }, dirHeaders);
+  console.log(`POST /api/session -> ${createdRes.status}`);
+  const body = createdRes.json;
+  const idOf = (v) => (typeof v?.id === "string" && v.id.startsWith("ses") ? v.id : undefined);
+  const sessionID = idOf(body) ?? idOf(body?.data) ?? idOf(body?.info) ?? idOf(body?.session);
+  if (createdRes.status !== 200 || sessionID === undefined) {
+    const shape = body !== null && typeof body === "object" ? Object.keys(body).join(",") : typeof body;
+    await fail(`POST /api/session answered ${createdRes.status} without a session id (body keys: ${shape})`);
+  }
+  const heartbeat = await waitFor(
     () =>
       requests.find(
-        (r) => r.path === "/v1/hooks/errors" && JSON.stringify(r.body ?? {}).includes("api_family_inactive"),
+        (r) =>
+          r.path === "/v1/hooks/pretool" &&
+          r.body?.event_name === "session_start" &&
+          r.body?.unbound_app_label === "opencode" &&
+          r.body?.pre_tool_use_data?.metadata?.opencode_version === cliVersion,
       ),
-    "the api_family_inactive report at the mock",
+    `the v2 session_start heartbeat with opencode_version=${cliVersion} at the mock`,
     budget(),
   );
+
+  // 3. A REAL block on the real v2 host, model-free (14-SPIKES V2-10): the user shell route fires
+  //    `shell.create.before` before the spawn; the mock denies every tool_use, so the plugin must
+  //    raise and nothing may spawn. Pass = the mock saw the `bash` tool_use with exactly this
+  //    command AND the marker file does not exist.
+  const marker = join(projectDir, "ran.txt");
+  const shellCommand = `echo smoke > ${marker}`;
+  const shellRes = await httpJson("POST", `/api/session/${encodeURIComponent(sessionID)}/shell`, { command: shellCommand }, dirHeaders);
+  console.log(`POST /api/session/:id/shell -> ${shellRes.status} (a blocked user shell answers an empty 500)`);
+  const denied = await waitFor(
+    () =>
+      requests.find(
+        (r) =>
+          r.path === "/v1/hooks/pretool" &&
+          r.body?.event_name === "tool_use" &&
+          r.body?.pre_tool_use_data?.tool_name === "bash" &&
+          r.body?.pre_tool_use_data?.command === shellCommand,
+      ),
+    "the plugin's tool_use check of the v2 user shell command at the mock",
+    budget(),
+  );
+  await sleep(1_500);
+  if (existsSync(marker)) await fail(`the denied v2 user shell command ran: ${marker} exists`);
+
+  // Give a second (wrong) status report a moment to show up before counting.
+  await sleep(1_000);
   const failures = loadFailures();
   if (failures.length > 0) await fail(`load failure logged:\n${failures.join("\n")}`);
-  const heartbeats = requests.filter((r) => r.body?.event_name === "session_start");
+  const statuses = requests.filter(isStatus);
+  if (statuses.length !== 1) await fail(`expected exactly one v2_status report, saw ${statuses.length}`);
+  const inactive = requests.filter((r) => JSON.stringify(r.body ?? {}).includes("api_family_inactive"));
+  if (inactive.length > 0) await fail("the v2 entry sent the retired api_family_inactive report");
 
   clearTimeout(overall);
-  console.log(`api_family_inactive: hook_source=${report.body.hook_source} errors=${JSON.stringify(report.body.errors?.map((e) => e?.message))}`);
-  console.log(`session_start heartbeats on v2: ${heartbeats.length} (server() is never called by a v2 host)`);
+  console.log(`v2_status: hook_source=${report.body.hook_source} message=${JSON.stringify(statusMessage)}`);
+  console.log(
+    `heartbeat: event_name=${heartbeat.body.event_name} opencode_version=${heartbeat.body.pre_tool_use_data.metadata.opencode_version} ` +
+      `client_entrypoint=${heartbeat.body.client_entrypoint} (CLI ${cliVersion})`,
+  );
+  console.log(
+    `real block: tool_use tool_name=${denied.body.pre_tool_use_data.tool_name} denied by the mock; ${marker} was not created`,
+  );
   console.log(`mock requests: ${JSON.stringify(summarizeRequests())}`);
   console.log(`OK line=v2 (${Date.now() - started} ms)`);
 }

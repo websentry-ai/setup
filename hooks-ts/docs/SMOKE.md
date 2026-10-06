@@ -289,8 +289,8 @@ Never record a real API key, admin token, device serial or customer identifier i
 
 Smokes for the opencode plugin (`opencode/index.js`, dual entry `{ id, server, setup }`). All of them
 run against the committed bytes and load the plugin through a real opencode CLI. Tested against
-`opencode-ai` 1.18.34 (v1 line, the enforcing `server` entry) and `@opencode/cli` 2.0.21 / 2.0.22
-(v2 line: load check only, Phase 14 owns v2 enforcement), Node `v22.22.2`.
+`opencode-ai` 1.18.34 (v1 line, the `server` entry) and `@opencode/cli` 2.0.24 (v2 line, the
+`setup` entry; both enforce), Node `v22.22.2`.
 
 ### Isolation
 
@@ -326,10 +326,17 @@ node scripts/opencode-loader-smoke.mjs --cli $T/oc2/node_modules/.bin/opencode \
   --artifact ../opencode/index.js --line v2                         # @opencode/cli@latest
 ```
 
-Both scripts build their own isolated home and an inline loopback mock. The v1 leg asserts the
-`session_start` heartbeat (`pre_tool_use_data.metadata.opencode_version`) and that no
-`failed to load plugin` line names `unbound.js`. The v2 leg authenticates with a random per-run
-`OPENCODE_SERVER_PASSWORD` and asserts the `api_family_inactive` report.
+Both scripts build their own isolated home and an inline loopback mock.
+
+- **v1 leg:**
+  - asserts the `session_start` heartbeat (`pre_tool_use_data.metadata.opencode_version`);
+  - asserts a real user-shell block (no marker file);
+  - asserts that no `failed to load plugin` line names `unbound.js`;
+  - asserts that no `v2_status` report is sent (the embedded `setup` stays inert).
+- **v2 leg:** authenticates with a random per-run `OPENCODE_SERVER_PASSWORD`, then:
+  - asserts exactly one `v2_status` report whose detail is the shipped capability set (`EXPECTED_V2_STATUS`);
+  - asserts a `session_start` heartbeat with the CLI's own version for a model-free `POST /api/session`;
+  - asserts a real user-shell block through `POST /api/session/:id/shell`: an empty HTTP 500, the mock saw the `bash` tool_use, and the marker file was not created.
 
 ### Model-free legs (`opencode serve`, no provider key)
 
@@ -360,7 +367,7 @@ OPENROUTER_API_KEY=<provider key, child env only> \
 | Leg | Mock mode | Evidence |
 |-----|-----------|----------|
 | Heartbeat (loader smoke v1) | inline allow | pretool `session_start`, `unbound_app_label` `opencode`, `client_entrypoint` `opencode/1.18.34`, `opencode_version` `1.18.34`; no load error |
-| v2 load (loader smoke v2) | inline | `/v1/hooks/errors` `opencode-hook hook api_family_inactive: v2_setup_inactive for tool=setup`; no heartbeat (v2 never calls `server`) |
+| v2 load + block (loader smoke v2, `@opencode/cli` 2.0.24) | inline (tool_use denied) | one `/v1/hooks/errors` `opencode-hook hook v2_status: tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce for tool=setup`; pretool `session_start` `opencode_version` `2.0.24`, `client_entrypoint` `opencode/2.0.24`; user shell `POST /api/session/:id/shell` → 500, `bash` tool_use denied, marker not created |
 | `--pure` / `OPENCODE_PURE=1` | allow | no request reaches the mock: the plugin is silently not loaded |
 | 1 BLOCK (tool, live) | denyTools | tool part `bash` `status:error`, `error:"Blocked by Unbound policy: Smoke: tool calls are blocked."`; the model replied that the command "has been blocked by policy restrictions"; `run` exit 0; mock: `session_start`, `user_prompt`, `tool_use` `bash` `echo unbound-smoke`, `POST /v1/hooks/opencode` model `auto` |
 | 2 PROMPT | deny | HTTP 500 generic `UnknownError`; server log `error="Error: Blocked by Unbound policy: Reading secrets is blocked."`; 0 messages persisted (LLM not called); mock: `user_prompt` |

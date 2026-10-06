@@ -5,8 +5,9 @@
 // tamper rule (keep enforcing, report), and the cleanup the host runs on location shutdown.
 
 import assert from "node:assert/strict";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { after, before, test } from "node:test";
 
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
@@ -97,6 +98,13 @@ test("v2StatusDetail lists every capability", () => {
     v2StatusDetail(V2_CAPABILITIES),
     "tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce",
   );
+});
+
+test("the loader smoke expects exactly the shipped v2_status detail", () => {
+  const smoke = readFileSync(fileURLToPath(new URL("../../../scripts/opencode-loader-smoke.mjs", import.meta.url)), "utf8");
+  const match = /export const EXPECTED_V2_STATUS =\s*"([^"]+)";/.exec(smoke);
+  assert.ok(match !== null, "EXPECTED_V2_STATUS is declared in the smoke");
+  assert.equal(match[1], v2StatusDetail(V2_CAPABILITIES));
 });
 
 test("setup on a v2 ctx registers every handler once per directory, without awaiting I/O", async () => {

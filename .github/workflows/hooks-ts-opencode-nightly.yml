@@ -21,9 +21,13 @@ name: hooks-ts-opencode-nightly
 #                 (serve + POST /session) must yield the plugin's session_start heartbeat, and a
 #                 model-free REAL block must hold: `POST /session/:id/shell` with a command the mock
 #                 denies must reach the mock as a bash tool_use and must not run (no marker file).
-#   loader-v2     @opencode/cli@latest (v2 line): the bundle loads and its inactive `setup` reports
-#                 api_family_inactive. Informational until Phase 14 (which owns v2 enforcement).
+#   loader-v2     @opencode/cli@latest (v2 line, the active `setup` entry): the bundle loads, reports
+#                 exactly one v2_status with the shipped capability set, sends a session_start
+#                 heartbeat carrying the CLI version for a model-free session, and a model-free REAL
+#                 block must hold: `POST /api/session/:id/shell` with a command the mock denies must
+#                 reach the mock as a bash tool_use and must not run (no marker file).
 #   types-v1      the adapter's hand-written host types against @opencode-ai/plugin@latest.
+#   types-v2      the adapter's hand-written v2 host types against @opencode/plugin@latest.
 
 on:
   schedule:
@@ -114,10 +118,8 @@ jobs:
   loader-v2:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Phase 14 owns v2 enforcement. Until then this leg only proves the bundle loads on v2 and
-    # reports itself inactive; a red run is surfaced (the script prints the loader's log lines and
-    # the mock's requests) but does not fail the workflow.
-    continue-on-error: true
+    # Required (Phase 14): the v2 entry enforces, so a bundle that stops loading, stops reporting
+    # its status or stops blocking on the current v2 CLI must fail the workflow.
     steps:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -168,3 +170,29 @@ jobs:
 
       - name: Host-type conformance
         run: npx tsc -p packages/opencode/conformance/tsconfig.json
+
+  types-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      # No npm cache, for the same reason as types-v1.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+
+      - name: Install
+        run: npm ci
+
+      # Type-only (--ignore-scripts, --no-save): the package and its ~280 dependencies never enter
+      # the lockfile.
+      - name: Install @opencode/plugin@latest (types only)
+        run: |
+          npm install --no-save --ignore-scripts --no-audit --no-fund @opencode/plugin@latest
+          npm ls @opencode/plugin || true
+
+      - name: v2 host-type conformance
+        run: npx tsc -p packages/opencode/conformance/tsconfig.v2.json
