@@ -55,6 +55,7 @@ import { capCommand } from "../../core/src/payload.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import type { PolicySnapshot } from "../../core/src/policyState.ts";
+import type { AgentAuthSummary } from "../../core/src/profile.ts";
 import { createScopedStates } from "../../core/src/scopedState.ts";
 import type { ScopedState, ScopedStates } from "../../core/src/scopedState.ts";
 import { createInstanceStates, createSessionStates, directoryKey } from "../../core/src/sessionState.ts";
@@ -140,6 +141,12 @@ export interface Deps {
   moduleToken: object;
   /** The build token a genuine holder must carry. Default: `BUILD_TOKEN`. */
   buildToken: string;
+  /**
+   * Replaces the opencode credential-store reader (`auth.json` / `OPENCODE_AUTH_CONTENT`) the
+   * identity loader uses. The v2 entry passes one that reads nothing, so identity stays
+   * provider-level and no credential database is ever opened (14-SPIKES HV2-07).
+   */
+  readAuth?: (dataDir: string | undefined, provider: string | undefined) => AgentAuthSummary | undefined;
 }
 
 /**
@@ -326,6 +333,20 @@ function mcpServerNamesOf(cfg: unknown): string[] {
   }
 }
 
+/** A copy of a server-name list: non-empty strings only, bounded. Total. */
+function mcpServerNamesFromList(list: readonly unknown[]): string[] {
+  try {
+    const names: string[] = [];
+    for (const name of list) {
+      if (names.length >= MAX_MCP_SERVER_NAMES) break;
+      if (typeof name === "string" && name !== "" && !names.includes(name)) names.push(name);
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
 /** The server names of a `client.mcp.status()` answer (`{ data: { <name>: status } }`). Total. */
 function liveMcpNamesOf(answer: unknown): string[] | undefined {
   try {
@@ -450,7 +471,30 @@ function rollUp(store: TurnStore, root: string): TurnStore {
   };
 }
 
-export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin {
+/**
+ * One adapter runtime plus its directory records, built without I/O. `createServerPlugin` (v1) and
+ * the v2 `setup` entry each build theirs through `createRuntime`, so key resolution, scoped state,
+ * sessions, signals and identity have one implementation (14-CONTEXT design constraints).
+ */
+export interface RuntimeHandle {
+  readonly runtime: Runtime;
+  /**
+   * The record of a directory (one per canonical absolute directory; `""` for an unusable one),
+   * with `client` set. `mcpServerNames`, when given, replaces the record's config snapshot; when
+   * omitted the previous snapshot is kept (v1 `server()` never resets it, 13-REVIEW BL-01).
+   */
+  recordFor(directory: unknown, client: unknown, mcpServerNames?: readonly string[]): DirectoryRecord;
+  /** The stored record of a directory, or `undefined`. */
+  peekRecord(directory: unknown): DirectoryRecord | undefined;
+  /** Drop a directory's record. */
+  releaseRecord(directory: unknown): void;
+  /** How many times `init()` actually resolved. */
+  resolveCount(): number;
+  /** Whether the current resolution has a checker. */
+  hasChecker(): boolean;
+}
+
+export function createRuntime(overrides: Partial<Deps> = {}): RuntimeHandle {
   // Construction reads no env value and no home directory: both are read on the first hook call.
   const source: Partial<Deps> = overrides ?? {};
   const deps: Readonly<Omit<Deps, "env" | "homeDir">> = Object.freeze({
@@ -503,7 +547,10 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       identityLoader = createAccountIdentityLoader({
         ...(source.identity ?? {}),
         agentDir: resolveOpencodeDataDir(env, homeDir),
-        readAuth: (dataDir, provider) => readOpencodeAuthSummary(dataDir, provider, env),
+        readAuth:
+          typeof source.readAuth === "function"
+            ? source.readAuth
+            : (dataDir, provider) => readOpencodeAuthSummary(dataDir, provider, env),
       });
     }
     return identityLoader;
@@ -920,6 +967,26 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     },
   };
 
+  return {
+    runtime,
+    recordFor(directory: unknown, client: unknown, mcpServerNames?: readonly string[]): DirectoryRecord {
+      const record = records.get(directory);
+      record.client = client;
+      if (Array.isArray(mcpServerNames)) record.mcpServerNames = mcpServerNamesFromList(mcpServerNames);
+      return record;
+    },
+    peekRecord: (directory: unknown) => records.peek(directory),
+    releaseRecord: (directory: unknown) => records.release(directory),
+    resolveCount: () => resolveCount,
+    hasChecker: () => resolved?.checker !== undefined,
+  };
+}
+
+export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin {
+  const handle = createRuntime(overrides);
+  const { runtime } = handle;
+  const deps = runtime.deps;
+
   /** The allow-everything set served when the factory itself faulted. Reports, never decides. */
   function degradedHooks(): HooksLike {
     later(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, "server", "factory_fault"));
@@ -975,9 +1042,9 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       // earlier release, must not drop the live instance's record, heartbeat gate or no-key latch.
       dispose: async () => {
         try {
-          if (record.directory !== "" && record.generation === generation && records.peek(record.directory) === record) {
-            instances.release(record.directory);
-            records.release(record.directory);
+          if (record.directory !== "" && record.generation === generation && handle.peekRecord(record.directory) === record) {
+            runtime.instances.release(record.directory);
+            handle.releaseRecord(record.directory);
           }
         } catch {
           // Nothing to release.
@@ -1062,8 +1129,7 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       const directory: unknown = host.directory;
       const client: unknown = host.client;
 
-      const record = records.get(directory);
-      record.client = client;
+      const record = handle.recordFor(directory, client);
       // The MCP names are NOT reset here (13-REVIEW BL-01 / WR-05): an existing record may still
       // serve a live hook set, and the next `config` call replaces the config names anyway.
       // The generation makes this the hook set that owns the record's release (WR-05).
@@ -1075,13 +1141,13 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
   };
 
   const inspector: PluginInspector = {
-    resolveCount: () => resolveCount,
-    hasChecker: () => resolved?.checker !== undefined,
+    resolveCount: () => handle.resolveCount(),
+    hasChecker: () => handle.hasChecker(),
     instance(dir: string) {
-      const record = records.peek(dir);
+      const record = handle.peekRecord(dir);
       return record === undefined ? undefined : { directory: record.directory, mcpServerNames: [...record.mcpServerNames] };
     },
-    turn: (sessionID: string) => sessions.forSession(sessionID).turn.snapshot(),
+    turn: (sessionID: string) => runtime.sessions.forSession(sessionID).turn.snapshot(),
     runtime: () => runtime,
   };
   Object.defineProperty(factory, "inspect", { value: inspector, enumerable: false });

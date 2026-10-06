@@ -73,7 +73,7 @@ export interface V2Capabilities {
 }
 
 export const V2_CAPABILITIES: V2Capabilities = Object.freeze({
-  /** HV2-02 GO lever=both (permission.evaluate deny + message; execute.before throw for MCP). */
+  /** HV2-02 GO lever=both (permission.evaluate deny + message; an execute.before raise for MCP). */
   tools: "enforce",
   /** HV2-03 NATIVE (`effect = "ask"` → opencode's own pending permission; reject prevents execution). */
   ask: "native",
