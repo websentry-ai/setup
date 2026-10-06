@@ -161,6 +161,111 @@ test("setup on a v2 ctx registers every handler once per directory, without awai
   }
 });
 
+/**
+ * A host that keeps every registration until its handle is disposed and fires ALL live callbacks of
+ * a hook, like a host that does not drop a location's hooks on its own (WR-02).
+ */
+function keepingHost(directory: string): {
+  ctx: Record<string, unknown>;
+  fire(hook: string, event: unknown): Promise<void>;
+  live(hook: string): number;
+} {
+  const live = new Map<string, Set<Handler>>();
+  const domain = (name: string) => ({
+    hook: async (hook: string, cb: Handler) => {
+      const key = `${name}.${hook}`;
+      const set = live.get(key) ?? new Set<Handler>();
+      live.set(key, set);
+      set.add(cb);
+      return {
+        dispose: async () => {
+          set.delete(cb);
+        },
+      };
+    },
+  });
+  const ctx: Record<string, unknown> = {
+    app: { name: "cli", version: "2.0.24", channel: "latest" },
+    location: { directory },
+    tool: domain("tool"),
+    permission: domain("permission"),
+    session: { ...domain("session"), get: async () => ({ id: "s" }) },
+    shell: domain("shell"),
+    mcp: { list: async () => ({ data: [] }) },
+    event: { subscribe: () => ({ async *[Symbol.asyncIterator]() {} }) },
+  };
+  return {
+    ctx,
+    async fire(hook: string, event: unknown): Promise<void> {
+      for (const cb of [...(live.get(hook) ?? [])]) await cb(event);
+    },
+    live: (hook: string) => live.get(hook)?.size ?? 0,
+  };
+}
+
+test("WR-02: cleanup disposes every hook; setup, cleanup, setup for one directory checks each call once", async () => {
+  resetMock();
+  const t = makeDeps(mock);
+  try {
+    const setup = createSetupV2({ ...t.deps, sentinelKey: Symbol("v2-setup-test") });
+    const host = keepingHost("/repo");
+    const first = await setup(host.ctx);
+    await tick(5);
+    for (const hook of ALL_HOOKS) assert.equal(host.live(hook), 1, hook);
+    await (first as () => Promise<void>)();
+    await tick(5);
+    for (const hook of ALL_HOOKS) assert.equal(host.live(hook), 0, `${hook} disposed`);
+    // A second cleanup call is a no-op.
+    await (first as () => Promise<void>)();
+
+    // The location comes back: one fresh set, not two.
+    const second = await setup(host.ctx);
+    assert.equal(typeof second, "function");
+    // And a repeated setup without a cleanup registers nothing more.
+    assert.equal(await setup(host.ctx), undefined);
+    await tick(5);
+    for (const hook of ALL_HOOKS) assert.equal(host.live(hook), 1, `${hook} once`);
+
+    mock.setMode("deny");
+    await host.fire("tool.execute.before", { tool: "shell", sessionID: "s1", agent: "b", messageID: "m", id: "c1", input: { command: "cat .env" } });
+    const evaluate: Record<string, unknown> = { sessionID: "s1", action: "shell", resources: ["cat .env"], source: { type: "tool", messageID: "m", id: "c1" }, effect: "allow" };
+    await host.fire("permission.evaluate", evaluate);
+    assert.equal(evaluate.effect, "deny");
+    assert.equal(pretoolRequests(mock).length, 1, "exactly one check per call");
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("WR-02: a registration that resolves after the cleanup is disposed as it arrives", async () => {
+  resetMock();
+  const t = makeDeps(mock);
+  try {
+    const setup = createSetupV2({ ...t.deps, sentinelKey: Symbol("v2-setup-test") });
+    const host = keepingHost("/repo");
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tool = host.ctx.tool as { hook: (hook: string, cb: Handler) => Promise<unknown> };
+    const slowHook = tool.hook;
+    host.ctx.tool = {
+      hook: async (hook: string, cb: Handler) => {
+        await gate;
+        return slowHook(hook, cb);
+      },
+    };
+    const cleanup = await setup(host.ctx);
+    await (cleanup as () => Promise<void>)();
+    release?.();
+    await tick(20);
+    assert.equal(host.live("tool.execute.before"), 0);
+    assert.equal(host.live("tool.execute.after"), 0);
+  } finally {
+    t.cleanup();
+  }
+});
+
 test("an audit-only tools capability also reports v2_not_enforcing once", async () => {
   resetMock();
   const t = makeDeps(mock);

@@ -37,7 +37,7 @@ import type { V2Capabilities } from "./constants.ts";
 import type { V2Cleanup, V2ContextLike } from "./hostTypesV2.ts";
 import { BUILD_TOKEN, createRuntime } from "./plugin.ts";
 import type { Deps, DirectoryRecord, RuntimeHandle } from "./plugin.ts";
-import { createV2Scope, registerV2Enforcement, v2HostClient } from "./v2Enforce.ts";
+import { createV2Registrations, createV2Scope, registerV2Enforcement, v2HostClient } from "./v2Enforce.ts";
 import type { V2Scope } from "./v2Enforce.ts";
 import { registerV2Recording, V2_RECORDING_GAPS, v2ProviderIdentity } from "./v2Record.ts";
 
@@ -221,14 +221,16 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
       reportStatus(shared);
 
       let stopRecording: (() => void) | undefined;
+      // Every hook handle of this directory, disposed by the cleanup (WR-02).
+      const registrations = createV2Registrations();
       try {
         const client = v2HostClient(v2, directory);
         // MCP server names are not known at setup (`ctx.mcp.list()` is empty before servers
         // connect, 14-SPIKES V2-3): the decision side reads the live list when it needs it.
         handle.recordFor(directory, client, []);
         const recordFor = (dir: string): DirectoryRecord => handle.recordFor(dir, client);
-        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities, shared.scope);
-        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor, shared.scope) : undefined;
+        const registered = registerV2Enforcement(v2, runtime, recordFor, shared.capabilities, shared.scope, registrations);
+        stopRecording = registered ? registerV2Recording(v2, runtime, recordFor, shared.scope, registrations) : undefined;
         if (stopRecording === undefined) {
           later(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
         }
@@ -236,9 +238,18 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
         later(() => runtime.reportOnce(SIGNAL_INIT_DEGRADED, SETUP_TOOL_LABEL, "registration_fault"));
       }
 
-      // Location shutdown: stop recording and free the directory; a pending turn is never posted
-      // from here.
+      // Location shutdown: dispose this directory's hooks, stop recording and free the directory; a
+      // pending turn is never posted from here. Runs once: a second call does nothing, so it can
+      // never free a later setup's registration of the same directory.
+      let cleaned = false;
       const cleanup = async (): Promise<void> => {
+        if (cleaned) return;
+        cleaned = true;
+        try {
+          registrations.dispose();
+        } catch {
+          // A host that keeps a handle keeps it.
+        }
         try {
           stopRecording?.();
           shared.directories.delete(key);

@@ -45,8 +45,15 @@ import type {
 import type { DirectoryRecord, Runtime } from "./plugin.ts";
 import { handleEvent, outputParts, recordResult, sanitizeHostVersion, toolExecuteAfter } from "./record.ts";
 import type { RecordContext } from "./record.ts";
-import { createV2Scope, noteInterrupted, V2_BUILTIN_TOOLS, V2_CODE_MODE_TOOL, v1ToolName } from "./v2Enforce.ts";
-import type { V2Scope } from "./v2Enforce.ts";
+import {
+  createV2Registrations,
+  createV2Scope,
+  noteInterrupted,
+  V2_BUILTIN_TOOLS,
+  V2_CODE_MODE_TOOL,
+  v1ToolName,
+} from "./v2Enforce.ts";
+import type { V2Registrations, V2Scope } from "./v2Enforce.ts";
 
 /** HV2-06 is GO on 2.0.22: no recording piece is missing. A PARTIAL host would list them here. */
 export const V2_RECORDING_GAPS: readonly string[] = Object.freeze([]);
@@ -124,6 +131,7 @@ export function registerV2Recording(
   runtime: Runtime,
   recordFor: (directory: string) => DirectoryRecord,
   scope: V2Scope = createV2Scope(),
+  registrations: V2Registrations = createV2Registrations(),
 ): (() => void) | undefined {
   let controller: AbortController | undefined;
   let stopped = false;
@@ -294,11 +302,11 @@ export function registerV2Recording(
 
     const tool = ctx.tool;
     if (tool !== undefined && typeof tool.hook === "function") {
-      void Promise.resolve(tool.hook("execute.after", afterHandler)).catch(() => undefined);
+      registrations.track(tool.hook("execute.after", afterHandler));
     }
     const session = ctx.session;
     if (session !== undefined && typeof session.hook === "function") {
-      void Promise.resolve(session.hook("model.request", modelRequest)).catch(() => undefined);
+      registrations.track(session.hook("model.request", modelRequest));
     }
 
     const events = ctx.event;

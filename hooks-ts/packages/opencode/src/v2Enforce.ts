@@ -173,6 +173,56 @@ export function noteInterrupted(scope: V2Scope, sessionID: string, at: number): 
   }
 }
 
+/**
+ * The `{dispose}` handles of one directory's hook registrations (`ctx.<domain>.hook(...)` resolves to
+ * one, `registration.d.ts`). The setup cleanup disposes them all: a host that keeps a location's
+ * hooks after its cleanup must not end up with two sets after the next setup (WR-02). A
+ * registration that resolves after `dispose()` is disposed as it arrives. Total.
+ */
+export interface V2Registrations {
+  /** Keep the handle a `hook(...)` call resolves to; a rejected registration is ignored. */
+  track(registration: unknown): void;
+  /** Dispose every handle kept so far and every one that arrives later. Idempotent. */
+  dispose(): void;
+  /** How many handles are currently kept (test seam). */
+  size(): number;
+}
+
+function disposeOne(registration: unknown): void {
+  try {
+    const dispose = readField(registration, "dispose");
+    if (typeof dispose !== "function") return;
+    void Promise.resolve((dispose as (this: unknown) => unknown).call(registration)).catch(() => undefined);
+  } catch {
+    // A handle that cannot be disposed stays with the host.
+  }
+}
+
+export function createV2Registrations(): V2Registrations {
+  const kept: unknown[] = [];
+  let disposed = false;
+  return {
+    track(registration: unknown): void {
+      try {
+        void Promise.resolve(registration).then(
+          (handle) => {
+            if (disposed) disposeOne(handle);
+            else kept.push(handle);
+          },
+          () => undefined,
+        );
+      } catch {
+        // Not trackable: nothing to dispose either.
+      }
+    },
+    dispose(): void {
+      disposed = true;
+      for (const handle of kept.splice(0, kept.length)) disposeOne(handle);
+    },
+    size: () => kept.length,
+  };
+}
+
 /** The directory a model shell call spawns in: an absolute `workdir`, a relative one under `directory`, else `directory`. */
 function modelShellCwd(input: unknown, directory: string): string {
   try {
@@ -329,6 +379,7 @@ export function registerV2Enforcement(
   recordFor: (directory: string) => DirectoryRecord,
   capabilities: V2Capabilities = V2_CAPABILITIES,
   scope: V2Scope = createV2Scope(),
+  registrations: V2Registrations = createV2Registrations(),
 ): boolean {
   try {
     const directory = readString(readField(ctx, "location"), "directory");
@@ -589,7 +640,7 @@ export function registerV2Enforcement(
     const tool = ctx.tool;
     if (tool !== undefined && typeof tool.hook === "function") {
       // The raise happens outside the decision's guard, and only with a verdict message.
-      void Promise.resolve(
+      registrations.track(
         tool.hook("execute.before", async (event: V2ToolBefore): Promise<void> => {
           const started = nowSafe();
           const outcome = await decideToolCall(event).catch((): ToolCallOutcome => NO_OUTCOME);
@@ -599,28 +650,24 @@ export function registerV2Enforcement(
           // THIS call follows with nothing awaited in between (CR-01).
           markModelShell(event, outcome.kind, started);
         }),
-      ).catch(() => undefined);
+      );
     }
     const permission = ctx.permission;
     if (permission !== undefined && typeof permission.hook === "function") {
-      void Promise.resolve(permission.hook("evaluate", (event: V2PermissionEvaluate) => applyEvaluate(event))).catch(
-        () => undefined,
-      );
+      registrations.track(permission.hook("evaluate", (event: V2PermissionEvaluate) => applyEvaluate(event)));
     }
     const session = ctx.session;
     if (session !== undefined && typeof session.hook === "function") {
-      void Promise.resolve(session.hook("prompt", (event: V2SessionPrompt) => handlePrompt(event))).catch(
-        () => undefined,
-      );
+      registrations.track(session.hook("prompt", (event: V2SessionPrompt) => handlePrompt(event)));
     }
     const shell = ctx.shell;
     if (capabilities.userShell !== "none" && shell !== undefined && typeof shell.hook === "function") {
-      void Promise.resolve(
+      registrations.track(
         shell.hook("create.before", async (event: V2ShellCreateBefore): Promise<void> => {
           const message = await decideUserShell(event).catch(() => undefined);
           if (typeof message === "string" && message.length > 0) block(message);
         }),
-      ).catch(() => undefined);
+      );
     }
     return true;
   } catch {
