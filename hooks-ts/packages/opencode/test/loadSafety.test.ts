@@ -516,7 +516,12 @@ test("setup on a v2 ctx reports one v2_status per process, never api_family_inac
         errors?: Array<{ message?: string }>;
       };
       assert.equal(body.hook_source, "opencode-hook");
-      assert.match(body.errors?.[0]?.message ?? "", /tools=enforce;ask=native;mcp=enforce;prompt=block;recording=full;identity=provider;shell=enforce/);
+      assert.ok(
+        (body.errors?.[0]?.message ?? "").includes(
+          "v2_status: tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce for tool=setup",
+        ),
+        body.errors?.[0]?.message,
+      );
       // A second call, and a second copy on the same slot, for the same directory register and report nothing more.
       assert.equal(await setup(ctx), undefined);
       assert.equal(await createSetupV2({ ...t.deps, sentinelKey })(ctx), undefined);

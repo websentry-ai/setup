@@ -95,7 +95,7 @@ const ALL_HOOKS = [
 test("v2StatusDetail lists every capability", () => {
   assert.equal(
     v2StatusDetail(V2_CAPABILITIES),
-    "tools=enforce;ask=native;mcp=enforce;prompt=block;recording=full;identity=provider;shell=enforce",
+    "tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce",
   );
 });
 
@@ -165,7 +165,7 @@ test("an audit-only tools capability also reports v2_not_enforcing once", async 
     await setup(fakeCtx("/repo").ctx);
     assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_V2_NOT_ENFORCING).length === 1));
     const message = (signalsOf(mock, SIGNAL_V2_STATUS)[0]?.body as { errors?: Array<{ message?: string }> }).errors?.[0]?.message;
-    assert.match(message ?? "", /tools=audit/);
+    assert.ok((message ?? "").includes("tools:audit/"), message);
   } finally {
     t.cleanup();
   }
