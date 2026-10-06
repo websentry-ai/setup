@@ -23,7 +23,7 @@ import { SIGNAL_ARGS_CHANGED } from "../src/constants.ts";
 import type { V2ContextLike } from "../src/hostTypesV2.ts";
 import { createRuntime } from "../src/plugin.ts";
 import type { DirectoryRecord, Deps, RuntimeHandle } from "../src/plugin.ts";
-import { registerV2Enforcement, v2HostClient } from "../src/v2Enforce.ts";
+import { createV2Scope, registerV2Enforcement, v2HostClient } from "../src/v2Enforce.ts";
 import { registerV2Recording, V2_RECORDING_GAPS, v2ProviderIdentity } from "../src/v2Record.ts";
 import { makeDeps, pretoolRequests, signalsOf, startOpencodeMock, tick, waitFor } from "./helpers/fakeHost.ts";
 
@@ -131,8 +131,10 @@ async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
   } as unknown as V2ContextLike;
   const record = handle.recordFor(DIRECTORY, v2HostClient(ctx, DIRECTORY), []);
   const recordFor = (dir: string): DirectoryRecord => handle.recordFor(dir, v2HostClient(ctx, dir));
-  registerV2Enforcement(ctx, handle.runtime, recordFor);
-  const stop = registerV2Recording(ctx, handle.runtime, recordFor);
+  // One shared scope, as setup passes (v2.ts): Code Mode numbering, shell marks, sessions.
+  const scope = createV2Scope();
+  registerV2Enforcement(ctx, handle.runtime, recordFor, undefined, scope);
+  const stop = registerV2Recording(ctx, handle.runtime, recordFor, scope);
   return {
     ctx,
     handlers,
@@ -346,6 +348,66 @@ test("Code Mode: inner MCP calls sharing the outer id each get a result, and no 
     await afterHook({ ...base, tool: "execute", input: { code: "..." }, status: "completed", result: "done" });
     const results = f.handle.runtime.sessions.forSession("s1").turn.snapshot().results;
     assert.equal(results.filter((r) => r.tool_name === "spike_echo").length, 2, JSON.stringify(results));
+    await tick(50);
+    assert.equal(signalsOf(mock, SIGNAL_ARGS_CHANGED).length, 0);
+    // IN-05: every inner call and its result share one numbered id, so they pair in the turn log.
+    const snapshot = f.handle.runtime.sessions.forSession("s1").turn.snapshot();
+    const callIds = snapshot.tool_calls.filter((c) => c.tool_name === "spike_echo").map((c) => c.tool_use_id);
+    const resultIds = snapshot.results.filter((r) => r.tool_name === "spike_echo").map((r) => r.tool_use_id);
+    assert.deepEqual(callIds, ["call_x", "call_x#1"]);
+    assert.deepEqual(resultIds, callIds);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("IN-05: parallel inner Code Mode calls pair by number and never raise a false args-changed signal", async () => {
+  const f = await fakeV2();
+  try {
+    await f.emit("session.created", { sessionID: "s1", version: "2.0.24" });
+    await hook(f, "session.prompt")({ sessionID: "s1", messageID: "u", prompt: { text: "go" }, delivery: "steer" });
+    const before = hook(f, "tool.execute.before");
+    const afterHook = hook(f, "tool.execute.after");
+    const base = { sessionID: "s1", agent: "build", messageID: "m", id: "call_p" };
+    // Promise.all in Code Mode: three befores, then the results in another order.
+    const inputs = [{ n: "a" }, { n: "b" }, { n: "c" }];
+    for (const input of inputs) await before({ ...base, tool: "spike_echo", input });
+    for (const input of [inputs[2], inputs[0], inputs[1]]) {
+      await afterHook({ ...base, tool: "spike_echo", input, status: "completed", result: `r${input?.n}` });
+    }
+    await tick(50);
+    assert.equal(signalsOf(mock, SIGNAL_ARGS_CHANGED).length, 0, "no false tamper signal");
+    const snapshot = f.handle.runtime.sessions.forSession("s1").turn.snapshot();
+    const callIds = snapshot.tool_calls.filter((c) => c.tool_name === "spike_echo").map((c) => c.tool_use_id);
+    const resultIds = snapshot.results.filter((r) => r.tool_name === "spike_echo").map((r) => r.tool_use_id);
+    assert.deepEqual(callIds, ["call_p", "call_p#1", "call_p#2"]);
+    assert.deepEqual([...resultIds].sort(), [...callIds].sort(), "each result pairs with a recorded call");
+    // A sequential call after them is compared again: a real change is still reported.
+    await before({ ...base, tool: "spike_echo", input: { n: "d" } });
+    await afterHook({ ...base, tool: "spike_echo", input: { n: "CHANGED" }, status: "completed", result: "rd" });
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_ARGS_CHANGED).length === 1));
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("IN-05: a blocked inner call leaves no open id, so the next inner result pairs with its own call", async () => {
+  const f = await fakeV2();
+  try {
+    await f.emit("session.created", { sessionID: "s1", version: "2.0.24" });
+    await hook(f, "session.prompt")({ sessionID: "s1", messageID: "u", prompt: { text: "go" }, delivery: "steer" });
+    const before = hook(f, "tool.execute.before");
+    const afterHook = hook(f, "tool.execute.after");
+    const base = { sessionID: "s1", agent: "build", messageID: "m", id: "call_b" };
+    f.record.liveMcpServerNames = ["spike"]; // attributed: the server would evaluate it
+    mock.setMode("deny");
+    await assert.rejects(async () => before({ ...base, tool: "spike_echo", input: { n: "1" } }));
+    mock.setMode("allow");
+    await before({ ...base, tool: "spike_echo", input: { n: "2" } });
+    await afterHook({ ...base, tool: "spike_echo", input: { n: "2" }, status: "completed", result: "r2" });
+    const snapshot = f.handle.runtime.sessions.forSession("s1").turn.snapshot();
+    assert.deepEqual(snapshot.results.map((r) => r.tool_use_id), ["call_b#1"]);
+    assert.ok(snapshot.tool_calls.some((c) => c.tool_use_id === "call_b#1"));
     await tick(50);
     assert.equal(signalsOf(mock, SIGNAL_ARGS_CHANGED).length, 0);
   } finally {

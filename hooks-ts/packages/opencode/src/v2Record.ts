@@ -27,10 +27,12 @@
 // passes to the runtime, and it reads nothing. opencode 2.x keeps credentials in its local database
 // (14-SPIKES V2-8), which this adapter never opens.
 //
-// Code Mode (14-SPIKES V2-3): every inner MCP call reaches the hooks with the OUTER call id. The
-// first result under an id is recorded under that id (and tamper-checked); later ones get
-// `<id>#<n>` and are not compared, since their digest may belong to a sibling call. The wrapper's own
-// result is not recorded: no call was recorded for it (its inner calls are).
+// Code Mode (14-SPIKES V2-3): every inner MCP call reaches the hooks with the OUTER call id.
+// `execute.before` numbers each inner call (the first keeps the id, later ones get `<id>#<n>`) and
+// decides and records it under that id; its result takes the oldest open numbered id, so call and
+// result pair in the turn log. While sibling inner calls are still open (parallel calls), results may
+// finish out of order, so the args digest is not compared then. The wrapper's own result is not
+// recorded: no call was recorded for it (its inner calls are).
 //
 // Every handler is total, and the event loop never rejects. Bookkeeping is synchronous; every network
 // call is record.ts's fire-and-forget.
@@ -53,6 +55,7 @@ import {
   noteInterrupted,
   noteRootSession,
   noteSessionDirectory,
+  takeCodeModeResult,
   V2_BUILTIN_TOOLS,
   V2_CODE_MODE_TOOL,
   v1ToolName,
@@ -269,25 +272,40 @@ export function registerV2Recording(
         const name = v1ToolName(tool);
         const status = readField(event, "status");
         let callID = id;
+        let compare = true;
         if (!V2_BUILTIN_TOOLS.has(tool)) {
-          // Code Mode inner calls share the outer id: number the later ones.
-          const key = keyOf(sessionID, id);
-          const seen = afterCounts.get(key) ?? 0;
-          remember(afterCounts, key, seen + 1);
-          if (seen > 0) callID = `${id}#${seen}`;
+          // Code Mode inner calls share the outer id. Their result takes the numbered id their
+          // `execute.before` opened (IN-05), so call and result pair in the turn log.
+          const taken = takeCodeModeResult(scope, sessionID, id);
+          if (taken !== undefined) {
+            callID = taken.callID;
+            // Siblings still open (parallel inner calls): results may finish out of order, so the
+            // digest is not compared (no false `args_changed_after_check`).
+            compare = !taken.concurrent;
+          } else {
+            // Nothing numbered (the call was not checked): number the results on their own.
+            const key = keyOf(sessionID, id);
+            const seen = afterCounts.get(key) ?? 0;
+            remember(afterCounts, key, seen + 1);
+            if (seen > 0) {
+              callID = `${id}#${seen}`;
+              compare = false;
+            }
+          }
         }
         if (status === "error") {
+          runtime.takeDigest(sessionID, callID);
           const error = readField(readField(event, "error"), "error");
           recordError(sessionID, callID, name, readString(error, "reason") || readString(error, "_tag"));
           return;
         }
-        if (callID !== id) {
-          // Not compared: this id's remembered digest may belong to a sibling inner call.
+        if (!compare) {
+          runtime.takeDigest(sessionID, callID);
           recordResult(context(), sessionID, callID, name, false, outputParts(readField(event, "result")));
           return;
         }
         await toolExecuteAfter(context())(
-          { tool: name, sessionID, callID: id, args: readField(event, "input") },
+          { tool: name, sessionID, callID, args: readField(event, "input") },
           { output: readField(event, "result") },
         );
       } catch {

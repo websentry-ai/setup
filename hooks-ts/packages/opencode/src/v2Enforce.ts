@@ -183,6 +183,90 @@ export interface V2Scope {
   readonly confirmedRoots: Set<string>;
   /** Called on every model tool call and prompt (v2.ts: send `v2_status` once a key exists, IN-06). */
   onActivity: (() => void) | undefined;
+  /**
+   * Code Mode (IN-05): every inner MCP call reaches the hooks with the OUTER call id. Per
+   * `session\0outer id`: how many inner calls were numbered, and the numbered ids still awaiting a
+   * result, oldest first (bounded).
+   */
+  readonly codeMode: Map<string, CodeModeCalls>;
+}
+
+/** The inner calls of one outer Code Mode call. */
+export interface CodeModeCalls {
+  /** How many inner calls were numbered. */
+  next: number;
+  /** Numbered ids awaiting a result, oldest first. */
+  open: string[];
+  /** More than one inner call was open at once since the open set was last empty. */
+  overlapped: boolean;
+}
+
+/** The most outer Code Mode calls tracked, and the most open inner calls per outer call. */
+const MAX_CODE_MODE_CALLS = 1024;
+const MAX_OPEN_INNER_CALLS = 256;
+
+/**
+ * Number one inner Code Mode call: the first keeps the outer id, later ones get `<id>#<n>`. The
+ * decision, its audit entry and its digest all use the numbered id, and so does the result
+ * (`takeCodeModeResult`), so the turn log pairs them. Total: a fault keeps the outer id.
+ */
+export function openCodeModeCall(scope: V2Scope, sessionID: string, callID: string): string {
+  try {
+    if (sessionID === "" || callID === "") return callID;
+    const key = `${sessionID}\u0000${callID}`;
+    const entry: CodeModeCalls = scope.codeMode.get(key) ?? { next: 0, open: [], overlapped: false };
+    scope.codeMode.delete(key);
+    scope.codeMode.set(key, entry);
+    while (scope.codeMode.size > MAX_CODE_MODE_CALLS) {
+      const oldest = scope.codeMode.keys().next().value;
+      if (oldest === undefined) break;
+      scope.codeMode.delete(oldest);
+    }
+    const id = entry.next === 0 ? callID : `${callID}#${entry.next}`;
+    entry.next += 1;
+    entry.open.push(id);
+    while (entry.open.length > MAX_OPEN_INNER_CALLS) entry.open.shift();
+    if (entry.open.length > 1) entry.overlapped = true;
+    return id;
+  } catch {
+    return callID;
+  }
+}
+
+/** An inner call that was blocked before it ran: no result will come for it. Total. */
+export function closeCodeModeCall(scope: V2Scope, sessionID: string, callID: string, numbered: string): void {
+  try {
+    const open = scope.codeMode.get(`${sessionID}\u0000${callID}`)?.open;
+    const index = open?.indexOf(numbered) ?? -1;
+    if (open !== undefined && index >= 0) open.splice(index, 1);
+  } catch {
+    // It ages out.
+  }
+}
+
+/**
+ * The numbered id an inner call's result is recorded under: the oldest open one. `concurrent` is
+ * true when other inner calls of the same outer call were open at the same time (in this batch), so
+ * results may complete out of order and the args digest must not be compared (it may belong to a
+ * sibling). `undefined` when
+ * nothing was numbered for this id (the caller falls back). Total.
+ */
+export function takeCodeModeResult(
+  scope: V2Scope,
+  sessionID: string,
+  callID: string,
+): { callID: string; concurrent: boolean } | undefined {
+  try {
+    const entry = scope.codeMode.get(`${sessionID}\u0000${callID}`);
+    if (entry === undefined || entry.open.length === 0) return undefined;
+    const concurrent = entry.overlapped || entry.open.length > 1;
+    const numbered = entry.open.shift();
+    // The batch drained: the next inner call starts a fresh, comparable sequence.
+    if (entry.open.length === 0) entry.overlapped = false;
+    return numbered === undefined ? undefined : { callID: numbered, concurrent };
+  } catch {
+    return undefined;
+  }
 }
 
 /** `scope.onActivity`, guarded. Total. */
@@ -206,6 +290,7 @@ export function createV2Scope(directories: Set<string> = new Set<string>()): V2S
     evaluateWithoutSource: false,
     confirmedRoots: new Set<string>(),
     onActivity: undefined,
+    codeMode: new Map<string, CodeModeCalls>(),
   };
 }
 
@@ -530,6 +615,8 @@ const NO_DECISION: BeforeDecision = Object.freeze({ message: undefined, kind: un
 interface ToolCallOutcome {
   raise: string | undefined;
   kind: BeforeDecision["kind"];
+  /** The numbered id of a non-built-in (Code Mode inner) call, when one was opened. */
+  numbered?: string;
 }
 
 const NO_OUTCOME: ToolCallOutcome = Object.freeze({ raise: undefined, kind: undefined });
@@ -660,8 +747,10 @@ export function registerV2Enforcement(
 
         const rec = record();
         if (!builtin) await learnMcpNames(tool, rec);
+        // Inner Code Mode calls share the outer id: each gets its own numbered id (IN-05).
+        const numbered = builtin ? callID : openCodeModeCall(scope, sessionID, callID);
         const decision = decideBeforeVerdict(
-          { tool: v1ToolName(tool), sessionID, callID },
+          { tool: v1ToolName(tool), sessionID, callID: numbered },
           { args: readField(event, "input") },
           { runtime, record: rec },
         ).catch((): BeforeDecision => NO_DECISION);
@@ -687,7 +776,7 @@ export function registerV2Enforcement(
         }
         // deny / unavailable → the verdict text; confirm → the v1 approval sentence (MCP ask is
         // unproven on v2, so it blocks as on v1).
-        return { raise: message, kind };
+        return { raise: message, kind, numbered };
       } catch {
         return NO_OUTCOME;
       }
@@ -898,7 +987,13 @@ export function registerV2Enforcement(
           const started = nowSafe();
           const outcome = await decideToolCall(event).catch((): ToolCallOutcome => NO_OUTCOME);
           const message = outcome.raise;
-          if (typeof message === "string" && message.length > 0) block(message);
+          if (typeof message === "string" && message.length > 0) {
+            // Blocked before it ran: no result will come for this inner call.
+            if (outcome.numbered !== undefined) {
+              closeCodeModeCall(scope, readString(event, "sessionID"), readString(event, "id"), outcome.numbered);
+            }
+            block(message);
+          }
           // Only now, with the decision in and right before returning: the host's spawn hook for
           // THIS call follows with nothing awaited in between (CR-01).
           markModelShell(event, outcome.kind, started);
