@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from unbound_hook import migration, setup_cmd
+from unbound_hook import clear_cmd, migration, setup_cmd
 from unbound_hook._loader import load_mdm_setup_module
 from unbound_hook._resources import HOOK_BINARY
 
@@ -759,6 +759,53 @@ def test_codex_clear_still_removes_the_binary_install(env):
     hooks_json = env["home"] / ".codex" / "hooks.json"
     if hooks_json.exists():
         assert not any(_codex_registrations(env["home"]).values())
+
+
+def test_codex_replaces_a_symlink_at_its_hook_path(env):
+    """The sweep used to delete a symlinked ~/.codex/hooks/unbound.py before the
+    adapter's O_NOFOLLOW write; now the adapter replaces the link itself, never
+    writing through it."""
+    target = env["tmp"] / "elsewhere.py"
+    target.write_text("# not ours\n")
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.symlink_to(target)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert not wrapper.is_symlink() and "os.execv" in wrapper.read_text()
+    assert target.read_text() == "# not ours\n"
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
+@pytest.mark.parametrize("shape", ["corrupt", "symlink"])
+def test_codex_defers_on_an_unusable_hooks_json(env, shape):
+    """A hooks.json we can't safely merge into defers codex without touching it
+    (or writing through a link), and the other tools still configure."""
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json.parent.mkdir(parents=True)
+    if shape == "corrupt":
+        hooks_json.write_text("{not json")
+        watched = hooks_json
+    else:
+        watched = env["tmp"] / "dotfiles-hooks.json"
+        watched.write_text(json.dumps({"hooks": {}}))
+        hooks_json.symlink_to(watched)
+    before = watched.read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert watched.read_text() == before
+    assert not _codex_states(env)
+    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
+
+
+def test_clear_command_removes_the_codex_install(env, monkeypatch):
+    """`unbound-hook clear` runs the sweep after each clear_setup; with codex no
+    longer swept, its own clear_setup must still leave nothing behind."""
+    monkeypatch.setattr(env["modules"]["copilot"], "managed_settings_path",
+                        lambda: env["tmp"] / "managed-copilot" / "managed-settings.json")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert clear_cmd.run([]) == 0
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    assert not hooks_json.exists() or not any(_codex_registrations(env["home"]).values())
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
