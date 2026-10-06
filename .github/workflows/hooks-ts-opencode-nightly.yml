@@ -54,6 +54,8 @@ jobs:
             node-version: 22
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -62,7 +64,8 @@ jobs:
       - if: matrix.runtime == 'bun'
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          # Pinned: an exact release, so a new Bun cannot change this leg without a commit.
+          bun-version: 1.4.2
 
       - name: Import smoke (Node)
         if: matrix.runtime != 'bun'
@@ -76,20 +79,29 @@ jobs:
           bun --version
           bun scripts/opencode-import-smoke.mjs ../opencode/index.js
 
+  # The two loader legs install an @latest CLI. Its install needs exactly one lifecycle script, the
+  # CLI package's own postinstall (it puts the platform binary in place), so every script is turned
+  # off (--ignore-scripts) and only that one is run, by hand. The install happens BEFORE checkout, in
+  # $RUNNER_TEMP, so no repository and no token are on disk while @latest code runs; checkout never
+  # persists its token anyway (persist-credentials: false on every job).
   loader-v1:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
 
-      - name: Install opencode-ai@latest into a temp prefix
+      - name: Install opencode-ai@latest into a temp prefix (before checkout, scripts off)
+        working-directory: ${{ runner.temp }}
         run: |
-          npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/oc1" opencode-ai@latest
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/oc1" opencode-ai@latest
+          (cd "$RUNNER_TEMP/oc1/node_modules/opencode-ai" && node ./postinstall.mjs)
           "$RUNNER_TEMP/oc1/node_modules/.bin/opencode" --version
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Loader smoke (v1)
         run: |
@@ -107,16 +119,20 @@ jobs:
     # the mock's requests) but does not fail the workflow.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
 
-      - name: Install @opencode/cli@latest into a temp prefix
+      - name: Install @opencode/cli@latest into a temp prefix (before checkout, scripts off)
+        working-directory: ${{ runner.temp }}
         run: |
-          npm install --no-audit --no-fund --prefix "$RUNNER_TEMP/oc2" @opencode/cli@latest
+          npm install --ignore-scripts --no-audit --no-fund --prefix "$RUNNER_TEMP/oc2" @opencode/cli@latest
+          (cd "$RUNNER_TEMP/oc2/node_modules/@opencode/cli" && node ./postinstall.mjs)
           "$RUNNER_TEMP/oc2/node_modules/.bin/opencode" --version
+
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
       - name: Loader smoke (v2)
         run: |
@@ -131,20 +147,23 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
 
+      # No npm cache here: this job installs an @latest package into the workspace, and a scheduled
+      # run would otherwise save ~/.npm under the key other workflows restore.
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: hooks-ts/package-lock.json
 
       - name: Install
         run: npm ci
 
-      # Type-only; --no-save keeps the lockfile untouched (the package is never a dependency).
+      # Type-only, so no lifecycle script is needed (--ignore-scripts); --no-save keeps the lockfile
+      # untouched (the package is never a dependency).
       - name: Install @opencode-ai/plugin@latest (types only)
         run: |
-          npm install --no-save --no-audit --no-fund @opencode-ai/plugin@latest
+          npm install --no-save --ignore-scripts --no-audit --no-fund @opencode-ai/plugin@latest
           npm ls @opencode-ai/plugin || true
 
       - name: Host-type conformance
