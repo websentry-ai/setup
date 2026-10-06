@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 
-import { DENY_PREFIX } from "../../core/src/constants.ts";
+import { DENY_PREFIX, USER_BASH_ID_PREFIX } from "../../core/src/constants.ts";
 import type { PretoolRequestBody } from "../../core/src/types.ts";
 import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import { V2_CAPABILITIES } from "../src/constants.ts";
@@ -61,7 +61,7 @@ interface FakeOptions {
   /** `ctx.session.get` never answers. */
   sessionGetHangs?: boolean;
   /** The ctx has none of these domains. */
-  omit?: Array<"tool" | "permission" | "session">;
+  omit?: Array<"tool" | "permission" | "session" | "shell">;
 }
 
 async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
@@ -84,6 +84,7 @@ async function fakeV2(opts: FakeOptions = {}): Promise<FakeV2> {
     location: { directory: DIRECTORY },
     tool: domain("tool"),
     permission: domain("permission"),
+    shell: domain("shell"),
     session: {
       ...domain("session"),
       get: (input: { sessionID: string }) =>
@@ -646,5 +647,130 @@ test("prompt: fail-open (API down, no key) leaves the prompt untouched; hostile 
     assert.equal(pretoolRequests(mock).length, 0);
   } finally {
     noKey.cleanup();
+  }
+});
+
+// --- user `!cmd` shell (shell.create.before, deferred-items 14-03 #1) -----------------------------
+
+/** A `shell.create.before` input as 14-SPIKES V2-10 recorded it: no session id, no call id. */
+function shellCreate(command: string, cwd = DIRECTORY): Record<string, unknown> {
+  return { command, cwd, timeout: 120_000, shell: "/bin/zsh", env: { PATH: "/usr/bin" } };
+}
+
+async function userShell(f: FakeV2, command: string, cwd?: string): Promise<string | undefined> {
+  const handler = f.handlers.get("shell.create.before");
+  assert.ok(handler !== undefined, "shell.create.before registered");
+  try {
+    await handler(shellCreate(command, cwd));
+    return undefined;
+  } catch (err) {
+    return (err as Error).message;
+  }
+}
+
+test("user shell: an unseen command is checked as bash through the v1 path and raised on deny", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    assert.equal(await userShell(f, "cat .env"), SECRETS_DENY);
+    const bodies = toolBodies();
+    assert.equal(bodies.length, 1);
+    assert.equal(bodies[0]?.pre_tool_use_data.tool_name, "bash");
+    assert.equal(bodies[0]?.pre_tool_use_data.command, "cat .env");
+    assert.ok(bodies[0]?.pre_tool_use_data.tool_use_id?.startsWith(USER_BASH_ID_PREFIX));
+    assert.equal(metadataOf(bodies[0]).cwd, DIRECTORY);
+    // A relative cwd falls back to the directory.
+    assert.equal(await userShell(f, "cat .env", "sub"), SECRETS_DENY);
+    assert.equal(metadataOf(toolBodies()[1]).cwd, DIRECTORY);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("user shell: an approval verdict also raises (no native approval exists for a user shell)", async () => {
+  const f = await fakeV2({ mode: "ask" });
+  try {
+    const message = await userShell(f, "cat .env");
+    assert.ok(message?.startsWith(APPROVAL_PREFIX), message);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("user shell: an allowed command runs; the model's shell call is never checked twice", async () => {
+  const f = await fakeV2({ mode: "allow" });
+  try {
+    assert.equal(await userShell(f, "ls"), undefined);
+    assert.equal(toolBodies().length, 1);
+    // Model shell: execute.before, then shell.create.before with the same command → not re-checked.
+    const r = await toolCall(f, "shell", { command: "echo hi" }, { id: "call_m" });
+    assert.equal(r.raised, undefined);
+    assert.equal(toolBodies().length, 2);
+    assert.equal(await userShell(f, "echo hi"), undefined);
+    assert.equal(toolBodies().length, 2, "the model call's spawn is not checked again");
+    // The pending mark is consumed once: the same command typed by the user afterwards is checked.
+    assert.equal(await userShell(f, "echo hi"), undefined);
+    assert.equal(toolBodies().length, 3);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("user shell: a model shell that will be denied at evaluate is not raised from its spawn hook", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const before = f.handlers.get("tool.execute.before");
+    await before?.({ tool: "shell", sessionID: "ses_root", agent: "build", messageID: "m", id: "call_d", input: { command: "cat .env" } });
+    // Host order (V2-10): execute.before → shell.create.before → evaluate.
+    assert.equal(await userShell(f, "cat .env"), undefined);
+    assert.equal(toolBodies().length, 1);
+    const evaluated = await evaluateAgain(f, "ses_root", "call_d");
+    assert.equal(evaluated.effect, "deny");
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("user shell: no key, API down and hostile inputs never raise", async () => {
+  const f = await fakeV2({ mode: "allow", deps: { withKey: false } });
+  try {
+    assert.equal(await userShell(f, "cat .env"), undefined);
+    assert.equal(toolBodies().length, 0);
+    const handler = f.handlers.get("shell.create.before");
+    const boom = new Proxy({}, { get: () => { throw new Error("boom"); } });
+    for (const input of [null, undefined, 5, boom, { command: 5 }, { command: "" }]) {
+      await handler?.(input);
+    }
+  } finally {
+    f.cleanup();
+  }
+  const g = await fakeV2({ mode: "500" });
+  try {
+    assert.equal(await userShell(g, "cat .env"), undefined, "fail-open org: an unreachable API allows");
+  } finally {
+    g.cleanup();
+  }
+});
+
+test("user shell AUDIT: checked and reported, never raised; NONE: not registered", async () => {
+  const f = await fakeV2({ mode: "deny", capabilities: { userShell: "audit" } });
+  try {
+    assert.equal(await userShell(f, "cat .env"), undefined);
+    assert.equal(toolBodies().length, 1);
+    assert.ok(await waitFor(() => signalsOf(mock, "v2_not_enforcing").length === 1));
+  } finally {
+    f.cleanup();
+  }
+  const g = await fakeV2({ capabilities: { userShell: "none" } });
+  try {
+    assert.equal(g.handlers.has("shell.create.before"), false);
+  } finally {
+    g.cleanup();
+  }
+  const h = await fakeV2({ omit: ["shell"] });
+  try {
+    assert.equal(h.handlers.has("shell.create.before"), false);
+    assert.ok(h.handlers.has("tool.execute.before"), "the other domains still register");
+  } finally {
+    h.cleanup();
   }
 });
