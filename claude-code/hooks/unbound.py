@@ -4998,7 +4998,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if not session_id:
             session_id = event.get('session_id')
-        transcript_path = transcript_path or event.get('transcript_path')
+        # Claude sends the literal 'undefined' when it has no transcript yet.
+        if event.get('transcript_path') not in (None, '', 'undefined'):
+            transcript_path = event['transcript_path']
 
         if not permission_mode:
             permission_mode = event.get('permission_mode')

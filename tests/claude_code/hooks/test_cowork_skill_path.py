@@ -177,6 +177,23 @@ class TestCoworkRunInAPickedFolder(_CoworkTree):
         picked.mkdir()
         self.assertIsNone(self.resolve("xlsx", cwd=picked, transcript_path=fake))
 
+    def test_an_undefined_transcript_never_shadows_the_real_one(self):
+        skill = self.bundle("b1", "xlsx")
+        picked = Path(self._tmp.name) / "picked"
+        picked.mkdir()
+        base = {"session_id": "s1", "cwd": str(picked)}
+        events = [
+            dict(base, hook_event_name="UserPromptSubmit", prompt="sheet", transcript_path="undefined"),
+            dict(base, hook_event_name="PostToolUse", tool_name="Skill", transcript_path=self.transcript(),
+                 tool_input={"skill": "anthropic-skills:xlsx"}, tool_response={}),
+        ]
+        exchange = unbound.build_llm_exchange(
+            [{"timestamp": "2026-10-06T10:00:0%dZ" % i, "session_id": "s1", "event": e} for i, e in enumerate(events)],
+            stop_assistant_message="done", cwd=str(picked))
+        tool_uses = [t for m in exchange["messages"] for t in m.get("tool_use", [])]
+        entry = next(t for t in tool_uses if t["tool_name"] == "Skill")
+        self.assertEqual(entry["skill_path"], str(skill))
+
     def test_typed_skill_uses_the_session_transcript(self):
         content = "---\nname: xlsx\n---\nMake spreadsheets.\n"
         skill = self.bundle("b1", "xlsx", content)
