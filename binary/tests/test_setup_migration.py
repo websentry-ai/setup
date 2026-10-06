@@ -67,6 +67,11 @@ def env(tmp_path, monkeypatch):
     bootouts = []
     monkeypatch.setattr(migration, "_bootout_legacy_agents",
                         lambda username, uid, h, log: bootouts.append((username, uid)))
+    daemon_bootouts = []
+    monkeypatch.setattr(migration, "_bootout_legacy_daemon",
+                        lambda log: daemon_bootouts.append(log) or True)
+    monkeypatch.setattr(migration, "LEGACY_DAEMON_PLIST", tmp_path / "coding-discovery.plist")
+    monkeypatch.setattr(migration, "LEGACY_HOOK_SHIM", tmp_path / "usr-local-bin-unbound-hook")
     # Discovery needs no key any more: it resolves the device owner from the
     # serial and runs the locally installed binary. Stand in a no-op binary so
     # the step exercises that path instead of deferring on a missing file.
@@ -75,7 +80,8 @@ def env(tmp_path, monkeypatch):
     discovery_bin.chmod(0o755)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_BINARY", discovery_bin)
     return {"tmp": tmp_path, "home": home, "modules": modules,
-            "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts}
+            "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts,
+            "daemon_bootouts": daemon_bootouts}
 
 
 def _cmd(tool, event):
@@ -449,6 +455,82 @@ def test_sweep_full_python_install(env):
     _assert_swept(env["home"], env["tmp"])
     # legacy LaunchAgent bootout attempted for the user (stubbed in tests)
     assert env["bootouts"] == [(ME, __import__("pwd").getpwnam(ME).pw_uid)]
+
+
+def test_sweep_removes_python_era_system_daemon_and_shim(env):
+    plist, shim = migration.LEGACY_DAEMON_PLIST, migration.LEGACY_HOOK_SHIM
+    plist.write_text("<plist/>")
+    shim.write_text("#!/bin/bash")
+    status, reason = migration.run_sweep(log=lambda *_: None)
+    assert (status, reason) == ("configured", None)
+    assert not plist.exists() and not shim.exists()
+    assert len(env["daemon_bootouts"]) == (1 if sys.platform == "darwin" else 0)
+
+
+def test_sweep_keeps_a_symlinked_hook_shim(env):
+    target = env["tmp"] / "real-binary"
+    target.write_text("binary")
+    migration.LEGACY_HOOK_SHIM.symlink_to(target)
+    status, _ = migration.run_sweep(log=lambda *_: None)
+    assert status == "configured"
+    assert migration.LEGACY_HOOK_SHIM.is_symlink() and target.read_text() == "binary"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchctl is macOS-only")
+def test_sweep_defers_while_the_legacy_daemon_stays_loaded(env, monkeypatch):
+    monkeypatch.setattr(migration, "_bootout_legacy_daemon", lambda log: False)
+    status, reason = migration.run_sweep(log=lambda *_: None)
+    assert status == "deferred" and "system" in reason
+
+
+def test_bootout_reports_a_daemon_that_is_still_loaded(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv[1])
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(migration.subprocess, "run", fake_run)
+    logs = []
+    assert migration._bootout_legacy_daemon(logs.append) is False
+    assert calls == ["bootout", "print"]
+    assert any("still loaded" in line for line in logs)
+
+
+@pytest.mark.parametrize("print_rc", [113, 3])
+def test_bootout_succeeds_once_the_daemon_is_gone(monkeypatch, print_rc):
+    monkeypatch.setattr(
+        migration.subprocess, "run",
+        lambda argv, **kw: type("R", (), {"returncode": print_rc if argv[1] == "print" else 0})())
+    assert migration._bootout_legacy_daemon(lambda *_: None) is True
+
+
+def test_bootout_error_counts_as_not_unloaded(monkeypatch):
+    def boom(argv, **kw):
+        raise OSError("launchctl missing")
+
+    monkeypatch.setattr(migration.subprocess, "run", boom)
+    logs = []
+    assert migration._bootout_legacy_daemon(logs.append) is False
+    assert any("launchctl missing" in line for line in logs)
+
+
+def test_sweep_system_removal_failure_defers_but_still_sweeps_users(env, monkeypatch):
+    _plant_python_era_artifacts(env["home"], env["tmp"])
+    migration.LEGACY_DAEMON_PLIST.write_text("<plist/>")
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *a, **k):
+        if self == migration.LEGACY_DAEMON_PLIST:
+            raise PermissionError("denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    logs = []
+    status, reason = migration.run_sweep(log=logs.append)
+    assert status == "deferred" and "system" in reason
+    assert any("could not remove" in line for line in logs)
+    _assert_swept(env["home"], env["tmp"])
 
 
 def test_sweep_half_installed(env):
