@@ -18,7 +18,10 @@ import test from "node:test";
 const SRC = resolve(import.meta.dirname, "..", "src");
 
 const RAISE_FILE = "block.ts";
-const ALLOWED_BLOCK_CALLERS: ReadonlySet<string> = new Set(["before.ts", "prompt.ts", "userShell.ts"]);
+// `v2Enforce.ts`: the v2 lever for MCP / non-built-in tools (14-SPIKES.md HV2-02 "GO lever=both",
+// HV2-04 GO): an evaluate-deny on an MCP id drops the reason ("Unable to execute <id>"), while a raise
+// from `tool.execute.before` reaches the model verbatim. Built-in tools and prompts never raise on v2.
+const ALLOWED_BLOCK_CALLERS: ReadonlySet<string> = new Set(["before.ts", "prompt.ts", "userShell.ts", "v2Enforce.ts"]);
 
 /**
  * Remove block comments (JSDoc included) and line comments. A `//` directly after a `:` is kept, so

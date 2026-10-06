@@ -174,10 +174,33 @@ async function fanOut<T>(
 }
 
 /**
- * The message to block this call with, or `undefined` to let it run. Total: any fault is
- * `undefined` (allow), never a block.
+ * What `decideBeforeVerdict` concluded: the message to block with (or `undefined` to let the call
+ * run), the verdict kind it came from, and the verdict's own reason. `kind` is `undefined` when no
+ * verdict was reached (no key, init fault, `task`, a fault). The v2 entry needs the kind and reason
+ * to pick its lever (evaluate deny vs native ask vs raise, 14-SPIKES HV2-02/03/04); v1 needs only
+ * the message.
  */
-export async function decideBefore(input: unknown, output: unknown, ctx: BeforeContext): Promise<string | undefined> {
+export interface BeforeDecision {
+  message: string | undefined;
+  kind: ToolEvaluation["kind"] | undefined;
+  reason?: string;
+}
+
+const NO_DECISION: BeforeDecision = Object.freeze({ message: undefined, kind: undefined });
+
+function reasonOf(verdict: ToolEvaluation): string | undefined {
+  try {
+    const reason: unknown = (verdict as { reason?: unknown }).reason;
+    return typeof reason === "string" && reason !== "" ? reason : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The decision for this call. Total: any fault is `NO_DECISION` (allow), never a block.
+ */
+export async function decideBeforeVerdict(input: unknown, output: unknown, ctx: BeforeContext): Promise<BeforeDecision> {
   try {
     const { runtime, record } = ctx;
     // First thing: this call is model-issued, so `shell.env` must never check it again (HOOK-19).
@@ -193,14 +216,14 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
           record.initErrorNoticeShown = true;
           void notify(record.client, INIT_ERROR_NOTICE, "warning");
         }
-        return undefined;
+        return NO_DECISION;
       }
       const instance = runtime.instances.forDirectory(record.directory);
       if (!instance.noKeyNoticeShown) {
         instance.noKeyNoticeShown = true;
         void notify(record.client, NO_KEY_NOTICE, "info");
       }
-      return undefined;
+      return NO_DECISION;
     }
 
     const tool = readString(input, "tool");
@@ -227,7 +250,7 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
           ),
         );
       }
-      return undefined;
+      return NO_DECISION;
     }
 
     // MCP (HOOK-13): attribution only from the call's own server argument (resource tools) or the
@@ -299,7 +322,7 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
         );
         const message = blockingMessage(verdict);
         if (message !== undefined) void notify(record.client, message, "error");
-        return message;
+        return { message, kind: "deny", reason: PATCH_TOO_LARGE_REASON };
       }
       verdict = await fanOut(
         targets,
@@ -378,11 +401,24 @@ export async function decideBefore(input: unknown, output: unknown, ctx: BeforeC
     const message = blockingMessage(verdict);
     if (message === undefined) {
       runtime.rememberDigest(sessionID, callID, argsDigest(rawArgs));
-      return undefined;
+      return { message: undefined, kind: verdict.kind };
     }
     if (verdict.kind === "deny") void notify(record.client, message, "error");
     else if (verdict.kind === "confirm") void notify(record.client, message, "warning");
-    return message;
+    const reason = reasonOf(verdict);
+    return reason === undefined ? { message, kind: verdict.kind } : { message, kind: verdict.kind, reason };
+  } catch {
+    return NO_DECISION;
+  }
+}
+
+/**
+ * The message to block this call with, or `undefined` to let it run. Total: any fault is
+ * `undefined` (allow), never a block.
+ */
+export async function decideBefore(input: unknown, output: unknown, ctx: BeforeContext): Promise<string | undefined> {
+  try {
+    return (await decideBeforeVerdict(input, output, ctx)).message;
   } catch {
     return undefined;
   }
