@@ -4925,13 +4925,13 @@ def _cowork_session_from_transcript(transcript_path: Optional[str]) -> Optional[
     sits in a temp dir, under a project slug that is the session's outputs path with
     every non-alphanumeric turned into '-'. None unless exactly one session matches."""
     slug = Path(transcript_path).parent.name if transcript_path else ''
-    if 'local-agent-mode-sessions' not in slug:
+    if _COWORK_SESSIONS_DIRNAME not in slug:
         return None
     try:
         matches = [session
                    for base in _claude_desktop_support_dirs()
-                   for session in (base / _COWORK_SESSIONS_DIRNAME).glob('*/*/local_*/')
-                   if slug.startswith(re.sub(r'[^A-Za-z0-9]', '-', str(session)) + '-')]
+                   for session in (base / _COWORK_SESSIONS_DIRNAME).glob('*/*/local_*')
+                   if session.is_dir() and slug.startswith(re.sub(r'[^A-Za-z0-9]', '-', str(session)) + '-')]
     except Exception:
         return None
     return matches[0] if len(matches) == 1 else None
@@ -4949,8 +4949,8 @@ def _plugin_manifest_name(plugin: Path) -> Optional[str]:
 
 def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
     """The SKILL.md a Cowork run used: the session's own copy for a bare name, else the
-    newest version from the one source shipping the name — the bundle for anthropic-skills, the org
-    plugin declaring any other prefix. No source, or two, resolves nothing."""
+    newest version from the one source shipping it — the bundle for anthropic-skills,
+    the org plugin declaring any other prefix. No source, or two, resolves nothing."""
     own = session / '.claude' / 'skills' / name / 'SKILL.md'
     if not prefix and own.is_file():
         return str(own)
@@ -4960,8 +4960,8 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         for path in (root / 'skills-plugin').glob('**/skills/%s/SKILL.md' % name):
             sources.setdefault('bundle', []).append(path)
     if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
-        for plugin in (session.parent / 'rpm').glob('*/'):
-            if prefix and _plugin_manifest_name(plugin) != prefix:
+        for plugin in (session.parent / 'rpm').glob('*'):
+            if not plugin.is_dir() or (prefix and _plugin_manifest_name(plugin) != prefix):
                 continue
             for path in plugin.glob('**/skills/%s/SKILL.md' % name):
                 sources.setdefault(plugin.name, []).append(path)
