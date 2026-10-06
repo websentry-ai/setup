@@ -394,6 +394,30 @@ for (const copy of [false, true]) {
   });
 }
 
+test("IN-06: with no key at the first setup, v2_status is sent once a key appears", async () => {
+  resetMock();
+  let clock = 5_000_000;
+  const t = makeDeps(mock, { withKey: false, now: () => clock });
+  try {
+    const setup = createSetupV2({ ...t.deps, sentinelKey: Symbol("v2-setup-test") });
+    const a = fakeCtx("/repo");
+    await setup(a.ctx);
+    await tick(50);
+    assert.equal(signalsOf(mock, SIGNAL_V2_STATUS).length, 0, "nothing can be sent without a key");
+    // The key is installed while the process runs; the runtime looks again after its retry window.
+    (t.deps.env as NodeJS.ProcessEnv).UNBOUND_OPENCODE_API_KEY = "test-key-added-later";
+    clock += 31_000;
+    await a.handlers.get("tool.execute.before")?.({ tool: "read", sessionID: "s1", agent: "b", messageID: "m", id: "c1", input: { path: "a" } });
+    assert.ok(await waitFor(() => signalsOf(mock, SIGNAL_V2_STATUS).length === 1));
+    await a.handlers.get("tool.execute.before")?.({ tool: "read", sessionID: "s1", agent: "b", messageID: "m", id: "c2", input: { path: "a" } });
+    await setup(fakeCtx("/other").ctx);
+    await tick(100);
+    assert.equal(signalsOf(mock, SIGNAL_V2_STATUS).length, 1, "still once per process");
+  } finally {
+    t.cleanup();
+  }
+});
+
 test("an audit-only tools capability also reports v2_not_enforcing once", async () => {
   resetMock();
   const t = makeDeps(mock);

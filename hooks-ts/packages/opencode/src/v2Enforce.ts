@@ -181,6 +181,17 @@ export interface V2Scope {
   evaluateWithoutSource: boolean;
   /** Sessions whose `session.created` arrived without a `parentID` (bounded, insertion-ordered). */
   readonly confirmedRoots: Set<string>;
+  /** Called on every model tool call and prompt (v2.ts: send `v2_status` once a key exists, IN-06). */
+  onActivity: (() => void) | undefined;
+}
+
+/** `scope.onActivity`, guarded. Total. */
+function noteActivity(scope: V2Scope): void {
+  try {
+    scope.onActivity?.();
+  } catch {
+    // A status report is never worth a fault.
+  }
 }
 
 /** A fresh, empty scope; `directories` is the caller's live registration set when it has one. */
@@ -194,6 +205,7 @@ export function createV2Scope(directories: Set<string> = new Set<string>()): V2S
     seenHookInputs: new Map<string, WeakSet<object>>(),
     evaluateWithoutSource: false,
     confirmedRoots: new Set<string>(),
+    onActivity: undefined,
   };
 }
 
@@ -882,6 +894,7 @@ export function registerV2Enforcement(
       registrations.track(
         tool.hook("execute.before", async (event: V2ToolBefore): Promise<void> => {
           if (!claimHookInput(scope, "tool.execute.before", event)) return;
+          noteActivity(scope);
           const started = nowSafe();
           const outcome = await decideToolCall(event).catch((): ToolCallOutcome => NO_OUTCOME);
           const message = outcome.raise;
@@ -904,7 +917,9 @@ export function registerV2Enforcement(
     if (session !== undefined && typeof session.hook === "function") {
       registrations.track(
         session.hook("prompt", async (event: V2SessionPrompt): Promise<void> => {
-          if (claimHookInput(scope, "session.prompt", event)) await handlePrompt(event);
+          if (!claimHookInput(scope, "session.prompt", event)) return;
+          noteActivity(scope);
+          await handlePrompt(event);
         }),
       );
     }

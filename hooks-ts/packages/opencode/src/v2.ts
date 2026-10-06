@@ -62,7 +62,10 @@ interface SharedV2 {
   capabilities: V2Capabilities;
   /** Directories whose handlers are registered (until their cleanup runs). */
   directories: Set<string>;
+  /** `v2_status` went out (only once a key exists, IN-06). */
   statusReported: boolean;
+  /** A status attempt is queued on a later macrotask. */
+  statusPending: boolean;
   /** Model shell marks and interrupts, shared by every directory's handlers. */
   scope: V2Scope;
 }
@@ -139,7 +142,17 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
     // HV2-07 PROVIDER-LEVEL: the identity reader reads nothing; the provider id is the label.
     const handle = createRuntime({ ...deps, readAuth: (_dataDir, provider) => v2ProviderIdentity(provider) });
     const directories = new Set<string>();
-    return { handle, capabilities, directories, statusReported: false, scope: createV2Scope(directories) };
+    const shared: SharedV2 = {
+      handle,
+      capabilities,
+      directories,
+      statusReported: false,
+      statusPending: false,
+      scope: createV2Scope(directories),
+    };
+    // A key installed while the process runs: the status goes out with the next call (IN-06).
+    shared.scope.onActivity = () => reportStatus(shared);
+    return shared;
   }
 
   /** Put a frozen holder of `shared` in the slot: non-writable, non-configurable, non-enumerable. */
@@ -197,13 +210,21 @@ export function createSetupV2(overrides: Partial<SetupDeps> = {}): SetupEntry {
     return { shared: local, tampered: foreign };
   }
 
-  /** One `v2_status` (and `v2_not_enforcing` when tool calls are audit-only) per process. */
+  /**
+   * One `v2_status` (and `v2_not_enforcing` when tool calls are audit-only) per process. Without a
+   * key nothing can be sent, so the report is marked done only once a key exists; until then every
+   * later setup, model tool call and prompt tries again (IN-06: a key added while the process runs).
+   * The key lookup is the runtime's own (cached, re-read at most every 30 s).
+   */
   function reportStatus(shared: SharedV2): void {
-    if (shared.statusReported) return;
-    shared.statusReported = true;
+    if (shared.statusReported || shared.statusPending) return;
+    shared.statusPending = true;
     const runtime = shared.handle.runtime;
     const detail = v2StatusDetail(shared.capabilities);
     later(() => {
+      shared.statusPending = false;
+      if (shared.statusReported || runtime.init().signals === undefined) return;
+      shared.statusReported = true;
       runtime.reportOnce(SIGNAL_V2_STATUS, SETUP_TOOL_LABEL, detail);
       if (shared.capabilities.tools === "audit") runtime.reportOnce(SIGNAL_V2_NOT_ENFORCING, SETUP_TOOL_LABEL, "tools");
     });

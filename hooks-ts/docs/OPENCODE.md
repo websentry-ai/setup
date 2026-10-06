@@ -63,7 +63,7 @@ only the way it is applied differs.
 
 **v2 status signal.** Once per process the plugin reports `v2_status` with every capability, for
 example `tools:enforce/ask:native/mcp:enforce/prompt:block/recording:full/identity:provider/shell:enforce`.
-A seat whose tool calls ran audit-only would also report `v2_not_enforcing`. The shipped build
+If no API key is found at start, the report goes out with the first call after a key is found. A seat whose tool calls ran audit-only would also report `v2_not_enforcing`. The shipped build
 enforces every capability above.
 
 **Pending human verification (desktop 2.x UI):** native approval card rendering; deny rendering for a
