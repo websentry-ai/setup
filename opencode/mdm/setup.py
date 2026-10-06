@@ -52,10 +52,17 @@ download and a stale-vs-fresh mismatch, and it gives the backend an honest `hook
 is NOT a supply-chain control -- anyone who could replace the artifact could replace the
 sidecar in the same commit.
 
-LIMITATION, stated up front: opencode does have managed config, but this baseline does not
-use it. `opencode --pure`, `OPENCODE_PURE=1`, or a redirected `XDG_CONFIG_HOME` /
-`OPENCODE_CONFIG_DIR` / `HOME` still start opencode without any plugin, and nothing in this
-script can prevent that. Root cannot read a user's `OPENCODE_CONFIG_DIR` or
+Managed reference (opencode 1.x; spike V1-8, 15-SPIKES.md): root also writes a root-owned
+copy to `<managed>/unbound/unbound.js` (+ sidecar, + `package.json` {"type":"module"}) and
+merges its absolute `file://` URL into the managed `opencode.json` `plugin` array, where
+`<managed>` is `/Library/Application Support/opencode` (macOS) or `/etc/opencode` (Linux).
+Every other key and plugin entry is kept; a managed `opencode.jsonc` or an unparseable
+`opencode.json` is never modified. Where both copies load, the second is inert
+(`duplicate_load`). opencode 2.x does not read it, so the per-home drop stays the baseline.
+
+LIMITATION, stated up front: `opencode --pure`, `OPENCODE_PURE=1`, or a redirected
+`XDG_CONFIG_HOME` / `OPENCODE_CONFIG_DIR` / `HOME` still start opencode without any plugin
+(`--pure` skips the managed reference too), and nothing in this script can prevent that. Root cannot read a user's `OPENCODE_CONFIG_DIR` or
 `XDG_CONFIG_HOME`, so this installer covers the default `~/.config/opencode` per home only.
 This is advisory control over a machine whose user may administer it, not tamper resistance.
 See `opencode/mdm/README.md`.
@@ -126,6 +133,16 @@ UNBOUND_BUNDLE_MARKER = b"unbound-hooks-ts"
 BANNER_SCAN_BYTES = 4096
 PLUGIN_SUFFIXES = (".js", ".ts")
 ESM_PACKAGE_JSON = {"type": "module"}
+
+# opencode's managed config dir (packages/opencode/src/config/managed.ts). The test override is
+# honoured exactly as opencode honours it, so tests and spikes never reach the system dirs.
+ENV_TEST_MANAGED_CONFIG_DIR = "OPENCODE_TEST_MANAGED_CONFIG_DIR"
+MACOS_MANAGED_CONFIG_DIR = "/Library/Application Support/opencode"
+LINUX_MANAGED_CONFIG_DIR = "/etc/opencode"
+MANAGED_SUBDIR = "unbound"
+MANAGED_CONFIG_NAME = "opencode.json"
+MANAGED_JSONC_NAME = "opencode.jsonc"
+MAX_MANAGED_CONFIG_BYTES = 1024 * 1024
 
 # The v2 line (OpenCode 2.x / desktop) enforces since Phase 14 (hooks-ts/docs/OPENCODE.md,
 # "opencode v2"). Kept identical in both installers; the bypass notes print separately.
@@ -1511,6 +1528,226 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
     return False
 
 
+# --- the managed reference (opencode 1.x, every account) -----------------------------------
+#
+# Spike V1-8 (15-SPIKES.md) proved on opencode-ai 1.18.34 that a managed `opencode.json` whose
+# `plugin` array holds an absolute `file://` URL loads that file for the user, alongside a
+# per-home copy; the second copy of the same build stays inert (`duplicate_load`). opencode
+# reads ONLY `opencode.json[c]` from the managed dir -- it never scans it for plugin files --
+# so the reference is the only way in. The v2 line (2.x) did not load it in the same spike,
+# which is why the per-home drop above stays the baseline and this step is additive.
+
+
+def managed_config_dir(env=None, system=None) -> Optional[Path]:
+    """opencode's managed config dir, resolved as config/managed.ts managedConfigDir() does.
+
+    OPENCODE_TEST_MANAGED_CONFIG_DIR first (opencode's own test override; it is how every
+    test and the V1-8 spike reach a scratch dir instead of the real system one), else the
+    platform default. Two deliberate narrowings: a non-absolute override is refused rather
+    than resolved against the cwd, and Windows (ProgramData) is not supported by this
+    installer, so it answers None there.
+    """
+    env = os.environ if env is None else env
+    override = env.get(ENV_TEST_MANAGED_CONFIG_DIR)
+    if isinstance(override, str) and override:  # opencode's `||`: any non-empty string wins
+        return Path(override) if os.path.isabs(override) else None
+    system = (system or platform.system()).lower()
+    if system == "darwin":
+        return Path(MACOS_MANAGED_CONFIG_DIR)
+    if system == "linux":
+        return Path(LINUX_MANAGED_CONFIG_DIR)
+    return None
+
+
+def managed_plugin_uri(managed_dir) -> str:
+    """The `plugin` entry: an absolute, percent-encoded file:// URL (the space in
+    `Application Support` becomes %20; V1-8 loaded exactly that form)."""
+    return (Path(managed_dir) / MANAGED_SUBDIR / PLUGIN_NAME).as_uri()
+
+
+def _read_managed_config(path: Path):
+    """(dict, None) for a strict-JSON object config, ({}, None) when absent, or
+    (None, reason) when it must not be modified."""
+    if not os.path.lexists(str(path)):
+        return {}, None
+    if os.path.islink(str(path)) or not path.is_file():
+        return None, "not a regular file"
+    try:
+        if path.stat().st_size > MAX_MANAGED_CONFIG_BYTES:
+            return None, "too large"
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None, "unparseable"
+    if not isinstance(data, dict):
+        return None, "unparseable"
+    if "plugin" in data and not isinstance(data["plugin"], list):
+        return None, "unparseable"
+    return data, None
+
+
+def _write_root_file(target: Path, data: bytes, mode: int = 0o644) -> bool:
+    """Publish bytes by sibling temp + fsync + os.replace, refusing a symlinked target."""
+    if os.path.islink(str(target)):
+        debug_print(f"Refusing to write {target}: it is a symlink")
+        return False
+    tmp = _unique_tmp_path(target)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        _unlink_legacy_tmp(target)
+        fd = os.open(str(tmp), flags, mode)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(str(tmp), mode)
+        os.replace(str(tmp), str(target))
+        return True
+    except OSError as e:
+        debug_print(f"Could not write {target}: {e}")
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
+        return False
+
+
+def _dump_config(data: dict) -> bytes:
+    return (json.dumps(data, indent=2) + "\n").encode("utf-8")
+
+
+def install_managed_reference(payload: bytes, digest: str) -> str:
+    """Install the root-owned copy and reference it from the managed opencode.json.
+
+    Returns "installed", "persisted", "skipped (<why>)" or "failed: <why>"; never raises.
+    Runs as root, so the files are root-owned; mode 0644 so every account's opencode can
+    read them. The config is parse-merge-only: every existing key and plugin entry is kept,
+    a managed opencode.jsonc (comments) or an unparseable opencode.json is not modified,
+    and a rerun that finds our entry leaves the file byte-for-byte alone.
+    """
+    try:
+        mdir = managed_config_dir()
+        if mdir is None:
+            return "skipped (no managed config dir on this platform)"
+        if os.path.lexists(str(mdir / MANAGED_JSONC_NAME)):
+            return "skipped (a managed opencode.jsonc exists; it is never edited)"
+        config_path = mdir / MANAGED_CONFIG_NAME
+        config, why = _read_managed_config(config_path)
+        if config is None:
+            return f"skipped (managed opencode.json is {why}; it was not modified)"
+
+        udir = mdir / MANAGED_SUBDIR
+        if os.path.islink(str(mdir)) or os.path.islink(str(udir)):
+            return f"failed: {udir} or its parent is a symlink"
+        mdir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        udir.mkdir(mode=0o755, exist_ok=True)
+        os.chmod(str(udir), 0o755)
+
+        copy = udir / PLUGIN_NAME
+        state = "persisted" if copy.exists() else "installed"
+        if not _write_root_file(copy, payload):
+            return f"failed: could not write {copy}"
+        if artifact_sha256(copy) != digest:
+            return "failed: the bytes written do not match the verified artifact"
+        _write_root_file(udir / SIDECAR_NAME, f"{digest}  {PLUGIN_NAME}\n".encode("utf-8"))
+        # A .js under a Node host is CommonJS unless the nearest package.json says module;
+        # this directory is ours alone, so it always gets one.
+        _write_root_file(udir / "package.json", _dump_config(ESM_PACKAGE_JSON))
+
+        marker_file = udir / MARKER_NAME
+        marker = {}
+        if os.path.isfile(str(marker_file)) and not os.path.islink(str(marker_file)):
+            try:
+                loaded = json.loads(marker_file.read_text(encoding="utf-8"))
+                marker = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                marker = {}
+        entry = managed_plugin_uri(mdir)
+        created_config = bool(marker.get("created_config", not config_path.exists()))
+        added_plugin_key = bool(marker.get("added_plugin_key", "plugin" not in config))
+
+        plugins = list(config.get("plugin", []))
+        if entry not in plugins:
+            plugins.append(entry)
+            config["plugin"] = plugins
+            mode = stat.S_IMODE(config_path.stat().st_mode) if config_path.exists() else 0o644
+            if not _write_root_file(config_path, _dump_config(config), mode | 0o444):
+                return f"failed: could not write {config_path}"
+        _write_root_file(marker_file, _dump_config({
+            "entry": entry, "created_config": created_config, "added_plugin_key": added_plugin_key}))
+        return state
+    except Exception as e:
+        return f"failed: {e}"
+
+
+def clear_managed_reference() -> str:
+    """Undo install_managed_reference: our entry, our copy, sidecar, package.json, marker.
+
+    opencode.json is deleted only when it is then `{}` AND the marker says this installer
+    created it; a `plugin` key this installer added is dropped again once it is empty. A
+    config that is no longer strict JSON keeps our entry (reported "kept ..."). Returns
+    "cleared", "not_found", "kept (...)", "skipped (...)" or "failed"; never raises.
+    """
+    try:
+        mdir = managed_config_dir()
+        if mdir is None:
+            return "skipped (no managed config dir on this platform)"
+        udir = mdir / MANAGED_SUBDIR
+        config_path = mdir / MANAGED_CONFIG_NAME
+        if not os.path.lexists(str(udir)) and not os.path.lexists(str(config_path)):
+            return "not_found"
+        if os.path.islink(str(udir)):
+            return "failed"
+        marker = {}
+        marker_file = udir / MARKER_NAME
+        if os.path.isfile(str(marker_file)) and not os.path.islink(str(marker_file)):
+            try:
+                loaded = json.loads(marker_file.read_text(encoding="utf-8"))
+                marker = loaded if isinstance(loaded, dict) else {}
+            except (OSError, ValueError):
+                marker = {}
+        entries = {managed_plugin_uri(mdir)}
+        if isinstance(marker.get("entry"), str):
+            entries.add(marker["entry"])
+
+        status = "cleared"
+        found = os.path.lexists(str(udir))
+        config, why = _read_managed_config(config_path)
+        if config is None:
+            # Our entry may still be in it, so our copy stays too: a reference to a removed
+            # file would only turn into a load error for every account.
+            return f"kept (managed opencode.json is {why}; our entry and copy were left)"
+        elif any(e in config.get("plugin", []) for e in entries):
+            found = True
+            config["plugin"] = [p for p in config["plugin"] if p not in entries]
+            if not config["plugin"] and marker.get("added_plugin_key"):
+                del config["plugin"]
+            if not config and marker.get("created_config"):
+                if _clear_path(config_path, MANAGED_CONFIG_NAME) == "failed":
+                    status = "failed"
+            else:
+                mode = stat.S_IMODE(config_path.stat().st_mode)
+                if not _write_root_file(config_path, _dump_config(config), mode):
+                    status = "failed"
+        if not found:
+            return "not_found"
+
+        if os.path.isdir(str(udir)):
+            for name in (PLUGIN_NAME, SIDECAR_NAME, "package.json"):
+                if _clear_path(udir / name, name) == "failed":
+                    status = "failed"
+            if status == "cleared":
+                # The marker goes last, so a failed clear can still be retried with it.
+                _clear_path(marker_file, "managed marker")
+            try:
+                udir.rmdir()
+            except OSError:
+                pass
+        return status
+    except Exception as e:
+        debug_print(f"Could not clear the managed reference: {e}")
+        return "failed"
+
+
 # --- the device report -------------------------------------------------------------------
 
 
@@ -1627,9 +1864,10 @@ def clear_setup() -> bool:
         # even when there are no profiles under the users directory.
         user_homes = [(None, None)]
     if not user_homes:
-        print("No user home directories found; nothing to clear.")
+        managed_status = clear_managed_reference()
+        print(f"No user home directories found. managed opencode.json: {managed_status}")
         print("Clear Complete!")
-        return True
+        return managed_status != "failed"
 
     names = list(INSTALLED_NAMES) + ["package.json"]
     any_failed = False
@@ -1656,6 +1894,11 @@ def clear_setup() -> bool:
         if env_status == "failed":
             any_failed = True
         print(f"  {username}: {files}; {ENV_API_KEY}: {env_status}")
+
+    managed_status = clear_managed_reference()
+    if managed_status == "failed":
+        any_failed = True
+    print(f"  managed opencode.json: {managed_status}")
 
     print("\nThe plugins directories, and every other file in them, were left in place.")
     print("~/.unbound/config.json was NOT touched: its api_key is shared with the other")
@@ -1798,6 +2041,15 @@ def main() -> bool:
         rows.append((username, extension_status, key_status))
 
     _print_summary(rows)
+
+    # Additive to the per-home drop, never a replacement: 2.x does not read it (15-SPIKES).
+    try:
+        managed_status = install_managed_reference(payload, digest)
+    except Exception as e:
+        managed_status = f"failed: {e}"
+    print(f"  managed opencode.json: {managed_status}")
+    if not (managed_status.startswith("installed") or managed_status.startswith("persisted")):
+        print("   The per-home plugin above is unaffected; the managed reference is an extra layer.")
 
     # Exactly one report per device run, after the loop, with the state read before it. A
     # run where every home failed still reports -- the backend's view of the fleet would

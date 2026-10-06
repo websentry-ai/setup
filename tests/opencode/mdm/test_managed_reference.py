@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.opencode.conftest import SYSTEM_MANAGED_DIRS, UNBOUND_BANNER
-from tests.opencode.mdm.test_report_and_clear import _run_install, device  # noqa: F401
+from tests.opencode.mdm.test_report_and_clear import _run_install
 
 WINDOWS = os.name == "nt"
 PAYLOAD = UNBOUND_BANNER + b"export default {};\n"
@@ -208,7 +208,7 @@ class TestClear:
 @pytest.mark.skipif(WINDOWS, reason="Unix-only")
 class TestTheDeviceRun:
     def test_the_run_adds_the_reference_and_keeps_the_per_home_drop(
-            self, oc_mdm_setup, device, managed, capsys):  # noqa: F811
+            self, oc_mdm_setup, device, managed, capsys):
         assert _run_install(device) is True
         assert _config(managed)["plugin"] == [_uri(managed)]
         for _, h in device["homes"]:
@@ -216,13 +216,13 @@ class TestTheDeviceRun:
         assert "managed opencode.json: installed" in capsys.readouterr().out
 
     def test_a_failed_managed_step_does_not_fail_the_run(
-            self, oc_mdm_setup, device, managed, monkeypatch):  # noqa: F811
+            self, oc_mdm_setup, device, managed, monkeypatch):
         def boom(*a, **k):
             raise RuntimeError("managed step exploded")
         monkeypatch.setattr(oc_mdm_setup, "install_managed_reference", boom)
         assert _run_install(device) is True
 
-    def test_clear_removes_the_reference(self, oc_mdm_setup, device, managed, capsys):  # noqa: F811
+    def test_clear_removes_the_reference(self, oc_mdm_setup, device, managed, capsys):
         _run_install(device)
         assert device["run"]("--clear") is True
         assert not (managed / "opencode.json").exists()
