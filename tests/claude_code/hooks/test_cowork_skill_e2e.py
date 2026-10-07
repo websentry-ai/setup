@@ -144,6 +144,37 @@ class CoworkHookE2E(unittest.TestCase):
                 self.assertNotIn("skill_path", use)
                 self.assertNotIn("content_hash", use)
 
+    def install_plugin(self, rel_dir, declares, skill, text):
+        """A plugin Cowork installed, recorded in installed_plugins.json from inside its VM."""
+        plugins_root = self.org / "cowork_plugins"
+        root = plugins_root / rel_dir
+        self.write(root / ".claude-plugin" / "plugin.json", json.dumps({"name": declares}))
+        path = self.write(root / "skills" / skill / "SKILL.md", text)
+        self.write(plugins_root / "installed_plugins.json", json.dumps({"version": 2, "plugins": {
+            "%s@mkt" % declares: [{"scope": "user", "installPath": "/sessions/vm/mnt/.claude/cowork_plugins/" + rel_dir}]}}))
+        return path
+
+    def test_installed_plugin_skill_carries_the_recorded_copys_path_and_hash(self):
+        text = "---\nname: skill-development\n---\nWrite skills.\n"
+        skill = self.install_plugin("cache/claude-plugins-official/plugin-dev/2cd88e7947b7", "plugin-dev",
+                                    "skill-development", text)
+        (use,) = self.run_turn(skill="plugin-dev:skill-development")
+        self.assertEqual(use["skill_path"], str(skill))
+        self.assertEqual(use["content_hash"], self.scanner_hash(text))
+
+    def test_a_bare_bundle_name_still_sends_the_bundle_copy(self):
+        bundled = self.bundle_skill("xlsx", "# bundled xlsx")
+        self.install_plugin("cache/mkt/document-skills/1.0", "document-skills", "xlsx", "# plugin xlsx")
+        (use,) = self.run_turn(skill="xlsx")
+        self.assertEqual(use["skill_path"], str(bundled))
+
+    def test_a_catalog_only_plugin_sends_no_path(self):
+        catalog = self.org / "cowork_plugins" / "marketplaces" / "knowledge-work-plugins" / "sales"
+        self.write(catalog / ".claude-plugin" / "plugin.json", json.dumps({"name": "sales"}))
+        self.write(catalog / "skills" / "call-prep" / "SKILL.md", "# call prep")
+        (use,) = self.run_turn(skill="sales:call-prep")
+        self.assertNotIn("skill_path", use)
+
     def test_a_broken_or_huge_plugin_manifest_does_not_break_the_turn(self):
         plugin = self.org / "rpm" / "plugin_01"
         self.write(plugin / ".claude-plugin" / "plugin.json", "{not json" + "x" * 2_000_000)

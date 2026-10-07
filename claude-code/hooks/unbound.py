@@ -5003,10 +5003,39 @@ def _plugin_manifest_name(plugin: Path) -> Optional[str]:
         return None
 
 
+def _cowork_plugin_dirs(org_dir: Path):
+    """(source, plugin dir, registry name) for every plugin a Cowork session can load: the
+    org's plugins, and the install installed_plugins.json records for each installed or
+    uploaded plugin. Any other copy under cowork_plugins is a catalog entry or stale."""
+    for plugin in (org_dir / 'rpm').glob('*'):
+        yield plugin.name, plugin, None
+    plugins_root = org_dir / 'cowork_plugins'
+    for key, entries in _installed_plugins_registry(plugins_root).items():
+        # The first record that exists in this cowork_plugins dir is the copy the app loads.
+        for entry in entries if isinstance(entries, list) else []:
+            path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
+            if path is not None and path.is_dir():
+                yield 'installed:%s' % key, path, key.split('@', 1)[0]
+                break
+
+
+def _cowork_install_dir(plugins_root: Path, install_path) -> Optional[Path]:
+    """A recorded installPath, which may be the VM's view of it, re-rooted under this
+    host's cowork_plugins dir. None when it does not point inside cowork_plugins."""
+    parts = [p for p in re.split(r'[\\/]+', install_path) if p] if isinstance(install_path, str) else []
+    if 'cowork_plugins' not in parts:
+        return None
+    tail = parts[len(parts) - parts[::-1].index('cowork_plugins'):]
+    # ':' would let a drive letter re-root the join outside cowork_plugins on Windows.
+    if not tail or any(part in ('.', '..') or ':' in part for part in tail):
+        return None
+    return plugins_root.joinpath(*tail)
+
+
 def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
     """The SKILL.md a Cowork run used: the session's own copy for a bare name, else the
     newest version from the one source shipping it — the bundle for anthropic-skills,
-    the org plugin declaring any other prefix. No source, or two, resolves nothing."""
+    the plugin declaring any other prefix. No source, or two, resolves nothing."""
     own = session / '.claude' / 'skills' / name / 'SKILL.md'
     if not prefix and own.is_file():
         return str(own)
@@ -5018,12 +5047,17 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         copies = list(own.glob('**/skills/%s/SKILL.md' % name))
         if copies:
             sources['bundle'] = copies
-    if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
-        for plugin in (session.parent / 'rpm').glob('*'):
-            if not plugin.is_dir() or (prefix and _plugin_manifest_name(plugin) != prefix):
+    # A bare name is the bundle's when the bundle has it; plugin skills are namespaced.
+    if prefix != COWORK_BUNDLED_SKILLS_PREFIX and not (not prefix and sources):
+        for source, plugin, registry_name in _cowork_plugin_dirs(session.parent):
+            if not plugin.is_dir():
                 continue
-            for path in plugin.glob('**/skills/%s/SKILL.md' % name):
-                sources.setdefault(plugin.name, []).append(path)
+            # A plugin need not ship plugin.json; the registry key names it then.
+            if prefix and (_plugin_manifest_name(plugin) or registry_name) != prefix:
+                continue
+            copies = list(plugin.glob('skills/%s/SKILL.md' % name)) or list(plugin.glob('skills/*/%s/SKILL.md' % name))
+            if copies:
+                sources.setdefault(source, []).extend(copies)
     if len(sources) != 1:
         return None
     (copies,) = sources.values()

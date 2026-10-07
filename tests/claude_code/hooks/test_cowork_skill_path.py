@@ -6,6 +6,7 @@ and no hash, so the backend could never tie it to a discovered body.
 """
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -115,9 +116,14 @@ class TestCoworkSkillIdentity(_CoworkTree):
         self.plugin("review", plugin="plugin_02")
         self.assertIsNone(self.resolve("gtm-skills:review"))
 
-    def test_bare_name_in_bundle_and_plugin_resolves_nothing(self):
-        self.bundle("review")
+    def test_bare_name_in_bundle_and_plugin_is_the_bundles(self):
+        bundled = self.bundle("review", age=3600)
         self.plugin("review")
+        self.assertEqual(self.resolve("review"), str(bundled))
+
+    def test_bare_name_in_two_plugins_only_resolves_nothing(self):
+        self.plugin("review", plugin="plugin_01")
+        self.plugin("review", plugin="plugin_02")
         self.assertIsNone(self.resolve("review"))
 
     def test_the_sessions_own_copy_wins_for_a_bare_name(self):
@@ -170,6 +176,109 @@ class TestCoworkBundleScope(_CoworkTree):
     def test_a_bundle_in_session_order_is_not_the_accounts(self):
         _write(self.root / "skills-plugin" / "acct-1" / "org-1" / "skills" / "xlsx" / "SKILL.md", "# wrong order")
         self.assertIsNone(self.resolve("anthropic-skills:xlsx"))
+
+
+class TestCoworkInstalledPlugins(_CoworkTree):
+    """Plugins a user installs or uploads, laid out as Cowork keeps them, and recorded in
+    installed_plugins.json the way Cowork records them (from inside its VM)."""
+
+    def setUp(self):
+        super().setUp()
+        self.plugins_root = self.org / "cowork_plugins"
+        self.registry = {}
+
+    def _record(self, key, rel_dir):
+        self.registry.setdefault(key, []).append(
+            {"scope": "user", "installPath": "/sessions/vm/mnt/.claude/cowork_plugins/" + rel_dir})
+        _write(self.plugins_root / "installed_plugins.json", json.dumps({"version": 2, "plugins": self.registry}))
+
+    def _plugin(self, rel_dir, declares, rel_skill, text="# skill", age=0):
+        root = self.plugins_root / rel_dir
+        _write(root / ".claude-plugin" / "plugin.json", '{"name": "%s"}' % declares)
+        return _write(root / rel_skill / "SKILL.md", text, age)
+
+    def installed(self, rel_dir, declares, rel_skill, **kw):
+        skill = self._plugin(rel_dir, declares, rel_skill, **kw)
+        self._record("%s@mkt" % declares, rel_dir)
+        return skill
+
+    def test_installed_marketplace_plugin_resolves(self):
+        skill = self.installed("cache/claude-plugins-official/plugin-dev/2cd88e7947b7", "plugin-dev",
+                               "skills/skill-development")
+        self.assertEqual(self.resolve("plugin-dev:skill-development"), str(skill))
+
+    def test_a_skill_grouped_under_skills_resolves(self):
+        skill = self.installed("cache/claude-plugins-official/Notion/0.1.0", "Notion", "skills/notion/knowledge-capture")
+        self.assertEqual(self.resolve("Notion:knowledge-capture"), str(skill))
+
+    def test_the_recorded_version_wins_over_a_newer_stale_one(self):
+        recorded = self.installed("cache/mkt/plugin-dev/aaa111", "plugin-dev", "skills/agent-development",
+                                  text="# recorded", age=3600)
+        self._plugin("cache/mkt/plugin-dev/bbb222", "plugin-dev", "skills/agent-development", text="# stale")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(recorded))
+
+    def test_only_the_first_recorded_install_of_a_plugin_counts(self):
+        first = self.installed("cache/mkt/plugin-dev/aaa111", "plugin-dev", "skills/agent-development", age=3600)
+        self._plugin("cache/mkt/plugin-dev/bbb222", "plugin-dev", "skills/agent-development")
+        self._record("plugin-dev@mkt", "cache/mkt/plugin-dev/bbb222")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(first))
+
+    def test_the_first_record_inside_cowork_plugins_counts(self):
+        self.registry["plugin-dev@mkt"] = [{"scope": "project", "installPath": "/elsewhere/plugin-dev"}]
+        skill = self.installed("cache/mkt/plugin-dev/live", "plugin-dev", "skills/agent-development")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(skill))
+
+    def test_a_recorded_install_that_is_gone_falls_through_to_the_next(self):
+        self.registry["plugin-dev@mkt"] = [{"scope": "user", "installPath": "/vm/cowork_plugins/cache/mkt/plugin-dev/deleted"}]
+        skill = self.installed("cache/mkt/plugin-dev/live", "plugin-dev", "skills/agent-development")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(skill))
+
+    def test_a_drive_letter_segment_never_leaves_cowork_plugins(self):
+        self.assertIsNone(unbound._cowork_install_dir(self.plugins_root, "/vm/cowork_plugins/D:/other/plugin"))
+
+    def test_a_plugin_without_plugin_json_is_named_by_its_registry_key(self):
+        root = self.plugins_root / "cache" / "mkt" / "lean-kit" / "1.0"
+        skill = _write(root / "skills" / "brief" / "SKILL.md", "# brief")
+        self._record("lean-kit@mkt", "cache/mkt/lean-kit/1.0")
+        self.assertEqual(self.resolve("lean-kit:brief"), str(skill))
+
+    def test_a_direct_skill_wins_over_a_grouped_one_of_the_same_name(self):
+        direct = self.installed("cache/mkt/plugin-dev/aaa", "plugin-dev", "skills/agent-development", age=3600)
+        _write(direct.parents[2] / "skills" / "extra" / "agent-development" / "SKILL.md", "# grouped")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(direct))
+
+    def test_a_recorded_path_with_a_trailing_slash_still_resolves(self):
+        skill = self._plugin("cache/mkt/kit/1.0", "kit", "skills/brief")
+        self.registry["kit@mkt"] = [{"scope": "user", "installPath": "/sessions/vm/mnt/.claude/cowork_plugins/cache/mkt/kit/1.0/"}]
+        _write(self.plugins_root / "installed_plugins.json", json.dumps({"version": 2, "plugins": self.registry}))
+        self.assertEqual(self.resolve("kit:brief"), str(skill))
+
+    def test_an_uploaded_plugin_resolves(self):
+        skill = self.installed("marketplaces/local-desktop-app-uploads/my-kit", "my-kit", "skills/deck-review")
+        self.assertEqual(self.resolve("my-kit:deck-review"), str(skill))
+
+    def test_a_plugin_installed_in_its_marketplace_clone_resolves(self):
+        skill = self.installed("marketplaces/team-plugins/release-kit", "release-kit", "skills/cut-release")
+        self.assertEqual(self.resolve("release-kit:cut-release"), str(skill))
+
+    def test_the_marketplace_catalog_is_not_installed(self):
+        self._plugin("marketplaces/knowledge-work-plugins/sales", "sales", "skills/call-prep")
+        self.assertIsNone(self.resolve("sales:call-prep"))
+
+    def test_a_skill_md_shipped_inside_another_skill_is_not_a_skill(self):
+        skill = self.installed("cache/mkt/plugin-dev/aaa111", "plugin-dev", "skills/skill-development", age=3600)
+        _write(skill.parent / "templates" / "skill-development" / "SKILL.md", "# template")
+        self.assertEqual(self.resolve("plugin-dev:skill-development"), str(skill))
+
+    def test_a_bare_name_stays_with_the_bundle_when_it_has_it(self):
+        bundled = self.bundle("docx", age=3600)
+        self.installed("cache/mkt/document-skills/1.0", "document-skills", "skills/docx")
+        self.assertEqual(self.resolve("docx"), str(bundled))
+
+    def test_the_prefix_picks_between_an_org_plugin_and_an_installed_one(self):
+        self.plugin("review")
+        mine = self.installed("cache/mkt/code-review/1.0", "code-review", "skills/review")
+        self.assertEqual(self.resolve("code-review:review"), str(mine))
 
 
 class TestCoworkRunInAPickedFolder(_CoworkTree):
