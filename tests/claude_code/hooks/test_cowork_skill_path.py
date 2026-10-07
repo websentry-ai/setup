@@ -223,6 +223,22 @@ class TestCoworkInstalledPlugins(_CoworkTree):
         self._record("plugin-dev@mkt", "cache/mkt/plugin-dev/bbb222")
         self.assertEqual(self.resolve("plugin-dev:agent-development"), str(first))
 
+    def test_the_first_record_inside_cowork_plugins_counts(self):
+        self.registry["plugin-dev@mkt"] = [{"scope": "project", "installPath": "/elsewhere/plugin-dev"}]
+        skill = self.installed("cache/mkt/plugin-dev/live", "plugin-dev", "skills/agent-development")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(skill))
+
+    def test_a_plugin_without_plugin_json_is_named_by_its_registry_key(self):
+        root = self.plugins_root / "cache" / "mkt" / "lean-kit" / "1.0"
+        skill = _write(root / "skills" / "brief" / "SKILL.md", "# brief")
+        self._record("lean-kit@mkt", "cache/mkt/lean-kit/1.0")
+        self.assertEqual(self.resolve("lean-kit:brief"), str(skill))
+
+    def test_a_direct_skill_wins_over_a_grouped_one_of_the_same_name(self):
+        direct = self.installed("cache/mkt/plugin-dev/aaa", "plugin-dev", "skills/agent-development", age=3600)
+        _write(direct.parents[2] / "skills" / "extra" / "agent-development" / "SKILL.md", "# grouped")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(direct))
+
     def test_a_recorded_path_with_a_trailing_slash_still_resolves(self):
         skill = self._plugin("cache/mkt/kit/1.0", "kit", "skills/brief")
         self.registry["kit@mkt"] = [{"scope": "user", "installPath": "/sessions/vm/mnt/.claude/cowork_plugins/cache/mkt/kit/1.0/"}]

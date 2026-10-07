@@ -4970,18 +4970,19 @@ def _plugin_manifest_name(plugin: Path) -> Optional[str]:
 
 
 def _cowork_plugin_dirs(org_dir: Path):
-    """(source, plugin dir) for every plugin a Cowork session can load: the org's plugins,
-    and the install path installed_plugins.json records for each installed or uploaded
-    plugin. Any other copy under cowork_plugins is a catalog entry or a stale version."""
+    """(source, plugin dir, registry name) for every plugin a Cowork session can load: the
+    org's plugins, and the install installed_plugins.json records for each installed or
+    uploaded plugin. Any other copy under cowork_plugins is a catalog entry or stale."""
     for plugin in (org_dir / 'rpm').glob('*'):
-        yield plugin.name, plugin
+        yield plugin.name, plugin, None
     plugins_root = org_dir / 'cowork_plugins'
     for key, entries in _installed_plugins_registry(plugins_root).items():
-        # The first recorded install is the one the app loads.
-        entry = entries[0] if isinstance(entries, list) and entries else None
-        path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
-        if path is not None:
-            yield 'installed:%s' % key, path
+        # The first record that lands in this cowork_plugins dir is the copy the app loads.
+        for entry in entries if isinstance(entries, list) else []:
+            path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
+            if path is not None:
+                yield 'installed:%s' % key, path, key.split('@', 1)[0]
+                break
 
 
 def _cowork_install_dir(plugins_root: Path, install_path) -> Optional[Path]:
@@ -5013,12 +5014,15 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
             sources['bundle'] = copies
     # A bare name is the bundle's when the bundle has it; plugin skills are namespaced.
     if prefix != COWORK_BUNDLED_SKILLS_PREFIX and not (not prefix and sources):
-        for source, plugin in _cowork_plugin_dirs(session.parent):
-            if not plugin.is_dir() or (prefix and _plugin_manifest_name(plugin) != prefix):
+        for source, plugin, registry_name in _cowork_plugin_dirs(session.parent):
+            if not plugin.is_dir():
                 continue
-            for pattern in ('skills/%s/SKILL.md', 'skills/*/%s/SKILL.md'):
-                for path in plugin.glob(pattern % name):
-                    sources.setdefault(source, []).append(path)
+            # A plugin need not ship plugin.json; the registry key names it then.
+            if prefix and (_plugin_manifest_name(plugin) or registry_name) != prefix:
+                continue
+            copies = list(plugin.glob('skills/%s/SKILL.md' % name)) or list(plugin.glob('skills/*/%s/SKILL.md' % name))
+            if copies:
+                sources.setdefault(source, []).extend(copies)
     if len(sources) != 1:
         return None
     (copies,) = sources.values()
