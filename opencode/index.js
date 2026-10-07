@@ -8,10 +8,14 @@
  * the only deliberate blocks are a policy deny, an approval-required verdict (opencode v1 has no
  * native ask), or an org whose last successful response asked for block-on-failure.
  *
- * The v2 `setup` entry is present but INACTIVE: it enforces nothing and, on a v2 host only,
- * reports itself inactive.
+ * The v2 `setup` entry enforces on opencode 2.0.x through the same policy path, under the same
+ * fail-open contract: a built-in tool deny or approval is applied at `permission.evaluate`, an
+ * MCP block is raised from `tool.execute.before`, a blocked prompt is replaced with a block
+ * notice, and a blocked user shell command is raised from `shell.create.before`. It reports its
+ * per-capability status once per process (`v2_status`). On a 1.18.x host it stays inert.
  *
- * Tested against opencode-ai 1.18.x (Bun-compiled CLI); also importable on Node >= 22.19.0.
+ * Tested against opencode-ai 1.18.x (Bun-compiled CLI) and @opencode/cli 2.0.x; also importable
+ * on Node >= 22.19.0.
  */
 
 // packages/opencode/src/constants.ts
@@ -2780,7 +2784,7 @@ async function decideBeforeVerdict(input, output, ctx) {
         toolCallId: callID,
         command: shellCommandOf(tool, args),
         toolInput: args,
-        cwd: SHELL_TOOLS.has(tool) ? shellCwdOf(args, directory) : directory,
+        cwd: SHELL_TOOLS.has(tool) ? typeof ctx.shellCwd === "string" && ctx.shellCwd !== "" ? ctx.shellCwd : shellCwdOf(args, directory) : directory,
         sessionId: sessionID,
         model,
         ...mcp === void 0 ? {} : { mcp },
@@ -3388,7 +3392,7 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "4f84820750f21ec06be99b86f7c676f3" : "source";
+var BUILD_TOKEN = true ? "40a71a517b0d3938aedf861437a2d203" : "source";
 function isBuildToken(value) {
   return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 }
@@ -4327,6 +4331,17 @@ function modelShellCwd(input, sessionID, directory, scope) {
     return "";
   }
 }
+function relativeShellCwd(input, sessionID, directory, scope) {
+  try {
+    const workdir = readField6(input, "workdir");
+    if (typeof workdir !== "string" || workdir === "" || isAbsolute7(workdir)) return void 0;
+    const base = scope.sessionDirs.get(sessionID) ?? directoryKey(directory);
+    if (base === void 0 || base === "") return void 0;
+    return directoryKey(resolve2(base, workdir));
+  } catch {
+    return void 0;
+  }
+}
 var APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
 var SUBAGENT_PROMPT_PREFIX = "You are a subagent spawned by another session.\n";
 var MAX_CONFIRMED_ROOTS = 1024;
@@ -4514,10 +4529,12 @@ function registerV2Enforcement(ctx, runtime, recordFor, capabilities = V2_CAPABI
         const rec = record();
         if (!builtin) await learnMcpNames(tool2, rec);
         const numbered = builtin ? callID : openCodeModeCall(scope, sessionID, callID);
+        const input = readField6(event, "input");
+        const shellCwd = tool2 === V2_SHELL_TOOL ? relativeShellCwd(input, sessionID, directory, scope) : void 0;
         const decision = decideBeforeVerdict(
           { tool: v1ToolName(tool2), sessionID, callID: numbered },
-          { args: readField6(event, "input") },
-          { runtime, record: rec }
+          { args: input },
+          { runtime, record: rec, ...shellCwd === void 0 ? {} : { shellCwd } }
         ).catch(() => NO_DECISION2);
         const correlatable = sessionID !== "" && callID !== "" && !scope.evaluateWithoutSource;
         if (builtin && sessionID !== "" && callID !== "") {
