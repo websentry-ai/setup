@@ -3086,6 +3086,21 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
         return None
 
 
+def _git_branch(root: Optional[str]) -> Optional[str]:
+    """Checked-out branch of the repo at `root`; None on detached HEAD or any git failure."""
+    try:
+        if not root:
+            return None
+        result = subprocess.run(
+            ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
+            capture_output=True, text=True, timeout=10,
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else None
+    except Exception:
+        return None
+
+
 # Canonical (post-AUGMENT_TOOL_FAMILY) tool names whose input carries a file
 # path — used for per-tool-call project attribution on the Stop exchange.
 _FILE_TOOLS = {'Read', 'Write', 'Edit', 'Delete'}
@@ -3229,16 +3244,16 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
 
 
-def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Optional[str]]) -> tuple:
-    """Resolve the git project ("<org>/<repo>") a single tool call worked in.
-    File tools resolve from the tool's file path (Augment often sends
-    workspace-relative paths — those join onto the tracked shell dir); Bash
-    resolves from the first absolute path in the command, else the shell's
-    working directory tracked across the turn's `cd`s. Returns
-    (project, shell_dir) — shell_dir updated when the command changed
-    directory. `root_projects` caches the origin lookup so `git remote
-    get-url` runs at most once per distinct repo. (None, shell_dir) when
-    nothing resolves (fail-open)."""
+def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, tuple]) -> tuple:
+    """Resolve the git project ("<org>/<repo>") and checked-out branch a single
+    tool call worked in. File tools resolve from the tool's file path (Augment
+    often sends workspace-relative paths — those join onto the tracked shell
+    dir); Bash resolves from the first absolute path in the command, else the
+    shell's working directory tracked across the turn's `cd`s. Returns
+    (project, branch, shell_dir) — shell_dir updated when the command changed
+    directory. `root_projects` caches both per repo root so git runs at most
+    twice per distinct repo. (None, None, shell_dir) when nothing resolves
+    (fail-open)."""
     try:
         tool_input = tool_input or {}
         candidates = []
@@ -3264,12 +3279,14 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
             if not root:
                 continue
             if root not in root_projects:
-                root_projects[root] = _get_project(root)
-            if root_projects[root]:
-                return root_projects[root], shell_dir
-        return None, shell_dir
+                project = _get_project(root)
+                root_projects[root] = (project, _git_branch(root) if project else None)
+            project, branch = root_projects[root]
+            if project:
+                return project, branch, shell_dir
+        return None, None, shell_dir
     except Exception:
-        return None, shell_dir
+        return None, None, shell_dir
 
 
 # --- Bash calls in scope for the repo gate: a segment runs a git write subcommand or writes the working tree; anything unclassifiable is not gated ---
@@ -3811,9 +3828,10 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             # Attribute this tool call to the repo it worked in (file path /
             # shell cwd tracking); rides on the tool_use entry so the backend
             # can store per-call project on each analytics row.
-            tool_project, shell_dir = _project_for_tool_use(
+            tool_project, tool_branch, shell_dir = _repo_for_tool_use(
                 shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
             shaped['project'] = tool_project
+            shaped['git_branch'] = tool_branch
             assistant_tool_uses.append(shaped)
 
             # Auggie loads an auto-triggered skill by READING its SKILL.md, so
@@ -3882,6 +3900,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
+        'git_branch': _git_branch(cwd),
         'account_identity': build_account_identity(event, probe=True),
     }
 
