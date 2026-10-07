@@ -61,6 +61,12 @@ import { blockingMessage, strictest } from "./verdicts.ts";
 export interface BeforeContext {
   runtime: Runtime;
   record: DirectoryRecord;
+  /**
+   * Where a shell call runs, when the host's own resolution of a relative `workdir` is known (v2:
+   * resolved under the session's directory). Absent: `shellCwdOf` (absolute `workdir` or the
+   * instance directory). Only the checked cwd changes; the call's arguments are never rewritten.
+   */
+  shellCwd?: string;
 }
 
 const APPLY_PATCH_TOOL = "apply_patch";
@@ -391,7 +397,11 @@ export async function decideBeforeVerdict(input: unknown, output: unknown, ctx: 
         toolCallId: callID,
         command: shellCommandOf(tool, args),
         toolInput: args,
-        cwd: SHELL_TOOLS.has(tool) ? shellCwdOf(args, directory) : directory,
+        cwd: SHELL_TOOLS.has(tool)
+          ? typeof ctx.shellCwd === "string" && ctx.shellCwd !== ""
+            ? ctx.shellCwd
+            : shellCwdOf(args, directory)
+          : directory,
         sessionId: sessionID,
         model,
         ...(mcp === undefined ? {} : { mcp }),

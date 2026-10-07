@@ -241,6 +241,29 @@ test("GO: a denied shell call is refused at evaluate with the verbatim verdict t
   }
 });
 
+test("a relative shell workdir is checked in the directory the call runs in, not the project root", async () => {
+  const f = await fakeV2({ mode: "deny" });
+  try {
+    const input = { command: "cat secret.txt", workdir: "sub" };
+    const r = await toolCall(f, "shell", input);
+    assert.equal(r.effect, "deny");
+    assert.equal(metadataOf(toolBodies()[0]).cwd, `${DIRECTORY}/sub`, "resolved under the project directory");
+    // The host's arguments are not rewritten (the after-digest compares them).
+    assert.deepEqual(input, { command: "cat secret.txt", workdir: "sub" });
+    // A known session directory is the base, as for the spawn mark; `..` is normalised.
+    noteSessionDirectory(f.scope, "ses_other", "/elsewhere/app");
+    await toolCall(f, "shell", { command: "cat secret.txt", workdir: "../lib" }, { sessionID: "ses_other", id: "call_2" });
+    assert.equal(metadataOf(toolBodies()[1]).cwd, "/elsewhere/lib");
+    // Absolute and missing workdirs are unchanged.
+    await toolCall(f, "shell", { command: "ls", workdir: "/abs" }, { id: "call_3" });
+    await toolCall(f, "shell", { command: "ls" }, { id: "call_4" });
+    assert.equal(metadataOf(toolBodies()[2]).cwd, "/abs");
+    assert.equal(metadataOf(toolBodies()[3]).cwd, DIRECTORY);
+  } finally {
+    f.cleanup();
+  }
+});
+
 test("GO: write/read/edit carry `path`; a deny applies through evaluate (write asserts action edit)", async () => {
   const f = await fakeV2({ mode: "deny" });
   try {

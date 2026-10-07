@@ -469,6 +469,24 @@ function modelShellCwd(input: unknown, sessionID: string, directory: string, sco
   }
 }
 
+/**
+ * The checked cwd for a model shell call with a RELATIVE `workdir`: resolved under the session's
+ * directory, else this registration's (hooks fire in the call's own location, 14-REVIEW probe), as
+ * the 2.x tool resolves it. `undefined` for an absolute or missing `workdir` (the v1 path's own
+ * `shellCwdOf` already handles both) or when no base is known. Total.
+ */
+function relativeShellCwd(input: unknown, sessionID: string, directory: string, scope: V2Scope): string | undefined {
+  try {
+    const workdir = readField(input, "workdir");
+    if (typeof workdir !== "string" || workdir === "" || isAbsolute(workdir)) return undefined;
+    const base = scope.sessionDirs.get(sessionID) ?? directoryKey(directory);
+    if (base === undefined || base === "") return undefined;
+    return directoryKey(resolve(base, workdir));
+  } catch {
+    return undefined;
+  }
+}
+
 const APPROVAL_NATIVE_TAIL = "Approve it only if you expect it.";
 /** The text opencode 2.x puts before a subagent's prompt (14-SPIKES child-session probe). */
 export const SUBAGENT_PROMPT_PREFIX = "You are a subagent spawned by another session.\n";
@@ -749,10 +767,14 @@ export function registerV2Enforcement(
         if (!builtin) await learnMcpNames(tool, rec);
         // Inner Code Mode calls share the outer id: each gets its own numbered id (IN-05).
         const numbered = builtin ? callID : openCodeModeCall(scope, sessionID, callID);
+        const input = readField(event, "input");
+        // A relative `workdir` is checked where the call runs, not at the project root (the v1
+        // path keeps only an absolute one). The arguments themselves are passed unchanged.
+        const shellCwd = tool === V2_SHELL_TOOL ? relativeShellCwd(input, sessionID, directory, scope) : undefined;
         const decision = decideBeforeVerdict(
           { tool: v1ToolName(tool), sessionID, callID: numbered },
-          { args: readField(event, "input") },
-          { runtime, record: rec },
+          { args: input },
+          { runtime, record: rec, ...(shellCwd === undefined ? {} : { shellCwd }) },
         ).catch((): BeforeDecision => NO_DECISION);
         // A built-in decision is applied at `evaluate`, found by session + call id. Without either
         // id (a call from outside the provider loop), or once the host was seen asserting without
