@@ -3161,14 +3161,14 @@ _SYSTEM_CHECKOUT_ROOTS = (
     '/usr',
     '/Library',
     '/System',
-    '/dev',  # `> /dev/null` names no checkout; the call still resolves from the cwd
 )
 
 
 def _is_system_checkout_path(path):
     try:
         normalized = os.path.normpath(path)
-        return any(
+        # `> /dev/null` names no checkout either; the call still resolves from the cwd.
+        return normalized in _NULL_REDIRECT_TARGETS or any(
             normalized == root or normalized.startswith(root + '/')
             for root in _SYSTEM_CHECKOUT_ROOTS
         )
@@ -3306,7 +3306,8 @@ _GIT_WRITE_SUBCOMMANDS = frozenset({
     'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
     'apply', 'am', 'worktree', 'submodule', 'update-ref', 'init', 'clone',
     'filter-branch', 'bisect', 'sparse-checkout', 'notes', 'replace', 'symbolic-ref',
-    'gc', 'prune', 'reflog', 'read-tree', 'checkout-index',
+    'gc', 'prune', 'reflog', 'read-tree', 'checkout-index', 'update-index',
+    'merge-file', 'format-patch', 'lfs',
 })
 # `git -c key=value` and `--config-env` can point core.pager, core.editor or diff.external at any command: always gated.
 _GIT_CONFIG_OVERRIDE_OPTIONS = frozenset({'-c', '--config-env'})
