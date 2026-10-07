@@ -677,11 +677,10 @@ def _plant_python_era_codex(home: Path, command: str):
     script = home / ".codex" / "hooks" / "unbound.py"
     script.parent.mkdir(parents=True)
     script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
-    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
-        "PreToolUse": [{"hooks": [
-            {"type": "command", "command": command.format(script=script)}]}],
-        "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]}],
-    }}))
+    # Every python-era installer wrote all five events, with the same matchers.
+    config = setup_cmd._codex_hooks_config(command.format(script=script))
+    config["Stop"].append({"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]})
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": config}))
     return script
 
 
@@ -931,6 +930,37 @@ def test_an_unchanged_hooks_json_is_not_rewritten(env):
     os.utime(hooks_json, (1_000_000_000, 1_000_000_000))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert hooks_json.stat().st_mtime == 1_000_000_000
+
+
+def test_setup_repairs_a_narrowed_matcher(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["hooks"]["PreToolUse"][0]["matcher"] = "^$"
+    hooks_json.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
+    matchers = [g.get("matcher") for g in json.loads(hooks_json.read_text())["hooks"]["PreToolUse"]]
+    assert matchers == ["^$", "*"]
+
+
+def test_a_working_non_ascii_entry_on_a_symlink_is_left_alone(env, monkeypatch):
+    """`/Users/José/...` is one shell word unquoted, so it already runs; only a
+    path the shell would split is replaced."""
+    home = env["tmp"] / "José"
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    dotfile = env["tmp"] / "dotfiles" / "hooks.json"
+    dotfile.parent.mkdir()
+    dotfile.write_text(json.dumps({"hooks": setup_cmd._codex_hooks_config(str(wrapper))}))
+    (home / ".codex" / "hooks.json").symlink_to(dotfile)
+    before = dotfile.read_text()
+    _only_home(env, monkeypatch, home)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted"]
+    assert dotfile.read_text() == before
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---

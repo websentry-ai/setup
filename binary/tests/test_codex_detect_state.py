@@ -147,6 +147,35 @@ def test_a_home_path_with_a_space_is_judged_as_the_shell_runs_it(m, tmp_path, qu
     assert _state(m, home) == expected
 
 
+@pytest.mark.parametrize("dropped", EVENTS)
+def test_every_installed_event_must_be_registered(m, tmp_path, dropped):
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    del cfg["hooks"][dropped]
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == "tampered"
+
+
+@pytest.mark.parametrize("matcher, expected", [
+    ("*", "persisted"), ("", "persisted"), ("^$", "tampered"), ("Bash", "tampered"),
+])
+def test_a_narrowed_matcher_is_not_our_registration(m, tmp_path, matcher, expected):
+    """Codex treats a missing, empty or "*" matcher as every tool."""
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    cfg["hooks"]["PreToolUse"][0]["matcher"] = matcher
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == expected
+
+
+def test_a_non_command_entry_is_not_our_registration(m, tmp_path):
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    cfg["hooks"]["PreToolUse"][0]["hooks"][0]["type"] = "mcp_tool"
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == "tampered"
+
+
 # --- malformed content reads as "codex couldn't load it" ---------------------
 
 @pytest.mark.parametrize("raw", [

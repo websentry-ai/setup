@@ -522,6 +522,7 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     our hook is left alone even when it's a symlink we would refuse to write."""
     wrapper = Path(wrapper_path)
     command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
+    bare_path_runs = _codex_runs_wrapper(wrapper_path, wrapper)
     try:
         config = json.loads(_read_user_file(hooks_path, follow=True))
     except FileNotFoundError:
@@ -537,28 +538,19 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
             config["hooks"][event] = new_config
             continue
         existing_config = config["hooks"][event]
-        our_hook_exists = False
-        for existing_item in list(existing_config):
-            if not isinstance(existing_item, dict):
-                continue
-            # .get's default only applies to a missing key, so a scalar here
-            # would be iterated and raise before the command check ran.
-            existing_hooks = existing_item.get("hooks")
-            if not isinstance(existing_hooks, list):
-                continue
-            if command != wrapper_path:
-                # Our earlier unquoted entry, which the shell splits and never runs.
+        if not bare_path_runs:
+            # Our earlier unquoted entry, which the shell splits and never runs.
+            for existing_item in list(existing_config):
+                existing_hooks = existing_item.get("hooks") if isinstance(existing_item, dict) else None
+                if not isinstance(existing_hooks, list):
+                    continue
                 kept = [h for h in existing_hooks
                         if not (isinstance(h, dict) and h.get("command") == wrapper_path)]
                 if len(kept) != len(existing_hooks):
-                    existing_item["hooks"] = existing_hooks = kept
+                    existing_item["hooks"] = kept
                     if not kept:
                         existing_config.remove(existing_item)
-                        continue
-            if any(isinstance(h, dict) and _codex_runs_wrapper(h.get("command"), wrapper)
-                   for h in existing_hooks):
-                our_hook_exists = True
-        if not our_hook_exists:
+        if not any(_codex_group_runs_wrapper(item, wrapper) for item in existing_config):
             existing_config.extend(new_config)
 
     if json.dumps(config, sort_keys=True) == before:
@@ -779,22 +771,32 @@ def _codex_runs_wrapper(command, wrapper: Path) -> bool:
     return tokens == [str(wrapper)]
 
 
+def _codex_group_runs_wrapper(group, wrapper: Path) -> bool:
+    """A hooks.json group that fires our wrapper for every tool: a match-all
+    matcher (codex treats absent, "" and "*" alike) and a command that is it."""
+    if not isinstance(group, dict) or group.get("matcher") not in (None, "", "*"):
+        return False
+    hooks = group.get("hooks")
+    return any(isinstance(h, dict) and h.get("type") == "command"
+               and _codex_runs_wrapper(h.get("command"), wrapper)
+               for h in (hooks if isinstance(hooks, list) else []))
+
+
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
-    """Whether this hooks.json registers our wrapper. Runs as the profile's user
-    and reads the file as codex does, following a symlink. Anything codex
-    couldn't load counts as not registered."""
+    """Whether this hooks.json registers our wrapper for every event. Runs as the
+    profile's user and reads the file as codex does, following a symlink.
+    Anything codex couldn't load counts as not registered."""
     try:
         config = json.loads(_read_user_file(hooks_path, follow=True))
     except Exception:
         return False
     events = config.get("hooks") if isinstance(config, dict) else None
-    for entries in events.values() if isinstance(events, dict) else []:
-        for item in entries if isinstance(entries, list) else []:
-            hooks = item.get("hooks") if isinstance(item, dict) else None
-            for hook in hooks if isinstance(hooks, list) else []:
-                if isinstance(hook, dict) and _codex_runs_wrapper(hook.get("command"), wrapper):
-                    return True
-    return False
+    if not isinstance(events, dict):
+        return False
+    # Every event setup installs, or a dropped PreToolUse would still read healthy.
+    return all(any(_codex_group_runs_wrapper(group, wrapper)
+                   for group in (events.get(event) if isinstance(events.get(event), list) else []))
+               for event in _codex_hooks_config(None))
 
 
 def _codex_detect_state(m, user_homes):
