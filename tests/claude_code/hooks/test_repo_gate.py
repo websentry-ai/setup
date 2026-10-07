@@ -620,12 +620,15 @@ class TestBashPaths(RepoGateCase):
 
 
 class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
-    """A Bash call is in scope only when it runs git or mutates the working tree."""
+    """A Bash call is in scope only when it runs a git write subcommand or mutates the working tree."""
 
     # No absolute paths here: a command that names one resolves against THAT
     # path, not the cwd, which is a separate axis covered by TestBashPaths.
-    GATED = ['git push', 'git commit -m wip', '/usr/bin/git status',
-             'sudo git push', 'GIT_SSH_COMMAND=ssh git push', 'git log | head',
+    GATED = ['git push', 'git commit -m wip', '/usr/bin/git push',
+             'sudo git push', 'GIT_SSH_COMMAND=ssh git push', 'git log | git commit -m x',
+             'git -C . reset --hard', 'git branch -D old', 'git stash',
+             'git checkout -b feature', 'git rebase main', 'git clean -fd',
+             'git tag v1', 'git status > status.txt',
              'rm auth.py', 'rm -rf build/', 'mv a b', 'cp a b', 'touch new.py',
              'mkdir -p src/x', "sed -i 's/a/b/' f", "perl -pi -e 's/a/b/' f",
              'tee out.txt', 'truncate -s 0 f', 'dd if=a of=b', 'ln -s a b',
@@ -636,7 +639,15 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
                '/opt/homebrew/bin/git-lfs --help', 'grep -r "rm -rf" .',
                'grep git README.md', 'echo "moved to archive"',
                'echo "a && git push"', 'npm run remove-stale',
-               'make 2>&1', 'cmd 1>&2', 'chmod +x run.sh']
+               'make 2>&1', 'cmd 1>&2', 'chmod +x run.sh',
+               # WEB-6070: read-only git and output discarded to /dev/null.
+               'git status', '/usr/bin/git status', 'git log | head',
+               'git status --short; git diff --stat', 'git -C . status',
+               'git branch -a', 'git remote -v', 'git branch feature',
+               'git config --get user.name', 'git status 2>/dev/null',
+               'ls ~/.clasprc.json 2>/dev/null',
+               'ls ~/.clasprc.json 2>/dev/null && echo exists || echo "not logged in"',
+               'cat notes.md 2>/dev/null', 'npm test > /dev/null 2>&1']
 
     def test_gated_commands_are_caught_in_an_out_of_scope_repo(self):
         self.set_policies([ORG_POLICY])
@@ -663,7 +674,7 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
         program cannot be classified with confidence."""
         for command in ('xargs git commit', 'sh -c "git push"', 'xargs rm'):
             with self.subTest(command=command):
-                self.assertFalse(unbound._is_git_command(command))
+                self.assertFalse(unbound._is_git_write_command(command))
                 self.assertFalse(unbound._is_shell_write_command(command))
 
     def test_the_write_command_set_is_one_reviewable_constant(self):
