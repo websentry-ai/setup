@@ -4978,18 +4978,12 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         return str(own)
     sources = {}
     if prefix in ('', COWORK_BUNDLED_SKILLS_PREFIX):
-        root = session.parent.parent.parent
-        bundles = root / 'skills-plugin'
-        own = (session.parent.parent.name, session.parent.name)
-        mine, shared = [], []
-        for path in bundles.glob('**/skills/%s/SKILL.md' % name):
-            ids = path.relative_to(bundles).parts[:2]
-            if ids == own:
-                mine.append(path)
-            elif not (root / ids[0] / ids[1]).is_dir():
-                shared.append(path)  # a bundle keyed to another account/org's sessions is theirs
-        if mine or shared:
-            sources['bundle'] = mine or shared
+        # One bundle per account, kept at skills-plugin/<org>/<account> (the reverse of
+        # the sessions tree); another account's bundle on the same machine is theirs.
+        own = session.parent.parent.parent / 'skills-plugin' / session.parent.name / session.parent.parent.name
+        copies = list(own.glob('**/skills/%s/SKILL.md' % name))
+        if copies:
+            sources['bundle'] = copies
     if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
         for plugin in (session.parent / 'rpm').glob('*'):
             if not plugin.is_dir() or (prefix and _plugin_manifest_name(plugin) != prefix):

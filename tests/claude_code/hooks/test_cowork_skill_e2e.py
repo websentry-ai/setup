@@ -84,7 +84,8 @@ class CoworkHookE2E(unittest.TestCase):
         return path
 
     def bundle_skill(self, name, text):
-        root = self.org.parent.parent / "skills-plugin" / "b1" / "b1" / "skills"
+        # Cowork keeps the account's bundle at skills-plugin/<org>/<account>.
+        root = self.org.parent.parent / "skills-plugin" / self.org.name / self.org.parent.name / "skills"
         return self.write(root / name / "SKILL.md", text)
 
     def run_turn(self, *, skill=None, prompt="make it", cwd=None, transcript=None):
