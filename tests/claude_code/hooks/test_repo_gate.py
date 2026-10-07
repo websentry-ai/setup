@@ -633,6 +633,7 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
              'git 2>/dev/null push', 'git >/dev/null commit -m wip', 'git 2>&1 push',
              'git "re"set --hard', 'git >& /dev/null push', 'git \\\n  push origin main',
              'git push > /dev/null', 'git push 2> /dev/null',
+             'git pu\\sh', "git $'push'", "git -c core.pager='touch x' status",
              'git tag v1', 'git status > status.txt',
              'rm auth.py', 'rm -rf build/', 'mv a b', 'cp a b', 'touch new.py',
              'mkdir -p src/x', "sed -i 's/a/b/' f", "perl -pi -e 's/a/b/' f",

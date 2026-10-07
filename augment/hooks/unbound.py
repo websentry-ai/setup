@@ -3278,8 +3278,10 @@ _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 _LINE_CONTINUATION_RE = re.compile(r'\\\n')
 # Inside a quoted run these are plain text; masking them keeps `"a b"` one word and `"a && b"` one segment.
 _QUOTED_SHELL_CHAR_RE = re.compile(r'[\s;|&<>()`$]')
-# Quotes anywhere in a word are shell syntax, not text: `"re"set` is `reset`.
-_QUOTE_CHAR_RE = re.compile(r'["\']')
+# Quotes, backslash escapes and the `$` of `$'…'` are shell syntax, not text: `"re"set`, `pu\sh` and `$'push'` are `reset` and `push`.
+_SHELL_QUOTING_RE = re.compile(r'["\']|\\|\$(?=["\'])')
+# A word still holding an expansion (`$(…)`, `$VAR`, backticks) cannot be classified.
+_SHELL_EXPANSION_RE = re.compile(r'[$`]')
 # An `&` inside a redirect (`2>&1`, `&>file`) is not a background `&`.
 _SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|\n]|(?<![<>])&(?!>)')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
@@ -3298,8 +3300,10 @@ _GIT_WRITE_SUBCOMMANDS = frozenset({
     'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
     'apply', 'am', 'worktree', 'submodule', 'update-ref', 'init', 'clone',
     'filter-branch', 'bisect', 'sparse-checkout', 'notes', 'replace', 'symbolic-ref',
-    'gc', 'prune', 'reflog',
+    'gc', 'prune', 'reflog', 'read-tree', 'checkout-index',
 })
+# `git -c key=value` and `--config-env` can point core.pager, core.editor or diff.external at any command: always gated.
+_GIT_CONFIG_OVERRIDE_OPTIONS = frozenset({'-c', '--config-env'})
 # `git branch` is gated only when it deletes, moves, copies or forces: `-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `-f`, or a short-flag run containing one (`-rd`).
 _GIT_BRANCH_WRITE_RE = re.compile(r'^(?:--(?:delete|move|copy|force)$|-[A-Za-z]*[dDmMcCf])')
 # A redirect inside a word: optional fd digits, the operator (`>`, `>>`, `>&`, `&>`), then whatever is glued on (`2>/dev/null`, `push>out`, `2>&1`).
@@ -3345,7 +3349,7 @@ def _without_redirects(words):
 def _segment_words(segment):
     """A segment's words from its command word on, dropping redirects, env assignments and any sudo/env/command wrapper."""
     words = []
-    for word in _without_redirects(_QUOTE_CHAR_RE.sub('', word).strip('()`{}') for word in segment.split()):
+    for word in _without_redirects(_SHELL_QUOTING_RE.sub('', word).strip('(){}') for word in segment.split()):
         if not words and (not word or word.startswith('-')
                           or _ENV_ASSIGNMENT_RE.match(word)
                           or word in _COMMAND_PREFIX_WORDS):
@@ -3366,20 +3370,30 @@ def _segment_writes(words):
     return False
 
 
-def _git_subcommand(words):
-    """(subcommand, arguments) of a git invocation, skipping global options such as `-C dir`; (None, []) when none is named."""
+def _git_invocation(words):
+    """(global options, subcommand, arguments) of a git invocation; the subcommand is None when none is named."""
+    options = []
     remaining = iter(words[1:])
     for word in remaining:
         if word in _GIT_OPTIONS_WITH_VALUE:
+            options.append(word)
             next(remaining, None)  # the option's value
-        elif not word.startswith('-'):
-            return word, list(remaining)
-    return None, []
+        elif word.startswith('-'):
+            options.append(word.partition('=')[0])
+        else:
+            return options, word, list(remaining)
+    return options, None, []
 
 
 def _git_segment_writes(words):
-    """Whether a git invocation runs a write subcommand; `git branch` only with a flag that changes refs."""
-    subcommand, arguments = _git_subcommand(words)
+    """Whether a git invocation is gated: a config override, an unclassifiable subcommand, a write subcommand, or `git branch` with a flag that changes refs."""
+    options, subcommand, arguments = _git_invocation(words)
+    if _GIT_CONFIG_OVERRIDE_OPTIONS.intersection(options):
+        return True
+    if subcommand is None:
+        return False
+    if _SHELL_EXPANSION_RE.search(subcommand):
+        return True
     if subcommand == 'branch':
         return any(_GIT_BRANCH_WRITE_RE.match(argument) for argument in arguments)
     return subcommand in _GIT_WRITE_SUBCOMMANDS

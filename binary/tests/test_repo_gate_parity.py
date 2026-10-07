@@ -673,6 +673,19 @@ GIT_COMMANDS = [
     'git gc',
     'git prune',
     'git reflog expire --expire=now --all',
+    'git read-tree -u --reset HEAD',
+    'git checkout-index -a -f',
+    'git pu\\sh',
+    'git \\push origin main',
+    "git $'push'",
+    'git $"push"',
+    'git $(echo push)',
+    'git $CMD',
+    'git `echo push`',
+    "git -c core.pager='touch pwned' status",
+    'git -c color.ui=never log --oneline',
+    'git --config-env=core.pager=X status',
+    'git --config-env core.pager=X status',
     'git tag v1.0',
     'git stash',
     'git stash pop',
@@ -691,8 +704,8 @@ GIT_READ_COMMANDS = [
     'cd /tmp/x; git log',
     'GIT_DIR=/tmp/x git status',
     'git -C /tmp/x status',
-    'git -c color.ui=never log --oneline',
     'git --no-pager show HEAD',
+    'git --no-pager log --oneline',
     'git blame README.md',
     'git rev-parse --show-toplevel',
     'git ls-files',
@@ -825,6 +838,9 @@ def test_redirects_into_a_file_are_still_writes(hook, command):
     ('git 2>&1 push', ['git', 'push']),
     ('git >&2 push', ['git', 'push']),
     ('git "re"set --hard', ['git', 'reset', '--hard']),
+    ('git pu\\sh', ['git', 'push']),
+    ("git $'push'", ['git', 'push']),
+    ('git $(echo push)', ['git', '$(echo', 'push']),
     ('git >& /dev/null push', ['git', 'push']),
     ('git 2>& 1 push', ['git', 'push']),
     ('git &> /dev/null push', ['git', 'push']),
@@ -852,6 +868,7 @@ def test_git_command_sets_are_reviewable_constants(hook):
     assert 'push' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'restore' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'filter-branch' in hook._GIT_WRITE_SUBCOMMANDS
+    assert hook._GIT_CONFIG_OVERRIDE_OPTIONS == frozenset({'-c', '--config-env'})
     assert 'status' not in hook._GIT_WRITE_SUBCOMMANDS
     assert 'branch' not in hook._GIT_WRITE_SUBCOMMANDS
     assert '/dev/null' in hook._NULL_REDIRECT_TARGETS
