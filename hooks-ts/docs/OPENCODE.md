@@ -40,7 +40,7 @@ unless a row says otherwise; the **v2 line (opencode desktop / CLI 2.0.x)** has 
 | What | How it behaves |
 |---|---|
 | Model-issued shell and file tools (`tool.execute.before`) | `bash` and the file tools `read`, `write`, `edit`, `grep`, `glob`, `lsp` and `apply_patch` are evaluated by the Unbound policy engine before they run. |
-| MCP tools | Sent for evaluation with an explicit server and tool, attributed by the configured (or live, `client.mcp.status()`) MCP server names, or by the call's own server argument for resource tools; never by splitting the tool id. When more than one configured server could have produced the tool id (sanitised names can collide), the call is checked once per candidate server and the strictest verdict wins; this is reported as `mcp_attribution_ambiguous`. A non-built-in tool that matches no known server is still sent, with its raw id and no MCP attribution, and reported as `mcp_attribution_miss` (also when no MCP server is configured). |
+| MCP tools | Sent for evaluation with an explicit server and tool, attributed by the configured (or live, `client.mcp.status()`) MCP server names, or by the call's own server argument for resource tools; never by splitting the tool id. When more than one configured server could have produced the tool id (sanitised names can collide), the call is checked once per candidate server and the strictest verdict wins; this is reported as `mcp_attribution_ambiguous`. A non-built-in tool that matches no known server is still sent, with its raw id and no MCP attribution, and reported as `mcp_attribution_miss` (also when no MCP server is configured). **Arguments** go through the same allowlist and caps as a native tool, not whole: server- and tool-level MCP policies apply, but argument-level MCP policies and MCP input DLP do not see the arguments. (pi sends brokered MCP arguments whole, up to 512 KiB; extending that egress to opencode is a separate product decision.) |
 | Custom (plugin-defined) tools | Sent with their raw tool id and no MCP attribution. The server has no evaluation path for them today: it logs the call (an attribution miss) and allows it. So a custom tool runs unchecked, but it is visible server-side. |
 | `webfetch`, `websearch`, `skill` | **Not sent.** The server has no evaluation path for these tools under `opencode`, so a URL-fetch or search policy cannot apply to them. They run unchecked. The same holds for `todowrite`, `question`, `plan_exit`, `invalid` and the outer Code Mode `execute` call (the MCP calls made inside it are checked one by one). |
 | Tools inside subagents | A subagent's own tool calls are checked like the root session's. |
@@ -92,6 +92,9 @@ skill.
   the tool calls of the turn including those made inside its subagents, and the assistant's text.
   The turn log carries the user prompt and the assistant's text in clear (capped). Subagent idles
   post nothing; a deleted session's pending state is dropped, not posted.
+- **Pretool requests carry no prompt.** `messages[0].content` is empty on tool-call checks, so a
+  gateway block/warn row shows the command without the prompt that led to it; the prompt is in the
+  turn log. (pi sends the turn prompt on tool calls; extending that to opencode is a separate change.)
 - **Heartbeat.** On a new root session, at most once per project directory per cache TTL, carrying
   the opencode version (`metadata.opencode_version`). Requests use `client_entrypoint`
   `opencode/<version>` once the version is known.
