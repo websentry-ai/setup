@@ -4381,7 +4381,8 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 # Inside a quoted run these are plain text; masking them keeps `"a b"` one word and `"a && b"` one segment.
 _QUOTED_SHELL_CHAR_RE = re.compile(r'[\s;|&<>()`$]')
-_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+# `&>` is a redirect, not a background `&`.
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|\n]|&(?!>)')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
@@ -4400,8 +4401,8 @@ _GIT_WRITE_SUBCOMMANDS = frozenset({
 })
 # `git branch` is gated only when it deletes, moves, copies or forces: `-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `-f`, or a short-flag run containing one (`-rd`).
 _GIT_BRANCH_WRITE_RE = re.compile(r'^(?:--(?:delete|move|copy|force)$|-[A-Za-z]*[dDmMcCf])')
-# A redirect glued to a word (`push>/dev/null`) ends the word; the operator and its target are not arguments.
-_WORD_REDIRECT_TAIL_RE = re.compile(r'[<>].*')
+# A redirect inside a word: optional fd digits, the operator, then whatever is glued on (`2>/dev/null`, `push>out`, `2>&1`).
+_REDIRECT_IN_WORD_RE = re.compile(r'(\d*&?[<>]{1,2})(&?.*)$')
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -4423,11 +4424,27 @@ def _mask_quoted_runs(command):
         command)
 
 
+def _without_redirects(words):
+    """`words` minus redirect operators and their targets: `push>/dev/null` keeps `push`, a bare `2>` also drops the next word."""
+    kept = []
+    remaining = iter(words)
+    for word in remaining:
+        match = _REDIRECT_IN_WORD_RE.search(word)
+        if match is None:
+            kept.append(word)
+            continue
+        head = word[:match.start()]
+        if head:
+            kept.append(head)
+        if not match.group(2):
+            next(remaining, None)  # the operator's target
+    return kept
+
+
 def _segment_words(segment):
-    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    """A segment's words from its command word on, dropping redirects, env assignments and any sudo/env/command wrapper."""
     words = []
-    for word in segment.split():
-        word = _WORD_REDIRECT_TAIL_RE.sub('', word).strip('()`{}"\'')
+    for word in _without_redirects(word.strip('()`{}"\'') for word in segment.split()):
         if not words and (not word or word.startswith('-')
                           or _ENV_ASSIGNMENT_RE.match(word)
                           or word in _COMMAND_PREFIX_WORDS):

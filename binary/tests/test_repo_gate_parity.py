@@ -646,6 +646,13 @@ GIT_COMMANDS = [
     'git push>/dev/null',
     'git stash>/dev/null 2>&1',
     'git push>out.txt',
+    'git push> /dev/null',
+    'git 2>/dev/null push',
+    'git >/dev/null commit -m wip',
+    'git 2> /dev/null push',
+    'git > "/dev/null" push',
+    'git push 2>&1',
+    'git &>/dev/null push',
     'git tag v1.0',
     'git stash',
     'git stash pop',
@@ -678,6 +685,8 @@ GIT_READ_COMMANDS = [
     'git reflog',
     'git status>/dev/null',
     'git log>/dev/null 2>&1',
+    'git 2>/dev/null status',
+    'git status 2>&1',
     'git --version',
     'git status 2>/dev/null',
     'git',
@@ -774,6 +783,21 @@ def test_output_discarded_to_dev_null_is_not_a_write(hook, command):
 ])
 def test_redirects_into_a_file_are_still_writes(hook, command):
     assert hook._is_shell_write_command(command) is True
+
+
+@pytest.mark.parametrize("segment, words", [
+    ('git push>/dev/null', ['git', 'push']),
+    ('git push> /dev/null', ['git', 'push']),
+    ('git 2>/dev/null push', ['git', 'push']),
+    ('git 2> /dev/null push', ['git', 'push']),
+    ('git > "/dev/null" push', ['git', 'push']),
+    ('git push 2>&1', ['git', 'push']),
+    ('cat <<EOF', ['cat']),
+    ('patch < fix.diff', ['patch']),
+    ('git log --oneline', ['git', 'log', '--oneline']),
+])
+def test_segment_words_drop_redirects_and_their_targets(hook, segment, words):
+    assert hook._segment_words(segment) == words
 
 
 def test_git_command_sets_are_reviewable_constants(hook):
