@@ -95,7 +95,7 @@ def test_a_symlinked_wrapper_is_not_our_script(m, tmp_path):
 
 # --- what counts as our registration -----------------------------------------
 
-@pytest.mark.parametrize("shape", ["{w}", '"{w}"', 'python3 "{w}"', "/usr/bin/python3 -u {w}"])
+@pytest.mark.parametrize("shape", ["{w}", '"{w}"', "'{w}'", 'python3 "{w}"', "/usr/bin/python3.12 {w}"])
 def test_every_shape_our_installers_wrote_is_ours(m, tmp_path, shape):
     home = _profile(tmp_path, script=True)
     cfg = _registration(shape.format(w=_wrapper(home)))
@@ -108,6 +108,15 @@ def test_every_shape_our_installers_wrote_is_ours(m, tmp_path, shape):
     "echo {w}",
     "/opt/other/unbound.py",
     "/usr/local/bin/unbound.py-wrapper",
+    'python3 -c "{w}"',
+    'python3 -u "{w}"',
+    'bash "{w}"',
+    'python3 -m "{w}"',
+    '"{w}" > /dev/null',
+    '"{w}"; true',
+    '"{w}" || true',
+    "{w} &",
+    '"{w}',
 ])
 def test_a_command_that_only_mentions_our_paths_is_not_ours(m, tmp_path, decoy):
     home = _profile(tmp_path, script=True)
@@ -143,6 +152,7 @@ def test_a_home_path_with_a_space_is_judged_as_the_shell_runs_it(m, tmp_path, qu
     '{"hooks": {"PreToolUse": 1}}',
     '{"hooks": {"PreToolUse": [1, "x", {"hooks": 1}]}}',
     '{"hooks": {"PreToolUse": [{"hooks": [{"command": 1}, {"command": null}, "x"]}]}}',
+    "[" * 100000,
 ])
 def test_malformed_content_with_the_script_is_tampered_not_a_crash(m, tmp_path, raw):
     assert _state(m, _profile(tmp_path, script=True, raw=raw)) == "tampered"
@@ -151,7 +161,7 @@ def test_malformed_content_with_the_script_is_tampered_not_a_crash(m, tmp_path, 
 def test_an_oversized_file_is_not_read(m, tmp_path, monkeypatch):
     home = _profile(tmp_path, script=True)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    monkeypatch.setattr(setup_cmd, "_CODEX_HOOKS_JSON_MAX_BYTES", 10)
+    monkeypatch.setattr(setup_cmd, "_USER_FILE_MAX_BYTES", 10)
     assert _state(m, home) == "tampered"
 
 

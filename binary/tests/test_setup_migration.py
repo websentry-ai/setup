@@ -808,6 +808,60 @@ def test_clear_command_removes_the_codex_install(env, monkeypatch):
     assert not hooks_json.exists() or not any(_codex_registrations(env["home"]).values())
 
 
+def _without_hanging(fn, seconds=5):
+    """Run fn, failing if anything in it blocks. Setup swallows per-tool errors,
+    so the alarm is recorded rather than trusted to propagate."""
+    import signal
+    fired = []
+
+    def _hung(*_):
+        fired.append(True)
+        raise TimeoutError("setup blocked")
+
+    old = signal.signal(signal.SIGALRM, _hung)
+    signal.alarm(seconds)
+    try:
+        result = fn()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+    assert not fired, "setup blocked on a FIFO"
+    return result
+
+
+@pytest.mark.parametrize("where", ["hooks.json", "hooks/unbound.py"])
+def test_a_fifo_in_the_codex_install_does_not_hang_setup(env, where):
+    fifo = env["home"] / ".codex" / where
+    fifo.parent.mkdir(parents=True, exist_ok=True)
+    os.mkfifo(fifo)
+    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
+    assert __import__("stat").S_ISFIFO(fifo.lstat().st_mode)
+    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
+
+
+def test_a_fifo_in_one_profile_reports_tampered_from_the_others(env, monkeypatch):
+    other = env["tmp"] / "other"
+    other.mkdir()
+    homes = [(ME, env["home"]), (ME, other)]
+    for mod in env["modules"].values():
+        monkeypatch.setattr(mod, "get_all_user_homes", lambda: homes)
+
+    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = other / ".codex" / "hooks.json"
+    hooks_json.unlink()
+    os.mkfifo(hooks_json)
+    _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
+    assert _codex_states(env) == ["fresh", "tampered"]
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
 
 def test_clear_strips_binary_hook_preserves_foreign(env):

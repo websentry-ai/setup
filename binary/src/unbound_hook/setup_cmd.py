@@ -21,6 +21,7 @@ but never aborts the remaining components.
 import json
 import os
 import platform
+import re
 import shlex
 import stat
 import subprocess
@@ -420,6 +421,30 @@ def _write_augment_managed_settings(m) -> bool:
         return False
 
 
+# Files in a user's home: never follow a link we write through, and never wait
+# on a FIFO planted in place of one.
+_USER_FILE_WRITE_FLAGS = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                          | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+_USER_FILE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _read_user_file(path: Path, follow: bool) -> bytes:
+    """A user-owned file's bytes, read non-blocking and capped. Raises OSError for
+    anything but a regular file within the cap."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if not follow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(_USER_FILE_MAX_BYTES + 1)
+    if len(data) > _USER_FILE_MAX_BYTES:
+        raise OSError(f"{path} is larger than {_USER_FILE_MAX_BYTES} bytes")
+    return data
+
+
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
     actually discovers them from), mirroring the python user-level
@@ -444,8 +469,7 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
         # (O_NOFOLLOW below would otherwise defer codex on every run).
         if wrapper.is_symlink():
             wrapper.unlink()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(wrapper), flags, 0o755)
+        fd = os.open(str(wrapper), _USER_FILE_WRITE_FLAGS, 0o755)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(_codex_wrapper_source())
         os.chmod(wrapper, 0o755)
@@ -497,10 +521,9 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
     """Idempotent merge of the codex hook events into hooks.json, mirroring the
     python configure_codex_hooks merge: re-runs don't duplicate our entry and
     other tools' hooks are preserved."""
-    if hooks_path.exists():
-        with open(hooks_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    else:
+    try:
+        config = json.loads(_read_user_file(hooks_path, follow=False))
+    except FileNotFoundError:
         config = {}
 
     hooks_config = _codex_hooks_config(hook_command)
@@ -528,8 +551,7 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
         if not our_hook_exists:
             existing_config.extend(new_config)
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(hooks_path), flags, 0o644)
+    fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
 
@@ -731,35 +753,35 @@ def _setup_codex(opts):
     return ("configured", None)
 
 
-_CODEX_HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
+def _codex_runs_wrapper(command, wrapper: Path) -> bool:
+    """The command, as the shell splits it, is exactly our wrapper, optionally
+    after a bare python launcher. Anything else around it (`python3 -c`, `; true`,
+    `> /dev/null`, an unquoted path with a space) can skip the hook."""
+    if not isinstance(command, str):
+        return False
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if len(tokens) == 2 and re.fullmatch(r"python(\d+(\.\d+)?)?", os.path.basename(tokens[0])):
+        tokens = tokens[1:]
+    return len(tokens) == 1 and os.path.normpath(tokens[0]) == os.path.normpath(str(wrapper))
 
 
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
     """Whether this hooks.json registers our wrapper. Runs as the profile's user
-    and reads the file as codex does, following a symlink, but non-blocking,
-    regular files only and size-capped. Anything codex couldn't load is False."""
+    and reads the file as codex does, following a symlink. Anything codex
+    couldn't load counts as not registered."""
     try:
-        fd = os.open(str(hooks_path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
-    except OSError:
+        config = json.loads(_read_user_file(hooks_path, follow=True))
+    except Exception:
         return False
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _CODEX_HOOKS_JSON_MAX_BYTES:
-            return False
-        with os.fdopen(fd, "r", encoding="utf-8") as f:
-            fd = None
-            config = json.load(f)
-    except (OSError, ValueError):
-        return False
-    finally:
-        if fd is not None:
-            os.close(fd)
     events = config.get("hooks") if isinstance(config, dict) else None
     for entries in events.values() if isinstance(events, dict) else []:
         for item in entries if isinstance(entries, list) else []:
             hooks = item.get("hooks") if isinstance(item, dict) else None
             for hook in hooks if isinstance(hooks, list) else []:
-                if isinstance(hook, dict) and _command_targets_hook(hook.get("command"), wrapper):
+                if isinstance(hook, dict) and _codex_runs_wrapper(hook.get("command"), wrapper):
                     return True
     return False
 
