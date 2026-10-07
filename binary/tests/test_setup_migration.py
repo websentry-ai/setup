@@ -1052,14 +1052,13 @@ def test_a_fresh_install_that_fails_reports_nothing(env, monkeypatch):
     assert _codex_states(env) == []
 
 
-def test_setup_makes_an_unloadable_hooks_json_loadable(env):
-    """An unknown top-level key or a malformed sibling makes codex refuse the
-    file, so setup drops just those and keeps everything codex can load."""
+def test_setup_repairs_malformed_known_content(env):
+    """A malformed handler of a type codex knows makes it refuse the file, so setup
+    drops just that and keeps everything codex can load."""
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     hooks_json = env["home"] / ".codex" / "hooks.json"
     config = json.loads(hooks_json.read_text())
     foreign = {"type": "command", "command": "/usr/bin/audit", "timeout": 30}
-    config["x"] = 1
     config["hooks"]["PreToolUse"][0]["hooks"].append(foreign)
     config["hooks"]["PreToolUse"].append({"hooks": [{"type": "command", "command": "/y", "timeout": 1.5}]})
     config["hooks"]["PreToolUse"].append({"hooks": [{"type": [], "command": "/z"}]})
@@ -1068,8 +1067,35 @@ def test_setup_makes_an_unloadable_hooks_json_loadable(env):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env) == ["fresh", "tampered", "persisted"]
     repaired = json.loads(hooks_json.read_text())
-    assert setup_cmd._codex_can_load(repaired) and "x" not in repaired
+    assert setup_cmd._codex_can_load(repaired)
     assert foreign in repaired["hooks"]["PreToolUse"][0]["hooks"]
+
+
+def test_setup_keeps_keys_and_handler_types_it_does_not_know(env):
+    """A newer codex may define them, so they're never deleted; the profile reads
+    tampered against the codex this check knows, and the file is left alone."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["futureField"] = {"x": 1}
+    config["hooks"]["Stop"].append({"hooks": [{"type": "future_kind", "anything": 1}]})
+    hooks_json.write_text(json.dumps(config))
+    before = hooks_json.read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "tampered"]
+    assert hooks_json.read_text() == before
+
+
+def test_setup_collapses_a_repeated_key(env):
+    """Rewriting is what makes a file with a repeated field loadable again."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    body = json.loads(hooks_json.read_text())["hooks"]
+    hooks_json.write_text('{"hooks": {}, "hooks": ' + json.dumps(body) + "}")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
+    assert hooks_json.read_text().count('"hooks"') >= 1 and setup_cmd._codex_can_load(json.loads(hooks_json.read_text()))
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---

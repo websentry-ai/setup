@@ -470,7 +470,25 @@ def _load_codex_json(data: bytes):
 
     config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant)
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
+    if _json_depth(config) > _SERDE_MAX_DEPTH:
+        raise ValueError("nested deeper than serde_json allows")
     return config
+
+
+_SERDE_MAX_DEPTH = 128  # serde_json's default recursion limit
+
+
+def _json_depth(value) -> int:
+    """Deepest array/object nesting, counted iteratively."""
+    deepest, stack = 0, [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else None
+        if children is None:
+            continue
+        deepest = max(deepest, depth)
+        stack.extend((child, depth + 1) for child in children)
+    return deepest
 
 
 # Codex's hooks.json schema (codex-rs/config/src/hook_config.rs). It rejects the
@@ -559,18 +577,16 @@ def _codex_can_load(config) -> bool:
 
 
 def _codex_make_loadable(config) -> dict:
-    """Drop only what makes codex refuse the whole file, so the hooks that do load
-    (ours and other tools') run again. Everything codex could load is kept."""
+    """Drop only content that breaks codex's known schema (wrong types, malformed
+    groups or handlers), so the hooks it can load run again. Keys and handler types
+    this check doesn't know are kept: a newer codex may define them."""
     if not isinstance(config, dict):
         return {}
-    clean = {k: v for k, v in config.items() if k in _CODEX_FILE_FIELDS}
+    clean = dict(config)
     if not _field_ok(clean.get("description"), "str?"):
         clean.pop("description")
     events = clean.get("hooks")
-    if not isinstance(events, dict):
-        clean["hooks"] = events = {}
-    else:
-        clean["hooks"] = events = dict(events)
+    clean["hooks"] = events = dict(events) if isinstance(events, dict) else {}
     for event in _CODEX_EVENT_FIELDS:
         if event not in events:
             continue
@@ -581,11 +597,20 @@ def _codex_make_loadable(config) -> dict:
                 continue
             group = dict(group)
             hooks = group.get("hooks", [])
-            group["hooks"] = [h for h in hooks if _codex_handler_loads(h)] if isinstance(hooks, list) else []
+            group["hooks"] = ([h for h in hooks if _codex_handler_kept(h)]
+                              if isinstance(hooks, list) else [])
             if group["hooks"] or not hooks:
                 kept.append(group)
         events[event] = kept
     return clean
+
+
+def _codex_handler_kept(handler) -> bool:
+    """Keep a handler unless it breaks the schema of a type we know."""
+    kind = handler.get("type") if isinstance(handler, dict) else None
+    if isinstance(kind, str) and kind not in _CODEX_HANDLER_FIELDS:
+        return True
+    return _codex_handler_loads(handler)
 
 
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
@@ -699,11 +724,15 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
                     existing_config.remove(existing_item)
         existing_config.extend(new_config)
 
-    if loadable and json.dumps(config, sort_keys=True) == before:
+    text = json.dumps(config, indent=2)
+    # Unchanged content is still rewritten when that alone makes it loadable
+    # (a repeated key collapses on rewrite); otherwise the file is left alone.
+    if json.dumps(config, sort_keys=True) == before and (
+            loadable or not _codex_can_load(_load_codex_json(text.encode("utf-8")))):
         return
     fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+        f.write(text)
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:

@@ -383,6 +383,19 @@ def test_many_duplicate_keys_parse_in_linear_time(m, tmp_path):
     assert time.monotonic() - started < 5
 
 
+@pytest.mark.parametrize("depth, expected", [(120, "persisted"), (150, "tampered")])
+def test_nesting_beyond_serde_json_s_limit_is_not_registered(m, tmp_path, depth, expected):
+    """serde_json refuses nesting past 128 levels, so codex can't load such a file."""
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    nested = 1
+    for _ in range(depth - 6):  # the handler's own objects add the remaining levels
+        nested = [nested]
+    _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": nested}})
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == expected
+
+
 # --- read the way codex does: a symlink is followed, a FIFO never blocks ------
 
 @pytest.mark.parametrize("ours", [True, False])
