@@ -27,8 +27,7 @@
 # PyInstaller; the Nuitka path (packaging/scripts/build-nuitka.sh, per-arch
 # + lipo merge, Apache-2.0 Nuitka 2.8.x only) produces dist/ with the same
 # layout, so the lipo gate / signing / smoke / pkg stages below run on it
-# unchanged. Nuitka artifacts carry a -nuitka suffix so both builders'
-# outputs can sit side by side for the EDR rehearsal.
+# unchanged. Both builders publish the same artifact names.
 
 name: release-macos-runtime
 
@@ -109,10 +108,6 @@ jobs:
             echo "::error::unknown builder '$builder'"
             exit 1
           fi
-          # Artifact names carry the builder so both can exist side by side
-          # for the EDR rehearsal; the default builder keeps today's names.
-          builder_suffix=""
-          [[ "$builder" == "nuitka" ]] && builder_suffix="-nuitka"
           # A tag always builds pyinstaller (above), so a non-pyinstaller publish
           # can only come from a deliberate workflow_dispatch with publish=true —
           # that is how a Nuitka build ships. Allow it, but make it loud: the
@@ -191,10 +186,10 @@ jobs:
             echo "pkg_sign=$pkg_sign"
             echo "notarize=$notarize"
             echo "s3=$HAS_S3"
-            echo "pkg_name=unbound-runtime-$version$builder_suffix.pkg"
-            echo "tar_name=unbound-runtime-$version$builder_suffix.tar.gz"
-            echo "artifact_name=unbound-runtime-$version$builder_suffix"
-            echo "artifact_url=$artifact_base/unbound-runtime-$version$builder_suffix.pkg"
+            echo "pkg_name=unbound-runtime-$version.pkg"
+            echo "tar_name=unbound-runtime-$version.tar.gz"
+            echo "artifact_name=unbound-runtime-$version"
+            echo "artifact_url=$artifact_base/unbound-runtime-$version.pkg"
             echo "discovery_ref=$discovery_ref"
             echo "lock_python=$lock_python"
             echo "lock_pyinstaller=$lock_pyinstaller"
@@ -398,11 +393,11 @@ jobs:
       # macOS's /bin/bash 3.2, where an empty array under `set -u` aborts, so
       # this runner is the only place that failure class is exercised. Fully
       # sandboxed: stubbed system tools, no root, no network, temp dir only.
-      - name: onboard.sh argv gate — rendered template under /bin/bash 3.2
+      - name: onboard.sh + jamf-setup.sh argv gate under /bin/bash 3.2
         run: |
           set -euo pipefail
           VENV=$([ "${{ steps.cfg.outputs.builder }}" = "nuitka" ] && echo .build-venv-nuitka || echo .build-venv)
-          "$VENV/bin/python" -m pytest tests/test_mdm_onboard_sh.py -q
+          "$VENV/bin/python" -m pytest tests/test_mdm_onboard_sh.py tests/test_mdm_jamf_setup_sh.py -q
 
       - name: Import Developer ID certs into throwaway keychain
         if: steps.cfg.outputs.sign == 'true'
@@ -600,6 +595,8 @@ jobs:
           set -euo pipefail
           tar -czf "out/$TAR_NAME" -C dist unbound-hook unbound-discovery
           (cd out && shasum -a 256 "$TAR_NAME" > "$TAR_NAME.sha256")
+          cp mdm/jamf-setup.sh out/
+          (cd out && shasum -a 256 jamf-setup.sh > jamf-setup.sh.sha256)
           ls -lh out/
 
       - name: Upload build artifacts (always, incl. dry-runs)
@@ -692,9 +689,9 @@ jobs:
           # the YAML block scalar, and indenting the second line to stay inside it would
           # put four leading spaces in the notes, which renders as a code block.
           notes="$(printf '%s\n\n%s\n' \
-            "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh." \
+            "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh, or upload the pkg to Jamf and run jamf-setup.sh after it." \
             "discovery source: $DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}")"
           gh release create "runtime-v$VERSION" \
             --title "macOS runtime $VERSION" \
             --notes "$notes" \
-            out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh
+            out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh out/jamf-setup.sh

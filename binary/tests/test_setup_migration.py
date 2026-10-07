@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from unbound_hook import migration, setup_cmd
+from unbound_hook import clear_cmd, migration, setup_cmd
 from unbound_hook._loader import load_mdm_setup_module
 from unbound_hook._resources import HOOK_BINARY
 
@@ -67,6 +67,11 @@ def env(tmp_path, monkeypatch):
     bootouts = []
     monkeypatch.setattr(migration, "_bootout_legacy_agents",
                         lambda username, uid, h, log: bootouts.append((username, uid)))
+    daemon_bootouts = []
+    monkeypatch.setattr(migration, "_bootout_legacy_daemon",
+                        lambda log: daemon_bootouts.append(log) or True)
+    monkeypatch.setattr(migration, "LEGACY_DAEMON_PLIST", tmp_path / "coding-discovery.plist")
+    monkeypatch.setattr(migration, "LEGACY_HOOK_SHIM", tmp_path / "usr-local-bin-unbound-hook")
     # Discovery needs no key any more: it resolves the device owner from the
     # serial and runs the locally installed binary. Stand in a no-op binary so
     # the step exercises that path instead of deferring on a missing file.
@@ -75,7 +80,8 @@ def env(tmp_path, monkeypatch):
     discovery_bin.chmod(0o755)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_BINARY", discovery_bin)
     return {"tmp": tmp_path, "home": home, "modules": modules,
-            "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts}
+            "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts,
+            "daemon_bootouts": daemon_bootouts}
 
 
 def _cmd(tool, event):
@@ -417,8 +423,11 @@ def _assert_swept(home: Path, tmp: Path):
     assert not (home / "Library" / "LaunchAgents" / "ai.getunbound.discovery.plist").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".local" / "share" / "unbound" / "run-scheduled.sh").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks", ".augment/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".augment/hooks"):
         assert not (home / d / "unbound.py").exists()
+    # codex's unbound.py is its hook target in both eras; the codex adapter
+    # overwrites it in place, so the sweep leaves it alone
+    assert (home / ".codex" / "hooks" / "unbound.py").exists()
     for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
@@ -449,6 +458,82 @@ def test_sweep_full_python_install(env):
     _assert_swept(env["home"], env["tmp"])
     # legacy LaunchAgent bootout attempted for the user (stubbed in tests)
     assert env["bootouts"] == [(ME, __import__("pwd").getpwnam(ME).pw_uid)]
+
+
+def test_sweep_removes_python_era_system_daemon_and_shim(env):
+    plist, shim = migration.LEGACY_DAEMON_PLIST, migration.LEGACY_HOOK_SHIM
+    plist.write_text("<plist/>")
+    shim.write_text("#!/bin/bash")
+    status, reason = migration.run_sweep(log=lambda *_: None)
+    assert (status, reason) == ("configured", None)
+    assert not plist.exists() and not shim.exists()
+    assert len(env["daemon_bootouts"]) == (1 if sys.platform == "darwin" else 0)
+
+
+def test_sweep_keeps_a_symlinked_hook_shim(env):
+    target = env["tmp"] / "real-binary"
+    target.write_text("binary")
+    migration.LEGACY_HOOK_SHIM.symlink_to(target)
+    status, _ = migration.run_sweep(log=lambda *_: None)
+    assert status == "configured"
+    assert migration.LEGACY_HOOK_SHIM.is_symlink() and target.read_text() == "binary"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="launchctl is macOS-only")
+def test_sweep_defers_while_the_legacy_daemon_stays_loaded(env, monkeypatch):
+    monkeypatch.setattr(migration, "_bootout_legacy_daemon", lambda log: False)
+    status, reason = migration.run_sweep(log=lambda *_: None)
+    assert status == "deferred" and "system" in reason
+
+
+def test_bootout_reports_a_daemon_that_is_still_loaded(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv[1])
+        return type("R", (), {"returncode": 0})()
+
+    monkeypatch.setattr(migration.subprocess, "run", fake_run)
+    logs = []
+    assert migration._bootout_legacy_daemon(logs.append) is False
+    assert calls == ["bootout", "print"]
+    assert any("still loaded" in line for line in logs)
+
+
+@pytest.mark.parametrize("print_rc", [113, 3])
+def test_bootout_succeeds_once_the_daemon_is_gone(monkeypatch, print_rc):
+    monkeypatch.setattr(
+        migration.subprocess, "run",
+        lambda argv, **kw: type("R", (), {"returncode": print_rc if argv[1] == "print" else 0})())
+    assert migration._bootout_legacy_daemon(lambda *_: None) is True
+
+
+def test_bootout_error_counts_as_not_unloaded(monkeypatch):
+    def boom(argv, **kw):
+        raise OSError("launchctl missing")
+
+    monkeypatch.setattr(migration.subprocess, "run", boom)
+    logs = []
+    assert migration._bootout_legacy_daemon(logs.append) is False
+    assert any("launchctl missing" in line for line in logs)
+
+
+def test_sweep_system_removal_failure_defers_but_still_sweeps_users(env, monkeypatch):
+    _plant_python_era_artifacts(env["home"], env["tmp"])
+    migration.LEGACY_DAEMON_PLIST.write_text("<plist/>")
+    real_unlink = Path.unlink
+
+    def failing_unlink(self, *a, **k):
+        if self == migration.LEGACY_DAEMON_PLIST:
+            raise PermissionError("denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    logs = []
+    status, reason = migration.run_sweep(log=logs.append)
+    assert status == "deferred" and "system" in reason
+    assert any("could not remove" in line for line in logs)
+    _assert_swept(env["home"], env["tmp"])
 
 
 def test_sweep_half_installed(env):
@@ -583,6 +668,144 @@ def test_sweep_keeps_binary_era_copilot_registration(env):
     status, _ = migration.run_sweep(log=lambda *_: None)
     assert status == "configured"
     assert (hooks_dir / "unbound.json").read_text() == binary_json
+
+
+CODEX_EVENTS = {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"}
+
+
+def _plant_python_era_codex(home: Path, command: str):
+    script = home / ".codex" / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
+        "PreToolUse": [{"hooks": [
+            {"type": "command", "command": command.format(script=script)}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]}],
+    }}))
+    return script
+
+
+def _codex_states(env):
+    return [k["install_state"] for a, k in env["notified"] if a[1] == "codex"]
+
+
+def _codex_registrations(home: Path):
+    hooks = json.loads((home / ".codex" / "hooks.json").read_text()).get("hooks", {})
+    wrapper = str(home / ".codex" / "hooks" / "unbound.py")
+    return {ev: [h["command"] for grp in groups for h in grp.get("hooks", [])
+                 if setup_cmd._command_targets_hook(h.get("command", ""), Path(wrapper))]
+            for ev, groups in hooks.items()}
+
+
+def test_codex_rerun_reports_persisted_not_tampered(env):
+    """The sweep runs before the codex adapter. If it strips codex's user-level
+    hook, every re-run sees it missing and reports a healthy install as
+    tampered, then reinstalls it."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "persisted", "persisted"]
+
+
+def test_sweep_keeps_the_binary_codex_install(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    before = (wrapper.read_text(), hooks_json.read_text())
+    status, _ = migration.run_sweep(log=lambda *_: None)
+    assert status == "configured"
+    assert (wrapper.read_text(), hooks_json.read_text()) == before
+
+
+@pytest.mark.parametrize("python_era_command", [
+    "{script}",              # python user-level installer
+    '"{script}"',            # python MDM installer
+    'python3 "{script}"',
+])
+def test_python_era_codex_install_upgrades_in_place(env, python_era_command):
+    """A python-era codex hook is the same file + hooks.json entry the binary
+    writes, so setup upgrades it in place: one registration per event, the
+    file becomes the binary wrapper, and the run reports persisted."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, python_era_command)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted"]
+    assert "os.execv" in script.read_text()
+    regs = _codex_registrations(home)
+    assert set(regs) == CODEX_EVENTS
+    assert all(len(cmds) == 1 for cmds in regs.values()), regs
+    stop = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["Stop"]
+    assert any(h["command"] == "/usr/local/bin/other-hook"
+               for grp in stop for h in grp["hooks"])
+
+
+def test_codex_deferred_keeps_python_era(env, monkeypatch):
+    """A codex deferral (MDM key fetch fails) must leave the python-era hook
+    and its registration intact until a successful re-run replaces them."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, '"{script}"')
+    before = (script.read_text(), (home / ".codex" / "hooks.json").read_text())
+    monkeypatch.setattr(env["modules"]["codex"], "fetch_api_key_from_mdm",
+                        lambda *a: None)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert (script.read_text(), (home / ".codex" / "hooks.json").read_text()) == before
+
+
+def test_codex_clear_still_removes_the_binary_install(env):
+    """Uninstall doesn't rely on the sweep for codex: clear_setup strips it."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert env["modules"]["codex"].clear_setup() is True
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    if hooks_json.exists():
+        assert not any(_codex_registrations(env["home"]).values())
+
+
+def test_codex_replaces_a_symlink_at_its_hook_path(env):
+    """The sweep used to delete a symlinked ~/.codex/hooks/unbound.py before the
+    adapter's O_NOFOLLOW write; now the adapter replaces the link itself, never
+    writing through it."""
+    target = env["tmp"] / "elsewhere.py"
+    target.write_text("# not ours\n")
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.symlink_to(target)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert not wrapper.is_symlink() and "os.execv" in wrapper.read_text()
+    assert target.read_text() == "# not ours\n"
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
+@pytest.mark.parametrize("shape", ["corrupt", "symlink"])
+def test_codex_defers_on_an_unusable_hooks_json(env, shape):
+    """A hooks.json we can't safely merge into defers codex without touching it
+    (or writing through a link), and the other tools still configure."""
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json.parent.mkdir(parents=True)
+    if shape == "corrupt":
+        hooks_json.write_text("{not json")
+        watched = hooks_json
+    else:
+        watched = env["tmp"] / "dotfiles-hooks.json"
+        watched.write_text(json.dumps({"hooks": {}}))
+        hooks_json.symlink_to(watched)
+    before = watched.read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert watched.read_text() == before
+    assert not _codex_states(env)
+    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
+
+
+def test_clear_command_removes_the_codex_install(env, monkeypatch):
+    """`unbound-hook clear` runs the sweep after each clear_setup; with codex no
+    longer swept, its own clear_setup must still leave nothing behind."""
+    monkeypatch.setattr(env["modules"]["copilot"], "managed_settings_path",
+                        lambda: env["tmp"] / "managed-copilot" / "managed-settings.json")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert clear_cmd.run([]) == 0
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    assert not hooks_json.exists() or not any(_codex_registrations(env["home"]).values())
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---

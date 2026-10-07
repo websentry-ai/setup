@@ -36,6 +36,7 @@ import {
   createFakeInputEvent,
   createFakeToolCallEvent,
   createFakeToolResultEvent,
+  createFakeUserBashEvent,
 } from "./helpers/fakeCtx.ts";
 import { PI_PROFILE } from "../src/profile.ts";
 
@@ -162,6 +163,41 @@ test("a latched key stops recording too, and does not accumulate behind the latc
     );
     await sleep(60);
     assert.deepEqual(turnLogs(api), [], "and posts nothing");
+  } finally {
+    f.cleanup();
+    await api.close();
+  }
+});
+
+test("a keyless !cmd posts no standalone turn log", async () => {
+  // `!cmd` is posted as its own one-call row now (pi fires no `agent_end` for it), so the inert rule
+  // has to hold on that path as well: no key means no request of any kind.
+  const api = await startMockApi({ mode: "allow" });
+  const f = await fixture({ UNBOUND_GATEWAY_URL: api.url });
+  try {
+    const ctx = createFakeCtx({ sessionId: SESSION });
+    assert.equal(await handlerOf(f, "user_bash")(createFakeUserBashEvent("echo hi"), ctx), undefined);
+    await sleep(60);
+    assert.deepEqual(api.requests, [], "nothing at all was sent");
+    assert.deepEqual(turnStore.snapshot(), { tool_calls: [], results: [] });
+  } finally {
+    f.cleanup();
+    await api.close();
+  }
+});
+
+// Must stay LAST: it relies on the latch the case above it ("a latched key stops recording too")
+// tripped, and the latch is permanent for this process.
+test("a latched key: a !cmd posts no standalone turn log either", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const f = await fixture({ UNBOUND_PI_API_KEY: TEST_KEY, UNBOUND_GATEWAY_URL: api.url });
+  try {
+    assert.equal(keyState.isInactive(), true, "still latched from the case above");
+    const ctx = createFakeCtx({ sessionId: SESSION });
+    await handlerOf(f, "user_bash")(createFakeUserBashEvent("echo hi"), ctx);
+    await sleep(60);
+    assert.deepEqual(turnLogs(api), [], "a latched session posts nothing for a !cmd");
+    assert.deepEqual(turnStore.snapshot(), { tool_calls: [], results: [] });
   } finally {
     f.cleanup();
     await api.close();

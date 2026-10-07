@@ -104,6 +104,7 @@ var MAX_TOOL_NAME_CHARS = 64;
 var MAX_CONFIG_BYTES = 262144;
 var MAX_HASH_BYTES = 4194304;
 var MAX_TURN_RESULTS = 500;
+var MAX_TURN_OUTPUT_CHARS = 131072;
 var MAX_TURN_TOOL_CALLS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
@@ -166,6 +167,8 @@ var PLACEHOLDER_SERIALS = [
   "123456789",
   "xxxxxxxx"
 ];
+var MAX_MCP_ARGS_BYTES = 524288;
+var MAX_PRETOOL_BODY_BYTES = 921600;
 
 // packages/core/src/breaker.ts
 function createBreaker(opts = {}) {
@@ -669,20 +672,118 @@ function withAccountIdentity(body, identity) {
   if (clean !== void 0) body.account_identity = clean;
   return body;
 }
+var MCP_ARGS_TRUNCATION_MARKER = "\n...unbound: arguments truncated...\n";
+var MAX_STRUCTURED_KEYS = 512;
+var MIN_KEPT_VALUE_BYTES = 256;
+var MAX_TRUNCATED_KEYS_REPORTED = 32;
+var MAX_TRUNCATED_KEY_CHARS = 128;
+function jsonBytes(value) {
+  const text = JSON.stringify(value);
+  return typeof text === "string" ? Buffer.byteLength(text) : 0;
+}
+function headTailFitting(text, targetBytes) {
+  const markerBytes = Buffer.byteLength(MCP_ARGS_TRUNCATION_MARKER) + 8;
+  let keep = Math.max(2, targetBytes - markerBytes);
+  let candidate = MCP_ARGS_TRUNCATION_MARKER;
+  for (let attempt2 = 0; attempt2 < 8; attempt2 += 1) {
+    const half = Math.max(1, Math.floor(keep / 2));
+    const head = Buffer.from(text.slice(0, half), "utf8").subarray(0, half).toString("utf8");
+    const tailSource = Buffer.from(text.slice(-half), "utf8");
+    const tail = tailSource.subarray(Math.max(0, tailSource.length - half)).toString("utf8");
+    candidate = head + MCP_ARGS_TRUNCATION_MARKER + tail;
+    const measured = jsonBytes(candidate);
+    if (measured <= targetBytes) return candidate;
+    keep = Math.floor(keep * targetBytes / measured) - 1;
+    if (keep < 2) break;
+  }
+  return MCP_ARGS_TRUNCATION_MARKER;
+}
+function singleStringForm(serialised, maxBytes) {
+  const half = Math.max(1, Math.floor((maxBytes - Buffer.byteLength(MCP_ARGS_TRUNCATION_MARKER)) / 2));
+  const bytes = Buffer.from(serialised, "utf8");
+  const head = bytes.subarray(0, half).toString("utf8");
+  const tail = bytes.subarray(bytes.length - half).toString("utf8");
+  return { _truncated_json: head + MCP_ARGS_TRUNCATION_MARKER + tail };
+}
+function mcpArgsForWire(args, maxBytes = MAX_MCP_ARGS_BYTES) {
+  try {
+    if (args === null || typeof args !== "object" || Array.isArray(args)) return { toolInput: {}, truncated: false };
+    const serialised = JSON.stringify(args);
+    if (typeof serialised !== "string") return { toolInput: { _unserializable: true }, truncated: true };
+    const originalBytes = Buffer.byteLength(serialised);
+    if (originalBytes <= maxBytes) return { toolInput: args, truncated: false };
+    const keys = Object.keys(args);
+    if (keys.length <= MAX_STRUCTURED_KEYS) {
+      const entries = [];
+      for (const key of keys) {
+        const value = args[key];
+        const text = JSON.stringify(value);
+        if (typeof text !== "string") continue;
+        entries.push({ key, value, size: Buffer.byteLength(text), overhead: jsonBytes(key) + 2, cut: false });
+      }
+      const totalOf = () => 2 + entries.reduce((sum, e) => sum + e.size + e.overhead, 0) - 1;
+      let fits = false;
+      for (let round = 0; round < entries.length * 4 + 16; round += 1) {
+        const total = totalOf();
+        if (total <= maxBytes) {
+          fits = true;
+          break;
+        }
+        let largest;
+        for (const entry of entries) {
+          if (entry.size > MIN_KEPT_VALUE_BYTES && (largest === void 0 || entry.size > largest.size)) largest = entry;
+        }
+        if (largest === void 0) break;
+        const target = Math.max(MIN_KEPT_VALUE_BYTES, largest.size - (total - maxBytes));
+        const source = typeof largest.value === "string" ? largest.value : JSON.stringify(largest.value) ?? "";
+        largest.value = headTailFitting(source, target);
+        largest.size = jsonBytes(largest.value);
+        largest.cut = true;
+      }
+      if (fits) {
+        const toolInput = {};
+        for (const entry of entries) defineData(toolInput, entry.key, entry.value);
+        const truncatedKeys = entries.filter((entry) => entry.cut).slice(0, MAX_TRUNCATED_KEYS_REPORTED).map((entry) => entry.key.slice(0, MAX_TRUNCATED_KEY_CHARS));
+        return { toolInput, truncated: true, originalBytes, truncatedKeys };
+      }
+    }
+    return { toolInput: singleStringForm(serialised, maxBytes), truncated: true, originalBytes };
+  } catch {
+    return { toolInput: { _unserializable: true }, truncated: true };
+  }
+}
+function defineData(target, key, value) {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
+function brokeredMcpCall(raw) {
+  try {
+    if (raw === null || typeof raw !== "object") return void 0;
+    const args = raw.args;
+    return args !== null && typeof args === "object" ? raw : void 0;
+  } catch {
+    return void 0;
+  }
+}
 function buildPretoolPayload(input, profile) {
-  const metadata = {
-    cwd: input.cwd,
-    // Allowlist first, then the whole-object cap as defence in depth (WR-04).
-    tool_input: capToolInput(sanitizeToolInput(input.toolInput, profileExtraToolInputKeys(profile)))
-  };
-  const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
-  if (filePath !== void 0) metadata.file_path = filePath;
-  const capped = capCommand(input.command);
+  const brokered = brokeredMcpCall(input.mcp);
+  const metadata = { cwd: input.cwd };
+  if (brokered !== void 0) {
+    metadata.mcp_server = brokered.server;
+    metadata.mcp_tool = brokered.tool;
+    applyWireArgs(metadata, mcpArgsForWire(brokered.args));
+    if (brokered.serverConfig !== void 0) metadata.mcp_server_config = brokered.serverConfig;
+    if (typeof brokered.origin === "string" && brokered.origin !== "") metadata.mcp_origin = brokered.origin;
+  } else {
+    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput, profileExtraToolInputKeys(profile)));
+    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
+    if (filePath !== void 0) metadata.file_path = filePath;
+  }
+  const capped = capCommand(brokered === void 0 ? input.command : "");
   if (capped.truncated) {
     metadata.command_truncated = true;
     metadata.command_original_chars = input.command.length;
   }
-  const mcp = normaliseMcp(input.mcp);
+  const mcp = brokered === void 0 ? normaliseMcp(input.mcp) : void 0;
   if (mcp !== void 0) {
     metadata.mcp_server = mcp.server;
     if (mcp.tool !== void 0) metadata.mcp_tool = mcp.tool;
@@ -690,8 +791,9 @@ function buildPretoolPayload(input, profile) {
   if (input.patchOperation === "delete") metadata.patch_operation = "delete";
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
-    // server never matches the tool and enforcement silently disappears.
-    tool_name: input.toolName,
+    // server never matches the tool and enforcement silently disappears. A resolved MCP call is
+    // named the way the gateway and the backend parse MCP names, `mcp__<server>__<tool>`.
+    tool_name: brokered === void 0 ? input.toolName : `mcp__${brokered.server}__${brokered.tool}`,
     command: capped.command,
     metadata
   };
@@ -710,7 +812,48 @@ function buildPretoolPayload(input, profile) {
     client_entrypoint: input.clientEntrypoint
   };
   if (input.pullPolicies === true) body.pull_policies = true;
-  return withAccountIdentity(body, input.accountIdentity);
+  const finished = withAccountIdentity(body, input.accountIdentity);
+  if (brokered !== void 0) fitMcpBody(finished, brokered.args);
+  return finished;
+}
+function applyWireArgs(metadata, wire) {
+  metadata.tool_input = wire.toolInput;
+  delete metadata.tool_input_truncated;
+  delete metadata.tool_input_original_bytes;
+  delete metadata.tool_input_truncated_keys;
+  if (!wire.truncated) return;
+  metadata.tool_input_truncated = true;
+  if (wire.originalBytes !== void 0) metadata.tool_input_original_bytes = wire.originalBytes;
+  if (wire.truncatedKeys !== void 0 && wire.truncatedKeys.length > 0) {
+    metadata.tool_input_truncated_keys = wire.truncatedKeys;
+  }
+}
+function serialisedBytes(value) {
+  try {
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? Buffer.byteLength(text) : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+function fitMcpBody(body, args) {
+  try {
+    const metadata = body.pre_tool_use_data.metadata;
+    let budget = MAX_MCP_ARGS_BYTES;
+    while (serialisedBytes(body) >= MAX_PRETOOL_BODY_BYTES) {
+      budget = Math.floor(budget / 2);
+      if (budget < 1024) {
+        metadata.tool_input = {};
+        metadata.tool_input_truncated = true;
+        metadata.tool_input_original_bytes = serialisedBytes(args);
+        delete metadata.tool_input_truncated_keys;
+        return;
+      }
+      const wire = mcpArgsForWire(args, budget);
+      applyWireArgs(metadata, { ...wire, truncated: true, originalBytes: wire.originalBytes ?? serialisedBytes(args) });
+    }
+  } catch {
+  }
 }
 function buildPromptPayload(input, profile) {
   const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
@@ -1420,14 +1563,26 @@ function hashContent(parts) {
     return { content_sha256: void 0, content_bytes: 0, hash_skipped: true };
   }
 }
+function copyInput(input) {
+  try {
+    return structuredClone(input);
+  } catch {
+    return { ...input };
+  }
+}
 function createTurnStore() {
   let record = { tool_calls: [], results: [] };
+  let outputChars = 0;
+  const fresh = () => {
+    outputChars = 0;
+    return { tool_calls: [], results: [] };
+  };
   const started = () => record.prompt !== void 0 || record.tool_calls.length > 0;
   const idOf = (sessionId) => typeof sessionId === "string" && sessionId !== "" ? sessionId : void 0;
   function startTurn(sessionId, now) {
     const incoming = idOf(sessionId);
     if (incoming !== void 0 && record.session_id !== void 0 && record.session_id !== incoming) {
-      record = { tool_calls: [], results: [] };
+      record = fresh();
     }
     if (incoming !== void 0) {
       const ours = record.tool_calls.filter(
@@ -1449,7 +1604,7 @@ function createTurnStore() {
         const incoming = idOf(sessionId);
         if (incoming === void 0) return;
         if (record.session_id === incoming) return;
-        record = { tool_calls: [], results: [] };
+        record = fresh();
       } catch {
       }
     },
@@ -1505,8 +1660,9 @@ function createTurnStore() {
       try {
         if (entry === null || typeof entry !== "object") return;
         while (record.results.length >= MAX_TURN_RESULTS) {
-          record.results.shift();
+          const evicted = record.results.shift();
           record.results_truncated = (record.results_truncated ?? 0) + 1;
+          if (typeof evicted?.content === "string") outputChars = Math.max(0, outputChars - evicted.content.length);
         }
         const stored = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
@@ -1516,6 +1672,23 @@ function createTurnStore() {
         };
         if (typeof entry.content_sha256 === "string") stored.content_sha256 = entry.content_sha256;
         if (entry.hash_skipped === true) stored.hash_skipped = true;
+        const id = stored.tool_use_id;
+        const recorded = id !== "" && record.tool_calls.some((call) => call.tool_use_id === id);
+        if (!recorded) {
+        } else if (typeof entry.content === "string") {
+          if (outputChars + entry.content.length > MAX_TURN_OUTPUT_CHARS) {
+            stored.content_omitted = true;
+          } else {
+            stored.content = entry.content;
+            outputChars += entry.content.length;
+            if (entry.content_truncated === true) stored.content_truncated = true;
+            if (typeof entry.content_original_chars === "number" && Number.isFinite(entry.content_original_chars)) {
+              stored.content_original_chars = entry.content_original_chars;
+            }
+          }
+        } else if (entry.content_omitted === true) {
+          stored.content_omitted = true;
+        }
         record.results.push(stored);
       } catch {
       }
@@ -1524,17 +1697,17 @@ function createTurnStore() {
      * Consumes the record unconditionally, and answers `undefined` when there was nothing postable.
      *
      * The reset is NOT conditional on the record being postable, and that is the point. A turn can
-     * collect results without ever starting — a custom or MCP tool takes the nothing-evaluable skip
-     * and records no decision, an extension-sourced prompt records no prompt — and an early return
-     * here left those results in place, where `agent_end` could never drain them. They then belonged
-     * to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
+     * collect results without ever starting — a custom tool (or an MCP call nobody could resolve)
+     * takes the nothing-evaluable skip and records no decision, an extension-sourced prompt records
+     * no prompt — and an early return here left those results in place, where `agent_end` could
+     * never drain them. They then belonged to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
      * fail to match them by `tool_use_id`. Consumed and dropped is the honest outcome.
      */
     take() {
       try {
         const taken = record;
         const postable = started();
-        record = { tool_calls: [], results: [] };
+        record = fresh();
         return postable ? taken : void 0;
       } catch {
         return void 0;
@@ -1549,11 +1722,11 @@ function createTurnStore() {
     },
     snapshot() {
       const copy = {
-        // `tool_input` is spread a second time so the copy is deep ENOUGH: its values are scalars by
-        // construction (`sanitizeToolInput` forwards nothing else), so one more level is the whole
-        // object. Without it, `snapshot()` handed callers a live reference into the record.
+        // `tool_input` is copied a second time so `snapshot()` never hands callers a live reference
+        // into the record. A native call's values are scalars (`sanitizeToolInput` forwards nothing
+        // else), but an MCP call's capped arguments can nest, so the copy is structural.
         tool_calls: record.tool_calls.map(
-          (entry) => entry.tool_input === void 0 ? { ...entry } : { ...entry, tool_input: { ...entry.tool_input } }
+          (entry) => entry.tool_input === void 0 ? { ...entry } : { ...entry, tool_input: copyInput(entry.tool_input) }
         ),
         results: record.results.map((entry) => ({ ...entry }))
       };
@@ -1565,6 +1738,18 @@ function createTurnStore() {
         copy.tool_calls_truncated = record.tool_calls_truncated;
       }
       return copy;
+    },
+    currentPrompt(sessionId) {
+      try {
+        const prompt = record.prompt;
+        if (typeof prompt !== "string") return void 0;
+        if (sessionId === "" || record.session_id === void 0 || record.session_id === sessionId) {
+          return prompt;
+        }
+        return void 0;
+      } catch {
+        return void 0;
+      }
     }
   };
 }
@@ -1797,6 +1982,13 @@ function isRecord3(value) {
 function asString(value) {
   return typeof value === "string" ? value : "";
 }
+function readPrompt(source) {
+  try {
+    return asString(source.lastUserPrompt);
+  } catch {
+    return "";
+  }
+}
 function resolveState(raw) {
   return raw !== null && typeof raw === "object" ? raw : createPolicyState();
 }
@@ -1898,6 +2090,7 @@ async function evaluateToolCall(call, deps) {
       model: typeof model === "string" ? model : void 0,
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
+      lastUserPrompt: readPrompt(source),
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
       ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } },
       ...source.patchOperation === "delete" ? { patchOperation: "delete" } : {}
@@ -2727,11 +2920,36 @@ function shouldPostTurn(record) {
     return false;
   }
 }
+var MAX_REDACT_DEPTH = 8;
+function redactLeaves(value, apiKey, depth) {
+  if (typeof value === "string") return redactSecrets(value, apiKey);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (depth >= MAX_REDACT_DEPTH || typeof value !== "object") return void 0;
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const out2 = redactLeaves(item, apiKey, depth + 1);
+      return out2 === void 0 ? null : out2;
+    });
+  }
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) return void 0;
+  const out = {};
+  for (const [key, item] of Object.entries(value)) {
+    const redacted = redactLeaves(item, apiKey, depth + 1);
+    if (redacted !== void 0) {
+      Object.defineProperty(out, key, { value: redacted, enumerable: true, writable: true, configurable: true });
+    }
+  }
+  return out;
+}
 function toolInputFor(value, apiKey) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
-  const input = { ...value };
-  if (typeof input.command === "string") input.command = redactSecrets(input.command, apiKey);
-  return input;
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+    const redacted = redactLeaves(value, apiKey, 0);
+    return redacted !== null && typeof redacted === "object" && !Array.isArray(redacted) ? redacted : {};
+  } catch {
+    return {};
+  }
 }
 function capAssistantText(text, apiKey) {
   try {
@@ -2742,17 +2960,29 @@ function capAssistantText(text, apiKey) {
     return { content: "", truncated: false };
   }
 }
-function toolResponseFor(record, toolUseId) {
+function toolResponseFor(record, toolUseId, apiKey) {
   const results = Array.isArray(record.results) ? record.results : [];
   const match = results.find((entry) => entry?.tool_use_id === toolUseId);
   if (match === void 0) return {};
+  const bytes = typeof match.content_bytes === "number" ? match.content_bytes : 0;
+  let response;
   if (match.hash_skipped === true) {
-    return { hash_skipped: true, content_bytes: match.content_bytes };
+    response = { hash_skipped: true, content_bytes: bytes };
+  } else if (typeof match.content_sha256 === "string") {
+    response = { content_sha256: match.content_sha256, content_bytes: bytes };
+  } else if (typeof match.content !== "string") {
+    return {};
+  } else {
+    response = { content_bytes: bytes };
   }
-  if (typeof match.content_sha256 === "string") {
-    return { content_sha256: match.content_sha256, content_bytes: match.content_bytes };
+  if (typeof match.content === "string") response.content = redactSecrets(match.content, apiKey);
+  if (match.is_error === true) response.is_error = true;
+  if (match.content_truncated === true) response.content_truncated = true;
+  if (typeof match.content_original_chars === "number") {
+    response.content_original_chars = match.content_original_chars;
   }
-  return {};
+  if (match.content_omitted === true) response.content_omitted = true;
+  return response;
 }
 function buildTurnLogBody(record, opts) {
   let conversationId = "";
@@ -2776,7 +3006,11 @@ function buildTurnLogBody(record, opts) {
       // `call`-derived, and still never `event.input`-derived: what the record holds was already
       // allowlisted and capped by `auditToolInput` — header decision 2.
       tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
-      tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : "")
+      tool_response: toolResponseFor(
+        safe,
+        typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
+        opts?.apiKey
+      )
     }));
   } catch {
   }
@@ -3134,7 +3368,7 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "f031fa1ef21673872a70a66e1acdb817" : "source";
+var BUILD_TOKEN = true ? "b7c09529089ba76cfad43c4d454d9cf9" : "source";
 function isBuildToken(value) {
   return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 }
@@ -3286,6 +3520,7 @@ function rollUp(store, root) {
     recordPrompt: (text, _sessionId, now) => store.recordPrompt(text, root, now),
     recordToolCall: (entry, _sessionId, now) => store.recordToolCall(entry, root, now),
     recordResult: (entry) => store.recordResult(entry),
+    currentPrompt: () => store.currentPrompt(root),
     take: () => store.take(),
     isEmpty: () => store.isEmpty(),
     snapshot: () => store.snapshot()

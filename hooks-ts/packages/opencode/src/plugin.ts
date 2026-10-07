@@ -475,6 +475,7 @@ function rollUp(store: TurnStore, root: string): TurnStore {
     recordPrompt: (text, _sessionId, now) => store.recordPrompt(text, root, now),
     recordToolCall: (entry, _sessionId, now) => store.recordToolCall(entry, root, now),
     recordResult: (entry) => store.recordResult(entry),
+    currentPrompt: () => store.currentPrompt(root),
     take: () => store.take(),
     isEmpty: () => store.isEmpty(),
     snapshot: () => store.snapshot(),

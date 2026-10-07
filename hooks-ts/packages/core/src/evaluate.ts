@@ -93,6 +93,13 @@ export interface ToolCallInput {
    * set it, so their wire behaviour is unchanged.
    */
   patchOperation?: "delete";
+  /**
+   * The turn's user prompt, sent as the pretool body's `messages[0].content` (the gateway writes its
+   * block/warn row from it). Read only when a payload is built, so an adapter may supply it as a
+   * getter and a skipped call never pays for it. A getter that throws, or anything that is not a
+   * string, costs the prompt and never the verdict: it is sent as `""`. Absent means `""`.
+   */
+  lastUserPrompt?: string;
 }
 
 /** One user prompt, as the adapter sees it. Images and attachments have no field here on purpose. */
@@ -197,6 +204,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function asString(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+/** `source.lastUserPrompt` read through its getter, `""` on any fault. */
+function readPrompt(source: Partial<Record<keyof ToolCallInput, unknown>>): string {
+  try {
+    return asString(source.lastUserPrompt);
+  } catch {
+    return "";
+  }
 }
 
 // The caller's state, or a fresh one for this call only. Never a process singleton (WR-03): a fresh
@@ -400,6 +416,7 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
       model: typeof model === "string" ? model : undefined,
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
+      lastUserPrompt: readPrompt(source),
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
       ...(mcp === undefined ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }),
       ...(source.patchOperation === "delete" ? { patchOperation: "delete" as const } : {}),

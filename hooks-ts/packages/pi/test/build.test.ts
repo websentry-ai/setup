@@ -11,6 +11,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -65,4 +66,31 @@ test("build output loads and registers all six events", async () => {
     `the built bundle registers ${registered.join(", ")}`,
   );
   assert.equal(registered.length, EXPECTED_EVENTS.length, "and registers each of them exactly once");
+});
+
+test("build output: exactly one pi.events listener, on the adapter's approval channel — and none without a bus", async () => {
+  // Revision 2: MCP enforcement rides the pi-mcp-adapter approval broker. The bundle subscribes to
+  // exactly one `pi.events` channel, by string literal (no adapter import), and still registers the
+  // same six `pi.on` events. A pi (or stub) without `events` loads fine and simply has no listener.
+  const mod = await import(pathToFileURL(distFile).href);
+  const registered: string[] = [];
+  const channels: string[] = [];
+  await mod.default({
+    on(event: string) {
+      registered.push(event);
+      return () => {};
+    },
+    events: {
+      on(channel: string) {
+        channels.push(channel);
+        return () => {};
+      },
+      emit() {},
+    },
+  });
+  assert.deepEqual([...registered].sort(), [...EXPECTED_EVENTS]);
+  assert.deepEqual(channels, ["pi-mcp-adapter:tool-approval-request"]);
+
+  const content = readFileSync(distFile, "utf8");
+  assert.equal(content.includes('from "pi-mcp-adapter"'), false, "the adapter is never imported");
 });

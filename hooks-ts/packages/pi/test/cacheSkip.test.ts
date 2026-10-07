@@ -29,7 +29,7 @@ import type { PolicyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
-import { decideToolCall } from "../src/decide.ts";
+import { decideMcpApproval, decideToolCall } from "../src/decide.ts";
 import type { DecideDeps } from "../src/decide.ts";
 import { createFakeClock, createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeClock } from "./helpers/fakeCtx.ts";
@@ -213,6 +213,8 @@ test("RES-03 the skip predicate refuses every name outside the six, whatever the
   const state = createPolicyState();
   seedTools(state, clock, []);
 
+  // `mcp__notion__search` is kept here as a NAME the predicate refuses; MCP calls are decided at the
+  // adapter's approval broker, which never consults this cache (the integration case below).
   for (const toolName of ["bash", "powershell", "mcp__notion__search", "some_custom_tool", "READ", "Read", ""]) {
     assert.equal(
       shouldSkipFileToolFromState(toolName, state, clock.now(), PI_PROFILE.fileTools),
@@ -310,6 +312,37 @@ test("WR-02 the confirming round trip still enforces: a planted [] cannot pre-al
       reason: "Blocked by Unbound policy: Reading secrets is blocked.",
     });
     assert.equal(pretoolBodies(api).length, 1, "the plant bought the attacker nothing");
+  } finally {
+    await api.close();
+  }
+});
+
+test("RES-03 a brokered MCP call is never cache-skipped, even with a fresh confirmed list that omits it", async () => {
+  // The 300 s skip answers "is there a FILE policy for this tool" — no cached list can say whether an
+  // MCP sanction or MCP policy applies. So every call the adapter's broker hands us round-trips.
+  const clock = createFakeClock();
+  const state = createPolicyState();
+  seedTools(state, clock, []);
+  assert.equal(state.getToolsConfirmed(), true, "the list is confirmed and fresh");
+
+  const api = await startMockApi({ mode: "deny" });
+  try {
+    const answer = await decideMcpApproval(
+      {
+        call: { server: "notion", tool: "search", args: { query: "q" } },
+        toolUseId: "toolu_x",
+        cwd: "/tmp/project-x",
+        sessionId: "s",
+        model: undefined,
+        ui: createFakeCtx(),
+      },
+      depsFor(api, state, clock),
+    );
+    assert.equal(answer, "deny", "evaluated, and the deny applied");
+    const bodies = pretoolBodies(api);
+    assert.equal(bodies.length, 1);
+    assert.equal((bodies[0]?.pre_tool_use_data as { tool_name?: string }).tool_name, "mcp__notion__search");
+    assert.equal(Object.hasOwn(bodies[0] ?? {}, "pull_policies"), false, "fresh and confirmed ⇒ no pull");
   } finally {
     await api.close();
   }

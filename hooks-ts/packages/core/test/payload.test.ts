@@ -15,6 +15,7 @@ import test from "node:test";
 
 import {
   MAX_COMMAND_CHARS,
+  MAX_MCP_ARGS_BYTES,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
@@ -23,7 +24,10 @@ import {
   auditToolInput,
   buildPretoolPayload,
   capCommand,
+  auditMcpArgs,
   capToolInput,
+  MCP_ARGS_TRUNCATION_MARKER,
+  mcpArgsForWire,
   COMMAND_TRUNCATION_MARKER,
   resolveFilePath,
   sanitizeToolInput,
@@ -124,8 +128,17 @@ test("path contract: bash and other command tools never send a file_path", () =>
   const bash = buildPretoolPayload(bashInput(), TEST_PROFILE);
   assert.equal(Object.hasOwn(bash.pre_tool_use_data.metadata, "file_path"), false);
 
-  const custom = buildPretoolPayload(bashInput({ toolName: "mcp__x__y", toolInput: { path: "/a" } }), TEST_PROFILE);
+  // Without an `mcp` field the builder does not know this is an MCP call — resolution happens in
+  // the pi-mcp-adapter approval broker, upstream — so an `mcp__`-looking name is a plain custom tool: no file_path, and
+  // the native allowlist still applies to its input (only `path` survives, `query` is dropped). The
+  // MCP shape is pinned by the "MCP branch" cases below.
+  const custom = buildPretoolPayload(
+    bashInput({ toolName: "mcp__x__y", toolInput: { path: "/a", query: "q" } }),
+    TEST_PROFILE,
+  );
   assert.equal(Object.hasOwn(custom.pre_tool_use_data.metadata, "file_path"), false);
+  assert.deepStrictEqual(custom.pre_tool_use_data.metadata.tool_input, { path: "/a", _dropped: true });
+  assert.equal(custom.pre_tool_use_data.tool_name, "mcp__x__y");
 
   assert.equal(resolveFilePath("bash", { path: "/a" }, "/cwd", TEST_PROFILE.fileTools), undefined);
   assert.equal(resolveFilePath("powershell", {}, "/cwd", TEST_PROFILE.fileTools), undefined);
@@ -456,4 +469,186 @@ test("buildPretoolPayload: patchOperation 'delete' rides metadata.patch_operatio
     JSON.stringify(buildPretoolPayload(input, TEST_PROFILE)),
     JSON.stringify(buildPretoolPayload({ ...input, patchOperation: undefined }, TEST_PROFILE)),
   );
+});
+
+// --- The MCP branch (gateway Path 3) -----------------------------------------------------------
+//
+// A call the pi-mcp-adapter approval broker handed us (exact server, tool) is the ONE deliberate exception
+// to the native allowlist: the gateway's MCP policies and input DLP evaluate the arguments.
+
+const MCP = {
+  server: "my-srv",
+  tool: "create_page",
+  args: { title: "Q3", body: { blocks: [{ text: "nested is kept" }] }, content: "a file body is fine here" },
+};
+
+test("MCP branch: tool_name, explicit server/tool, the whole args, no command and no file_path", () => {
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "mcp__my_srv", command: "", toolInput: { tool: "create_page" }, mcp: MCP }),
+    TEST_PROFILE,
+  );
+  const data = body.pre_tool_use_data;
+  assert.equal(data.tool_name, "mcp__my-srv__create_page");
+  assert.equal(data.command, "");
+  assert.equal(data.metadata.mcp_server, "my-srv");
+  assert.equal(data.metadata.mcp_tool, "create_page");
+  assert.deepStrictEqual(data.metadata.tool_input, MCP.args, "not allowlisted: nested and `content` survive");
+  assert.equal(Object.hasOwn(data.metadata, "file_path"), false);
+  assert.equal(Object.hasOwn(data.metadata, "mcp_server_config"), false, "only when provided");
+});
+
+test("MCP branch: mcp_server_config rides only when provided, verbatim", () => {
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, serverConfig: { url: "https://x.invalid/mcp" } } }),
+    TEST_PROFILE,
+  );
+  assert.deepStrictEqual(body.pre_tool_use_data.metadata.mcp_server_config, { url: "https://x.invalid/mcp" });
+});
+
+test("MCP branch: a command passed alongside is ignored", () => {
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "rm -rf /", mcp: MCP }), TEST_PROFILE);
+  assert.equal(body.pre_tool_use_data.command, "");
+  assert.equal(Object.hasOwn(body.pre_tool_use_data.metadata, "command_truncated"), false);
+});
+
+test("MCP args: whole on the wire up to 512 KiB — a secret deep in a big arg reaches the gateway (CR-04)", () => {
+  // The security property, not only the size bound: the gateway's MCP input DLP must see what the
+  // tool will receive. A 17 KB pad used to push everything nested, and every byte past 2 KB of a
+  // string, out of `tool_input`.
+  const args = { pad: "x".repeat(17_000), text: "y".repeat(17_000) + " AKIA-SECRET-AT-34K", data: { token: "ghp_nested" } };
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }), TEST_PROFILE);
+  const metadata = body.pre_tool_use_data.metadata;
+  assert.deepStrictEqual(metadata.tool_input, args, "whole, nested values and all");
+  assert.equal(Object.hasOwn(metadata, "tool_input_truncated"), false);
+  assert.ok(JSON.stringify(body).includes("AKIA-SECRET-AT-34K"));
+  assert.ok(JSON.stringify(body).includes("ghp_nested"));
+});
+
+test("MCP args over 512 KiB: structure kept, the oversized value cut head+tail, an explicit marker", () => {
+  // Updated deliberately (PR #371): this used to pin the single-string `_truncated_json` form, which
+  // dropped every field a field-level policy could match. Now the small fields arrive whole and only
+  // the oversized value is cut, both ends kept.
+  const args = { head: "HEAD-SECRET", blob: `BLOB-START${"z".repeat(MAX_MCP_ARGS_BYTES + 10)}BLOB-END`, tail: "TAIL-SECRET" };
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }), TEST_PROFILE);
+  const metadata = body.pre_tool_use_data.metadata;
+  assert.equal(metadata.tool_input_truncated, true);
+  assert.ok((metadata.tool_input_original_bytes as number) > MAX_MCP_ARGS_BYTES);
+  const input = metadata.tool_input as Record<string, string>;
+  assert.equal(input.head, "HEAD-SECRET", "small fields whole");
+  assert.equal(input.tail, "TAIL-SECRET");
+  assert.ok(input.blob?.startsWith("BLOB-START") && input.blob.endsWith("BLOB-END"), "both ends of the cut value");
+  assert.ok(input.blob?.includes(MCP_ARGS_TRUNCATION_MARKER));
+  assert.deepStrictEqual(metadata.tool_input_truncated_keys, ["blob"]);
+  assert.ok(Buffer.byteLength(JSON.stringify(metadata.tool_input)) <= MAX_MCP_ARGS_BYTES);
+});
+
+test("mcpArgsForWire is total: unserialisable args are marked, never a throw", () => {
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  assert.deepStrictEqual(mcpArgsForWire(circular), { toolInput: { _unserializable: true }, truncated: true });
+  assert.deepStrictEqual(
+    mcpArgsForWire({ big: 10n } as unknown as Record<string, unknown>),
+    { toolInput: { _unserializable: true }, truncated: true },
+  );
+});
+
+test("auditMcpArgs: an owned copy, capped for the audit row, __proto__ and constructor kept as data (WR-06)", () => {
+  const parsed = JSON.parse('{"__proto__":{"secret":"hidden?"},"constructor":"c","q":"x"}') as Record<string, unknown>;
+  const copy = auditMcpArgs(parsed);
+  assert.deepStrictEqual(Object.keys(copy).sort(), ["__proto__", "constructor", "q"]);
+  assert.equal(Object.getPrototypeOf(copy), Object.prototype, "no prototype assignment");
+  assert.equal(JSON.stringify(copy), '{"__proto__":{"secret":"hidden?"},"constructor":"c","q":"x"}');
+  assert.notEqual(copy, parsed, "owned, never the live object");
+
+  const big = { keep: "short", nested: { blob: "x".repeat(MAX_TOOL_INPUT_BYTES) } };
+  const capped = auditMcpArgs(big);
+  assert.equal(capped._truncated, true);
+  assert.equal(capped.keep, "short");
+  assert.equal(Object.hasOwn(capped, "nested"), false, "the audit column is capped; the wire copy is not");
+
+  const bigProto = JSON.parse(`{"__proto__":"proto-value","pad":"${"p".repeat(MAX_TOOL_INPUT_BYTES)}"}`) as Record<string, unknown>;
+  const cappedProto = auditMcpArgs(bigProto);
+  assert.ok(Object.hasOwn(cappedProto, "__proto__"), "kept as an own key in the truncated branch too");
+  assert.equal(Object.getPrototypeOf(cappedProto), Object.prototype);
+});
+
+test("the whole MCP body stays under 900 KiB whatever the args — a 413 at the 1 MiB ingress is unreachable (REVIEW-2 CR-03)", () => {
+  // The reviewer's probe: ASCII just under 1 MiB, CJK (3-byte) over it, and quote-heavy input that
+  // doubles when the truncated string is escaped a second time. Plus an 8 KB prompt riding along.
+  for (const args of [
+    { body: "a".repeat(1_040_000) },
+    { body: "a".repeat(1_048_000) },
+    { body: "中".repeat(2_000_000) },
+    { body: '"'.repeat(2_000_000) },
+    { body: "\u0001".repeat(600_000) },
+  ]) {
+    const body = buildPretoolPayload(
+      bashInput({ toolName: "mcp", command: "", lastUserPrompt: "p".repeat(8000), mcp: { ...MCP, args } }),
+      TEST_PROFILE,
+    );
+    const bytes = Buffer.byteLength(JSON.stringify(body));
+    assert.ok(bytes < 921_600, `body ${bytes} bytes`);
+    assert.equal(body.pre_tool_use_data.metadata.tool_input_truncated, true);
+    assert.equal(typeof body.pre_tool_use_data.metadata.tool_input_original_bytes, "number");
+  }
+});
+
+// --- PR #371: structure is kept when MCP args are cut ----------------------------------------------
+
+test("padding cannot hide a field: {query, pad: 2 MiB} keeps query exact and cuts only pad", () => {
+  const args = { query: "DROP TABLE users", pad: "x".repeat(2 * 1024 * 1024) };
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }), TEST_PROFILE);
+  const metadata = body.pre_tool_use_data.metadata;
+  const input = metadata.tool_input as Record<string, unknown>;
+  assert.equal(input.query, "DROP TABLE users", "byte-identical — a field-level policy still has its field");
+  assert.equal(typeof input.pad, "string");
+  assert.ok((input.pad as string).includes(MCP_ARGS_TRUNCATION_MARKER));
+  assert.equal(metadata.tool_input_truncated, true);
+  assert.deepStrictEqual(metadata.tool_input_truncated_keys, ["pad"]);
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) < 921_600);
+});
+
+test("many medium fields: only the largest are cut, the small ones arrive whole", () => {
+  const args: Record<string, unknown> = { id: "keep-me" };
+  for (let i = 0; i < 40; i += 1) args[`f${i}`] = String(i).repeat(20_000);
+  const wire = mcpArgsForWire(args);
+  assert.equal(wire.truncated, true);
+  assert.equal(wire.toolInput.id, "keep-me");
+  assert.deepStrictEqual(Object.keys(wire.toolInput), Object.keys(args), "every key, in order");
+  assert.ok(Buffer.byteLength(JSON.stringify(wire.toolInput)) <= MAX_MCP_ARGS_BYTES);
+});
+
+test("a large nested object becomes a head+tail string of its JSON; siblings are untouched", () => {
+  const args = { query: "q", data: { rows: Array.from({ length: 50_000 }, (_, i) => ({ i, v: "row" })) } };
+  const wire = mcpArgsForWire(args);
+  assert.equal(wire.toolInput.query, "q");
+  assert.equal(typeof wire.toolInput.data, "string");
+  assert.ok((wire.toolInput.data as string).startsWith('{"rows":[{"i":0'));
+  assert.deepStrictEqual(wire.truncatedKeys, ["data"]);
+});
+
+test("CJK values are cut by bytes and still fit", () => {
+  const args = { query: "検索", text: "中".repeat(400_000) };
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }), TEST_PROFILE);
+  const input = body.pre_tool_use_data.metadata.tool_input as Record<string, unknown>;
+  assert.equal(input.query, "検索");
+  assert.ok(Buffer.byteLength(JSON.stringify(input)) <= MAX_MCP_ARGS_BYTES);
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) < 921_600);
+});
+
+test("a pathological key count falls back to the single-string form", () => {
+  const args: Record<string, unknown> = {};
+  for (let i = 0; i < 2000; i += 1) args[`k${i}`] = "v".repeat(400);
+  const wire = mcpArgsForWire(args);
+  assert.equal(wire.truncated, true);
+  assert.deepStrictEqual(Object.keys(wire.toolInput), ["_truncated_json"]);
+  assert.equal(wire.truncatedKeys, undefined);
+});
+
+test("structure-keeping is __proto__-safe", () => {
+  const args = JSON.parse(`{"__proto__":"keep","pad":"${"p".repeat(MAX_MCP_ARGS_BYTES)}"}`) as Record<string, unknown>;
+  const wire = mcpArgsForWire(args);
+  assert.ok(Object.hasOwn(wire.toolInput, "__proto__"));
+  assert.equal(Object.getPrototypeOf(wire.toolInput), Object.prototype);
+  assert.equal(JSON.parse(JSON.stringify(wire.toolInput)).__proto__, "keep");
 });

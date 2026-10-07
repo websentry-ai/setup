@@ -23,11 +23,16 @@ import {
   CONFIRM_QUESTION,
   CONFIRM_TITLE,
   DECLINED_REASON,
+  ENGINE_UNAVAILABLE_REASON,
   GENERIC_DENY_REASON,
+  MAX_PROMPT_CHARS,
 } from "../../core/src/constants.ts";
-import { evaluateToolCall, verdictMessage } from "../../core/src/evaluate.ts";
+import { areToolsFresh } from "../../core/src/cache.ts";
+import { evaluateToolCall, noteDecision, verdictMessage } from "../../core/src/evaluate.ts";
 import type { DecisionEntry } from "../../core/src/evaluate.ts";
+import { auditMcpArgs, buildPretoolPayload, capCommand } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import type { McpCallInfo } from "../../core/src/types.ts";
 import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
@@ -97,6 +102,33 @@ export interface DecideDeps {
    * lookup settles simply goes without it (the Python hook's pre-tool path reads a cache, likewise).
    */
   accountIdentity?: AccountIdentity;
+  /**
+   * The turn's user prompt, read lazily for the pretool body's `messages[0].content`.
+   *
+   * The gateway writes its block/warn row from the pretool `messages` (`queueHookLog`'s
+   * `hookRequestBody`), so a blank there is the "empty block log" bug: a row that says a command was
+   * blocked without saying what the developer had asked for. `user_prompts` is deliberately NOT sent —
+   * the gateway's only reader of it falls back to `messages` anyway.
+   *
+   * A closure rather than a value so a call that takes an early return (nothing evaluable, cache
+   * skip) costs nothing, and read through `promptOf`, so a getter that throws costs the prompt column
+   * and never the verdict. Optional: absent means `""`, today's behaviour.
+   */
+  currentPrompt?: () => string | undefined;
+}
+
+/**
+ * The prompt for the pretool `messages`, capped exactly as the prompt check caps it, or `""`.
+ * Total: a throwing or non-string getter is an empty prompt, never a thrown `tool_call` (= a BLOCK).
+ */
+function promptOf(deps: Pick<DecideDeps, "currentPrompt">): string {
+  try {
+    const prompt = deps.currentPrompt?.();
+    if (typeof prompt !== "string" || prompt === "") return "";
+    return capCommand(prompt, MAX_PROMPT_CHARS).command;
+  } catch {
+    return "";
+  }
 }
 
 /** What pi reads back from a `tool_call` handler; Phase 8 only ever blocks or says nothing. */
@@ -136,6 +168,11 @@ export async function decideToolCall(
         },
         get model(): string | undefined {
           return ctx.model?.id;
+        },
+        // Read by core only when a payload is built, after both early returns: a skipped call never
+        // pays for it. `promptOf` is total.
+        get lastUserPrompt(): string {
+          return promptOf(deps);
         },
       },
       {
@@ -187,5 +224,122 @@ export async function decideToolCall(
   } catch {
     // Belt and braces: `index.ts` catches too, but an internal fault must allow, never block.
     return undefined;
+  }
+}
+
+/** The three answers the adapter's broker handler ever gets from us. */
+export type McpApprovalAnswer = "allow_once" | "deny" | "abstain";
+
+/** One brokered MCP call, with the context values already read (a stale ctx's getters can throw). */
+export interface McpApprovalInput {
+  /** The adapter's own resolution: exact server, original tool, the arguments it will send. */
+  call: McpCallInfo;
+  /** The audit id: the matched `tool_call`'s `toolCallId`, or a minted `mcpb_…`. */
+  toolUseId: string;
+  cwd: string;
+  sessionId: string;
+  model: string | undefined;
+  /** The most recent live ctx, for the notice and the confirm. Absent ⇒ no UI. */
+  ui: UiCtx | undefined;
+  /** The broker request's own signal: the adapter aborted the call ⇒ no dialog, `abstain`. */
+  signal?: AbortSignal;
+}
+
+/**
+ * The confirm for a brokered call, behind its own guard: a policy "confirm" that cannot be asked must
+ * be a `deny`, never fall through to `abstain` (which the adapter, with no `approveTools`, runs).
+ * The dialog closes on either the agent run's signal or the broker request's, whichever aborts first.
+ */
+async function confirmBrokered(ui: UiCtx, reason: string, signal: AbortSignal | undefined): Promise<McpApprovalAnswer> {
+  try {
+    if (ui.hasUI !== true) {
+      notifySafe(ui, NO_UI_REASON, "warning");
+      return "deny";
+    }
+    notifySafe(ui, reason, "warning");
+    const signals = [ui.signal, signal].filter((s): s is AbortSignal => s instanceof AbortSignal);
+    const combined = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
+    const dialogCtx: UiCtx = { hasUI: true, ui: ui.ui, signal: combined };
+    const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
+    return accepted ? "allow_once" : "deny";
+  } catch {
+    return "deny";
+  }
+}
+
+/**
+ * Decide one MCP call the pi-mcp-adapter approval broker handed us — the MCP enforcement point.
+ *
+ * The gateway's Path 3 sees exactly what the adapter will run (`buildPretoolPayload`'s `mcp` branch),
+ * through the same checker as every other call, so the breaker, the key latch, `pull_policies` and
+ * bypass telemetry all behave the same. Never the file-tool cache: no cached list can say whether an
+ * MCP policy applies. The answer maps onto the adapter's vocabulary:
+ *
+ *   | policy outcome                         | answer                                             |
+ *   | -------------------------------------- | -------------------------------------------------- |
+ *   | allow (incl. a fail-open API failure)  | `abstain` — the adapter's own approval still runs  |
+ *   | deny                                   | `deny`, and the reason is notified to the developer |
+ *   | confirm                                | asked through the live ctx: yes `allow_once`, no / no UI `deny` |
+ *   | unavailable (a fail-closed org)        | `deny`                                             |
+ *
+ * The model sees the adapter's fixed denial text, not our reason (an accepted cost: the broker has no
+ * reason channel); the developer sees the reason as a notice. Total: any fault is `abstain`, because
+ * the adapter reads a throw as a deny and an internal error must not block.
+ */
+export async function decideMcpApproval(input: McpApprovalInput, deps: DecideDeps): Promise<McpApprovalAnswer> {
+  try {
+    const { call } = input;
+    const toolName = `mcp__${call.server}__${call.tool}`;
+    const now = (deps.now ?? Date.now)();
+    const state = deps.state ?? policyState;
+    const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
+
+    const payload = buildPretoolPayload({
+      toolName,
+      command: "",
+      toolUseId: input.toolUseId,
+      toolInput: {},
+      cwd: input.cwd,
+      sessionId: input.sessionId,
+      model: input.model,
+      clientEntrypoint: deps.entrypoint,
+      pullPolicies,
+      lastUserPrompt: promptOf(deps),
+      mcp: call,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
+    }, PI_PROFILE);
+
+    const ui = input.ui;
+    const hooks: CheckHooks =
+      deps.hooks ?? { notify: (message, level) => (ui === undefined ? undefined : notifySafe(ui, message, level)) };
+    const outcome = await deps.checker.checkTool(payload, toolName, hooks);
+    // Before the confirm, as on the native path: the row records what the POLICY said.
+    noteDecision(deps, {
+      tool_name: toolName,
+      tool_use_id: input.toolUseId,
+      decision: outcome.kind,
+      tool_input: auditMcpArgs(call.args),
+    });
+
+    // The adapter aborted the call while the policy request was in flight (Esc, a reload): it will
+    // never run, so no dialog and no notice — the adapter rethrows the abort itself.
+    if (input.signal?.aborted === true) return "abstain";
+
+    switch (outcome.kind) {
+      case "allow":
+        return "abstain";
+      case "deny":
+        if (ui !== undefined) notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "error");
+        return "deny";
+      case "confirm":
+        if (ui === undefined) return "deny";
+        return await confirmBrokered(ui, outcome.reason ?? GENERIC_DENY_REASON, input.signal);
+      case "unavailable":
+        if (ui !== undefined) notifySafe(ui, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
+        return "deny";
+    }
+    return "abstain";
+  } catch {
+    return "abstain";
   }
 }

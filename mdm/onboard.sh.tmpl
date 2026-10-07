@@ -55,6 +55,17 @@ install_succeeded=0
 # shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'; }
 
+# Same rule as normalize_url in each tool's setup.py: default to https, no trailing slash.
+# shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
+normalize_url() {
+  local v="$1"
+  v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+  [[ -n "$v" ]] || return 0
+  [[ "$v" == http://* || "$v" == https://* ]] || v="https://$v"
+  while [[ "$v" == */ ]]; do v="${v%/}"; done
+  printf '%s' "$v"
+}
+
 # Hardware serial — the key the install-report endpoint joins on (one row per
 # device, keyed by org+serial_number). ioreg's IOPlatformSerialNumber is
 # locale-stable; system_profiler's "Serial Number" label is localized and
@@ -95,7 +106,7 @@ on_exit() {
     # -f dropped on purpose: we WANT the body/status on 4xx/5xx, not a curl
     # exit. -o /dev/null discards the response body; -w prints just the code.
     http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
-      -X POST "${BACKEND_URL}/api/v1/automations/mdm/install-report/" \
+      -X POST "$(normalize_url "$BACKEND_URL")/api/v1/automations/mdm/install-report/" \
       -H 'Content-Type: application/json' \
       -H "X-API-KEY: ${API_KEY}" \
       -d "$report_body" 2>/dev/null)" || http_code="000"
@@ -123,7 +134,7 @@ on_exit() {
       "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
       "$(json_escape "$(sw_vers -productVersion)")" "$(date +%s)")"
     http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
-      -X POST "${BACKEND_URL}/api/v1/automations/mdm/install-report/" \
+      -X POST "$(normalize_url "$BACKEND_URL")/api/v1/automations/mdm/install-report/" \
       -H 'Content-Type: application/json' \
       -H "X-API-KEY: ${API_KEY}" \
       -d "$report_body" 2>/dev/null)" || http_code="000"
