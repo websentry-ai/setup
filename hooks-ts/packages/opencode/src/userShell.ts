@@ -64,13 +64,20 @@ export async function decideUserShell(input: unknown, ctx: UserShellContext): Pr
     const scope = resolved.scope;
     if (checker === undefined || scope === undefined) return undefined;
 
-    const command = runtime.takeUserShell(sessionID, callID);
-    if (command === undefined) {
+    const stashed = runtime.takeUserShell(sessionID, callID);
+    if (stashed === undefined) {
       runtime.reportSignal(SIGNAL_USER_SHELL_UNCHECKED, "bash", "no_part");
       return undefined;
     }
 
-    return await checkUserCommand(command, readString(input, "cwd"), sessionID, callID, ctx);
+    return await checkUserCommand(
+      stashed.command,
+      readString(input, "cwd"),
+      sessionID,
+      callID,
+      ctx,
+      stashed.originalChars,
+    );
   } catch {
     return undefined;
   }
@@ -97,9 +104,10 @@ export async function checkUserCommand(
   sessionID: string,
   callID: string,
   ctx: UserShellContext,
+  originalChars?: number,
 ): Promise<string | undefined> {
   try {
-    return (await checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx)).message;
+    return (await checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx, originalChars)).message;
   } catch {
     return undefined;
   }
@@ -112,6 +120,8 @@ export async function checkUserCommandVerdict(
   sessionID: string,
   callID: string,
   ctx: UserShellContext,
+  /** The length before an adapter-side cap (the v1 stash); absent when `command` is whole. */
+  originalChars?: number,
 ): Promise<UserCommandDecision> {
   try {
     const { runtime, record } = ctx;
@@ -152,6 +162,7 @@ export async function checkUserCommandVerdict(
         cwd,
         sessionId: sessionID,
         model: sessionID === "" ? undefined : runtime.modelFor(sessionID),
+        ...(originalChars === undefined ? {} : { commandOriginalChars: originalChars }),
       },
       evalDeps,
     );

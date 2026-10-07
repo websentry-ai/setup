@@ -100,6 +100,12 @@ export interface ToolCallInput {
    * string, costs the prompt and never the verdict: it is sent as `""`. Absent means `""`.
    */
   lastUserPrompt?: string;
+  /**
+   * The command's length before the adapter capped it, for an adapter that hands over an already
+   * capped command (see `PretoolPayloadInput.commandOriginalChars`). Absent means "this is the whole
+   * command".
+   */
+  commandOriginalChars?: number;
 }
 
 /** One user prompt, as the adapter sees it. Images and attachments have no field here on purpose. */
@@ -417,6 +423,7 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
       lastUserPrompt: readPrompt(source),
+      ...(typeof source.commandOriginalChars === "number" ? { commandOriginalChars: source.commandOriginalChars } : {}),
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
       ...(mcp === undefined ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }),
       ...(source.patchOperation === "delete" ? { patchOperation: "delete" as const } : {}),

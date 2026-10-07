@@ -129,6 +129,12 @@ const MAX_ASSISTANT_PARTS = 32;
 /** The most bash commands stashed per session awaiting `shell.env`; the oldest is dropped first. */
 const MAX_SHELL_STASH_PER_SESSION = 32;
 
+/** A user `!cmd` awaiting `shell.env`: the capped text, and the length before it was capped. */
+export interface StashedUserShell {
+  command: string;
+  originalChars: number;
+}
+
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
   env: NodeJS.ProcessEnv;
@@ -263,8 +269,8 @@ export interface Runtime {
   beforeSeen(sessionID: string, callID: string): boolean;
   /** Stash a bash part's command by callID (bounded, short-lived; latest non-empty wins). */
   stashUserShell(sessionID: string, callID: string, command: string): void;
-  /** Take (and forget) a stashed bash command. */
-  takeUserShell(sessionID: string, callID: string): string | undefined;
+  /** Take (and forget) a stashed bash command: the capped text and the original length. */
+  takeUserShell(sessionID: string, callID: string): StashedUserShell | undefined;
   /** Forget a stashed bash command (the part reached a final status). */
   dropUserShell(sessionID: string, callID: string): void;
   /** Every MCP server name known for a directory: config order first, then runtime-only names. */
@@ -405,7 +411,7 @@ export interface SessionExtras {
   /** Call ids that passed through `tool.execute.before` (model-issued). */
   before: Set<string>;
   /** callID → command of a bash part, until `shell.env` takes it or the part finishes. */
-  shell: Map<string, string>;
+  shell: Map<string, StashedUserShell>;
 }
 
 function freshRecord(directory: string): DirectoryRecord {
@@ -426,12 +432,12 @@ function freshExtras(): SessionExtras {
     roles: new Map<string, string>(),
     assistant: new Map<string, string>(),
     before: new Set<string>(),
-    shell: new Map<string, string>(),
+    shell: new Map<string, StashedUserShell>(),
   };
 }
 
 /** Set `key` in an insertion-ordered map, dropping the oldest past `max`. */
-function boundedSet(map: Map<string, string>, key: string, value: string, max: number): void {
+function boundedSet<V>(map: Map<string, V>, key: string, value: V, max: number): void {
   if (!map.has(key)) {
     while (map.size >= max) {
       const oldest = map.keys().next().value;
@@ -897,12 +903,19 @@ export function createRuntime(overrides: Partial<Deps> = {}): RuntimeHandle {
         if (sessionID === "" || callID === "" || typeof command !== "string" || command === "") return;
         const kept = extras.get(sessionID);
         if (kept.before.has(callID)) return;
-        boundedSet(kept.shell, callID, capCommand(command).command, MAX_SHELL_STASH_PER_SESSION);
+        // Capped to keep the stash bounded; the original length rides along so the check can still
+        // say the command is partial (`command_truncated` / `command_original_chars`).
+        boundedSet(
+          kept.shell,
+          callID,
+          { command: capCommand(command).command, originalChars: command.length },
+          MAX_SHELL_STASH_PER_SESSION,
+        );
       } catch {
         // A missing stash is reported as `no_part` at `shell.env` time.
       }
     },
-    takeUserShell(sessionID: string, callID: string): string | undefined {
+    takeUserShell(sessionID: string, callID: string): StashedUserShell | undefined {
       try {
         const map = extras.peek(sessionID)?.shell;
         const command = map?.get(callID);

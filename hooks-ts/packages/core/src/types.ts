@@ -126,6 +126,14 @@ export interface PretoolPayloadInput {
    * after every other metadata key, so a body without it is byte-identical to before.
    */
   patchOperation?: "delete";
+  /**
+   * The command's length before the ADAPTER capped it: for an adapter that must keep a command
+   * bounded in memory before the check, and so hands over text that is already a head + tail. When
+   * it is a whole number greater than `command.length`, the body says the command is partial
+   * (`command_truncated`, `command_original_chars`) exactly as if core had capped it. Absent on every
+   * adapter that passes the command whole, so their bodies are unchanged.
+   */
+  commandOriginalChars?: number;
 }
 
 /**

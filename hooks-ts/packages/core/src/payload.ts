@@ -607,12 +607,14 @@ export function buildPretoolPayload(
 
   // An MCP call carries no command: an empty one keeps it out of the Path-2 command gate.
   const capped = capCommand(brokered === undefined ? input.command : "");
-  if (capped.truncated) {
+  // A command the adapter capped itself arrives already short; its own original length says so.
+  const preCapped = brokered === undefined ? adapterOriginalChars(input) : undefined;
+  if (capped.truncated || preCapped !== undefined) {
     // The server cannot tell a whole command from a capped one by looking at the string. Say so
     // explicitly, so a future entry gate can choose to ask or deny rather than matching a
     // partial command as if it were the command that will actually run.
     metadata.command_truncated = true;
-    metadata.command_original_chars = input.command.length;
+    metadata.command_original_chars = Math.max(preCapped ?? 0, input.command.length);
   }
   // Explicit MCP attribution (PLAT-12), appended after every existing key so a body without it is
   // byte-identical to before. Only from the caller's validated field; never derived from a tool name.
@@ -655,6 +657,20 @@ export function buildPretoolPayload(
   const finished = withAccountIdentity(body, input.accountIdentity);
   if (brokered !== undefined) fitMcpBody(finished, brokered.args);
   return finished;
+}
+
+/**
+ * `input.commandOriginalChars` when it is a whole number greater than the command handed over (the
+ * adapter capped it), else `undefined`. Total.
+ */
+function adapterOriginalChars(input: PretoolPayloadInput): number | undefined {
+  try {
+    const raw: unknown = input.commandOriginalChars;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return undefined;
+    return raw > input.command.length ? raw : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Write `mcpArgsForWire`'s result onto the request metadata, markers present-only. */
