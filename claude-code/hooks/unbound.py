@@ -4977,10 +4977,10 @@ def _cowork_plugin_dirs(org_dir: Path):
         yield plugin.name, plugin, None
     plugins_root = org_dir / 'cowork_plugins'
     for key, entries in _installed_plugins_registry(plugins_root).items():
-        # The first record that lands in this cowork_plugins dir is the copy the app loads.
+        # The first record that exists in this cowork_plugins dir is the copy the app loads.
         for entry in entries if isinstance(entries, list) else []:
             path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
-            if path is not None:
+            if path is not None and path.is_dir():
                 yield 'installed:%s' % key, path, key.split('@', 1)[0]
                 break
 
@@ -4992,7 +4992,8 @@ def _cowork_install_dir(plugins_root: Path, install_path) -> Optional[Path]:
     if 'cowork_plugins' not in parts:
         return None
     tail = parts[len(parts) - parts[::-1].index('cowork_plugins'):]
-    if not tail or any(part in ('.', '..') for part in tail):
+    # ':' would let a drive letter re-root the join outside cowork_plugins on Windows.
+    if not tail or any(part in ('.', '..') or ':' in part for part in tail):
         return None
     return plugins_root.joinpath(*tail)
 

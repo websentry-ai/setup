@@ -228,6 +228,14 @@ class TestCoworkInstalledPlugins(_CoworkTree):
         skill = self.installed("cache/mkt/plugin-dev/live", "plugin-dev", "skills/agent-development")
         self.assertEqual(self.resolve("plugin-dev:agent-development"), str(skill))
 
+    def test_a_recorded_install_that_is_gone_falls_through_to_the_next(self):
+        self.registry["plugin-dev@mkt"] = [{"scope": "user", "installPath": "/vm/cowork_plugins/cache/mkt/plugin-dev/deleted"}]
+        skill = self.installed("cache/mkt/plugin-dev/live", "plugin-dev", "skills/agent-development")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(skill))
+
+    def test_a_drive_letter_segment_never_leaves_cowork_plugins(self):
+        self.assertIsNone(unbound._cowork_install_dir(self.plugins_root, "/vm/cowork_plugins/D:/other/plugin"))
+
     def test_a_plugin_without_plugin_json_is_named_by_its_registry_key(self):
         root = self.plugins_root / "cache" / "mkt" / "lean-kit" / "1.0"
         skill = _write(root / "skills" / "brief" / "SKILL.md", "# brief")
