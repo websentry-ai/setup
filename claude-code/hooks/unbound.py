@@ -4976,21 +4976,22 @@ def _cowork_plugin_dirs(org_dir: Path):
     for plugin in (org_dir / 'rpm').glob('*'):
         yield plugin.name, plugin
     plugins_root = org_dir / 'cowork_plugins'
-    for entries in _installed_plugins_registry(plugins_root).values():
-        for entry in entries if isinstance(entries, list) else []:
-            path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
-            if path is not None:
-                yield 'installed:%s' % path, path
+    for key, entries in _installed_plugins_registry(plugins_root).items():
+        # The first recorded install is the one the app loads.
+        entry = entries[0] if isinstance(entries, list) and entries else None
+        path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
+        if path is not None:
+            yield 'installed:%s' % key, path
 
 
 def _cowork_install_dir(plugins_root: Path, install_path) -> Optional[Path]:
     """A recorded installPath, which may be the VM's view of it, re-rooted under this
     host's cowork_plugins dir. None when it does not point inside cowork_plugins."""
-    parts = re.split(r'[\\/]+', install_path) if isinstance(install_path, str) else []
+    parts = [p for p in re.split(r'[\\/]+', install_path) if p] if isinstance(install_path, str) else []
     if 'cowork_plugins' not in parts:
         return None
     tail = parts[len(parts) - parts[::-1].index('cowork_plugins'):]
-    if not tail or any(part in ('', '.', '..') for part in tail):
+    if not tail or any(part in ('.', '..') for part in tail):
         return None
     return plugins_root.joinpath(*tail)
 

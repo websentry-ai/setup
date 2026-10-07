@@ -217,6 +217,18 @@ class TestCoworkInstalledPlugins(_CoworkTree):
         self._plugin("cache/mkt/plugin-dev/bbb222", "plugin-dev", "skills/agent-development", text="# stale")
         self.assertEqual(self.resolve("plugin-dev:agent-development"), str(recorded))
 
+    def test_only_the_first_recorded_install_of_a_plugin_counts(self):
+        first = self.installed("cache/mkt/plugin-dev/aaa111", "plugin-dev", "skills/agent-development", age=3600)
+        self._plugin("cache/mkt/plugin-dev/bbb222", "plugin-dev", "skills/agent-development")
+        self._record("plugin-dev@mkt", "cache/mkt/plugin-dev/bbb222")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(first))
+
+    def test_a_recorded_path_with_a_trailing_slash_still_resolves(self):
+        skill = self._plugin("cache/mkt/kit/1.0", "kit", "skills/brief")
+        self.registry["kit@mkt"] = [{"scope": "user", "installPath": "/sessions/vm/mnt/.claude/cowork_plugins/cache/mkt/kit/1.0/"}]
+        _write(self.plugins_root / "installed_plugins.json", json.dumps({"version": 2, "plugins": self.registry}))
+        self.assertEqual(self.resolve("kit:brief"), str(skill))
+
     def test_an_uploaded_plugin_resolves(self):
         skill = self.installed("marketplaces/local-desktop-app-uploads/my-kit", "my-kit", "skills/deck-review")
         self.assertEqual(self.resolve("my-kit:deck-review"), str(skill))
