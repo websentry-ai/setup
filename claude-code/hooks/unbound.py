@@ -4194,6 +4194,21 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
         return None
 
 
+def _git_branch(root: Optional[str]) -> Optional[str]:
+    """Checked-out branch of the repo at `root`; None on detached HEAD or any git failure."""
+    try:
+        if not root:
+            return None
+        result = subprocess.run(
+            ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
+            capture_output=True, text=True, timeout=10,
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else None
+    except Exception:
+        return None
+
+
 # Per-repo observation tiers for the end-of-turn exchange. The hook reports
 # raw facts (which repos the turn touched, and how); the attribution policy
 # lives server-side where it can be tuned without redeploying hooks.
@@ -4525,14 +4540,8 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
     return candidates, shell_dir
 
 
-def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Optional[str]]) -> tuple:
-    """Resolve the git project ("<org>/<repo>") a single tool call worked in.
-    Writes/reads resolve from the tool's file path; Bash resolves from the
-    first absolute path in the command, else the shell's working directory
-    tracked across the turn's `cd`s. Returns (project, shell_dir) — shell_dir
-    updated when the command changed directory. `root_projects` caches the
-    origin lookup so `git remote get-url` runs at most once per distinct repo.
-    (None, shell_dir) when nothing resolves (fail-open)."""
+def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
+    """Per-call (project, branch, shell_dir) for a tool call, cached per repo root; (None, None, shell_dir) when nothing resolves."""
     try:
         candidates, shell_dir = _tool_use_path_candidates(tool_name, tool_input, shell_dir)
         for candidate in candidates:
@@ -4540,12 +4549,14 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
             if not root:
                 continue
             if root not in root_projects:
-                root_projects[root] = _get_project(root)
-            if root_projects[root]:
-                return root_projects[root], shell_dir
-        return None, shell_dir
+                project = _get_project(root)
+                root_projects[root] = (project, _git_branch(root) if project else None)
+            project, branch = root_projects[root]
+            if project:
+                return project, branch, shell_dir
+        return None, None, shell_dir
     except Exception:
-        return None, shell_dir
+        return None, None, shell_dir
 
 
 # --- Repository-scope gate: blocks writes, git write subcommands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
@@ -5041,7 +5052,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     transcript_path = None
     permission_mode = None
     # Per-tool-use project resolution state: the persistent shell starts at
-    # the session cwd; origin lookups are cached per repo root.
+    # the session cwd; origin and branch lookups are cached per repo root.
     shell_dir = cwd
     root_projects = {}
 
@@ -5086,7 +5097,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             # Attribute this tool call to the repo it worked in (file path /
             # Bash cwd tracking); rides on the tool_use entry so the backend
             # can store per-call project on each analytics row.
-            tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
+            tool_project, tool_branch, shell_dir = _repo_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
 
             tool_use_entry = {
                 'type': 'PostToolUse',
@@ -5094,7 +5105,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'tool_input': tool_input,
                 'tool_response': tool_response,
                 'tool_use_id': resolve_tool_use_id(event),
-                'project': tool_project
+                'project': tool_project,
+                'git_branch': tool_branch
             }
             # Lift the invoked skill to stable keys so the backend reads one
             # field regardless of how a tool spells its skill input.
@@ -5186,6 +5198,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     if not model:
         model = _get_session_model(session_id) or 'auto'
 
+    turn_project = _get_project(cwd)
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': model,
@@ -5194,7 +5207,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'account_identity': build_account_identity({'cwd': cwd}, probe=True),
     }
 

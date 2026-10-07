@@ -3117,6 +3117,21 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
         return None
 
 
+def _git_branch(root: Optional[str]) -> Optional[str]:
+    """Checked-out branch of the repo at `root`; None on detached HEAD or any git failure."""
+    try:
+        if not root:
+            return None
+        result = subprocess.run(
+            ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
+            capture_output=True, text=True, timeout=10,
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else None
+    except Exception:
+        return None
+
+
 def _find_git_root(path: str) -> Optional[str]:
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
@@ -3374,10 +3389,8 @@ def _is_shell_write_command(command):
         return False
 
 
-def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Optional[str]]) -> Optional[str]:
-    """First project ("<org>/<repo>") resolved from `candidates` paths.
-    `root_projects` caches origin lookups so `git remote get-url` runs at
-    most once per distinct repo. None when nothing resolves (fail-open)."""
+def _repo_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
+    """First (project, branch) resolved from `candidates`, cached per repo root; (None, None) when nothing resolves."""
     try:
         for candidate in candidates:
             if not candidate:
@@ -3386,12 +3399,14 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
             if not root:
                 continue
             if root not in root_projects:
-                root_projects[root] = _get_project(root)
-            if root_projects[root]:
-                return root_projects[root]
+                project = _get_project(root)
+                root_projects[root] = (project, _git_branch(root) if project else None)
+            project, branch = root_projects[root]
+            if project:
+                return project, branch
     except Exception:
         pass
-    return None
+    return None, None
 
 
 # --- Repository-scope gate: blocks writes, git write subcommands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
@@ -3811,9 +3826,9 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
 
         # Match calls with outputs and convert to PostToolUse format.
         # shell_dir mirrors the persistent shell across the turn's commands
-        # (seeded with the session cwd); root_projects caches origin lookups.
+        # (seeded with the session cwd); root_projects caches origin and branch lookups.
         shell_dir = session_cwd
-        root_projects: Dict[str, Optional[str]] = {}
+        root_projects: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
         for call_id, call_data in function_calls.items():
             name = call_data.get('name', '')
             args = call_data.get('arguments', {})
@@ -3843,7 +3858,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)
-                project = _project_for_paths(candidates, root_projects)
+                project, branch = _repo_for_paths(candidates, root_projects)
                 # Parse exec_command output format to extract clean stdout and exit_code
                 stdout = output
                 exit_code = 0
@@ -3868,7 +3883,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 ]
                 if not candidates and shell_dir:
                     candidates = [shell_dir]
-                project = _project_for_paths(candidates, root_projects)
+                project, branch = _repo_for_paths(candidates, root_projects)
 
             tool_uses.append({
                 'type': 'PostToolUse',
@@ -3876,7 +3891,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 'tool_input': tool_input,
                 'tool_response': tool_response,
                 'tool_use_id': call_id,
-                'project': project
+                'project': project,
+                'git_branch': branch
             })
 
     except Exception:
@@ -4233,6 +4249,7 @@ def process_stop_event(event: Dict, api_key: str):
     # Stop event's logged time, not processing time
     request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
+    turn_project = _get_project(cwd)
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
@@ -4241,7 +4258,8 @@ def process_stop_event(event: Dict, api_key: str):
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'account_identity': build_account_identity(probe=True),
     }
 
