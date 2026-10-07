@@ -660,6 +660,19 @@ GIT_COMMANDS = [
     'git 2>&1 push',
     'git >&2 commit -m wip',
     'git 2>&1 >/dev/null push',
+    'git >& /dev/null push',
+    'git 2>& 1 push',
+    'git \\\n  push origin main',
+    'git push \\\n  origin main',
+    'git filter-branch --tree-filter "rm -f secret" HEAD',
+    'git bisect start',
+    'git sparse-checkout set src',
+    'git notes add -m x',
+    'git replace a b',
+    'git symbolic-ref HEAD refs/heads/x',
+    'git gc',
+    'git prune',
+    'git reflog expire --expire=now --all',
     'git tag v1.0',
     'git stash',
     'git stash pop',
@@ -689,13 +702,15 @@ GIT_READ_COMMANDS = [
     'git branch --show-current',
     'git remote -v',
     'git config --get user.name',
-    'git reflog',
     'git status>/dev/null',
     'git log>/dev/null 2>&1',
     'git 2>/dev/null status',
     'git status 2>&1',
     'git 2>&1 status',
     'git st"atus"',
+    'git >& /dev/null status',
+    'git \\\n  status',
+    'git log \\\n  --oneline',
     'git --version',
     'git status 2>/dev/null',
     'git',
@@ -773,6 +788,10 @@ def test_only_the_listed_write_subcommands_are_gated(hook, command):
     'npm test > /dev/null',
     'npm test >/dev/null 2>&1',
     'make &> /dev/null',
+    'make >& /dev/null',
+    'cmd 2>&1',
+    'cmd >&2',
+    'cmd >&-',
     'echo x >> /dev/null',
     'echo x > "/dev/null"',
     'echo x > /dev/stderr',
@@ -788,6 +807,8 @@ def test_output_discarded_to_dev_null_is_not_a_write(hook, command):
     'cmd 2>/dev/null > out.txt',
     'cmd 2> errors.log',
     'cmd &> all.log',
+    'cmd >& all.log',
+    'cmd >&all.log',
     'echo x >> /dev/null.txt',
 ])
 def test_redirects_into_a_file_are_still_writes(hook, command):
@@ -804,6 +825,9 @@ def test_redirects_into_a_file_are_still_writes(hook, command):
     ('git 2>&1 push', ['git', 'push']),
     ('git >&2 push', ['git', 'push']),
     ('git "re"set --hard', ['git', 'reset', '--hard']),
+    ('git >& /dev/null push', ['git', 'push']),
+    ('git 2>& 1 push', ['git', 'push']),
+    ('git &> /dev/null push', ['git', 'push']),
     ('cat <<EOF', ['cat']),
     ('patch < fix.diff', ['patch']),
     ('git log --oneline', ['git', 'log', '--oneline']),
@@ -827,6 +851,7 @@ def test_git_command_sets_are_reviewable_constants(hook):
     assert 'commit' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'push' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'restore' in hook._GIT_WRITE_SUBCOMMANDS
+    assert 'filter-branch' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'status' not in hook._GIT_WRITE_SUBCOMMANDS
     assert 'branch' not in hook._GIT_WRITE_SUBCOMMANDS
     assert '/dev/null' in hook._NULL_REDIRECT_TARGETS

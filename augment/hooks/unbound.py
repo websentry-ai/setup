@@ -3101,6 +3101,7 @@ _SYSTEM_CHECKOUT_ROOTS = (
     '/usr',
     '/Library',
     '/System',
+    '/dev',  # `> /dev/null` names no checkout; the call still resolves from the cwd
 )
 
 
@@ -3273,6 +3274,8 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
 
 # --- Bash calls in scope for the repo gate: a segment's command word runs a git command that changes the repository, or writes the working tree; anything unclassifiable is not gated ---
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+# A backslash-newline continues the line; two spaces keep the length.
+_LINE_CONTINUATION_RE = re.compile(r'\\\n')
 # Inside a quoted run these are plain text; masking them keeps `"a b"` one word and `"a && b"` one segment.
 _QUOTED_SHELL_CHAR_RE = re.compile(r'[\s;|&<>()`$]')
 # Quotes anywhere in a word are shell syntax, not text: `"re"set` is `reset`.
@@ -3283,7 +3286,7 @@ _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
 # Creating or appending redirect plus its target; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
-_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])\s*([^\s;|&<>()]*)')
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?:&(?![\d&-]))?(?![&>])\s*([^\s;|&<>()]*)')
 # Redirect targets that discard or echo output instead of creating a file: `2>/dev/null` is a read.
 _NULL_REDIRECT_TARGETS = frozenset({'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'})
 
@@ -3294,11 +3297,13 @@ _GIT_WRITE_SUBCOMMANDS = frozenset({
     'add', 'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
     'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
     'apply', 'am', 'worktree', 'submodule', 'update-ref', 'init', 'clone',
+    'filter-branch', 'bisect', 'sparse-checkout', 'notes', 'replace', 'symbolic-ref',
+    'gc', 'prune', 'reflog',
 })
 # `git branch` is gated only when it deletes, moves, copies or forces: `-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `-f`, or a short-flag run containing one (`-rd`).
 _GIT_BRANCH_WRITE_RE = re.compile(r'^(?:--(?:delete|move|copy|force)$|-[A-Za-z]*[dDmMcCf])')
-# A redirect inside a word: optional fd digits, the operator, then whatever is glued on (`2>/dev/null`, `push>out`, `2>&1`).
-_REDIRECT_IN_WORD_RE = re.compile(r'(\d*&?[<>]{1,2})(&?.*)$')
+# A redirect inside a word: optional fd digits, the operator (`>`, `>>`, `>&`, `&>`), then whatever is glued on (`2>/dev/null`, `push>out`, `2>&1`).
+_REDIRECT_IN_WORD_RE = re.compile(r'(\d*&?[<>]{1,2}&?)(.*)$')
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -3314,10 +3319,10 @@ _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
 
 
 def _mask_quoted_runs(command):
-    """Replace whitespace and shell metacharacters inside quoted runs with `_`, preserving length; an unbalanced quote leaves its tail untouched."""
+    """Join continued lines and replace whitespace and shell metacharacters inside quoted runs with `_`, preserving length; an unbalanced quote leaves its tail untouched."""
     return _QUOTED_RUN_RE.sub(
         lambda m: m.group(0)[0] + _QUOTED_SHELL_CHAR_RE.sub('_', m.group(0)[1:-1]) + m.group(0)[0],
-        command)
+        _LINE_CONTINUATION_RE.sub('  ', command))
 
 
 def _without_redirects(words):
