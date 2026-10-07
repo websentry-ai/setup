@@ -284,6 +284,31 @@ test("confirm ⇒ asks through the live ctx: yes ⇒ allow_once, no ⇒ deny, no
   }
 });
 
+test("confirm: a run signal that was already aborted (Esc earlier) does not cancel a later brokered dialog", async () => {
+  // The last ctx a handler saw belongs to a run the developer aborted. A brokered call that arrives
+  // later without any handler in between (an mcpScript / resource / iframe call) must still be asked,
+  // not denied by that stale signal. The broker request's own live signal still bounds the dialog.
+  const stale = new AbortController();
+  stale.abort();
+  for (const withBrokerSignal of [false, true]) {
+    const f = await fixture("ask", { ctx: { hasUI: true, confirmResult: true, signal: stale.signal } });
+    try {
+      const live = new AbortController();
+      const { decision } = await brokerRequest(f.bus, {
+        serverName: "s",
+        originalToolName: "t",
+        ...(withBrokerSignal ? { signal: live.signal } : {}),
+      });
+      assert.equal(f.ctx.confirmCalls.length, 1, "the developer is asked");
+      const dialogSignal = (f.ctx.confirmCalls[0]?.opts as { signal?: AbortSignal } | undefined)?.signal;
+      assert.notEqual(dialogSignal?.aborted, true, "the dialog is not handed an already-aborted signal");
+      assert.equal(decision, "allow_once");
+    } finally {
+      await f.close();
+    }
+  }
+});
+
 test("confirm with no ctx seen yet ⇒ deny (there is nobody to ask)", async () => {
   const f = await fixture("ask", { seeCtx: false });
   try {
