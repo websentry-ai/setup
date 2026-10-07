@@ -4540,7 +4540,7 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
     return candidates, shell_dir
 
 
-def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, tuple]) -> tuple:
+def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
     """Resolve the git project ("<org>/<repo>") and checked-out branch a single
     tool call worked in. Writes/reads resolve from the tool's file path; Bash
     resolves from the first absolute path in the command, else the shell's
@@ -5204,6 +5204,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     if not model:
         model = _get_session_model(session_id) or 'auto'
 
+    turn_project = _get_project(cwd)
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': model,
@@ -5212,8 +5213,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
-        'git_branch': _git_branch(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'account_identity': build_account_identity({'cwd': cwd}, probe=True),
     }
 

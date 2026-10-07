@@ -97,8 +97,14 @@ class TestPerCallResolution:
         r.mkdir()
         _git(r, "init", "-q", "-b", "main")
         m = tool_module(HOOKS[tool])
-        with patch.object(m, "_git_branch", side_effect=AssertionError("looked up a branch with no project")):
+        with patch.object(m, "_git_branch", wraps=m._git_branch) as spy:
             assert _resolve(tool, m, str(r / "a.py"), {}) == (None, None)
+        spy.assert_not_called()
+
+    def test_detached_head_keeps_the_project_and_drops_the_branch(self, tool, repo):
+        _git(repo, "checkout", "-q", "--detach")
+        m = tool_module(HOOKS[tool])
+        assert _resolve(tool, m, str(repo / "src" / "a.py"), {}) == ("acme/web", None)
 
     def test_the_branch_is_read_once_per_repo_root(self, tool, repo):
         m = tool_module(HOOKS[tool])
@@ -139,6 +145,15 @@ class TestClaudeCodePayload:
         [tu] = _tool_uses(exchange)
         assert (tu["project"], tu["git_branch"]) == (None, None)
         assert exchange["git_branch"] == BRANCH
+
+    def test_a_turn_in_a_repo_without_origin_carries_no_branch(self, tmp_path):
+        r = tmp_path / "local-only"
+        r.mkdir()
+        _git(r, "init", "-q", "-b", "main")
+        unbound = tool_module("claude-code/hooks")
+        events = [{"event": {"hook_event_name": "UserPromptSubmit", "session_id": "s", "prompt": "hi"}}]
+        exchange = unbound.build_llm_exchange(events, stop_assistant_message="done", cwd=str(r))
+        assert (exchange["project"], exchange["git_branch"]) == (None, None)
 
 
 class TestCursorPayload:

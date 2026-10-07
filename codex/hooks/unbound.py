@@ -3389,7 +3389,7 @@ def _is_shell_write_command(command):
         return False
 
 
-def _repo_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, tuple]) -> tuple:
+def _repo_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
     """First (project, branch) resolved from `candidates` paths: the
     "<org>/<repo>" of the nearest repo and its checked-out branch. `root_projects`
     caches both per repo root so git runs at most twice per distinct repo.
@@ -3829,9 +3829,9 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
 
         # Match calls with outputs and convert to PostToolUse format.
         # shell_dir mirrors the persistent shell across the turn's commands
-        # (seeded with the session cwd); root_projects caches origin lookups.
+        # (seeded with the session cwd); root_projects caches origin and branch lookups.
         shell_dir = session_cwd
-        root_projects: Dict[str, tuple] = {}
+        root_projects: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
         for call_id, call_data in function_calls.items():
             name = call_data.get('name', '')
             args = call_data.get('arguments', {})
@@ -4252,6 +4252,7 @@ def process_stop_event(event: Dict, api_key: str):
     # Stop event's logged time, not processing time
     request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
+    turn_project = _get_project(cwd)
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
@@ -4260,8 +4261,8 @@ def process_stop_event(event: Dict, api_key: str):
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
-        'git_branch': _git_branch(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'account_identity': build_account_identity(probe=True),
     }
 

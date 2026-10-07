@@ -3244,7 +3244,7 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
 
 
-def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, tuple]) -> tuple:
+def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
     """Resolve the git project ("<org>/<repo>") and checked-out branch a single
     tool call worked in. File tools resolve from the tool's file path (Augment
     often sends workspace-relative paths — those join onto the tracked shell
@@ -3812,7 +3812,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
                           or conversation.get('agentTextResponse') or '').strip()
 
     # Per-tool-use project resolution state: the shell starts at the session
-    # cwd; origin lookups are cached per repo root across the turn.
+    # cwd; origin and branch lookups are cached per repo root across the turn.
     cwd = event.get('cwd')
     shell_dir = cwd
     root_projects = {}
@@ -3891,6 +3891,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     if not model:
         model = _augment_model(event, session_id)
 
+    turn_project = _get_project(cwd)
     return {
         'conversation_id': session_id or 'unknown',
         'model': model,
@@ -3899,8 +3900,8 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
-        'git_branch': _git_branch(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'account_identity': build_account_identity(event, probe=True),
     }
 

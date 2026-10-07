@@ -4996,7 +4996,7 @@ def _git_branch(root):
             return None
         result = subprocess.run(
             ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=_git_remote_timeout(),
         )
         branch = result.stdout.strip()
         return branch if result.returncode == 0 and branch else None
@@ -6351,6 +6351,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         log_error("transcript produced no messages", 'transcript')
         return None, set(), None, set(), None
 
+    turn_project = _get_project(cwd)
     return {
         'conversation_id': conversation_id,
         'model': served_model or model or session_start_model or 'auto',
@@ -6358,8 +6359,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
-        'git_branch': _git_branch(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'agent_surface': copilot_surface(transcript_path),
         # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
         # rotates or collides across sessions. The github block below is the provenance.
