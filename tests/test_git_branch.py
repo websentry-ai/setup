@@ -1,9 +1,4 @@
-"""Every hook reports the checked-out branch beside the project it resolved (WEB-6034).
-
-The branch is read at the same repo root the project came from: the nearest
-`.git` above a tool call's file path or shell directory, so a linked worktree
-reports its own branch and a detached HEAD reports none.
-"""
+"""WEB-6034: every hook reports the checked-out branch at the repo root its project came from."""
 
 import json
 import subprocess

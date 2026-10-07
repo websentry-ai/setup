@@ -5261,10 +5261,7 @@ def _is_shell_write_command(command):
 
 
 def _repo_for_paths(candidates, root_projects):
-    """First (project, branch) resolved from `candidates` paths: the
-    "<org>/<repo>" of the nearest repo and its checked-out branch. `root_projects`
-    caches both per repo root so git runs at most twice per distinct repo.
-    (None, None) when nothing resolves (fail-open)."""
+    """First (project, branch) resolved from `candidates`, cached per repo root; (None, None) when nothing resolves."""
     try:
         for candidate in candidates:
             if not candidate:

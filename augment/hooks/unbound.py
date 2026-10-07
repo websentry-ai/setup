@@ -3245,15 +3245,7 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
 
 
 def _repo_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
-    """Resolve the git project ("<org>/<repo>") and checked-out branch a single
-    tool call worked in. File tools resolve from the tool's file path (Augment
-    often sends workspace-relative paths — those join onto the tracked shell
-    dir); Bash resolves from the first absolute path in the command, else the
-    shell's working directory tracked across the turn's `cd`s. Returns
-    (project, branch, shell_dir) — shell_dir updated when the command changed
-    directory. `root_projects` caches both per repo root so git runs at most
-    twice per distinct repo. (None, None, shell_dir) when nothing resolves
-    (fail-open)."""
+    """Per-call (project, branch, shell_dir) for a tool call, cached per repo root; (None, None, shell_dir) when nothing resolves."""
     try:
         tool_input = tool_input or {}
         candidates = []
