@@ -4971,15 +4971,28 @@ def _plugin_manifest_name(plugin: Path) -> Optional[str]:
 
 def _cowork_plugin_dirs(org_dir: Path):
     """(source, plugin dir) for every plugin a Cowork session can load: the org's plugins,
-    the user's uploads, and installed marketplace plugins, where each cached version of
-    one plugin is the same source. The marketplace catalog itself is not installed."""
+    and the install path installed_plugins.json records for each installed or uploaded
+    plugin. Any other copy under cowork_plugins is a catalog entry or a stale version."""
     for plugin in (org_dir / 'rpm').glob('*'):
         yield plugin.name, plugin
-    plugins = org_dir / 'cowork_plugins'
-    for plugin in (plugins / 'marketplaces' / 'local-desktop-app-uploads').glob('*'):
-        yield 'upload:' + plugin.name, plugin
-    for version in (plugins / 'cache').glob('*/*/*'):
-        yield 'cache:%s/%s' % (version.parent.parent.name, version.parent.name), version
+    plugins_root = org_dir / 'cowork_plugins'
+    for entries in _installed_plugins_registry(plugins_root).values():
+        for entry in entries if isinstance(entries, list) else []:
+            path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
+            if path is not None:
+                yield 'installed:%s' % path, path
+
+
+def _cowork_install_dir(plugins_root: Path, install_path) -> Optional[Path]:
+    """A recorded installPath, which may be the VM's view of it, re-rooted under this
+    host's cowork_plugins dir. None when it does not point inside cowork_plugins."""
+    parts = re.split(r'[\\/]+', install_path) if isinstance(install_path, str) else []
+    if 'cowork_plugins' not in parts:
+        return None
+    tail = parts[len(parts) - parts[::-1].index('cowork_plugins'):]
+    if not tail or any(part in ('', '.', '..') for part in tail):
+        return None
+    return plugins_root.joinpath(*tail)
 
 
 def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
@@ -4997,12 +5010,13 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         copies = list(own.glob('**/skills/%s/SKILL.md' % name))
         if copies:
             sources['bundle'] = copies
-    if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
+    # A bare name is the bundle's when the bundle has it; plugin skills are namespaced.
+    if prefix != COWORK_BUNDLED_SKILLS_PREFIX and not (not prefix and sources):
         for source, plugin in _cowork_plugin_dirs(session.parent):
             if not plugin.is_dir() or (prefix and _plugin_manifest_name(plugin) != prefix):
                 continue
-            for path in plugin.glob('**/%s/SKILL.md' % name):
-                if 'skills' in path.relative_to(plugin).parts[:-2]:
+            for pattern in ('skills/%s/SKILL.md', 'skills/*/%s/SKILL.md'):
+                for path in plugin.glob(pattern % name):
                     sources.setdefault(source, []).append(path)
     if len(sources) != 1:
         return None

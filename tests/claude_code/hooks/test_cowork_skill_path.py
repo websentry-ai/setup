@@ -6,6 +6,7 @@ and no hash, so the backend could never tie it to a discovered body.
 """
 
 import hashlib
+import json
 import os
 import re
 import tempfile
@@ -115,9 +116,14 @@ class TestCoworkSkillIdentity(_CoworkTree):
         self.plugin("review", plugin="plugin_02")
         self.assertIsNone(self.resolve("gtm-skills:review"))
 
-    def test_bare_name_in_bundle_and_plugin_resolves_nothing(self):
-        self.bundle("review")
+    def test_bare_name_in_bundle_and_plugin_is_the_bundles(self):
+        bundled = self.bundle("review", age=3600)
         self.plugin("review")
+        self.assertEqual(self.resolve("review"), str(bundled))
+
+    def test_bare_name_in_two_plugins_only_resolves_nothing(self):
+        self.plugin("review", plugin="plugin_01")
+        self.plugin("review", plugin="plugin_02")
         self.assertIsNone(self.resolve("review"))
 
     def test_the_sessions_own_copy_wins_for_a_bare_name(self):
@@ -173,42 +179,69 @@ class TestCoworkBundleScope(_CoworkTree):
 
 
 class TestCoworkInstalledPlugins(_CoworkTree):
-    """Plugins a user installs from a marketplace or uploads, laid out as Cowork keeps them."""
+    """Plugins a user installs or uploads, laid out as Cowork keeps them, and recorded in
+    installed_plugins.json the way Cowork records them (from inside its VM)."""
 
-    def _plugin(self, root, declares, rel_skill, text="# skill", age=0):
+    def setUp(self):
+        super().setUp()
+        self.plugins_root = self.org / "cowork_plugins"
+        self.registry = {}
+
+    def _record(self, key, rel_dir):
+        self.registry.setdefault(key, []).append(
+            {"scope": "user", "installPath": "/sessions/vm/mnt/.claude/cowork_plugins/" + rel_dir})
+        _write(self.plugins_root / "installed_plugins.json", json.dumps({"version": 2, "plugins": self.registry}))
+
+    def _plugin(self, rel_dir, declares, rel_skill, text="# skill", age=0):
+        root = self.plugins_root / rel_dir
         _write(root / ".claude-plugin" / "plugin.json", '{"name": "%s"}' % declares)
         return _write(root / rel_skill / "SKILL.md", text, age)
 
-    def cached(self, plugin, version, declares, rel_skill, **kw):
-        root = self.org / "cowork_plugins" / "cache" / "claude-plugins-official" / plugin / version
-        return self._plugin(root, declares, rel_skill, **kw)
+    def installed(self, rel_dir, declares, rel_skill, **kw):
+        skill = self._plugin(rel_dir, declares, rel_skill, **kw)
+        self._record("%s@mkt" % declares, rel_dir)
+        return skill
 
     def test_installed_marketplace_plugin_resolves(self):
-        skill = self.cached("plugin-dev", "2cd88e7947b7", "plugin-dev", "skills/skill-development")
+        skill = self.installed("cache/claude-plugins-official/plugin-dev/2cd88e7947b7", "plugin-dev",
+                               "skills/skill-development")
         self.assertEqual(self.resolve("plugin-dev:skill-development"), str(skill))
 
-    def test_a_skill_nested_under_skills_resolves(self):
-        skill = self.cached("Notion", "0.1.0", "Notion", "skills/notion/knowledge-capture")
+    def test_a_skill_grouped_under_skills_resolves(self):
+        skill = self.installed("cache/claude-plugins-official/Notion/0.1.0", "Notion", "skills/notion/knowledge-capture")
         self.assertEqual(self.resolve("Notion:knowledge-capture"), str(skill))
 
-    def test_the_newest_cached_version_of_one_plugin_wins(self):
-        self.cached("plugin-dev", "1.0.0", "plugin-dev", "skills/agent-development", text="# old", age=3600)
-        new = self.cached("plugin-dev", "2.0.0", "plugin-dev", "skills/agent-development", text="# new")
-        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(new))
+    def test_the_recorded_version_wins_over_a_newer_stale_one(self):
+        recorded = self.installed("cache/mkt/plugin-dev/aaa111", "plugin-dev", "skills/agent-development",
+                                  text="# recorded", age=3600)
+        self._plugin("cache/mkt/plugin-dev/bbb222", "plugin-dev", "skills/agent-development", text="# stale")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(recorded))
 
     def test_an_uploaded_plugin_resolves(self):
-        root = self.org / "cowork_plugins" / "marketplaces" / "local-desktop-app-uploads" / "my-kit"
-        skill = self._plugin(root, "my-kit", "skills/deck-review")
+        skill = self.installed("marketplaces/local-desktop-app-uploads/my-kit", "my-kit", "skills/deck-review")
         self.assertEqual(self.resolve("my-kit:deck-review"), str(skill))
 
+    def test_a_plugin_installed_in_its_marketplace_clone_resolves(self):
+        skill = self.installed("marketplaces/team-plugins/release-kit", "release-kit", "skills/cut-release")
+        self.assertEqual(self.resolve("release-kit:cut-release"), str(skill))
+
     def test_the_marketplace_catalog_is_not_installed(self):
-        root = self.org / "cowork_plugins" / "marketplaces" / "knowledge-work-plugins" / "sales"
-        self._plugin(root, "sales", "skills/call-prep")
+        self._plugin("marketplaces/knowledge-work-plugins/sales", "sales", "skills/call-prep")
         self.assertIsNone(self.resolve("sales:call-prep"))
+
+    def test_a_skill_md_shipped_inside_another_skill_is_not_a_skill(self):
+        skill = self.installed("cache/mkt/plugin-dev/aaa111", "plugin-dev", "skills/skill-development", age=3600)
+        _write(skill.parent / "templates" / "skill-development" / "SKILL.md", "# template")
+        self.assertEqual(self.resolve("plugin-dev:skill-development"), str(skill))
+
+    def test_a_bare_name_stays_with_the_bundle_when_it_has_it(self):
+        bundled = self.bundle("docx", age=3600)
+        self.installed("cache/mkt/document-skills/1.0", "document-skills", "skills/docx")
+        self.assertEqual(self.resolve("docx"), str(bundled))
 
     def test_the_prefix_picks_between_an_org_plugin_and_an_installed_one(self):
         self.plugin("review")
-        mine = self.cached("code-review", "1.0.0", "code-review", "skills/review")
+        mine = self.installed("cache/mkt/code-review/1.0", "code-review", "skills/review")
         self.assertEqual(self.resolve("code-review:review"), str(mine))
 
 
