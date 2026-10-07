@@ -257,7 +257,13 @@ async function confirmBrokered(ui: UiCtx, reason: string, signal: AbortSignal | 
       return "deny";
     }
     notifySafe(ui, reason, "warning");
-    const signals = [ui.signal, signal].filter((s): s is AbortSignal => s instanceof AbortSignal);
+    // A run signal that is ALREADY aborted belongs to an earlier run (Esc), not to this call: the ctx
+    // is the last one a handler saw, and an mcpScript / resource / iframe call can arrive with no
+    // handler in between. Combining it would abort the dialog at once and deny without asking. This
+    // call's own cancellation is the broker request's signal, which is always kept.
+    const signals = [ui.signal, signal].filter(
+      (s): s is AbortSignal => s instanceof AbortSignal && (s === signal || !s.aborted),
+    );
     const combined = signals.length === 0 ? undefined : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
     const dialogCtx: UiCtx = { hasUI: true, ui: ui.ui, signal: combined };
     const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
