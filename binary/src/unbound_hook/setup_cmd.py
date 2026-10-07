@@ -692,10 +692,18 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     wrapper = Path(wrapper_path)
     command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
     try:
-        config = _load_codex_json(_read_user_file(hooks_path, follow=True))
+        raw = _read_user_file(hooks_path, follow=True)
     except FileNotFoundError:
-        config = {}
-    loadable = _codex_can_load(config)
+        raw = b"{}"
+    try:
+        config = _load_codex_json(raw)
+        loadable = _codex_can_load(config)
+    except ValueError:
+        # Codex rejects it (byte-order mark, NaN, lone surrogate, too deep), so nothing
+        # in it runs; recover what Python can and rewrite only if that loads.
+        config = json.loads(raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8"),
+                            object_pairs_hook=_json_object)
+        loadable = False
     before = json.dumps(config, sort_keys=True)
     config = _codex_make_loadable(config)
 
@@ -724,11 +732,14 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
                     existing_config.remove(existing_item)
         existing_config.extend(new_config)
 
-    text = json.dumps(config, indent=2)
+    text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False)
+    try:
+        rewritten_loads = _codex_can_load(_load_codex_json(text.encode("utf-8")))
+    except ValueError:
+        rewritten_loads = False
     # Unchanged content is still rewritten when that alone makes it loadable
     # (a repeated key collapses on rewrite); otherwise the file is left alone.
-    if json.dumps(config, sort_keys=True) == before and (
-            loadable or not _codex_can_load(_load_codex_json(text.encode("utf-8")))):
+    if json.dumps(config, sort_keys=True) == before and (loadable or not rewritten_loads):
         return
     fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1005,13 +1016,31 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
 
 
 def _codex_wrapper_runnable(wrapper: Path) -> bool:
-    """Our wrapper as codex runs it: a regular file (not followed) its owner can
-    execute, since `$SHELL -lc "<path>"` fails on one without the bit."""
+    """A regular file (not followed) its owner can read and execute: the shell needs
+    the execute bit, then python has to open the file after the shebang."""
     try:
         mode = wrapper.lstat().st_mode
     except OSError:
         return False
-    return stat.S_ISREG(mode) and bool(mode & stat.S_IXUSR)
+    return stat.S_ISREG(mode) and mode & (stat.S_IRUSR | stat.S_IXUSR) == stat.S_IRUSR | stat.S_IXUSR
+
+
+# Every python-era codex hook (the script setup installed before the binary) has these.
+_PYTHON_ERA_HOOK_MARKERS = ("def main", "hook_event_name", "api.getunbound.ai")
+_PYTHON_ERA_HOOK_MIN_BYTES = 20_000
+
+
+def _codex_wrapper_is_ours(wrapper: Path) -> bool:
+    """Runs as the profile's user: the script is the binary's wrapper or a genuine
+    python-era hook, not a no-op kept at our path with the right mode."""
+    try:
+        text = _read_user_file(wrapper, follow=False).decode("utf-8", errors="replace")
+    except OSError:
+        return False
+    if text == _codex_wrapper_source():
+        return True
+    return (text.startswith("#!/usr/bin/env python3") and len(text) >= _PYTHON_ERA_HOOK_MIN_BYTES
+            and all(marker in text for marker in _PYTHON_ERA_HOOK_MARKERS))
 
 
 def _codex_detect_state(m, user_homes):
@@ -1028,10 +1057,14 @@ def _codex_detect_state(m, user_homes):
             script = _codex_wrapper_runnable(wrapper)
             if not script and os.path.lexists(wrapper):
                 return "tampered"  # something other than our file holds the script path
+            if script:
+                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper)
+                if script is False:
+                    return "tampered"  # a runnable script at our path that isn't ours
             registered = False
             if os.path.lexists(hooks_path):
                 registered = m._run_as_user(username, _codex_hook_registered, hooks_path, wrapper)
-            if registered is None:
+            if registered is None or script is None:
                 indeterminate = True
             elif script and registered:
                 any_complete = True

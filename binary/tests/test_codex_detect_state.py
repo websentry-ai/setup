@@ -38,7 +38,7 @@ def _profile(tmp_path, name="u", *, script=False, config=None, raw=None) -> Path
     home = tmp_path / name
     (home / ".codex" / "hooks").mkdir(parents=True)
     if script:
-        _wrapper(home).write_text("#!/usr/bin/env python3\n")
+        _wrapper(home).write_text(setup_cmd._codex_wrapper_source())
         _wrapper(home).chmod(0o755)  # every installer sets it
     hooks_json = home / ".codex" / "hooks.json"
     if raw is not None:
@@ -247,7 +247,8 @@ def test_malformed_content_with_the_script_is_tampered_not_a_crash(m, tmp_path, 
 def test_an_oversized_file_is_not_read(m, tmp_path, monkeypatch):
     home = _profile(tmp_path, script=True)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    monkeypatch.setattr(setup_cmd, "_USER_FILE_MAX_BYTES", 10)
+    # Big enough for the wrapper, too small for hooks.json.
+    monkeypatch.setattr(setup_cmd, "_USER_FILE_MAX_BYTES", len(setup_cmd._codex_wrapper_source()) + 1)
     assert _state(m, home) == "tampered"
 
 
@@ -472,7 +473,8 @@ def test_tampered_wins_over_an_unknown_profile(m, tmp_path, monkeypatch):
     b = _profile(tmp_path, "b", script=True, config={"hooks": {}})
     real = m._run_as_user
     monkeypatch.setattr(m, "_run_as_user",
-                        lambda u, fn, path, w: None if path.parent.parent == b else real(u, fn, path, w))
+                        lambda u, fn, *a: None if fn is setup_cmd._codex_hook_registered
+                        and a[0].parent.parent == b else real(u, fn, *a))
     assert _state(m, b, a) == "tampered"
 
 
@@ -483,10 +485,43 @@ def test_the_file_is_read_as_the_profiles_user(m, tmp_path, monkeypatch):
     real = m._run_as_user
     monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a: (seen.append(u), real(u, fn, *a))[1])
     setup_cmd._codex_detect_state(m, [("alice", home)])
-    assert seen == ["alice"]
+    assert seen and set(seen) == {"alice"}  # the wrapper and hooks.json are both read as alice
 
 
-def test_no_privilege_drop_when_the_profile_has_no_hooks_json(m, tmp_path, monkeypatch):
-    home = _profile(tmp_path, script=True)
+def test_no_privilege_drop_for_a_profile_without_codex(m, tmp_path, monkeypatch):
+    home = tmp_path / "u"
+    home.mkdir()
     monkeypatch.setattr(m, "_run_as_user", lambda *a, **k: pytest.fail("forked for nothing"))
+    assert _state(m, home) == "fresh"
+
+
+@pytest.mark.parametrize("content", [
+    "#!/bin/sh\nexit 0\n",
+    "#!/usr/bin/env python3\n",
+    "#!/usr/bin/env python3\n# def main hook_event_name api.getunbound.ai\n",  # markers but not a real hook
+])
+def test_a_runnable_script_that_is_not_ours_is_tampered(m, tmp_path, content):
+    """A no-op kept at our path with the right mode enforces nothing."""
+    home = _profile(tmp_path, script=True)
+    _wrapper(home).write_text(content)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     assert _state(m, home) == "tampered"
+
+
+def test_a_python_era_hook_script_is_ours(m, tmp_path):
+    home = _profile(tmp_path, script=True)
+    real_hook = Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py"
+    _wrapper(home).write_text(real_hook.read_text())
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    assert _state(m, home) == "persisted"
+
+
+@pytest.mark.parametrize("mode, expected", [(0o500, "persisted"), (0o100, "tampered"), (0o111, "tampered")])
+def test_the_owner_must_be_able_to_read_and_execute_the_wrapper(m, tmp_path, mode, expected):
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    _wrapper(home).chmod(mode)
+    try:
+        assert _state(m, home) == expected
+    finally:
+        _wrapper(home).chmod(0o755)

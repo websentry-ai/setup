@@ -19,6 +19,7 @@ from unbound_hook._loader import load_mdm_setup_module
 from unbound_hook._resources import HOOK_BINARY
 
 ME = getpass.getuser()
+_PYTHON_ERA_HOOK = (Path(__file__).resolve().parents[2] / "codex" / "hooks" / "unbound.py").read_text()
 BIN = str(HOOK_BINARY)
 
 
@@ -676,7 +677,7 @@ CODEX_EVENTS = {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "Sessio
 def _plant_python_era_codex(home: Path, command: str):
     script = home / ".codex" / "hooks" / "unbound.py"
     script.parent.mkdir(parents=True)
-    script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
+    script.write_text(_PYTHON_ERA_HOOK)  # the real hook a python-era install downloaded
     script.chmod(0o755)
     # Every python-era installer wrote all five events, with the same matchers.
     config = setup_cmd._codex_hooks_config(command.format(script=script))
@@ -868,7 +869,7 @@ def test_setup_repairs_a_decoy_registration(env, decoy_shape):
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.write_text(setup_cmd._codex_wrapper_source())
     wrapper.chmod(0o755)
     decoy = decoy_shape.format(w=wrapper)
     (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
@@ -954,7 +955,7 @@ def test_a_working_non_ascii_entry_on_a_symlink_is_left_alone(env, monkeypatch):
     home = env["tmp"] / "José"
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.write_text(setup_cmd._codex_wrapper_source())
     wrapper.chmod(0o755)
     dotfile = env["tmp"] / "dotfiles" / "hooks.json"
     dotfile.parent.mkdir()
@@ -973,7 +974,7 @@ def test_an_old_era_install_is_not_duplicated(env):
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.write_text(setup_cmd._codex_wrapper_source())
     wrapper.chmod(0o755)
     config = {}
     for event in CODEX_EVENTS:
@@ -1029,7 +1030,7 @@ def test_a_tamper_is_reported_even_when_the_only_install_fails(env, monkeypatch,
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.write_text(setup_cmd._codex_wrapper_source())
     wrapper.chmod(0o755)
     hooks_json = home / ".codex" / "hooks.json"
     if blocker == "symlink":
@@ -1101,6 +1102,23 @@ def test_setup_collapses_a_repeated_key(env):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env) == ["fresh", "tampered", "persisted"]
     assert hooks_json.read_text().count('"hooks"') >= 1 and setup_cmd._codex_can_load(json.loads(hooks_json.read_text()))
+
+
+@pytest.mark.parametrize("spoil, repaired", [
+    (lambda text: "\ufeff" + text, True),                                     # byte-order mark
+    (lambda text: text.replace('"timeout": 60', '"timeout": NaN', 1), True),  # NaN in our handler
+    (lambda text: text[:-1] + ', "description": "x\\ud800"}', False),        # lone surrogate
+])
+def test_setup_recovers_a_hooks_json_codex_rejects_at_parse_time(env, spoil, repaired):
+    """Codex refuses the whole file, so nothing runs. Setup recovers what Python can
+    parse and rewrites it when that loads; a value it can't write validly is left."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json.write_text(spoil(hooks_json.read_text()), encoding="utf-8")
+    setup_cmd.run(["--api-key", "admin-key"])
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert _codex_states(env)[1] == "tampered"
+    assert _codex_states(env)[-1] == ("persisted" if repaired else "tampered")
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
