@@ -444,18 +444,144 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
     return data
 
 
+class _JsonObject(dict):
+    """A parsed JSON object that remembers which keys appeared more than once."""
+    dups = frozenset()
+
+
+def _json_object(pairs):
+    obj = _JsonObject(pairs)
+    if len(obj) != len(pairs):
+        obj.dups = frozenset(k for i, (k, _) in enumerate(pairs) if k in dict(pairs[:i]))
+    return obj
+
+
 def _load_codex_json(data: bytes):
-    """Parse as codex's serde_json does where Python's json is looser: no byte-order
-    mark, NaN/Infinity or lone surrogates. A duplicate key keeps the last value in both."""
+    """Parse the way codex's serde_json would see it: no byte-order mark,
+    NaN/Infinity or lone surrogates. Duplicate keys are kept for the schema check."""
     if data.startswith(b"\xef\xbb\xbf"):
         raise ValueError("byte-order mark")
 
     def _constant(name):
         raise ValueError(name)
 
-    config = json.loads(data.decode("utf-8"), parse_constant=_constant)
+    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant)
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
     return config
+
+
+# Codex's hooks.json schema (codex-rs/config/src/hook_config.rs). It rejects the
+# whole file if any of this fails to deserialize, and no hook in it runs.
+_CODEX_FILE_FIELDS = ("description", "hooks")
+_CODEX_EVENT_FIELDS = (
+    "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact", "PostCompact",
+    "SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop",
+    "Stop", "Interrupt")
+_CODEX_HANDLER_FIELDS = {
+    "command": {"type": None, "command": str, "commandWindows": "str?", "command_windows": "str?",
+                "timeout": "u64?", "async": bool, "statusMessage": "str?",
+                "additionalContextLimit": "u64?"},
+    "mcp_tool": {"type": None, "server": str, "tool": str, "input": "toml_map",
+                 "timeout": "u64?", "statusMessage": "str?"},
+    "prompt": {"type": None},
+    "agent": {"type": None},
+}
+_U64_MAX = 2 ** 64 - 1
+
+
+def _struct_ok(obj, fields) -> bool:
+    """A serde-derived struct: a JSON object with no known field repeated."""
+    return isinstance(obj, dict) and not (getattr(obj, "dups", frozenset()) & set(fields))
+
+
+def _toml_ok(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool) or isinstance(value, (str, float)):
+        return True
+    if isinstance(value, int):
+        return -2 ** 63 <= value < 2 ** 63
+    if isinstance(value, list):
+        return all(_toml_ok(v) for v in value)
+    return isinstance(value, dict) and all(_toml_ok(v) for v in value.values())
+
+
+def _field_ok(value, kind) -> bool:
+    if kind is str:
+        return isinstance(value, str)
+    if kind is bool:
+        return isinstance(value, bool)
+    if kind == "str?":
+        return value is None or isinstance(value, str)
+    if kind == "u64?":
+        return value is None or (isinstance(value, int) and not isinstance(value, bool)
+                                 and 0 <= value <= _U64_MAX)
+    if kind == "toml_map":
+        return isinstance(value, dict) and _toml_ok(value)
+    return True
+
+
+def _codex_handler_loads(handler) -> bool:
+    fields = _CODEX_HANDLER_FIELDS.get(handler.get("type")) if isinstance(handler, dict) else None
+    if fields is None or not _struct_ok(handler, fields):
+        return False
+    if "commandWindows" in handler and "command_windows" in handler:
+        return False  # one field under two names
+    required = [k for k, kind in fields.items() if kind in (str,)]
+    return (all(k in handler for k in required)
+            and all(_field_ok(handler[k], kind) for k, kind in fields.items() if k in handler))
+
+
+def _codex_group_loads(group) -> bool:
+    if not _struct_ok(group, ("matcher", "hooks")):
+        return False
+    if not _field_ok(group.get("matcher"), "str?"):
+        return False
+    hooks = group.get("hooks", [])
+    return isinstance(hooks, list) and all(_codex_handler_loads(h) for h in hooks)
+
+
+def _codex_can_load(config) -> bool:
+    """Whether codex would load this hooks.json at all."""
+    if not _struct_ok(config, _CODEX_FILE_FIELDS) or set(config) - set(_CODEX_FILE_FIELDS):
+        return False
+    if not _field_ok(config.get("description"), "str?"):
+        return False
+    events = config.get("hooks", {})
+    if not _struct_ok(events, _CODEX_EVENT_FIELDS):
+        return False
+    return all(isinstance(events[e], list) and all(_codex_group_loads(g) for g in events[e])
+               for e in _CODEX_EVENT_FIELDS if e in events)
+
+
+def _codex_make_loadable(config) -> dict:
+    """Drop only what makes codex refuse the whole file, so the hooks that do load
+    (ours and other tools') run again. Everything codex could load is kept."""
+    if not isinstance(config, dict):
+        return {}
+    clean = {k: v for k, v in config.items() if k in _CODEX_FILE_FIELDS}
+    if not _field_ok(clean.get("description"), "str?"):
+        clean.pop("description")
+    events = clean.get("hooks")
+    if not isinstance(events, dict):
+        clean["hooks"] = events = {}
+    else:
+        clean["hooks"] = events = dict(events)
+    for event in _CODEX_EVENT_FIELDS:
+        if event not in events:
+            continue
+        groups = events[event] if isinstance(events[event], list) else []
+        kept = []
+        for group in groups:
+            if not isinstance(group, dict) or not _field_ok(group.get("matcher"), "str?"):
+                continue
+            group = dict(group)
+            hooks = group.get("hooks", [])
+            group["hooks"] = [h for h in hooks if _codex_handler_loads(h)] if isinstance(hooks, list) else []
+            if group["hooks"] or not hooks:
+                kept.append(group)
+        events[event] = kept
+    return clean
 
 
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
@@ -540,7 +666,9 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
         config = _load_codex_json(_read_user_file(hooks_path, follow=True))
     except FileNotFoundError:
         config = {}
+    loadable = _codex_can_load(config)
     before = json.dumps(config, sort_keys=True)
+    config = _codex_make_loadable(config)
 
     hooks_config = _codex_hooks_config(command)
     if "hooks" not in config:
@@ -567,7 +695,7 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
                     existing_config.remove(existing_item)
         existing_config.extend(new_config)
 
-    if json.dumps(config, sort_keys=True) == before:
+    if loadable and json.dumps(config, sort_keys=True) == before:
         return
     fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -782,6 +910,8 @@ _SHELL_SPECIAL = set(" \t\n\"'\\$`;&|<>()*?[]{}~#!")
 # Events where an async hook can't block, so codex wouldn't enforce our answer.
 # Older installs wrote async only on PostToolUse and SessionStart.
 _CODEX_BLOCKING_EVENTS = ("PreToolUse", "UserPromptSubmit", "Stop")
+# Codex ignores the matcher on these (matcher_pattern_for_event).
+_CODEX_UNMATCHED_EVENTS = ("UserPromptSubmit", "Stop", "Interrupt")
 
 
 def _codex_runs_wrapper(command, wrapper: Path) -> bool:
@@ -805,7 +935,9 @@ def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
     """A hooks.json group that fires our wrapper for every tool and lets it act: a
     match-all matcher (codex treats absent, "" and "*" alike), the exact command,
     synchronous where it blocks, and no shorter timeout than any we've written."""
-    if not isinstance(group, dict) or group.get("matcher") not in (None, "", "*"):
+    if not isinstance(group, dict):
+        return False
+    if event not in _CODEX_UNMATCHED_EVENTS and group.get("matcher") not in (None, "", "*"):
         return False
     floor = 10 if event == "PreToolUse" else 60
     hooks = group.get("hooks")
@@ -830,9 +962,9 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
         config = _load_codex_json(_read_user_file(hooks_path, follow=True))
     except Exception:
         return False
-    events = config.get("hooks") if isinstance(config, dict) else None
-    if not isinstance(events, dict):
+    if not _codex_can_load(config):
         return False
+    events = config.get("hooks", {})
     # Every event setup installs, or a dropped PreToolUse would still read healthy.
     return all(any(_codex_group_runs_wrapper(group, wrapper, event)
                    for group in (events.get(event) if isinstance(events.get(event), list) else []))
@@ -851,6 +983,8 @@ def _codex_detect_state(m, user_homes):
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
             script = m._is_our_hook_file(wrapper)
+            if not script and os.path.lexists(wrapper):
+                return "tampered"  # something other than our file holds the script path
             registered = False
             if os.path.lexists(hooks_path):
                 registered = m._run_as_user(username, _codex_hook_registered, hooks_path, wrapper)

@@ -276,13 +276,24 @@ def test_a_file_codex_would_refuse_to_parse_is_not_registered(m, tmp_path, spoil
     assert _state(m, home) == "tampered"
 
 
-@pytest.mark.parametrize("last_is_ours, expected", [(True, "persisted"), (False, "tampered")])
-def test_a_duplicate_key_keeps_the_last_value_as_codex_does(m, tmp_path, last_is_ours, expected):
+@pytest.mark.parametrize("last_is_ours", [True, False])
+def test_a_duplicate_known_field_makes_codex_refuse_the_file(m, tmp_path, last_is_ours):
+    """serde's derived structs reject a repeated field, so neither copy counts."""
     home = _profile(tmp_path, script=True)
     ours, empty = json.dumps(_ours(home)["hooks"]), "{}"
     first, last = (empty, ours) if last_is_ours else (ours, empty)
     (home / ".codex" / "hooks.json").write_text(f'{{"hooks": {first}, "hooks": {last}}}')
-    assert _state(m, home) == expected
+    assert _state(m, home) == "tampered"
+
+
+def test_a_duplicate_key_inside_free_form_mcp_input_is_fine(m, tmp_path):
+    """mcp_tool `input` is a map, not a struct, so a repeat just keeps the last value."""
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    raw = json.dumps(cfg)[:-2] + ', "Interrupt": [{"hooks": [{"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": 1, "a": 2}}]}]}}'
+    (home / ".codex" / "hooks.json").write_text(raw)
+    assert json.loads(raw)  # still valid JSON
+    assert _state(m, home) == "persisted"
 
 
 @pytest.mark.parametrize("timeout", [10.0, 15000.0])
@@ -292,6 +303,70 @@ def test_a_float_timeout_is_not_registered(m, tmp_path, timeout):
     cfg = _ours(home)
     cfg["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = timeout
     (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == "tampered"
+
+
+def _spoiled(home, mutate):
+    cfg = _ours(home)
+    mutate(cfg)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+
+
+def _add_sibling(cfg, handler):
+    cfg["hooks"]["PreToolUse"][0]["hooks"].append(handler)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda c: c.update(x=1),                                                     # unknown top-level key
+    lambda c: c.update(description=5),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "timeout": 1.5}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "timeout": 2 ** 64}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "timeout": -1}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "async": None}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "async": 0}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "additionalContextLimit": 1.0}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "statusMessage": 3}),
+    lambda c: _add_sibling(c, {"type": "command", "command": "/x", "commandWindows": "a", "command_windows": "b"}),
+    lambda c: _add_sibling(c, {"type": "command"}),                              # no command
+    lambda c: _add_sibling(c, {"type": "shell", "command": "/x"}),               # unknown handler type
+    lambda c: _add_sibling(c, {"command": "/x"}),                                # no type tag
+    lambda c: _add_sibling(c, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": None}}),
+    lambda c: _add_sibling(c, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": 2 ** 63}}),
+    lambda c: c["hooks"].update(SessionEnd=None),                                # a known event not a list
+    lambda c: c["hooks"]["PreToolUse"].append({"matcher": 3, "hooks": []}),
+    lambda c: c["hooks"]["PreToolUse"].append({"hooks": None}),
+])
+def test_a_file_codex_would_not_deserialize_is_not_registered(m, tmp_path, mutate):
+    """Codex rejects the whole hooks.json when any part fails its schema, so none
+    of our five entries run either."""
+    home = _profile(tmp_path, script=True)
+    _spoiled(home, mutate)
+    assert _state(m, home) == "tampered"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda c: c.update(description="team hooks"),
+    lambda c: c["hooks"].update(SomeFutureEvent=[{"x": 1}]),                     # unknown events are ignored
+    lambda c: c["hooks"]["PreToolUse"][0].update(note="kept"),                   # unknown group keys are ignored
+    lambda c: c["hooks"]["PreToolUse"][0]["hooks"][0].update(statusMessage="checking", extra=1),
+    lambda c: _add_sibling(c, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": [1, "b"]}}),
+    lambda c: _add_sibling(c, {"type": "prompt", "anything": 1}),
+    lambda c: c["hooks"]["Stop"][0].update(matcher="ignored-on-stop"),           # codex ignores it here
+])
+def test_content_codex_loads_still_counts(m, tmp_path, mutate):
+    home = _profile(tmp_path, script=True)
+    _spoiled(home, mutate)
+    assert _state(m, home) == "persisted"
+
+
+@pytest.mark.parametrize("squat", ["fifo", "dir"])
+def test_something_else_at_the_script_path_is_tampered(m, tmp_path, squat):
+    home = tmp_path / "u"
+    (home / ".codex" / "hooks").mkdir(parents=True)
+    if squat == "fifo":
+        os.mkfifo(_wrapper(home))
+    else:
+        _wrapper(home).mkdir()
     assert _state(m, home) == "tampered"
 
 

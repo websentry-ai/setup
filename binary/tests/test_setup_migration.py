@@ -1052,6 +1052,25 @@ def test_a_fresh_install_that_fails_reports_nothing(env, monkeypatch):
     assert _codex_states(env) == []
 
 
+def test_setup_makes_an_unloadable_hooks_json_loadable(env):
+    """An unknown top-level key or a malformed sibling makes codex refuse the
+    file, so setup drops just those and keeps everything codex can load."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    foreign = {"type": "command", "command": "/usr/bin/audit", "timeout": 30}
+    config["x"] = 1
+    config["hooks"]["PreToolUse"][0]["hooks"].append(foreign)
+    config["hooks"]["PreToolUse"].append({"hooks": [{"type": "command", "command": "/y", "timeout": 1.5}]})
+    hooks_json.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
+    repaired = json.loads(hooks_json.read_text())
+    assert setup_cmd._codex_can_load(repaired) and "x" not in repaired
+    assert foreign in repaired["hooks"]["PreToolUse"][0]["hooks"]
+
+
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
 
 def test_clear_strips_binary_hook_preserves_foreign(env):
