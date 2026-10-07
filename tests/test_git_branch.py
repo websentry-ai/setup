@@ -88,6 +88,15 @@ class TestPerCallResolution:
         assert _resolve(tool, m, str(repo / "src" / "a.py"), cache) == ("acme/web", BRANCH)
         assert _resolve(tool, m, str(wt / "b.py"), cache) == ("acme/web", WORKTREE_BRANCH)
 
+    def test_a_bash_cd_moves_the_shell_into_the_other_checkout(self, tool, repo, tmp_path):
+        if tool not in TOOL_HOOKS:
+            pytest.skip("shell tracking across cd lives in the tool-use resolvers")
+        wt = tmp_path / "web-wt"
+        _git(repo, "worktree", "add", "-q", str(wt), "-b", WORKTREE_BRANCH)
+        m = tool_module(HOOKS[tool])
+        project, branch, shell_dir = m._repo_for_tool_use("Bash", {"command": "cd %s && touch b.py" % wt}, str(repo), {})
+        assert (project, branch, shell_dir) == ("acme/web", WORKTREE_BRANCH, str(wt))
+
     def test_outside_a_repo_resolves_nothing(self, tool, tmp_path):
         m = tool_module(HOOKS[tool])
         assert _resolve(tool, m, str(tmp_path / "x.py"), {}) == (None, None)
@@ -186,6 +195,17 @@ class TestCopilotPayload:
         mapped = unbound.map_copilot_tool("write", {"filePath": str(tmp_path / "x.py"), "content": "x"},
                                           "ok", shell_state={"dir": str(tmp_path)}, root_projects={})
         assert "project" not in mapped and "git_branch" not in mapped
+
+
+    def test_turn_carries_the_branch(self, repo, tmp_path):
+        unbound = tool_module("copilot/hooks")
+        transcript = tmp_path / "events.jsonl"
+        transcript.write_text("\n".join(json.dumps(line) for line in [
+            {"type": "user.message", "id": "u1", "data": {"content": "edit a.py"}},
+            {"type": "assistant.message", "id": "a1", "data": {"content": "done"}},
+        ]) + "\n")
+        exchange = unbound.build_exchange_from_transcript(str(transcript), "S", cwd=str(repo))[0]
+        assert (exchange["project"], exchange["git_branch"]) == ("acme/web", BRANCH)
 
 
 class TestCodexPayload:

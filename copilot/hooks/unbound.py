@@ -6278,7 +6278,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     tool_use = []
     # Per-call project attribution state: the shell starts at the session
-    # cwd; origin lookups are cached once per repo across the turn.
+    # cwd; origin and branch lookups are cached once per repo across the turn.
     shell_state = {'dir': cwd}
     root_projects = {}
     mcp_servers = read_copilot_mcp_servers(cwd)

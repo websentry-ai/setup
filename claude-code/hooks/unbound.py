@@ -5058,7 +5058,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     transcript_path = None
     permission_mode = None
     # Per-tool-use project resolution state: the persistent shell starts at
-    # the session cwd; origin lookups are cached per repo root.
+    # the session cwd; origin and branch lookups are cached per repo root.
     shell_dir = cwd
     root_projects = {}
 
