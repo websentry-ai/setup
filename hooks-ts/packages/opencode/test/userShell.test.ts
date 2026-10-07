@@ -42,6 +42,24 @@ function bashPart(callID: string, status: string, command: string, sessionID = S
   };
 }
 
+test("a user !cmd is checked in its own absolute cwd; a relative cwd falls back to the instance directory", async () => {
+  const h = await startHarness(mock, "allow");
+  try {
+    await h.emit("message.part.updated", bashPart("c1", "running", "ls"));
+    await outcome(h.hook("shell.env")({ cwd: "/repo/sub", sessionID: S, callID: "c1" }, { env: {} }));
+    await h.emit("message.part.updated", bashPart("c2", "running", "ls"));
+    await outcome(h.hook("shell.env")({ cwd: "sub", sessionID: S, callID: "c2" }, { env: {} }));
+    const cwds = pretoolRequests(mock)
+      .slice(-2)
+      .map((r) => (r.body as PretoolRequestBody).pre_tool_use_data.metadata.cwd);
+    assert.equal(cwds[0], "/repo/sub", "an absolute cwd is used as-is");
+    assert.notEqual(cwds[1], "sub", "a relative cwd is never sent");
+    assert.ok(typeof cwds[1] === "string" && cwds[1].startsWith("/"), "it falls back to the instance directory");
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("shell.env is registered (V1-7 GO)", async () => {
   const h = await startHarness(mock, "allow");
   try {

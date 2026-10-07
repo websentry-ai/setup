@@ -19,6 +19,8 @@
 // the session transcript records the blocked command as `completed` with empty output. The reason is
 // toasted (bounded) before the raise, as for prompts. `output.env` is never touched.
 
+import { isAbsolute } from "node:path";
+
 import { USER_BASH_ID_PREFIX } from "../../core/src/constants.ts";
 import { evaluateToolCall } from "../../core/src/evaluate.ts";
 import type { EvaluateDeps, ToolEvaluation } from "../../core/src/evaluate.ts";
@@ -118,7 +120,9 @@ export async function checkUserCommandVerdict(
     const checker = resolved.checker;
     const scope = resolved.scope;
     if (checker === undefined || scope === undefined) return NO_USER_DECISION;
-    const cwd = typeof cwdRaw === "string" && cwdRaw.startsWith("/") ? cwdRaw : record.directory;
+    // The platform's notion of absolute (a drive-letter or UNC path on Windows), as `narrow.ts` uses
+    // for a model shell's `workdir`. A relative or missing cwd is the instance directory.
+    const cwd = typeof cwdRaw === "string" && cwdRaw !== "" && isAbsolute(cwdRaw) ? cwdRaw : record.directory;
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
     const evalDeps: EvaluateDeps = {
