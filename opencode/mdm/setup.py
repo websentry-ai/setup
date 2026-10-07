@@ -1730,6 +1730,11 @@ def clear_managed_reference() -> str:
                     status = "failed"
         if not found:
             return "not_found"
+        if status == "failed":
+            # opencode.json still names our copy (its rewrite or delete failed), so the copy,
+            # sidecar, package.json and marker stay: removing them would turn the surviving
+            # entry into a load error for every account, and the marker lets a retry finish.
+            return status
 
         if os.path.isdir(str(udir)):
             for name in (PLUGIN_NAME, SIDECAR_NAME, "package.json"):

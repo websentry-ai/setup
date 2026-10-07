@@ -193,6 +193,37 @@ class TestClear:
         assert "kept" in status or "failed" in status
         assert cfg.read_text() == text
 
+    def test_a_failed_config_rewrite_keeps_the_copy_it_still_references(self, oc_mdm_setup, managed, monkeypatch):
+        managed.mkdir(parents=True)
+        (managed / "opencode.json").write_text(json.dumps({"share": "disabled"}))
+        oc_mdm_setup.install_managed_reference(PAYLOAD, DIGEST)
+        before = (managed / "opencode.json").read_bytes()
+        real_write = oc_mdm_setup._write_root_file
+        broken = {"on": True}
+        monkeypatch.setattr(oc_mdm_setup, "_write_root_file",
+                            lambda *a, **k: False if broken["on"] else real_write(*a, **k))
+        assert oc_mdm_setup.clear_managed_reference() == "failed"
+        # The entry is still there, so the file it points at must be too (no load error), and
+        # the marker stays so a retry can finish the job.
+        assert (managed / "opencode.json").read_bytes() == before
+        for name in ("unbound.js", "unbound.js.sha256", "package.json"):
+            assert (managed / "unbound" / name).exists(), name
+        assert [p for p in (managed / "unbound").iterdir() if p.name not in
+                ("unbound.js", "unbound.js.sha256", "package.json")], "marker kept"
+        broken["on"] = False
+        assert oc_mdm_setup.clear_managed_reference() == "cleared"
+        assert _config(managed) == {"share": "disabled"}
+        assert not (managed / "unbound").exists()
+
+    def test_a_failed_config_delete_keeps_the_copy_it_still_references(self, oc_mdm_setup, managed, monkeypatch):
+        oc_mdm_setup.install_managed_reference(PAYLOAD, DIGEST)
+        real_clear = oc_mdm_setup._clear_path
+        monkeypatch.setattr(oc_mdm_setup, "_clear_path",
+                            lambda p, label: "failed" if Path(p).name == "opencode.json" else real_clear(p, label))
+        assert oc_mdm_setup.clear_managed_reference() == "failed"
+        assert _config(managed) == {"plugin": [_uri(managed)]}
+        assert (managed / "unbound" / "unbound.js").read_bytes() == PAYLOAD
+
     def test_nothing_installed_is_not_found_and_creates_nothing(self, oc_mdm_setup, managed):
         assert oc_mdm_setup.clear_managed_reference() == "not_found"
         assert not managed.exists()
