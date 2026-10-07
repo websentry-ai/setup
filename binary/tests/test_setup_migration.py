@@ -1134,17 +1134,39 @@ def test_a_write_that_cannot_be_encoded_leaves_hooks_json_intact(env):
     assert hooks_json.read_text(encoding="utf-8") == text
 
 
-def test_a_nan_inside_mcp_input_is_repaired(env):
+def _with_mcp_nan(config):
+    config["hooks"]["Interrupt"] = [{"hooks": [
+        {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": "__NAN__"}}]}]
+
+
+def _with_handler_nan(config):
+    config["hooks"]["Stop"][0]["hooks"][0]["note"] = "__NAN__"
+
+
+@pytest.mark.parametrize("plant", [_with_mcp_nan, _with_handler_nan])
+def test_a_nan_anywhere_is_repaired(env, plant):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     hooks_json = env["home"] / ".codex" / "hooks.json"
     config = json.loads(hooks_json.read_text())
-    config["hooks"]["Interrupt"] = [{"hooks": [
-        {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": "__NAN__"}}]}]
+    plant(config)
     hooks_json.write_text(json.dumps(config).replace('"__NAN__"', "NaN"))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env)[-1] == "persisted"
     assert setup_cmd._codex_can_load(setup_cmd._load_codex_json(hooks_json.read_bytes()))
+
+
+def test_a_nan_on_an_unknown_top_level_key_is_dropped(env):
+    """The key is kept, as any unknown key is; the NaN codex can't parse is not."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["x"] = {"keep": 1, "bad": "__NAN__"}
+    del config["hooks"]["Stop"]  # forces a write
+    hooks_json.write_text(json.dumps(config).replace('"__NAN__"', "NaN"))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    repaired = setup_cmd._load_codex_json(hooks_json.read_bytes())
+    assert repaired["x"] == {"keep": 1} and "Stop" in repaired["hooks"]
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---

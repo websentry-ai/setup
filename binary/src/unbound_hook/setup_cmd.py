@@ -608,7 +608,17 @@ def _codex_make_loadable(config) -> dict:
             if group["hooks"] or not hooks:
                 kept.append(group)
         events[event] = kept
-    return clean
+    return _drop_non_finite(clean)
+
+
+def _drop_non_finite(value):
+    """Drop NaN/Infinity wherever they sit: codex's JSON parser rejects the whole file."""
+    if isinstance(value, dict):
+        return {k: _drop_non_finite(v) for k, v in value.items()
+                if not (isinstance(v, float) and not math.isfinite(v))}
+    if isinstance(value, list):
+        return [_drop_non_finite(v) for v in value if not (isinstance(v, float) and not math.isfinite(v))]
+    return value
 
 
 def _codex_handler_kept(handler) -> bool:
@@ -927,7 +937,7 @@ def _setup_codex(opts):
     # setup. No managed write and no user-level strip (the install IS the user
     # registration).
     user_homes = m.get_all_user_homes()
-    state = _codex_detect_state(m, user_homes)
+    state = _codex_detect_state(m, user_homes, gateway)
     installed = 0
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -1034,13 +1044,19 @@ def _codex_wrapper_runnable(wrapper: Path) -> bool:
 
 # The python installers patch the tenant gateway into the hook's one gateway literal;
 # resetting it gives the shipped script back, to compare against the shipped hashes.
-_PYTHON_ERA_GATEWAY = re.compile(r'(UNBOUND_GATEWAY_URL", |UNBOUND_GATEWAY_URL = )"[^"\n]*"')
-_PYTHON_ERA_DEFAULT_GATEWAY = '"https://api.getunbound.ai"'
+_PYTHON_ERA_GATEWAY = re.compile(r'(UNBOUND_GATEWAY_URL", |UNBOUND_GATEWAY_URL = )"([^"\n]*)"')
+_PYTHON_ERA_DEFAULT_GATEWAY = "https://api.getunbound.ai"
 
 
-def _python_era_hook_sha256(text: str) -> str:
-    canonical = _PYTHON_ERA_GATEWAY.sub(lambda match: match.group(1) + _PYTHON_ERA_DEFAULT_GATEWAY, text, count=1)
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+def _python_era_hook_sha256(text: str, gateways=(_PYTHON_ERA_DEFAULT_GATEWAY,)):
+    """The hash with the gateway reset to the default; None if the hook points at a
+    gateway other than the ones given, since the installers only wrote those."""
+    match = _PYTHON_ERA_GATEWAY.search(text)
+    if match:
+        if match.group(2) not in gateways:
+            return None
+        text = text[:match.start()] + match.group(1) + f'"{_PYTHON_ERA_DEFAULT_GATEWAY}"' + text[match.end():]
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _known_python_era_hashes() -> frozenset:
@@ -1052,17 +1068,17 @@ def _known_python_era_hashes() -> frozenset:
     return CODEX_PYTHON_ERA_HOOK_SHA256 | {bundled}
 
 
-def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset) -> bool:
+def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset, gateways: tuple) -> bool:
     """Runs as the profile's user: the script is the binary's wrapper or a python-era
     hook we shipped, not a no-op kept at our path with the right mode."""
     try:
         text = _read_user_file(wrapper, follow=False).decode("utf-8")
     except (OSError, ValueError):
         return False
-    return text == _codex_wrapper_source() or _python_era_hook_sha256(text) in python_era_hashes
+    return text == _codex_wrapper_source() or _python_era_hook_sha256(text, gateways) in python_era_hashes
 
 
-def _codex_detect_state(m, user_homes):
+def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
     """Install state before this run reasserts it, per profile, on the pair setup
     installs: the wrapper script and our hooks.json entry. Either alone leaves codex
     unenforced for that user. 'fresh' (no profile has either), 'persisted' (one has
@@ -1071,6 +1087,7 @@ def _codex_detect_state(m, user_homes):
         any_complete = False
         indeterminate = False
         python_era_hashes = _known_python_era_hashes()
+        gateways = (_PYTHON_ERA_DEFAULT_GATEWAY, gateway)
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
@@ -1078,7 +1095,7 @@ def _codex_detect_state(m, user_homes):
             if not script and os.path.lexists(wrapper):
                 return "tampered"  # something other than our file holds the script path
             if script:
-                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper, python_era_hashes)
+                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper, python_era_hashes, gateways)
                 if script is False:
                     return "tampered"  # a runnable script at our path that isn't ours
             registered = False

@@ -48,8 +48,8 @@ def _profile(tmp_path, name="u", *, script=False, config=None, raw=None) -> Path
     return home
 
 
-def _state(m, *homes):
-    return setup_cmd._codex_detect_state(m, [(ME, h) for h in homes])
+def _state(m, *homes, **kwargs):
+    return setup_cmd._codex_detect_state(m, [(ME, h) for h in homes], **kwargs)
 
 
 def _ours(home):
@@ -519,7 +519,20 @@ def test_a_python_era_hook_script_is_ours(m, tmp_path, gateway):
         real_hook = real_hook.replace('"https://api.getunbound.ai"', f'"{gateway}"')
     _wrapper(home).write_text(real_hook)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home) == "persisted"
+    assert _state(m, home, gateway=gateway or "https://api.getunbound.ai") == "persisted"
+
+
+@pytest.mark.parametrize("gateway", [
+    "https://allow-everything.example",  # a server that answers allow
+    "https://gateway.acme.example/\\xZZ",  # a SyntaxError: the hook never runs
+])
+def test_a_python_era_hook_pointing_elsewhere_is_not_ours(m, tmp_path, gateway):
+    """Only the default or this device's configured gateway was ever written there."""
+    home = _profile(tmp_path, script=True)
+    real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
+    _wrapper(home).write_text(real_hook.replace('"https://api.getunbound.ai"', f'"{gateway}"'))
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    assert _state(m, home, gateway="https://gateway.acme.example") == "tampered"
 
 
 def test_an_edited_python_era_hook_is_not_ours(m, tmp_path):
@@ -535,7 +548,9 @@ def test_the_shipped_hash_list_matches_the_canonical_form():
     hook canonicalises to itself."""
     bundled = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
     patched = bundled.replace('"https://api.getunbound.ai"', '"https://tenant.example"')
-    assert setup_cmd._python_era_hook_sha256(patched) == setup_cmd._python_era_hook_sha256(bundled)
+    assert (setup_cmd._python_era_hook_sha256(patched, ("https://tenant.example",))
+            == setup_cmd._python_era_hook_sha256(bundled))
+    assert setup_cmd._python_era_hook_sha256(patched) is None
     assert all(len(h) == 64 for h in setup_cmd.CODEX_PYTHON_ERA_HOOK_SHA256)
 
 
