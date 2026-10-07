@@ -626,9 +626,7 @@ def remove_hooks_from_settings() -> str:
                     continue
                 new_config = []
                 for item in event_config:
-                    # Anything empty reads as [], exactly as on main, so such an item is
-                    # still dropped. Only a truthy non-list — which used to crash the loop —
-                    # is now left in place instead.
+                    # Empty `hooks` reads as [] (item dropped); a truthy non-list is kept, not iterated.
                     if isinstance(item, dict) and isinstance(item.get("hooks") or [], list):
                         hooks = item.get("hooks") or []
                         new_hooks = [h for h in hooks

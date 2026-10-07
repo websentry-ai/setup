@@ -235,7 +235,7 @@ def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
     install merge, so our hook still gets registered for that user.
 
     A non-list event value is deliberately not covered: it keeps main's
-    behaviour, because both ways of handling it are worse (see WEB-6057)."""
+    behaviour, because both ways of handling it are worse."""
     home = tmp_path / "u"
     (home / ".codex" / "hooks").mkdir(parents=True)
     hooks_path = home / ".codex" / "hooks.json"

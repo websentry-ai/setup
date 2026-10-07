@@ -452,9 +452,7 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
 
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not isinstance(command, str) or not command:
-        # A non-string command is not ours, and must not raise: the membership
-        # test and shlex below throw on an int, bool or list, and the callers
-        # turn that into an aborted strip or a device-wide "no answer".
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     try:
         tokens = shlex.split(command, posix=(os.name != "nt"))

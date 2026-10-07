@@ -390,9 +390,7 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
 
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not isinstance(command, str) or not command:
-        # A non-string command is not ours, and must not raise: the membership
-        # test and shlex below throw on an int, bool or list, and the callers
-        # turn that into an aborted strip or a device-wide "no answer".
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     try:
         tokens = shlex.split(command, posix=(os.name != "nt"))
@@ -564,15 +562,11 @@ def remove_hooks_from_config() -> str:
         for event in list(config["hooks"].keys()):
             event_config = config["hooks"][event]
             if not isinstance(event_config, list):
-                # Nothing of ours can be registered in a non-list, and
-                # iterating it raises — which aborted the strip and left our
-                # hook in place on a machine being cleaned.
+                # Nothing of ours can be registered in a non-list; skip it rather than raise.
                 continue
             new_config = []
             for item in event_config:
-                # Anything empty reads as [], exactly as on main, so such an item is
-                # still dropped. Only a truthy non-list — which used to crash the loop —
-                # is now left in place instead.
+                # Empty `hooks` reads as [] (item dropped); a truthy non-list is kept, not iterated.
                 if isinstance(item, dict) and isinstance(item.get("hooks") or [], list):
                     hooks = item.get("hooks") or []
                     new_hooks = [h for h in hooks

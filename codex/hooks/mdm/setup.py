@@ -671,9 +671,7 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not isinstance(command, str) or not command:
-        # A non-string command is not ours, and must not raise: the membership
-        # test and shlex below throw on an int, bool or list, and the callers
-        # turn that into an aborted strip or a device-wide "no answer".
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     # Binary install: command invokes the /opt/unbound hook binary (require both
     # the prefix and the binary name so a foreign hook merely mentioning the path
@@ -1108,9 +1106,7 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     config that merely references some other unbound.py / mentions /opt/unbound/
     isn't stripped."""
     if not isinstance(cmd, str) or not cmd:
-        # A non-string command is not ours, and must not raise: the membership
-        # tests below throw on an int or a bool, and the caller turns that into
-        # "no answer" for every profile on the device.
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
