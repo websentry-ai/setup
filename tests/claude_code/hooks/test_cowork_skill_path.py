@@ -172,6 +172,46 @@ class TestCoworkBundleScope(_CoworkTree):
         self.assertIsNone(self.resolve("anthropic-skills:xlsx"))
 
 
+class TestCoworkInstalledPlugins(_CoworkTree):
+    """Plugins a user installs from a marketplace or uploads, laid out as Cowork keeps them."""
+
+    def _plugin(self, root, declares, rel_skill, text="# skill", age=0):
+        _write(root / ".claude-plugin" / "plugin.json", '{"name": "%s"}' % declares)
+        return _write(root / rel_skill / "SKILL.md", text, age)
+
+    def cached(self, plugin, version, declares, rel_skill, **kw):
+        root = self.org / "cowork_plugins" / "cache" / "claude-plugins-official" / plugin / version
+        return self._plugin(root, declares, rel_skill, **kw)
+
+    def test_installed_marketplace_plugin_resolves(self):
+        skill = self.cached("plugin-dev", "2cd88e7947b7", "plugin-dev", "skills/skill-development")
+        self.assertEqual(self.resolve("plugin-dev:skill-development"), str(skill))
+
+    def test_a_skill_nested_under_skills_resolves(self):
+        skill = self.cached("Notion", "0.1.0", "Notion", "skills/notion/knowledge-capture")
+        self.assertEqual(self.resolve("Notion:knowledge-capture"), str(skill))
+
+    def test_the_newest_cached_version_of_one_plugin_wins(self):
+        self.cached("plugin-dev", "1.0.0", "plugin-dev", "skills/agent-development", text="# old", age=3600)
+        new = self.cached("plugin-dev", "2.0.0", "plugin-dev", "skills/agent-development", text="# new")
+        self.assertEqual(self.resolve("plugin-dev:agent-development"), str(new))
+
+    def test_an_uploaded_plugin_resolves(self):
+        root = self.org / "cowork_plugins" / "marketplaces" / "local-desktop-app-uploads" / "my-kit"
+        skill = self._plugin(root, "my-kit", "skills/deck-review")
+        self.assertEqual(self.resolve("my-kit:deck-review"), str(skill))
+
+    def test_the_marketplace_catalog_is_not_installed(self):
+        root = self.org / "cowork_plugins" / "marketplaces" / "knowledge-work-plugins" / "sales"
+        self._plugin(root, "sales", "skills/call-prep")
+        self.assertIsNone(self.resolve("sales:call-prep"))
+
+    def test_the_prefix_picks_between_an_org_plugin_and_an_installed_one(self):
+        self.plugin("review")
+        mine = self.cached("code-review", "1.0.0", "code-review", "skills/review")
+        self.assertEqual(self.resolve("code-review:review"), str(mine))
+
+
 class TestCoworkRunInAPickedFolder(_CoworkTree):
     """A run working in a folder the user picked: cwd is outside the sandbox and the
     transcript sits in a temp dir, named by a slug of the session's outputs path."""

@@ -4969,10 +4969,23 @@ def _plugin_manifest_name(plugin: Path) -> Optional[str]:
         return None
 
 
+def _cowork_plugin_dirs(org_dir: Path):
+    """(source, plugin dir) for every plugin a Cowork session can load: the org's plugins,
+    the user's uploads, and installed marketplace plugins, where each cached version of
+    one plugin is the same source. The marketplace catalog itself is not installed."""
+    for plugin in (org_dir / 'rpm').glob('*'):
+        yield plugin.name, plugin
+    plugins = org_dir / 'cowork_plugins'
+    for plugin in (plugins / 'marketplaces' / 'local-desktop-app-uploads').glob('*'):
+        yield 'upload:' + plugin.name, plugin
+    for version in (plugins / 'cache').glob('*/*/*'):
+        yield 'cache:%s/%s' % (version.parent.parent.name, version.parent.name), version
+
+
 def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
     """The SKILL.md a Cowork run used: the session's own copy for a bare name, else the
     newest version from the one source shipping it — the bundle for anthropic-skills,
-    the org plugin declaring any other prefix. No source, or two, resolves nothing."""
+    the plugin declaring any other prefix. No source, or two, resolves nothing."""
     own = session / '.claude' / 'skills' / name / 'SKILL.md'
     if not prefix and own.is_file():
         return str(own)
@@ -4985,11 +4998,12 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         if copies:
             sources['bundle'] = copies
     if prefix != COWORK_BUNDLED_SKILLS_PREFIX:
-        for plugin in (session.parent / 'rpm').glob('*'):
+        for source, plugin in _cowork_plugin_dirs(session.parent):
             if not plugin.is_dir() or (prefix and _plugin_manifest_name(plugin) != prefix):
                 continue
-            for path in plugin.glob('**/skills/%s/SKILL.md' % name):
-                sources.setdefault(plugin.name, []).append(path)
+            for path in plugin.glob('**/%s/SKILL.md' % name):
+                if 'skills' in path.relative_to(plugin).parts[:-2]:
+                    sources.setdefault(source, []).append(path)
     if len(sources) != 1:
         return None
     (copies,) = sources.values()
