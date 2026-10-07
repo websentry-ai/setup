@@ -630,6 +630,22 @@ GIT_COMMANDS = [
     'git branch -D old',
     'git branch --delete old',
     'git branch -rd origin/old',
+    'git branch -m old new',
+    'git branch -M main',
+    'git branch --move old new',
+    'git branch -f feature HEAD',
+    'git branch -c a b',
+    'git restore .',
+    'git apply fix.patch',
+    'git am fix.mbox',
+    'git worktree add ../x',
+    'git submodule update --init',
+    'git update-ref refs/heads/x abc123',
+    'git init',
+    'git clone https://example.com/x.git',
+    'git push>/dev/null',
+    'git stash>/dev/null 2>&1',
+    'git push>out.txt',
     'git tag v1.0',
     'git stash',
     'git stash pop',
@@ -659,8 +675,9 @@ GIT_READ_COMMANDS = [
     'git branch --show-current',
     'git remote -v',
     'git config --get user.name',
-    'git worktree list',
     'git reflog',
+    'git status>/dev/null',
+    'git log>/dev/null 2>&1',
     'git --version',
     'git status 2>/dev/null',
     'git',
@@ -763,6 +780,7 @@ def test_git_command_sets_are_reviewable_constants(hook):
     """The write call is one edit to a named constant, not buried in the parser."""
     assert 'commit' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'push' in hook._GIT_WRITE_SUBCOMMANDS
+    assert 'restore' in hook._GIT_WRITE_SUBCOMMANDS
     assert 'status' not in hook._GIT_WRITE_SUBCOMMANDS
     assert 'branch' not in hook._GIT_WRITE_SUBCOMMANDS
     assert '/dev/null' in hook._NULL_REDIRECT_TARGETS

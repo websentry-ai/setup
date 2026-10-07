@@ -3273,10 +3273,13 @@ _NULL_REDIRECT_TARGETS = frozenset({'/dev/null', '/dev/stdout', '/dev/stderr', '
 _GIT_OPTIONS_WITH_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env'})
 _GIT_WRITE_SUBCOMMANDS = frozenset({
     'add', 'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
-    'reset', 'checkout', 'switch', 'tag', 'stash', 'clean', 'rm', 'mv',
+    'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
+    'apply', 'am', 'worktree', 'submodule', 'update-ref', 'init', 'clone',
 })
-# `git branch` is gated only when it deletes: `-d`, `-D`, `--delete`, or a short-flag run containing one (`-rd`).
-_GIT_BRANCH_DELETE_RE = re.compile(r'^(?:--delete$|-[A-Za-z]*[dD])')
+# `git branch` is gated only when it deletes, moves, copies or forces: `-d`, `-D`, `-m`, `-M`, `-c`, `-C`, `-f`, or a short-flag run containing one (`-rd`).
+_GIT_BRANCH_WRITE_RE = re.compile(r'^(?:--(?:delete|move|copy|force)$|-[A-Za-z]*[dDmMcCf])')
+# A redirect glued to a word (`push>/dev/null`) ends the word; the operator and its target are not arguments.
+_WORD_REDIRECT_TAIL_RE = re.compile(r'[<>].*')
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -3302,7 +3305,7 @@ def _segment_words(segment):
     """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
     words = []
     for word in segment.split():
-        word = word.strip('()`{}"\'')
+        word = _WORD_REDIRECT_TAIL_RE.sub('', word).strip('()`{}"\'')
         if not words and (not word or word.startswith('-')
                           or _ENV_ASSIGNMENT_RE.match(word)
                           or word in _COMMAND_PREFIX_WORDS):
@@ -3324,24 +3327,21 @@ def _segment_writes(words):
 
 
 def _git_subcommand(words):
-    """(subcommand, args) of a git invocation, skipping global options such as `-C dir`; (None, []) when none is named."""
-    i = 1
-    while i < len(words):
-        word = words[i]
+    """(subcommand, arguments) of a git invocation, skipping global options such as `-C dir`; (None, []) when none is named."""
+    remaining = iter(words[1:])
+    for word in remaining:
         if word in _GIT_OPTIONS_WITH_VALUE:
-            i += 2
-        elif word.startswith('-'):
-            i += 1
-        else:
-            return word, words[i + 1:]
+            next(remaining, None)  # the option's value
+        elif not word.startswith('-'):
+            return word, list(remaining)
     return None, []
 
 
 def _git_segment_writes(words):
-    """Whether a git invocation runs a write subcommand; `git branch` only when it deletes."""
-    subcommand, args = _git_subcommand(words)
+    """Whether a git invocation runs a write subcommand; `git branch` only with a flag that changes refs."""
+    subcommand, arguments = _git_subcommand(words)
     if subcommand == 'branch':
-        return any(_GIT_BRANCH_DELETE_RE.match(arg) for arg in args)
+        return any(_GIT_BRANCH_WRITE_RE.match(argument) for argument in arguments)
     return subcommand in _GIT_WRITE_SUBCOMMANDS
 
 

@@ -628,6 +628,8 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
              'sudo git push', 'GIT_SSH_COMMAND=ssh git push', 'git log | git commit -m x',
              'git -C . reset --hard', 'git branch -D old', 'git stash',
              'git checkout -b feature', 'git rebase main', 'git clean -fd',
+             'git restore .', 'git apply fix.patch', 'git branch -m old new',
+             'git push>/dev/null', 'git stash>/dev/null 2>&1',
              'git tag v1', 'git status > status.txt',
              'rm auth.py', 'rm -rf build/', 'mv a b', 'cp a b', 'touch new.py',
              'mkdir -p src/x', "sed -i 's/a/b/' f", "perl -pi -e 's/a/b/' f",
@@ -645,6 +647,7 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
                'git status --short; git diff --stat', 'git -C . status',
                'git branch -a', 'git remote -v', 'git branch feature',
                'git config --get user.name', 'git status 2>/dev/null',
+               'git status>/dev/null',
                'ls ~/.clasprc.json 2>/dev/null',
                'ls ~/.clasprc.json 2>/dev/null && echo exists || echo "not logged in"',
                'cat notes.md 2>/dev/null', 'npm test > /dev/null 2>&1']
