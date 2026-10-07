@@ -1062,6 +1062,7 @@ def test_setup_makes_an_unloadable_hooks_json_loadable(env):
     config["x"] = 1
     config["hooks"]["PreToolUse"][0]["hooks"].append(foreign)
     config["hooks"]["PreToolUse"].append({"hooks": [{"type": "command", "command": "/y", "timeout": 1.5}]})
+    config["hooks"]["PreToolUse"].append({"hooks": [{"type": [], "command": "/z"}]})
     hooks_json.write_text(json.dumps(config))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0

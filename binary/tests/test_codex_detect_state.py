@@ -330,6 +330,8 @@ def _add_sibling(cfg, handler):
     lambda c: _add_sibling(c, {"type": "command"}),                              # no command
     lambda c: _add_sibling(c, {"type": "shell", "command": "/x"}),               # unknown handler type
     lambda c: _add_sibling(c, {"command": "/x"}),                                # no type tag
+    lambda c: _add_sibling(c, {"type": [], "command": "/x"}),                    # unhashable type tag
+    lambda c: _add_sibling(c, {"type": {}, "command": "/x"}),
     lambda c: _add_sibling(c, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": None}}),
     lambda c: _add_sibling(c, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": 2 ** 63}}),
     lambda c: c["hooks"].update(SessionEnd=None),                                # a known event not a list
@@ -368,6 +370,17 @@ def test_something_else_at_the_script_path_is_tampered(m, tmp_path, squat):
     else:
         _wrapper(home).mkdir()
     assert _state(m, home) == "tampered"
+
+
+def test_many_duplicate_keys_parse_in_linear_time(m, tmp_path):
+    """A user-controlled file full of repeated keys must not stall setup."""
+    import time
+    home = _profile(tmp_path, script=True)
+    body = ", ".join('"a": 0' for _ in range(300_000))
+    (home / ".codex" / "hooks.json").write_text("{" + body + "}")
+    started = time.monotonic()
+    assert _state(m, home) == "tampered"
+    assert time.monotonic() - started < 5
 
 
 # --- read the way codex does: a symlink is followed, a FIFO never blocks ------

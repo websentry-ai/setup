@@ -452,7 +452,10 @@ class _JsonObject(dict):
 def _json_object(pairs):
     obj = _JsonObject(pairs)
     if len(obj) != len(pairs):
-        obj.dups = frozenset(k for i, (k, _) in enumerate(pairs) if k in dict(pairs[:i]))
+        seen, dups = set(), set()
+        for key, _ in pairs:
+            (dups if key in seen else seen).add(key)
+        obj.dups = frozenset(dups)
     return obj
 
 
@@ -522,7 +525,8 @@ def _field_ok(value, kind) -> bool:
 
 
 def _codex_handler_loads(handler) -> bool:
-    fields = _CODEX_HANDLER_FIELDS.get(handler.get("type")) if isinstance(handler, dict) else None
+    kind = handler.get("type") if isinstance(handler, dict) else None
+    fields = _CODEX_HANDLER_FIELDS.get(kind) if isinstance(kind, str) else None
     if fields is None or not _struct_ok(handler, fields):
         return False
     if "commandWindows" in handler and "command_windows" in handler:
