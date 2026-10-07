@@ -550,7 +550,7 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
                     existing_item["hooks"] = kept
                     if not kept:
                         existing_config.remove(existing_item)
-        if not any(_codex_group_runs_wrapper(item, wrapper) for item in existing_config):
+        if not any(_codex_group_runs_wrapper(item, wrapper, event) for item in existing_config):
             existing_config.extend(new_config)
 
     if json.dumps(config, sort_keys=True) == before:
@@ -757,29 +757,49 @@ def _setup_codex(opts):
     return ("configured", None)
 
 
+# Characters the shell acts on in an unquoted word.
+_SHELL_SPECIAL = set(" \t\n\"'\\$`;&|<>()*?[]{}~#!")
+# Events where an async hook can't block, so codex wouldn't enforce our answer.
+# Older installs wrote async only on PostToolUse and SessionStart.
+_CODEX_BLOCKING_EVENTS = ("PreToolUse", "UserPromptSubmit", "Stop")
+
+
 def _codex_runs_wrapper(command, wrapper: Path) -> bool:
-    """The command, as the shell splits it, is exactly our wrapper: the only shapes
-    our installers write here (bare or quoted path). Anything around it, including
-    a launcher the user controls, can skip the hook."""
+    """The command is literally a way our installers write the wrapper: shell-
+    quoted, or single/double-quoted or bare where the shell expands nothing.
+    Anything else can expand, redirect or skip it."""
     if not isinstance(command, str):
         return False
-    try:
-        tokens = shlex.split(command)
-    except ValueError:
-        return False
-    # Exact, not normpath'd: the shell can't run "<wrapper>/" or "<wrapper>/.".
-    return tokens == [str(wrapper)]
+    path = str(wrapper)
+    forms = {shlex.quote(path)}
+    if "'" not in path:
+        forms.add(f"'{path}'")
+    if not any(c in path for c in '"$`\\'):
+        forms.add(f'"{path}"')
+    if not any(c in _SHELL_SPECIAL for c in path):
+        forms.add(path)
+    return command in forms
 
 
-def _codex_group_runs_wrapper(group, wrapper: Path) -> bool:
-    """A hooks.json group that fires our wrapper for every tool: a match-all
-    matcher (codex treats absent, "" and "*" alike) and a command that is it."""
+def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
+    """A hooks.json group that fires our wrapper for every tool and lets it act: a
+    match-all matcher (codex treats absent, "" and "*" alike), the exact command,
+    synchronous where it blocks, and no shorter timeout than any we've written."""
     if not isinstance(group, dict) or group.get("matcher") not in (None, "", "*"):
         return False
+    floor = 10 if event == "PreToolUse" else 60
     hooks = group.get("hooks")
-    return any(isinstance(h, dict) and h.get("type") == "command"
-               and _codex_runs_wrapper(h.get("command"), wrapper)
-               for h in (hooks if isinstance(hooks, list) else []))
+    for h in hooks if isinstance(hooks, list) else []:
+        if not (isinstance(h, dict) and h.get("type") == "command"
+                and _codex_runs_wrapper(h.get("command"), wrapper)):
+            continue
+        if h.get("async") and event in _CODEX_BLOCKING_EVENTS:
+            continue
+        timeout = h.get("timeout", floor)
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < floor:
+            continue
+        return True
+    return False
 
 
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
@@ -794,7 +814,7 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
     if not isinstance(events, dict):
         return False
     # Every event setup installs, or a dropped PreToolUse would still read healthy.
-    return all(any(_codex_group_runs_wrapper(group, wrapper)
+    return all(any(_codex_group_runs_wrapper(group, wrapper, event)
                    for group in (events.get(event) if isinstance(events.get(event), list) else []))
                for event in _codex_hooks_config(None))
 

@@ -963,6 +963,38 @@ def test_a_working_non_ascii_entry_on_a_symlink_is_left_alone(env, monkeypatch):
     assert dotfile.read_text() == before
 
 
+def test_an_old_era_install_is_not_duplicated(env):
+    """Pre-May installs carry a 10s PreToolUse timeout and async PostToolUse /
+    SessionStart; they're ours, so setup must not add a second copy."""
+    home = env["home"]
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    config = {}
+    for event in CODEX_EVENTS:
+        hook = {"type": "command", "command": str(wrapper),
+                "timeout": 10 if event == "PreToolUse" else 60}
+        if event in ("PostToolUse", "SessionStart"):
+            hook["async"] = True
+        config[event] = [{"matcher": "*", "hooks": [hook]}]
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": config}))
+    before = (home / ".codex" / "hooks.json").read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted"]
+    assert (home / ".codex" / "hooks.json").read_text() == before
+
+
+def test_setup_repairs_an_async_pretooluse(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = True
+    hooks_json.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
+
+
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
 
 def test_clear_strips_binary_hook_preserves_foreign(env):

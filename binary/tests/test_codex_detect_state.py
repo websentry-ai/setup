@@ -176,6 +176,57 @@ def test_a_non_command_entry_is_not_our_registration(m, tmp_path):
     assert _state(m, home) == "tampered"
 
 
+def _old_era(home):
+    """What the python installers wrote before async was removed: a 10s
+    PreToolUse timeout and async PostToolUse / SessionStart."""
+    cfg = _ours(home)
+    w = str(_wrapper(home))
+    timeouts = {"PreToolUse": 10}
+    for event in EVENTS:
+        hook = {"type": "command", "command": w, "timeout": timeouts.get(event, 60)}
+        if event in ("PostToolUse", "SessionStart"):
+            hook["async"] = True
+        cfg["hooks"][event] = [{"matcher": "*", "hooks": [hook]}]
+    return cfg
+
+
+def test_an_old_era_install_is_still_ours(m, tmp_path):
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_old_era(home)))
+    assert _state(m, home) == "persisted"
+
+
+@pytest.mark.parametrize("event", ["PreToolUse", "UserPromptSubmit", "Stop"])
+def test_an_async_hook_where_it_must_block_is_not_ours(m, tmp_path, event):
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    cfg["hooks"][event][0]["hooks"][0]["async"] = True
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == "tampered"
+
+
+@pytest.mark.parametrize("timeout, expected", [(1, "tampered"), (9, "tampered"), ("15000", "tampered"),
+                                               (True, "tampered"), (10, "persisted"), (15000, "persisted")])
+def test_a_pretooluse_timeout_shorter_than_any_we_wrote_is_not_ours(m, tmp_path, timeout, expected):
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    cfg["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = timeout
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == expected
+
+
+@pytest.mark.parametrize("shape, expected", [
+    ("{w}", "tampered"), ('"{w}"', "tampered"), ("'{w}'", "persisted"),
+])
+def test_a_home_path_the_shell_would_expand(m, tmp_path, shape, expected):
+    """`$Doe` in `/Users/Jane$Doe` is expanded bare or double-quoted, so only the
+    single-quoted form runs the wrapper."""
+    home = _profile(tmp_path, "Jane$Doe", script=True)
+    cfg = _registration(shape.format(w=_wrapper(home)))
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == expected
+
+
 # --- malformed content reads as "codex couldn't load it" ---------------------
 
 @pytest.mark.parametrize("raw", [
@@ -277,7 +328,7 @@ def test_tampered_wins_over_an_unknown_profile(m, tmp_path, monkeypatch):
     real = m._run_as_user
     monkeypatch.setattr(m, "_run_as_user",
                         lambda u, fn, path, w: None if path.parent.parent == b else real(u, fn, path, w))
-    assert _state(m, a, b) == "tampered"
+    assert _state(m, b, a) == "tampered"
 
 
 def test_the_file_is_read_as_the_profiles_user(m, tmp_path, monkeypatch):
