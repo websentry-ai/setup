@@ -49,10 +49,14 @@ const OPENCODE_BANNER = [
   " * the only deliberate blocks are a policy deny, an approval-required verdict (opencode v1 has no",
   " * native ask), or an org whose last successful response asked for block-on-failure.",
   " *",
-  " * The v2 `setup` entry is present but INACTIVE: it enforces nothing and, on a v2 host only,",
-  " * reports itself inactive.",
+  " * The v2 `setup` entry enforces on opencode 2.0.x through the same policy path, under the same",
+  " * fail-open contract: a built-in tool deny or approval is applied at `permission.evaluate`, an",
+  " * MCP block is raised from `tool.execute.before`, a blocked prompt is replaced with a block",
+  " * notice, and a blocked user shell command is raised from `shell.create.before`. It reports its",
+  " * per-capability status once per process (`v2_status`). On a 1.18.x host it stays inert.",
   " *",
-  " * Tested against opencode-ai 1.18.x (Bun-compiled CLI); also importable on Node >= 22.19.0.",
+  " * Tested against opencode-ai 1.18.x (Bun-compiled CLI) and @opencode/cli 2.0.x; also importable",
+  " * on Node >= 22.19.0.",
   " */",
 ].join("\n");
 

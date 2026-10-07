@@ -84,6 +84,11 @@ test("TARGETS holds the opencode target, built from the opencode package entry",
   assert.ok(opencode.banner.endsWith(" */"));
   // The opencode build test greps the whole output (banner included) for a Bun API access.
   assert.doesNotMatch(opencode.banner, /\bBun\.[A-Za-z]/);
+  // The banner ships at the top of opencode/index.js: it must describe the v2 entry as it is
+  // (enforcing since Phase 14), never as the inactive stub it once was.
+  assert.doesNotMatch(opencode.banner, /inactive/i);
+  assert.match(opencode.banner, /v2 `setup` entry[^.]*enforces/);
+  assert.match(opencode.banner, /opencode 2\.0\.x|@opencode\/cli 2\.0/);
   // pi stays first: its artifact and sidecar paths keep their place in every listing.
   assert.deepEqual(
     TARGETS.map((target) => target.name),
