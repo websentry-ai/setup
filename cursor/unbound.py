@@ -3304,7 +3304,8 @@ _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
 # git subcommands that change the repository; everything else (status, diff, log, fetch, config, aliases) passes.
 _GIT_WRITE_SUBCOMMANDS = frozenset({
     'add', 'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
-    'reset', 'checkout', 'switch', 'tag', 'stash', 'clean', 'rm', 'mv',
+    'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
+    'apply', 'am',
 })
 # `git branch` writes only when deleting.
 _GIT_BRANCH_DELETE_FLAGS = frozenset({'-d', '-D', '--delete'})
@@ -3323,7 +3324,7 @@ def _segment_words(segment):
     """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
     try:
         raw_words = shlex.split(segment)
-    except ValueError:  # unbalanced quote
+    except ValueError:  # unbalanced quote or trailing backslash
         raw_words = segment.split()
     words = []
     for word in raw_words:

@@ -628,6 +628,7 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
              'sudo git push', 'GIT_SSH_COMMAND=ssh git push', 'git stash | cat',
              'git --no-pager commit -m wip', 'git -c user.name=x commit -m wip',
              'git branch -d feature', 'git checkout .', 'git -C "a b" commit -m wip',
+             'git restore .', 'git apply fix.patch',
              'rm auth.py', 'rm -rf build/', 'mv a b', 'cp a b', 'touch new.py',
              'mkdir -p src/x', "sed -i 's/a/b/' f", "perl -pi -e 's/a/b/' f",
              'tee out.txt', 'truncate -s 0 f', 'dd if=a of=b', 'ln -s a b',
