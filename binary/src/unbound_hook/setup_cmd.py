@@ -470,12 +470,12 @@ def _load_codex_json(data: bytes):
 
     config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant)
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
-    if _json_depth(config) > _SERDE_MAX_DEPTH:
+    if _json_depth(config) >= _SERDE_MAX_DEPTH:
         raise ValueError("nested deeper than serde_json allows")
     return config
 
 
-_SERDE_MAX_DEPTH = 128  # serde_json's default recursion limit
+_SERDE_MAX_DEPTH = 128  # serde_json fails on the 128th nested [ or {
 
 
 def _json_depth(value) -> int:
@@ -1004,6 +1004,16 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
                for event in _codex_hooks_config(None))
 
 
+def _codex_wrapper_runnable(wrapper: Path) -> bool:
+    """Our wrapper as codex runs it: a regular file (not followed) its owner can
+    execute, since `$SHELL -lc "<path>"` fails on one without the bit."""
+    try:
+        mode = wrapper.lstat().st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) and bool(mode & stat.S_IXUSR)
+
+
 def _codex_detect_state(m, user_homes):
     """Install state before this run reasserts it, per profile, on the pair setup
     installs: the wrapper script and our hooks.json entry. Either alone leaves codex
@@ -1015,7 +1025,7 @@ def _codex_detect_state(m, user_homes):
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
-            script = m._is_our_hook_file(wrapper)
+            script = _codex_wrapper_runnable(wrapper)
             if not script and os.path.lexists(wrapper):
                 return "tampered"  # something other than our file holds the script path
             registered = False

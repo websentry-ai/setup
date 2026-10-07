@@ -677,6 +677,7 @@ def _plant_python_era_codex(home: Path, command: str):
     script = home / ".codex" / "hooks" / "unbound.py"
     script.parent.mkdir(parents=True)
     script.write_text("#!/usr/bin/env python3\n# python-era hook\n")
+    script.chmod(0o755)
     # Every python-era installer wrote all five events, with the same matchers.
     config = setup_cmd._codex_hooks_config(command.format(script=script))
     config["Stop"].append({"hooks": [{"type": "command", "command": "/usr/local/bin/other-hook"}]})
@@ -868,6 +869,7 @@ def test_setup_repairs_a_decoy_registration(env, decoy_shape):
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.chmod(0o755)
     decoy = decoy_shape.format(w=wrapper)
     (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
         e: [{"hooks": [{"type": "command", "command": decoy}]}] for e in CODEX_EVENTS}}))
@@ -953,6 +955,7 @@ def test_a_working_non_ascii_entry_on_a_symlink_is_left_alone(env, monkeypatch):
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.chmod(0o755)
     dotfile = env["tmp"] / "dotfiles" / "hooks.json"
     dotfile.parent.mkdir()
     dotfile.write_text(json.dumps({"hooks": setup_cmd._codex_hooks_config(str(wrapper))}))
@@ -971,6 +974,7 @@ def test_an_old_era_install_is_not_duplicated(env):
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.chmod(0o755)
     config = {}
     for event in CODEX_EVENTS:
         hook = {"type": "command", "command": str(wrapper),
@@ -1026,6 +1030,7 @@ def test_a_tamper_is_reported_even_when_the_only_install_fails(env, monkeypatch,
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("#!/usr/bin/env python3\n")
+    wrapper.chmod(0o755)
     hooks_json = home / ".codex" / "hooks.json"
     if blocker == "symlink":
         target = env["tmp"] / "dotfiles.json"

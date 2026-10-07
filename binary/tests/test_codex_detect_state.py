@@ -39,6 +39,7 @@ def _profile(tmp_path, name="u", *, script=False, config=None, raw=None) -> Path
     (home / ".codex" / "hooks").mkdir(parents=True)
     if script:
         _wrapper(home).write_text("#!/usr/bin/env python3\n")
+        _wrapper(home).chmod(0o755)  # every installer sets it
     hooks_json = home / ".codex" / "hooks.json"
     if raw is not None:
         hooks_json.write_text(raw)
@@ -361,6 +362,14 @@ def test_content_codex_loads_still_counts(m, tmp_path, mutate):
     assert _state(m, home) == "persisted"
 
 
+def test_a_wrapper_without_its_execute_bit_is_tampered(m, tmp_path):
+    """Codex runs the path through the shell, which can't execute it."""
+    home = _profile(tmp_path, script=True)
+    _wrapper(home).chmod(0o644)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    assert _state(m, home) == "tampered"
+
+
 @pytest.mark.parametrize("squat", ["fifo", "dir"])
 def test_something_else_at_the_script_path_is_tampered(m, tmp_path, squat):
     home = tmp_path / "u"
@@ -383,15 +392,17 @@ def test_many_duplicate_keys_parse_in_linear_time(m, tmp_path):
     assert time.monotonic() - started < 5
 
 
-@pytest.mark.parametrize("depth, expected", [(120, "persisted"), (150, "tampered")])
-def test_nesting_beyond_serde_json_s_limit_is_not_registered(m, tmp_path, depth, expected):
-    """serde_json refuses nesting past 128 levels, so codex can't load such a file."""
+@pytest.mark.parametrize("depth, expected", [(127, "persisted"), (128, "tampered"), (150, "tampered")])
+def test_nesting_at_serde_json_s_limit_is_not_registered(m, tmp_path, depth, expected):
+    """serde_json fails on the 128th nested [ or {, so codex can't load such a file."""
     home = _profile(tmp_path, script=True)
     cfg = _ours(home)
+    # The file, hooks, PreToolUse, group, hooks, handler and input objects are 7 levels.
     nested = 1
-    for _ in range(depth - 6):  # the handler's own objects add the remaining levels
+    for _ in range(depth - 7):
         nested = [nested]
     _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": nested}})
+    assert setup_cmd._json_depth(cfg) == depth
     (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
     assert _state(m, home) == expected
 
