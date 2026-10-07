@@ -661,6 +661,8 @@ SHELL_WRITE_COMMANDS = [
     'echo x >/dev/null >& README.md',
     'cmd >& out.log',
     'cmd >&out.log',
+    'cmd >&1.log',
+    'cmd >&-backup',
     'echo x > "out.txt"',
 ]
 # The anti-false-positive set: git or a write command appears in the LINE but is
@@ -687,7 +689,7 @@ NOT_COMMANDS = [
 # A redirect into a device creates nothing on disk.
 DEVICE_REDIRECTS = ['ls ~/.clasprc.json 2>/dev/null', 'cmd > /dev/null', 'cmd >/dev/null 2>&1',
                     'cmd >/dev/null; ls', 'echo x >/dev/stdout', 'echo x > /dev/stderr', 'cat f > /dev/tty',
-                    'cmd >& /dev/null', 'cmd >&2', 'cmd >&-', 'cmd 2>&1 >/dev/null',
+                    'cmd >& /dev/null', 'cmd >&2', 'cmd >&-', 'cmd 2>&1 >/dev/null', 'cmd >&2; ls', 'cmd 2>&1 | grep x',
                     'echo `git rev-parse HEAD 2>/dev/null`']
 
 

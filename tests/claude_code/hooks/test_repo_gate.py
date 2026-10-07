@@ -678,6 +678,8 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
         self.assertTrue(unbound._is_shell_write_command('echo x >/dev/null >& README.md'))
         self.assertFalse(unbound._is_shell_write_command('cmd >& /dev/null'))
         self.assertFalse(unbound._is_shell_write_command('cmd >&2'))
+        self.assertTrue(unbound._is_shell_write_command('cmd >&1.log'))
+        self.assertTrue(unbound._is_shell_write_command('cmd >&-backup'))
         self.assertTrue(unbound._is_shell_write_command('echo x > "out.txt"'))
 
     def test_indirect_invocation_is_deliberately_not_gated(self):
