@@ -881,6 +881,58 @@ def test_setup_repairs_a_decoy_registration(env, decoy_shape):
         assert cmds.count(str(wrapper)) == 1 and decoy in cmds
 
 
+def _only_home(env, monkeypatch, home):
+    for mod in env["modules"].values():
+        monkeypatch.setattr(mod, "get_all_user_homes", lambda: [(ME, home)])
+
+
+def _codex_commands(home, event):
+    hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
+    return [h["command"] for grp in hooks[event] for h in grp["hooks"]]
+
+
+def test_a_home_with_a_space_gets_one_working_entry(env, monkeypatch):
+    """Codex runs the command via `$SHELL -lc`, so the path is shell-quoted; the
+    old unquoted entry (split by the shell, never run) is replaced, not duplicated."""
+    home = env["tmp"] / "Jane Doe"
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
+        e: [{"hooks": [{"type": "command", "command": str(wrapper)}]}] for e in CODEX_EVENTS}}))
+    _only_home(env, monkeypatch, home)
+    for _ in range(3):
+        assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "persisted", "persisted"]
+    for event in CODEX_EVENTS:
+        assert _codex_commands(home, event) == [__import__("shlex").quote(str(wrapper))]
+
+
+@pytest.mark.parametrize("ours", [True, False])
+def test_a_symlinked_hooks_json_is_never_written_through(env, monkeypatch, ours):
+    """A dotfiles link that already registers our hook needs no write, so setup
+    succeeds; one that doesn't is refused rather than written through."""
+    home = env["home"]
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    dotfile = env["tmp"] / "dotfiles" / "hooks.json"
+    dotfile.parent.mkdir()
+    command = str(wrapper) if ours else "/usr/local/bin/other-hook"
+    dotfile.write_text(json.dumps({"hooks": {
+        e: [{"hooks": [{"type": "command", "command": command}]}] for e in CODEX_EVENTS}}))
+    (home / ".codex" / "hooks.json").symlink_to(dotfile)
+    before = dotfile.read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == (0 if ours else 1)
+    assert (home / ".codex" / "hooks.json").is_symlink() and dotfile.read_text() == before
+
+
+def test_an_unchanged_hooks_json_is_not_rewritten(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    os.utime(hooks_json, (1_000_000_000, 1_000_000_000))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert hooks_json.stat().st_mtime == 1_000_000_000
+
+
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
 
 def test_clear_strips_binary_hook_preserves_foreign(env):

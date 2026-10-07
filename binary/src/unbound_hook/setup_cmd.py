@@ -516,16 +516,19 @@ def _codex_wrapper_source() -> str:
     )
 
 
-def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
-    """Idempotent merge of the codex hook events into hooks.json, mirroring the
-    python configure_codex_hooks merge: re-runs don't duplicate our entry and
-    other tools' hooks are preserved."""
+def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
+    """Idempotent merge of the codex hook events into hooks.json, preserving other
+    tools' hooks. Writes only when something changed, so a file that already has
+    our hook is left alone even when it's a symlink we would refuse to write."""
+    wrapper = Path(wrapper_path)
+    command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
     try:
-        config = json.loads(_read_user_file(hooks_path, follow=False))
+        config = json.loads(_read_user_file(hooks_path, follow=True))
     except FileNotFoundError:
         config = {}
+    before = json.dumps(config, sort_keys=True)
 
-    hooks_config = _codex_hooks_config(hook_command)
+    hooks_config = _codex_hooks_config(command)
     if "hooks" not in config:
         config["hooks"] = {}
 
@@ -535,21 +538,31 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             continue
         existing_config = config["hooks"][event]
         our_hook_exists = False
-        for existing_item in existing_config:
+        for existing_item in list(existing_config):
             if not isinstance(existing_item, dict):
                 continue
             # .get's default only applies to a missing key, so a scalar here
             # would be iterated and raise before the command check ran.
             existing_hooks = existing_item.get("hooks")
-            for hook in existing_hooks if isinstance(existing_hooks, list) else []:
-                if not isinstance(hook, dict):
-                    continue
-                if _codex_runs_wrapper(hook.get("command"), Path(hook_command)):
-                    our_hook_exists = True
-                    break
+            if not isinstance(existing_hooks, list):
+                continue
+            if command != wrapper_path:
+                # Our earlier unquoted entry, which the shell splits and never runs.
+                kept = [h for h in existing_hooks
+                        if not (isinstance(h, dict) and h.get("command") == wrapper_path)]
+                if len(kept) != len(existing_hooks):
+                    existing_item["hooks"] = existing_hooks = kept
+                    if not kept:
+                        existing_config.remove(existing_item)
+                        continue
+            if any(isinstance(h, dict) and _codex_runs_wrapper(h.get("command"), wrapper)
+                   for h in existing_hooks):
+                our_hook_exists = True
         if not our_hook_exists:
             existing_config.extend(new_config)
 
+    if json.dumps(config, sort_keys=True) == before:
+        return
     fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(config, f, indent=2)
