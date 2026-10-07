@@ -762,7 +762,8 @@ def _codex_runs_wrapper(command, wrapper: Path) -> bool:
         tokens = shlex.split(command)
     except ValueError:
         return False
-    return len(tokens) == 1 and os.path.normpath(tokens[0]) == os.path.normpath(str(wrapper))
+    # Exact, not normpath'd: the shell can't run "<wrapper>/" or "<wrapper>/.".
+    return tokens == [str(wrapper)]
 
 
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:

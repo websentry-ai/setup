@@ -861,14 +861,15 @@ def test_a_fifo_in_one_profile_reports_tampered_from_the_others(env, monkeypatch
     assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
 
 
-def test_setup_repairs_a_decoy_registration(env):
+@pytest.mark.parametrize("decoy_shape", ['python3 -c "{w}"', '"{w}/"'])
+def test_setup_repairs_a_decoy_registration(env, decoy_shape):
     """A command that names the wrapper but skips it is not ours to the install
     either, so setup registers the real hook beside it and the next run is clean."""
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("#!/usr/bin/env python3\n")
-    decoy = f'python3 -c "{wrapper}"'
+    decoy = decoy_shape.format(w=wrapper)
     (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
         e: [{"hooks": [{"type": "command", "command": decoy}]}] for e in CODEX_EVENTS}}))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
