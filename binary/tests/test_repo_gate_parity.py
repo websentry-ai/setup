@@ -623,6 +623,8 @@ GIT_WRITE_COMMANDS = [
     'git branch -D feature',
     'git branch --delete feature',
     'git restore .',
+    'git --namespace x push',
+    'git --config-env user.name=X commit -m wip',
     'git apply fix.patch',
     'git am fix.mbox',
     'git -C "/tmp/a b" commit -m wip',

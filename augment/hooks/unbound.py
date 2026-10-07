@@ -3304,7 +3304,7 @@ _GIT_WRITE_SUBCOMMANDS = frozenset({
 # `git branch` writes only when deleting.
 _GIT_BRANCH_DELETE_FLAGS = frozenset({'-d', '-D', '--delete'})
 # git's own options that take the next word as their value, so `git -C dir commit` reads as `commit`.
-_GIT_OPTIONS_WITH_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree'})
+_GIT_OPTIONS_WITH_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--attr-source'})
 
 
 def _mask_quoted_runs(command):
