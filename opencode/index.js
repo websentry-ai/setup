@@ -779,9 +779,10 @@ function buildPretoolPayload(input, profile) {
     if (filePath !== void 0) metadata.file_path = filePath;
   }
   const capped = capCommand(brokered === void 0 ? input.command : "");
-  if (capped.truncated) {
+  const preCapped = brokered === void 0 ? adapterOriginalChars(input) : void 0;
+  if (capped.truncated || preCapped !== void 0) {
     metadata.command_truncated = true;
-    metadata.command_original_chars = input.command.length;
+    metadata.command_original_chars = Math.max(preCapped ?? 0, input.command.length);
   }
   const mcp = brokered === void 0 ? normaliseMcp(input.mcp) : void 0;
   if (mcp !== void 0) {
@@ -815,6 +816,15 @@ function buildPretoolPayload(input, profile) {
   const finished = withAccountIdentity(body, input.accountIdentity);
   if (brokered !== void 0) fitMcpBody(finished, brokered.args);
   return finished;
+}
+function adapterOriginalChars(input) {
+  try {
+    const raw = input.commandOriginalChars;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return void 0;
+    return raw > input.command.length ? raw : void 0;
+  } catch {
+    return void 0;
+  }
 }
 function applyWireArgs(metadata, wire) {
   metadata.tool_input = wire.toolInput;
@@ -2091,6 +2101,7 @@ async function evaluateToolCall(call, deps) {
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
       lastUserPrompt: readPrompt(source),
+      ...typeof source.commandOriginalChars === "number" ? { commandOriginalChars: source.commandOriginalChars } : {},
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
       ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } },
       ...source.patchOperation === "delete" ? { patchOperation: "delete" } : {}
@@ -3294,25 +3305,32 @@ async function decideUserShell(input, ctx) {
     const checker = resolved.checker;
     const scope = resolved.scope;
     if (checker === void 0 || scope === void 0) return void 0;
-    const command = runtime.takeUserShell(sessionID, callID);
-    if (command === void 0) {
+    const stashed = runtime.takeUserShell(sessionID, callID);
+    if (stashed === void 0) {
       runtime.reportSignal(SIGNAL_USER_SHELL_UNCHECKED, "bash", "no_part");
       return void 0;
     }
-    return await checkUserCommand(command, readString4(input, "cwd"), sessionID, callID, ctx);
+    return await checkUserCommand(
+      stashed.command,
+      readString4(input, "cwd"),
+      sessionID,
+      callID,
+      ctx,
+      stashed.originalChars
+    );
   } catch {
     return void 0;
   }
 }
 var NO_USER_DECISION = Object.freeze({ message: void 0, kind: void 0 });
-async function checkUserCommand(command, cwdRaw, sessionID, callID, ctx) {
+async function checkUserCommand(command, cwdRaw, sessionID, callID, ctx, originalChars) {
   try {
-    return (await checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx)).message;
+    return (await checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx, originalChars)).message;
   } catch {
     return void 0;
   }
 }
-async function checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx) {
+async function checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx, originalChars) {
   try {
     const { runtime, record } = ctx;
     if (typeof command !== "string" || command === "") return NO_USER_DECISION;
@@ -3349,7 +3367,8 @@ async function checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx) 
         toolInput: {},
         cwd,
         sessionId: sessionID,
-        model: sessionID === "" ? void 0 : runtime.modelFor(sessionID)
+        model: sessionID === "" ? void 0 : runtime.modelFor(sessionID),
+        ...originalChars === void 0 ? {} : { commandOriginalChars: originalChars }
       },
       evalDeps
     );
@@ -3369,7 +3388,7 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "ebb7fbe027f819b8f084c53837a58d1b" : "source";
+var BUILD_TOKEN = true ? "4f84820750f21ec06be99b86f7c676f3" : "source";
 function isBuildToken(value) {
   return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 }
@@ -3858,7 +3877,12 @@ function createRuntime(overrides = {}) {
         if (sessionID === "" || callID === "" || typeof command !== "string" || command === "") return;
         const kept = extras.get(sessionID);
         if (kept.before.has(callID)) return;
-        boundedSet(kept.shell, callID, capCommand(command).command, MAX_SHELL_STASH_PER_SESSION);
+        boundedSet(
+          kept.shell,
+          callID,
+          { command: capCommand(command).command, originalChars: command.length },
+          MAX_SHELL_STASH_PER_SESSION
+        );
       } catch {
       }
     },

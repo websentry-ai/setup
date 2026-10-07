@@ -836,9 +836,10 @@ function buildPretoolPayload(input, profile) {
     if (filePath !== void 0) metadata.file_path = filePath;
   }
   const capped = capCommand(brokered === void 0 ? input.command : "");
-  if (capped.truncated) {
+  const preCapped = brokered === void 0 ? adapterOriginalChars(input) : void 0;
+  if (capped.truncated || preCapped !== void 0) {
     metadata.command_truncated = true;
-    metadata.command_original_chars = input.command.length;
+    metadata.command_original_chars = Math.max(preCapped ?? 0, input.command.length);
   }
   const mcp = brokered === void 0 ? normaliseMcp(input.mcp) : void 0;
   if (mcp !== void 0) {
@@ -872,6 +873,15 @@ function buildPretoolPayload(input, profile) {
   const finished = withAccountIdentity(body, input.accountIdentity);
   if (brokered !== void 0) fitMcpBody(finished, brokered.args);
   return finished;
+}
+function adapterOriginalChars(input) {
+  try {
+    const raw = input.commandOriginalChars;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return void 0;
+    return raw > input.command.length ? raw : void 0;
+  } catch {
+    return void 0;
+  }
 }
 function applyWireArgs(metadata, wire) {
   metadata.tool_input = wire.toolInput;
@@ -2045,6 +2055,7 @@ async function evaluateToolCall(call, deps) {
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
       lastUserPrompt: readPrompt(source),
+      ...typeof source.commandOriginalChars === "number" ? { commandOriginalChars: source.commandOriginalChars } : {},
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
       ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } },
       ...source.patchOperation === "delete" ? { patchOperation: "delete" } : {}
