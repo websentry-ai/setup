@@ -262,6 +262,31 @@ def test_a_file_the_user_cannot_read_is_not_registered(m, tmp_path):
         hooks_json.chmod(0o644)
 
 
+@pytest.mark.parametrize("spoil", [
+    lambda raw: "\ufeff" + raw,                                   # byte-order mark
+    lambda raw: raw[:-1] + ', "x": NaN}',                          # NaN
+    lambda raw: raw[:-1] + ', "x": Infinity}',                     # Infinity
+    lambda raw: raw[:-1] + ', "hooks": ' + raw[raw.index(":") + 1:],  # duplicate key
+    lambda raw: raw[:-1] + ', "x": "\\ud800"}',                  # lone surrogate
+])
+def test_a_file_codex_would_refuse_to_parse_is_not_registered(m, tmp_path, spoil):
+    """Python's json accepts these; codex's serde_json does not, so no hook runs."""
+    home = _profile(tmp_path, script=True)
+    raw = json.dumps(_ours(home))
+    (home / ".codex" / "hooks.json").write_text(spoil(raw), encoding="utf-8")
+    assert _state(m, home) == "tampered"
+
+
+@pytest.mark.parametrize("timeout", [10.0, 15000.0])
+def test_a_float_timeout_is_not_registered(m, tmp_path, timeout):
+    """Codex reads timeout as a u64, so a float makes it reject the whole file."""
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    cfg["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] = timeout
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == "tampered"
+
+
 # --- read the way codex does: a symlink is followed, a FIFO never blocks ------
 
 @pytest.mark.parametrize("ours", [True, False])

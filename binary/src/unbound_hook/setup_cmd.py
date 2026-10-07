@@ -444,6 +444,25 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
     return data
 
 
+def _load_codex_json(data: bytes):
+    """Parse as strictly as codex's serde_json, which rejects what Python's json
+    accepts: a byte-order mark, NaN/Infinity, duplicate keys, lone surrogates."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("byte-order mark")
+
+    def _pairs(pairs):
+        if len({k for k, _ in pairs}) != len(pairs):
+            raise ValueError("duplicate key")
+        return dict(pairs)
+
+    def _constant(name):
+        raise ValueError(name)
+
+    config = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
+    json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
+    return config
+
+
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
     actually discovers them from), mirroring the python user-level
@@ -522,9 +541,8 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     our hook is left alone even when it's a symlink we would refuse to write."""
     wrapper = Path(wrapper_path)
     command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
-    bare_path_runs = _codex_runs_wrapper(wrapper_path, wrapper)
     try:
-        config = json.loads(_read_user_file(hooks_path, follow=True))
+        config = _load_codex_json(_read_user_file(hooks_path, follow=True))
     except FileNotFoundError:
         config = {}
     before = json.dumps(config, sort_keys=True)
@@ -538,20 +556,21 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
             config["hooks"][event] = new_config
             continue
         existing_config = config["hooks"][event]
-        if not bare_path_runs:
-            # Our earlier unquoted entry, which the shell splits and never runs.
-            for existing_item in list(existing_config):
-                existing_hooks = existing_item.get("hooks") if isinstance(existing_item, dict) else None
-                if not isinstance(existing_hooks, list):
-                    continue
-                kept = [h for h in existing_hooks
-                        if not (isinstance(h, dict) and h.get("command") == wrapper_path)]
-                if len(kept) != len(existing_hooks):
-                    existing_item["hooks"] = kept
-                    if not kept:
-                        existing_config.remove(existing_item)
-        if not any(_codex_group_runs_wrapper(item, wrapper, event) for item in existing_config):
-            existing_config.extend(new_config)
+        if any(_codex_group_runs_wrapper(item, wrapper, event) for item in existing_config):
+            continue
+        # Drop our own entries that don't work (unquoted path the shell splits,
+        # async, short timeout, narrowed matcher) so the real group isn't doubled.
+        for existing_item in list(existing_config):
+            existing_hooks = existing_item.get("hooks") if isinstance(existing_item, dict) else None
+            if not isinstance(existing_hooks, list):
+                continue
+            kept = [h for h in existing_hooks if not (isinstance(h, dict) and (
+                h.get("command") == wrapper_path or _codex_runs_wrapper(h.get("command"), wrapper)))]
+            if len(kept) != len(existing_hooks):
+                existing_item["hooks"] = kept
+                if not kept:
+                    existing_config.remove(existing_item)
+        existing_config.extend(new_config)
 
     if json.dumps(config, sort_keys=True) == before:
         return
@@ -795,8 +814,8 @@ def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
             continue
         if h.get("async") and event in _CODEX_BLOCKING_EVENTS:
             continue
-        timeout = h.get("timeout", floor)
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < floor:
+        timeout = h.get("timeout", floor)  # codex reads a u64: no float, no bool
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < floor:
             continue
         return True
     return False
@@ -807,7 +826,7 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
     profile's user and reads the file as codex does, following a symlink.
     Anything codex couldn't load counts as not registered."""
     try:
-        config = json.loads(_read_user_file(hooks_path, follow=True))
+        config = _load_codex_json(_read_user_file(hooks_path, follow=True))
     except Exception:
         return False
     events = config.get("hooks") if isinstance(config, dict) else None

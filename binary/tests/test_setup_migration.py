@@ -941,8 +941,9 @@ def test_setup_repairs_a_narrowed_matcher(env):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env) == ["fresh", "tampered", "persisted"]
+    # The narrowed copy is ours, so it's replaced rather than kept firing beside it.
     matchers = [g.get("matcher") for g in json.loads(hooks_json.read_text())["hooks"]["PreToolUse"]]
-    assert matchers == ["^$", "*"]
+    assert matchers == ["*"]
 
 
 def test_a_working_non_ascii_entry_on_a_symlink_is_left_alone(env, monkeypatch):
@@ -982,6 +983,21 @@ def test_an_old_era_install_is_not_duplicated(env):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env) == ["persisted"]
     assert (home / ".codex" / "hooks.json").read_text() == before
+
+
+@pytest.mark.parametrize("bad", [{"async": True}, {"timeout": 9.5}, {"timeout": True}, {"timeout": 15000.0}])
+def test_a_disqualified_entry_of_ours_is_replaced_not_doubled(env, bad):
+    """Codex would still run (or fail to load) our non-qualifying entry, so it's
+    removed when the real group is added: the wrapper fires once per event."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["hooks"]["PreToolUse"][0]["hooks"][0].update(bad)
+    hooks_json.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["fresh", "tampered"]
+    pre = json.loads(hooks_json.read_text())["hooks"]["PreToolUse"]
+    assert pre == setup_cmd._codex_hooks_config(str(env["home"] / ".codex" / "hooks" / "unbound.py"))["PreToolUse"]
 
 
 def test_setup_repairs_an_async_pretooluse(env):
