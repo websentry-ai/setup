@@ -24,9 +24,9 @@ import {
   ERROR_CATEGORY_BYPASS,
   ERROR_CATEGORY_TURNLOG,
   ERROR_REPORT_INTERVAL_MS,
-  HOOK_SOURCE,
 } from "./constants.ts";
 import type { ApiClient, HookErrorsBody } from "./client.ts";
+import type { AgentProfile } from "./profile.ts";
 
 /** Everything any report is allowed to know. Note the absence of a command or payload field. */
 export interface ReportContext {
@@ -49,7 +49,7 @@ export interface Telemetry {
   /** An enforcement failure: bypassed (fail-open) or blocked (fail-closed). Never anything else. */
   reportBypass(ctx: BypassContext): void;
   /**
-   * A lost audit row — `POST /v1/hooks/pi` failed. A separate method rather than a third state of
+   * A lost audit row — the turn-log POST (`AgentProfile.turnLogPath`) failed. A separate method rather than a third state of
    * `blocked`, because it is not an enforcement outcome at all: the check already happened and was
    * honoured. Filed under `ERROR_CATEGORY_TURNLOG`, which exists so this cannot reach the fail-open
    * alert. Shares the window, the re-entrancy guard and the redaction with `reportBypass`.
@@ -59,6 +59,11 @@ export interface Telemetry {
 
 export interface TelemetryOptions {
   client: Pick<ApiClient, "postHookErrors">;
+  /**
+   * Which agent is reporting. `hookSource` is both the `hook_source` field and the message prefix
+   * (`<hookSource> hook <category>: …`), so the Sentry tag and the fingerprint name the same agent.
+   */
+  profile: Pick<AgentProfile, "hookSource">;
   /** Absent key ⇒ never report: the endpoint answers 401 without an Authorization header (§B6). */
   apiKey?: string | undefined;
   now?: () => number;
@@ -106,12 +111,12 @@ export function createTelemetry(opts: TelemetryOptions): Telemetry {
       // `message.slice(0, 100)` (§B6), so a leading latency would fragment one alert into one per
       // millisecond value.
       const message = redactSecrets(
-        `pi hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
+        `${opts.profile.hookSource} hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
         apiKey,
       );
       const body: HookErrorsBody = {
         errors: [{ message, timestamp: new Date(at).toISOString(), category }],
-        hook_source: HOOK_SOURCE,
+        hook_source: opts.profile.hookSource,
       };
 
       void opts.client

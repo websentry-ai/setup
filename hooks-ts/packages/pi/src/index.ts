@@ -86,26 +86,22 @@ import {
   keyFingerprint,
   readCache,
   resolveCachePath,
-  resolvePiAgentDir,
   writeCache,
 } from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import {
   CACHE_TTL_MS,
-  MAX_INFLIGHT_MCP_CALLS,
-  MCP_INFLIGHT_MAX_AGE_MS,
-  MCP_TOOL_APPROVAL_REQUEST_EVENT,
   NO_KEY_NOTICE,
   SESSION_PRESENCE_ROW_ENABLED,
 } from "../../core/src/constants.ts";
-import { NATIVE_FILE_TOOLS } from "../../core/src/payload.ts";
+import { nativeFileTools } from "../../core/src/payload.ts";
+import { MAX_INFLIGHT_MCP_CALLS, MCP_INFLIGHT_MAX_AGE_MS, MCP_TOOL_APPROVAL_REQUEST_EVENT } from "./constants.ts";
 import { buildHeartbeatPayload, createHeartbeatGate } from "../../core/src/heartbeat.ts";
 import type { HeartbeatGate } from "../../core/src/heartbeat.ts";
 import { buildTurnLogBody } from "../../core/src/turnLog.ts";
 import { redactSecrets, resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
 import { keyState } from "../../core/src/keyState.ts";
-import { resolveClientEntrypoint } from "../../core/src/piVersion.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
@@ -120,6 +116,7 @@ import { createInflightCalls, createMcpApprovalListener, mintBrokerId } from "./
 import type { McpBrokerCall } from "./mcpBroker.ts";
 import { createMcpConfigReader } from "./mcpConfig.ts";
 import { isShellCall } from "./narrow.ts";
+import { PI_PROFILE } from "./profile.ts";
 import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
 import { notifySafe } from "./ui.ts";
@@ -162,7 +159,8 @@ function modelProviderOf(ctx: { model?: { provider?: unknown } | undefined }): s
 }
 
 /**
- * `"pi/0.87.1"` → `"0.87.1"`, for `metadata.pi_version`.
+ * `"pi/0.87.1"` → `"0.87.1"`, for the heartbeat's `metadata.<versionMetadataKey>`
+ * (`pi_version`).
  *
  * Derived from the resolved entrypoint rather than resolved a second time: two independent lookups
  * could disagree, and the entrypoint is the value that already survived `sanitizeVersion`.
@@ -200,7 +198,7 @@ export interface Deps {
    * Seams for the account-identity lookup (profile URL, fetch, serial probe, deadline). The agent dir
    * is NOT among them: it is always resolved from `env` / `homeDir`, exactly like the policy cache.
    */
-  identity: Omit<AccountIdentityLoaderOptions, "agentDir">;
+  identity: Omit<AccountIdentityLoaderOptions, "agentDir" | "readAuth">;
   /** pi's argv, read only for the adapter's `--mcp-config` flag. Defaults to `process.argv`. */
   argv: readonly string[];
 }
@@ -259,7 +257,7 @@ export function makeCacheSync(
   env: NodeJS.ProcessEnv = {},
   homeDir = "",
 ): ((snapshot: PolicySnapshot) => void) | undefined {
-  const cachePath = resolveCachePath(env, homeDir);
+  const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
   if (cachePath === undefined) return undefined;
   const fingerprint = keyFingerprint(apiKey);
   return (snapshot: PolicySnapshot) => {
@@ -280,11 +278,16 @@ export function defaultMakeChecker(
   env: NodeJS.ProcessEnv = {},
   homeDir = "",
 ): PolicyChecker {
-  const client = createApiClient({ baseUrl, apiKey });
+  const client = createApiClient({ baseUrl, apiKey, profile: PI_PROFILE });
   return createPolicyChecker({
     client,
     state: policyState,
-    telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+    telemetry: createTelemetry({
+      client,
+      apiKey,
+      profile: PI_PROFILE,
+      isInactive: () => keyState.isInactive(),
+    }),
     breaker: createBreaker({ now: Date.now }),
     keyState,
     onSync: makeCacheSync(apiKey, baseUrl, env, homeDir),
@@ -303,7 +306,7 @@ function hydrateFromCache(
   homeDir: string,
 ): void {
   try {
-    const cachePath = resolveCachePath(env, homeDir);
+    const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
     if (cachePath === undefined) return;
     const onDisk = readCache(cachePath, { gatewayUrl: baseUrl, fingerprint: keyFingerprint(apiKey) });
     if (onDisk !== undefined) policyState.hydrate(onDisk);
@@ -344,7 +347,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
    */
   const identityLoader: AccountIdentityLoader = createAccountIdentityLoader({
     ...deps.identity,
-    agentDir: resolvePiAgentDir(env, homeDir),
+    agentDir: PI_PROFILE.resolveAgentDir(env, homeDir),
+    // A profile may omit `readAuth`; then there is no credential store and no identity is sent.
+    readAuth: PI_PROFILE.readAuth ?? (() => undefined),
   });
 
   /** The settled identity as a spreadable option: `{}` while pending or when there is none. */
@@ -384,7 +389,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
    */
   function init(): Resolved {
     if (resolved === undefined) {
-      const apiKey = resolveApiKey(deps.env, deps.homeDir);
+      const apiKey = resolveApiKey(deps.env, deps.homeDir, PI_PROFILE);
       // One resolution, used for the cache identity, the hydrate and the checker — three call sites
       // that must not be able to disagree, since the base URL is half the cache key (WR-09).
       const baseUrl = apiKey === undefined ? undefined : resolveGatewayUrl(deps.env, deps.homeDir);
@@ -392,16 +397,21 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
       }
       const inactive = apiKey === undefined || baseUrl === undefined;
-      const client = inactive ? undefined : createApiClient({ baseUrl, apiKey });
+      const client = inactive ? undefined : createApiClient({ baseUrl, apiKey, profile: PI_PROFILE });
       resolved = {
         apiKey,
-        entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
+        entrypoint: deps.entrypoint ?? PI_PROFILE.resolveClientEntrypoint(deps.env, process.argv[1]),
         checker: inactive ? undefined : deps.makeChecker(apiKey, baseUrl),
         client,
         telemetry:
           client === undefined
             ? undefined
-            : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+            : createTelemetry({
+                client,
+                apiKey,
+                profile: PI_PROFILE,
+                isInactive: () => keyState.isInactive(),
+              }),
         cacheSync: inactive ? undefined : makeCacheSync(apiKey, baseUrl, deps.env, deps.homeDir),
       };
     }
@@ -576,7 +586,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           model: ctx.model?.id,
           clientEntrypoint: state.entrypoint,
           hasUI: ctx.hasUI === true,
-          piVersion: versionOf(state.entrypoint),
+          agentVersion: versionOf(state.entrypoint),
         };
         const client = state.client;
         // The heartbeat waits for the identity (bounded by its deadline) so the session's first
@@ -584,10 +594,13 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         void identityPending
           .then((identity) =>
             client.postPretool(
-              buildHeartbeatPayload({
-                ...heartbeatInput,
-                ...(identity === undefined ? {} : { accountIdentity: identity }),
-              }),
+              buildHeartbeatPayload(
+                {
+                  ...heartbeatInput,
+                  ...(identity === undefined ? {} : { accountIdentity: identity }),
+                },
+                PI_PROFILE,
+              ),
             ),
           )
           .then((result) => {
@@ -642,7 +655,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         // A non-native, non-shell call may be an MCP tool the adapter will broker: remember it, so
         // the broker handler can put this call's id on the audit row. No request, no resolution —
         // enforcement happens at the broker — and nothing remembered when nothing will be posted.
-        if (recordingActive(state) && !isShellCall(event) && !NATIVE_FILE_TOOLS.has(event.toolName)) {
+        if (recordingActive(state) && !isShellCall(event) && !nativeFileTools(PI_PROFILE.fileTools).has(event.toolName)) {
           inflight.remember(
             { toolCallId: event.toolCallId, toolName: event.toolName, input: event.input },
             sessionIdOf(ctx),

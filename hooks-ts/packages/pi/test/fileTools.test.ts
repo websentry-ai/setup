@@ -32,6 +32,7 @@ import { decideToolCall } from "../src/decide.ts";
 import type { DecideDeps } from "../src/decide.ts";
 import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
 
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
@@ -47,7 +48,7 @@ interface DepsOptions {
 }
 
 function depsFor(api: MockApi, opts: DepsOptions = {}): DecideDeps {
-  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: PI_PROFILE });
   // One state object for both the checker and the adapter: the skip decision and the recorded
   // response have to be talking about the same memory, or the test proves nothing.
   const state = opts.state ?? createPolicyState();
@@ -55,7 +56,7 @@ function depsFor(api: MockApi, opts: DepsOptions = {}): DecideDeps {
     checker: createPolicyChecker({
       client,
       state,
-      telemetry: createTelemetry({ client, apiKey: TEST_KEY }),
+      telemetry: createTelemetry({ client, apiKey: TEST_KEY, profile: PI_PROFILE }),
       now: opts.now,
     }),
     apiKey: TEST_KEY,

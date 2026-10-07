@@ -21,9 +21,10 @@
 // `/fork`, `/clone` and `/reload` (`agent-session-runtime.js:141,165,211,229,246,291`), so a developer
 // cycling `/new` five times sends five heartbeats against an ungated implementation (T-09-23).
 
-import { APP_LABEL, EVENT_NAME_SESSION_START, TURNLOG_MODEL } from "./constants.ts";
+import { EVENT_NAME_SESSION_START, TURNLOG_MODEL } from "./constants.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
 import { withAccountIdentity } from "./payload.ts";
+import type { AgentProfile } from "./profile.ts";
 import type { PretoolRequestBody } from "./types.ts";
 
 export interface HeartbeatInput {
@@ -33,8 +34,9 @@ export interface HeartbeatInput {
   model: string | undefined;
   clientEntrypoint: string;
   hasUI: boolean;
-  piVersion: string;
-  /** The account pi is signed in as, when the session_start lookup produced one. */
+  /** The agent's own version, sent under the metadata key `AgentProfile.versionMetadataKey` names. */
+  agentVersion: string;
+  /** The account the agent is signed in as, when the session_start lookup produced one. */
   accountIdentity?: AccountIdentity;
 }
 
@@ -58,7 +60,10 @@ export interface HeartbeatGateOptions {
  * session start, and the wire field is required. Note that this is a pretool request, where the model
  * is not row-gating — but sending the same honest placeholder from both paths beats two conventions.
  */
-export function buildHeartbeatPayload(input: HeartbeatInput): PretoolRequestBody {
+export function buildHeartbeatPayload(
+  input: HeartbeatInput,
+  profile: Pick<AgentProfile, "appLabel" | "versionMetadataKey">,
+): PretoolRequestBody {
   const body: PretoolRequestBody = {
     conversation_id: input.sessionId,
     model: input.model !== undefined && input.model.length > 0 ? input.model : TURNLOG_MODEL,
@@ -68,13 +73,13 @@ export function buildHeartbeatPayload(input: HeartbeatInput): PretoolRequestBody
     pre_tool_use_data: {
       tool_name: "",
       command: "",
-      metadata: { cwd: input.cwd, has_ui: input.hasUI, pi_version: input.piVersion },
+      metadata: { cwd: input.cwd, has_ui: input.hasUI, [profile.versionMetadataKey]: input.agentVersion },
     },
     // Empty rather than absent: the field is required by the server type, and a heartbeat has no
     // prompt to report. Sending a blank prompt through the guardrail path is exactly what §C2 warns
     // against, which is why `event_name` above is not `user_prompt`.
     messages: [],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint,
     // Harmless here (the fall-through attaches no payload) and future-proof if the API later answers
     // this shape with one — at which point `recordSuccess` already handles the fields correctly.

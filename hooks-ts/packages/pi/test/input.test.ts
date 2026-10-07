@@ -33,6 +33,7 @@ import type { InputDeps } from "../src/prompt.ts";
 import { createFakeCtx, createFakeInputEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtxOptions, FakeInputOptions } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
 
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
@@ -47,12 +48,12 @@ const MAX_PROMPT = 8192;
 const IMAGE_MARKER = "aGVsbG8taW1hZ2UtZGF0YS1zZWNyZXQ";
 
 function depsFor(api: MockApi): InputDeps {
-  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: PI_PROFILE });
   return {
     checker: createPolicyChecker({
       client,
       state: createPolicyState(),
-      telemetry: createTelemetry({ client, apiKey: TEST_KEY }),
+      telemetry: createTelemetry({ client, apiKey: TEST_KEY, profile: PI_PROFILE }),
     }),
     apiKey: TEST_KEY,
     entrypoint: "pi/0.87.1",

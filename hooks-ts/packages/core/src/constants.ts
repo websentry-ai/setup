@@ -1,15 +1,17 @@
 // Every literal Phase 8 depends on, in exactly one place.
 //
-// RESEARCH assumption A3: `UNBOUND_PI_API_KEY` (and every other user-visible string) lives here so
-// Phase 9's handlers and Phase 10's `setup/pi/setup.py` installer import the same value instead of
-// re-typing it. Nothing in this file imports anything.
+// RESEARCH assumption A3: every user-visible string lives here so Phase 9's handlers and Phase 10's
+// `setup/pi/setup.py` installer import the same value instead of re-typing it. Nothing in this file
+// imports anything.
+//
+// What is NOT here: the facts that differ per agent. The agent-specific key env var, the errors
+// `hook_source`, the turn-log route, the wire app label, the heartbeat's version metadata key, the
+// agent's own directory and its credential-store layout come from the injected `AgentProfile`
+// (`profile.ts`).
 
 // --- Environment variables (naming precedent: RESEARCH §C3) ---------------------------------
-export const ENV_API_KEY_PI = "UNBOUND_PI_API_KEY";
 export const ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
 export const ENV_GATEWAY_URL = "UNBOUND_GATEWAY_URL";
-/** Exported by pi's managed-install launcher; its `current-version` file holds the pi version (§A8). */
-export const ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
 
 // --- Hosts, paths, identity ------------------------------------------------------------------
 /** unbound-cli `src/config.js:9` DEFAULT_GATEWAY_URL. */
@@ -17,22 +19,14 @@ export const DEFAULT_GATEWAY_URL = "https://api.getunbound.ai";
 export const CONFIG_DIR_NAME = ".unbound";
 export const CONFIG_FILE_NAME = "config.json";
 /**
- * The policy cache lives beside pi's own install, not in `~/.unbound`: `<agent dir>/.unbound/
- * policy_cache.json`. Same literal as `CONFIG_DIR_NAME`, deliberately a separate constant — the two
+ * The policy cache lives beside the agent's own install, not in `~/.unbound`: `<agent dir>/.unbound/
+ * policy_cache.json`, with the agent dir from `AgentProfile.resolveAgentDir`. Same literal as `CONFIG_DIR_NAME`, deliberately a separate constant — the two
  * have different parents and relocating one must not move the other.
  */
 export const CACHE_DIR_NAME = ".unbound";
 export const CACHE_FILE_NAME = "policy_cache.json";
-/** `join(homedir(), ...)` — pi's default agent dir, `PI/dist/config.js:405-427`. */
-export const PI_AGENT_DIR_SEGMENTS = [".pi", "agent"] as const;
-/** pi's own relocation hook, tilde-expanded, takes precedence over the default (§A6). */
-export const ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
 /** The cache is keyed on a digest, never on the key. See `keyFingerprint` (T-09-14). */
 export const KEY_FINGERPRINT_PREFIX = "sha256:";
-/** `unbound_app_label` on the wire; `'pi'` joined the union in Phase 7. */
-export const APP_LABEL = "pi";
-/** `hook_source` on POST /v1/hooks/errors — the label rides this field, there is no app label there. */
-export const HOOK_SOURCE = "pi";
 export const EVENT_NAME_TOOL_USE = "tool_use";
 /**
  * RES-05's `event_name`. It lands on `preToolUseHandler.ts:1008-1012` — the fall-through for an
@@ -71,11 +65,8 @@ export const EVENT_NAME_USER_PROMPT = "user_prompt";
 export const USER_BASH_ID_PREFIX = "ubash_";
 export const PRETOOL_PATH = "/v1/hooks/pretool";
 export const ERRORS_PATH = "/v1/hooks/errors";
-/**
- * The turn log (RES-04). `piHandler` is registered here and at `/hooks/pi`; unlike pretool, a missing
- * `Authorization: Bearer` is a hard 401 (`hooksHandlerFactory.ts:46-50`).
- */
-export const TURNLOG_PATH = "/v1/hooks/pi";
+// The turn-log route (RES-04) is per agent — `AgentProfile.turnLogPath`, e.g. `/v1/hooks/pi`. Unlike
+// pretool, a missing `Authorization: Bearer` there is a hard 401 (`hooksHandlerFactory.ts:46-50`).
 /**
  * **The turn log's `model` is this literal, not `ctx.model?.id`. Do not "improve" it.**
  *
@@ -95,6 +86,21 @@ export const TURNLOG_TOOL_USE_TYPE = "PostToolUse";
 
 // --- Timeouts (RESEARCH §F5: an unbounded confirm hangs the whole tool batch) -----------------
 export const PRETOOL_TIMEOUT_MS = 20_000;
+/**
+ * Added to `PRETOOL_TIMEOUT_MS` to give the outer bound `evaluate.ts` puts on one policy check.
+ *
+ * The client already aborts its own request at `PRETOOL_TIMEOUT_MS`, so this outer bound only fires
+ * for an injected or future checker that ignores its own deadline. On the normal path the client's
+ * abort always comes first, and the timing an adapter sees is unchanged.
+ */
+export const EVALUATE_DEADLINE_SLACK_MS = 2_000;
+/**
+ * The `errorClass` an outer-deadline timeout is reported under (IN-02), in the same CamelCase style
+ * as the client's own classes (`HttpStatus503`, `MalformedJson`, ...). It is filed through
+ * `reportBypass`, so it lands in `ERROR_CATEGORY_BYPASS` or `ERROR_CATEGORY_BLOCKED` like any other
+ * enforcement failure; no new category or wire field exists for it.
+ */
+export const EVALUATE_DEADLINE_ERROR_CLASS = "EvaluateDeadline";
 export const ERRORS_TIMEOUT_MS = 10_000;
 /**
  * The turn-log deadline, locked by 09-CONTEXT and matching the Python hook's 10 s curl timeout
@@ -151,6 +157,36 @@ export const BREAKER_OPEN_MS = 60_000;
  * because the last successful response was six minutes ago.
  */
 export const CACHE_TTL_MS = 300_000;
+
+/**
+ * How many sessions one process keeps a turn record for (`sessionState.ts`). A host that runs many
+ * sessions in one process counts every open session and every subagent session; real use is a
+ * handful. 256 is far above that and still bounds a desktop process that stays up for a week and
+ * never reports a session as ended — past it, the least-recently-used session's record is dropped.
+ */
+export const MAX_TRACKED_SESSIONS = 256;
+/**
+ * How many project directories one host process keeps per-instance state for (the heartbeat gate
+ * and the no-key notice latch). One per open project; 64 is more projects than one process serves.
+ */
+export const MAX_TRACKED_INSTANCES = 64;
+/**
+ * How many distinct gateway URLs one process keeps a circuit breaker for (`breakerRegistry.ts`).
+ * Normally exactly 1; more only when projects in the same process point at different gateways.
+ */
+export const MAX_TRACKED_GATEWAYS = 16;
+/**
+ * How many (gateway, API key) scopes one process keeps policy memory and a revoked-key latch for
+ * (`scopedState.ts`). Normally one per org a host serves; 16 is far above that.
+ */
+export const MAX_TRACKED_SCOPES = 16;
+/**
+ * The capacity `createKeyedState` uses when its `max` is unusable: not a number, not finite
+ * (`Infinity` included), or below 1 (IN-06). A caller asking for "unbounded" gets a bounded registry
+ * of this size, never a single-entry one that evicts on every new key. Equal to the largest of the
+ * per-purpose caps above.
+ */
+export const DEFAULT_KEYED_STATE_MAX = MAX_TRACKED_SESSIONS;
 
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;
@@ -283,6 +319,12 @@ export const MAX_ASSISTANT_CHARS = 16_384;
  */
 export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
 /**
+ * The longest MCP server or tool name sent as `metadata.mcp_server` / `metadata.mcp_tool`. A name
+ * longer than this is not a real name, so it is dropped, never truncated: a truncated name could
+ * attribute the call to a different server.
+ */
+export const MAX_MCP_NAME_CHARS = 256;
+/**
  * The only `metadata.tool_input` keys that leave the machine (WR-04 / T-09-03).
  *
  * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a native pi
@@ -293,6 +335,9 @@ export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
  *
  * **Widening this list is an egress decision, not a convenience.** A test spells the set out
  * independently so an addition cannot be slipped in as a formatting change.
+ *
+ * These are wire keys the server reads, not an agent's argument names. `path` here is unrelated to
+ * how a profile finds a file tool's path argument (`AgentProfile.fileTools.pathOf`).
  *
  * MCP arguments reach `metadata.tool_input` through the separate MCP branch in `payload.ts`
  * (`mcpArgsForWire`, whole up to 512 KiB, body under 900 KiB), which is the deliberate, MCP-only egress widening: the
@@ -331,8 +376,7 @@ export const CONFIRM_TITLE = "Unbound policy";
  * only while the modal was open.
  */
 export const CONFIRM_QUESTION = "Run this command?";
-export const NO_UI_REASON =
-  "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
+// The no-UI block reason names the agent and its CLI modes, so each adapter package owns its own.
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";
 export const NO_KEY_NOTICE = "Unbound: no API key found — extension inactive";
 /**
@@ -362,14 +406,13 @@ export const KEY_REJECTED_BLOCK_REASON =
 
 // --- Account identity (parity with the Claude Code hook's `account_identity`) ------------------
 
-/** pi's credential store, beside its own install: `<agent dir>/auth.json`. Read, never written. */
-export const PI_AUTH_FILE_NAME = "auth.json";
-/** A handful of provider entries. Anything bigger is not pi's auth file, and is not opened. */
+/**
+ * The size cap an adapter's credential-store reader applies (`AgentProfile.readAuth`). A handful of
+ * provider entries; anything bigger is not an agent's auth file, and is not opened.
+ */
 export const MAX_AUTH_FILE_BYTES = 65_536;
 /** The only provider whose OAuth token we know how to turn into an account. */
 export const ANTHROPIC_PROVIDER_ID = "anthropic";
-/** pi's credential `type` for a subscription sign-in. */
-export const PI_AUTH_TYPE_OAUTH = "oauth";
 /**
  * The profile endpoint Claude Code itself uses. The token goes to its own issuer and nowhere else:
  * this is the ONLY request that ever carries it, and redirects are refused so it cannot be bounced.
@@ -402,28 +445,11 @@ export const PLACEHOLDER_SERIALS: readonly string[] = [
   "invalid", "123456789", "xxxxxxxx",
 ];
 
-// --- pi-mcp-adapter (MCP tool calls) ---------------------------------------------------------
+// --- MCP request size caps ---------------------------------------------------------------------
 //
-// pi has no native MCP; MCP tools arrive through the `pi-mcp-adapter` extension. Enforcement rides
-// the adapter's own approval broker (>= 2.21.0), which hands us the exact server, tool and arguments
-// it is about to run. These are the adapter's own names, transcribed so nothing imports the adapter.
+// Used by the MCP branch of `buildPretoolPayload`, for any adapter that hands core a broker-resolved
+// MCP call (`McpCallInfo`).
 
-/**
- * The adapter's broker event (`types.ts MCP_TOOL_APPROVAL_REQUEST_EVENT`, README "Tool Approval").
- * Emitted on `pi.events` for EVERY resolved MCP call — proxy, direct, `mcpScript`, resource, iframe.
- */
-export const MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
-/** The adapter's proxy tool: `mcp({tool, args, server?})`. Used only to correlate audit ids. */
-export const MCP_PROXY_TOOL_NAME = "mcp";
-/** Namespace wrappers are `mcp__<namespace>`. Used only to correlate audit ids. */
-export const MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
-/**
- * Prefix of the `tool_use_id` minted for a brokered call that no in-flight `tool_call` matched (an
- * `mcpScript` call, a resource read, an iframe). Distinct from `toolu_…`/`ubash_…` so a row says so.
- */
-export const MCP_BROKER_ID_PREFIX = "mcpb_";
-/** In-flight non-native tool calls remembered for audit correlation. Oldest dropped past this. */
-export const MAX_INFLIGHT_MCP_CALLS = 64;
 /**
  * MCP arguments go on the wire whole up to this many serialised bytes (512 KiB), because the gateway's
  * MCP input DLP and arg-based policies must see what the tool will receive. Beyond it the head and tail
@@ -439,20 +465,3 @@ export const MAX_MCP_ARGS_BYTES = 524_288;
  * a 413 is unreachable by construction (review CR-03).
  */
 export const MAX_PRETOOL_BODY_BYTES = 921_600;
-/**
- * How long an in-flight non-native `tool_call` stays claimable by a broker request (5 min). An entry
- * whose `tool_result` never fires (a call blocked upstream) must not be claimed by an unrelated call
- * later — audit correlation only.
- */
-export const MCP_INFLIGHT_MAX_AGE_MS = 300_000;
-/** `PI_MCP_CONFIG_MODE=exclusive` makes the adapter read only its own config file. */
-export const ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
-/** The adapter's own config file, under the agent dir and under `<cwd>/.pi/`. */
-export const MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
-/** The pi CLI flag the adapter registers to replace that file. Its presence omits the config. */
-export const MCP_CONFIG_FLAG = "--mcp-config";
-/**
- * The cap on one MCP config file (1 MiB; adapter configs are kilobytes). A file over it is "unknown",
- * which omits `mcp_server_config` rather than guessing.
- */
-export const MAX_MCP_CONFIG_BYTES = 1_048_576;

@@ -16,7 +16,8 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import { ENV_PI_INSTALL_ROOT } from "./constants.ts";
+/** Exported by pi's managed-install launcher; its `current-version` file holds the pi version (§A8). */
+export const ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
 
 /**
  * The package whose `version` we are after. Referenced as data only — never imported.

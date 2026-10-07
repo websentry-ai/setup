@@ -8,15 +8,19 @@
 // `account_identity` has since joined the type (parity with the Claude Code hook): optional, and
 // only ever set through `withAccountIdentity`, which forwards the six wire strings and nothing else.
 //
-// `PretoolPayloadInput.mcp` is the one input that changes the body's SHAPE: an MCP call handed over
-// by the pi-mcp-adapter approval broker goes to the gateway's MCP path (Path 3) as
-// `tool_name: "mcp__<server>__<tool>"` with `metadata.mcp_server` / `mcp_tool` / `tool_input` (the
-// arguments, whole up to 512 KiB) and, when the config could be read unambiguously,
-// `mcp_server_config`. The native-tool allowlist still governs every other call; MCP arguments are
-// the one explicit exception.
+// `PretoolPayloadInput.mcp` takes one of two shapes, told apart by `args`:
 //
-// Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
-// future opencode adapter can reuse it unchanged.
+//   * an `McpAttribution` (`{server, tool}`, no `args`) is explicit attribution only (PLAT-12): the
+//     body keeps its native shape and gains `metadata.mcp_server` / `mcp_tool`;
+//   * an `McpCallInfo` (with `args`) is a call an adapter's own MCP broker resolved, and it changes
+//     the body's SHAPE: it goes to the gateway's MCP path (Path 3) as
+//     `tool_name: "mcp__<server>__<tool>"` with `metadata.mcp_server` / `mcp_tool` / `tool_input` (the
+//     arguments, whole up to 512 KiB) and, when the config could be read unambiguously,
+//     `mcp_server_config`. The native-tool allowlist still governs every other call; MCP arguments
+//     are the one explicit exception.
+//
+// Type-only file. Core imports no agent SDK, even as a type, so every adapter package reuses it
+// unchanged.
 
 import type { AccountIdentity } from "./accountIdentity.ts";
 
@@ -41,7 +45,11 @@ export interface PretoolRequestBody {
   pre_tool_use_data: PreToolUseData;
   /** Required by the server type; may be an empty array. */
   messages: PretoolMessage[];
-  unbound_app_label: "pi";
+  /**
+   * Set from `AgentProfile.appLabel`. A plain string here on purpose: which labels exist is the
+   * server's decision (`KNOWN_APP_LABELS`), not this type's.
+   */
+  unbound_app_label: string;
   client_entrypoint?: string;
   /**
    * Ask the response to carry the policy payload (RES-03).
@@ -104,10 +112,28 @@ export interface PretoolPayloadInput {
   /** The process's settled account identity, when known. */
   accountIdentity?: AccountIdentity;
   /**
-   * A resolved MCP call (see the header). When set, `toolName`/`command`/`toolInput` no longer shape
-   * the body: the builder sends the Path-3 MCP shape instead. Absent for every native/custom tool.
+   * Explicit MCP attribution (an `McpAttribution`), or a broker-resolved MCP call (an `McpCallInfo`,
+   * see the header and `McpCallInfo`). Attribution becomes `metadata.mcp_server` / `metadata.mcp_tool`, the API's
+   * explicit-attribution contract (PLAT-12). Only the adapter knows a call is an MCP call; core never
+   * infers this from a tool name. Each name is sent only when it is a non-blank string of at most
+   * `MAX_MCP_NAME_CHARS`; `mcp_tool` only alongside a valid `mcp_server`.
    */
-  mcp?: McpCallInfo;
+  mcp?: McpAttribution | McpCallInfo;
+  /**
+   * The file operation of a per-file request that carries no patch text (an adapter that fans a
+   * multi-file patch out into one request per file). Only `"delete"` is defined: it becomes
+   * `metadata.patch_operation`, so the server classifies the target as a file deletion. Appended
+   * after every other metadata key, so a body without it is byte-identical to before.
+   */
+  patchOperation?: "delete";
+  /**
+   * The command's length before the ADAPTER capped it: for an adapter that must keep a command
+   * bounded in memory before the check, and so hands over text that is already a head + tail. When
+   * it is a whole number greater than `command.length`, the body says the command is partial
+   * (`command_truncated`, `command_original_chars`) exactly as if core had capped it. Absent on every
+   * adapter that passes the command whole, so their bodies are unchanged.
+   */
+  commandOriginalChars?: number;
 }
 
 /**
@@ -133,6 +159,12 @@ export interface McpCallInfo {
   serverConfig?: Record<string, unknown>;
   /** The broker's `origin`: `proxy` | `direct` | `script` | `resource` | `iframe`. Audit only. */
   origin?: string;
+}
+
+/** Explicit MCP attribution only: the body keeps its native shape (PLAT-12). */
+export interface McpAttribution {
+  server: string;
+  tool: string;
 }
 
 /**

@@ -24,8 +24,10 @@
 //     a `policy_cache.json` that is a FIFO makes `readFileSync` hang forever inside `init()`, which
 //     every handler awaits. An `lstat` answers both the shape and the size question without blocking.
 //   * **A non-absolute base directory is refused outright**, the same guard `config.ts` carries: a
-//     relative path resolves against the process cwd, i.e. whatever repository pi was started in,
-//     which could then plant its own cache.
+//     relative path resolves against the process cwd, i.e. whatever repository the agent was started
+//     in, which could then plant its own cache. The base is the agent dir
+//     (`AgentProfile.resolveAgentDir`); `resolveCachePath` refuses a relative answer whatever the
+//     profile returns.
 //
 // Deliberate deviation from the Python hook's cache (`unbound.py:270-276`): `repo_policies` and
 // `unbound_attribution_enabled` are **not** persisted. Nothing in this extension reads them, and an
@@ -41,15 +43,14 @@ import {
   CACHE_DIR_NAME,
   CACHE_FILE_NAME,
   CACHE_TTL_MS,
-  ENV_PI_AGENT_DIR,
   KEY_FINGERPRINT_PREFIX,
   MAX_CACHE_BYTES,
-  PI_AGENT_DIR_SEGMENTS,
 } from "./constants.ts";
 import { readSmallRegularFile } from "./safeRead.ts";
 import { parseFailureAction, parseTimestamp, parseToolsToCheck } from "./policyState.ts";
 import type { FailureAction, PolicySnapshot, PolicyState } from "./policyState.ts";
-import { NATIVE_FILE_TOOLS } from "./payload.ts";
+import { nativeFileTools } from "./payload.ts";
+import type { AgentFileTools, AgentProfile } from "./profile.ts";
 
 /**
  * The on-disk record, snake_case so the file is diffable by eye against the Python hook's cache.
@@ -71,8 +72,11 @@ export interface CacheIdentity {
 /** Just the two fields a freshness question needs, so a caller can ask with a partial record. */
 type ToolsFreshness = Pick<PolicySnapshot, "tools_synced_at" | "tools_to_check">;
 
-/** Tilde expansion against an explicit home dir — never `process.env.HOME`. */
-function expandTilde(raw: unknown, homeDir: string): string | undefined {
+/**
+ * Tilde expansion against an explicit home dir — never `process.env.HOME`. Exported so an adapter's
+ * `resolveAgentDir` expands a relocation variable the same way instead of carrying its own copy.
+ */
+export function expandTilde(raw: unknown, homeDir: string): string | undefined {
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
   if (trimmed.length === 0) return undefined;
@@ -82,36 +86,28 @@ function expandTilde(raw: unknown, homeDir: string): string | undefined {
 }
 
 /**
- * `<PI_CODING_AGENT_DIR | ~/.pi/agent>/.unbound/policy_cache.json`, or `undefined` when no safe
- * absolute base exists — in which case the cache is simply not used, for reading or writing.
+ * `<agent dir>/.unbound/policy_cache.json`, where the agent dir is whatever
+ * `AgentProfile.resolveAgentDir` answers — or `undefined` when no safe absolute base exists, in which
+ * case the cache is simply not used, for reading or writing.
  *
- * A **relative** `PI_CODING_AGENT_DIR` falls back to the home default rather than resolving against
- * the process cwd. `os.homedir()` can also fail, and the caller's fallback for that is `""`; joining
- * from `""` would put the cache inside the repository pi was started in, where a hostile repo could
- * plant one. Same reasoning, same guard, as `readUnboundConfig` (PR #348 finding 3).
+ * The profile owns how its directory is found (its relocation variable, its home default). What this
+ * function owns is the refusal: an `undefined`, non-string, empty or **relative** answer, or a
+ * resolver that throws, yields no cache. A relative base would resolve against the process cwd —
+ * the repository the agent was started in — where a hostile repo could plant a cache (T-09-01).
  */
-export function resolveCachePath(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
-  const base = resolvePiAgentDir(env, homeDir);
-  if (base === undefined) return undefined;
-  return join(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
-}
-
-/**
- * pi's agent dir — `PI_CODING_AGENT_DIR` (tilde-expanded, absolute only) → `~/.pi/agent` — or
- * `undefined` when no safe absolute base exists. The one resolution both the cache and the
- * account-identity reader (`auth.json`) use, so the two can never look in different places.
- */
-export function resolvePiAgentDir(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
+export function resolveCachePath(
+  env: NodeJS.ProcessEnv,
+  homeDir: string,
+  profile: Pick<AgentProfile, "resolveAgentDir">,
+): string | undefined {
+  let base: unknown;
   try {
-    let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
-    if (base === undefined || !isAbsolute(base)) {
-      if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return undefined;
-      base = join(homeDir, ...PI_AGENT_DIR_SEGMENTS);
-    }
-    return isAbsolute(base) ? base : undefined;
+    base = profile.resolveAgentDir(env, homeDir);
   } catch {
     return undefined;
   }
+  if (typeof base !== "string" || base.length === 0 || !isAbsolute(base)) return undefined;
+  return join(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
 }
 
 /**
@@ -285,21 +281,26 @@ export function getFailureActionFromCache(
 /**
  * May this tool call skip the API entirely? Three conditions, all required:
  *
- *   1. the tool is one of the six native file tools — everything else (shell tools, MCP tools, an
- *      unknown name) is evaluated on `command` and is never skippable;
+ *   1. the tool is one of the profile's native file tools (`nativeFileTools(fileTools)`) —
+ *      everything else (shell tools, MCP tools, an unknown name) is evaluated on `command` and is
+ *      never skippable;
  *   2. the tool list is **tools-fresh**, not merely cached;
  *   3. the list does not contain this tool.
  *
  * Mirrors `unbound.py:3818-3826`, with condition 2 tightened to the tools-specific timestamp. Note
  * the comparison is exact: an unknown casing is an unknown tool, and Phase 7 registered pi's
  * lowercase names.
+ *
+ * The skip set is exactly what the profile declares, so a tool the profile does not list as a native
+ * file tool can never be skipped (T-12-16).
  */
 export function shouldSkipFileTool(
   toolName: string,
   cache: ToolsFreshness | undefined,
   now: number,
+  fileTools: AgentFileTools,
 ): boolean {
-  if (typeof toolName !== "string" || !NATIVE_FILE_TOOLS.has(toolName)) return false;
+  if (typeof toolName !== "string" || !nativeFileTools(fileTools).has(toolName)) return false;
   if (!isToolsFresh(cache, now)) return false;
   const tools = cache?.tools_to_check;
   if (!Array.isArray(tools)) return false;
@@ -318,10 +319,12 @@ export function shouldSkipFileToolFromState(
   toolName: string,
   state: Pick<PolicyState, "getToolsToCheck" | "getToolsSyncedAt">,
   now: number,
+  fileTools: AgentFileTools,
 ): boolean {
   return shouldSkipFileTool(
     toolName,
     { tools_synced_at: state.getToolsSyncedAt(), tools_to_check: state.getToolsToCheck() },
     now,
+    fileTools,
   );
 }

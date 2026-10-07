@@ -21,6 +21,7 @@ import {
   resolveApiKey,
   resolveGatewayUrl,
 } from "../src/config.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
 
 const NO_ENV: NodeJS.ProcessEnv = {};
 
@@ -28,7 +29,7 @@ test("resolveApiKey: UNBOUND_PI_API_KEY beats the config file", () => {
   const home = createFakeHome({ api_key: "from-file" });
   try {
     assert.equal(
-      resolveApiKey({ UNBOUND_PI_API_KEY: "from-pi-env", UNBOUND_API_KEY: "from-generic-env" }, home.homeDir),
+      resolveApiKey({ UNBOUND_PI_API_KEY: "from-pi-env", UNBOUND_API_KEY: "from-generic-env" }, home.homeDir, TEST_PROFILE),
       "from-pi-env",
     );
   } finally {
@@ -39,7 +40,7 @@ test("resolveApiKey: UNBOUND_PI_API_KEY beats the config file", () => {
 test("resolveApiKey: the generic UNBOUND_API_KEY is the second tier", () => {
   const home = createFakeHome({ api_key: "from-file" });
   try {
-    assert.equal(resolveApiKey({ UNBOUND_API_KEY: "from-generic-env" }, home.homeDir), "from-generic-env");
+    assert.equal(resolveApiKey({ UNBOUND_API_KEY: "from-generic-env" }, home.homeDir, TEST_PROFILE), "from-generic-env");
   } finally {
     home.cleanup();
   }
@@ -48,7 +49,7 @@ test("resolveApiKey: the generic UNBOUND_API_KEY is the second tier", () => {
 test("resolveApiKey: falls back to config.json api_key when no env var is set", () => {
   const home = createFakeHome({ api_key: "from-file" });
   try {
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), "from-file");
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), "from-file");
   } finally {
     home.cleanup();
   }
@@ -57,7 +58,7 @@ test("resolveApiKey: falls back to config.json api_key when no env var is set", 
 test("resolveApiKey: no env and no config file -> undefined", () => {
   const home = createFakeHome();
   try {
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), undefined);
   } finally {
     home.cleanup();
   }
@@ -66,8 +67,8 @@ test("resolveApiKey: no env and no config file -> undefined", () => {
 test("resolveApiKey: malformed JSON -> undefined, never throws", () => {
   const home = createFakeHome("{ not json");
   try {
-    assert.doesNotThrow(() => resolveApiKey(NO_ENV, home.homeDir));
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.doesNotThrow(() => resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE));
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), undefined);
     assert.deepEqual(readUnboundConfig(home.homeDir), {});
   } finally {
     home.cleanup();
@@ -79,8 +80,8 @@ test("resolveApiKey: an unreadable config file -> undefined, never throws", { sk
   const configFile = join(home.homeDir, ".unbound", "config.json");
   chmodSync(configFile, 0o000);
   try {
-    assert.doesNotThrow(() => resolveApiKey(NO_ENV, home.homeDir));
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.doesNotThrow(() => resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE));
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), undefined);
   } finally {
     chmodSync(configFile, 0o600);
     home.cleanup();
@@ -93,11 +94,11 @@ test("resolveApiKey: a non-string or blank api_key is rejected", () => {
   const empty = createFakeHome({ api_key: "" });
   const usable = createFakeHome({ api_key: "from-file" });
   try {
-    assert.equal(resolveApiKey(NO_ENV, numeric.homeDir), undefined);
-    assert.equal(resolveApiKey(NO_ENV, blank.homeDir), undefined);
-    assert.equal(resolveApiKey(NO_ENV, empty.homeDir), undefined);
+    assert.equal(resolveApiKey(NO_ENV, numeric.homeDir, TEST_PROFILE), undefined);
+    assert.equal(resolveApiKey(NO_ENV, blank.homeDir, TEST_PROFILE), undefined);
+    assert.equal(resolveApiKey(NO_ENV, empty.homeDir, TEST_PROFILE), undefined);
     // …and a blank env var must not shadow a usable config value.
-    assert.equal(resolveApiKey({ UNBOUND_PI_API_KEY: "  " }, usable.homeDir), "from-file");
+    assert.equal(resolveApiKey({ UNBOUND_PI_API_KEY: "  " }, usable.homeDir, TEST_PROFILE), "from-file");
   } finally {
     numeric.cleanup();
     blank.cleanup();
@@ -115,11 +116,11 @@ test("readUnboundConfig: a blank or relative home is refused, never resolved aga
   try {
     for (const bogus of ["", ".", "./x", "relative/path"]) {
       assert.deepEqual(readUnboundConfig(bogus), {});
-      assert.equal(resolveApiKey(NO_ENV, bogus), undefined);
+      assert.equal(resolveApiKey(NO_ENV, bogus, TEST_PROFILE), undefined);
       assert.equal(resolveGatewayUrl(NO_ENV, bogus), "https://api.getunbound.ai");
     }
     // …and the absolute case still works, so this is a guard and not a regression.
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), "from-file");
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), "from-file");
   } finally {
     home.cleanup();
   }
@@ -131,9 +132,9 @@ test("resolveApiKey: surrounding whitespace is stripped from every tier", () => 
   // enforcement at all. Every tier must therefore hand back a trimmed token.
   const home = createFakeHome({ api_key: "  from-file\n" });
   try {
-    assert.equal(resolveApiKey({ UNBOUND_PI_API_KEY: "pi-key\n" }, home.homeDir), "pi-key");
-    assert.equal(resolveApiKey({ UNBOUND_API_KEY: " generic-key " }, home.homeDir), "generic-key");
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), "from-file");
+    assert.equal(resolveApiKey({ UNBOUND_PI_API_KEY: "pi-key\n" }, home.homeDir, TEST_PROFILE), "pi-key");
+    assert.equal(resolveApiKey({ UNBOUND_API_KEY: " generic-key " }, home.homeDir, TEST_PROFILE), "generic-key");
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), "from-file");
   } finally {
     home.cleanup();
   }
@@ -319,7 +320,7 @@ test("readUnboundConfig: a config above MAX_CONFIG_BYTES is refused, and identit
   try {
     assert.deepEqual(readUnboundConfig(home.homeDir), {});
     // An unreadable config is an INERT extension, never a block: no key, default URL.
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), undefined);
     assert.equal(resolveGatewayUrl(NO_ENV, home.homeDir), DEFAULT_GATEWAY_URL);
   } finally {
     home.cleanup();
@@ -340,7 +341,7 @@ test("readUnboundConfig: a symlinked config.json is refused even when the target
     // Following the link is what would let a symlink-to-FIFO block; `unbound login` writes a real
     // file, so nothing legitimate is lost by refusing one.
     assert.deepEqual(readUnboundConfig(home.homeDir), {});
-    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir, TEST_PROFILE), undefined);
   } finally {
     home.cleanup();
   }

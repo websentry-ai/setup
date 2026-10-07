@@ -39,7 +39,7 @@
 
 import { randomBytes } from "node:crypto";
 
-import { MCP_BROKER_ID_PREFIX, MCP_NAMESPACE_TOOL_PREFIX, MCP_PROXY_TOOL_NAME } from "../../core/src/constants.ts";
+import { MCP_BROKER_ID_PREFIX, MCP_NAMESPACE_TOOL_PREFIX, MCP_PROXY_TOOL_NAME } from "./constants.ts";
 import type { McpApprovalAnswer } from "./decide.ts";
 
 /** The answers the adapter accepts; anything else it reads as `deny`. */

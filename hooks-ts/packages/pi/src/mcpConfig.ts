@@ -47,13 +47,13 @@
 import { closeSync, constants as fsConstants, fstatSync, lstatSync, openSync, readSync, statSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
+import { ENV_PI_AGENT_DIR } from "./agentDir.ts";
 import {
-  ENV_PI_AGENT_DIR,
   ENV_PI_MCP_CONFIG_MODE,
   MAX_MCP_CONFIG_BYTES,
   MCP_ADAPTER_CONFIG_FILE_NAME,
   MCP_CONFIG_FLAG,
-} from "../../core/src/constants.ts";
+} from "./constants.ts";
 
 /** Every key of the adapter's `ServerEntry` (`types.ts:438-522`, 4.0.0), plus the inert `type`. */
 const KNOWN_SERVER_KEYS: ReadonlySet<string> = new Set([

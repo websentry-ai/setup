@@ -1,5 +1,7 @@
 // Account identity — parity with the Claude Code hook's `account_identity` (`unbound.py`
-// `read_account_identity` / `_device_serial`), derived from pi's own `auth.json`.
+// `read_account_identity` / `_device_serial`), derived from what the agent's credential store says
+// (`AgentAuthSummary`, produced by `AgentProfile.readAuth`). The pi `auth.json` reader's own cases
+// live with it, in `packages/pi/test/auth.test.ts`.
 //
 // What these cases pin down:
 //
@@ -11,7 +13,7 @@
 //   * **An expired token is not spent.** No network call is made with it.
 
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -21,17 +23,27 @@ import test from "node:test";
 
 import {
   buildAccountIdentity,
-  chooseProvider,
   createAccountIdentityLoader,
   fetchAnthropicProfile,
   isValidSerial,
   readDeviceSerial,
-  readPiAuth,
   probeToolPath,
 } from "../src/accountIdentity.ts";
 import type { ExecFileLike } from "../src/accountIdentity.ts";
-import { resolvePiAgentDir } from "../src/cache.ts";
-import { ANTHROPIC_OAUTH_BETA_VALUE, ENV_PI_AGENT_DIR } from "../src/constants.ts";
+import { ANTHROPIC_OAUTH_BETA_VALUE } from "../src/constants.ts";
+import type { AgentAuthSummary } from "../src/profile.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
+
+/** The credential-store reader the loader is given; the test profile reads a pi-shaped `auth.json`. */
+const readAuth = (agentDir: string | undefined, modelProvider: string | undefined): AgentAuthSummary | undefined =>
+  TEST_PROFILE.readAuth?.(agentDir, modelProvider);
+
+/** A store holding an Anthropic subscription sign-in for the session's provider. */
+const OAUTH_ANTHROPIC: AgentAuthSummary = { provider: "anthropic", hasCredential: true, anthropicOAuth: true };
+/** A store holding some other credential for `provider` (an API key, or a non-Anthropic OAuth). */
+const otherCredential = (provider: string): AgentAuthSummary => ({ provider, hasCredential: true, anthropicOAuth: false });
+/** A store that exists but names no provider for this session. */
+const NO_PROVIDER: AgentAuthSummary = { provider: undefined, hasCredential: false, anthropicOAuth: false };
 
 const TOKEN = "sk-ant-oat01-TEST-ACCESS-TOKEN-never-forward";
 const PROFILE = {
@@ -93,71 +105,6 @@ const noSerial: ExecFileLike = async () => undefined;
 // "No serial" must hold on every runner: the Linux fallback reads /etc/machine-id via `readFile`, not
 // `execFile`, so both probes are stubbed together — a GitHub runner has a machine-id.
 const noSerialProbe = { execFile: noSerial, readFile: () => undefined } as const;
-
-// --- agent dir -----------------------------------------------------------------------------------
-
-test("the agent dir resolves exactly like the cache: env override, else ~/.pi/agent", () => {
-  assert.equal(resolvePiAgentDir({}, "/home/dev"), "/home/dev/.pi/agent");
-  assert.equal(resolvePiAgentDir({ [ENV_PI_AGENT_DIR]: "/opt/pi" }, "/home/dev"), "/opt/pi");
-  assert.equal(resolvePiAgentDir({ [ENV_PI_AGENT_DIR]: "~/alt" }, "/home/dev"), "/home/dev/alt");
-  assert.equal(resolvePiAgentDir({ [ENV_PI_AGENT_DIR]: "relative" }, "/home/dev"), "/home/dev/.pi/agent");
-  assert.equal(resolvePiAgentDir({}, ""), undefined);
-});
-
-// --- auth.json -----------------------------------------------------------------------------------
-
-test("readPiAuth reads provider → type/access/expires and nothing else", () => {
-  const agent = tempAgentDir({
-    ...oauthAnthropic(123),
-    openai: { type: "api_key", key: "sk-openai" },
-    junk: "not-an-object",
-  });
-  try {
-    const auth = readPiAuth(agent.dir);
-    assert.ok(auth !== undefined);
-    assert.deepEqual(Object.keys(auth).sort(), ["anthropic", "openai"]);
-    assert.equal(auth.anthropic?.type, "oauth");
-    assert.equal(auth.anthropic?.expires, 123);
-    assert.equal(auth.openai?.type, "api_key");
-    assert.equal(JSON.stringify(auth).includes("refresh-secret"), false, "the refresh token is not kept");
-    assert.equal(JSON.stringify(auth).includes("sk-openai"), false, "an API key is not kept");
-  } finally {
-    agent.cleanup();
-  }
-});
-
-test("readPiAuth is undefined for a missing, corrupt, non-object or unresolvable auth.json", () => {
-  for (const content of [undefined, "{not json", "[]", "null", "42"]) {
-    const agent = tempAgentDir(content);
-    try {
-      assert.equal(readPiAuth(agent.dir), undefined, `content=${String(content)}`);
-    } finally {
-      agent.cleanup();
-    }
-  }
-  assert.equal(readPiAuth(undefined), undefined);
-  assert.equal(readPiAuth(""), undefined);
-});
-
-test("readPiAuth refuses a directory named auth.json rather than blocking or throwing", () => {
-  const agent = tempAgentDir();
-  try {
-    mkdirSync(join(agent.dir, "auth.json"));
-    assert.equal(readPiAuth(agent.dir), undefined);
-  } finally {
-    agent.cleanup();
-  }
-});
-
-// --- provider choice ------------------------------------------------------------------------------
-
-test("the session model's provider wins; else the single provider; else none", () => {
-  const two = { anthropic: { type: "oauth" }, openai: { type: "api_key" } };
-  assert.equal(chooseProvider(two, "openai"), "openai");
-  assert.equal(chooseProvider(two, undefined), undefined, "ambiguous without a model");
-  assert.equal(chooseProvider({ openai: { type: "api_key" } }, undefined), "openai");
-  assert.equal(chooseProvider({ openai: { type: "api_key" } }, ""), "openai", "a blank provider is no provider");
-});
 
 // --- profile ---------------------------------------------------------------------------------------
 
@@ -241,8 +188,7 @@ test("a throwing fetch implementation is undefined", async () => {
 
 test("anthropic OAuth + profile → the full Claude Code vocabulary", () => {
   const identity = buildAccountIdentity({
-    auth: { anthropic: { type: "oauth" } },
-    provider: "anthropic",
+    auth: OAUTH_ANTHROPIC,
     profile: { email: "Dev@Example.COM", orgId: "org-uuid-1", plan: "claude_max" },
     deviceSerial: "C02XYZ",
   });
@@ -258,16 +204,15 @@ test("anthropic OAuth + profile → the full Claude Code vocabulary", () => {
 
 test("anthropic OAuth without a profile is subscription only", () => {
   assert.deepEqual(
-    buildAccountIdentity({ auth: { anthropic: { type: "oauth" } }, provider: "anthropic" }),
+    buildAccountIdentity({ auth: OAUTH_ANTHROPIC }),
     { auth_mode: "subscription" },
   );
 });
 
 test("any other provider, or a non-OAuth anthropic entry, is api_key and nothing else", () => {
-  const auth = { openai: { type: "api_key" }, anthropic: { type: "api_key" }, openrouter: { type: "oauth" } };
   for (const provider of ["openai", "anthropic", "openrouter"]) {
     assert.deepEqual(
-      buildAccountIdentity({ auth, provider, profile: { email: "x@y.z", plan: "p" } }),
+      buildAccountIdentity({ auth: otherCredential(provider), profile: { email: "x@y.z", plan: "p" } }),
       { auth_mode: "api_key" },
       provider,
     );
@@ -275,13 +220,13 @@ test("any other provider, or a non-OAuth anthropic entry, is api_key and nothing
 });
 
 test("no auth.json is no identity at all, even with a serial", () => {
-  assert.equal(buildAccountIdentity({ auth: undefined, provider: "anthropic", deviceSerial: "C02" }), undefined);
+  assert.equal(buildAccountIdentity({ auth: undefined, deviceSerial: "C02" }), undefined);
 });
 
 test("auth.json with no chosen provider is the serial only, or nothing", () => {
-  const auth = { a: { type: "api_key" }, b: { type: "api_key" } };
-  assert.deepEqual(buildAccountIdentity({ auth, provider: undefined, deviceSerial: "C02" }), { device_serial: "C02" });
-  assert.equal(buildAccountIdentity({ auth, provider: undefined }), undefined);
+  const auth = NO_PROVIDER;
+  assert.deepEqual(buildAccountIdentity({ auth, deviceSerial: "C02" }), { device_serial: "C02" });
+  assert.equal(buildAccountIdentity({ auth }), undefined);
 });
 
 // --- device serial ------------------------------------------------------------------------------------
@@ -352,6 +297,7 @@ test("the loader computes once, caches the promise, and exposes the settled valu
   try {
     const loader = createAccountIdentityLoader({
       agentDir: agent.dir,
+      readAuth,
       profileUrl: server.url,
       timeoutMs: 2_000,
       platform: "darwin",
@@ -381,6 +327,7 @@ test("an expired token makes no profile call", async () => {
   try {
     const loader = createAccountIdentityLoader({
       agentDir: agent.dir,
+      readAuth,
       profileUrl: server.url,
       timeoutMs: 2_000,
       ...noSerialProbe,
@@ -400,6 +347,7 @@ test("a missing auth.json skips the serial probe and the network entirely", asyn
   try {
     const loader = createAccountIdentityLoader({
       agentDir: agent.dir,
+      readAuth,
       execFile: async () => {
         probes += 1;
         return "Serial Number: C02";
@@ -447,4 +395,42 @@ test("the Windows PowerShell path honours SystemRoot and falls back to C:\\Windo
     probeToolPath("powershell", {}),
     "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
   );
+});
+
+test("buildAccountIdentity: a host-reported authMode labels a store-less sign-in, never overrides a credential", () => {
+  // WR-05: only the shared vocabulary leaves the device.
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "openrouter", hasCredential: false, anthropicOAuth: false, authMode: "api_key" } }),
+    { auth_mode: "api_key" },
+  );
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "anthropic", hasCredential: false, anthropicOAuth: false, authMode: "subscription" } }),
+    { auth_mode: "subscription" },
+  );
+  // A provider id, a custom provider name, or `subscription` for a non-Anthropic provider: omitted.
+  for (const [provider, authMode] of [
+    ["openrouter", "openrouter"],
+    ["anthropic", "anthropic"],
+    ["corp-proxy", "corp-proxy"],
+    ["openrouter", "subscription"],
+    [undefined, "subscription"],
+  ] as const) {
+    assert.equal(
+      buildAccountIdentity({ auth: { provider, hasCredential: false, anthropicOAuth: false, authMode } }),
+      undefined,
+      `${provider}/${authMode}`,
+    );
+  }
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "corp-proxy", hasCredential: false, anthropicOAuth: false, authMode: "corp-proxy" }, deviceSerial: "C02XYZ" }),
+    { device_serial: "C02XYZ" },
+    "the serial still goes, the provider name never does",
+  );
+  assert.deepEqual(
+    buildAccountIdentity({ auth: { provider: "x", hasCredential: true, anthropicOAuth: false, authMode: "x" } }),
+    { auth_mode: "api_key" },
+  );
+  for (const bad of ["", "   ", "y".repeat(500), 5 as unknown as string]) {
+    assert.equal(buildAccountIdentity({ auth: { provider: "p", hasCredential: false, anthropicOAuth: false, authMode: bad } }), undefined);
+  }
 });

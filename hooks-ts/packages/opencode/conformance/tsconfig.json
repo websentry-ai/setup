@@ -1,0 +1,5 @@
+{
+  "//": "Host-type conformance against the REAL @opencode-ai/plugin types. Not in the root tsconfig: the package is installed only with --no-save by the nightly job (types-v1) or for a local check.",
+  "extends": "../../../tsconfig.base.json",
+  "include": ["v1.ts", "../src/hostTypes.ts"]
+}

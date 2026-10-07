@@ -18,7 +18,6 @@ import {
   ERRORS_PATH,
   ERROR_CATEGORY_TURNLOG,
   MAX_ASSISTANT_CHARS,
-  TURNLOG_PATH,
 } from "../../core/src/constants.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import { createPolicyState } from "../../core/src/policyState.ts";
@@ -38,6 +37,9 @@ import {
   createFakeToolCallEvent,
   createFakeUserMessage,
 } from "./helpers/fakeCtx.ts";
+import { PI_PROFILE } from "../src/profile.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 /** An output marker: since tool output is sent (capped, redacted), it is EXPECTED in the turn log. */
 const MARKER = "PRIVATE_KEY_BEGIN-output-marker";
@@ -52,6 +54,7 @@ function client(api: MockApi, timeoutMs?: number) {
     baseUrl: api.url,
     apiKey: TEST_KEY,
     ...(timeoutMs === undefined ? {} : { turnLogTimeoutMs: timeoutMs }),
+    profile: PI_PROFILE,
   });
 }
 
@@ -244,7 +247,7 @@ test("a 50 KB write body appears nowhere in the request, path only", async () =>
         checker: createPolicyChecker({
           client: client(api),
           state: createPolicyState(),
-          telemetry: createTelemetry({ client: client(api), apiKey: TEST_KEY }),
+          telemetry: createTelemetry({ client: client(api), apiKey: TEST_KEY, profile: PI_PROFILE }),
         }),
         apiKey: TEST_KEY,
         entrypoint: "pi/0.87.1",
@@ -588,6 +591,7 @@ test("a failed turn log reaches /v1/hooks/errors as turn_log_failed, once", asyn
         client: client(api, SHORT_TIMEOUT_MS),
         apiKey: TEST_KEY,
         intervalMs: 0, // the rate limiter is `telemetry.ts`'s own test; this case is about the label
+        profile: PI_PROFILE,
       });
       handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx(), {
         client: client(api, SHORT_TIMEOUT_MS),

@@ -16,11 +16,11 @@
 //
 //   * The §B1 field list, exactly. Every Phase-9 / Future field is absent from the code as well as
 //     the type — the identity field in particular runs a deny-capable gate server-side.
-//   * The path contract carried forward from the Phase-7 review (STATE.md): pi makes `path`
-//     OPTIONAL on grep/find/ls (§A2), while the API entry gate requires
+//   * The path contract carried forward from the Phase-7 review (STATE.md): an agent can make the
+//     path OPTIONAL on its search tools (§A2), while the API entry gate requires
 //     `!!command || (isValidNativeTool && !!filePath)` (§B3). A pathless search would therefore
-//     skip policy evaluation entirely, so those three tools always send `metadata.file_path`,
-//     defaulting to cwd.
+//     skip policy evaluation entirely, so the tools a profile lists as `fileTools.defaulting`
+//     always send `metadata.file_path`, defaulting to cwd.
 //   * The allowlist runs BEFORE the existing 16 KB whole-object cap, which stays as defence in
 //     depth for the keys that do survive.
 //
@@ -43,10 +43,10 @@
 // unambiguously.
 
 import {
-  APP_LABEL,
   EVENT_NAME_TOOL_USE,
   EVENT_NAME_USER_PROMPT,
   MAX_COMMAND_CHARS,
+  MAX_MCP_NAME_CHARS,
   MAX_PROMPT_CHARS,
   MAX_MCP_ARGS_BYTES,
   MAX_PRETOOL_BODY_BYTES,
@@ -55,54 +55,131 @@ import {
   TOOL_INPUT_ALLOWLIST,
 } from "./constants.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
+import type { AgentFileTools, AgentProfile } from "./profile.ts";
 import type {
+  McpCallInfo,
   PreToolUseData,
   PretoolPayloadInput,
   PretoolRequestBody,
   PromptPayloadInput,
 } from "./types.ts";
 
-/** Native search tools whose `path` is optional in pi — `file_path` falls back to cwd. */
-export const PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"] as const;
-/** Native file tools whose `path` is required by pi's schema. */
-export const PATH_REQUIRED_TOOLS = ["read", "write", "edit"] as const;
-
-const PATH_DEFAULTING: ReadonlySet<string> = new Set(PATH_DEFAULTING_TOOLS);
-const PATH_REQUIRED: ReadonlySet<string> = new Set(PATH_REQUIRED_TOOLS);
+/** What `nativeFileTools` answers for a taxonomy it cannot read: nothing is a file tool. */
+const NO_FILE_TOOLS: ReadonlySet<string> = new Set<string>();
+const nativeFileToolsMemo = new WeakMap<object, ReadonlySet<string>>();
 
 /**
- * The six tools the API evaluates on `metadata.file_path` rather than on a command —
- * `PI_NATIVE_FILE_TOOLS` in `taxonomy.ts:137-144`, and the exact set `computeToolsToCheck`
- * intersects against.
+ * Every tool the profile declares as evaluated on `metadata.file_path` rather than on a command: the
+ * union of `fileTools.defaulting` and `fileTools.required`.
  *
- * Exported so `cache.ts` (RES-03's file-tool skip) imports the list instead of retyping it: a
- * taxonomy change must not be able to drift between the payload builder and the skip decision, and
- * a name in one place but not the other is either a skipped check or a redundant round trip.
+ * One function for both users — the payload builder and `cache.ts`'s RES-03 file-tool skip — so the
+ * two cannot disagree about which names are file tools. A name in one place but not the other is
+ * either a skipped check or a redundant round trip.
+ *
+ * Memoised per `fileTools` object (a profile is built once and frozen), so the decision path does not
+ * rebuild a set on every tool call. Total: a taxonomy that cannot be read is an empty set, which
+ * makes nothing skippable.
  */
-export const NATIVE_FILE_TOOLS: ReadonlySet<string> = new Set([
-  ...PATH_DEFAULTING_TOOLS,
-  ...PATH_REQUIRED_TOOLS,
-]);
+export function nativeFileTools(fileTools: AgentFileTools): ReadonlySet<string> {
+  try {
+    if (fileTools === null || typeof fileTools !== "object") return NO_FILE_TOOLS;
+    const known = nativeFileToolsMemo.get(fileTools);
+    if (known !== undefined) return known;
+    const union = new Set<string>();
+    for (const name of fileTools.defaulting) if (typeof name === "string") union.add(name);
+    for (const name of fileTools.required) if (typeof name === "string") union.add(name);
+    nativeFileToolsMemo.set(fileTools, union);
+    return union;
+  } catch {
+    return NO_FILE_TOOLS;
+  }
+}
 
 /**
- * `metadata.file_path` for a tool call, or `undefined` when the tool has no file semantics
- * (`bash`, `powershell`, any custom/MCP tool) — those are evaluated on `command`, or (a resolved
- * MCP call) on the MCP branch of `buildPretoolPayload`.
+ * `metadata.file_path` for a tool call, or `undefined` when the tool has no file semantics (a shell
+ * tool, any custom/MCP tool) — those are evaluated on `command`, or (a broker-resolved MCP call) on the
+ * MCP branch of `buildPretoolPayload`.
+ *
+ * Which tools take a path, which of them default it to cwd, and which argument holds it all come from
+ * the profile's `fileTools`. `pathOf` reads unvalidated model arguments, so it is called inside a
+ * try/catch and a throw is treated as "no path given": a defaulting tool still gets cwd, a required
+ * tool gets `undefined`.
  */
 export function resolveFilePath(
   toolName: string,
   toolInput: Record<string, unknown>,
   cwd: string,
+  fileTools: AgentFileTools,
 ): string | undefined {
-  const isDefaulting = PATH_DEFAULTING.has(toolName);
-  if (!isDefaulting && !PATH_REQUIRED.has(toolName)) return undefined;
+  let isDefaulting: boolean;
+  try {
+    isDefaulting = fileTools.defaulting.has(toolName) === true;
+    if (!isDefaulting && fileTools.required.has(toolName) !== true) return undefined;
+  } catch {
+    // An unreadable taxonomy declares no file tools — the same answer `nativeFileTools` gives.
+    return undefined;
+  }
 
-  const path = toolInput.path;
+  let path: unknown;
+  try {
+    path = fileTools.pathOf(toolName, toolInput);
+  } catch {
+    path = undefined;
+  }
   if (typeof path === "string" && path.length > 0) return path;
   return isDefaulting ? cwd : undefined;
 }
 
 const ALLOWED_TOOL_INPUT_KEYS: ReadonlySet<string> = new Set(TOOL_INPUT_ALLOWLIST);
+
+/**
+ * The keys a tool input may forward: `TOOL_INPUT_ALLOWLIST` plus the string members of `extraKeys`
+ * (a profile's `extraToolInputKeys`). Total: anything that is not a readable array of strings adds
+ * nothing, so an unreadable declaration behaves exactly like no declaration.
+ */
+function allowedKeysFor(extraKeys: unknown): ReadonlySet<string> {
+  try {
+    if (!Array.isArray(extraKeys) || extraKeys.length === 0) return ALLOWED_TOOL_INPUT_KEYS;
+    const allowed = new Set<string>(ALLOWED_TOOL_INPUT_KEYS);
+    for (const key of extraKeys) if (typeof key === "string" && key !== "") allowed.add(key);
+    return allowed;
+  } catch {
+    return ALLOWED_TOOL_INPUT_KEYS;
+  }
+}
+
+/** A profile's `extraToolInputKeys`, read so that a throwing getter is "none declared". */
+export function profileExtraToolInputKeys(profile: unknown): readonly string[] | undefined {
+  try {
+    if (profile === null || typeof profile !== "object") return undefined;
+    const keys: unknown = (profile as { extraToolInputKeys?: unknown }).extraToolInputKeys;
+    return Array.isArray(keys) ? (keys as readonly string[]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function validMcpName(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAX_MCP_NAME_CHARS) return undefined;
+  return value;
+}
+
+/**
+ * Explicit MCP attribution, validated: a non-blank `server` of at most `MAX_MCP_NAME_CHARS`, and the
+ * `tool` when it is likewise valid. `undefined` for anything else (null, a number, a getter that
+ * raises, a bad server). Names are dropped when invalid, never truncated. Total.
+ */
+export function normaliseMcp(raw: unknown): { server: string; tool?: string } | undefined {
+  try {
+    if (raw === null || typeof raw !== "object") return undefined;
+    const server = validMcpName((raw as { server?: unknown }).server);
+    if (server === undefined) return undefined;
+    const tool = validMcpName((raw as { tool?: unknown }).tool);
+    return tool === undefined ? { server } : { server, tool };
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Slice a string to at most `maxBytes` UTF-8 bytes **on a code-point boundary**.
@@ -127,7 +204,7 @@ function sliceToBytes(value: string, maxBytes: number): string {
 }
 
 /**
- * Apply `TOOL_INPUT_ALLOWLIST` (WR-04). Keeps only allowlisted keys whose values are
+ * Apply `TOOL_INPUT_ALLOWLIST` (WR-04), plus a profile's `extraKeys` when given. Keeps only allowed keys whose values are
  * `string | number | boolean`, slices any surviving string to `MAX_TOOL_INPUT_VALUE_BYTES`, and says
  * so:
  *
@@ -138,15 +215,19 @@ function sliceToBytes(value: string, maxBytes: number): string {
  * Neither marker appears when nothing happened, so a clean forward stays byte-diffable. Total: a
  * non-object input is an empty forward, never a throw.
  */
-export function sanitizeToolInput(toolInput: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeToolInput(
+  toolInput: Record<string, unknown>,
+  extraKeys?: readonly string[],
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (toolInput === null || typeof toolInput !== "object" || Array.isArray(toolInput)) return out;
+  const allowed = allowedKeysFor(extraKeys);
 
   let dropped = false;
   let truncated = false;
 
   for (const [key, value] of Object.entries(toolInput)) {
-    if (!ALLOWED_TOOL_INPUT_KEYS.has(key)) {
+    if (!allowed.has(key)) {
       dropped = true;
       continue;
     }
@@ -259,12 +340,14 @@ export function capCommand(
 export function auditToolInput(
   toolInput: Record<string, unknown>,
   command: string,
+  extraKeys?: readonly string[],
 ): Record<string, unknown> {
   const isObject = toolInput !== null && typeof toolInput === "object" && !Array.isArray(toolInput);
   // A copy: the caller's `event.input` is pi's live object and must not be mutated (§F9).
   const source: Record<string, unknown> = isObject ? { ...toolInput } : {};
   delete source.command;
-  const out = sanitizeToolInput(source);
+  // The same extra keys the request forwards, so the audit row and the request agree.
+  const out = sanitizeToolInput(source, extraKeys);
   if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
   return capToolInput(out);
 }
@@ -481,40 +564,74 @@ export function auditMcpArgs(args: Record<string, unknown>, maxBytes = MAX_TOOL_
   }
 }
 
-/** Assemble the §B1 body. Pure: same input, same output, no side effects. */
-export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestBody {
-  const mcp = input.mcp;
+/**
+ * A broker-resolved MCP call (`McpCallInfo`, carrying `args`), as opposed to attribution only
+ * (`McpAttribution`). Only the former changes the body's shape. Total.
+ */
+function brokeredMcpCall(raw: unknown): McpCallInfo | undefined {
+  try {
+    if (raw === null || typeof raw !== "object") return undefined;
+    const args: unknown = (raw as { args?: unknown }).args;
+    return args !== null && typeof args === "object" ? (raw as McpCallInfo) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Assemble the §B1 body. Pure: same input, same output, no side effects.
+ *
+ * The profile supplies the things that differ per agent: the wire app label, the file-tool taxonomy
+ * that decides `metadata.file_path`, and any extra tool-input keys its tools use.
+ */
+export function buildPretoolPayload(
+  input: PretoolPayloadInput,
+  profile: Pick<AgentProfile, "appLabel" | "fileTools" | "extraToolInputKeys">,
+): PretoolRequestBody {
+  const brokered = brokeredMcpCall(input.mcp);
   const metadata: Record<string, unknown> = { cwd: input.cwd };
-  if (mcp !== undefined) {
+  if (brokered !== undefined) {
     // Path 3 (see the header): explicit server/tool, the capped arguments, and the projected config
     // only when there is one. No `file_path` — an MCP tool has no file semantics here.
-    metadata.mcp_server = mcp.server;
-    metadata.mcp_tool = mcp.tool;
-    applyWireArgs(metadata, mcpArgsForWire(mcp.args));
-    if (mcp.serverConfig !== undefined) metadata.mcp_server_config = mcp.serverConfig;
-    if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
+    metadata.mcp_server = brokered.server;
+    metadata.mcp_tool = brokered.tool;
+    applyWireArgs(metadata, mcpArgsForWire(brokered.args));
+    if (brokered.serverConfig !== undefined) metadata.mcp_server_config = brokered.serverConfig;
+    if (typeof brokered.origin === "string" && brokered.origin !== "") metadata.mcp_origin = brokered.origin;
   } else {
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
-    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));
-    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
+    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput, profileExtraToolInputKeys(profile)));
+    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
     if (filePath !== undefined) metadata.file_path = filePath;
   }
 
   // An MCP call carries no command: an empty one keeps it out of the Path-2 command gate.
-  const capped = capCommand(mcp === undefined ? input.command : "");
-  if (capped.truncated) {
+  const capped = capCommand(brokered === undefined ? input.command : "");
+  // A command the adapter capped itself arrives already short; its own original length says so.
+  const preCapped = brokered === undefined ? adapterOriginalChars(input) : undefined;
+  if (capped.truncated || preCapped !== undefined) {
     // The server cannot tell a whole command from a capped one by looking at the string. Say so
     // explicitly, so a future entry gate can choose to ask or deny rather than matching a
     // partial command as if it were the command that will actually run.
     metadata.command_truncated = true;
-    metadata.command_original_chars = input.command.length;
+    metadata.command_original_chars = Math.max(preCapped ?? 0, input.command.length);
   }
+  // Explicit MCP attribution (PLAT-12), appended after every existing key so a body without it is
+  // byte-identical to before. Only from the caller's validated field; never derived from a tool name.
+  // A brokered call already carries both names, in its own Path-3 position.
+  const mcp = brokered === undefined ? normaliseMcp(input.mcp) : undefined;
+  if (mcp !== undefined) {
+    metadata.mcp_server = mcp.server;
+    if (mcp.tool !== undefined) metadata.mcp_tool = mcp.tool;
+  }
+  // A per-file request with no patch text states its operation; only an exact "delete" is sent.
+  if (input.patchOperation === "delete") metadata.patch_operation = "delete";
 
   const preToolUseData: PreToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
     // server never matches the tool and enforcement silently disappears. A resolved MCP call is
     // named the way the gateway and the backend parse MCP names, `mcp__<server>__<tool>`.
-    tool_name: mcp === undefined ? input.toolName : `mcp__${mcp.server}__${mcp.tool}`,
+    tool_name: brokered === undefined ? input.toolName : `mcp__${brokered.server}__${brokered.tool}`,
     command: capped.command,
     metadata,
   };
@@ -530,7 +647,7 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
     event_name: EVENT_NAME_TOOL_USE,
     pre_tool_use_data: preToolUseData,
     messages: [{ role: "user", content: input.lastUserPrompt ?? "" }],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint,
   };
   // Set only when true. `pull_policies: false` would say nothing the absence does not already say,
@@ -538,8 +655,22 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   // account for.
   if (input.pullPolicies === true) body.pull_policies = true;
   const finished = withAccountIdentity(body, input.accountIdentity);
-  if (mcp !== undefined) fitMcpBody(finished, mcp.args);
+  if (brokered !== undefined) fitMcpBody(finished, brokered.args);
   return finished;
+}
+
+/**
+ * `input.commandOriginalChars` when it is a whole number greater than the command handed over (the
+ * adapter capped it), else `undefined`. Total.
+ */
+function adapterOriginalChars(input: PretoolPayloadInput): number | undefined {
+  try {
+    const raw: unknown = input.commandOriginalChars;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return undefined;
+    return raw > input.command.length ? raw : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Write `mcpArgsForWire`'s result onto the request metadata, markers present-only. */
@@ -612,7 +743,10 @@ function fitMcpBody(body: PretoolRequestBody, args: Record<string, unknown>): vo
  *
  * Pure, like `buildPretoolPayload`: same input, same output, nothing written anywhere.
  */
-export function buildPromptPayload(input: PromptPayloadInput): PretoolRequestBody {
+export function buildPromptPayload(
+  input: PromptPayloadInput,
+  profile: Pick<AgentProfile, "appLabel">,
+): PretoolRequestBody {
   // The same both-ends discipline a command gets, for the same padding-bypass reason — see
   // `MAX_PROMPT_CHARS`.
   const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
@@ -630,7 +764,7 @@ export function buildPromptPayload(input: PromptPayloadInput): PretoolRequestBod
     event_name: EVENT_NAME_USER_PROMPT,
     pre_tool_use_data: { tool_name: "", command: "", metadata },
     messages: [{ role: "user", content: capped.command }],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint,
   };
   // Inert on this path — `handleGuardrails` never attaches `tools_to_check` (§C2) — so it is only
