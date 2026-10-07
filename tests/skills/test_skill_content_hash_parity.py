@@ -172,7 +172,7 @@ def test_copilot_invoked_event_emission_carries_the_hash(tmp_path, monkeypatch):
 def test_claude_code_posttooluse_emission_carries_the_hash(tmp_path, monkeypatch):
     unbound = tool_module("claude-code/hooks")
     skill, expected = _skill_file(tmp_path)
-    monkeypatch.setattr(unbound, "_resolve_skill_path", lambda name, cwd: str(skill))
+    monkeypatch.setattr(unbound, "_resolve_skill_path", lambda name, cwd, *_: str(skill))
     events = [
         {"event": {"hook_event_name": "UserPromptSubmit", "session_id": "s",
                    "prompt": "run the docx skill"}},
@@ -192,7 +192,7 @@ def test_claude_code_typed_slash_skill_carries_the_hash(tmp_path, monkeypatch):
     prompt and emitted separately, and must carry the hash on that path too."""
     unbound = tool_module("claude-code/hooks")
     skill, expected = _skill_file(tmp_path)
-    monkeypatch.setattr(unbound, "_resolve_skill_path", lambda name, cwd: str(skill))
+    monkeypatch.setattr(unbound, "_resolve_skill_path", lambda name, cwd, *_: str(skill))
     events = [{"event": {"hook_event_name": "UserPromptSubmit", "session_id": "s",
                          "prompt": "/docx do it"}}]
     exchange = unbound.build_llm_exchange(events, stop_assistant_message="done")
