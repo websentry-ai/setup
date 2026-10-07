@@ -3273,6 +3273,7 @@ function toolExecuteAfter(ctx) {
 }
 
 // packages/opencode/src/userShell.ts
+import { isAbsolute as isAbsolute6 } from "node:path";
 function readString4(value, key) {
   try {
     if (value === null || typeof value !== "object") return "";
@@ -3319,7 +3320,7 @@ async function checkUserCommandVerdict(command, cwdRaw, sessionID, callID, ctx) 
     const checker = resolved.checker;
     const scope = resolved.scope;
     if (checker === void 0 || scope === void 0) return NO_USER_DECISION;
-    const cwd = typeof cwdRaw === "string" && cwdRaw.startsWith("/") ? cwdRaw : record.directory;
+    const cwd = typeof cwdRaw === "string" && cwdRaw !== "" && isAbsolute6(cwdRaw) ? cwdRaw : record.directory;
     const identity = runtime.identity();
     const deadlineMs = runtime.deps.deadlineMs;
     const evalDeps = {
@@ -3368,7 +3369,7 @@ function shellEnv(ctx) {
 }
 
 // packages/opencode/src/plugin.ts
-var BUILD_TOKEN = true ? "b7c09529089ba76cfad43c4d454d9cf9" : "source";
+var BUILD_TOKEN = true ? "ebb7fbe027f819b8f084c53837a58d1b" : "source";
 function isBuildToken(value) {
   return typeof value === "string" && /^[0-9a-f]{32}$/.test(value);
 }
@@ -4087,7 +4088,7 @@ function createServerPlugin(overrides = {}) {
 }
 
 // packages/opencode/src/v2Enforce.ts
-import { isAbsolute as isAbsolute6, resolve as resolve2 } from "node:path";
+import { isAbsolute as isAbsolute7, resolve as resolve2 } from "node:path";
 var V2_SHELL_TOOL = "shell";
 var V2_SUBAGENT_TOOL = "subagent";
 var V2_CODE_MODE_TOOL = "execute";
@@ -4293,7 +4294,7 @@ function createV2Registrations() {
 function modelShellCwd(input, sessionID, directory, scope) {
   try {
     const workdir = readField6(input, "workdir");
-    if (typeof workdir === "string" && workdir !== "" && isAbsolute6(workdir)) return directoryKey(workdir) ?? "";
+    if (typeof workdir === "string" && workdir !== "" && isAbsolute7(workdir)) return directoryKey(workdir) ?? "";
     const base = scope.sessionDirs.get(sessionID) ?? (scope.directories.size > 1 ? void 0 : directoryKey(directory));
     if (base === void 0) return "";
     if (typeof workdir === "string" && workdir !== "") return directoryKey(resolve2(base, workdir)) ?? "";

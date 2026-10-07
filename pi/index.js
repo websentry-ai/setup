@@ -2375,7 +2375,9 @@ async function confirmBrokered(ui, reason, signal) {
       return "deny";
     }
     notifySafe(ui, reason, "warning");
-    const signals = [ui.signal, signal].filter((s) => s instanceof AbortSignal);
+    const signals = [ui.signal, signal].filter(
+      (s) => s instanceof AbortSignal && (s === signal || !s.aborted)
+    );
     const combined = signals.length === 0 ? void 0 : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
     const dialogCtx = { hasUI: true, ui: ui.ui, signal: combined };
     const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
