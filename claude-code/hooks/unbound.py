@@ -4381,8 +4381,10 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 # Inside a quoted run these are plain text; masking them keeps `"a b"` one word and `"a && b"` one segment.
 _QUOTED_SHELL_CHAR_RE = re.compile(r'[\s;|&<>()`$]')
-# `&>` is a redirect, not a background `&`.
-_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|\n]|&(?!>)')
+# Quotes anywhere in a word are shell syntax, not text: `"re"set` is `reset`.
+_QUOTE_CHAR_RE = re.compile(r'["\']')
+# An `&` inside a redirect (`2>&1`, `&>file`) is not a background `&`.
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|\n]|(?<![<>])&(?!>)')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
@@ -4444,7 +4446,7 @@ def _without_redirects(words):
 def _segment_words(segment):
     """A segment's words from its command word on, dropping redirects, env assignments and any sudo/env/command wrapper."""
     words = []
-    for word in _without_redirects(word.strip('()`{}"\'') for word in segment.split()):
+    for word in _without_redirects(_QUOTE_CHAR_RE.sub('', word).strip('()`{}') for word in segment.split()):
         if not words and (not word or word.startswith('-')
                           or _ENV_ASSIGNMENT_RE.match(word)
                           or word in _COMMAND_PREFIX_WORDS):

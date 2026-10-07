@@ -620,6 +620,10 @@ GIT_COMMANDS = [
     'git -c user.name=x merge main',
     'git --no-pager commit -m wip',
     'git "commit" -m wip',
+    'git "re"set --hard',
+    "git 're'set --hard",
+    'git pu"sh"',
+    'git "pu""sh" origin main',
     'git commit -m "fix; rm -rf"',
     'git rebase main',
     'git cherry-pick abc123',
@@ -653,6 +657,9 @@ GIT_COMMANDS = [
     'git > "/dev/null" push',
     'git push 2>&1',
     'git &>/dev/null push',
+    'git 2>&1 push',
+    'git >&2 commit -m wip',
+    'git 2>&1 >/dev/null push',
     'git tag v1.0',
     'git stash',
     'git stash pop',
@@ -687,6 +694,8 @@ GIT_READ_COMMANDS = [
     'git log>/dev/null 2>&1',
     'git 2>/dev/null status',
     'git status 2>&1',
+    'git 2>&1 status',
+    'git st"atus"',
     'git --version',
     'git status 2>/dev/null',
     'git',
@@ -792,12 +801,25 @@ def test_redirects_into_a_file_are_still_writes(hook, command):
     ('git 2> /dev/null push', ['git', 'push']),
     ('git > "/dev/null" push', ['git', 'push']),
     ('git push 2>&1', ['git', 'push']),
+    ('git 2>&1 push', ['git', 'push']),
+    ('git >&2 push', ['git', 'push']),
+    ('git "re"set --hard', ['git', 'reset', '--hard']),
     ('cat <<EOF', ['cat']),
     ('patch < fix.diff', ['patch']),
     ('git log --oneline', ['git', 'log', '--oneline']),
 ])
 def test_segment_words_drop_redirects_and_their_targets(hook, segment, words):
     assert hook._segment_words(segment) == words
+
+
+@pytest.mark.parametrize("command, segments", [
+    ('git 2>&1 push', ['git 2>&1 push']),
+    ('git &>/dev/null push', ['git &>/dev/null push']),
+    ('make & git push', ['make ', ' git push']),
+    ('a && b; c | d', ['a ', ' b', ' c ', ' d']),
+])
+def test_segment_separator_keeps_redirect_ampersands(hook, command, segments):
+    assert hook._SHELL_SEGMENT_SEP_RE.split(command) == segments
 
 
 def test_git_command_sets_are_reviewable_constants(hook):
