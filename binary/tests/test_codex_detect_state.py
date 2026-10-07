@@ -498,7 +498,9 @@ def test_no_privilege_drop_for_a_profile_without_codex(m, tmp_path, monkeypatch)
 @pytest.mark.parametrize("content", [
     "#!/bin/sh\nexit 0\n",
     "#!/usr/bin/env python3\n",
-    "#!/usr/bin/env python3\n# def main hook_event_name api.getunbound.ai\n",  # markers but not a real hook
+    "#!/usr/bin/env python3\n# def main hook_event_name api.getunbound.ai\n",
+    # A forged "python-era" hook: the markers and the size, but a no-op.
+    "#!/usr/bin/env python3\n# def main\n# hook_event_name\n# api.getunbound.ai\n" + "# pad\n" * 5000,
 ])
 def test_a_runnable_script_that_is_not_ours_is_tampered(m, tmp_path, content):
     """A no-op kept at our path with the right mode enforces nothing."""
@@ -508,12 +510,33 @@ def test_a_runnable_script_that_is_not_ours_is_tampered(m, tmp_path, content):
     assert _state(m, home) == "tampered"
 
 
-def test_a_python_era_hook_script_is_ours(m, tmp_path):
+@pytest.mark.parametrize("gateway", [None, "https://gateway.acme.example"])
+def test_a_python_era_hook_script_is_ours(m, tmp_path, gateway):
+    """The python installers patch the tenant gateway into the hook they download."""
     home = _profile(tmp_path, script=True)
-    real_hook = Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py"
-    _wrapper(home).write_text(real_hook.read_text())
+    real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
+    if gateway:
+        real_hook = real_hook.replace('"https://api.getunbound.ai"', f'"{gateway}"')
+    _wrapper(home).write_text(real_hook)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     assert _state(m, home) == "persisted"
+
+
+def test_an_edited_python_era_hook_is_not_ours(m, tmp_path):
+    home = _profile(tmp_path, script=True)
+    real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
+    _wrapper(home).write_text(real_hook.replace("def main(", "def _unused(", 1) + "\nraise SystemExit(0)\n")
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    assert _state(m, home) == "tampered"
+
+
+def test_the_shipped_hash_list_matches_the_canonical_form():
+    """Every shipped hash is a canonical (default-gateway) script, and the bundled
+    hook canonicalises to itself."""
+    bundled = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
+    patched = bundled.replace('"https://api.getunbound.ai"', '"https://tenant.example"')
+    assert setup_cmd._python_era_hook_sha256(patched) == setup_cmd._python_era_hook_sha256(bundled)
+    assert all(len(h) == 64 for h in setup_cmd.CODEX_PYTHON_ERA_HOOK_SHA256)
 
 
 @pytest.mark.parametrize("mode, expected", [(0o500, "persisted"), (0o100, "tampered"), (0o111, "tampered")])

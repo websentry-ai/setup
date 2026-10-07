@@ -18,9 +18,12 @@ Fail-open: a component failure is reported in the summary and the exit code,
 but never aborts the remaining components.
 """
 
+import hashlib
 import json
+import math
 import os
 import platform
+import re
 import shlex
 import stat
 import subprocess
@@ -36,6 +39,7 @@ from ._resources import (
     hook_source_path,
 )
 from . import migration
+from ._codex_python_era_hashes import CODEX_PYTHON_ERA_HOOK_SHA256
 
 # Mirrors mdm/onboard.py's discovery timeout contract.
 DISCOVERY_TIMEOUT_SECONDS = 5400
@@ -518,7 +522,9 @@ def _struct_ok(obj, fields) -> bool:
 def _toml_ok(value) -> bool:
     if value is None:
         return False
-    if isinstance(value, bool) or isinstance(value, (str, float)):
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, (bool, str)):
         return True
     if isinstance(value, int):
         return -2 ** 63 <= value < 2 ** 63
@@ -741,9 +747,10 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     # (a repeated key collapses on rewrite); otherwise the file is left alone.
     if json.dumps(config, sort_keys=True) == before and (loadable or not rewritten_loads):
         return
+    data = text.encode("utf-8")  # before the truncating open: a failure must leave the file intact
     fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(text)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:
@@ -1025,22 +1032,34 @@ def _codex_wrapper_runnable(wrapper: Path) -> bool:
     return stat.S_ISREG(mode) and mode & (stat.S_IRUSR | stat.S_IXUSR) == stat.S_IRUSR | stat.S_IXUSR
 
 
-# Every python-era codex hook (the script setup installed before the binary) has these.
-_PYTHON_ERA_HOOK_MARKERS = ("def main", "hook_event_name", "api.getunbound.ai")
-_PYTHON_ERA_HOOK_MIN_BYTES = 20_000
+# The python installers patch the tenant gateway into the hook's one gateway literal;
+# resetting it gives the shipped script back, to compare against the shipped hashes.
+_PYTHON_ERA_GATEWAY = re.compile(r'(UNBOUND_GATEWAY_URL", |UNBOUND_GATEWAY_URL = )"[^"\n]*"')
+_PYTHON_ERA_DEFAULT_GATEWAY = '"https://api.getunbound.ai"'
 
 
-def _codex_wrapper_is_ours(wrapper: Path) -> bool:
-    """Runs as the profile's user: the script is the binary's wrapper or a genuine
-    python-era hook, not a no-op kept at our path with the right mode."""
+def _python_era_hook_sha256(text: str) -> str:
+    canonical = _PYTHON_ERA_GATEWAY.sub(lambda match: match.group(1) + _PYTHON_ERA_DEFAULT_GATEWAY, text, count=1)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _known_python_era_hashes() -> frozenset:
+    """Every shipped version, plus the one bundled with this binary (newer than the list)."""
     try:
-        text = _read_user_file(wrapper, follow=False).decode("utf-8", errors="replace")
+        bundled = _python_era_hook_sha256(hook_source_path("codex").read_text(encoding="utf-8"))
     except OSError:
+        return CODEX_PYTHON_ERA_HOOK_SHA256
+    return CODEX_PYTHON_ERA_HOOK_SHA256 | {bundled}
+
+
+def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset) -> bool:
+    """Runs as the profile's user: the script is the binary's wrapper or a python-era
+    hook we shipped, not a no-op kept at our path with the right mode."""
+    try:
+        text = _read_user_file(wrapper, follow=False).decode("utf-8")
+    except (OSError, ValueError):
         return False
-    if text == _codex_wrapper_source():
-        return True
-    return (text.startswith("#!/usr/bin/env python3") and len(text) >= _PYTHON_ERA_HOOK_MIN_BYTES
-            and all(marker in text for marker in _PYTHON_ERA_HOOK_MARKERS))
+    return text == _codex_wrapper_source() or _python_era_hook_sha256(text) in python_era_hashes
 
 
 def _codex_detect_state(m, user_homes):
@@ -1051,6 +1070,7 @@ def _codex_detect_state(m, user_homes):
     try:
         any_complete = False
         indeterminate = False
+        python_era_hashes = _known_python_era_hashes()
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
@@ -1058,7 +1078,7 @@ def _codex_detect_state(m, user_homes):
             if not script and os.path.lexists(wrapper):
                 return "tampered"  # something other than our file holds the script path
             if script:
-                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper)
+                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper, python_era_hashes)
                 if script is False:
                     return "tampered"  # a runnable script at our path that isn't ours
             registered = False

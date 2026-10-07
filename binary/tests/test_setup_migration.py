@@ -1121,6 +1121,32 @@ def test_setup_recovers_a_hooks_json_codex_rejects_at_parse_time(env, spoil, rep
     assert _codex_states(env)[-1] == ("persisted" if repaired else "tampered")
 
 
+def test_a_write_that_cannot_be_encoded_leaves_hooks_json_intact(env):
+    """Encoding happens before the truncating open, so a value that can't be
+    written as UTF-8 never empties the user's file."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    del config["hooks"]["Stop"]  # forces a write
+    text = json.dumps(config)[:-1] + ', "description": "x\\ud800"}'
+    hooks_json.write_text(text, encoding="utf-8")
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert hooks_json.read_text(encoding="utf-8") == text
+
+
+def test_a_nan_inside_mcp_input_is_repaired(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["hooks"]["Interrupt"] = [{"hooks": [
+        {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": "__NAN__"}}]}]
+    hooks_json.write_text(json.dumps(config).replace('"__NAN__"', "NaN"))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env)[-1] == "persisted"
+    assert setup_cmd._codex_can_load(setup_cmd._load_codex_json(hooks_json.read_bytes()))
+
+
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
 
 def test_clear_strips_binary_hook_preserves_foreign(env):
