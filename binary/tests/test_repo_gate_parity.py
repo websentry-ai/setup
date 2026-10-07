@@ -271,10 +271,12 @@ def _prompt_event(tool, cwd, turn='t1'):
     return event
 
 
-# The default command must be one the gate is in scope for: `git status` runs git.
-GATED_COMMAND = 'git status'
+# The default command must be one the gate is in scope for: `git commit` writes the repository.
+GATED_COMMAND = 'git commit -m wip'
 # Commands the gate now ignores entirely, whatever repo they resolve in.
-UNGATED_COMMANDS = ['ls -la', 'cat README.md', 'npm test', 'python -m pytest']
+UNGATED_COMMANDS = ['ls -la', 'cat README.md', 'npm test', 'python -m pytest',
+                    'git status --short', 'git diff --stat', 'ls ~/.clasprc.json 2>/dev/null',
+                    'git fetch', 'git branch feature']
 
 
 def _tool_event(tool, cwd, turn='t1', command=GATED_COMMAND):
@@ -600,21 +602,44 @@ def test_every_call_into_an_out_of_scope_repo_denies(hook, repos):
 
 
 # ===========================================================================
-# Scope: write tools always, a shell call only when it runs git or mutates the working tree.
+# Scope: write tools always, a shell call only when it runs a git write subcommand or mutates the working tree.
 # ===========================================================================
 
-GIT_COMMANDS = [
+GIT_WRITE_COMMANDS = [
     'git push',
-    'git status --short',
     '/usr/bin/git push',
     'cd /tmp/x && git commit -m wip',
-    'cd /tmp/x; git log',
-    'false || git fetch',
+    'cd /tmp/x; git rebase main',
+    'false || git reset --hard',
     'sudo git push',
-    'GIT_DIR=/tmp/x git status',
+    'GIT_DIR=/tmp/x git add .',
     '(cd /tmp/x && git push)',
-    'git log | head -5',
+    'git stash | cat',
+    'git -C /tmp/x commit -m wip',
+    'git --git-dir=/tmp/x/.git checkout .',
+    'git --no-pager merge feature',
+    'git -c user.name=x commit -m wip',
+    'git branch -d feature',
+    'git branch -D feature',
+    'git branch --delete feature',
+    'git restore .',
+    'git --namespace x push',
+    'git --config-env user.name=X commit -m wip',
+    'git apply fix.patch',
+    'git am fix.mbox',
+    'git -C "/tmp/a b" commit -m wip',
+    "git -C '/tmp/a b' push",
+    'git --git-dir="/tmp/a b/.git" push',
+    'git --work-tree "/tmp/a b" checkout -- .',
 ]
+# Read-only git is out of scope: WEB-6070, `git status` in a personal repo blocked harmless work.
+GIT_READ_COMMANDS = ['git status', 'git status --short', 'git diff --stat', 'git log --oneline | head -5',
+                     'cd /tmp/x; git log', 'GIT_DIR=/tmp/x git status', '/usr/bin/git status',
+                     'git -C /tmp/x status', 'git --no-pager diff', 'git -C "/tmp/a b" status']
+# Denylist by design: unlisted subcommands pass even when they could write. Add to _GIT_WRITE_SUBCOMMANDS, not here.
+GIT_UNLISTED_COMMANDS = ['git fetch', 'git branch feature', 'git config user.name x', 'git some-alias']
+# `tag` and `stash` are on the write list, so their listing forms are gated too; a conscious trade for a short list.
+GIT_GATED_READ_FORMS = ['git tag', 'git tag -l', 'git stash list', 'git stash show']
 SHELL_WRITE_COMMANDS = [
     'rm auth.py',
     'rm -rf build/',
@@ -632,6 +657,13 @@ SHELL_WRITE_COMMANDS = [
     'cd /tmp/x && rm auth.py',
     'ln -s a b',
     'patch < fix.diff',
+    'cmd 2>/dev/null > out.txt',
+    'echo x >/dev/null >& README.md',
+    'cmd >& out.log',
+    'cmd >&out.log',
+    'cmd >&1.log',
+    'cmd >&-backup',
+    'echo x > "out.txt"',
 ]
 # The anti-false-positive set: git or a write command appears in the LINE but is
 # not the command being invoked. An over-eager block here stops legitimate work.
@@ -654,11 +686,33 @@ NOT_COMMANDS = [
     'cd /tmp/x',
     'cd /tmp/x && npm run build',
 ]
+# A redirect into a device creates nothing on disk.
+DEVICE_REDIRECTS = ['ls ~/.clasprc.json 2>/dev/null', 'cmd > /dev/null', 'cmd >/dev/null 2>&1',
+                    'cmd >/dev/null; ls', 'echo x >/dev/stdout', 'echo x > /dev/stderr', 'cat f > /dev/tty',
+                    'cmd >& /dev/null', 'cmd >&2', 'cmd >&-', 'cmd 2>&1 >/dev/null', 'cmd >&2; ls', 'cmd 2>&1 | grep x',
+                    'echo `git rev-parse HEAD 2>/dev/null`']
 
 
-@pytest.mark.parametrize("command", GIT_COMMANDS)
-def test_git_commands_are_in_scope(hook, command):
-    assert hook._is_git_command(command) is True
+@pytest.mark.parametrize("command", GIT_WRITE_COMMANDS)
+def test_git_writes_are_in_scope(hook, command):
+    assert hook._is_git_write_command(command) is True
+
+
+@pytest.mark.parametrize("command", GIT_READ_COMMANDS)
+def test_read_only_git_is_out_of_scope(hook, command):
+    assert hook._is_git_write_command(command) is False
+    assert hook._is_shell_write_command(command) is False
+
+
+@pytest.mark.parametrize("command", GIT_UNLISTED_COMMANDS)
+def test_unlisted_git_subcommands_are_deliberately_not_gated(hook, command):
+    assert hook._is_git_write_command(command) is False
+    assert hook._is_shell_write_command(command) is False
+
+
+@pytest.mark.parametrize("command", GIT_GATED_READ_FORMS)
+def test_listing_forms_of_write_subcommands_are_gated(hook, command):
+    assert hook._is_git_write_command(command) is True
 
 
 @pytest.mark.parametrize("command", SHELL_WRITE_COMMANDS)
@@ -666,17 +720,22 @@ def test_shell_writes_are_in_scope(hook, command):
     assert hook._is_shell_write_command(command) is True
 
 
+@pytest.mark.parametrize("command", DEVICE_REDIRECTS)
+def test_a_redirect_into_a_device_is_not_a_write(hook, command):
+    assert hook._is_shell_write_command(command) is False
+
+
 @pytest.mark.parametrize("command", NOT_COMMANDS)
 def test_a_mention_is_never_an_invocation(hook, command):
     """Detection reads the command WORD of each segment, never a substring of
     the line, so these are out of scope however much they look like a match."""
-    assert hook._is_git_command(command) is False
+    assert hook._is_git_write_command(command) is False
     assert hook._is_shell_write_command(command) is False
 
 
 @pytest.mark.parametrize("command", [None, '', 123, {}, [], b'git push'])
 def test_detection_fails_open_on_junk(hook, command):
-    assert hook._is_git_command(command) is False
+    assert hook._is_git_write_command(command) is False
     assert hook._is_shell_write_command(command) is False
 
 
@@ -686,7 +745,7 @@ def test_indirect_invocation_is_deliberately_not_detected(hook):
     TOOLS still cover the ordinary case."""
     for command in ('xargs git commit', 'sh -c "git push"', 'xargs rm',
                     'sh -c "rm x"'):
-        assert hook._is_git_command(command) is False
+        assert hook._is_git_write_command(command) is False
         assert hook._is_shell_write_command(command) is False
 
 
@@ -698,6 +757,18 @@ def test_the_shell_write_command_set_is_one_reviewable_constant(hook):
     assert 'chmod' not in hook._SHELL_WRITE_COMMANDS
     assert 'chown' not in hook._SHELL_WRITE_COMMANDS
     assert hook._is_shell_write_command('chmod +x run.sh') is False
+
+
+def test_the_git_write_subcommand_set_is_one_reviewable_constant(hook):
+    assert 'commit' in hook._GIT_WRITE_SUBCOMMANDS
+    assert 'status' not in hook._GIT_WRITE_SUBCOMMANDS
+    assert 'fetch' not in hook._GIT_WRITE_SUBCOMMANDS
+    assert hook._is_git_write_command('git fetch') is False
+
+
+@pytest.mark.parametrize("subcommand", sorted(_load('claude-code')._GIT_WRITE_SUBCOMMANDS))
+def test_every_listed_write_subcommand_is_detected(hook, subcommand):
+    assert hook._is_git_write_command('git ' + subcommand) is True
 
 
 def test_read_tools_are_out_of_scope_entirely(hook):
@@ -733,6 +804,8 @@ def _assert_cd_caught(hook, response, repo='acme/widgets'):
 
 
 @pytest.mark.parametrize("command", ['cd %s && git commit -m wip',
+                                     'cd %s && git push',
+                                     'git -C %s commit -m wip',
                                      'cd %s && rm README.md',
                                      'cd %s && echo x > out.txt'])
 def test_cd_into_an_out_of_scope_repo_is_caught(hook, repos, command):
@@ -786,13 +859,14 @@ def test_a_cd_escape_is_blocked(hook, repos):
 #                        | inside allowed org | outside it | no git repo
 #   read / grep / glob   | allow              | allow      | allow
 #   write tool           | allow              | warn→block | allow
-#   git command          | allow              | warn→block | allow
+#   git write subcommand | allow              | warn→block | allow
+#   read-only git        | allow              | allow      | allow
 #   shell write          | allow              | warn→block | allow
 #   any other command    | allow              | allow      | allow
 # ===========================================================================
 
-@pytest.mark.parametrize("command", [GATED_COMMAND, 'git push', 'rm notes.txt',
-                                     'mv a b', 'echo x > out.txt'])
+@pytest.mark.parametrize("command", [GATED_COMMAND, 'git push', 'git branch -d x',
+                                     'rm notes.txt', 'mv a b', 'echo x > out.txt'])
 def test_gated_commands_in_an_out_of_scope_repo_are_blocked(hook, repos,
                                                                 command):
     _set_policies(hook, [BLOCK_ORG])
@@ -1032,7 +1106,7 @@ def test_augment_in_scope_workspace_still_gates_individual_paths(augment, repos)
 
 
 @pytest.mark.parametrize("command", [
-    'cd %s && git log --oneline',
+    'cd %s && git commit -m wip',
     'cd %s && rm README.md',
     'cd %s && echo x > out.txt',
 ])
