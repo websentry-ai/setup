@@ -720,7 +720,6 @@ def test_sweep_keeps_the_binary_codex_install(env):
 @pytest.mark.parametrize("python_era_command", [
     "{script}",              # python user-level installer
     '"{script}"',            # python MDM installer
-    'python3 "{script}"',
 ])
 def test_python_era_codex_install_upgrades_in_place(env, python_era_command):
     """A python-era codex hook is the same file + hooks.json entry the binary
@@ -860,6 +859,25 @@ def test_a_fifo_in_one_profile_reports_tampered_from_the_others(env, monkeypatch
     _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
     assert _codex_states(env) == ["fresh", "tampered"]
     assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
+def test_setup_repairs_a_decoy_registration(env):
+    """A command that names the wrapper but skips it is not ours to the install
+    either, so setup registers the real hook beside it and the next run is clean."""
+    home = env["home"]
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    decoy = f'python3 -c "{wrapper}"'
+    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
+        e: [{"hooks": [{"type": "command", "command": decoy}]}] for e in CODEX_EVENTS}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["tampered", "persisted"]
+    hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
+    for event in CODEX_EVENTS:
+        cmds = [h["command"] for grp in hooks[event] for h in grp["hooks"]]
+        assert cmds.count(str(wrapper)) == 1 and decoy in cmds
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---

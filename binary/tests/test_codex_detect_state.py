@@ -95,7 +95,7 @@ def test_a_symlinked_wrapper_is_not_our_script(m, tmp_path):
 
 # --- what counts as our registration -----------------------------------------
 
-@pytest.mark.parametrize("shape", ["{w}", '"{w}"', "'{w}'", 'python3 "{w}"', "/usr/bin/python3.12 {w}"])
+@pytest.mark.parametrize("shape", ["{w}", '"{w}"', "'{w}'"])
 def test_every_shape_our_installers_wrote_is_ours(m, tmp_path, shape):
     home = _profile(tmp_path, script=True)
     cfg = _registration(shape.format(w=_wrapper(home)))
@@ -109,6 +109,8 @@ def test_every_shape_our_installers_wrote_is_ours(m, tmp_path, shape):
     "/opt/other/unbound.py",
     "/usr/local/bin/unbound.py-wrapper",
     'python3 -c "{w}"',
+    'python3 "{w}"',
+    '/tmp/bin/python3 "{w}"',
     'python3 -u "{w}"',
     'bash "{w}"',
     'python3 -m "{w}"',

@@ -21,7 +21,6 @@ but never aborts the remaining components.
 import json
 import os
 import platform
-import re
 import shlex
 import stat
 import subprocess
@@ -545,7 +544,7 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             for hook in existing_hooks if isinstance(existing_hooks, list) else []:
                 if not isinstance(hook, dict):
                     continue
-                if _command_targets_hook(hook.get("command", ""), Path(hook_command)):
+                if _codex_runs_wrapper(hook.get("command"), Path(hook_command)):
                     our_hook_exists = True
                     break
         if not our_hook_exists:
@@ -754,17 +753,15 @@ def _setup_codex(opts):
 
 
 def _codex_runs_wrapper(command, wrapper: Path) -> bool:
-    """The command, as the shell splits it, is exactly our wrapper, optionally
-    after a bare python launcher. Anything else around it (`python3 -c`, `; true`,
-    `> /dev/null`, an unquoted path with a space) can skip the hook."""
+    """The command, as the shell splits it, is exactly our wrapper: the only shapes
+    our installers write here (bare or quoted path). Anything around it, including
+    a launcher the user controls, can skip the hook."""
     if not isinstance(command, str):
         return False
     try:
         tokens = shlex.split(command)
     except ValueError:
         return False
-    if len(tokens) == 2 and re.fullmatch(r"python(\d+(\.\d+)?)?", os.path.basename(tokens[0])):
-        tokens = tokens[1:]
     return len(tokens) == 1 and os.path.normpath(tokens[0]) == os.path.normpath(str(wrapper))
 
 
