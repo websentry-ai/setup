@@ -35,6 +35,34 @@ export const GOLDEN_PATH = join(PI_TEST_DIR, "fixtures", "pi-wire-golden.json");
 export const EXTRA_GOLDEN_PATH = join(PI_TEST_DIR, "fixtures", "pi-wire-golden-extra.json");
 /** The commit the first golden was captured from, and whose artifact the second one is captured from. */
 export const EXTRA_GOLDEN_BASE = "a9f621e";
+/**
+ * The THIRD golden: every scenario (both tables), captured by running origin/staging's own committed
+ * `pi/index.js` (`git show <STAGING_GOLDEN_BASE>:pi/index.js`) through this same harness, when the
+ * refactored branch was merged with staging. Staging changed pi's wire output on purpose after the
+ * first two goldens were frozen, so for the scenarios it changed, the oracle for "pi unchanged" is
+ * staging's shipped pi, not pre-refactor pi. Written only under `UNBOUND_WRITE_STAGING_GOLDEN=1`;
+ * the first two goldens are never touched.
+ */
+export const STAGING_GOLDEN_PATH = join(PI_TEST_DIR, "fixtures", "pi-wire-golden-staging.json");
+/** The origin/staging commit whose committed `pi/index.js` the third golden is captured from. */
+export const STAGING_GOLDEN_BASE = "19546dfafc14ff62e45c626093918210d580f793";
+/**
+ * The frozen-golden scenarios whose transcript staging's shipped pi legitimately changed, each with
+ * the staging commit(s) that changed it. Only these skip their frozen-golden comparison, and
+ * `equivalenceStaging.test.ts` asserts this map equals EXACTLY the set where a frozen golden and the
+ * staging golden disagree, so nothing can be hidden by adding a name here.
+ */
+export const SUPERSEDED_BY_STAGING: Readonly<Record<string, string>> = {
+  // messages[0].content now carries the turn prompt (be6fa19); tool_response.content / is_error now
+  // carry capped, redacted tool output (c3cf7da).
+  "allow-deny-turn": "be6fa19 + c3cf7da",
+  // a typed !cmd is posted at once as its own turn log, not folded into the next turn (be6fa19).
+  "user-bash": "be6fa19",
+  // the turn prompt on the tool call, and the standalone !cmd turn log (be6fa19).
+  "identity-api-key": "be6fa19",
+  // the turn prompt on the tool calls (be6fa19).
+  "agent-dir-env-absolute": "be6fa19",
+};
 /** The source entry the refactor will change. */
 export const SOURCE_ENTRY = join(WORKSPACE_ROOT, "packages", "pi", "src", "index.ts");
 /** The committed, installable bundle — one directory above the workspace, beside `setup.py`. */

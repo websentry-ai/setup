@@ -1,0 +1,2848 @@
+{
+  "captured_from": "19546dfafc14ff62e45c626093918210d580f793:pi/index.js",
+  "artifact_sha256": "ec84dd8042080a74c22076172b92f35e7fec2d3cc1ad71ec0c3bef03692cebd2",
+  "scenarios": {
+    "allow-deny-turn": {
+      "scenario": "allow-deny-turn",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "session-start",
+          "event": "session_start",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "session_start",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true,
+                    "pi_version": "0.87.1"
+                  }
+                },
+                "messages": [],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true,
+                "first_approval_check": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "prompt",
+          "event": "input",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "user_prompt",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true
+                  }
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "list the files and clean up /tmp/x"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            }
+          ]
+        },
+        {
+          "step": "bash-ls-allow",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls -la",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "list the files and clean up /tmp/x"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "bash-rm-deny",
+          "event": "tool_call",
+          "mode": "deny",
+          "returned": {
+            "block": true,
+            "reason": "Blocked by Unbound policy: Reading secrets is blocked."
+          },
+          "notices": [
+            {
+              "message": "Reading secrets is blocked.",
+              "type": "error"
+            }
+          ],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "rm -rf /tmp/x",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "list the files and clean up /tmp/x"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "read-with-path",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "read",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "path": "<ROOT>/work/src/app.ts",
+                      "offset": 1,
+                      "limit": 50
+                    },
+                    "file_path": "<ROOT>/work/src/app.ts"
+                  },
+                  "tool_use_id": "toolu_wire_3"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "list the files and clean up /tmp/x"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "grep-no-path",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "grep",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "pattern": "TODO",
+                      "ignoreCase": true
+                    },
+                    "file_path": "<ROOT>/work"
+                  },
+                  "tool_use_id": "toolu_wire_4"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "list the files and clean up /tmp/x"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "result-ls",
+          "event": "tool_result",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "result-read",
+          "event": "tool_result",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "result-grep",
+          "event": "tool_result",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "agent-end",
+          "event": "agent_end",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pi",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "auto",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "list the files and clean up /tmp/x"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "Listed the files; the cleanup was blocked by policy.",
+                    "tool_use": [
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "toolu_wire_1",
+                        "tool_input": {
+                          "command": "ls -la"
+                        },
+                        "tool_response": {
+                          "content_sha256": "60c6ce63b41a89ab997ad3e9cc6a16310dcd870339337f87d5741b0d0e4c4cc8",
+                          "content_bytes": 17,
+                          "content": "total 0\nsrc\n"
+                        }
+                      },
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "toolu_wire_2",
+                        "tool_input": {
+                          "command": "rm -rf /tmp/x"
+                        },
+                        "tool_response": {}
+                      },
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "read",
+                        "tool_use_id": "toolu_wire_3",
+                        "tool_input": {
+                          "path": "<ROOT>/work/src/app.ts",
+                          "offset": 1,
+                          "limit": 50
+                        },
+                        "tool_response": {
+                          "content_sha256": "42acbb669984daae9eb39bdf302fe1b31301e8e4d4cc72a9e9c9acc3e03ad4e8",
+                          "content_bytes": 27,
+                          "content": "export const app = 1;\n"
+                        }
+                      },
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "grep",
+                        "tool_use_id": "toolu_wire_4",
+                        "tool_input": {
+                          "pattern": "TODO",
+                          "ignoreCase": true
+                        },
+                        "tool_response": {
+                          "content_sha256": "405e0cbcc7cdae257d3dbe658a5f334eb589c3cf464c22b004521928294c5e3f",
+                          "content_bytes": 21,
+                          "content": "No matches found",
+                          "is_error": true
+                        }
+                      }
+                    ]
+                  }
+                ],
+                "cwd": "<ROOT>/work",
+                "requestCompleted": "<VOLATILE>",
+                "usage": {
+                  "prompt_tokens": 0,
+                  "completion_tokens": 0,
+                  "total_tokens": 0
+                },
+                "requestInitialized": "<VOLATILE>"
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "ask-confirm": {
+      "scenario": "ask-confirm",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "confirm-yes",
+          "event": "tool_call",
+          "mode": "ask",
+          "returned": "<undefined>",
+          "notices": [
+            {
+              "message": "Unusual command.",
+              "type": "warning"
+            }
+          ],
+          "confirms": [
+            {
+              "title": "Unbound policy",
+              "message": "Run this command?",
+              "timeout": 120000,
+              "has_signal": true
+            }
+          ],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "git push --force",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "confirm-no",
+          "event": "tool_call",
+          "mode": "ask",
+          "returned": {
+            "block": true,
+            "reason": "Declined by user (Unbound policy)"
+          },
+          "notices": [
+            {
+              "message": "Unusual command.",
+              "type": "warning"
+            }
+          ],
+          "confirms": [
+            {
+              "title": "Unbound policy",
+              "message": "Run this command?",
+              "timeout": 120000,
+              "has_signal": true
+            }
+          ],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "git push --force",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "no-ui",
+          "event": "tool_call",
+          "mode": "ask",
+          "returned": {
+            "block": true,
+            "reason": "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy."
+          },
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "git push --force",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_3"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "fail-open-breaker": {
+      "scenario": "fail-open-breaker",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "fail-1",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/errors",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "errors": [
+                  {
+                    "message": "pi hook bypassed_due_to_failure: HttpStatus500 for tool=bash after <N>ms",
+                    "timestamp": "<VOLATILE>",
+                    "category": "bypassed_due_to_failure"
+                  }
+                ],
+                "hook_source": "pi"
+              }
+            }
+          ]
+        },
+        {
+          "step": "fail-2",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "fail-3-opens",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": "<undefined>",
+          "notices": [
+            {
+              "message": "Unbound policy engine unreachable — allowing tool calls for 60 s",
+              "type": "warning"
+            }
+          ],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_3"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "open-no-request",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        }
+      ],
+      "files_written": []
+    },
+    "fail-closed": {
+      "scenario": "fail-closed",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "teach-block",
+          "event": "tool_call",
+          "mode": "failBlock",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "fail-blocks",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": {
+            "block": true,
+            "reason": "Unbound policy engine unavailable — please retry"
+          },
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/errors",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "errors": [
+                  {
+                    "message": "pi hook blocked_due_to_failure: HttpStatus500 for tool=bash after <N>ms",
+                    "timestamp": "<VOLATILE>",
+                    "category": "blocked_due_to_failure"
+                  }
+                ],
+                "hook_source": "pi"
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "block",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "revoked-key": {
+      "scenario": "revoked-key",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "reject-1",
+          "event": "tool_call",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/errors",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "errors": [
+                  {
+                    "message": "pi hook bypassed_due_to_failure: HttpStatus401 for tool=bash after <N>ms",
+                    "timestamp": "<VOLATILE>",
+                    "category": "bypassed_due_to_failure"
+                  }
+                ],
+                "hook_source": "pi"
+              }
+            }
+          ]
+        },
+        {
+          "step": "reject-2-latches",
+          "event": "tool_call",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [
+            {
+              "message": "Unbound: API key rejected — enforcement inactive",
+              "type": "warning"
+            }
+          ],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "latched-no-request",
+          "event": "tool_call",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "latched-prompt",
+          "event": "input",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "latched-agent-end",
+          "event": "agent_end",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        }
+      ],
+      "files_written": []
+    },
+    "no-key": {
+      "scenario": "no-key",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "session-start",
+          "event": "session_start",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [
+            {
+              "message": "Unbound: no API key found — extension inactive",
+              "type": "info"
+            }
+          ],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "session-start-again",
+          "event": "session_start",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "prompt",
+          "event": "input",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "tool-call",
+          "event": "tool_call",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "tool-result",
+          "event": "tool_result",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "user-bash",
+          "event": "user_bash",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "agent-end",
+          "event": "agent_end",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        }
+      ],
+      "files_written": []
+    },
+    "user-bash": {
+      "scenario": "user-bash",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "allow",
+          "event": "user_bash",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "git status",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {}
+                  },
+                  "tool_use_id": "ubash_<MINTED:1>"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pi",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "auto",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_use": [
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "ubash_<MINTED:1>",
+                        "tool_input": {
+                          "command": "git status"
+                        },
+                        "tool_response": {}
+                      }
+                    ]
+                  }
+                ],
+                "cwd": "<ROOT>/work",
+                "requestCompleted": "<VOLATILE>",
+                "usage": {
+                  "prompt_tokens": 0,
+                  "completion_tokens": 0,
+                  "total_tokens": 0
+                },
+                "requestInitialized": "<VOLATILE>"
+              }
+            }
+          ]
+        },
+        {
+          "step": "deny",
+          "event": "user_bash",
+          "mode": "deny",
+          "returned": {
+            "result": {
+              "output": "Blocked by Unbound policy: Reading secrets is blocked.",
+              "exitCode": 1,
+              "cancelled": false,
+              "truncated": false
+            }
+          },
+          "notices": [
+            {
+              "message": "Reading secrets is blocked.",
+              "type": "error"
+            }
+          ],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "cat ~/.aws/credentials",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {}
+                  },
+                  "tool_use_id": "ubash_<MINTED:2>"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pi",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "auto",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_use": [
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "ubash_<MINTED:2>",
+                        "tool_input": {
+                          "command": "cat ~/.aws/credentials"
+                        },
+                        "tool_response": {}
+                      }
+                    ]
+                  }
+                ],
+                "cwd": "<ROOT>/work",
+                "requestCompleted": "<VOLATILE>",
+                "usage": {
+                  "prompt_tokens": 0,
+                  "completion_tokens": 0,
+                  "total_tokens": 0
+                },
+                "requestInitialized": "<VOLATILE>"
+              }
+            }
+          ]
+        },
+        {
+          "step": "deny-excluded",
+          "event": "user_bash",
+          "mode": "deny",
+          "returned": {
+            "result": {
+              "output": "Blocked by Unbound policy: Reading secrets is blocked.",
+              "exitCode": 1,
+              "cancelled": false,
+              "truncated": false
+            }
+          },
+          "notices": [
+            {
+              "message": "Reading secrets is blocked.",
+              "type": "error"
+            }
+          ],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "cat ~/.aws/credentials",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {}
+                  },
+                  "tool_use_id": "ubash_<MINTED:3>"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pi",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "auto",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_use": [
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "ubash_<MINTED:3>",
+                        "tool_input": {
+                          "command": "cat ~/.aws/credentials"
+                        },
+                        "tool_response": {}
+                      }
+                    ]
+                  }
+                ],
+                "cwd": "<ROOT>/work",
+                "requestCompleted": "<VOLATILE>",
+                "usage": {
+                  "prompt_tokens": 0,
+                  "completion_tokens": 0,
+                  "total_tokens": 0
+                },
+                "requestInitialized": "<VOLATILE>"
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "cache-skip": {
+      "scenario": "cache-skip",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "learn-tools",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "grep-skipped",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "edit-skipped",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        },
+        {
+          "step": "read-checked",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "read",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "path": "src/app.ts"
+                    },
+                    "file_path": "src/app.ts"
+                  },
+                  "tool_use_id": "toolu_wire_4"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            }
+          ]
+        },
+        {
+          "step": "write-checked",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "write",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "path": "<ROOT>/work/out.txt",
+                      "_dropped": true
+                    },
+                    "file_path": "<ROOT>/work/out.txt"
+                  },
+                  "tool_use_id": "toolu_wire_5"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "tools_synced_at": "<VOLATILE>",
+            "tools_to_check": [
+              "read",
+              "write"
+            ],
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "key-tier-generic": {
+      "scenario": "key-tier-generic",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "check",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:generic>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:e3ee492871815b47"
+          }
+        }
+      ]
+    },
+    "key-tier-config": {
+      "scenario": "key-tier-config",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "session-start",
+          "event": "session_start",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:config>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "session_start",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true,
+                    "pi_version": "0.87.1"
+                  }
+                },
+                "messages": [],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true,
+                "first_approval_check": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "check",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:config>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:66638a9b8b11d80d"
+          }
+        }
+      ]
+    },
+    "identity-api-key": {
+      "scenario": "identity-api-key",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "session-start",
+          "event": "session_start",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "session_start",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true,
+                    "pi_version": "0.87.1"
+                  }
+                },
+                "messages": [],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true,
+                "first_approval_check": true,
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "prompt",
+          "event": "input",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "user_prompt",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true
+                  }
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "hello"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "check",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "hello"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true,
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "user-bash",
+          "event": "user_bash",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "pwd",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {}
+                  },
+                  "tool_use_id": "ubash_<MINTED:1>"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pi",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "auto",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_use": [
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "ubash_<MINTED:1>",
+                        "tool_input": {
+                          "command": "pwd"
+                        },
+                        "tool_response": {}
+                      }
+                    ]
+                  }
+                ],
+                "cwd": "<ROOT>/work",
+                "requestCompleted": "<VOLATILE>",
+                "usage": {
+                  "prompt_tokens": 0,
+                  "completion_tokens": 0,
+                  "total_tokens": 0
+                },
+                "requestInitialized": "<VOLATILE>",
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "agent-end",
+          "event": "agent_end",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pi",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "auto",
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "hello"
+                  },
+                  {
+                    "role": "assistant",
+                    "content": "hi",
+                    "tool_use": [
+                      {
+                        "type": "PostToolUse",
+                        "tool_name": "bash",
+                        "tool_use_id": "toolu_wire_1",
+                        "tool_input": {
+                          "command": "ls"
+                        },
+                        "tool_response": {}
+                      }
+                    ]
+                  }
+                ],
+                "cwd": "<ROOT>/work",
+                "requestCompleted": "<VOLATILE>",
+                "usage": {
+                  "prompt_tokens": 0,
+                  "completion_tokens": 0,
+                  "total_tokens": 0
+                },
+                "requestInitialized": "<VOLATILE>",
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "agent-dir-env-absolute": {
+      "scenario": "agent-dir-env-absolute",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "session-start",
+          "event": "session_start",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "session_start",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true,
+                    "pi_version": "0.87.1"
+                  }
+                },
+                "messages": [],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true,
+                "first_approval_check": true,
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "prompt",
+          "event": "input",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "user_prompt",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": true
+                  }
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "hello"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "learn-tools",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "hello"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true,
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        },
+        {
+          "step": "read-checked",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "read",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "path": "<ROOT>/work/src/app.ts"
+                    },
+                    "file_path": "<ROOT>/work/src/app.ts"
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "hello"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "account_identity": {
+                  "auth_mode": "api_key"
+                }
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/alt-agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "tools_synced_at": "<VOLATILE>",
+            "tools_to_check": [
+              "read",
+              "write"
+            ],
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "agent-dir-env-tilde": {
+      "scenario": "agent-dir-env-tilde",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "learn-tools",
+          "event": "tool_call",
+          "mode": "toolsList",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/tilde-agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "tools_synced_at": "<VOLATILE>",
+            "tools_to_check": [
+              "read",
+              "write"
+            ],
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "hydrated-cache-pulls": {
+      "scenario": "hydrated-cache-pulls",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "read-1-pulled",
+          "event": "tool_call",
+          "mode": "toolsEmpty",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "read",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "path": "<ROOT>/work/src/app.ts"
+                    },
+                    "file_path": "<ROOT>/work/src/app.ts"
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        },
+        {
+          "step": "read-2-skipped",
+          "event": "tool_call",
+          "mode": "toolsEmpty",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": []
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "tools_synced_at": "<VOLATILE>",
+            "tools_to_check": [],
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "hydrated-cache-fail-closed": {
+      "scenario": "hydrated-cache-fail-closed",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "fail-blocks",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": {
+            "block": true,
+            "reason": "Unbound policy engine unavailable — please retry"
+          },
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/errors",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "errors": [
+                  {
+                    "message": "pi hook blocked_due_to_failure: HttpStatus500 for tool=bash after <N>ms",
+                    "timestamp": "<VOLATILE>",
+                    "category": "blocked_due_to_failure"
+                  }
+                ],
+                "hook_source": "pi"
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "tools_synced_at": "<VOLATILE>",
+            "tools_to_check": [
+              "read"
+            ],
+            "policy_check_failure_action": "block",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "foreign-cache-ignored": {
+      "scenario": "foreign-cache-ignored",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "fail-allows",
+          "event": "tool_call",
+          "mode": "500",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/errors",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "errors": [
+                  {
+                    "message": "pi hook bypassed_due_to_failure: HttpStatus500 for tool=bash after <N>ms",
+                    "timestamp": "<VOLATILE>",
+                    "category": "bypassed_due_to_failure"
+                  }
+                ],
+                "hook_source": "pi"
+              }
+            }
+          ]
+        },
+        {
+          "step": "read-checked",
+          "event": "tool_call",
+          "mode": "allow",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "read",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "path": "<ROOT>/work/src/app.ts"
+                    },
+                    "file_path": "<ROOT>/work/src/app.ts"
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "fetched_at": "<VOLATILE>",
+            "policy_check_failure_action": "allow",
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "headless-stderr": {
+      "scenario": "headless-stderr",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "prompt-deny",
+          "event": "input",
+          "mode": "deny",
+          "returned": {
+            "action": "handled"
+          },
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "user_prompt",
+                "pre_tool_use_data": {
+                  "tool_name": "",
+                  "command": "",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "has_ui": false
+                  }
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "read the secrets"
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1"
+              }
+            }
+          ],
+          "stderr": [
+            "Blocked by Unbound policy: Reading secrets is blocked."
+          ]
+        },
+        {
+          "step": "bash-deny",
+          "event": "tool_call",
+          "mode": "deny",
+          "returned": {
+            "block": true,
+            "reason": "Blocked by Unbound policy: Reading secrets is blocked."
+          },
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "cat ~/.aws/credentials",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_1"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ],
+          "stderr": [
+            "Reading secrets is blocked."
+          ]
+        },
+        {
+          "step": "bash-ask-no-ui",
+          "event": "tool_call",
+          "mode": "ask",
+          "returned": {
+            "block": true,
+            "reason": "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy."
+          },
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "git push --force",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_2"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ],
+          "stderr": []
+        },
+        {
+          "step": "reject-1",
+          "event": "tool_call",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_3"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            },
+            {
+              "method": "POST",
+              "path": "/v1/hooks/errors",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "errors": [
+                  {
+                    "message": "pi hook bypassed_due_to_failure: HttpStatus401 for tool=bash after <N>ms",
+                    "timestamp": "<VOLATILE>",
+                    "category": "bypassed_due_to_failure"
+                  }
+                ],
+                "hook_source": "pi"
+              }
+            }
+          ],
+          "stderr": []
+        },
+        {
+          "step": "reject-2-latches",
+          "event": "tool_call",
+          "mode": "401",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [
+            {
+              "method": "POST",
+              "path": "/v1/hooks/pretool",
+              "authorization": "Bearer <KEY:pi>",
+              "content_type": "application/json",
+              "body": {
+                "conversation_id": "sess-wire-1",
+                "model": "claude-sonnet-4-5",
+                "event_name": "tool_use",
+                "pre_tool_use_data": {
+                  "tool_name": "bash",
+                  "command": "ls",
+                  "metadata": {
+                    "cwd": "<ROOT>/work",
+                    "tool_input": {
+                      "_dropped": true
+                    }
+                  },
+                  "tool_use_id": "toolu_wire_4"
+                },
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": ""
+                  }
+                ],
+                "unbound_app_label": "pi",
+                "client_entrypoint": "pi/0.87.1",
+                "pull_policies": true
+              }
+            }
+          ],
+          "stderr": [
+            "Unbound: API key rejected — enforcement inactive"
+          ]
+        }
+      ],
+      "files_written": [
+        {
+          "path": "<ROOT>/home/.pi/agent/.unbound/policy_cache.json",
+          "mode": "600",
+          "content": {
+            "gateway_url": "<GATEWAY>",
+            "key_fingerprint": "sha256:09bbeea5ac5df300"
+          }
+        }
+      ]
+    },
+    "headless-no-key": {
+      "scenario": "headless-no-key",
+      "registered": [
+        "session_start",
+        "tool_call",
+        "tool_result",
+        "agent_end",
+        "user_bash",
+        "input"
+      ],
+      "steps": [
+        {
+          "step": "session-start",
+          "event": "session_start",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [],
+          "stderr": [
+            "Unbound: no API key found — extension inactive"
+          ]
+        },
+        {
+          "step": "session-start-again",
+          "event": "session_start",
+          "mode": "deny",
+          "returned": "<undefined>",
+          "notices": [],
+          "confirms": [],
+          "requests": [],
+          "stderr": []
+        }
+      ],
+      "files_written": []
+    }
+  }
+}

@@ -30,6 +30,7 @@ import {
   GOLDEN_PATH,
   SCENARIO_NAMES,
   SOURCE_ENTRY,
+  SUPERSEDED_BY_STAGING,
   WORKSPACE_ROOT,
   runScenario,
 } from "./helpers/wireScenario.ts";
@@ -91,12 +92,17 @@ if (WRITE_GOLDEN) {
     });
 
     for (const name of SCENARIO_NAMES) {
-      test(`${name}: source entry matches the golden`, async () => {
+      // A scenario staging's own shipped pi changed is compared against the staging golden instead
+      // (`equivalenceStaging.test.ts`), which also proves this skip list is exact. The golden is
+      // still not regenerated.
+      const superseded = SUPERSEDED_BY_STAGING[name];
+      const skip = superseded === undefined ? false : `superseded by the staging golden (${superseded})`;
+      test(`${name}: source entry matches the golden`, { skip }, async () => {
         const expected = expectedFor(name);
         assert.deepStrictEqual(await runScenario(SOURCE_ENTRY, name), expected);
       });
 
-      test(`${name}: committed artifact pi/index.js matches the golden`, async () => {
+      test(`${name}: committed artifact pi/index.js matches the golden`, { skip }, async () => {
         const expected = expectedFor(name);
         assert.deepStrictEqual(await runScenario(ARTIFACT_ENTRY, name), expected);
       });
