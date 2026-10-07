@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -707,7 +708,7 @@ def _setup_codex(opts):
     # setup. No managed write and no user-level strip (the install IS the user
     # registration).
     user_homes = m.get_all_user_homes()
-    state = _codex_detect_state(user_homes)
+    state = _codex_detect_state(m, user_homes)
     installed = 0
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -730,27 +731,63 @@ def _setup_codex(opts):
     return ("configured", None)
 
 
-def _codex_detect_state(user_homes) -> str:
-    """Per-user analog of the python detect_install_state(): now that codex
-    registers in ~/.codex/hooks.json, install state is read from there.
-    'fresh' = no user has a hooks.json; 'persisted' = at least one references
-    this binary or the python-era unbound.py; 'tampered' otherwise."""
-    saw_json = False
-    saw_known_ref = False
+_CODEX_HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
+    """Whether this hooks.json registers our wrapper. Runs as the profile's user
+    and reads the file as codex does, following a symlink, but non-blocking,
+    regular files only and size-capped. Anything codex couldn't load is False."""
     try:
-        for _username, home_dir in user_homes:
-            p = home_dir / ".codex" / "hooks.json"
-            if p.exists():
-                saw_json = True
-                try:
-                    text = p.read_text(encoding="utf-8")
-                    if str(HOOK_BINARY) in text or "unbound.py" in text:
-                        saw_known_ref = True
-                except OSError:
-                    pass
-        if not saw_json:
-            return "fresh"
-        return "persisted" if saw_known_ref else "tampered"
+        fd = os.open(str(hooks_path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _CODEX_HOOKS_JSON_MAX_BYTES:
+            return False
+        with os.fdopen(fd, "r", encoding="utf-8") as f:
+            fd = None
+            config = json.load(f)
+    except (OSError, ValueError):
+        return False
+    finally:
+        if fd is not None:
+            os.close(fd)
+    events = config.get("hooks") if isinstance(config, dict) else None
+    for entries in events.values() if isinstance(events, dict) else []:
+        for item in entries if isinstance(entries, list) else []:
+            hooks = item.get("hooks") if isinstance(item, dict) else None
+            for hook in hooks if isinstance(hooks, list) else []:
+                if isinstance(hook, dict) and _command_targets_hook(hook.get("command"), wrapper):
+                    return True
+    return False
+
+
+def _codex_detect_state(m, user_homes):
+    """Install state before this run reasserts it, per profile, on the pair setup
+    installs: the wrapper script and our hooks.json entry. Either alone leaves codex
+    unenforced for that user. 'fresh' (no profile has either), 'persisted' (one has
+    both), 'tampered' (any has one without the other; wins), None if a check failed."""
+    try:
+        any_complete = False
+        indeterminate = False
+        for username, home_dir in user_homes:
+            wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
+            hooks_path = home_dir / ".codex" / "hooks.json"
+            script = m._is_our_hook_file(wrapper)
+            registered = False
+            if os.path.lexists(hooks_path):
+                registered = m._run_as_user(username, _codex_hook_registered, hooks_path, wrapper)
+            if registered is None:
+                indeterminate = True
+            elif script and registered:
+                any_complete = True
+            elif script or registered:
+                return "tampered"
+        if indeterminate:
+            return None
+        return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
         return None
