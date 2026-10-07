@@ -445,20 +445,15 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
 
 
 def _load_codex_json(data: bytes):
-    """Parse as strictly as codex's serde_json, which rejects what Python's json
-    accepts: a byte-order mark, NaN/Infinity, duplicate keys, lone surrogates."""
+    """Parse as codex's serde_json does where Python's json is looser: no byte-order
+    mark, NaN/Infinity or lone surrogates. A duplicate key keeps the last value in both."""
     if data.startswith(b"\xef\xbb\xbf"):
         raise ValueError("byte-order mark")
-
-    def _pairs(pairs):
-        if len({k for k, _ in pairs}) != len(pairs):
-            raise ValueError("duplicate key")
-        return dict(pairs)
 
     def _constant(name):
         raise ValueError(name)
 
-    config = json.loads(data.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant)
+    config = json.loads(data.decode("utf-8"), parse_constant=_constant)
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
     return config
 
@@ -765,6 +760,12 @@ def _setup_codex(opts):
             installed += 1
 
     if user_homes and installed == 0:
+        # A user can make every install fail (a symlinked or FIFO hooks.json), so
+        # a detected tamper is still reported rather than lost with the deferral.
+        if state == "tampered":
+            m.notify_setup_complete(api_key, "codex", backend_url=base,
+                                    install_state=state, serial_number=device_id,
+                                    install_mode="binary")
         return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,

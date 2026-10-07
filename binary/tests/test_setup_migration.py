@@ -1011,6 +1011,47 @@ def test_setup_repairs_an_async_pretooluse(env):
     assert _codex_states(env) == ["fresh", "tampered", "persisted"]
 
 
+@pytest.mark.parametrize("blocker", ["symlink", "fifo"])
+def test_a_tamper_is_reported_even_when_the_only_install_fails(env, monkeypatch, blocker):
+    """One profile whose hooks.json the install can't touch: setup defers, but the
+    tamper it detected still reaches the dashboard."""
+    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+    home = env["home"]
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    hooks_json = home / ".codex" / "hooks.json"
+    if blocker == "symlink":
+        target = env["tmp"] / "dotfiles.json"
+        target.write_text(json.dumps({"hooks": {}}))
+        hooks_json.symlink_to(target)
+    else:
+        os.mkfifo(hooks_json)
+    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
+    assert _codex_states(env) == ["tampered"]
+
+
+def test_a_fresh_install_that_fails_reports_nothing(env, monkeypatch):
+    def _as_user(_u, fn, *a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json.parent.mkdir(parents=True)
+    os.mkfifo(hooks_json)
+    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
+    assert _codex_states(env) == []
+
+
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
 
 def test_clear_strips_binary_hook_preserves_foreign(env):

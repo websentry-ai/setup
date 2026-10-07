@@ -266,7 +266,6 @@ def test_a_file_the_user_cannot_read_is_not_registered(m, tmp_path):
     lambda raw: "\ufeff" + raw,                                   # byte-order mark
     lambda raw: raw[:-1] + ', "x": NaN}',                          # NaN
     lambda raw: raw[:-1] + ', "x": Infinity}',                     # Infinity
-    lambda raw: raw[:-1] + ', "hooks": ' + raw[raw.index(":") + 1:],  # duplicate key
     lambda raw: raw[:-1] + ', "x": "\\ud800"}',                  # lone surrogate
 ])
 def test_a_file_codex_would_refuse_to_parse_is_not_registered(m, tmp_path, spoil):
@@ -275,6 +274,15 @@ def test_a_file_codex_would_refuse_to_parse_is_not_registered(m, tmp_path, spoil
     raw = json.dumps(_ours(home))
     (home / ".codex" / "hooks.json").write_text(spoil(raw), encoding="utf-8")
     assert _state(m, home) == "tampered"
+
+
+@pytest.mark.parametrize("last_is_ours, expected", [(True, "persisted"), (False, "tampered")])
+def test_a_duplicate_key_keeps_the_last_value_as_codex_does(m, tmp_path, last_is_ours, expected):
+    home = _profile(tmp_path, script=True)
+    ours, empty = json.dumps(_ours(home)["hooks"]), "{}"
+    first, last = (empty, ours) if last_is_ours else (ours, empty)
+    (home / ".codex" / "hooks.json").write_text(f'{{"hooks": {first}, "hooks": {last}}}')
+    assert _state(m, home) == expected
 
 
 @pytest.mark.parametrize("timeout", [10.0, 15000.0])
