@@ -478,6 +478,10 @@ def _hook_command_matches(existing_cmd: str, hook_command: str, script_path: Pat
     """An existing hook entry is ours if its command matches exactly, or (on
     Windows, where it's wrapped in a `py -3 "..."` launcher) references our
     script path."""
+    if not isinstance(existing_cmd, str):
+        # A non-string command is not ours, and the Windows branch below does a
+        # membership test that raises on an int or a bool.
+        return False
     return existing_cmd == hook_command or (is_windows and bool(existing_cmd) and str(script_path) in existing_cmd)
 
 
@@ -522,7 +526,13 @@ def configure_augment_settings() -> bool:
                 our_hook_exists = False
                 for existing_item in existing_config:
                     if isinstance(existing_item, dict):
-                        for hook in existing_item.get("hooks", []):
+                        # .get's default only covers a missing key, so a
+                        # scalar would be iterated and raise, aborting the
+                        # merge and leaving our hook unregistered.
+                        existing_hooks = existing_item.get("hooks")
+                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                            if not isinstance(hook, dict):
+                                continue
                             if _hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows):
                                 our_hook_exists = True
                                 break
@@ -543,8 +553,14 @@ def configure_augment_settings() -> bool:
             for item in blocks:
                 if not isinstance(item, dict):
                     continue
+                item_hooks = item.get("hooks")
+                if not isinstance(item_hooks, list):
+                    # .get's default only covers a missing key, so a scalar
+                    # would be iterated here and raise before the isinstance
+                    # filter below ever runs.
+                    continue
                 if any(_hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
-                       for hook in item.get("hooks", []) if isinstance(hook, dict)):
+                       for hook in item_hooks if isinstance(hook, dict)):
                     metadata = item.get("metadata")
                     if not isinstance(metadata, dict):
                         metadata = {}
@@ -610,9 +626,12 @@ def remove_hooks_from_settings() -> str:
                     continue
                 new_config = []
                 for item in event_config:
-                    if isinstance(item, dict):
-                        hooks = item.get("hooks", [])
-                        new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                    # Empty `hooks` reads as [] (item dropped); a truthy non-list is kept, not iterated.
+                    if isinstance(item, dict) and isinstance(item.get("hooks") or [], list):
+                        hooks = item.get("hooks") or []
+                        new_hooks = [h for h in hooks
+                                     if not isinstance(h, dict)
+                                     or not _is_unbound(h.get("command", ""))]
                         removed_ours = new_hooks != hooks
                         if removed_ours:
                             modified = True

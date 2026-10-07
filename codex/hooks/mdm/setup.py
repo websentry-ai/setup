@@ -670,7 +670,8 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
-    if not command:
+    if not isinstance(command, str) or not command:
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     # Binary install: command invokes the /opt/unbound hook binary (require both
     # the prefix and the binary name so a foreign hook merely mentioning the path
@@ -1067,20 +1068,25 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
             config["hooks"] = {}
 
         for event, new_config in hooks_config.items():
-            if event in config["hooks"]:
-                existing_config = config["hooks"][event]
-                our_hook_exists = False
-                for existing_item in existing_config:
-                    if isinstance(existing_item, dict):
-                        for hook in existing_item.get("hooks", []):
-                            existing_cmd = hook.get("command", "")
-                            if _command_targets_hook(existing_cmd, script_path):
-                                our_hook_exists = True
-                                break
-                if not our_hook_exists:
-                    config["hooks"][event].extend(new_config)
-            else:
+            if event not in config["hooks"]:
                 config["hooks"][event] = new_config
+                continue
+            existing_config = config["hooks"][event]
+            our_hook_exists = False
+            for existing_item in existing_config:
+                if not isinstance(existing_item, dict):
+                    continue
+                # .get's default only applies to a missing key, so a scalar
+                # here would be iterated and raise before the command check ran.
+                existing_hooks = existing_item.get("hooks")
+                for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                    if not isinstance(hook, dict):
+                        continue
+                    if _command_targets_hook(hook.get("command", ""), script_path):
+                        our_hook_exists = True
+                        break
+            if not our_hook_exists:
+                existing_config.extend(new_config)
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(hooks_path), flags, 0o644)
@@ -1099,7 +1105,8 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     install prefix and the binary name, so a foreign hook in a shared/Enterprise
     config that merely references some other unbound.py / mentions /opt/unbound/
     isn't stripped."""
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
@@ -1531,7 +1538,11 @@ def _unbound_hook_registered(hooks_path, script_path):
         for item in entries if isinstance(entries, list) else []:
             if not isinstance(item, dict):
                 continue
-            for hook in item.get('hooks') or []:
+            hooks = item.get('hooks')
+            # Shape-guard before iterating: a scalar here is truthy, so
+            # `or []` would iterate an int and abort detection for every
+            # profile on the device, not just this one.
+            for hook in hooks if isinstance(hooks, list) else []:
                 if isinstance(hook, dict) and _is_unbound_hook_command(
                         hook.get('command', ''), script_path):
                     return True
