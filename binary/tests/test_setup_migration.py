@@ -1290,6 +1290,20 @@ def test_a_nan_anywhere_is_repaired(env, plant):
     assert setup_cmd._codex_can_load(setup_cmd._load_codex_json(hooks_json.read_bytes()))
 
 
+@pytest.mark.skipif(sys.version_info < (3, 12), reason="older json can't parse it; the binary ships 3.12")
+def test_a_deep_field_codex_skips_does_not_break_the_install(env):
+    """Codex skips an unknown group field without its depth limit; repair must not
+    crash on it either."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["hooks"]["PreToolUse"][0]["x"] = "__DEEP__"
+    del config["hooks"]["Stop"]  # forces a rewrite
+    hooks_json.write_text(json.dumps(config).replace('"__DEEP__"', "[" * 1000 + "]" * 1000))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
 def test_a_nan_on_an_unknown_top_level_key_is_dropped(env):
     """The key is kept, as any unknown key is; the NaN codex can't parse is not."""
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0

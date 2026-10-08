@@ -649,11 +649,18 @@ def _out_of_range(value) -> bool:
 
 
 def _drop_out_of_range(value):
-    """Drop numbers codex can't parse wherever they sit: one rejects the whole file."""
-    if isinstance(value, dict):
-        return {k: _drop_out_of_range(v) for k, v in value.items() if not _out_of_range(v)}
-    if isinstance(value, list):
-        return [_drop_out_of_range(v) for v in value if not _out_of_range(v)]
+    """Drop numbers codex can't parse wherever they sit: one rejects the whole file.
+    Iterative and in place, since a field codex skips can nest past Python's recursion."""
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key in [k for k, v in node.items() if _out_of_range(v)]:
+                del node[key]
+            stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            node[:] = [v for v in node if not _out_of_range(v)]
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
     return value
 
 
