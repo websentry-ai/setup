@@ -133,28 +133,50 @@ def _detect_state(settings_path: Path, expected_hooks):
     except ValueError:
         return "tampered"
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
-    if _registers_every_event(hooks, expected_hooks) or "unbound.py" in data.decode("utf-8"):
+    script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
+    if _holds_every_entry(hooks, expected_hooks) or (
+            script.is_file() and _runs_on_every_event(hooks, expected_hooks,
+                                                      lambda h: str(script) in h["command"])):
         return "persisted"
     return "tampered"
 
 
-def _registers_every_event(hooks, expected_hooks) -> bool:
-    """Whether ``hooks`` runs our command on every event ``expected_hooks`` installs."""
+def _holds_every_entry(hooks, expected_hooks) -> bool:
+    """Every event still holds the entry setup wrote, exactly: these files are setup's
+    to write, so a changed matcher, timeout or command is interference."""
+    return isinstance(hooks, dict) and all(
+        isinstance(hooks.get(event), list)
+        and all(any(_same_entry(actual, entry) for actual in hooks[event]) for entry in entries)
+        for event, entries in expected_hooks.items())
+
+
+def _same_entry(actual, ours) -> bool:
+    """Equal, except that a metadata block may carry keys beyond the ones we set."""
+    if not isinstance(actual, dict):
+        return False
+    actual, ours = dict(actual), dict(ours)
+    have, want = actual.pop("metadata", None), ours.pop("metadata", None)
+    if actual != ours:
+        return False
+    return want is None or (isinstance(have, dict) and all(have.get(k) == v for k, v in want.items()))
+
+
+def _runs_on_every_event(hooks, events, runs) -> bool:
+    """Every event has a handler passing ``runs`` (a python-era install being migrated),
+    flat or in a group that matches every tool."""
     if not isinstance(hooks, dict):
         return False
-    return all(set(_event_commands(entries)) & set(_event_commands(hooks.get(event)))
-               for event, entries in expected_hooks.items())
-
-
-def _event_commands(entries):
-    """The command strings in one event's entries, flat ({"command"}) or grouped
-    ({"hooks": [...]})."""
-    for entry in entries if isinstance(entries, list) else []:
-        if not isinstance(entry, dict):
-            continue
-        for item in entry["hooks"] if isinstance(entry.get("hooks"), list) else [entry]:
-            if isinstance(item, dict) and isinstance(item.get("command"), str):
-                yield item["command"]
+    for event in events:
+        handlers = []
+        for entry in hooks.get(event) if isinstance(hooks.get(event), list) else []:
+            if isinstance(entry, dict) and "hooks" in entry:
+                if entry.get("matcher") in (None, "", "*", ".*") and isinstance(entry["hooks"], list):
+                    handlers += entry["hooks"]
+            else:
+                handlers.append(entry)
+        if not any(isinstance(h, dict) and isinstance(h.get("command"), str) and runs(h) for h in handlers):
+            return False
+    return True
 
 
 def _remove_stale_managed_script(managed_dir: Path) -> None:
@@ -265,6 +287,16 @@ def _augment_hooks_config():
         "SessionEnd": [{"hooks": [
             {"type": "command", "command": cmd("SessionEnd"), "timeout": 10000}]}],
     }
+
+
+def _augment_written_hooks(m):
+    """The Augment hooks as the writer leaves them: our groups plus the metadata flags
+    it sets on them."""
+    hooks = _augment_hooks_config()
+    for event, flags in m._HOOK_METADATA.items():
+        for group in hooks.get(event, []):
+            group["metadata"] = dict(flags)
+    return hooks
 
 
 def _copilot_hooks_config():
@@ -974,7 +1006,7 @@ def _setup_augment(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
 
-    state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_hooks_config())
+    state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
     if not _write_augment_managed_settings(m):
         return ("deferred", "managed settings write failed")
     _remove_stale_managed_script(m.get_managed_settings_dir())
@@ -1023,9 +1055,9 @@ def _setup_codex(opts):
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and _codex_wrapper_present(home_dir / ".codex" / "hooks" / "unbound.py") \
-                and not m._run_as_user(username, _codex_wrapper_current, home_dir / ".codex" / "hooks" / "unbound.py"):
-            state = "tampered"  # a script we couldn't replace, and not our current one, holds our path
+        elif state == "persisted" and not m._run_as_user(
+                username, _codex_wrapper_current, home_dir / ".codex" / "hooks" / "unbound.py"):
+            state = "tampered"  # the install failed and our current wrapper isn't what's left
 
     if user_homes and installed == 0:
         # A user can make every install fail (a symlinked or FIFO hooks.json), so
@@ -1257,22 +1289,20 @@ def _copilot_detect_state(m, user_homes):
 
 
 def _copilot_registered(path: Path) -> bool:
-    """Runs as the profile's user: the file runs our command on every event, in both
-    fields Copilot reads (command for VS Code, bash for the CLI). A python-era file
-    still pointing at unbound.py is a legitimate install being migrated."""
+    """Runs as the profile's user: every event still holds the entry setup wrote. A
+    python-era file, every event running its own unbound.py (in both command and bash)
+    with that script still there, is a legitimate install being migrated."""
     try:
-        text = _read_user_file(path, follow=True).decode("utf-8")
-        config = json.loads(text)
+        config = json.loads(_read_user_file(path, follow=True).decode("utf-8"))
     except (OSError, ValueError):
         return False
     hooks = config.get("hooks") if isinstance(config, dict) else None
-    if isinstance(hooks, dict) and all(
-            any(isinstance(e, dict) and e.get("type") == "command"
-                and e.get("command") == ours[0]["command"] and e.get("bash") == ours[0]["bash"]
-                for e in (hooks.get(event) if isinstance(hooks.get(event), list) else []))
-            for event, ours in _copilot_hooks_config()["hooks"].items()):
-        return True
-    return "unbound.py" in text
+    expected = _copilot_hooks_config()["hooks"]
+    script = path.parent / "unbound.py"
+    quoted = f'"{script}"'
+    return _holds_every_entry(hooks, expected) or (
+        script.is_file() and _runs_on_every_event(
+            hooks, expected, lambda h: h.get("command") == quoted and h.get("bash") == quoted))
 
 
 def _setup_copilot(opts):
