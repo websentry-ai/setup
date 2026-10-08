@@ -1853,11 +1853,10 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
     elif spoil == "not_json":
         path.write_text("{" + str(setup_cmd.HOOK_BINARY))
     elif spoil == "changed_entry":
-        entry = hooks_of(config)[sorted(hooks_of(config))[0]][0]
-        if "matcher" in entry or "hooks" in entry:
-            entry["matcher"] = "NEVER"
+        if tool == "cursor":
+            hooks_of(config)["preToolUse"][0]["timeout"] = 1  # ours is 15000
         else:
-            entry["timeout"] = 1
+            hooks_of(config)[sorted(hooks_of(config))[0]][0]["matcher"] = "NEVER"
         path.write_text(json.dumps(config))
     else:
         script = path.parent / "hooks" / "unbound.py"
@@ -2114,3 +2113,33 @@ def test_an_empty_hooks_json_is_repaired(env):
     hooks_json.write_text("")
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
+@pytest.mark.parametrize("tool", list(MANAGED))
+def test_a_release_that_retunes_our_entry_doesn_t_read_as_tampering(env, tool):
+    """Detection runs before the rewrite: an older timeout or a field a newer release adds
+    must not flag every device on upgrade."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    folder, name, hooks_of = MANAGED[tool]
+    path = env["tmp"] / folder / name
+    config = json.loads(path.read_text())
+    for groups in hooks_of(config).values():
+        for item in groups:
+            handler = item["hooks"][0] if "hooks" in item else item
+            handler["statusMessage"] = "Unbound"
+            if isinstance(handler.get("timeout"), int):
+                handler["timeout"] = handler["timeout"] // 2
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, tool)[-1] == "persisted"
+
+
+@pytest.mark.parametrize("toml", [
+    "features = false\n", 'features = "false"\n', "features = []\n",
+    'features = { hooks = "false" }\n', "[features]\nhooks = 0\n", "[features]\ncodex_hooks = {}\n",
+])
+def test_a_features_value_codex_can_t_read_is_tampered(env, toml):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    (env["home"] / ".codex" / "config.toml").write_text(toml)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert _codex_states(env)[-1] == "tampered"

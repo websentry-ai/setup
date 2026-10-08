@@ -149,8 +149,9 @@ def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
 
 
 def _holds_every_entry(hooks, expected_hooks) -> bool:
-    """Every event still holds the entry setup wrote, exactly: these files are setup's
-    to write, so a changed matcher, timeout or command is interference."""
+    """Every event still holds an entry that enforces like ours. Detection runs before
+    the rewrite, so a release that tweaks a timeout or adds a field mustn't read as
+    tampering on every device."""
     return isinstance(hooks, dict) and all(
         isinstance(hooks.get(event), list)
         and all(any(_same_entry(actual, entry) for actual in hooks[event]) for entry in entries)
@@ -158,16 +159,25 @@ def _holds_every_entry(hooks, expected_hooks) -> bool:
 
 
 def _same_entry(actual, ours) -> bool:
-    """Our entry: a flat one exactly; a group with our matcher and our exact handler
-    (beside any an organisation added to it) and our metadata flags (Augment adds its own)."""
+    """Enforces like ours: a flat handler like ours; or a group with our matcher, a
+    handler like ours (beside any an organisation added) and our metadata flags."""
     if not isinstance(actual, dict):
         return False
     if "hooks" not in ours:
-        return actual == ours
+        return _handler_like(actual, ours)
     have = actual.get("metadata") if isinstance(actual.get("metadata"), dict) else {}
     return (actual.get("matcher") == ours.get("matcher")
-            and isinstance(actual.get("hooks"), list) and all(h in actual["hooks"] for h in ours["hooks"])
+            and isinstance(actual.get("hooks"), list)
+            and all(any(_handler_like(h, o) for h in actual["hooks"]) for o in ours["hooks"])
             and all(have.get(k) == v for k, v in (ours.get("metadata") or {}).items()))
+
+
+def _handler_like(handler, ours) -> bool:
+    """Same type and the exact command (and bash, where we set one), and no weaker."""
+    return (isinstance(handler, dict)
+            and handler.get("type", "command") == ours.get("type", "command")
+            and all(handler.get(k) == ours[k] for k in ("command", "bash") if k in ours)
+            and _no_weaker(handler, ours))
 
 
 def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
@@ -192,14 +202,15 @@ def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
 
 
 def _no_weaker(handler, ours) -> bool:
+    """Not async where ours isn't, and a timeout wherever ours sets one, of at least a
+    tenth of it: a missing one falls back to the tool's default (30 s for Copilot, which
+    fails a pre-tool hook open), and a release can retune ours."""
     if handler.get("async") is True and ours.get("async") is not True:
         return False
     for key in ("timeout", "timeoutSec"):
         mine, theirs = ours.get(key), handler.get(key)
-        # Where ours sets one it must be there: a missing timeout falls back to the
-        # tool's default, which for Copilot is 30 s and fails a pre-tool hook open.
         if isinstance(mine, int) and not (
-                isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= mine):
+                isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= max(1, mine // 10)):
             return False
     return True
 
@@ -1211,7 +1222,12 @@ def _codex_hooks_disabled(config_path: Path) -> bool:
         features = tomllib.loads(data.decode("utf-8")).get("features")
     except (ValueError, RecursionError):
         return True  # codex refuses the whole config, and setup won't rewrite it
-    return isinstance(features, dict) and any(features.get(k) is False for k in ("hooks", "codex_hooks"))
+    if features is None:
+        return False
+    # Codex reads [features] as a table of booleans; anything else fails the whole load.
+    if not isinstance(features, dict):
+        return True
+    return any(k in features and features[k] is not True for k in ("hooks", "codex_hooks"))
 
 
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
