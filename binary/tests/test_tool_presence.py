@@ -57,6 +57,7 @@ def test_an_empty_machine_has_no_tool(tmp_path, tool):
     ("claude-code", ".claude/local/claude"),
     ("claude-code", ".vscode/extensions/anthropic.claude-code-2.0.5-darwin-arm64/package.json"),
     ("claude-code", ".claude/projects/-Users-u-repo/0a1b.jsonl"),
+    ("claude-code", "Library/Application Support/Claude/claude-code-sessions/3f2a/session.json"),
     ("codex", ".nvm/versions/node/v22.11.0/bin/codex"),
     ("codex", ".cargo/bin/codex"),
     ("codex", ".codex/sessions/2026/10/08/rollout.jsonl"),

@@ -39,7 +39,8 @@ _TOOLS = {
         "binaries": ("claude",),
         "paths": (".claude/local/claude", ".local/share/claude/versions/*"),
         "extensions": ("anthropic.claude-code-*",),
-        "activity": (".claude/projects/*/*.jsonl",),
+        "activity": (".claude/projects/*/*.jsonl",
+                     "Library/Application Support/Claude/claude-code-sessions/*"),
     },
     "codex": {
         "binaries": ("codex",),
@@ -103,7 +104,8 @@ def _account_homes():
     except ImportError:
         return []
     floor = 500 if sys.platform == "darwin" else 1000
-    return [Path(u.pw_dir) for u in pwd.getpwall() if u.pw_uid >= floor and u.pw_dir not in ("", "/")]
+    return [Path(u.pw_dir) for u in pwd.getpwall()
+            if u.pw_uid >= floor and u.pw_dir not in ("", "/") and os.path.isdir(u.pw_dir)]
 
 
 def _home_patterns(signs):
