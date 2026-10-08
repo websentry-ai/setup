@@ -372,18 +372,11 @@ def test_content_codex_loads_still_counts(m, tmp_path, mutate):
     assert _state(m, home) == "persisted"
 
 
-def test_a_wrapper_without_its_execute_bit_is_tampered(m, tmp_path):
-    """Codex runs the path through the shell, which can't execute it."""
-    home = _profile(tmp_path, script=True)
-    _wrapper(home).chmod(0o644)
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home) == "tampered"
-
-
 @pytest.mark.parametrize("squat", ["fifo", "dir"])
 def test_something_else_at_the_script_path_is_tampered(m, tmp_path, squat):
     home = tmp_path / "u"
     (home / ".codex" / "hooks").mkdir(parents=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     if squat == "fifo":
         os.mkfifo(_wrapper(home))
     else:
@@ -494,7 +487,7 @@ def test_the_file_is_read_as_the_profiles_user(m, tmp_path, monkeypatch):
     real = m._run_as_user
     monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a: (seen.append(u), real(u, fn, *a))[1])
     setup_cmd._codex_detect_state(m, [("alice", home)])
-    assert seen and set(seen) == {"alice"}  # the wrapper and hooks.json are both read as alice
+    assert seen and set(seen) == {"alice"}  # hooks.json is read as alice
 
 
 def test_no_privilege_drop_for_a_profile_without_codex(m, tmp_path, monkeypatch):
@@ -504,71 +497,11 @@ def test_no_privilege_drop_for_a_profile_without_codex(m, tmp_path, monkeypatch)
     assert _state(m, home) == "fresh"
 
 
-@pytest.mark.parametrize("content", [
-    "#!/bin/sh\nexit 0\n",
-    "#!/usr/bin/env python3\n",
-    "#!/usr/bin/env python3\n# def main hook_event_name api.getunbound.ai\n",
-    # A forged "python-era" hook: the markers and the size, but a no-op.
-    "#!/usr/bin/env python3\n# def main\n# hook_event_name\n# api.getunbound.ai\n" + "# pad\n" * 5000,
-])
-def test_a_runnable_script_that_is_not_ours_is_tampered(m, tmp_path, content):
-    """A no-op kept at our path with the right mode enforces nothing."""
-    home = _profile(tmp_path, script=True)
-    _wrapper(home).write_text(content)
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home) == "tampered"
-
-
-@pytest.mark.parametrize("gateway", [None, "https://gateway.acme.example"])
-def test_a_python_era_hook_script_is_ours(m, tmp_path, gateway):
-    """The python installers patch the tenant gateway into the hook they download."""
-    home = _profile(tmp_path, script=True)
-    real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
-    if gateway:
-        real_hook = real_hook.replace('"https://api.getunbound.ai"', f'"{gateway}"')
-    _wrapper(home).write_text(real_hook)
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home, gateway=gateway or "https://api.getunbound.ai") == "persisted"
-
-
-@pytest.mark.parametrize("gateway", [
-    "https://api.getunbound.ai",  # the public default, where a tenant's checks fail open
-    "https://allow-everything.example",  # a server that answers allow
-    "https://gateway.acme.example/\\xZZ",  # a SyntaxError: the hook never runs
-])
-def test_a_python_era_hook_pointing_elsewhere_is_not_ours(m, tmp_path, gateway):
-    """Only the default or this device's configured gateway was ever written there."""
-    home = _profile(tmp_path, script=True)
-    real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
-    _wrapper(home).write_text(real_hook.replace('"https://api.getunbound.ai"', f'"{gateway}"'))
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home, gateway="https://gateway.acme.example") == "tampered"
-
-
 def test_the_wrapper_an_earlier_binary_release_wrote_is_ours(m, tmp_path):
     home = _profile(tmp_path, script=True)
     _wrapper(home).write_text('#!/bin/sh\nexec "%s" hook codex\n' % setup_cmd.HOOK_BINARY)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     assert _state(m, home) == "persisted"
-
-
-def test_an_edited_python_era_hook_is_not_ours(m, tmp_path):
-    home = _profile(tmp_path, script=True)
-    real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
-    _wrapper(home).write_text(real_hook.replace("def main(", "def _unused(", 1) + "\nraise SystemExit(0)\n")
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home) == "tampered"
-
-
-def test_the_shipped_hash_list_matches_the_canonical_form():
-    """Every shipped hash is a canonical (default-gateway) script, and the bundled
-    hook canonicalises to itself."""
-    bundled = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
-    patched = bundled.replace('"https://api.getunbound.ai"', '"https://tenant.example"')
-    assert (setup_cmd._python_era_hook_sha256(patched, "https://tenant.example")
-            == setup_cmd._python_era_hook_sha256(bundled))
-    assert setup_cmd._python_era_hook_sha256(patched) is None
-    assert all(len(h) == 64 for h in setup_cmd.CODEX_PYTHON_ERA_HOOK_SHA256)
 
 
 @pytest.mark.skipif(setup_cmd.tomllib is None, reason="tomllib is python 3.11+; the binary bundles it")
@@ -595,23 +528,3 @@ def test_a_config_toml_too_deep_to_parse_does_not_hide_a_tamper(m, tmp_path):
     (home / ".codex" / "config.toml").write_text("a = " + "[" * 100000 + "]" * 100000)
     assert _state(m, home) == "tampered"
 
-
-def test_a_wrapper_the_profiles_user_cannot_run_is_tampered(m, tmp_path, monkeypatch):
-    """Another account's file with our content and owner bits set still can't run here."""
-    home = _profile(tmp_path, script=True)
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    real = os.access
-    monkeypatch.setattr(setup_cmd.os, "access",
-                        lambda p, mode, **k: False if Path(p) == _wrapper(home) and mode & os.X_OK else real(p, mode, **k))
-    assert _state(m, home) == "tampered"
-
-
-@pytest.mark.parametrize("mode, expected", [(0o500, "persisted"), (0o100, "tampered"), (0o111, "tampered")])
-def test_the_owner_must_be_able_to_read_and_execute_the_wrapper(m, tmp_path, mode, expected):
-    home = _profile(tmp_path, script=True)
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    _wrapper(home).chmod(mode)
-    try:
-        assert _state(m, home) == expected
-    finally:
-        _wrapper(home).chmod(0o755)

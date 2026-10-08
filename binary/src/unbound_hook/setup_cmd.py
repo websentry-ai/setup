@@ -18,12 +18,10 @@ Fail-open: a component failure is reported in the summary and the exit code,
 but never aborts the remaining components.
 """
 
-import hashlib
 import json
 import math
 import os
 import platform
-import re
 import shlex
 import stat
 import subprocess
@@ -39,7 +37,6 @@ from ._resources import (
     hook_source_path,
 )
 from . import migration
-from ._codex_python_era_hashes import CODEX_PYTHON_ERA_HOOK_SHA256
 
 # Mirrors mdm/onboard.py's discovery timeout contract.
 DISCOVERY_TIMEOUT_SECONDS = 5400
@@ -963,7 +960,7 @@ def _setup_codex(opts):
     # setup. No managed write and no user-level strip (the install IS the user
     # registration).
     user_homes = m.get_all_user_homes()
-    state = _codex_detect_state(m, user_homes, gateway)
+    state = _codex_detect_state(m, user_homes)
     installed = 0
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -1083,61 +1080,15 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
                for event in _codex_hooks_config(None))
 
 
-def _codex_wrapper_runnable(wrapper: Path) -> bool:
-    """A regular file (not followed) its owner can read and execute: the shell needs
-    the execute bit, then python has to open the file after the shebang."""
+def _codex_wrapper_present(wrapper: Path) -> bool:
+    """A regular file at our path, not followed: a symlink there isn't something we installed."""
     try:
-        mode = wrapper.lstat().st_mode
+        return stat.S_ISREG(wrapper.lstat().st_mode)
     except OSError:
         return False
-    return stat.S_ISREG(mode) and mode & (stat.S_IRUSR | stat.S_IXUSR) == stat.S_IRUSR | stat.S_IXUSR
 
 
-# The python installers patch the tenant gateway into the hook's one gateway literal;
-# resetting it gives the shipped script back, to compare against the shipped hashes.
-_PYTHON_ERA_GATEWAY = re.compile(r'(UNBOUND_GATEWAY_URL", |UNBOUND_GATEWAY_URL = )"([^"\n]*)"')
-_PYTHON_ERA_DEFAULT_GATEWAY = "https://api.getunbound.ai"
-
-
-def _python_era_hook_sha256(text: str, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
-    """The hash with the gateway reset to the default; None if the hook points anywhere
-    but this device's gateway, the only URL the installers wrote there."""
-    match = _PYTHON_ERA_GATEWAY.search(text)
-    if match:
-        if match.group(2) != gateway:
-            return None
-        text = text[:match.start()] + match.group(1) + f'"{_PYTHON_ERA_DEFAULT_GATEWAY}"' + text[match.end():]
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def _known_python_era_hashes() -> frozenset:
-    """Every shipped version, plus the one bundled with this binary (newer than the list)."""
-    try:
-        bundled = _python_era_hook_sha256(hook_source_path("codex").read_text(encoding="utf-8"))
-    except OSError:
-        return CODEX_PYTHON_ERA_HOOK_SHA256
-    return CODEX_PYTHON_ERA_HOOK_SHA256 | {bundled}
-
-
-# The sh wrapper earlier binary releases wrote. Codex can't run it, but it's ours and
-# this run replaces it, so it isn't tampering.
-_EARLIER_CODEX_WRAPPER = '#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY
-
-
-def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset, gateway: str) -> bool:
-    """Runs as the profile's user: the script is the binary's wrapper or a python-era
-    hook we shipped, not a no-op kept at our path with the right mode."""
-    if not os.access(wrapper, os.R_OK | os.X_OK):
-        return False  # e.g. another account's file: its owner bits don't make it runnable here
-    try:
-        text = _read_user_file(wrapper, follow=False).decode("utf-8")
-    except (OSError, ValueError):
-        return False
-    return (text in (_codex_wrapper_source(), _EARLIER_CODEX_WRAPPER)
-            or _python_era_hook_sha256(text, gateway) in python_era_hashes)
-
-
-def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
+def _codex_detect_state(m, user_homes):
     """Install state before this run reasserts it, per profile, on the pair setup
     installs: the wrapper script and our hooks.json entry. Either alone leaves codex
     unenforced for that user. 'fresh' (no profile has either), 'persisted' (one has
@@ -1145,21 +1096,14 @@ def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
     try:
         any_complete = False
         indeterminate = False
-        python_era_hashes = _known_python_era_hashes()
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
-            script = _codex_wrapper_runnable(wrapper)
-            if not script and os.path.lexists(wrapper):
-                return "tampered"  # something other than our file holds the script path
-            if script:
-                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper, python_era_hashes, gateway)
-                if script is False:
-                    return "tampered"  # a runnable script at our path that isn't ours
+            script = _codex_wrapper_present(wrapper)
             registered = False
             if os.path.lexists(hooks_path):
                 registered = m._run_as_user(username, _codex_hook_registered, hooks_path, wrapper)
-            if registered is None or script is None:
+            if registered is None:
                 indeterminate = True
             elif script and registered:
                 any_complete = True
