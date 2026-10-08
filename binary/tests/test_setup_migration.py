@@ -1744,6 +1744,39 @@ def test_a_python_era_copilot_install_that_cannot_enforce_is_tampered(env, spoil
     assert _states(env, "copilot") == ["tampered"]
 
 
+def test_a_python_era_copilot_path_the_shell_would_expand_is_tampered(env, monkeypatch):
+    """Double quotes still expand $: /Users/Jane$Doe runs /Users/Jane/... instead."""
+    home = env["tmp"] / "Jane$Doe"
+    home.mkdir()
+    monkeypatch.setattr(env["modules"]["copilot"], "get_all_user_homes", lambda: [(ME, home)])
+    env["home"] = home
+    _python_era_copilot(env)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == ["tampered"]
+
+
+def test_a_failed_install_on_a_profile_setup_never_reached_is_not_tampered(env, monkeypatch):
+    """Another profile is fine; this one never had our hook, and its install failing
+    leaves it unenforced but not interfered with."""
+    other = env["tmp"] / "other"
+    other.mkdir()
+    for tool in ("codex", "copilot"):
+        monkeypatch.setattr(env["modules"][tool], "get_all_user_homes",
+                            lambda: [(ME, env["home"]), (ME, other)])
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0  # both profiles installed
+    for path in (other / ".codex", other / ".copilot"):
+        __import__("shutil").rmtree(path)
+    monkeypatch.setattr(setup_cmd, "_install_codex_hooks_for_user",
+                        lambda m, u, h, real_fn=setup_cmd._install_codex_hooks_for_user:
+                        False if h == other else real_fn(m, u, h))
+    monkeypatch.setattr(setup_cmd, "_install_copilot_hooks_for_user",
+                        lambda m, u, h, real_fn=setup_cmd._install_copilot_hooks_for_user:
+                        False if h == other else real_fn(m, u, h))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "codex")[-1] == "persisted"
+    assert _states(env, "copilot")[-1] == "persisted"
+
+
 def test_a_deeply_nested_copilot_file_is_tampered_not_unknown(env):
     path = _copilot_file(env["home"])
     path.parent.mkdir(parents=True)
@@ -1869,6 +1902,8 @@ def test_a_managed_install_reads_persisted(env, tool):
     ("python_era_symlink", "tampered"), # the script is a stand-in
     ("python_era_launcher", "tampered"),  # python3 "<script>": not a shape the macOS installers wrote
     ("python_era_not_executable", "tampered"),
+    ("python_era_execute_only", "tampered"),  # 0111: the shell can't read it
+    ("python_era_owner_only", "tampered"),    # 0700: the agents' users can't run it
 ])
 def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -1900,7 +1935,8 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
         elif spoil != "python_era_no_script":
             script.parent.mkdir(parents=True, exist_ok=True)
             script.write_text("#!/usr/bin/env python3\n")
-            script.chmod(0o644 if spoil == "python_era_not_executable" else 0o755)
+            script.chmod({"python_era_not_executable": 0o644, "python_era_execute_only": 0o111,
+                          "python_era_owner_only": 0o700}.get(spoil, 0o755))
         base = "./hooks/unbound.py" if tool == "cursor" else f'"{script}"'
         command = {"python_era_decoy": f'echo "{script}"', "python_era_piped": f'"{script}" | true',
                    "python_era_redirect": f'"{script}" > /dev/null',
@@ -1926,7 +1962,7 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
         "claude-code": setup_cmd._claude_hooks_config(),
         "augment_code": setup_cmd._augment_written_hooks(env["modules"]["augment"]),
         "cursor": setup_cmd._cursor_hooks_json()["hooks"],
-    }[tool])
+    }[tool], relative_ok=tool == "cursor")
     assert state == expected
 
 
@@ -1948,6 +1984,19 @@ def test_a_bare_python_era_path_with_a_space_never_runs(tmp_path):
     assert setup_cmd._detect_state(path, expected) == "tampered"
     path.write_text(json.dumps(_file(f'"{script}"')))
     assert setup_cmd._detect_state(path, expected) == "persisted"
+
+
+def test_cursor_s_relative_python_era_path_counts_only_for_cursor(tmp_path):
+    """Cursor runs hooks from the settings folder; Claude Code doesn't."""
+    script = tmp_path / "hooks" / "unbound.py"
+    script.parent.mkdir()
+    script.write_text("#!/usr/bin/env python3\n")
+    script.chmod(0o755)
+    expected = setup_cmd._claude_hooks_config()
+    path = tmp_path / "managed-settings.json"
+    path.write_text(json.dumps({"hooks": {e: [{"matcher": "*", "hooks": [
+        dict(g[0]["hooks"][0], command="./hooks/unbound.py")]}] for e, g in expected.items()}}))
+    assert setup_cmd._detect_state(path, expected) == "tampered"
 
 
 def test_a_managed_file_nested_too_deep_is_tampered(tmp_path):

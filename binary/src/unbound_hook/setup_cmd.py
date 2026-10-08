@@ -110,7 +110,7 @@ def _normalized_urls(m, opts):
     return base, gateway
 
 
-def _detect_state(settings_path: Path, expected_hooks):
+def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
     """Binary-era analog of the python detect_install_state(), for the admin-owned
     hook settings. 'persisted' = every event setup installs runs our exact command,
     or the file still points at the python-era unbound.py (a legitimate install being
@@ -134,9 +134,10 @@ def _detect_state(settings_path: Path, expected_hooks):
         return "tampered"
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
-    commands = _python_era_commands(script, settings_path.parent)
+    commands = _python_era_commands(script, settings_path.parent if relative_ok else None)
     if _holds_every_entry(hooks, expected_hooks) or (
-            script.is_file() and not script.is_symlink() and script.stat().st_mode & 0o111
+            script.is_file() and not script.is_symlink()
+            and script.stat().st_mode & 0o005 == 0o005  # the agents' users read and run it
             and _runs_on_every_event(
                 hooks, expected_hooks,
                 lambda h: h.get("type", "command") == "command" and h["command"] in commands)):
@@ -198,17 +199,20 @@ def _no_weaker(handler, ours) -> bool:
     return True
 
 
-def _python_era_commands(script: Path, base: Path) -> set:
+def _python_era_commands(script: Path, base) -> set:
     """Exactly the commands the macOS python installers wrote for ``script``, each running
     it directly: the quoted path, the bare one, or one relative to the settings folder
     (Cursor). Anything more (a pipe, a redirect, a flag) can discard the hook's answer."""
-    shapes = {f'"{script}"'}
+    shapes = set()
+    if not any(ch in '$`\\"' for ch in str(script)):
+        shapes.add(f'"{script}"')  # double quotes still expand these
     if not any(ch.isspace() or ch in _SHELL_SPECIAL for ch in str(script)):
         shapes.add(str(script))  # bare only where the shell keeps it one word
-    try:
-        shapes.add("./" + script.relative_to(base).as_posix())
-    except ValueError:
-        pass
+    if base is not None:  # Cursor runs hooks from the settings folder
+        try:
+            shapes.add("./" + script.relative_to(base).as_posix())
+        except ValueError:
+            pass
     return shapes
 
 
@@ -1086,10 +1090,12 @@ def _setup_codex(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         m.enable_codex_hooks_feature_for_user(username, home_dir)
+        wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
+        had_wrapper = os.path.lexists(wrapper)  # a profile setup never reached isn't tampered
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and m._run_as_user(
-                username, _codex_wrapper_current, home_dir / ".codex" / "hooks" / "unbound.py") is False:
+        elif state == "persisted" and had_wrapper and m._run_as_user(
+                username, _codex_wrapper_current, wrapper) is False:
             state = "tampered"  # the install failed and our current wrapper isn't what's left
 
     if user_homes and installed == 0:
@@ -1280,7 +1286,8 @@ def _setup_cursor(opts):
                 urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
             m.remove_user_level_hooks(username, home_dir)
 
-    state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"])
+    state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"],
+                          relative_ok=True)
     hooks_ok, hooks_changed = _write_cursor_enterprise_hooks(m)
     if not hooks_ok:
         return ("deferred", "enterprise hooks.json write failed")
@@ -1332,7 +1339,8 @@ def _copilot_registered(path: Path) -> bool:
         script = path.parent / "unbound.py"
         quoted = f'"{script}"'
         return _holds_every_entry(hooks, expected) or (
-            _codex_wrapper_present(script) and _codex_wrapper_runnable(script) and _runs_on_every_event(
+            not any(ch in '$`\\"' for ch in str(script))  # double quotes still expand these
+            and _codex_wrapper_present(script) and _codex_wrapper_runnable(script) and _runs_on_every_event(
                 hooks, expected, lambda h: h.get("type") == "command"
                 and h.get("command") == quoted and h.get("bash") == quoted))
     except Exception:  # RecursionError included: Copilot can't load it either
@@ -1365,10 +1373,12 @@ def _setup_copilot(opts):
         # taken back out.
         if home_dir is not None:
             m.clear_otel_export_for_user(username, home_dir)
+        registration = home_dir / ".copilot" / "hooks" / "unbound.json"
+        had_registration = os.path.lexists(registration)  # a profile setup never reached isn't tampered
         if _install_copilot_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and m._run_as_user(
-                username, _copilot_registered, home_dir / ".copilot" / "hooks" / "unbound.json") is False:
+        elif state == "persisted" and had_registration and m._run_as_user(
+                username, _copilot_registered, registration) is False:
             state = "tampered"  # the install failed and no working registration is left
 
     # Machine-wide, so once for the device rather than once per user. Called
