@@ -1034,7 +1034,8 @@ def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
             continue
         if h.get("async") and event in _CODEX_BLOCKING_EVENTS:
             continue
-        timeout = h.get("timeout", floor)  # codex reads a u64: no float, no bool
+        timeout = h.get("timeout")  # an Option<u64>: null is unset, like a missing key
+        timeout = floor if timeout is None else timeout
         if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < floor:
             continue
         return True

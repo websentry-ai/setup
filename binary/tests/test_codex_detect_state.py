@@ -308,6 +308,15 @@ def test_a_float_timeout_is_not_registered(m, tmp_path, timeout):
     assert _state(m, home) == "tampered"
 
 
+def test_a_null_timeout_is_an_unset_one(m, tmp_path):
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    for groups in cfg["hooks"].values():
+        groups[0]["hooks"][0]["timeout"] = None
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
+    assert _state(m, home) == "persisted"
+
+
 def _spoiled(home, mutate):
     cfg = _ours(home)
     mutate(cfg)
