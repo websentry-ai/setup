@@ -1015,6 +1015,24 @@ def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
     return False
 
 
+try:
+    import tomllib
+except ImportError:  # python older than 3.11; the shipped binary bundles it
+    tomllib = None
+
+
+def _codex_hooks_disabled(config_path: Path) -> bool:
+    """Whether config.toml turns codex's hooks feature off (on by default; the legacy
+    key codex_hooks is an alias). A config codex can't parse isn't read as either."""
+    if tomllib is None:
+        return False
+    try:
+        features = tomllib.loads(_read_user_file(config_path, follow=True).decode("utf-8")).get("features")
+    except (OSError, ValueError):
+        return False
+    return isinstance(features, dict) and any(features.get(k) is False for k in ("hooks", "codex_hooks"))
+
+
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
     """Whether this hooks.json registers our wrapper for every event. Runs as the
     profile's user and reads the file as codex does, following a symlink.
@@ -1023,7 +1041,7 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
         config = _load_codex_json(_read_user_file(hooks_path, follow=True))
     except Exception:
         return False
-    if not _codex_can_load(config):
+    if not _codex_can_load(config) or _codex_hooks_disabled(hooks_path.parent / "config.toml"):
         return False
     events = config.get("hooks", {})
     # Every event setup installs, or a dropped PreToolUse would still read healthy.

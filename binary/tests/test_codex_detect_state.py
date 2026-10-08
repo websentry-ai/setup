@@ -555,6 +555,23 @@ def test_the_shipped_hash_list_matches_the_canonical_form():
     assert all(len(h) == 64 for h in setup_cmd.CODEX_PYTHON_ERA_HOOK_SHA256)
 
 
+@pytest.mark.skipif(setup_cmd.tomllib is None, reason="tomllib is python 3.11+; the binary bundles it")
+@pytest.mark.parametrize("toml, expected", [
+    ("[features]\nhooks = false\n", "tampered"),
+    ("[features]\ncodex_hooks = false\n", "tampered"),
+    ("features = { hooks = false }\n", "tampered"),
+    ("[features]\nhooks = true\n", "persisted"),
+    ("model = \"o3\"\n", "persisted"),  # on by default
+    ("[other]\nhooks = false\n", "persisted"),  # another table's key
+    ("not toml [", "persisted"),
+])
+def test_hooks_turned_off_in_config_toml_are_not_registered(m, tmp_path, toml, expected):
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    (home / ".codex" / "config.toml").write_text(toml)
+    assert _state(m, home) == expected
+
+
 def test_a_wrapper_the_profiles_user_cannot_run_is_tampered(m, tmp_path, monkeypatch):
     """Another account's file with our content and owner bits set still can't run here."""
     home = _profile(tmp_path, script=True)
