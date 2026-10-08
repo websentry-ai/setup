@@ -68,6 +68,9 @@ def test_an_empty_machine_has_no_tool(tmp_path, tool):
     ("copilot", ".bun/bin/copilot"),
     ("copilot", ".copilot/session-state/abc/events.jsonl"),
     ("copilot", ".vscode/extensions/github.copilot-chat-0.30.0/package.json"),
+    ("copilot", "Library/Application Support/Code/User/globalStorage/github.copilot-chat/x"),
+    ("copilot", "Library/Application Support/Code/User/workspaceStorage/ab12/GitHub.copilot-chat/x"),
+    ("copilot", ".config/Code - Insiders/User/workspaceStorage/ab12/GitHub.copilot-chat/x"),
     ("augment", ".local/bin/auggie"),
     ("augment", ".vscode/extensions/augment.vscode-augment-0.500.0/package.json"),
     ("augment", "Library/Application Support/JetBrains/IntelliJIdea2025.2/plugins/augment-intellij"),
@@ -110,6 +113,45 @@ def test_finder_residue_alone_is_not_a_sign(tmp_path, rel):
     home = _home(tmp_path)
     _touch(home / rel)
     assert tool_presence.tool_present("claude-code", [("u", home)]) is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every folder")
+def test_an_account_home_that_cannot_be_reached_is_unknown(tmp_path, monkeypatch):
+    """A readable account with nothing doesn't make the device absent while another
+    account's home couldn't be looked at."""
+    readable, fenced = _home(tmp_path, "readable"), tmp_path / "fence"
+    _touch(fenced / "home/.local/bin/codex", executable=True)
+    fenced.chmod(0)
+    monkeypatch.setattr(tool_presence, "_account_homes", lambda: [readable, fenced / "home"])
+    try:
+        assert tool_presence.tool_present("codex", [("r", readable)]) is None
+    finally:
+        fenced.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX accounts")
+def test_the_account_list_keeps_homes_it_cannot_reach(tmp_path, monkeypatch):
+    """Only the checks decide what an unreachable home means (unknown); the listing
+    must not drop it on the way."""
+    import pwd
+    from types import SimpleNamespace
+    fenced = tmp_path / "fence"
+    (fenced / "home").mkdir(parents=True)
+    fenced.chmod(0)
+    accounts = [SimpleNamespace(pw_uid=501, pw_dir=str(fenced / "home")),
+                SimpleNamespace(pw_uid=0, pw_dir="/var/root"),
+                SimpleNamespace(pw_uid=502, pw_dir="")]
+    monkeypatch.setattr(pwd, "getpwall", lambda: accounts)
+    try:
+        assert _REAL_ACCOUNT_HOMES() == [fenced / "home"]
+    finally:
+        fenced.chmod(0o755)
+
+
+def test_an_account_without_a_home_folder_is_skipped(tmp_path, monkeypatch):
+    readable = _home(tmp_path, "readable")
+    monkeypatch.setattr(tool_presence, "_account_homes", lambda: [readable, tmp_path / "gone"])
+    assert tool_presence.tool_present("codex", []) is False
 
 
 def test_no_account_to_look_in_is_unknown(monkeypatch):

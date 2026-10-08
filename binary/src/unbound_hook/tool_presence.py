@@ -27,6 +27,8 @@ _USER_BIN_DIRS = (
 )
 _EDITOR_DIRS = (".vscode", ".vscode-insiders", ".vscode-oss", ".cursor", ".windsurf")
 _APP_DIRS = ("/Applications",)
+_EDITOR_DATA_ROOTS = ("Library/Application Support", ".config")
+_VSCODE_EDITORS = ("Code", "Code - Insiders", "VSCodium")
 # Users control their homes: a folder too big to list, or a slow one, is unknown.
 _MAX_ENTRIES = 2000
 _BUDGET_SECONDS = 5.0
@@ -55,7 +57,12 @@ _TOOLS = {
     "copilot": {
         "binaries": ("copilot",),
         "extensions": ("github.copilot-*",),
-        "activity": (".copilot/session-state/*",),
+        # Copilot CLI sessions, then VS Code Copilot Chat's own storage.
+        "activity": (".copilot/session-state/*",)
+        + tuple(f"{root}/{editor}/User/globalStorage/github.copilot-chat"
+                for root in _EDITOR_DATA_ROOTS for editor in _VSCODE_EDITORS)
+        + tuple(f"{root}/{editor}/User/workspaceStorage/*/GitHub.copilot-chat"
+                for root in _EDITOR_DATA_ROOTS for editor in _VSCODE_EDITORS),
     },
     "augment": {
         "binaries": ("auggie",),
@@ -83,8 +90,16 @@ def tool_present(tool, user_homes):
             return None  # no account to look in: that isn't evidence of absence
         checks = [(Path("/"), f"{d}/{name}") for d in _MACHINE_BIN_DIRS for name in signs["binaries"]]
         checks += [(Path("/"), f"{d}/{app}") for d in _APP_DIRS for app in signs.get("apps", ())]
-        checks += [(Path(home), p) for home in sorted(homes) for p in _home_patterns(signs)]
         unknown = False
+        for home in sorted(homes):
+            try:
+                os.stat(home)
+            except FileNotFoundError:
+                continue  # an account with no home folder has nothing to find
+            except OSError:
+                unknown = True  # one we couldn't reach
+                continue
+            checks += [(Path(home), p) for p in _home_patterns(signs)]
         for base, pattern in checks:
             try:
                 if _find(base, [p for p in pattern.split("/") if p], deadline):
@@ -104,8 +119,7 @@ def _account_homes():
     except ImportError:
         return []
     floor = 500 if sys.platform == "darwin" else 1000
-    return [Path(u.pw_dir) for u in pwd.getpwall()
-            if u.pw_uid >= floor and u.pw_dir not in ("", "/") and os.path.isdir(u.pw_dir)]
+    return [Path(u.pw_dir) for u in pwd.getpwall() if u.pw_uid >= floor and u.pw_dir not in ("", "/")]
 
 
 def _home_patterns(signs):
