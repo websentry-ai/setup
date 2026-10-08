@@ -18,7 +18,6 @@ Fail-open: a component failure is reported in the summary and the exit code,
 but never aborts the remaining components.
 """
 
-import errno
 import json
 import math
 import os
@@ -805,6 +804,15 @@ def _codex_handler_kept(handler) -> bool:
     return _codex_handler_loads(handler)
 
 
+# The user a check runs as can pause it; setup's own checks and installs are quick.
+_USER_CHECK_TIMEOUT = 30
+
+
+def _as_user(m, username, fn, *args):
+    """The module's _run_as_user, bounded: an answer of None (unknown) after the timeout."""
+    return m._run_as_user(username, fn, *args, _timeout=_USER_CHECK_TIMEOUT)
+
+
 def _replace_user_file(path: Path, data: bytes, mode: int) -> None:
     """Write ``data`` beside ``path`` and rename it over whatever is there: a symlink or
     FIFO at ``path`` is replaced rather than written through, and a write that fails
@@ -850,7 +858,7 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
         _merge_codex_hooks_json(hooks_path, hook_command)
         return True
 
-    return bool(m._run_as_user(username, _install))
+    return bool(_as_user(m, username, _install))
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
@@ -955,13 +963,14 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     data = text.encode("utf-8")
     if len(data) > _USER_FILE_MAX_BYTES:
         raise ValueError("hooks.json would outgrow what detection reads back")
-    if os.path.islink(hooks_path):  # a dotfiles link is the user's to keep; don't replace it
-        raise OSError(errno.ELOOP, "hooks.json is a symlink")
+    # A dotfiles link stays a link: as the user, update the file it points at, which
+    # reaches nothing the user couldn't already write.
+    target = Path(os.path.realpath(hooks_path))
     try:
-        mode = stat.S_IMODE(os.lstat(hooks_path).st_mode)
+        mode = stat.S_IMODE(os.lstat(target).st_mode)
     except FileNotFoundError:
         mode = 0o644
-    _replace_user_file(hooks_path, data, mode)  # a failed write leaves the old file whole
+    _replace_user_file(target, data, mode)  # a failed write leaves the old file whole
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:
@@ -1004,7 +1013,7 @@ def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
             pass  # stale script is inert once unbound.json points at the binary
         return True
 
-    return bool(m._run_as_user(username, _install))
+    return bool(_as_user(m, username, _install))
 
 
 # ---------------------------------------------------------------------------
@@ -1147,8 +1156,8 @@ def _setup_codex(opts):
         had_wrapper = os.path.lexists(wrapper)  # a profile setup never reached isn't tampered
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and had_wrapper and m._run_as_user(
-                username, _codex_wrapper_current, wrapper) is False and m._run_as_user(
+        elif state == "persisted" and had_wrapper and _as_user(m, 
+                username, _codex_wrapper_current, wrapper) is False and _as_user(m, 
                 username, _writable_dir, wrapper.parent) is False:
             # The folder was locked against setup, and what's left isn't our wrapper. An
             # ordinary failure (a full disk) leaves the working hook and its state alone.
@@ -1309,18 +1318,18 @@ def _codex_detect_state(m, user_homes):
             hooks_path = home_dir / ".codex" / "hooks.json"
             script = _codex_wrapper_present(wrapper)
             if script:
-                script = m._run_as_user(username, _codex_wrapper_runnable, wrapper)
+                script = _as_user(m, username, _codex_wrapper_runnable, wrapper)
                 if script is False:
                     return "tampered"  # our path holds a file this user can't run
             registered = False
             if os.path.lexists(hooks_path):
-                registered = m._run_as_user(username, _codex_hook_registered, hooks_path, wrapper)
+                registered = _as_user(m, username, _codex_hook_registered, hooks_path, wrapper)
             if registered is None or script is None:
                 indeterminate = True
             elif script and registered:
                 # Both halves in place, yet codex may still run nothing: the hooks feature
                 # turned off, or a config.toml codex can't load.
-                disabled = m._run_as_user(username, _codex_hooks_disabled, hooks_path.parent / "config.toml")
+                disabled = _as_user(m, username, _codex_hooks_disabled, hooks_path.parent / "config.toml")
                 if disabled is None:
                     indeterminate = True
                 elif disabled:
@@ -1388,7 +1397,7 @@ def _copilot_detect_state(m, user_homes):
             path = home_dir / ".copilot" / "hooks" / "unbound.json"
             if not os.path.lexists(path):
                 continue
-            registered = m._run_as_user(username, _copilot_registered, path)
+            registered = _as_user(m, username, _copilot_registered, path)
             if registered is None:
                 indeterminate = True
             elif registered:
@@ -1464,11 +1473,11 @@ def _setup_copilot(opts):
         if _install_copilot_hooks_for_user(m, username, home_dir):
             installed += 1
         elif state == "persisted" and had_registration and (
-                m._run_as_user(username, _copilot_registered, registration) is False
+                _as_user(m, username, _copilot_registered, registration) is False
                 # A folder locked against setup keeps whatever's there, which only
                 # today's registration vouches for (a python-era script isn't checked).
-                or (m._run_as_user(username, _writable_dir, registration.parent) is False
-                    and m._run_as_user(username, _copilot_current, registration) is False)):
+                or (_as_user(m, username, _writable_dir, registration.parent) is False
+                    and _as_user(m, username, _copilot_current, registration) is False)):
             state = "tampered"
 
     # Machine-wide, so once for the device rather than once per user. Called

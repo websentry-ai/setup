@@ -64,10 +64,7 @@ def _become_user(info) -> None:
     os.setuid(info.pw_uid)
 
 
-_RUN_AS_USER_TIMEOUT = 30
-
-
-def _run_as_user(username, fn, *args, **kwargs):
+def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
 
@@ -120,11 +117,12 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
-        # The child runs as the user, who can pause it: never wait on it unboundedly.
-        deadline = time.monotonic() + _RUN_AS_USER_TIMEOUT
+        # The child runs as the user, who can pause it: a caller can bound the wait
+        # (a backfill can't be bounded; a quick check can).
+        deadline = None if _timeout is None else time.monotonic() + _timeout
         while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except OSError:
@@ -141,7 +139,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         data = b''.join(chunks)
         del chunks
         try:
-            _, status = os.waitpid(pid, 0)
+            if deadline is None:
+                _, status = os.waitpid(pid, 0)
+            else:  # paused after closing the pipe, it would still hold the wait
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        return None
+                    time.sleep(0.05)
         except OSError:
             return None
         if os.WEXITSTATUS(status) != 0:

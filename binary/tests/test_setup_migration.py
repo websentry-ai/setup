@@ -35,7 +35,7 @@ def env(tmp_path, monkeypatch):
     for tool in ("claude-code", "cursor", "codex", "copilot", "augment"):
         m = load_mdm_setup_module(tool)
         modules[tool] = m
-        monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a, **k: fn(*a, **k))
+        monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a, _timeout=None, **k: fn(*a, **k))
         monkeypatch.setattr(m, "get_all_user_homes", lambda h=home: [(ME, h)])
         monkeypatch.setattr(m, "check_admin_privileges", lambda: True)
         monkeypatch.setattr(m, "get_device_identifier", lambda: "TESTSERIAL1")
@@ -787,19 +787,13 @@ def test_codex_replaces_a_read_only_script_at_its_hook_path(env):
     assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
 
 
-@pytest.mark.parametrize("shape", ["corrupt", "symlink"])
-def test_codex_defers_on_an_unusable_hooks_json(env, shape):
-    """A hooks.json we can't safely merge into defers codex without touching it
-    (or writing through a link), and the other tools still configure."""
+def test_codex_defers_on_an_unusable_hooks_json(env):
+    """A hooks.json we can't safely merge into defers codex without touching it,
+    and the other tools still configure."""
     hooks_json = env["home"] / ".codex" / "hooks.json"
     hooks_json.parent.mkdir(parents=True)
-    if shape == "corrupt":
-        hooks_json.write_text("{not json")
-        watched = hooks_json
-    else:
-        watched = env["tmp"] / "dotfiles-hooks.json"
-        watched.write_text(json.dumps({"hooks": {}}))
-        hooks_json.symlink_to(watched)
+    hooks_json.write_text("{not json")
+    watched = hooks_json
     before = watched.read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 1
     assert watched.read_text() == before
@@ -927,7 +921,7 @@ def test_a_fifo_in_one_profile_reports_tampered_from_the_others(env, monkeypatch
     for mod in env["modules"].values():
         monkeypatch.setattr(mod, "get_all_user_homes", lambda: homes)
 
-    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)
         except Exception:
@@ -991,9 +985,10 @@ def test_a_home_with_a_space_gets_one_working_entry(env, monkeypatch):
 
 
 @pytest.mark.parametrize("ours", [True, False])
-def test_a_symlinked_hooks_json_is_never_written_through(env, monkeypatch, ours):
-    """A dotfiles link that already registers our hook needs no write, so setup
-    succeeds; one that doesn't is refused rather than written through."""
+def test_a_symlinked_hooks_json_is_updated_where_it_points(env, monkeypatch, ours):
+    """A dotfiles link stays a link. One that already registers our hook needs no
+    write; one that doesn't gets our registration in the file it points at, as the
+    user, keeping what was there."""
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
@@ -1004,8 +999,13 @@ def test_a_symlinked_hooks_json_is_never_written_through(env, monkeypatch, ours)
         e: [{"hooks": [{"type": "command", "command": command}]}] for e in CODEX_EVENTS}}))
     (home / ".codex" / "hooks.json").symlink_to(dotfile)
     before = dotfile.read_text()
-    assert setup_cmd.run(["--api-key", "admin-key"]) == (0 if ours else 1)
-    assert (home / ".codex" / "hooks.json").is_symlink() and dotfile.read_text() == before
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert (home / ".codex" / "hooks.json").is_symlink()
+    if ours:
+        assert dotfile.read_text() == before
+    else:
+        assert set(_codex_registrations(home)) == CODEX_EVENTS
+        assert "/usr/local/bin/other-hook" in dotfile.read_text()
 
 
 def test_an_unchanged_hooks_json_is_not_rewritten(env):
@@ -1097,11 +1097,11 @@ def test_setup_repairs_an_async_pretooluse(env):
     assert _codex_states(env) == ["fresh", "tampered", "persisted"]
 
 
-@pytest.mark.parametrize("blocker", ["symlink", "fifo"])
+@pytest.mark.parametrize("blocker", ["fifo"])
 def test_a_tamper_is_reported_even_when_the_only_install_fails(env, monkeypatch, blocker):
     """One profile whose hooks.json the install can't touch: setup defers, but the
     tamper it detected still reaches the dashboard."""
-    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)
         except Exception:
@@ -1125,7 +1125,7 @@ def test_a_tamper_is_reported_even_when_the_only_install_fails(env, monkeypatch,
 
 
 def test_a_fresh_install_that_fails_reports_nothing(env, monkeypatch):
-    def _as_user(_u, fn, *a, **k):
+    def _as_user(_u, fn, *a, _timeout=None, **k):
         try:
             return fn(*a, **k)
         except Exception:
@@ -1984,7 +1984,7 @@ def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch, script
     """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading
     persisted. Our own wrapper there still works: nothing new is reported, so the
     last persisted stands."""
-    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)
         except Exception:
@@ -2075,7 +2075,7 @@ def test_a_python_era_script_behind_a_locked_folder_is_tampered(tmp_path):
 
 def test_a_full_disk_doesn_t_make_an_older_working_wrapper_tampered(env, monkeypatch):
     """Only a folder locked against setup turns a failed upgrade into tampering."""
-    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)
         except Exception:
@@ -2233,7 +2233,7 @@ def test_a_non_standard_json_constant_makes_the_file_unloadable(env, tool):
 
 def test_a_python_era_copilot_hook_behind_a_locked_folder_is_tampered(env, monkeypatch):
     """Setup can't replace it, and nothing vouches for the old script's content."""
-    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)
         except Exception:
@@ -2269,7 +2269,32 @@ def test_a_user_check_the_user_pauses_cannot_hold_setup(monkeypatch, tool):
     import time
     m = load_mdm_setup_module(tool)
     monkeypatch.setattr(m, "_become_user", lambda info: None)  # the drop itself needs root
-    monkeypatch.setattr(m, "_RUN_AS_USER_TIMEOUT", 0.5)
     started = time.monotonic()
-    assert m._run_as_user(ME, time.sleep, 30) is None
+    assert m._run_as_user(ME, time.sleep, 30, _timeout=0.5) is None
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the check forks only on POSIX")
+def test_a_backfill_run_as_the_user_is_not_cut_short(monkeypatch):
+    """Only setup's own checks are bounded; the modules' long runs (a backfill) aren't."""
+    import time
+    m = load_mdm_setup_module("codex")
+    monkeypatch.setattr(m, "_become_user", lambda info: None)
+    assert __import__("inspect").signature(m._run_as_user).parameters["_timeout"].default is None
+    assert m._run_as_user(ME, lambda: (time.sleep(1.5), "done")[1]) == "done"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the check forks only on POSIX")
+def test_a_child_paused_after_answering_cannot_hold_setup(monkeypatch):
+    """It closed the pipe, then paused: the wait for it to exit is bounded too."""
+    import time
+    m = load_mdm_setup_module("codex")
+    monkeypatch.setattr(m, "_become_user", lambda info: None)
+
+    real_exit = os._exit
+    # In the forked child only: it answers, closes the pipe, then pauses on its way out.
+    monkeypatch.setattr(os, "_exit", lambda code: (os.kill(os.getpid(), __import__("signal").SIGSTOP),
+                                                   real_exit(code)))
+    started = time.monotonic()
+    m._run_as_user(ME, lambda: True, _timeout=0.5)
     assert time.monotonic() - started < 5

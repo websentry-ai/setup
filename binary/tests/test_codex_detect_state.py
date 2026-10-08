@@ -23,7 +23,7 @@ EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart
 @pytest.fixture
 def m(monkeypatch):
     mod = load_mdm_setup_module("codex")
-    monkeypatch.setattr(mod, "_run_as_user", lambda u, fn, *a, **k: fn(*a, **k))
+    monkeypatch.setattr(mod, "_run_as_user", lambda u, fn, *a, _timeout=None, **k: fn(*a, **k))
     return mod
 
 
@@ -563,8 +563,8 @@ def test_tampered_wins_over_an_unknown_profile(m, tmp_path, monkeypatch):
     b = _profile(tmp_path, "b", script=True, config={"hooks": {}})
     real = m._run_as_user
     monkeypatch.setattr(m, "_run_as_user",
-                        lambda u, fn, *a: None if fn is setup_cmd._codex_hook_registered
-                        and a[0].parent.parent == b else real(u, fn, *a))
+                        lambda u, fn, *a, **k: None if fn is setup_cmd._codex_hook_registered
+                        and a[0].parent.parent == b else real(u, fn, *a, **k))
     assert _state(m, b, a) == "tampered"
 
 
@@ -573,7 +573,7 @@ def test_the_file_is_read_as_the_profiles_user(m, tmp_path, monkeypatch):
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     seen = []
     real = m._run_as_user
-    monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a: (seen.append(u), real(u, fn, *a))[1])
+    monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a, **k: (seen.append(u), real(u, fn, *a, **k))[1])
     setup_cmd._codex_detect_state(m, [("alice", home)])
     assert seen and set(seen) == {"alice"}  # the wrapper and hooks.json are both read as alice
 
