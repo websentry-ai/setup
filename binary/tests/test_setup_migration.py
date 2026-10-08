@@ -776,6 +776,17 @@ def test_codex_replaces_a_symlink_at_its_hook_path(env):
     assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
 
 
+def test_codex_replaces_a_read_only_script_at_its_hook_path(env):
+    """A no-op made read-only can't be truncated in place, so it would survive every run."""
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\nexit 0\n")
+    wrapper.chmod(0o555)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert "os.execv" in wrapper.read_text() and wrapper.stat().st_mode & 0o777 == 0o755
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+
+
 @pytest.mark.parametrize("shape", ["corrupt", "symlink"])
 def test_codex_defers_on_an_unusable_hooks_json(env, shape):
     """A hooks.json we can't safely merge into defers codex without touching it
@@ -829,14 +840,23 @@ def _without_hanging(fn, seconds=5):
     return result
 
 
-@pytest.mark.parametrize("where", ["hooks.json", "hooks/unbound.py"])
-def test_a_fifo_in_the_codex_install_does_not_hang_setup(env, where):
-    fifo = env["home"] / ".codex" / where
+def test_a_fifo_at_hooks_json_does_not_hang_setup(env):
+    fifo = env["home"] / ".codex" / "hooks.json"
     fifo.parent.mkdir(parents=True, exist_ok=True)
     os.mkfifo(fifo)
     assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
     assert __import__("stat").S_ISFIFO(fifo.lstat().st_mode)
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
+
+
+def test_a_fifo_at_the_codex_hook_path_is_replaced(env):
+    """Opened for writing, a FIFO with a reader attached would take the wrapper and stay a FIFO."""
+    fifo = env["home"] / ".codex" / "hooks" / "unbound.py"
+    fifo.parent.mkdir(parents=True)
+    os.mkfifo(fifo)
+    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 0
+    assert fifo.is_file() and "os.execv" in fifo.read_text()
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
 
 
 def test_a_fifo_at_config_toml_does_not_hang_setup(env):

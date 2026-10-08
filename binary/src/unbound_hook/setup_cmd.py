@@ -670,9 +670,9 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
 
     def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        # Replace a symlink at our own path rather than write through it
-        # (O_NOFOLLOW below would otherwise defer codex on every run).
-        if wrapper.is_symlink():
+        # Replace whatever holds our path rather than write into it: a symlink, a
+        # FIFO, or a read-only file would otherwise survive the run.
+        if os.path.lexists(wrapper):
             wrapper.unlink()
         fd = os.open(str(wrapper), _USER_FILE_WRITE_FLAGS, 0o755)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
