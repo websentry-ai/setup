@@ -110,21 +110,17 @@ def _normalized_urls(m, opts):
     return base, gateway
 
 
-def _detect_state(settings_path: Path):
-    """Binary-era analog of the python detect_install_state(): the python
-    version checked managed unbound.py existence, which no longer exists.
-    'persisted' = settings present and pointing at this binary OR at the
-    python-era unbound.py (a legitimate install being migrated — reporting
-    those as 'tampered' would flood the backend with false tamper signals on
-    rollout day); 'tampered' = settings present referencing neither. Callers that
-    do not own the settings file must not call this at all."""
+def _detect_state(settings_path: Path, expected_hooks):
+    """Binary-era analog of the python detect_install_state(), for the admin-owned
+    hook settings. 'persisted' = every event setup installs runs our exact command,
+    or the file still points at the python-era unbound.py (a legitimate install being
+    migrated; flagging those would flood the backend on rollout day); 'tampered' =
+    anything else, a file the tool can't parse included; 'fresh' = no file; None if
+    it couldn't be read. Callers that do not own the settings file must not call this."""
     try:
-        if not settings_path.exists():
-            return "fresh"
-        text = settings_path.read_text(encoding="utf-8")
-        if str(HOOK_BINARY) in text or "unbound.py" in text:
-            return "persisted"
-        return "tampered"
+        data = _read_user_file(settings_path, follow=True)
+    except FileNotFoundError:
+        return "fresh"
     except Exception as e:
         # None = "unknown" — notify_setup_complete omits the field entirely,
         # which is more honest than guessing 'fresh' over an unreadable but
@@ -132,6 +128,33 @@ def _detect_state(settings_path: Path):
         print(f"[setup] install_state detection failed for {settings_path}: {e}",
               file=sys.stderr)
         return None
+    try:
+        settings = json.loads(data.decode("utf-8"))
+    except ValueError:
+        return "tampered"
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    if _registers_every_event(hooks, expected_hooks) or "unbound.py" in data.decode("utf-8"):
+        return "persisted"
+    return "tampered"
+
+
+def _registers_every_event(hooks, expected_hooks) -> bool:
+    """Whether ``hooks`` runs our command on every event ``expected_hooks`` installs."""
+    if not isinstance(hooks, dict):
+        return False
+    return all(set(_event_commands(entries)) & set(_event_commands(hooks.get(event)))
+               for event, entries in expected_hooks.items())
+
+
+def _event_commands(entries):
+    """The command strings in one event's entries, flat ({"command"}) or grouped
+    ({"hooks": [...]})."""
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        for item in entry["hooks"] if isinstance(entry.get("hooks"), list) else [entry]:
+            if isinstance(item, dict) and isinstance(item.get("command"), str):
+                yield item["command"]
 
 
 def _remove_stale_managed_script(managed_dir: Path) -> None:
@@ -845,8 +868,11 @@ def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
 
     def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(hooks_json), flags, 0o644)
+        # The file is ours alone: replace whatever holds the path (a symlink, a FIFO, a
+        # read-only file) rather than write into it, and fail if something reappears.
+        if os.path.lexists(hooks_json):
+            hooks_json.unlink()
+        fd = os.open(str(hooks_json), _USER_FILE_WRITE_FLAGS | os.O_EXCL, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         try:
@@ -893,7 +919,7 @@ def _setup_claude_code(opts):
     # None (unknown) without looking: in skip mode managed-settings.json is the
     # admin's file, and unknown leaves the backend's tamper state untouched.
     state = None if skip_settings else _detect_state(
-        m.get_managed_settings_dir() / "managed-settings.json")
+        m.get_managed_settings_dir() / "managed-settings.json", _claude_hooks_config())
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
         return ("deferred", "managed settings update failed")
     if skip_settings:
@@ -948,7 +974,7 @@ def _setup_augment(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
 
-    state = _detect_state(m.get_managed_settings_dir() / "settings.json")
+    state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_hooks_config())
     if not _write_augment_managed_settings(m):
         return ("deferred", "managed settings write failed")
     _remove_stale_managed_script(m.get_managed_settings_dir())
@@ -1189,7 +1215,7 @@ def _setup_cursor(opts):
                 urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
             m.remove_user_level_hooks(username, home_dir)
 
-    state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json")
+    state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"])
     hooks_ok, hooks_changed = _write_cursor_enterprise_hooks(m)
     if not hooks_ok:
         return ("deferred", "enterprise hooks.json write failed")
@@ -1204,29 +1230,49 @@ def _setup_cursor(opts):
     return ("configured", None)
 
 
-def _copilot_detect_state(user_homes) -> str:
-    """Binary-era analog of copilot detect_install_state(): per-user files.
-    'fresh' = no user has an unbound.json; 'persisted' = at least one user's
-    unbound.json already points at the binary; 'tampered' otherwise."""
-    saw_json = False
-    saw_known_ref = False
+def _copilot_detect_state(m, user_homes):
+    """Per user, like codex: each profile's ~/.copilot/hooks/unbound.json is read as
+    that user and must run our exact command on every event. 'fresh' (no profile has
+    the file), 'persisted' (one has a working one), 'tampered' (any profile's file
+    doesn't; wins), None if a check failed."""
     try:
-        for _username, home_dir in user_homes:
-            p = home_dir / ".copilot" / "hooks" / "unbound.json"
-            if p.exists():
-                saw_json = True
-                try:
-                    text = p.read_text(encoding="utf-8")
-                    if str(HOOK_BINARY) in text or "unbound.py" in text:
-                        saw_known_ref = True
-                except OSError:
-                    pass
-        if not saw_json:
-            return "fresh"
-        return "persisted" if saw_known_ref else "tampered"
+        any_complete = indeterminate = False
+        for username, home_dir in user_homes:
+            path = home_dir / ".copilot" / "hooks" / "unbound.json"
+            if not os.path.lexists(path):
+                continue
+            registered = m._run_as_user(username, _copilot_registered, path)
+            if registered is None:
+                indeterminate = True
+            elif registered:
+                any_complete = True
+            else:
+                return "tampered"
+        if indeterminate:
+            return None
+        return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] copilot install_state detection failed: {e}", file=sys.stderr)
         return None
+
+
+def _copilot_registered(path: Path) -> bool:
+    """Runs as the profile's user: the file runs our command on every event, in both
+    fields Copilot reads (command for VS Code, bash for the CLI). A python-era file
+    still pointing at unbound.py is a legitimate install being migrated."""
+    try:
+        text = _read_user_file(path, follow=True).decode("utf-8")
+        config = json.loads(text)
+    except (OSError, ValueError):
+        return False
+    hooks = config.get("hooks") if isinstance(config, dict) else None
+    if isinstance(hooks, dict) and all(
+            any(isinstance(e, dict) and e.get("type") == "command"
+                and e.get("command") == ours[0]["command"] and e.get("bash") == ours[0]["bash"]
+                for e in (hooks.get(event) if isinstance(hooks.get(event), list) else []))
+            for event, ours in _copilot_hooks_config()["hooks"].items()):
+        return True
+    return "unbound.py" in text
 
 
 def _setup_copilot(opts):
@@ -1244,7 +1290,7 @@ def _setup_copilot(opts):
         return ("deferred", "failed to set UNBOUND_COPILOT_API_KEY")
 
     user_homes = m.get_all_user_homes()
-    state = _copilot_detect_state(user_homes)
+    state = _copilot_detect_state(m, user_homes)
     installed = 0
     for username, home_dir in user_homes:
         m.write_unbound_config_for_user(
@@ -1264,6 +1310,11 @@ def _setup_copilot(opts):
     m.configure_managed_telemetry(api_key, gateway_url=gateway)
 
     if user_homes and installed == 0:
+        # A user can make every install fail, so a detected tamper is still reported.
+        if state == "tampered":
+            m.notify_setup_complete(api_key, "copilot", backend_url=base,
+                                    install_state=state, serial_number=device_id,
+                                    install_mode="binary")
         return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "copilot", backend_url=base,

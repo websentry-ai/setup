@@ -1655,3 +1655,148 @@ def test_every_vendored_function_setup_cmd_calls_actually_exists():
     if orphans:
         problems.append(f"defined by no vendored module: {orphans}")
     assert not problems, "setup_cmd calls functions its module does not define -> " + "; ".join(problems)
+
+
+# --- copilot: each profile's unbound.json must run our command on every event ------
+
+
+def _states(env, tool):
+    return [k.get("install_state") for a, k in env["notified"] if a[1] == tool]
+
+
+def _copilot_file(home):
+    return home / ".copilot" / "hooks" / "unbound.json"
+
+
+def test_copilot_reads_persisted_after_a_clean_install(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == ["fresh", "persisted"]
+
+
+@pytest.mark.parametrize("spoil", [
+    lambda c: c["hooks"].pop("PreToolUse"),                                  # an event dropped
+    lambda c: c["hooks"]["Stop"][0].update(bash="/bin/true"),                 # the CLI runs something else
+    lambda c: c["hooks"]["Stop"][0].update(command="/bin/true"),             # VS Code runs something else
+    lambda c: c.update(hooks={"note": str(setup_cmd.HOOK_BINARY)}),          # the path only mentioned
+])
+def test_copilot_registration_that_does_not_run_us_everywhere_is_tampered(env, spoil):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    path = _copilot_file(env["home"])
+    config = json.loads(path.read_text())
+    spoil(config)
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == ["fresh", "tampered"]
+    assert setup_cmd._copilot_registered(path)  # and the install put it right
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("{not json", "tampered"),
+    ('{"version": 1, "hooks": {"PreToolUse": [{"type": "command", "bash": "python3 ~/.copilot/hooks/unbound.py"}]}}',
+     "persisted"),  # a python-era install being migrated
+])
+def test_copilot_file_content_decides(env, text, expected):
+    path = _copilot_file(env["home"])
+    path.parent.mkdir(parents=True)
+    path.write_text(text)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == [expected]
+
+
+def test_one_broken_copilot_profile_is_not_hidden_by_a_healthy_one(env, monkeypatch):
+    other = env["tmp"] / "other"
+    other.mkdir()
+    monkeypatch.setattr(env["modules"]["copilot"], "get_all_user_homes",
+                        lambda: [(ME, env["home"]), (ME, other)])
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    _copilot_file(other).write_text('{"version": 1, "hooks": {}}')
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == ["fresh", "tampered"]
+
+
+def test_a_fifo_at_the_copilot_file_does_not_hang_and_is_replaced(env):
+    path = _copilot_file(env["home"])
+    path.parent.mkdir(parents=True)
+    os.mkfifo(path)
+    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 0
+    assert _states(env, "copilot") == ["tampered"]
+    assert path.is_file() and setup_cmd._copilot_registered(path)
+
+
+def test_a_symlink_at_the_copilot_file_is_replaced_not_written_through(env):
+    target = env["tmp"] / "elsewhere.json"
+    target.write_text("{}")
+    path = _copilot_file(env["home"])
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert not path.is_symlink() and setup_cmd._copilot_registered(path)
+    assert target.read_text() == "{}"
+
+
+def test_the_copilot_user_check_keeps_the_user_s_groups(monkeypatch):
+    from types import SimpleNamespace
+    m = load_mdm_setup_module("copilot")
+    calls = []
+    for name in ("initgroups", "setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(m.os, name, lambda *a, n=name: calls.append((n, a)))
+    m._become_user(SimpleNamespace(pw_name="alice", pw_uid=501, pw_gid=20))
+    assert calls == [("initgroups", ("alice", 20)), ("setgid", (20,)), ("setuid", (501,))]
+
+
+# --- claude code, cursor, augment: the admin-owned file must run us on every event ---
+
+
+MANAGED = {
+    "claude-code": ("managed-claude", "managed-settings.json", lambda c: c["hooks"]),
+    "augment_code": ("managed-augment", "settings.json", lambda c: c["hooks"]),
+    "cursor": ("enterprise-cursor", "hooks.json", lambda c: c["hooks"]),
+}
+
+
+@pytest.mark.parametrize("tool", list(MANAGED))
+def test_a_managed_install_reads_persisted(env, tool):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, tool)[-1] == "persisted"
+
+
+@pytest.mark.parametrize("tool", list(MANAGED))
+@pytest.mark.parametrize("spoil, expected", [
+    ("drop_event", "tampered"),     # still names our binary elsewhere, but one event is gone
+    ("only_mention", "tampered"),   # the path appears, registered nowhere
+    ("not_json", "tampered"),
+    ("python_era", "persisted"),    # a python-era install being migrated
+])
+def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    folder, name, hooks_of = MANAGED[tool]
+    path = env["tmp"] / folder / name
+    config = json.loads(path.read_text())
+    if spoil == "drop_event":
+        hooks_of(config).pop(sorted(hooks_of(config))[0])
+        path.write_text(json.dumps(config))
+    elif spoil == "only_mention":
+        config["hooks"] = {"note": str(setup_cmd.HOOK_BINARY)}
+        path.write_text(json.dumps(config))
+    elif spoil == "not_json":
+        path.write_text("{" + str(setup_cmd.HOOK_BINARY))
+    else:
+        path.write_text(json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": "python3 /etc/managed/hooks/unbound.py"}]}]}}))
+    state = setup_cmd._detect_state(path, {
+        "claude-code": setup_cmd._claude_hooks_config(),
+        "augment_code": setup_cmd._augment_hooks_config(),
+        "cursor": setup_cmd._cursor_hooks_json()["hooks"],
+    }[tool])
+    assert state == expected
+
+
+def test_a_managed_file_that_cannot_be_read_is_unknown(tmp_path):
+    folder = tmp_path / "managed"
+    folder.mkdir()
+    os.mkfifo(folder / "settings.json")
+    assert _without_hanging(lambda: setup_cmd._detect_state(folder / "settings.json",
+                                                            setup_cmd._augment_hooks_config())) is None
+    assert setup_cmd._detect_state(folder / "missing.json", setup_cmd._augment_hooks_config()) == "fresh"

@@ -60,6 +60,17 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
+def _become_user(info) -> None:
+    """Drop to the user with their own groups, as Copilot runs: a file shared through
+    a group must read the same here as it does to Copilot."""
+    try:
+        os.initgroups(info.pw_name, info.pw_gid)
+    except OSError:
+        os.setgroups([])
+    os.setgid(info.pw_gid)
+    os.setuid(info.pw_uid)
+
+
 def _run_as_user(username, fn, *args, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
@@ -85,16 +96,13 @@ def _run_as_user(username, fn, *args, **kwargs):
         info = pwd.getpwnam(username)
     except KeyError:
         return None
-    uid, gid = info.pw_uid, info.pw_gid
 
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
         try:
-            os.setgroups([])
-            os.setgid(gid)
-            os.setuid(uid)
+            _become_user(info)
             # setuid alone leaves $HOME pointing at root, so a Path.home() /
             # expanduser('~') inside fn would resolve to root's home, not the
             # user's. Callers pass explicit home_dir today; this hardens against
