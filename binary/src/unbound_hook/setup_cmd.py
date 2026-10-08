@@ -173,9 +173,10 @@ def _same_entry(actual, ours) -> bool:
 
 
 def _handler_like(handler, ours) -> bool:
-    """The same type, command and bash wherever ours sets them, and no weaker."""
+    """The same type and commands (command, bash, powershell) wherever ours sets them,
+    and no weaker."""
     return (isinstance(handler, dict)
-            and all(handler.get(k) == ours[k] for k in ("type", "command", "bash") if k in ours)
+            and all(handler.get(k) == ours[k] for k in ("type", "command", "bash", "powershell") if k in ours)
             and _no_weaker(handler, ours))
 
 
@@ -187,10 +188,13 @@ def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
         return False
     for event, entries in expected_hooks.items():
         ours = entries[0]["hooks"][0] if "hooks" in entries[0] else entries[0]
+        flags = entries[0].get("metadata") or {}
         handlers = []
         for entry in hooks.get(event) if isinstance(hooks.get(event), list) else []:
             if isinstance(entry, dict) and "hooks" in entry:
-                if entry.get("matcher") in (None, "", "*", ".*") and isinstance(entry["hooks"], list):
+                have = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+                if (entry.get("matcher") in (None, "", "*", ".*") and isinstance(entry["hooks"], list)
+                        and all(have.get(k) == v for k, v in flags.items())):  # e.g. Augment's capture flags
                     handlers += entry["hooks"]
             else:
                 handlers.append(entry)
@@ -1227,8 +1231,9 @@ def _codex_hooks_disabled(config_path: Path) -> bool:
         return True  # codex refuses the whole config, and setup won't rewrite it
     if features is None:
         return False
-    # Codex reads [features] as a table of booleans; anything else fails the whole load.
-    if not isinstance(features, dict):
+    # Codex reads [features] as a table of booleans (a few features take a table);
+    # anything else there fails the whole load.
+    if not isinstance(features, dict) or not all(isinstance(v, (bool, dict)) for v in features.values()):
         return True
     return any(k in features and features[k] is not True for k in ("hooks", "codex_hooks"))
 

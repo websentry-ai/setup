@@ -1838,6 +1838,7 @@ def test_a_managed_install_reads_persisted(env, tool):
     ("python_era_not_executable", "tampered"),
     ("python_era_execute_only", "tampered"),  # 0111: the shell can't read it
     ("python_era_owner_only", "tampered"),    # 0700: the agents' users can't run it
+    ("python_era_flag_off", "persisted_unless_augment"),  # Augment's capture flags switched off
 ])
 def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -1888,14 +1889,24 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
                 kept = {"async": True, "timeout": 1}
             return {"type": "command", "command": command, **kept} if grouped else {"command": command, **kept}
 
+        def group(event):
+            g = {"matcher": "*", "hooks": [handler(event)]}
+            if "metadata" in ours_config[event][0]:
+                g["metadata"] = dict(ours_config[event][0]["metadata"])
+                if spoil == "python_era_flag_off":
+                    g["metadata"] = {k: False for k in g["metadata"]}
+            return g
+
         path.write_text(json.dumps({"hooks": {
-            event: ([{"matcher": "*", "hooks": [handler(event)]}] if grouped else [handler(event)])
+            event: ([group(event)] if grouped else [handler(event)])
             for event in hooks_of(config)}}))
     state = setup_cmd._detect_state(path, {
         "claude-code": setup_cmd._claude_hooks_config(),
         "augment_code": setup_cmd._augment_written_hooks(env["modules"]["augment"]),
         "cursor": setup_cmd._cursor_hooks_json()["hooks"],
     }[tool], relative_ok=tool == "cursor")
+    if expected == "persisted_unless_augment":
+        expected = "tampered" if tool == "augment_code" else "persisted"
     assert state == expected
 
 
@@ -2138,6 +2149,7 @@ def test_a_release_that_adds_a_field_doesn_t_read_as_tampering(env, tool):
 @pytest.mark.parametrize("toml", [
     "features = false\n", 'features = "false"\n', "features = []\n",
     'features = { hooks = "false" }\n', "[features]\nhooks = 0\n", "[features]\ncodex_hooks = {}\n",
+    '[features]\nhooks = true\nshell_tool = "false"\n', '[features]\ncode_mode = "no"\n',
 ])
 def test_a_features_value_codex_can_t_read_is_tampered(env, toml):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -2185,3 +2197,14 @@ def test_an_organisation_s_empty_augment_group_is_kept(env):
     path.write_text(json.dumps(config))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert {"matcher": "Bash", "hooks": []} in json.loads(path.read_text())["hooks"]["PreToolUse"]
+
+
+def test_copilot_s_powershell_command_must_be_ours_too(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    path = _copilot_file(env["home"])
+    config = json.loads(path.read_text())
+    for handlers in config["hooks"].values():
+        handlers[0]["powershell"] = "exit 0"
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot")[-1] == "tampered"
