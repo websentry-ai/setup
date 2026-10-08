@@ -446,22 +446,20 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
 
 
 class _JsonObject(dict):
-    """A parsed JSON object that remembers which keys appeared more than once, and how
-    deep the values they replaced went (serde_json still parses those)."""
+    """A parsed JSON object that remembers which keys appeared more than once, and its
+    nesting depth as serde_json reads it, including values a repeated key replaced."""
     dups = frozenset()
-    shadowed_depth = 0
 
 
 def _json_object(pairs):
     obj = _JsonObject(pairs)
+    # Built bottom-up, so nested objects already know their depth: linear overall.
+    obj.depth = 1 + max((_value_depth(v) for _, v in pairs), default=0)
     if len(obj) != len(pairs):
         seen, dups = set(), set()
         for key, _ in pairs:
             (dups if key in seen else seen).add(key)
         obj.dups = frozenset(dups)
-        last = {key: i for i, (key, _) in enumerate(pairs)}
-        obj.shadowed_depth = max((_value_depth(v) for i, (k, v) in enumerate(pairs) if last[k] != i),
-                                 default=0)
     return obj
 
 
@@ -500,19 +498,20 @@ _SERDE_HANDLER_DEPTH = 6
 
 
 def _value_depth(value) -> int:
-    """Nesting serde_json walks to read ``value``, counting values a repeated key replaced."""
-    deepest, stack = 0, [(value, 1)]
+    """Nesting serde_json walks to read ``value``, iteratively; a parsed object's own
+    depth (which counts values a repeated key replaced) ends the walk there."""
+    deepest, stack = 0, [(value, 0)]
     while stack:
-        node, depth = stack.pop()
-        if isinstance(node, dict):
-            children = node.values()
-            deepest = max(deepest, depth + getattr(node, "shadowed_depth", 0))
-        elif isinstance(node, list):
-            children = node
-        else:
+        node, above = stack.pop()
+        depth = getattr(node, "depth", None)
+        if depth is not None:
+            deepest = max(deepest, above + depth)
             continue
-        deepest = max(deepest, depth)
-        stack.extend((child, depth + 1) for child in children)
+        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else None
+        if children is None:
+            continue
+        deepest = max(deepest, above + 1)
+        stack.extend((child, above + 1) for child in children)
     return deepest
 
 
@@ -565,8 +564,9 @@ def _field_ok(value, kind) -> bool:
         return value is None or (isinstance(value, int) and not isinstance(value, bool)
                                  and 0 <= value <= _U64_MAX)
     if kind == "toml_map":
-        return (isinstance(value, dict) and _toml_ok(value)
-                and _SERDE_HANDLER_DEPTH + _value_depth(value) < _SERDE_MAX_DEPTH)
+        # Depth first: it's iterative, and _toml_ok recurses.
+        return (isinstance(value, dict) and _SERDE_HANDLER_DEPTH + _value_depth(value) < _SERDE_MAX_DEPTH
+                and _toml_ok(value))
     return True
 
 
@@ -1088,9 +1088,11 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
     Anything codex couldn't load counts as not registered."""
     try:
         config = _load_codex_json(_read_user_file(hooks_path, follow=True))
-    except Exception:
+        if not _codex_can_load(config):
+            return False
+    except Exception:  # RecursionError included: too deep for codex too
         return False
-    if not _codex_can_load(config) or _codex_hooks_disabled(hooks_path.parent / "config.toml"):
+    if _codex_hooks_disabled(hooks_path.parent / "config.toml"):
         return False
     events = config.get("hooks", {})
     # Every event setup installs, or a dropped PreToolUse would still read healthy.

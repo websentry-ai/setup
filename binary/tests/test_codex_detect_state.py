@@ -462,6 +462,32 @@ def test_a_malformed_file_full_of_escaped_quotes_is_judged_quickly(m, tmp_path):
     assert time.monotonic() - started < 5
 
 
+@pytest.mark.parametrize("arrays", [300, 600, 900])
+def test_input_too_deep_for_python_s_recursion_is_tampered(m, tmp_path, arrays):
+    """Far past codex's limit, yet parseable by Python: tampered, not unknown."""
+    home = _profile(tmp_path, script=True)
+    cfg = _ours(home)
+    _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": "__DEEP__"}})
+    deep = "[" * arrays + "1" + "]" * arrays
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg).replace('"__DEEP__"', deep))
+    assert _state(m, home) == "tampered"
+
+
+def test_nested_repeated_keys_are_measured_in_linear_time(m, tmp_path):
+    """Each level repeats a key whose first value holds the next level and a long list."""
+    home = _profile(tmp_path, script=True)
+    filler = "[" + ",".join(["0"] * 15000) + "]"
+    inner = "1"
+    for _ in range(110):
+        inner = '{"x": [%s, %s], "x": 1}' % (filler, inner)
+    cfg = _ours(home)
+    _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": "__DEEP__"}})
+    (home / ".codex" / "hooks.json").write_text(json.dumps(cfg).replace('"__DEEP__"', inner))
+    started = time.monotonic()
+    _state(m, home)
+    assert time.monotonic() - started < 5
+
+
 @pytest.mark.parametrize("arrays", [124, 200])
 def test_a_deep_value_in_a_field_codex_skips_is_not_counted(m, tmp_path, arrays):
     """Codex skips a group's unknown field without its depth limit, and loads the file."""
