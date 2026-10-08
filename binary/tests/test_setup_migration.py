@@ -2106,3 +2106,11 @@ def test_a_profile_without_a_home_doesn_t_stop_the_copilot_install(env, monkeypa
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd._copilot_registered(_copilot_file(env["home"]))
     assert _states(env, "copilot") == ["fresh"]
+
+
+def test_an_empty_hooks_json_is_repaired(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json.write_text("")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS

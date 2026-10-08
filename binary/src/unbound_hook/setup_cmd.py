@@ -869,6 +869,8 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
         raw = _read_user_file(hooks_path, follow=True)
     except FileNotFoundError:
         raw = b"{}"
+    if not raw.strip():
+        raw = b"{}"  # an empty file holds nothing to keep
     try:
         config = _load_codex_json(raw)
         loadable = _codex_can_load(config)
@@ -1196,7 +1198,7 @@ except ImportError:  # python older than 3.11; the shipped binary bundles it
 
 def _codex_hooks_disabled(config_path: Path) -> bool:
     """Whether config.toml turns codex's hooks feature off (on by default; the legacy
-    key codex_hooks is an alias). A config codex can't parse isn't read as either."""
+    key codex_hooks is an alias), or codex can't load it at all, so no hook runs."""
     try:
         data = _read_user_file(config_path, follow=True)
     except FileNotFoundError:
@@ -1208,7 +1210,7 @@ def _codex_hooks_disabled(config_path: Path) -> bool:
     try:
         features = tomllib.loads(data.decode("utf-8")).get("features")
     except (ValueError, RecursionError):
-        return False
+        return True  # codex refuses the whole config, and setup won't rewrite it
     return isinstance(features, dict) and any(features.get(k) is False for k in ("hooks", "codex_hooks"))
 
 
@@ -1221,8 +1223,6 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
         if not _codex_can_load(config):
             return False
     except Exception:  # RecursionError included: too deep for codex too
-        return False
-    if _codex_hooks_disabled(hooks_path.parent / "config.toml"):
         return False
     events = config.get("hooks", {})
     # Every event setup installs, or a dropped PreToolUse would still read healthy.
@@ -1280,7 +1280,15 @@ def _codex_detect_state(m, user_homes):
             if registered is None or script is None:
                 indeterminate = True
             elif script and registered:
-                any_complete = True
+                # Both halves in place, yet codex may still run nothing: the hooks feature
+                # turned off, or a config.toml codex can't load.
+                disabled = m._run_as_user(username, _codex_hooks_disabled, hooks_path.parent / "config.toml")
+                if disabled is None:
+                    indeterminate = True
+                elif disabled:
+                    return "tampered"
+                else:
+                    any_complete = True
             elif script or registered:
                 return "tampered"
         if indeterminate:

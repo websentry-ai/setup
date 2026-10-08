@@ -600,7 +600,7 @@ def test_the_wrapper_an_earlier_binary_release_wrote_is_ours(m, tmp_path):
     ("[features]\nhooks = true\n", "persisted"),
     ("model = \"o3\"\n", "persisted"),  # on by default
     ("[other]\nhooks = false\n", "persisted"),  # another table's key
-    ("not toml [", "persisted"),
+    ("not toml [", "tampered"),  # codex refuses the whole config
 ])
 def test_hooks_turned_off_in_config_toml_are_not_registered(m, tmp_path, toml, expected):
     home = _profile(tmp_path, script=True)
