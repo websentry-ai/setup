@@ -643,6 +643,15 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
         debug_print(f"Could not write config for {username}")
 
 
+def _read_config_lines(config_path: Path):
+    """config.toml's lines, or None if it isn't a regular file: a FIFO would hang setup."""
+    fd = os.open(str(config_path), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(fd, 'r', encoding='utf-8') as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return f.readlines()
+
+
 def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
     """Remove OPENAI_API_KEY env var and openai_base_url from ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
@@ -654,8 +663,9 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
         return
 
     def _strip():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        lines = _read_config_lines(config_path)
+        if lines is None:
+            return False
         new_lines = [l for l in lines if not l.strip().startswith('openai_base_url')]
         if len(new_lines) == len(lines):
             return False
@@ -1395,8 +1405,10 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
         if config_path.exists():
-            with open(config_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+            lines = _read_config_lines(config_path)
+            if lines is None:
+                print(f"{username}'s config.toml is not a regular file; hooks not enforced")
+                return False
         # Covers the inline spelling too, so a daily re-run does not rewrite a config that is
         # already correct.
         if tomllib is not None and _write_is_safe(''.join(lines), True):
@@ -1566,8 +1578,9 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if registered:
             debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
             return False
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        lines = _read_config_lines(config_path)
+        if lines is None:
+            return False
         new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return False
