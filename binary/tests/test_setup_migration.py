@@ -2116,9 +2116,9 @@ def test_an_empty_hooks_json_is_repaired(env):
 
 
 @pytest.mark.parametrize("tool", list(MANAGED))
-def test_a_release_that_retunes_our_entry_doesn_t_read_as_tampering(env, tool):
-    """Detection runs before the rewrite: an older timeout or a field a newer release adds
-    must not flag every device on upgrade."""
+def test_a_release_that_adds_a_field_doesn_t_read_as_tampering(env, tool):
+    """Detection runs before the rewrite: a field a newer release adds, or a longer
+    timeout, must not flag every device on upgrade."""
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     folder, name, hooks_of = MANAGED[tool]
     path = env["tmp"] / folder / name
@@ -2128,7 +2128,7 @@ def test_a_release_that_retunes_our_entry_doesn_t_read_as_tampering(env, tool):
             handler = item["hooks"][0] if "hooks" in item else item
             handler["statusMessage"] = "Unbound"
             if isinstance(handler.get("timeout"), int):
-                handler["timeout"] = handler["timeout"] // 2
+                handler["timeout"] = handler["timeout"] * 2
     path.write_text(json.dumps(config))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _states(env, tool)[-1] == "persisted"
@@ -2144,3 +2144,44 @@ def test_a_features_value_codex_can_t_read_is_tampered(env, toml):
     (env["home"] / ".codex" / "config.toml").write_text(toml)
     setup_cmd.run(["--api-key", "admin-key"])
     assert _codex_states(env)[-1] == "tampered"
+
+
+@pytest.mark.parametrize("tool", list(MANAGED))
+def test_a_timeout_below_ours_is_tampered(env, tool):
+    """The policy check needs most of our timeout; less fails open or never returns."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    folder, name, hooks_of = MANAGED[tool]
+    path = env["tmp"] / folder / name
+    config = json.loads(path.read_text())
+    for groups in hooks_of(config).values():
+        for item in groups:
+            handler = item["hooks"][0] if "hooks" in item else item
+            if isinstance(handler.get("timeout"), int):
+                handler["timeout"] -= 1
+    path.write_text(json.dumps(config))
+    expected = {"claude-code": setup_cmd._claude_hooks_config(),
+                "augment_code": setup_cmd._augment_written_hooks(env["modules"]["augment"]),
+                "cursor": setup_cmd._cursor_hooks_json()["hooks"]}[tool]
+    assert setup_cmd._detect_state(path, expected, relative_ok=tool == "cursor") == "tampered"
+
+
+def test_a_copilot_handler_without_its_type_is_tampered(env):
+    """Copilot needs the type to load a handler."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    path = _copilot_file(env["home"])
+    config = json.loads(path.read_text())
+    for handlers in config["hooks"].values():
+        handlers[0].pop("type")
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot")[-1] == "tampered"
+
+
+def test_an_organisation_s_empty_augment_group_is_kept(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    path = _augment_path(env)
+    config = json.loads(path.read_text())
+    config["hooks"]["PreToolUse"].append({"matcher": "Bash", "hooks": []})
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert {"matcher": "Bash", "hooks": []} in json.loads(path.read_text())["hooks"]["PreToolUse"]

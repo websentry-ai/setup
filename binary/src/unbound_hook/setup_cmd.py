@@ -173,10 +173,9 @@ def _same_entry(actual, ours) -> bool:
 
 
 def _handler_like(handler, ours) -> bool:
-    """Same type and the exact command (and bash, where we set one), and no weaker."""
+    """The same type, command and bash wherever ours sets them, and no weaker."""
     return (isinstance(handler, dict)
-            and handler.get("type", "command") == ours.get("type", "command")
-            and all(handler.get(k) == ours[k] for k in ("command", "bash") if k in ours)
+            and all(handler.get(k) == ours[k] for k in ("type", "command", "bash") if k in ours)
             and _no_weaker(handler, ours))
 
 
@@ -202,15 +201,16 @@ def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
 
 
 def _no_weaker(handler, ours) -> bool:
-    """Not async where ours isn't, and a timeout wherever ours sets one, of at least a
-    tenth of it: a missing one falls back to the tool's default (30 s for Copilot, which
-    fails a pre-tool hook open), and a release can retune ours."""
+    """Not async where ours isn't, and at least our timeout wherever we set one: the
+    policy check needs most of it (Copilot fails a killed pre-tool hook open), and a
+    missing one falls back to the tool's shorter default. A release that raises a
+    timeout must accept the old value for a release, or every device reads tampered."""
     if handler.get("async") is True and ours.get("async") is not True:
         return False
     for key in ("timeout", "timeoutSec"):
         mine, theirs = ours.get(key), handler.get(key)
         if isinstance(mine, int) and not (
-                isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= max(1, mine // 10)):
+                isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= mine):
             return False
     return True
 
@@ -476,13 +476,16 @@ def _write_augment_managed_settings(m) -> bool:
                 # other group, so a changed matcher or timeout is replaced, not kept beside it.
                 ours = dict(new_config[0])
                 our_hook_exists = any(_same_entry(item, ours) for item in existing_config)
+                emptied = []
                 for item in existing_config:
                     if isinstance(item, dict) and isinstance(item.get("hooks"), list) \
                             and not _same_entry(item, ours):
-                        item["hooks"] = [h for h in item["hooks"]
-                                         if not (isinstance(h, dict) and h.get("command") == our_command)]
-                existing_config[:] = [item for item in existing_config
-                                      if not (isinstance(item, dict) and item.get("hooks") == [])]
+                        kept = [h for h in item["hooks"]
+                                if not (isinstance(h, dict) and h.get("command") == our_command)]
+                        if item["hooks"] and not kept:
+                            emptied.append(id(item))  # ours alone: drop it; an org's empty group stays
+                        item["hooks"] = kept
+                existing_config[:] = [item for item in existing_config if id(item) not in emptied]
                 if not our_hook_exists:
                     existing_config.extend(new_config)
             elif existing_config is None:
