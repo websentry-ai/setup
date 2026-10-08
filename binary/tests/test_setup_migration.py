@@ -1729,9 +1729,13 @@ def _python_era_copilot(env, with_script=True):
 
 @pytest.mark.parametrize("spoil", [
     lambda path, script: script.chmod(0o644),                                   # can't execute
-    lambda path, script: (script.unlink(), script.symlink_to("/bin/true")),    # a stand-in
+    lambda path, script: (script.rename(script.with_name("real.py")),          # a stand-in
+                          script.symlink_to(script.with_name("real.py"))),
     lambda path, script: path.write_text(path.read_text().replace('"timeoutSec": 600', '"timeoutSec": 0')),
     lambda path, script: path.write_text(path.read_text().replace('"type": "command",', '')),
+    lambda path, script: path.write_text(  # no timeout: Copilot's 30 s default fails open
+        json.dumps({"version": 1, "hooks": {e: [{k: v for k, v in h[0].items() if not k.startswith("timeout")}]
+                                            for e, h in json.loads(path.read_text())["hooks"].items()}})),
 ])
 def test_a_python_era_copilot_install_that_cannot_enforce_is_tampered(env, spoil):
     path = _python_era_copilot(env)
@@ -1858,7 +1862,11 @@ def test_a_managed_install_reads_persisted(env, tool):
     ("python_era", "persisted"),    # a python-era install being migrated
     ("python_era_no_script", "tampered"),
     ("python_era_decoy", "tampered"),   # names the script without running it
+    ("python_era_piped", "tampered"),   # runs it but throws its answer away
+    ("python_era_redirect", "tampered"),
+    ("python_era_flag", "tampered"),    # python3 --version "<script>" never runs it
     ("python_era_weaker", "tampered"),  # runs it, but async with a 1 ms timeout
+    ("python_era_symlink", "tampered"), # the script is a stand-in
 ])
 def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -1882,16 +1890,33 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
         path.write_text(json.dumps(config))
     else:
         script = path.parent / "hooks" / "unbound.py"
-        if spoil != "python_era_no_script":
+        if spoil == "python_era_symlink":
+            script.parent.mkdir(parents=True, exist_ok=True)
+            stand_in = env["tmp"] / "stand-in"
+            stand_in.write_text("#!/bin/sh\nexit 0\n")
+            script.symlink_to(stand_in)
+        elif spoil != "python_era_no_script":
             script.parent.mkdir(parents=True, exist_ok=True)
             script.write_text("#!/usr/bin/env python3\n")
-        command = f'echo "{script}"' if spoil == "python_era_decoy" else (
-            "./hooks/unbound.py" if tool == "cursor" else f'python3 "{script}"')
-        extra = {"async": True, "timeout": 1} if spoil == "python_era_weaker" else {}
+        base = "./hooks/unbound.py" if tool == "cursor" else f'python3 "{script}"'
+        command = {"python_era_decoy": f'echo "{script}"', "python_era_piped": f'"{script}" | true',
+                   "python_era_redirect": f'"{script}" > /dev/null',
+                   "python_era_flag": f'python3 --version "{script}"'}.get(spoil, base)
+        ours_config = {"claude-code": setup_cmd._claude_hooks_config(),
+                       "augment_code": setup_cmd._augment_written_hooks(env["modules"]["augment"]),
+                       "cursor": setup_cmd._cursor_hooks_json()["hooks"]}[tool]
         grouped = tool != "cursor"
+
+        def handler(event):
+            ours = ours_config[event][0]["hooks"][0] if grouped else ours_config[event][0]
+            # the python installers wrote the same timeouts
+            kept = {k: ours[k] for k in ("timeout", "async") if k in ours}
+            if spoil == "python_era_weaker":
+                kept = {"async": True, "timeout": 1}
+            return {"type": "command", "command": command, **kept} if grouped else {"command": command, **kept}
+
         path.write_text(json.dumps({"hooks": {
-            event: ([{"matcher": "*", "hooks": [{"type": "command", "command": command, **extra}]}] if grouped
-                    else [{"command": command, **extra}])
+            event: ([{"matcher": "*", "hooks": [handler(event)]}] if grouped else [handler(event)])
             for event in hooks_of(config)}}))
     state = setup_cmd._detect_state(path, {
         "claude-code": setup_cmd._claude_hooks_config(),

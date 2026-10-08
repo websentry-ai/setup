@@ -134,11 +134,11 @@ def _detect_state(settings_path: Path, expected_hooks):
         return "tampered"
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
+    commands = _python_era_commands(script, settings_path.parent)
     if _holds_every_entry(hooks, expected_hooks) or (
-            script.is_file() and _runs_on_every_event(
+            script.is_file() and not script.is_symlink() and _runs_on_every_event(
                 hooks, expected_hooks,
-                lambda h: h.get("type", "command") == "command"
-                and _runs_script(h["command"], script, settings_path.parent))):
+                lambda h: h.get("type", "command") == "command" and h["command"] in commands)):
         return "persisted"
     return "tampered"
 
@@ -189,27 +189,25 @@ def _no_weaker(handler, ours) -> bool:
         return False
     for key in ("timeout", "timeoutSec"):
         mine, theirs = ours.get(key), handler.get(key)
-        if theirs is not None and isinstance(mine, int) and not (
+        # Where ours sets one it must be there: a missing timeout falls back to the
+        # tool's default, which for Copilot is 30 s and fails a pre-tool hook open.
+        if isinstance(mine, int) and not (
                 isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= mine):
             return False
     return True
 
 
-def _runs_script(command, script: Path, base: Path) -> bool:
-    """Whether ``command`` runs ``script`` itself, as the program or as a python
-    interpreter's script (the shapes the python installers wrote, relative paths from
-    ``base``). A command that only mentions the path doesn't."""
+def _python_era_commands(script: Path, base: Path) -> set:
+    """Exactly the commands the python installers wrote for ``script``: the path, bare
+    or quoted, run directly or by python, or relative to the settings folder (Cursor).
+    Anything more (a pipe, a redirect, an extra flag) can discard the hook's answer."""
+    quoted = f'"{script}"'
+    shapes = {quoted, str(script)} | {f"{launcher} {quoted}" for launcher in ("python3", "python", "py -3")}
     try:
-        tokens = [t for t in shlex.split(command) if t]
+        shapes.add("./" + script.relative_to(base).as_posix())
     except ValueError:
-        return False
-    if tokens and os.path.basename(tokens[0]) in ("python", "python3", "py"):
-        tokens = tokens[1:]
-        while tokens and tokens[0].startswith("-"):
-            if tokens[0] in ("-c", "-m"):
-                return False  # runs code or a module, not the script
-            tokens = tokens[1:]
-    return bool(tokens) and os.path.normpath(os.path.join(base, tokens[0])) == os.path.normpath(str(script))
+        pass
+    return shapes
 
 
 def _remove_stale_managed_script(managed_dir: Path) -> None:
