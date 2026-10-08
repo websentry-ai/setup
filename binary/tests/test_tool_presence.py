@@ -104,6 +104,13 @@ def test_an_account_setup_did_not_list_is_still_checked(tmp_path, monkeypatch):
     assert tool_presence.tool_present("codex", []) is True  # setup's list came back empty
 
 
+@pytest.mark.parametrize("rel", [".local/share/claude/versions/.DS_Store", ".claude/projects/.DS_Store/x.jsonl"])
+def test_finder_residue_alone_is_not_a_sign(tmp_path, rel):
+    home = _home(tmp_path)
+    _touch(home / rel)
+    assert tool_presence.tool_present("claude-code", [("u", home)]) is False
+
+
 def test_no_account_to_look_in_is_unknown(monkeypatch):
     assert tool_presence.tool_present("codex", []) is None
 
@@ -208,6 +215,6 @@ def test_an_old_caller_without_tool_present_still_works(monkeypatch, tool):
     assert "tool_present" not in sent[0]
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX accounts")
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="a POSIX login account, not root")
 def test_the_account_list_includes_this_users_home():
     assert any(home.resolve() == Path.home().resolve() for home in _REAL_ACCOUNT_HOMES())

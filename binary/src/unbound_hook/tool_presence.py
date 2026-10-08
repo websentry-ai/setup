@@ -136,8 +136,9 @@ def _find(base, parts, deadline):
             for count, entry in enumerate(entries):
                 if count >= _MAX_ENTRIES:
                     raise _Unknown
-                if not fnmatch.fnmatchcase(entry.name, head):
-                    continue
+                if not fnmatch.fnmatchcase(entry.name, head) or (
+                        entry.name.startswith(".") and not head.startswith(".")):
+                    continue  # like a shell glob: * skips .DS_Store and other dotfiles
                 try:
                     if _find(Path(entry.path), rest, deadline):
                         return True
