@@ -628,7 +628,8 @@ def _codex_make_loadable(config) -> dict:
                 kept.append(group)
                 continue
             hooks = group["hooks"]
-            group["hooks"] = ([h for h in hooks if _codex_handler_kept(h)]
+            # dict(): a repeated field collapses to its last value, as on rewrite.
+            group["hooks"] = ([dict(h) for h in hooks if isinstance(h, dict) and _codex_handler_kept(dict(h))]
                               if isinstance(hooks, list) else [])
             if group["hooks"] or not hooks:
                 kept.append(group)
@@ -792,7 +793,10 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
                     existing_config.remove(existing_item)
         existing_config.extend(new_config)
 
-    text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False)
+    try:
+        text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False)
+    except RecursionError:  # indent uses the recursive pure-Python encoder
+        text = json.dumps(config, ensure_ascii=False, allow_nan=False)
     try:
         rewritten_loads = _codex_can_load(_load_codex_json(text.encode("utf-8")))
     except ValueError:

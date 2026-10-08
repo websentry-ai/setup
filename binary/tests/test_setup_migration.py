@@ -1290,6 +1290,18 @@ def test_a_nan_anywhere_is_repaired(env, plant):
     assert setup_cmd._codex_can_load(setup_cmd._load_codex_json(hooks_json.read_bytes()))
 
 
+def test_another_tool_s_repeated_field_is_collapsed_not_deleted(env):
+    """Codex rejects the repeat; rewriting keeps the last value, so that tool's hook survives."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["hooks"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": "__CMD__"})
+    hooks_json.write_text(json.dumps(config).replace('"command": "__CMD__"', '"command": "/a", "command": "/b"'))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    handlers = json.loads(hooks_json.read_text())["hooks"]["PreToolUse"][0]["hooks"]
+    assert {"type": "command", "command": "/b"} in handlers
+
+
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="older json can't parse it; the binary ships 3.12")
 def test_a_deep_field_codex_skips_does_not_break_the_install(env):
     """Codex skips an unknown group field without its depth limit; repair must not
