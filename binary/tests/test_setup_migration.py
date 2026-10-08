@@ -2134,6 +2134,7 @@ def test_a_release_that_retunes_our_entry_doesn_t_read_as_tampering(env, tool):
     assert _states(env, tool)[-1] == "persisted"
 
 
+@pytest.mark.skipif(setup_cmd.tomllib is None, reason="tomllib is python 3.11+; the binary bundles it")
 @pytest.mark.parametrize("toml", [
     "features = false\n", 'features = "false"\n', "features = []\n",
     'features = { hooks = "false" }\n', "[features]\nhooks = 0\n", "[features]\ncodex_hooks = {}\n",
