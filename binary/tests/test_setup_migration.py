@@ -2054,3 +2054,55 @@ def test_a_python_era_script_behind_a_locked_folder_is_tampered(tmp_path):
         assert setup_cmd._detect_state(path, expected) == "tampered"
     finally:
         script.parent.chmod(0o755)
+
+
+def test_a_full_disk_doesn_t_make_an_older_working_wrapper_tampered(env, monkeypatch):
+    """Only a folder locked against setup turns a failed upgrade into tampering."""
+    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    wrapper.write_text("#!/usr/bin/env python3\n# an older working hook\n")
+    wrapper.chmod(0o755)
+    _failing_replacement(monkeypatch)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert "tampered" not in _codex_states(env)
+    assert "older working hook" in wrapper.read_text()
+    wrapper.parent.chmod(0o555)  # the same failure in a folder locked against setup is tampering
+    try:
+        setup_cmd.run(["--api-key", "admin-key"])
+    finally:
+        wrapper.parent.chmod(0o755)
+    assert _codex_states(env)[-1] == "tampered"
+
+
+def test_a_failed_hooks_json_write_leaves_it_whole(env, monkeypatch):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    config["description"] = "keep me"
+    del config["hooks"]["Stop"]  # forces a rewrite
+    hooks_json.write_text(json.dumps(config))
+    before = hooks_json.read_text()
+    real_open = os.open
+
+    def _open(path, flags, *a, **k):
+        if str(path).endswith(".tmp") and ".hooks.json." in str(path) and flags & os.O_EXCL:
+            raise OSError(28, "No space left on device")
+        return real_open(path, flags, *a, **k)
+    monkeypatch.setattr(setup_cmd.os, "open", _open)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert hooks_json.read_text() == before
+
+
+def test_a_profile_without_a_home_doesn_t_stop_the_copilot_install(env, monkeypatch):
+    monkeypatch.setattr(env["modules"]["copilot"], "get_all_user_homes",
+                        lambda: [("ghost", None), (ME, env["home"])])
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd._copilot_registered(_copilot_file(env["home"]))
+    assert _states(env, "copilot") == ["fresh"]

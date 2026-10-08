@@ -18,6 +18,7 @@ Fail-open: a component failure is reported in the summary and the exit code,
 but never aborts the remaining components.
 """
 
+import errno
 import json
 import math
 import os
@@ -917,12 +918,16 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     # (a repeated key collapses on rewrite); otherwise the file is left alone.
     if json.dumps(config, sort_keys=True) == before and (loadable or not rewritten_loads):
         return
-    data = text.encode("utf-8")  # before the truncating open: a failure must leave the file intact
+    data = text.encode("utf-8")
     if len(data) > _USER_FILE_MAX_BYTES:
         raise ValueError("hooks.json would outgrow what detection reads back")
-    fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    if os.path.islink(hooks_path):  # a dotfiles link is the user's to keep; don't replace it
+        raise OSError(errno.ELOOP, "hooks.json is a symlink")
+    try:
+        mode = stat.S_IMODE(os.lstat(hooks_path).st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    _replace_user_file(hooks_path, data, mode)  # a failed write leaves the old file whole
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:
@@ -1109,8 +1114,11 @@ def _setup_codex(opts):
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
         elif state == "persisted" and had_wrapper and m._run_as_user(
-                username, _codex_wrapper_current, wrapper) is False:
-            state = "tampered"  # the install failed and our current wrapper isn't what's left
+                username, _codex_wrapper_current, wrapper) is False and m._run_as_user(
+                username, _writable_dir, wrapper.parent) is False:
+            # The folder was locked against setup, and what's left isn't our wrapper. An
+            # ordinary failure (a full disk) leaves the working hook and its state alone.
+            state = "tampered"
 
     if user_homes and installed == 0:
         # A user can make every install fail (a symlinked or FIFO hooks.json), so
@@ -1223,6 +1231,11 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
                for event in _codex_hooks_config(None))
 
 
+def _writable_dir(path: Path) -> bool:
+    """Runs as the profile's user: setup could replace files in this folder."""
+    return os.access(path, os.W_OK | os.X_OK)
+
+
 def _codex_wrapper_current(wrapper: Path) -> bool:
     """Runs as the profile's user: the file at our path is this release's wrapper."""
     try:
@@ -1324,6 +1337,8 @@ def _copilot_detect_state(m, user_homes):
     try:
         any_complete = indeterminate = False
         for username, home_dir in user_homes:
+            if home_dir is None:
+                continue
             path = home_dir / ".copilot" / "hooks" / "unbound.json"
             if not os.path.lexists(path):
                 continue
@@ -1379,14 +1394,15 @@ def _setup_copilot(opts):
     state = _copilot_detect_state(m, user_homes)
     installed = 0
     for username, home_dir in user_homes:
+        if home_dir is None:
+            continue  # no home to hold a config or a registration
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         # Earlier versions configured the exporter here, per user, in VS Code
         # settings. The managed file written below outranks those, so they are only
         # taken back out.
-        if home_dir is not None:
-            m.clear_otel_export_for_user(username, home_dir)
+        m.clear_otel_export_for_user(username, home_dir)
         registration = home_dir / ".copilot" / "hooks" / "unbound.json"
         had_registration = os.path.lexists(registration)  # a profile setup never reached isn't tampered
         if _install_copilot_hooks_for_user(m, username, home_dir):
