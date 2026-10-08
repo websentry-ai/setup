@@ -136,6 +136,7 @@ def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
     commands = _python_era_commands(script, settings_path.parent if relative_ok else None)
+    grouped = not relative_ok  # Cursor (the only relative one) runs flat handlers only
     if _holds_every_entry(hooks, expected_hooks) or (
             script.is_file() and not script.is_symlink()
             # the agents' users must read and run it, and get through each folder to it
@@ -143,7 +144,8 @@ def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
             and all(os.stat(d).st_mode & 0o001 for d in (settings_path.parent, script.parent))
             and _runs_on_every_event(
                 hooks, expected_hooks,
-                lambda h: h.get("type", "command") == "command" and h["command"] in commands)):
+                lambda h: h.get("type", "command") == "command" and h["command"] in commands,
+                grouped=grouped)):
         return "persisted"
     return "tampered"
 

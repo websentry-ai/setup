@@ -1842,6 +1842,7 @@ def test_a_managed_install_reads_persisted(env, tool):
     ("python_era_execute_only", "tampered"),  # 0111: the shell can't read it
     ("python_era_owner_only", "tampered"),    # 0700: the agents' users can't run it
     ("python_era_flag_off", "persisted_unless_augment"),  # Augment's capture flags switched off
+    ("python_era_grouped", "persisted_unless_cursor"),    # Cursor runs flat handlers only
 ])
 def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -1900,8 +1901,9 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
                     g["metadata"] = {k: False for k in g["metadata"]}
             return g
 
+        wrap = grouped or spoil == "python_era_grouped"  # wraps even Cursor's handlers
         path.write_text(json.dumps({"hooks": {
-            event: ([group(event)] if grouped else [handler(event)])
+            event: ([group(event)] if wrap else [handler(event)])
             for event in hooks_of(config)}}))
     state = setup_cmd._detect_state(path, {
         "claude-code": setup_cmd._claude_hooks_config(),
@@ -1910,6 +1912,8 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
     }[tool], relative_ok=tool == "cursor")
     if expected == "persisted_unless_augment":
         expected = "tampered" if tool == "augment_code" else "persisted"
+    if expected == "persisted_unless_cursor":
+        expected = "tampered" if tool == "cursor" else "persisted"
     assert state == expected
 
 
@@ -2256,3 +2260,16 @@ def test_the_managed_writer_drops_a_nan_it_would_otherwise_write_back(env, tool)
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert "NaN" not in path.read_text()
     assert _states(env, tool)[-2:] == ["tampered", "persisted"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="the check forks only on POSIX")
+@pytest.mark.parametrize("tool", ["codex", "copilot"])
+def test_a_user_check_the_user_pauses_cannot_hold_setup(monkeypatch, tool):
+    """The check runs as the user, who can SIGSTOP it: setup gives up and reads unknown."""
+    import time
+    m = load_mdm_setup_module(tool)
+    monkeypatch.setattr(m, "_become_user", lambda info: None)  # the drop itself needs root
+    monkeypatch.setattr(m, "_RUN_AS_USER_TIMEOUT", 0.5)
+    started = time.monotonic()
+    assert m._run_as_user(ME, time.sleep, 30) is None
+    assert time.monotonic() - started < 5

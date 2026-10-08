@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import signal
+import select
 import random
 import stat
 import re
@@ -62,6 +64,9 @@ def _become_user(info) -> None:
     os.setuid(info.pw_uid)
 
 
+_RUN_AS_USER_TIMEOUT = 30
+
+
 def _run_as_user(username, fn, *args, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
@@ -115,7 +120,16 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
+        # The child runs as the user, who can pause it: never wait on it unboundedly.
+        deadline = time.monotonic() + _RUN_AS_USER_TIMEOUT
         while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
             try:
                 chunk = os.read(r_fd, 1 << 20)
             except OSError:
