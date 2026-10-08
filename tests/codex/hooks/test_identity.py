@@ -371,6 +371,10 @@ class TestAccountReasonAndGateway(unittest.TestCase):
         self._write_auth({"auth_mode": "chatgpt", "tokens": {}})
         self.assertEqual(unbound.read_account_identity()["account_reason"], "no_id_token")
 
+    def test_an_id_token_that_cannot_be_decoded(self):
+        self._write_auth({"auth_mode": "chatgpt", "tokens": {"id_token": "bad.!!!.token"}})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "id_token_unreadable")
+
     def test_an_unreadable_auth_json(self):
         self.auth_file.write_text("{not json", encoding="utf-8")
         self.assertEqual(unbound.read_account_identity()["account_reason"], "auth_json_unreadable")
@@ -388,7 +392,8 @@ class TestAccountReasonAndGateway(unittest.TestCase):
 
     def test_openai_unbound_and_loopback_hosts_name_no_one(self):
         for url in ("https://api.openai.com/v1", "https://chatgpt.com/backend-api", "https://api.getunbound.ai/v1",
-                    "http://localhost:8080", "http://127.0.0.1:4000"):
+                    "http://localhost:8080", "http://127.0.0.1:4000", "https://openrouter.ai/api/v1",
+                    "https://api.groq.com/openai/v1", "https://generativelanguage.googleapis.com/v1beta"):
             with self.subTest(url=url):
                 self._config('openai_base_url = "%s"\n' % url)
                 self.assertIsNone(unbound.read_account_identity()["org_id"])
@@ -396,6 +401,10 @@ class TestAccountReasonAndGateway(unittest.TestCase):
     def test_a_company_host_that_merely_ends_like_openai_is_a_gateway(self):
         self._config('openai_base_url = "https://gateway.company-openai.com/v1"\n')
         self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.company-openai.com")
+
+    def test_a_company_azure_openai_host_is_a_gateway(self):
+        self._config('openai_base_url = "https://acme.openai.azure.com/openai"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "acme.openai.azure.com")
 
     def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
         self._write_auth(self._auth_with_token({

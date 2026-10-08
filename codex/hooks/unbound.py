@@ -2678,7 +2678,10 @@ def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     ours = urlparse(UNBOUND_GATEWAY_URL).hostname or ''
-    shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com')
+    # Shared services, not a company gateway: Unbound, OpenAI, and public model providers.
+    shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com', 'openrouter.ai', 'groq.com', 'mistral.ai',
+              'googleapis.com', 'anthropic.com', 'together.xyz', 'deepseek.com', 'x.ai', 'fireworks.ai',
+              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co')
     if (not host or any(d and (host == d or host.endswith('.' + d)) for d in shared)
             or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
         return None
@@ -2705,6 +2708,8 @@ def read_account_identity() -> Dict:
         id_token = (auth.get('tokens') or {}).get('id_token')
         if id_token:
             claims = _decode_jwt_claims(id_token)
+            if not claims:
+                reason = 'id_token_unreadable'
             auth_claim = claims.get('https://api.openai.com/auth') or {}
             if isinstance(auth_claim, dict):
                 org_id = _codex_org_id(auth_claim)
