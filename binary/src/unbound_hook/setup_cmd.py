@@ -137,7 +137,9 @@ def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
     commands = _python_era_commands(script, settings_path.parent if relative_ok else None)
     if _holds_every_entry(hooks, expected_hooks) or (
             script.is_file() and not script.is_symlink()
-            and script.stat().st_mode & 0o005 == 0o005  # the agents' users read and run it
+            # the agents' users must read and run it, and get through each folder to it
+            and script.stat().st_mode & 0o005 == 0o005
+            and all(os.stat(d).st_mode & 0o001 for d in (settings_path.parent, script.parent))
             and _runs_on_every_event(
                 hooks, expected_hooks,
                 lambda h: h.get("type", "command") == "command" and h["command"] in commands)):
@@ -155,14 +157,16 @@ def _holds_every_entry(hooks, expected_hooks) -> bool:
 
 
 def _same_entry(actual, ours) -> bool:
-    """Equal, except that a metadata block may carry keys beyond the ones we set."""
+    """Our entry: a flat one exactly; a group with our matcher and our exact handler
+    (beside any an organisation added to it) and our metadata flags (Augment adds its own)."""
     if not isinstance(actual, dict):
         return False
-    actual, ours = dict(actual), dict(ours)
-    have, want = actual.pop("metadata", None), ours.pop("metadata", None)
-    if actual != ours:
-        return False
-    return want is None or (isinstance(have, dict) and all(have.get(k) == v for k, v in want.items()))
+    if "hooks" not in ours:
+        return actual == ours
+    have = actual.get("metadata") if isinstance(actual.get("metadata"), dict) else {}
+    return (actual.get("matcher") == ours.get("matcher")
+            and isinstance(actual.get("hooks"), list) and all(h in actual["hooks"] for h in ours["hooks"])
+            and all(have.get(k) == v for k, v in (ours.get("metadata") or {}).items()))
 
 
 def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
@@ -456,14 +460,17 @@ def _write_augment_managed_settings(m) -> bool:
             our_command = new_config[0]["hooks"][0]["command"]
             existing_config = settings["hooks"].get(event)
             if isinstance(existing_config, list):
-                our_hook_exists = any(
-                    hook.get("command", "") == our_command
-                    for item in existing_config if isinstance(item, dict)
-                    # .get's default only covers a missing key, so a scalar
-                    # would be iterated and raise, aborting the write.
-                    for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
-                    if isinstance(hook, dict)
-                )
+                # Our group as written (metadata is set below). Take our handler out of any
+                # other group, so a changed matcher or timeout is replaced, not kept beside it.
+                ours = dict(new_config[0])
+                our_hook_exists = any(_same_entry(item, ours) for item in existing_config)
+                for item in existing_config:
+                    if isinstance(item, dict) and isinstance(item.get("hooks"), list) \
+                            and not _same_entry(item, ours):
+                        item["hooks"] = [h for h in item["hooks"]
+                                         if not (isinstance(h, dict) and h.get("command") == our_command)]
+                existing_config[:] = [item for item in existing_config
+                                      if not (isinstance(item, dict) and item.get("hooks") == [])]
                 if not our_hook_exists:
                     existing_config.extend(new_config)
             elif existing_config is None:
@@ -765,6 +772,27 @@ def _codex_handler_kept(handler) -> bool:
     return _codex_handler_loads(handler)
 
 
+def _replace_user_file(path: Path, data: bytes, mode: int) -> None:
+    """Write ``data`` beside ``path`` and rename it over whatever is there: a symlink or
+    FIFO at ``path`` is replaced rather than written through, and a write that fails
+    leaves the old file in place."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if os.path.lexists(tmp):
+        tmp.unlink()
+    fd = os.open(str(tmp), _USER_FILE_WRITE_FLAGS | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            os.fchmod(f.fileno(), mode)
+        os.rename(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
     actually discovers them from), mirroring the python user-level
@@ -785,15 +813,7 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
 
     def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        # Replace whatever holds our path rather than write into it: a symlink, a
-        # FIFO, or a read-only file would otherwise survive the run.
-        if os.path.lexists(wrapper):
-            wrapper.unlink()
-        # O_EXCL: anything planted after the unlink makes this fail, not take the write.
-        fd = os.open(str(wrapper), _USER_FILE_WRITE_FLAGS | os.O_EXCL, 0o755)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_codex_wrapper_source())
-            os.fchmod(f.fileno(), 0o755)
+        _replace_user_file(wrapper, _codex_wrapper_source().encode("utf-8"), 0o755)
         _merge_codex_hooks_json(hooks_path, hook_command)
         return True
 
@@ -937,13 +957,7 @@ def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
 
     def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        # The file is ours alone: replace whatever holds the path (a symlink, a FIFO, a
-        # read-only file) rather than write into it, and fail if something reappears.
-        if os.path.lexists(hooks_json):
-            hooks_json.unlink()
-        fd = os.open(str(hooks_json), _USER_FILE_WRITE_FLAGS | os.O_EXCL, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+        _replace_user_file(hooks_json, json.dumps(config, indent=2).encode("utf-8"), 0o644)
         try:
             if stale_script.is_file():
                 stale_script.unlink()

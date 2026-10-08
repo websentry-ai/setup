@@ -849,75 +849,42 @@ def test_a_fifo_at_hooks_json_does_not_hang_setup(env):
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
 
 
-def test_a_file_planted_after_the_unlink_fails_the_codex_install(env, monkeypatch):
-    """The wrapper is created exclusively, so a FIFO raced into the path isn't written into."""
+def test_a_file_raced_into_the_temporary_path_fails_the_codex_install(env, monkeypatch):
+    """The replacement is created exclusively, so a FIFO raced into its path isn't written into."""
     wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
     wrapper.write_text("#!/bin/sh\nexit 0\n")
-    real_unlink = Path.unlink
-    readers = []
-
-    def _unlink_then_plant(self, *a, **k):
-        real_unlink(self, *a, **k)
-        if self == wrapper:
-            os.mkfifo(self)  # with a reader attached, a non-exclusive open would take the write
-            readers.append(os.open(self, os.O_RDONLY | os.O_NONBLOCK))
-    monkeypatch.setattr(Path, "unlink", _unlink_then_plant)
-    try:
-        assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
-    finally:
-        for fd in readers:
-            os.close(fd)
-    assert __import__("stat").S_ISFIFO(wrapper.lstat().st_mode)
-
-
-def test_a_wrapper_lost_to_a_failed_replace_reports_tampered(env, monkeypatch):
-    """The old wrapper is unlinked before the new one is created; if the create fails,
-    nothing is left at our path and the profile is unenforced."""
-    def _as_user(_u, fn, *a, **k):
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     real_open = os.open
 
-    def _open(path, flags, *a, **k):
-        if str(path).endswith(os.path.join("hooks", "unbound.py")) and flags & os.O_EXCL:
+    def _plant_then_open(path, flags, *a, **k):
+        if str(path).endswith(".tmp") and flags & os.O_EXCL:
+            os.mkfifo(path)
+        return real_open(path, flags, *a, **k)
+    monkeypatch.setattr(setup_cmd.os, "open", _plant_then_open)
+    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
+    assert wrapper.read_text() == "#!/bin/sh\nexit 0\n"
+
+
+def _failing_replacement(monkeypatch):
+    real_open = os.open
+
+    def _open(path, flags, *a, **k):  # any exclusive create of a hook file, however it's done
+        if flags & os.O_EXCL and str(path).endswith((".tmp", "unbound.py", "unbound.json")):
             raise OSError(28, "No space left on device")
         return real_open(path, flags, *a, **k)
-
     monkeypatch.setattr(setup_cmd.os, "open", _open)
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
-    assert _codex_states(env) == ["fresh", "tampered"]
 
 
-@pytest.mark.parametrize("script, expected", [("#!/bin/sh\nexit 0\n", ["fresh", "tampered"]),
-                                              (None, ["fresh"])])
-def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch, script, expected):
-    """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading
-    persisted. Our own wrapper there still works: nothing new is reported, so the
-    last persisted stands."""
-    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+def test_a_failed_replace_keeps_the_working_codex_wrapper(env, monkeypatch):
+    """The replacement is written beside the wrapper and renamed over it, so a write that
+    fails leaves the working one in place, and nothing is reported as tampered."""
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_dir = env["home"] / ".codex" / "hooks"
-    if script is not None:
-        (hooks_dir / "unbound.py").write_text(script)
-    hooks_dir.chmod(0o555)
-    try:
-        setup_cmd.run(["--api-key", "admin-key"])
-    finally:
-        hooks_dir.chmod(0o755)
-    assert _codex_states(env) == expected
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    before = wrapper.read_text()
+    _failing_replacement(monkeypatch)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert wrapper.read_text() == before
+    assert "tampered" not in _codex_states(env)
 
 
 def test_the_user_check_keeps_the_user_s_groups(monkeypatch):
@@ -1785,47 +1752,14 @@ def test_a_deeply_nested_copilot_file_is_tampered_not_unknown(env):
     assert _states(env, "copilot") == ["tampered"]
 
 
-def test_a_copilot_registration_lost_to_a_failed_replace_reports_tampered(env, monkeypatch):
-    def _as_user(_u, fn, *a, **k):
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["copilot"], "_run_as_user", _as_user)
+def test_a_failed_replace_keeps_the_working_copilot_registration(env, monkeypatch):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    real_open = os.open
-
-    def _open(path, flags, *a, **k):
-        if str(path).endswith("unbound.json") and flags & os.O_EXCL:
-            raise OSError(28, "No space left on device")
-        return real_open(path, flags, *a, **k)
-
-    monkeypatch.setattr(setup_cmd.os, "open", _open)
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert not _copilot_file(env["home"]).exists()
-    assert _states(env, "copilot") == ["fresh", "tampered"]
-
-
-@pytest.mark.parametrize("content, expected", [
-    ("{not json", "tampered"),
-    ('{"note": "unbound.py", "hooks": {}}', "tampered"),                 # the name, registered nowhere
-    ('{"hooks": {"PreToolUse": [{"type": "command", "bash": "python3 ~/.copilot/hooks/unbound.py"}]}}',
-     "tampered"),                                                       # one event, not all
-])
-def test_copilot_file_content_decides(env, content, expected):
     path = _copilot_file(env["home"])
-    path.parent.mkdir(parents=True)
-    path.write_text(content)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _states(env, "copilot") == [expected]
-
-
-@pytest.mark.parametrize("with_script, expected", [(True, "persisted"), (False, "tampered")])
-def test_a_python_era_copilot_install_is_migrated_only_while_it_still_runs(env, with_script, expected):
-    _python_era_copilot(env, with_script)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _states(env, "copilot") == [expected]
+    before = path.read_text()
+    _failing_replacement(monkeypatch)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert path.read_text() == before
+    assert "tampered" not in _states(env, "copilot")
 
 
 def test_one_broken_copilot_profile_is_not_hidden_by_a_healthy_one(env, monkeypatch):
@@ -2025,3 +1959,98 @@ def test_augment_metadata_extras_are_fine_but_ours_must_hold(env, change, expect
     config["hooks"]["PreToolUse"][0]["metadata"].update(change)
     path.write_text(json.dumps(config))
     assert setup_cmd._detect_state(path, setup_cmd._augment_written_hooks(env["modules"]["augment"])) == expected
+
+
+@pytest.mark.parametrize("script, expected", [("#!/bin/sh\nexit 0\n", ["fresh", "tampered"]),
+                                              (None, ["fresh"])])
+def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch, script, expected):
+    """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading
+    persisted. Our own wrapper there still works: nothing new is reported, so the
+    last persisted stands."""
+    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_dir = env["home"] / ".codex" / "hooks"
+    if script is not None:
+        (hooks_dir / "unbound.py").write_text(script)
+    hooks_dir.chmod(0o555)
+    try:
+        setup_cmd.run(["--api-key", "admin-key"])
+    finally:
+        hooks_dir.chmod(0o755)
+    assert _codex_states(env) == expected
+
+
+@pytest.mark.parametrize("content, expected", [
+    ("{not json", "tampered"),
+    ('{"note": "unbound.py", "hooks": {}}', "tampered"),                 # the name, registered nowhere
+    ('{"hooks": {"PreToolUse": [{"type": "command", "bash": "python3 ~/.copilot/hooks/unbound.py"}]}}',
+     "tampered"),                                                       # one event, not all
+])
+def test_copilot_file_content_decides(env, content, expected):
+    path = _copilot_file(env["home"])
+    path.parent.mkdir(parents=True)
+    path.write_text(content)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == [expected]
+
+
+@pytest.mark.parametrize("with_script, expected", [(True, "persisted"), (False, "tampered")])
+def test_a_python_era_copilot_install_is_migrated_only_while_it_still_runs(env, with_script, expected):
+    _python_era_copilot(env, with_script)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == [expected]
+
+
+def _augment_path(env):
+    return env["tmp"] / "managed-augment" / "settings.json"
+
+
+def test_an_organisation_s_hook_beside_ours_in_an_augment_group_is_fine(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    path = _augment_path(env)
+    config = json.loads(path.read_text())
+    config["hooks"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": "/opt/org/audit", "timeout": 5000})
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "augment_code")[-1] == "persisted"
+    groups = json.loads(path.read_text())["hooks"]["PreToolUse"]
+    assert len(groups) == 1 and {"type": "command", "command": "/opt/org/audit", "timeout": 5000} in groups[0]["hooks"]
+
+
+def test_a_changed_augment_group_is_tampered_then_repaired(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    path = _augment_path(env)
+    config = json.loads(path.read_text())
+    config["hooks"]["PreToolUse"][0]["matcher"] = "NEVER"
+    path.write_text(json.dumps(config))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "augment_code") == ["fresh", "tampered", "persisted"]
+    ours = setup_cmd._augment_hooks_config()["PreToolUse"][0]["hooks"][0]["command"]
+    groups = json.loads(path.read_text())["hooks"]["PreToolUse"]
+    assert not any(h.get("command") == ours for g in groups if g.get("matcher") == "NEVER" for h in g["hooks"])
+
+
+def test_a_python_era_script_behind_a_locked_folder_is_tampered(tmp_path):
+    """0755 on the script, 0700 on its folder: the agents' users can't reach it."""
+    script = tmp_path / "hooks" / "unbound.py"
+    script.parent.mkdir()
+    script.write_text("#!/usr/bin/env python3\n")
+    script.chmod(0o755)
+    tmp_path.chmod(0o755)
+    expected = setup_cmd._claude_hooks_config()
+    path = tmp_path / "managed-settings.json"
+    path.write_text(json.dumps({"hooks": {e: [{"matcher": "*", "hooks": [
+        dict(g[0]["hooks"][0], command=f'"{script}"')]}] for e, g in expected.items()}}))
+    assert setup_cmd._detect_state(path, expected) == "persisted"
+    script.parent.chmod(0o700)
+    try:
+        assert setup_cmd._detect_state(path, expected) == "tampered"
+    finally:
+        script.parent.chmod(0o755)
