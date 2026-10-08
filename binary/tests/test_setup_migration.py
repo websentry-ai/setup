@@ -2298,3 +2298,24 @@ def test_a_child_paused_after_answering_cannot_hold_setup(monkeypatch):
     started = time.monotonic()
     m._run_as_user(ME, lambda: True, _timeout=0.5)
     assert time.monotonic() - started < 5
+
+
+def test_a_copilot_check_its_user_stops_is_tampered(env, monkeypatch):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    real = env["modules"]["copilot"]._run_as_user
+    monkeypatch.setattr(env["modules"]["copilot"], "_run_as_user",
+                        lambda u, fn, *a, **k: None if fn is setup_cmd._copilot_registered else real(u, fn, *a, **k))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot")[-1] == "tampered"
+
+
+@pytest.mark.parametrize("tool", ["codex", "copilot"])
+def test_setup_bounds_the_module_s_own_user_calls_until_the_report(env, monkeypatch, tool):
+    """The config writes before the report run as the user too; the backfill after doesn't
+    need a limit."""
+    m = env["modules"][tool]
+    seen = []
+    monkeypatch.setattr(m, "notify_setup_complete", lambda *a, **k: seen.append(m._RUN_AS_USER_TIMEOUT))
+    monkeypatch.setattr(m, "run_backfill", lambda *a, **k: seen.append(m._RUN_AS_USER_TIMEOUT))
+    assert setup_cmd.run(["--api-key", "admin-key", "--backfill"]) == 0
+    assert seen == [setup_cmd._USER_CHECK_TIMEOUT, None]

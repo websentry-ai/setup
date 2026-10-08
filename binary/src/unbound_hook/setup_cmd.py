@@ -1124,6 +1124,7 @@ def _setup_augment(opts):
 
 def _setup_codex(opts):
     m = _module("codex")
+    m._RUN_AS_USER_TIMEOUT = _USER_CHECK_TIMEOUT  # until the report: a user can pause a call
     base, gateway = _normalized_urls(m, opts)
     device_id = m.get_device_identifier()
     if not device_id:
@@ -1177,6 +1178,7 @@ def _setup_codex(opts):
                             hook_hash=m.hook_script_hash(hook_source_path("codex")),
                             install_mode="binary")
     if opts["backfill"]:
+        m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
 
@@ -1309,10 +1311,10 @@ def _codex_detect_state(m, user_homes):
     """Install state before this run reasserts it, per profile, on the pair setup
     installs: the wrapper script and our hooks.json entry. Either alone leaves codex
     unenforced for that user. 'fresh' (no profile has either), 'persisted' (one has
-    both), 'tampered' (any has one without the other; wins), None if a check failed."""
+    both), 'tampered' (any has one without the other, or a check its user stopped; wins),
+    None if detection itself failed."""
     try:
         any_complete = False
-        indeterminate = False
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
@@ -1325,21 +1327,19 @@ def _codex_detect_state(m, user_homes):
             if os.path.lexists(hooks_path):
                 registered = _as_user(m, username, _codex_hook_registered, hooks_path, wrapper)
             if registered is None or script is None:
-                indeterminate = True
+                # Only reached for a profile holding our files: its user can kill or stop
+                # the check, so a check that didn't answer doesn't keep the old state.
+                return "tampered"
             elif script and registered:
                 # Both halves in place, yet codex may still run nothing: the hooks feature
                 # turned off, or a config.toml codex can't load.
                 disabled = _as_user(m, username, _codex_hooks_disabled, hooks_path.parent / "config.toml")
-                if disabled is None:
-                    indeterminate = True
-                elif disabled:
+                if disabled is None or disabled:
                     return "tampered"
                 else:
                     any_complete = True
             elif script or registered:
                 return "tampered"
-        if indeterminate:
-            return None
         return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
@@ -1388,24 +1388,19 @@ def _copilot_detect_state(m, user_homes):
     """Per user, like codex: each profile's ~/.copilot/hooks/unbound.json is read as
     that user and must run our exact command on every event. 'fresh' (no profile has
     the file), 'persisted' (one has a working one), 'tampered' (any profile's file
-    doesn't; wins), None if a check failed."""
+    doesn't, or its check didn't answer; wins), None if detection itself failed."""
     try:
-        any_complete = indeterminate = False
+        any_complete = False
         for username, home_dir in user_homes:
             if home_dir is None:
                 continue
             path = home_dir / ".copilot" / "hooks" / "unbound.json"
             if not os.path.lexists(path):
                 continue
-            registered = _as_user(m, username, _copilot_registered, path)
-            if registered is None:
-                indeterminate = True
-            elif registered:
-                any_complete = True
-            else:
+            # A check its user killed or stopped (None) doesn't keep the old state either.
+            if not _as_user(m, username, _copilot_registered, path):
                 return "tampered"
-        if indeterminate:
-            return None
+            any_complete = True
         return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] copilot install_state detection failed: {e}", file=sys.stderr)
@@ -1443,6 +1438,7 @@ def _copilot_registered(path: Path) -> bool:
 
 def _setup_copilot(opts):
     m = _module("copilot")
+    m._RUN_AS_USER_TIMEOUT = _USER_CHECK_TIMEOUT  # until the report: a user can pause a call
     base, gateway = _normalized_urls(m, opts)
     device_id = m.get_device_identifier()
     if not device_id:
@@ -1499,6 +1495,7 @@ def _setup_copilot(opts):
                             install_mode="binary")
     if opts["backfill"]:
         hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
+        m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, user_homes, hook_source)
     return ("configured", None)
 

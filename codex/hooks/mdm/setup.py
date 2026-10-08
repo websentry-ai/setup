@@ -64,6 +64,11 @@ def _become_user(info) -> None:
     os.setuid(info.pw_uid)
 
 
+# A limit for every privilege-dropped call, set by a caller that must not be held by
+# a user pausing one (the binary's setup); None (a backfill's case) waits as long as it takes.
+_RUN_AS_USER_TIMEOUT = None
+
+
 def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
@@ -119,7 +124,8 @@ def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
         chunks = []
         # The child runs as the user, who can pause it: a caller can bound the wait
         # (a backfill can't be bounded; a quick check can).
-        deadline = None if _timeout is None else time.monotonic() + _timeout
+        limit = _RUN_AS_USER_TIMEOUT if _timeout is None else _timeout
+        deadline = None if limit is None else time.monotonic() + limit
         while True:
             remaining = None if deadline is None else deadline - time.monotonic()
             if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):

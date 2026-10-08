@@ -551,11 +551,13 @@ def test_profiles_without_codex_do_not_count(m, tmp_path):
     assert _state(m, a, b, c) == "persisted"
 
 
-def test_a_failed_privilege_drop_leaves_the_state_unknown(m, tmp_path, monkeypatch):
+def test_a_check_that_didn_t_answer_is_tampered_not_unknown(m, tmp_path, monkeypatch):
+    """The check runs as the profile's user, who can kill or stop it; an unknown would
+    leave the dashboard on its last persisted."""
     home = _profile(tmp_path, script=True)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     monkeypatch.setattr(m, "_run_as_user", lambda *a, **k: None)
-    assert _state(m, home) is None
+    assert _state(m, home) == "tampered"
 
 
 def test_tampered_wins_over_an_unknown_profile(m, tmp_path, monkeypatch):
