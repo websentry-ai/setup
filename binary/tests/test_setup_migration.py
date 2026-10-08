@@ -1134,3 +1134,42 @@ def test_every_vendored_function_setup_cmd_calls_actually_exists():
     if orphans:
         problems.append(f"defined by no vendored module: {orphans}")
     assert not problems, "setup_cmd calls functions its module does not define -> " + "; ".join(problems)
+
+
+# --- each report says whether the tool is on the machine ---------------------------
+
+
+PRESENCE_TOOLS = ("claude-code", "codex", "cursor", "copilot", "augment_code")
+
+
+@pytest.fixture
+def no_machine_installs(tmp_path, monkeypatch):
+    """This machine's own /opt/homebrew/bin and /Applications stay out of it."""
+    from unbound_hook import tool_presence
+    monkeypatch.setattr(tool_presence, "_MACHINE_BIN_DIRS", (str(tmp_path / "machine-bin"),))
+    monkeypatch.setattr(tool_presence, "_APP_DIRS", (str(tmp_path / "machine-apps"),))
+
+
+def _reported(env):
+    return {a[1]: k.get("tool_present") for a, k in env["notified"]}
+
+
+def test_setup_reports_every_tool_absent_on_an_empty_machine(env, no_machine_installs):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _reported(env) == dict.fromkeys(PRESENCE_TOOLS, False)
+
+
+def test_setup_reports_the_tool_that_is_there(env, no_machine_installs):
+    codex = env["home"] / ".local/bin/codex"
+    codex.parent.mkdir(parents=True)
+    codex.write_text("#!/bin/sh\n")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _reported(env) == {**dict.fromkeys(PRESENCE_TOOLS, False), "codex": True}
+    # the install state is still reported beside it
+    assert all("install_state" in k for _, k in env["notified"])
+
+
+def test_a_second_run_still_ignores_what_the_first_wrote(env, no_machine_installs):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert all(k.get("tool_present") is False for _, k in env["notified"])
