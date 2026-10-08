@@ -1,13 +1,19 @@
 """Whether a coding tool is on this machine, reported beside its install state.
 
 Setup hooks every tool on every profile, so a machine that never had a tool still
-reports an install state for it. This lets the backend leave those out. It leans to
+reports an install state for it. This lets the backend tell those apart. It leans to
 "present": a wrong "absent" would hide a real tamper, a wrong "present" only keeps
-today's count. Paths are only stat'ed, never opened or run, and nothing setup itself
-writes (~/.unbound, ~/.codex/hooks*, ~/.codex/config.toml, ~/.copilot/hooks) counts.
+today's count, and a place that can't be checked makes the answer unknown. Paths are
+only stat'ed and listed, never opened or run, and nothing setup itself writes
+(~/.unbound, ~/.codex/hooks*, ~/.codex/config.toml, ~/.copilot/hooks) counts.
+
+The signs live in user-writable homes, so a user can remove them: "absent" is a hint
+for sorting reports, not proof that a tamper can be ignored.
 """
 
-import itertools
+import fnmatch
+import os
+import time
 from pathlib import Path
 
 _MACHINE_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin")
@@ -20,23 +26,23 @@ _USER_BIN_DIRS = (
 )
 _EDITOR_DIRS = (".vscode", ".vscode-insiders", ".vscode-oss", ".cursor", ".windsurf")
 _APP_DIRS = ("/Applications",)
-# Bounds the work per pattern: a session folder can hold thousands of files.
-_MAX_MATCHES = 64
+# Users control their homes: a folder too big to list, or a slow one, is unknown.
+_MAX_ENTRIES = 2000
+_BUDGET_SECONDS = 5.0
 
 # binaries: names on a bin dir; paths: other per-home locations; extensions: editor
-# extension folders; apps: macOS app bundles; activity: files only the tool writes.
+# extension folders; apps: macOS app bundles; activity: files only the tool writes
+# (the desktop apps that bundle these tools write the same sessions).
 _TOOLS = {
     "claude-code": {
         "binaries": ("claude",),
         "paths": (".claude/local/claude", ".local/share/claude/versions/*"),
         "extensions": ("anthropic.claude-code-*",),
-        "apps": ("Claude.app",),
         "activity": (".claude/projects/*/*.jsonl",),
     },
     "codex": {
         "binaries": ("codex",),
         "extensions": ("openai.chatgpt-*",),
-        "apps": ("Codex.app",),
         "activity": (".codex/sessions/*", ".codex/history.jsonl"),
     },
     "cursor": {
@@ -58,6 +64,10 @@ _TOOLS = {
 }
 
 
+class _Unknown(Exception):
+    """A folder couldn't be listed, was too big, or the time budget ran out."""
+
+
 def tool_present(tool, user_homes):
     """True if any sign of ``tool`` is on the machine or in any of ``user_homes``,
     False if none is, None if a place couldn't be checked (the report then omits it)."""
@@ -65,15 +75,20 @@ def tool_present(tool, user_homes):
     if signs is None:
         return None
     try:
-        machine = [str(Path(d) / name) for d in _MACHINE_BIN_DIRS for name in signs["binaries"]]
-        machine += [str(Path(d) / app) for d in _APP_DIRS for app in signs.get("apps", ())]
-        results = [_matches(Path("/"), p) for p in machine]
-        results += [_matches(Path(home), p) for _, home in user_homes for p in _home_patterns(signs)]
+        deadline = time.monotonic() + _BUDGET_SECONDS
+        checks = [(Path("/"), f"{d}/{name}") for d in _MACHINE_BIN_DIRS for name in signs["binaries"]]
+        checks += [(Path("/"), f"{d}/{app}") for d in _APP_DIRS for app in signs.get("apps", ())]
+        checks += [(Path(home), p) for _, home in user_homes for p in _home_patterns(signs)]
+        unknown = False
+        for base, pattern in checks:
+            try:
+                if _find(base, [p for p in pattern.split("/") if p], deadline):
+                    return True
+            except _Unknown:
+                unknown = True
+        return None if unknown else False
     except Exception:  # never fail the setup report over this
         return None
-    if True in results:
-        return True
-    return None if None in results else False
 
 
 def _home_patterns(signs):
@@ -84,11 +99,39 @@ def _home_patterns(signs):
     return patterns + list(signs.get("activity", ()))
 
 
-def _matches(base, pattern):
-    """Whether ``pattern`` under ``base`` exists; None if that couldn't be checked."""
+def _find(base, parts, deadline):
+    """Whether a path matching ``parts`` exists under ``base``, stopping at the first
+    match. Raises _Unknown when that can't be told, rather than answering no."""
+    if time.monotonic() > deadline:
+        raise _Unknown
+    if not parts:
+        return True
+    head, rest = parts[0], parts[1:]
+    if "*" not in head:
+        try:
+            os.stat(base / head)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+        except OSError:
+            raise _Unknown
+        return _find(base / head, rest, deadline)
+    unknown = False
     try:
-        if "*" not in pattern:
-            return (base / pattern.lstrip("/")).exists()
-        return any(p.exists() for p in itertools.islice(base.glob(pattern), _MAX_MATCHES))
+        with os.scandir(base) as entries:
+            for count, entry in enumerate(entries):
+                if count >= _MAX_ENTRIES:
+                    raise _Unknown
+                if not fnmatch.fnmatchcase(entry.name, head):
+                    continue
+                try:
+                    if _find(Path(entry.path), rest, deadline):
+                        return True
+                except _Unknown:
+                    unknown = True
+    except (FileNotFoundError, NotADirectoryError):
+        return False
     except OSError:
-        return None
+        raise _Unknown
+    if unknown:
+        raise _Unknown
+    return False

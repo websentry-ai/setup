@@ -76,7 +76,7 @@ def test_each_kind_of_sign_counts(tmp_path, tool, rel):
 
 @pytest.mark.parametrize("tool, app_or_bin", [
     ("claude-code", "bin/claude"), ("codex", "bin/codex"), ("cursor", "Applications/Cursor.app"),
-    ("codex", "Applications/Codex.app"), ("copilot", "bin/copilot"), ("augment", "bin/auggie"),
+    ("copilot", "bin/copilot"), ("augment", "bin/auggie"),
 ])
 def test_a_machine_wide_install_counts_for_the_device(tmp_path, no_machine_installs, tool, app_or_bin):
     _touch(no_machine_installs / app_or_bin)
@@ -111,15 +111,50 @@ def test_a_home_that_cannot_be_read_is_unknown_not_absent(tmp_path):
         (locked / ".local").chmod(0o755)
 
 
-def test_a_huge_session_folder_is_bounded(tmp_path, monkeypatch):
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads every folder")
+def test_a_wildcard_folder_that_cannot_be_listed_is_unknown(tmp_path):
+    """pathlib's glob would skip it silently and answer absent."""
     home = _home(tmp_path)
-    folder = home / ".claude/projects/p"
-    folder.mkdir(parents=True)
-    calls = []
-    real = tool_presence.itertools.islice
-    monkeypatch.setattr(tool_presence.itertools, "islice", lambda it, n: (calls.append(n), real(it, n))[1])
-    tool_presence.tool_present("claude-code", [("u", home)])
-    assert calls and set(calls) == {tool_presence._MAX_MATCHES}
+    _touch(home / ".nvm/versions/node/v22.11.0/bin/codex", executable=True)
+    (home / ".nvm/versions/node").chmod(0)
+    try:
+        assert tool_presence.tool_present("codex", [("u", home)]) is None
+    finally:
+        (home / ".nvm/versions/node").chmod(0o755)
+
+
+def test_a_folder_too_big_to_list_is_unknown(tmp_path, monkeypatch):
+    home = _home(tmp_path)
+    for i in range(5):
+        (home / ".claude/projects" / f"p{i}").mkdir(parents=True)
+    monkeypatch.setattr(tool_presence, "_MAX_ENTRIES", 3)
+    assert tool_presence.tool_present("claude-code", [("u", home)]) is None
+
+
+def test_running_out_of_time_is_unknown(tmp_path, monkeypatch):
+    monkeypatch.setattr(tool_presence, "_BUDGET_SECONDS", -1)
+    assert tool_presence.tool_present("codex", [("u", _home(tmp_path))]) is None
+
+
+def test_a_match_beside_an_unreadable_folder_still_counts(tmp_path):
+    home = _home(tmp_path)
+    _touch(home / ".local/bin/codex", executable=True)
+    (home / ".nvm/versions/node").mkdir(parents=True)
+    (home / ".nvm/versions/node").chmod(0)
+    try:
+        assert tool_presence.tool_present("codex", [("u", home)]) is True
+    finally:
+        (home / ".nvm/versions/node").chmod(0o755)
+
+
+@pytest.mark.parametrize("tool, app", [("claude-code", "Claude.app"), ("codex", "Codex.app")])
+def test_a_desktop_app_alone_is_not_the_cli(tmp_path, no_machine_installs, tool, app):
+    """Claude Desktop and the Codex app are other products; when they run the agent
+    they write the same session files, which do count."""
+    _touch(no_machine_installs / "Applications" / app / "Contents/Info.plist")
+    home = _home(tmp_path)
+    _touch(home / "Applications" / app / "Contents/Info.plist")
+    assert tool_presence.tool_present(tool, [("u", home)]) is False
 
 
 def test_an_unknown_tool_or_a_broken_check_is_unknown(tmp_path, monkeypatch):
