@@ -10,7 +10,11 @@ import os
 
 import pytest
 
+from pathlib import Path
+
 from unbound_hook import tool_presence
+
+_REAL_ACCOUNT_HOMES = tool_presence._account_homes
 from unbound_hook._loader import load_mdm_setup_module
 
 TOOLS = ("claude-code", "codex", "cursor", "copilot", "augment")
@@ -24,6 +28,7 @@ def no_machine_installs(tmp_path, monkeypatch):
     (machine / "Applications").mkdir()
     monkeypatch.setattr(tool_presence, "_MACHINE_BIN_DIRS", (str(machine / "bin"),))
     monkeypatch.setattr(tool_presence, "_APP_DIRS", (str(machine / "Applications"),))
+    monkeypatch.setattr(tool_presence, "_account_homes", lambda: [])  # this machine's real users
     return machine
 
 
@@ -88,6 +93,19 @@ def test_any_profile_counts_for_the_device(tmp_path):
     alice, bob = _home(tmp_path, "alice"), _home(tmp_path, "bob")
     _touch(bob / ".local/bin/codex", executable=True)
     assert tool_presence.tool_present("codex", [("alice", alice), ("bob", bob)]) is True
+
+
+def test_an_account_setup_did_not_list_is_still_checked(tmp_path, monkeypatch):
+    """Setup lists only readable homes under /Users; a home elsewhere still counts."""
+    listed, elsewhere = _home(tmp_path, "listed"), _home(tmp_path, "Volumes-Data-alice")
+    _touch(elsewhere / ".local/bin/codex", executable=True)
+    monkeypatch.setattr(tool_presence, "_account_homes", lambda: [listed, elsewhere])
+    assert tool_presence.tool_present("codex", [("listed", listed)]) is True
+    assert tool_presence.tool_present("codex", []) is True  # setup's list came back empty
+
+
+def test_no_account_to_look_in_is_unknown(monkeypatch):
+    assert tool_presence.tool_present("codex", []) is None
 
 
 def test_what_setup_writes_never_counts(tmp_path):
@@ -188,3 +206,8 @@ def test_an_old_caller_without_tool_present_still_works(monkeypatch, tool):
     monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: sent.append(json.loads(k["input"])))
     m.notify_setup_complete("key", tool, install_state="persisted", serial_number="S")
     assert "tool_present" not in sent[0]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX accounts")
+def test_the_account_list_includes_this_users_home():
+    assert any(home.resolve() == Path.home().resolve() for home in _REAL_ACCOUNT_HOMES())

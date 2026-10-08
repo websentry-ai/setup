@@ -65,6 +65,8 @@ def env(tmp_path, monkeypatch):
     # NEVER run real launchctl from tests — the dev machine may have live
     # agents under these labels. Record the bootout calls instead.
     bootouts = []
+    from unbound_hook import tool_presence
+    monkeypatch.setattr(tool_presence, "_account_homes", lambda: [])  # never this machine's users
     monkeypatch.setattr(migration, "_bootout_legacy_agents",
                         lambda username, uid, h, log: bootouts.append((username, uid)))
     daemon_bootouts = []

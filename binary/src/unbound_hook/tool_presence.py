@@ -13,6 +13,7 @@ for sorting reports, not proof that a tamper can be ignored.
 
 import fnmatch
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -76,9 +77,12 @@ def tool_present(tool, user_homes):
         return None
     try:
         deadline = time.monotonic() + _BUDGET_SECONDS
+        homes = {str(home) for _, home in user_homes} | {str(home) for home in _account_homes()}
+        if not homes:
+            return None  # no account to look in: that isn't evidence of absence
         checks = [(Path("/"), f"{d}/{name}") for d in _MACHINE_BIN_DIRS for name in signs["binaries"]]
         checks += [(Path("/"), f"{d}/{app}") for d in _APP_DIRS for app in signs.get("apps", ())]
-        checks += [(Path(home), p) for _, home in user_homes for p in _home_patterns(signs)]
+        checks += [(Path(home), p) for home in sorted(homes) for p in _home_patterns(signs)]
         unknown = False
         for base, pattern in checks:
             try:
@@ -89,6 +93,17 @@ def tool_present(tool, user_homes):
         return None if unknown else False
     except Exception:  # never fail the setup report over this
         return None
+
+
+def _account_homes():
+    """Every login account's home, wherever it lives. Setup's own list keeps only
+    readable homes under /Users, and is empty when any home can't be read."""
+    try:
+        import pwd
+    except ImportError:
+        return []
+    floor = 500 if sys.platform == "darwin" else 1000
+    return [Path(u.pw_dir) for u in pwd.getpwall() if u.pw_uid >= floor and u.pw_dir not in ("", "/")]
 
 
 def _home_patterns(signs):
