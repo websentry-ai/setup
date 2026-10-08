@@ -393,7 +393,9 @@ class TestAccountReasonAndGateway(unittest.TestCase):
     def test_openai_unbound_and_loopback_hosts_name_no_one(self):
         for url in ("https://api.openai.com/v1", "https://chatgpt.com/backend-api", "https://api.getunbound.ai/v1",
                     "http://localhost:8080", "http://127.0.0.1:4000", "https://openrouter.ai/api/v1",
-                    "https://api.groq.com/openai/v1", "https://generativelanguage.googleapis.com/v1beta"):
+                    "https://api.groq.com/openai/v1", "https://generativelanguage.googleapis.com/v1beta",
+                    "https://bedrock-runtime.us-east-1.amazonaws.com", "https://models.github.ai/inference",
+                    "https://models.inference.ai.azure.com"):
             with self.subTest(url=url):
                 self._config('openai_base_url = "%s"\n' % url)
                 self.assertIsNone(unbound.read_account_identity()["org_id"])
@@ -405,6 +407,22 @@ class TestAccountReasonAndGateway(unittest.TestCase):
     def test_a_company_azure_openai_host_is_a_gateway(self):
         self._config('openai_base_url = "https://acme.openai.azure.com/openai"\n')
         self.assertEqual(unbound.read_account_identity()["org_id"], "acme.openai.azure.com")
+
+    def test_the_active_profile_chooses_the_provider(self):
+        self._config('model_provider = "personal"\nprofile = "work"\n\n'
+                     '[profiles.work]\nmodel_provider = "corp"\n\n'
+                     '[model_providers.personal]\nbase_url = "https://me.example/v1"\n\n'
+                     '[model_providers.corp]\nbase_url = "https://llm.corp.example/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "llm.corp.example")
+
+    def test_a_readable_auth_json_with_no_sign_in_says_so(self):
+        self._write_auth({"last_refresh": "2026-10-01"})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "no_account_in_auth_json")
+
+    def test_a_keyring_store_explains_a_token_less_auth_json(self):
+        self._write_auth({"auth_mode": "chatgpt", "tokens": {}})
+        self._config('cli_auth_credentials_store = "keyring"\n')
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "credentials_keyring")
 
     def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
         self._write_auth(self._auth_with_token({

@@ -2646,10 +2646,14 @@ def _codex_account_config() -> Dict:
             data = _codex_account_config_regex(raw)
     except Exception:
         return {}
-    provider = data.get('model_provider')
+    profiles = data.get('profiles') if isinstance(data.get('profiles'), dict) else {}
+    profile = profiles.get(data.get('profile')) if isinstance(data.get('profile'), str) else None
+    profile = profile if isinstance(profile, dict) else {}
+    provider = profile.get('model_provider') or data.get('model_provider')
     providers = data.get('model_providers') if isinstance(data.get('model_providers'), dict) else {}
     chosen = providers.get(provider) if isinstance(provider, str) else None
-    base_url = (chosen.get('base_url') if isinstance(chosen, dict) else None) or data.get('openai_base_url')
+    base_url = ((chosen.get('base_url') if isinstance(chosen, dict) else None)
+                or profile.get('openai_base_url') or data.get('openai_base_url'))
     store = data.get('cli_auth_credentials_store')
     return {'base_url': base_url if isinstance(base_url, str) else None,
             'credentials_store': store if isinstance(store, str) else None}
@@ -2681,7 +2685,8 @@ def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
     # Shared services, not a company gateway: Unbound, OpenAI, and public model providers.
     shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com', 'openrouter.ai', 'groq.com', 'mistral.ai',
               'googleapis.com', 'anthropic.com', 'together.xyz', 'deepseek.com', 'x.ai', 'fireworks.ai',
-              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co')
+              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co', 'amazonaws.com', 'github.ai',
+              'githubcopilot.com', 'inference.ai.azure.com')
     if (not host or any(d and (host == d or host.endswith('.' + d)) for d in shared)
             or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
         return None
@@ -2727,13 +2732,13 @@ def read_account_identity() -> Dict:
             config = _codex_account_config()
         except Exception:
             config = {}
-        if reason == 'auth_json_missing':
-            if (config.get('credentials_store') or '') in ('keyring', 'auto', 'ephemeral'):
-                reason = 'credentials_' + config['credentials_store']
-            elif os.environ.get('OPENAI_API_KEY') or os.environ.get('CODEX_API_KEY'):
-                auth_mode, reason = 'api_key', 'api_key_env'
-        elif auth_mode == 'api_key':
-            reason = 'api_key'
+        store = config.get('credentials_store') or ''
+        if reason in (None, 'auth_json_missing', 'no_id_token') and store in ('keyring', 'auto', 'ephemeral'):
+            reason = 'credentials_' + store
+        elif reason == 'auth_json_missing' and (os.environ.get('OPENAI_API_KEY') or os.environ.get('CODEX_API_KEY')):
+            auth_mode, reason = 'api_key', 'api_key_env'
+        elif reason is None:
+            reason = 'api_key' if auth_mode == 'api_key' else 'no_account_in_auth_json'
         org_id = _codex_gateway_host(config.get('base_url'))
     identity = {
         'org_id': org_id,
