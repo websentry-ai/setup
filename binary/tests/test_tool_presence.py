@@ -7,6 +7,7 @@ setup itself writes."""
 
 import json
 import os
+import time
 
 import pytest
 
@@ -58,6 +59,7 @@ def test_an_empty_machine_has_no_tool(tmp_path, tool):
     ("claude-code", ".vscode/extensions/anthropic.claude-code-2.0.5-darwin-arm64/package.json"),
     ("claude-code", ".claude/projects/-Users-u-repo/0a1b.jsonl"),
     ("claude-code", "Library/Application Support/Claude/claude-code-sessions/3f2a/session.json"),
+    ("claude-code", "Library/Application Support/Claude/local-agent-mode-sessions/3f2a/session.json"),
     ("codex", ".nvm/versions/node/v22.11.0/bin/codex"),
     ("codex", ".cargo/bin/codex"),
     ("codex", ".codex/sessions/2026/10/08/rollout.jsonl"),
@@ -202,6 +204,19 @@ def test_a_folder_too_big_to_list_is_unknown(tmp_path, monkeypatch):
 def test_running_out_of_time_is_unknown(tmp_path, monkeypatch):
     monkeypatch.setattr(tool_presence, "_BUDGET_SECONDS", -1)
     assert tool_presence.tool_present("codex", [("u", _home(tmp_path))]) is None
+
+
+def test_a_check_stuck_on_a_dead_mount_does_not_hold_setup(tmp_path, monkeypatch):
+    import threading
+    release = threading.Event()
+    monkeypatch.setattr(tool_presence, "_BUDGET_SECONDS", 0.2)
+    monkeypatch.setattr(tool_presence, "_find", lambda *a: release.wait(30))
+    started = time.monotonic()
+    try:
+        assert tool_presence.tool_present("codex", [("u", _home(tmp_path))]) is None
+        assert time.monotonic() - started < 5
+    finally:
+        release.set()
 
 
 def test_a_match_beside_an_unreadable_folder_still_counts(tmp_path):

@@ -14,6 +14,7 @@ for sorting reports, not proof that a tamper can be ignored.
 import fnmatch
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -42,7 +43,8 @@ _TOOLS = {
         "paths": (".claude/local/claude", ".local/share/claude/versions/*"),
         "extensions": ("anthropic.claude-code-*",),
         "activity": (".claude/projects/*/*.jsonl",
-                     "Library/Application Support/Claude/claude-code-sessions/*"),
+                     "Library/Application Support/Claude/claude-code-sessions/*",
+                     "Library/Application Support/Claude/local-agent-mode-sessions/*"),
     },
     "codex": {
         "binaries": ("codex",),
@@ -79,7 +81,16 @@ class _Unknown(Exception):
 
 def tool_present(tool, user_homes):
     """True if any sign of ``tool`` is on the machine or in any of ``user_homes``,
-    False if none is, None if a place couldn't be checked (the report then omits it)."""
+    False if none is, None if a place couldn't be checked (the report then omits it).
+    Runs on a daemon thread: a stat stuck on a dead mount can't hold setup past the budget."""
+    result = []
+    worker = threading.Thread(target=lambda: result.append(_tool_present(tool, user_homes)), daemon=True)
+    worker.start()
+    worker.join(_BUDGET_SECONDS + 1)
+    return result[0] if result else None
+
+
+def _tool_present(tool, user_homes):
     signs = _TOOLS.get(tool)
     if signs is None:
         return None
