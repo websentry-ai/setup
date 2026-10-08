@@ -545,6 +545,11 @@ class TestCopilotNoAccountReason(_IsolatedConfig):
         self._vscode(login=None, sku=None)
         self.assertEqual(self._reason("vscode"), "vscode_no_copilot_login")
 
+    def test_a_signed_out_older_install_is_found_past_a_newer_one_without_copilot(self):
+        self._vscode(login="gone-user", sku=None, install=0, mtime=1_000)
+        self._vscode(login=None, sku=None, install=1, mtime=2_000)
+        self.assertEqual(self._reason("vscode"), "vscode_signed_out")
+
     def test_vscode_unreadable(self):
         path = self.vscode_dirs[0] / "globalStorage" / "state.vscdb"
         path.parent.mkdir(parents=True)

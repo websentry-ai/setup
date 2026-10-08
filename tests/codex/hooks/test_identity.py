@@ -403,6 +403,22 @@ class TestAccountReasonAndGateway(unittest.TestCase):
         self.assertEqual(identity["org_id"], "org-b")
         self.assertNotIn("account_reason", identity)
 
+    def test_the_regex_fallback_accepts_a_commented_provider_header(self):
+        raw = ('model_provider = "corp"\nopenai_base_url = "https://root.example"\n\n'
+               '[model_providers.corp] # Corporate gateway\nbase_url = "https://llm.corp.example/v1"\n')
+        self.assertEqual(unbound._codex_account_config_regex(raw)["model_providers"]["corp"]["base_url"],
+                         "https://llm.corp.example/v1")
+
+    def test_the_regex_fallback_ignores_keys_inside_a_leading_table(self):
+        raw = '[profiles.x]\ncli_auth_credentials_store = "keyring"\nopenai_base_url = "https://x.example"\n'
+        self.assertEqual(unbound._codex_account_config_regex(raw), {})
+
+    def test_a_config_that_fails_to_parse_never_breaks_the_identity(self):
+        self._config('openai_base_url = "https://ai-gateway.zende.sk/v1"\n')
+        with patch.object(unbound, "_codex_account_config", side_effect=RuntimeError("boom")):
+            identity = unbound.read_account_identity()
+        self.assertEqual((identity["org_id"], identity["account_reason"]), (None, "auth_json_missing"))
+
     def test_the_regex_fallback_reads_the_same_keys(self):
         raw = ('model_provider = "corp"\ncli_auth_credentials_store = "keyring"\n\n'
                '[model_providers.corp]\nbase_url = "https://llm.corp.example/v1"\n')

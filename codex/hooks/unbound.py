@@ -2639,13 +2639,11 @@ def _codex_account_config() -> Dict:
     """config.toml's credential store and the base URL Codex sends model traffic to."""
     try:
         raw = CODEX_CONFIG_PATH.read_text(encoding='utf-8')
-    except OSError:
-        return {}
-    try:
-        import tomllib
-        data = tomllib.loads(raw)
-    except ImportError:
-        data = _codex_account_config_regex(raw)
+        try:
+            import tomllib
+            data = tomllib.loads(raw)
+        except ImportError:
+            data = _codex_account_config_regex(raw)
     except Exception:
         return {}
     provider = data.get('model_provider')
@@ -2658,7 +2656,7 @@ def _codex_account_config() -> Dict:
 
 
 def _codex_account_config_regex(raw: str) -> Dict:
-    top = raw.split('\n[', 1)[0]
+    top = re.split(r'^\s*\[', raw, maxsplit=1, flags=re.M)[0]
     data = {}
     for key in ('model_provider', 'openai_base_url', 'cli_auth_credentials_store'):
         m = re.search(rf'^\s*{key}\s*=\s*["\']([^"\']*)["\']', top, re.M)
@@ -2666,7 +2664,7 @@ def _codex_account_config_regex(raw: str) -> Dict:
             data[key] = m.group(1)
     provider = data.get('model_provider')
     if provider:
-        m = re.search(r'^\[model_providers\.["\']?%s["\']?\]\s*\n(.*?)(?=^\[|\Z)' % re.escape(provider), raw, re.M | re.S)
+        m = re.search(r'^\s*\[model_providers\.["\']?%s["\']?\][^\n]*\n(.*?)(?=^\s*\[|\Z)' % re.escape(provider), raw, re.M | re.S)
         url = re.search(r'^\s*base_url\s*=\s*["\']([^"\']*)["\']', m.group(1), re.M) if m else None
         if url:
             data['model_providers'] = {provider: {'base_url': url.group(1)}}
@@ -2719,7 +2717,10 @@ def read_account_identity() -> Dict:
     except Exception:
         reason = 'auth_json_unreadable'
     if not org_id and not email:
-        config = _codex_account_config()
+        try:
+            config = _codex_account_config()
+        except Exception:
+            config = {}
         if reason == 'auth_json_missing':
             if (config.get('credentials_store') or '') in ('keyring', 'auto', 'ephemeral'):
                 reason = 'credentials_' + config['credentials_store']

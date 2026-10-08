@@ -1757,16 +1757,20 @@ def _vscode_no_account_reason(user_dir: Optional[Path] = None) -> str:
     paths = [p for p in paths if p.is_file()]
     if not paths:
         return 'vscode_not_found'
-    newest = max(paths, key=lambda p: p.stat().st_mtime_ns)
-    try:
-        with closing(sqlite3.connect(f'{newest.resolve().as_uri()}?mode=ro', uri=True, timeout=1.0)) as connection:
-            row = connection.execute('SELECT value FROM ItemTable WHERE key = ?',
-                                     (_VSCODE_COPILOT_ACCOUNT_KEY,)).fetchone()
-    except (OSError, sqlite3.Error):
-        return 'vscode_unreadable'
-    login = row[0] if row else None
-    login = login.decode('utf-8', 'replace') if isinstance(login, bytes) else login
-    return 'vscode_signed_out' if isinstance(login, str) and login.strip() else 'vscode_no_copilot_login'
+    unreadable = False
+    for path in sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True):
+        try:
+            with closing(sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True, timeout=1.0)) as connection:
+                row = connection.execute('SELECT value FROM ItemTable WHERE key = ?',
+                                         (_VSCODE_COPILOT_ACCOUNT_KEY,)).fetchone()
+        except (OSError, sqlite3.Error):
+            unreadable = True
+            continue
+        login = row[0] if row else None
+        login = login.decode('utf-8', 'replace') if isinstance(login, bytes) else login
+        if isinstance(login, str) and login.strip():
+            return 'vscode_signed_out'
+    return 'vscode_unreadable' if unreadable else 'vscode_no_copilot_login'
 
 
 def _copilot_cli_no_account_reason() -> str:
