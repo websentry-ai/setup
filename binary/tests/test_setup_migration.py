@@ -1171,13 +1171,19 @@ def _with_handler_nan(config):
     config["hooks"]["Stop"][0]["hooks"][0]["note"] = "__NAN__"
 
 
-@pytest.mark.parametrize("plant", [_with_mcp_nan, _with_handler_nan])
+def _with_overflowing_number(config):
+    config["hooks"]["Stop"][0]["hooks"][0]["note"] = "__1E400__"
+
+
+@pytest.mark.parametrize("plant", [_with_mcp_nan, _with_handler_nan, _with_overflowing_number])
 def test_a_nan_anywhere_is_repaired(env, plant):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     hooks_json = env["home"] / ".codex" / "hooks.json"
     config = json.loads(hooks_json.read_text())
     plant(config)
-    hooks_json.write_text(json.dumps(config).replace('"__NAN__"', "NaN"))
+    text = json.dumps(config).replace('"__NAN__"', "NaN").replace('"__1E400__"', "1e400")
+    hooks_json.write_text(text)
+    assert setup_cmd._codex_hook_registered(hooks_json, hooks_json.parent / "hooks" / "unbound.py") is False  # codex rejects it
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env)[-1] == "persisted"

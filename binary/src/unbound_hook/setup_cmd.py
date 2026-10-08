@@ -464,15 +464,23 @@ def _json_object(pairs):
 
 
 def _load_codex_json(data: bytes):
-    """Parse the way codex's serde_json would see it: no byte-order mark,
-    NaN/Infinity or lone surrogates. Duplicate keys are kept for the schema check."""
+    """Parse the way codex's serde_json would see it: no byte-order mark, NaN/Infinity
+    (literal or overflowing, like 1e400) or lone surrogates. Duplicate keys are kept
+    for the schema check."""
     if data.startswith(b"\xef\xbb\xbf"):
         raise ValueError("byte-order mark")
 
     def _constant(name):
         raise ValueError(name)
 
-    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant)
+    def _float(text):
+        value = float(text)
+        if not math.isfinite(value):
+            raise ValueError(f"number out of range: {text}")
+        return value
+
+    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object,
+                        parse_constant=_constant, parse_float=_float)
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
     if _json_depth(config) >= _SERDE_MAX_DEPTH:
         raise ValueError("nested deeper than serde_json allows")
