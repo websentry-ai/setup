@@ -572,6 +572,14 @@ def test_hooks_turned_off_in_config_toml_are_not_registered(m, tmp_path, toml, e
     assert _state(m, home) == expected
 
 
+def test_a_config_toml_too_deep_to_parse_does_not_hide_a_tamper(m, tmp_path):
+    """The registration without the wrapper is tampered whatever config.toml holds."""
+    home = _profile(tmp_path)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    (home / ".codex" / "config.toml").write_text("a = " + "[" * 100000 + "]" * 100000)
+    assert _state(m, home) == "tampered"
+
+
 def test_a_wrapper_the_profiles_user_cannot_run_is_tampered(m, tmp_path, monkeypatch):
     """Another account's file with our content and owner bits set still can't run here."""
     home = _profile(tmp_path, script=True)

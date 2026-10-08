@@ -1121,6 +1121,21 @@ def test_setup_recovers_a_hooks_json_codex_rejects_at_parse_time(env, spoil, rep
     assert _codex_states(env)[-1] == ("persisted" if repaired else "tampered")
 
 
+def test_a_rewrite_too_large_to_read_back_is_not_written(env):
+    """Detection reads at most the size cap; a bigger file would read as tampered forever."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_json = env["home"] / ".codex" / "hooks.json"
+    config = json.loads(hooks_json.read_text())
+    del config["hooks"]["Stop"]  # forces a write that adds a registration
+    config["description"] = ""
+    pad = setup_cmd._USER_FILE_MAX_BYTES - len(json.dumps(config)) - 100
+    config["description"] = "x" * pad
+    text = json.dumps(config)
+    hooks_json.write_text(text)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert hooks_json.read_text() == text
+
+
 def test_a_write_that_cannot_be_encoded_leaves_hooks_json_intact(env):
     """Encoding happens before the truncating open, so a value that can't be
     written as UTF-8 never empties the user's file."""

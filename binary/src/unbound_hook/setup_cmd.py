@@ -758,6 +758,8 @@ def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
     if json.dumps(config, sort_keys=True) == before and (loadable or not rewritten_loads):
         return
     data = text.encode("utf-8")  # before the truncating open: a failure must leave the file intact
+    if len(data) > _USER_FILE_MAX_BYTES:
+        raise ValueError("hooks.json would outgrow what detection reads back")
     fd = os.open(str(hooks_path), _USER_FILE_WRITE_FLAGS, 0o644)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
@@ -1028,7 +1030,7 @@ def _codex_hooks_disabled(config_path: Path) -> bool:
         return False
     try:
         features = tomllib.loads(_read_user_file(config_path, follow=True).decode("utf-8")).get("features")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return False
     return isinstance(features, dict) and any(features.get(k) is False for k in ("hooks", "codex_hooks"))
 
