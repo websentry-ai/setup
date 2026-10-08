@@ -419,7 +419,8 @@ def _write_claude_managed_settings(m, skip_settings: bool = False) -> bool:
         if settings_path.exists():
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f) or {}
+                    # Drop NaN/Infinity: the tool rejects the whole file over one.
+                    settings = _drop_out_of_range(json.load(f) or {})
             except Exception:
                 settings = {}
 
@@ -468,7 +469,8 @@ def _write_augment_managed_settings(m) -> bool:
         if settings_path.exists():
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f) or {}
+                    # Drop NaN/Infinity: the tool rejects the whole file over one.
+                    settings = _drop_out_of_range(json.load(f) or {})
             except Exception:
                 settings = {}
         if not isinstance(settings, dict):
@@ -1397,6 +1399,16 @@ def _copilot_detect_state(m, user_homes):
         return None
 
 
+def _copilot_current(path: Path) -> bool:
+    """Runs as the profile's user: the file holds this release's registration."""
+    try:
+        config = _strict_json(_read_user_file(path, follow=True).decode("utf-8"))
+        hooks = config.get("hooks") if isinstance(config, dict) else None
+        return _holds_every_entry(hooks, _copilot_hooks_config()["hooks"])
+    except Exception:
+        return False
+
+
 def _copilot_registered(path: Path) -> bool:
     """Runs as the profile's user: every event still holds the entry setup wrote. A
     python-era file, every event running its own unbound.py (in both command and bash)
@@ -1447,9 +1459,13 @@ def _setup_copilot(opts):
         had_registration = os.path.lexists(registration)  # a profile setup never reached isn't tampered
         if _install_copilot_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and had_registration and m._run_as_user(
-                username, _copilot_registered, registration) is False:
-            state = "tampered"  # the install failed and no working registration is left
+        elif state == "persisted" and had_registration and (
+                m._run_as_user(username, _copilot_registered, registration) is False
+                # A folder locked against setup keeps whatever's there, which only
+                # today's registration vouches for (a python-era script isn't checked).
+                or (m._run_as_user(username, _writable_dir, registration.parent) is False
+                    and m._run_as_user(username, _copilot_current, registration) is False)):
+            state = "tampered"
 
     # Machine-wide, so once for the device rather than once per user. Called
     # explicitly: this command drives the vendored module's named functions rather

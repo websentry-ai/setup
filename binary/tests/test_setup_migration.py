@@ -2222,3 +2222,34 @@ def test_a_non_standard_json_constant_makes_the_file_unloadable(env, tool):
     path.write_text(path.read_text().rstrip().rstrip("}") + ', "note": NaN}')
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _states(env, tool)[-1] == "tampered"
+
+
+def test_a_python_era_copilot_hook_behind_a_locked_folder_is_tampered(env, monkeypatch):
+    """Setup can't replace it, and nothing vouches for the old script's content."""
+    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["copilot"], "_run_as_user", _as_user)
+    _python_era_copilot(env)
+    hooks_dir = _copilot_file(env["home"]).parent
+    hooks_dir.chmod(0o555)
+    try:
+        setup_cmd.run(["--api-key", "admin-key"])
+    finally:
+        hooks_dir.chmod(0o755)
+    assert _states(env, "copilot") == ["tampered"]
+
+
+@pytest.mark.parametrize("tool", ["claude-code", "augment_code"])
+def test_the_managed_writer_drops_a_nan_it_would_otherwise_write_back(env, tool):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    folder, name, _ = MANAGED[tool]
+    path = env["tmp"] / folder / name
+    path.write_text(path.read_text().rstrip().rstrip("}") + ', "note": NaN}')
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0  # tampered, and rewritten
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert "NaN" not in path.read_text()
+    assert _states(env, tool)[-2:] == ["tampered", "persisted"]
