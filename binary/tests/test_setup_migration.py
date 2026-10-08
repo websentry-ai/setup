@@ -844,8 +844,10 @@ def test_a_fifo_at_config_toml_does_not_hang_setup(env):
     fifo.parent.mkdir(parents=True, exist_ok=True)
     os.mkfifo(fifo)
     _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
+    _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
     assert __import__("stat").S_ISFIFO(fifo.lstat().st_mode)
     assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+    assert _codex_states(env)[-1] == "tampered"  # codex can read hooks = false from it
 
 
 def test_a_fifo_in_one_profile_reports_tampered_from_the_others(env, monkeypatch):

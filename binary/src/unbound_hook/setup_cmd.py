@@ -1050,11 +1050,17 @@ except ImportError:  # python older than 3.11; the shipped binary bundles it
 def _codex_hooks_disabled(config_path: Path) -> bool:
     """Whether config.toml turns codex's hooks feature off (on by default; the legacy
     key codex_hooks is an alias). A config codex can't parse isn't read as either."""
+    try:
+        data = _read_user_file(config_path, follow=True)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # a FIFO or oversized file can still hand codex hooks = false
     if tomllib is None:
         return False
     try:
-        features = tomllib.loads(_read_user_file(config_path, follow=True).decode("utf-8")).get("features")
-    except (OSError, ValueError, RecursionError):
+        features = tomllib.loads(data.decode("utf-8")).get("features")
+    except (ValueError, RecursionError):
         return False
     return isinstance(features, dict) and any(features.get(k) is False for k in ("hooks", "codex_hooks"))
 
