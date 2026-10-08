@@ -1331,7 +1331,8 @@ def hook_script_hash(script_path) -> Optional[str]:
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
-                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None):
+                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None,
+                          tool_present: Optional[bool] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
@@ -1344,6 +1345,8 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
             body["hook_hash"] = hook_hash
         if install_mode is not None:
             body["install_mode"] = install_mode
+        if tool_present is not None:
+            body["tool_present"] = tool_present
         data = json.dumps(body)
         # X-API-KEY off-argv via 0600 temp header file; body off-argv via stdin.
         curl_with_auth(

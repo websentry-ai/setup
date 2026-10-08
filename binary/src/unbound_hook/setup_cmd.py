@@ -34,7 +34,7 @@ from ._resources import (
     hook_command_for_event,
     hook_source_path,
 )
-from . import migration
+from . import migration, tool_presence
 
 # Mirrors mdm/onboard.py's discovery timeout contract.
 DISCOVERY_TIMEOUT_SECONDS = 5400
@@ -626,7 +626,8 @@ def _setup_claude_code(opts):
     m.notify_setup_complete(api_key, "claude-code", backend_url=base,
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
-                            install_mode="binary-skip" if skip_settings else "binary")
+                            install_mode="binary-skip" if skip_settings else "binary",
+                            tool_present=tool_presence.tool_present("claude-code", m.get_all_user_homes()))
     if opts["backfill"]:
         # Bounded like the MDM script: a heavy history must not hold setup open. The
         # deadline origin is this tool's turn, not module import in the shared process.
@@ -681,7 +682,8 @@ def _setup_augment(opts):
     m.notify_setup_complete(api_key, "augment_code", backend_url=base,
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("augment")),
-                            install_mode="binary")
+                            install_mode="binary",
+                            tool_present=tool_presence.tool_present("augment", m.get_all_user_homes()))
     return ("configured", None)
 
 
@@ -724,7 +726,8 @@ def _setup_codex(opts):
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("codex")),
-                            install_mode="binary")
+                            install_mode="binary",
+                            tool_present=tool_presence.tool_present("codex", m.get_all_user_homes()))
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
@@ -787,7 +790,8 @@ def _setup_cursor(opts):
     m.notify_setup_complete(api_key, "cursor", backend_url=base,
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("cursor")),
-                            install_mode="binary")
+                            install_mode="binary",
+                            tool_present=tool_presence.tool_present("cursor", m.get_all_user_homes()))
     if env_changed or hooks_changed:
         m.restart_cursor()
     return ("configured", None)
@@ -858,7 +862,8 @@ def _setup_copilot(opts):
     m.notify_setup_complete(api_key, "copilot", backend_url=base,
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("copilot")),
-                            install_mode="binary")
+                            install_mode="binary",
+                            tool_present=tool_presence.tool_present("copilot", m.get_all_user_homes()))
     if opts["backfill"]:
         hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
         m.run_backfill(api_key, base, user_homes, hook_source)
