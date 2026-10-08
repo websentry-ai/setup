@@ -849,6 +849,48 @@ def test_a_fifo_at_hooks_json_does_not_hang_setup(env):
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
 
 
+def test_a_file_planted_after_the_unlink_fails_the_codex_install(env, monkeypatch):
+    """The wrapper is created exclusively, so a FIFO raced into the path isn't written into."""
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\nexit 0\n")
+    real_unlink = Path.unlink
+    readers = []
+
+    def _unlink_then_plant(self, *a, **k):
+        real_unlink(self, *a, **k)
+        if self == wrapper:
+            os.mkfifo(self)  # with a reader attached, a non-exclusive open would take the write
+            readers.append(os.open(self, os.O_RDONLY | os.O_NONBLOCK))
+    monkeypatch.setattr(Path, "unlink", _unlink_then_plant)
+    try:
+        assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
+    finally:
+        for fd in readers:
+            os.close(fd)
+    assert __import__("stat").S_ISFIFO(wrapper.lstat().st_mode)
+
+
+def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch):
+    """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading persisted."""
+    def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_dir = env["home"] / ".codex" / "hooks"
+    (hooks_dir / "unbound.py").write_text("#!/bin/sh\nexit 0\n")
+    hooks_dir.chmod(0o555)
+    try:
+        setup_cmd.run(["--api-key", "admin-key"])
+    finally:
+        hooks_dir.chmod(0o755)
+    assert _codex_states(env) == ["fresh", "tampered"]
+
+
 def test_a_fifo_at_the_codex_hook_path_is_replaced(env):
     """Opened for writing, a FIFO with a reader attached would take the wrapper and stay a FIFO."""
     fifo = env["home"] / ".codex" / "hooks" / "unbound.py"

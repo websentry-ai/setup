@@ -674,10 +674,11 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
         # FIFO, or a read-only file would otherwise survive the run.
         if os.path.lexists(wrapper):
             wrapper.unlink()
-        fd = os.open(str(wrapper), _USER_FILE_WRITE_FLAGS, 0o755)
+        # O_EXCL: anything planted after the unlink makes this fail, not take the write.
+        fd = os.open(str(wrapper), _USER_FILE_WRITE_FLAGS | os.O_EXCL, 0o755)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(_codex_wrapper_source())
-        os.chmod(wrapper, 0o755)
+            os.fchmod(f.fileno(), 0o755)
         _merge_codex_hooks_json(hooks_path, hook_command)
         return True
 
@@ -970,6 +971,8 @@ def _setup_codex(opts):
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
+        elif state == "persisted" and _codex_wrapper_present(home_dir / ".codex" / "hooks" / "unbound.py"):
+            state = "tampered"  # a script we couldn't replace holds our path
 
     if user_homes and installed == 0:
         # A user can make every install fail (a symlinked or FIFO hooks.json), so
