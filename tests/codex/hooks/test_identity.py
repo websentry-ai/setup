@@ -450,6 +450,16 @@ class TestAccountReasonAndGateway(unittest.TestCase):
             identity = unbound.read_account_identity()
         self.assertEqual((identity["org_id"], identity["account_reason"]), (None, "auth_json_missing"))
 
+    def test_the_regex_fallback_resolves_the_active_profile(self):
+        raw = ('model_provider = "personal"\nprofile = "work"\n\n'
+               '[profiles.work]\nmodel_provider = "corp"\n\n'
+               '[model_providers.personal]\nbase_url = "https://me.example/v1"\n\n'
+               '[model_providers.corp] # Corporate\nbase_url = "https://llm.corp.example/v1"\n')
+        with patch.object(unbound, "CODEX_CONFIG_PATH", self.config_file), \
+                patch.dict("sys.modules", {"tomllib": None}):
+            self.config_file.write_text(raw, encoding="utf-8")
+            self.assertEqual(unbound._codex_account_config()["base_url"], "https://llm.corp.example/v1")
+
     def test_the_regex_fallback_reads_the_same_keys(self):
         raw = ('model_provider = "corp"\ncli_auth_credentials_store = "keyring"\n\n'
                '[model_providers.corp]\nbase_url = "https://llm.corp.example/v1"\n')

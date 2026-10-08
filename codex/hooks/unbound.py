@@ -2660,18 +2660,30 @@ def _codex_account_config() -> Dict:
 
 
 def _codex_account_config_regex(raw: str) -> Dict:
-    top = re.split(r'^\s*\[', raw, maxsplit=1, flags=re.M)[0]
-    data = {}
-    for key in ('model_provider', 'openai_base_url', 'cli_auth_credentials_store'):
-        m = re.search(rf'^\s*{key}\s*=\s*["\']([^"\']*)["\']', top, re.M)
-        if m:
-            data[key] = m.group(1)
-    provider = data.get('model_provider')
-    if provider:
-        m = re.search(r'^\s*\[model_providers\.["\']?%s["\']?\][^\n]*\n(.*?)(?=^\s*\[|\Z)' % re.escape(provider), raw, re.M | re.S)
-        url = re.search(r'^\s*base_url\s*=\s*["\']([^"\']*)["\']', m.group(1), re.M) if m else None
-        if url:
-            data['model_providers'] = {provider: {'base_url': url.group(1)}}
+    def section(name: str) -> Optional[str]:
+        m = re.search(r'^\s*\[%s\][^\n]*\n(.*?)(?=^\s*\[|\Z)' % name, raw, re.M | re.S)
+        return m.group(1) if m else None
+
+    def values(body: str, keys) -> Dict:
+        found = {}
+        for key in keys:
+            m = re.search(rf'^\s*{key}\s*=\s*["\']([^"\']*)["\']', body, re.M)
+            if m:
+                found[key] = m.group(1)
+        return found
+
+    data = values(re.split(r'^\s*\[', raw, maxsplit=1, flags=re.M)[0],
+                  ('model_provider', 'openai_base_url', 'cli_auth_credentials_store', 'profile'))
+    profile_name = data.get('profile')
+    body = section(r'profiles\.["\']?%s["\']?' % re.escape(profile_name)) if profile_name else None
+    profile = values(body, ('model_provider', 'openai_base_url')) if body else {}
+    if profile:
+        data['profiles'] = {profile_name: profile}
+    provider = profile.get('model_provider') or data.get('model_provider')
+    body = section(r'model_providers\.["\']?%s["\']?' % re.escape(provider)) if provider else None
+    url = values(body, ('base_url',)) if body else {}
+    if url:
+        data['model_providers'] = {provider: url}
     return data
 
 
