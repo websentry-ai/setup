@@ -434,9 +434,25 @@ def test_nesting_at_serde_json_s_limit_is_not_registered(m, tmp_path, depth, exp
     for _ in range(depth - 7):
         nested = [nested]
     _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": nested}})
-    assert setup_cmd._json_depth(cfg) == depth
+    assert setup_cmd._json_depth(json.dumps(cfg)) == depth
     (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
     assert _state(m, home) == expected
+
+
+@pytest.mark.parametrize("arrays, expected", [(123, "persisted"), (124, "tampered")])
+def test_a_repeated_key_s_earlier_value_counts_toward_nesting(m, tmp_path, arrays, expected):
+    """Parsing keeps the last value, but serde_json still has to get through the first."""
+    home = _profile(tmp_path, script=True)
+    text = json.dumps(_ours(home))
+    deep = "[" * arrays + "1" + "]" * arrays
+    group = '{"hooks": [{"type": "command"'
+    text = text.replace(group, '{"x": %s, "x": 1, "hooks": [{"type": "command"' % deep)
+    (home / ".codex" / "hooks.json").write_text(text)
+    assert _state(m, home) == expected
+
+
+def test_brackets_inside_strings_do_not_count_as_nesting():
+    assert setup_cmd._json_depth('{"a": "[[[{{{\\"]]]", "b": [[1]]}') == 3
 
 
 # --- read the way codex does: a symlink is followed, a FIFO never blocks ------

@@ -871,8 +871,12 @@ def test_a_file_planted_after_the_unlink_fails_the_codex_install(env, monkeypatc
     assert __import__("stat").S_ISFIFO(wrapper.lstat().st_mode)
 
 
-def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch):
-    """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading persisted."""
+@pytest.mark.parametrize("script, expected", [("#!/bin/sh\nexit 0\n", ["fresh", "tampered"]),
+                                              (None, ["fresh"])])
+def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch, script, expected):
+    """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading
+    persisted. Our own wrapper there still works: nothing new is reported, so the
+    last persisted stands."""
     def _as_user(_u, fn, *a, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)
@@ -882,13 +886,26 @@ def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch):
     monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     hooks_dir = env["home"] / ".codex" / "hooks"
-    (hooks_dir / "unbound.py").write_text("#!/bin/sh\nexit 0\n")
+    if script is not None:
+        (hooks_dir / "unbound.py").write_text(script)
     hooks_dir.chmod(0o555)
     try:
         setup_cmd.run(["--api-key", "admin-key"])
     finally:
         hooks_dir.chmod(0o755)
-    assert _codex_states(env) == ["fresh", "tampered"]
+    assert _codex_states(env) == expected
+
+
+def test_the_user_check_keeps_the_user_s_groups(monkeypatch):
+    """Codex runs with the user's supplementary groups, so a file shared through a
+    group must read the same in the check."""
+    from types import SimpleNamespace
+    m = load_mdm_setup_module("codex")
+    calls = []
+    for name in ("initgroups", "setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(m.os, name, lambda *a, n=name: calls.append((n, a)))
+    m._become_user(SimpleNamespace(pw_name="alice", pw_uid=501, pw_gid=20))
+    assert calls == [("initgroups", ("alice", 20)), ("setgid", (20,)), ("setuid", (501,))]
 
 
 def test_a_fifo_at_the_codex_hook_path_is_replaced(env):

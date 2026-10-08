@@ -22,6 +22,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import stat
 import subprocess
@@ -478,27 +479,28 @@ def _load_codex_json(data: bytes):
             return value
         return checked
 
-    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant,
+    text = data.decode("utf-8")
+    if _json_depth(text) >= _SERDE_MAX_DEPTH:
+        raise ValueError("nested deeper than serde_json allows")
+    config = json.loads(text, object_pairs_hook=_json_object, parse_constant=_constant,
                         parse_float=_number(float), parse_int=_number(int))
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
-    if _json_depth(config) >= _SERDE_MAX_DEPTH:
-        raise ValueError("nested deeper than serde_json allows")
     return config
 
 
 _SERDE_MAX_DEPTH = 128  # serde_json fails on the 128th nested [ or {
 
 
-def _json_depth(value) -> int:
-    """Deepest array/object nesting, counted iteratively."""
-    deepest, stack = 0, [(value, 1)]
-    while stack:
-        node, depth = stack.pop()
-        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else None
-        if children is None:
-            continue
+_JSON_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+
+
+def _json_depth(text: str) -> int:
+    """Deepest [ / { nesting in the text: a repeated key's earlier value is gone once
+    parsed, but serde_json still has to parse it."""
+    deepest = depth = 0
+    for ch in re.findall(r"[\[\]{}]", _JSON_STRING.sub("", text)):
+        depth += 1 if ch in "[{" else -1
         deepest = max(deepest, depth)
-        stack.extend((child, depth + 1) for child in children)
     return deepest
 
 
@@ -971,8 +973,9 @@ def _setup_codex(opts):
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and _codex_wrapper_present(home_dir / ".codex" / "hooks" / "unbound.py"):
-            state = "tampered"  # a script we couldn't replace holds our path
+        elif state == "persisted" and _codex_wrapper_present(home_dir / ".codex" / "hooks" / "unbound.py") \
+                and not m._run_as_user(username, _codex_wrapper_current, home_dir / ".codex" / "hooks" / "unbound.py"):
+            state = "tampered"  # a script we couldn't replace, and not our current one, holds our path
 
     if user_homes and installed == 0:
         # A user can make every install fail (a symlinked or FIFO hooks.json), so
@@ -1081,6 +1084,14 @@ def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
     return all(any(_codex_group_runs_wrapper(group, wrapper, event)
                    for group in (events.get(event) if isinstance(events.get(event), list) else []))
                for event in _codex_hooks_config(None))
+
+
+def _codex_wrapper_current(wrapper: Path) -> bool:
+    """Runs as the profile's user: the file at our path is this release's wrapper."""
+    try:
+        return _read_user_file(wrapper, follow=False).decode("utf-8") == _codex_wrapper_source()
+    except (OSError, ValueError):
+        return False
 
 
 def _codex_wrapper_present(wrapper: Path) -> bool:
