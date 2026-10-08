@@ -1,6 +1,7 @@
 """SHA-256 of every codex hook script the python installers shipped (each version of
-codex/hooks/unbound.py on main), with the tenant gateway URL they patch in reset to
-the default. Generated from git history; the binary also accepts its bundled copy."""
+codex/hooks/unbound.py on main and staging), with the tenant gateway URL they patch
+in reset to the default. Generated from git history; the binary also accepts its
+bundled copy."""
 
 CODEX_PYTHON_ERA_HOOK_SHA256 = frozenset({
     "035999b70aac594c20ea031e2b4f36d91bb229cfe8008a9fd3378a70f0f8e625",
@@ -40,6 +41,7 @@ CODEX_PYTHON_ERA_HOOK_SHA256 = frozenset({
     "3b48ccddaa1accecb1e0b89b039db384edd78b113de5fda654a81d43d8366e4a",
     "3c19ee1288e0dc69c53e5cf9dc03750c4636c9a57ef4dedb98ab5a83c588180a",
     "3d85ae592023db6615890579ba1f47019c75707da90507a93d1c84e25e554f8a",
+    "3e7ee5f9834d94600351d9c61e5a0ad7b1b49784c7bcd715547725e847d0d83a",
     "3fe283b916dbce0e269bccd8116c1f543d6c1652c615fa5f5a579de385c0469d",
     "412bb00683a2dab4e23c78f4d3f9555d6c7e0fc85857d2280a76735f423ac883",
     "429ab7f642603bca9760672025b180aa7edbefe94e7292e4e11e30163e94b138",

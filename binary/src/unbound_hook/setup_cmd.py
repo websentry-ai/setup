@@ -464,23 +464,25 @@ def _json_object(pairs):
 
 
 def _load_codex_json(data: bytes):
-    """Parse the way codex's serde_json would see it: no byte-order mark, NaN/Infinity
-    (literal or overflowing, like 1e400) or lone surrogates. Duplicate keys are kept
-    for the schema check."""
+    """Parse the way codex's serde_json would see it: no byte-order mark, NaN/Infinity,
+    a number past f64's range (1e400, or a 400-digit integer) or lone surrogates.
+    Duplicate keys are kept for the schema check."""
     if data.startswith(b"\xef\xbb\xbf"):
         raise ValueError("byte-order mark")
 
     def _constant(name):
         raise ValueError(name)
 
-    def _float(text):
-        value = float(text)
-        if not math.isfinite(value):
-            raise ValueError(f"number out of range: {text}")
-        return value
+    def _number(parse):
+        def checked(text):
+            value = parse(text)
+            if _out_of_range(value):
+                raise ValueError("number out of range")
+            return value
+        return checked
 
-    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object,
-                        parse_constant=_constant, parse_float=_float)
+    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant,
+                        parse_float=_number(float), parse_int=_number(int))
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
     if _json_depth(config) >= _SERDE_MAX_DEPTH:
         raise ValueError("nested deeper than serde_json allows")
@@ -619,16 +621,27 @@ def _codex_make_loadable(config) -> dict:
             if group["hooks"] or not hooks:
                 kept.append(group)
         events[event] = kept
-    return _drop_non_finite(clean)
+    return _drop_out_of_range(clean)
 
 
-def _drop_non_finite(value):
-    """Drop NaN/Infinity wherever they sit: codex's JSON parser rejects the whole file."""
+def _out_of_range(value) -> bool:
+    """A number serde_json rejects: NaN/Infinity, or an integer too large for an f64."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        try:
+            float(value)
+        except OverflowError:
+            return True
+    return False
+
+
+def _drop_out_of_range(value):
+    """Drop numbers codex can't parse wherever they sit: one rejects the whole file."""
     if isinstance(value, dict):
-        return {k: _drop_non_finite(v) for k, v in value.items()
-                if not (isinstance(v, float) and not math.isfinite(v))}
+        return {k: _drop_out_of_range(v) for k, v in value.items() if not _out_of_range(v)}
     if isinstance(value, list):
-        return [_drop_non_finite(v) for v in value if not (isinstance(v, float) and not math.isfinite(v))]
+        return [_drop_out_of_range(v) for v in value if not _out_of_range(v)]
     return value
 
 
@@ -1099,6 +1112,11 @@ def _known_python_era_hashes() -> frozenset:
     return CODEX_PYTHON_ERA_HOOK_SHA256 | {bundled}
 
 
+# The sh wrapper earlier binary releases wrote. Codex can't run it, but it's ours and
+# this run replaces it, so it isn't tampering.
+_EARLIER_CODEX_WRAPPER = '#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY
+
+
 def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset, gateway: str) -> bool:
     """Runs as the profile's user: the script is the binary's wrapper or a python-era
     hook we shipped, not a no-op kept at our path with the right mode."""
@@ -1108,7 +1126,8 @@ def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset, gateway:
         text = _read_user_file(wrapper, follow=False).decode("utf-8")
     except (OSError, ValueError):
         return False
-    return text == _codex_wrapper_source() or _python_era_hook_sha256(text, gateway) in python_era_hashes
+    return (text in (_codex_wrapper_source(), _EARLIER_CODEX_WRAPPER)
+            or _python_era_hook_sha256(text, gateway) in python_era_hashes)
 
 
 def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):

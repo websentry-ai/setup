@@ -1175,13 +1175,18 @@ def _with_overflowing_number(config):
     config["hooks"]["Stop"][0]["hooks"][0]["note"] = "__1E400__"
 
 
-@pytest.mark.parametrize("plant", [_with_mcp_nan, _with_handler_nan, _with_overflowing_number])
+def _with_overflowing_integer(config):
+    config["hooks"]["Stop"][0]["hooks"][0]["note"] = "__BIGINT__"
+
+
+@pytest.mark.parametrize("plant", [_with_mcp_nan, _with_handler_nan, _with_overflowing_number,
+                                   _with_overflowing_integer])
 def test_a_nan_anywhere_is_repaired(env, plant):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     hooks_json = env["home"] / ".codex" / "hooks.json"
     config = json.loads(hooks_json.read_text())
     plant(config)
-    text = json.dumps(config).replace('"__NAN__"', "NaN").replace('"__1E400__"', "1e400")
+    text = json.dumps(config).replace('"__NAN__"', "NaN").replace('"__1E400__"', "1e400").replace('"__BIGINT__"', "1" + "0" * 400)
     hooks_json.write_text(text)
     assert setup_cmd._codex_hook_registered(hooks_json, hooks_json.parent / "hooks" / "unbound.py") is False  # codex rejects it
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0

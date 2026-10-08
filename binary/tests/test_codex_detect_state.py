@@ -536,6 +536,13 @@ def test_a_python_era_hook_pointing_elsewhere_is_not_ours(m, tmp_path, gateway):
     assert _state(m, home, gateway="https://gateway.acme.example") == "tampered"
 
 
+def test_the_wrapper_an_earlier_binary_release_wrote_is_ours(m, tmp_path):
+    home = _profile(tmp_path, script=True)
+    _wrapper(home).write_text('#!/bin/sh\nexec "%s" hook codex\n' % setup_cmd.HOOK_BINARY)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    assert _state(m, home) == "persisted"
+
+
 def test_an_edited_python_era_hook_is_not_ours(m, tmp_path):
     home = _profile(tmp_path, script=True)
     real_hook = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
