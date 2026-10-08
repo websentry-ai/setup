@@ -1048,12 +1048,12 @@ _PYTHON_ERA_GATEWAY = re.compile(r'(UNBOUND_GATEWAY_URL", |UNBOUND_GATEWAY_URL =
 _PYTHON_ERA_DEFAULT_GATEWAY = "https://api.getunbound.ai"
 
 
-def _python_era_hook_sha256(text: str, gateways=(_PYTHON_ERA_DEFAULT_GATEWAY,)):
-    """The hash with the gateway reset to the default; None if the hook points at a
-    gateway other than the ones given, since the installers only wrote those."""
+def _python_era_hook_sha256(text: str, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
+    """The hash with the gateway reset to the default; None if the hook points anywhere
+    but this device's gateway, the only URL the installers wrote there."""
     match = _PYTHON_ERA_GATEWAY.search(text)
     if match:
-        if match.group(2) not in gateways:
+        if match.group(2) != gateway:
             return None
         text = text[:match.start()] + match.group(1) + f'"{_PYTHON_ERA_DEFAULT_GATEWAY}"' + text[match.end():]
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1068,14 +1068,16 @@ def _known_python_era_hashes() -> frozenset:
     return CODEX_PYTHON_ERA_HOOK_SHA256 | {bundled}
 
 
-def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset, gateways: tuple) -> bool:
+def _codex_wrapper_is_ours(wrapper: Path, python_era_hashes: frozenset, gateway: str) -> bool:
     """Runs as the profile's user: the script is the binary's wrapper or a python-era
     hook we shipped, not a no-op kept at our path with the right mode."""
+    if not os.access(wrapper, os.R_OK | os.X_OK):
+        return False  # e.g. another account's file: its owner bits don't make it runnable here
     try:
         text = _read_user_file(wrapper, follow=False).decode("utf-8")
     except (OSError, ValueError):
         return False
-    return text == _codex_wrapper_source() or _python_era_hook_sha256(text, gateways) in python_era_hashes
+    return text == _codex_wrapper_source() or _python_era_hook_sha256(text, gateway) in python_era_hashes
 
 
 def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
@@ -1087,7 +1089,6 @@ def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
         any_complete = False
         indeterminate = False
         python_era_hashes = _known_python_era_hashes()
-        gateways = (_PYTHON_ERA_DEFAULT_GATEWAY, gateway)
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
@@ -1095,7 +1096,7 @@ def _codex_detect_state(m, user_homes, gateway=_PYTHON_ERA_DEFAULT_GATEWAY):
             if not script and os.path.lexists(wrapper):
                 return "tampered"  # something other than our file holds the script path
             if script:
-                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper, python_era_hashes, gateways)
+                script = m._run_as_user(username, _codex_wrapper_is_ours, wrapper, python_era_hashes, gateway)
                 if script is False:
                     return "tampered"  # a runnable script at our path that isn't ours
             registered = False

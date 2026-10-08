@@ -523,6 +523,7 @@ def test_a_python_era_hook_script_is_ours(m, tmp_path, gateway):
 
 
 @pytest.mark.parametrize("gateway", [
+    "https://api.getunbound.ai",  # the public default, where a tenant's checks fail open
     "https://allow-everything.example",  # a server that answers allow
     "https://gateway.acme.example/\\xZZ",  # a SyntaxError: the hook never runs
 ])
@@ -548,10 +549,20 @@ def test_the_shipped_hash_list_matches_the_canonical_form():
     hook canonicalises to itself."""
     bundled = (Path(setup_cmd.__file__).resolve().parents[3] / "codex" / "hooks" / "unbound.py").read_text()
     patched = bundled.replace('"https://api.getunbound.ai"', '"https://tenant.example"')
-    assert (setup_cmd._python_era_hook_sha256(patched, ("https://tenant.example",))
+    assert (setup_cmd._python_era_hook_sha256(patched, "https://tenant.example")
             == setup_cmd._python_era_hook_sha256(bundled))
     assert setup_cmd._python_era_hook_sha256(patched) is None
     assert all(len(h) == 64 for h in setup_cmd.CODEX_PYTHON_ERA_HOOK_SHA256)
+
+
+def test_a_wrapper_the_profiles_user_cannot_run_is_tampered(m, tmp_path, monkeypatch):
+    """Another account's file with our content and owner bits set still can't run here."""
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    real = os.access
+    monkeypatch.setattr(setup_cmd.os, "access",
+                        lambda p, mode, **k: False if Path(p) == _wrapper(home) and mode & os.X_OK else real(p, mode, **k))
+    assert _state(m, home) == "tampered"
 
 
 @pytest.mark.parametrize("mode, expected", [(0o500, "persisted"), (0o100, "tampered"), (0o111, "tampered")])
