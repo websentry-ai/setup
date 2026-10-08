@@ -188,7 +188,7 @@ def _handler_like(handler, ours) -> bool:
             and _no_weaker(handler, ours))
 
 
-def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
+def _runs_on_every_event(hooks, expected_hooks, runs, grouped=True) -> bool:
     """Every event has a handler passing ``runs`` (a python-era install being migrated),
     flat or in a group that matches every tool, no less able to block than ours: not
     async where ours isn't, and no shorter timeout."""
@@ -200,6 +200,8 @@ def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
         handlers = []
         for entry in hooks.get(event) if isinstance(hooks.get(event), list) else []:
             if isinstance(entry, dict) and "hooks" in entry:
+                if not grouped:
+                    continue  # this tool runs only flat handlers
                 have = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
                 if (entry.get("matcher") in (None, "", "*", ".*") and isinstance(entry["hooks"], list)
                         and all(have.get(k) == v for k, v in flags.items())):  # e.g. Augment's capture flags
@@ -1423,7 +1425,7 @@ def _copilot_registered(path: Path) -> bool:
             not any(ch in '$`\\"' for ch in str(script))  # double quotes still expand these
             and _codex_wrapper_present(script) and _codex_wrapper_runnable(script) and _runs_on_every_event(
                 hooks, expected, lambda h: h.get("type") == "command"
-                and h.get("command") == quoted and h.get("bash") == quoted))
+                and h.get("command") == quoted and h.get("bash") == quoted, grouped=False))
     except Exception:  # RecursionError included: Copilot can't load it either
         return False
 

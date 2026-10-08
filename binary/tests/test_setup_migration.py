@@ -1700,6 +1700,9 @@ def _python_era_copilot(env, with_script=True):
                           script.symlink_to(script.with_name("real.py"))),
     lambda path, script: path.write_text(path.read_text().replace('"timeoutSec": 600', '"timeoutSec": 0')),
     lambda path, script: path.write_text(path.read_text().replace('"type": "command",', '')),
+    lambda path, script: path.write_text(json.dumps(  # wrapped in a group Copilot doesn't run
+        {"version": 1, "hooks": {e: [{"hooks": h} for h in [hs]]
+                                 for e, hs in json.loads(path.read_text())["hooks"].items()}})),
     lambda path, script: path.write_text(  # no timeout: Copilot's 30 s default fails open
         json.dumps({"version": 1, "hooks": {e: [{k: v for k, v in h[0].items() if not k.startswith("timeout")}]
                                             for e, h in json.loads(path.read_text())["hooks"].items()}})),
