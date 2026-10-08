@@ -372,6 +372,35 @@ def test_content_codex_loads_still_counts(m, tmp_path, mutate):
     assert _state(m, home) == "persisted"
 
 
+def test_a_wrapper_without_its_execute_bit_is_tampered(m, tmp_path):
+    """Codex runs the path through the shell, which can't execute it."""
+    home = _profile(tmp_path, script=True)
+    _wrapper(home).chmod(0o644)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    assert _state(m, home) == "tampered"
+
+
+def test_a_wrapper_the_profiles_user_cannot_run_is_tampered(m, tmp_path, monkeypatch):
+    """Another account's file with our content and owner bits set still can't run here."""
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    real = os.access
+    monkeypatch.setattr(setup_cmd.os, "access",
+                        lambda p, mode, **k: False if Path(p) == _wrapper(home) and mode & os.X_OK else real(p, mode, **k))
+    assert _state(m, home) == "tampered"
+
+
+@pytest.mark.parametrize("mode, expected", [(0o500, "persisted"), (0o100, "tampered"), (0o111, "tampered")])
+def test_the_owner_must_be_able_to_read_and_execute_the_wrapper(m, tmp_path, mode, expected):
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
+    _wrapper(home).chmod(mode)
+    try:
+        assert _state(m, home) == expected
+    finally:
+        _wrapper(home).chmod(0o755)
+
+
 @pytest.mark.parametrize("squat", ["fifo", "dir"])
 def test_something_else_at_the_script_path_is_tampered(m, tmp_path, squat):
     home = tmp_path / "u"
@@ -487,7 +516,7 @@ def test_the_file_is_read_as_the_profiles_user(m, tmp_path, monkeypatch):
     real = m._run_as_user
     monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a: (seen.append(u), real(u, fn, *a))[1])
     setup_cmd._codex_detect_state(m, [("alice", home)])
-    assert seen and set(seen) == {"alice"}  # hooks.json is read as alice
+    assert seen and set(seen) == {"alice"}  # the wrapper and hooks.json are both read as alice
 
 
 def test_no_privilege_drop_for_a_profile_without_codex(m, tmp_path, monkeypatch):

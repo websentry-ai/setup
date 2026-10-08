@@ -1088,6 +1088,12 @@ def _codex_wrapper_present(wrapper: Path) -> bool:
         return False
 
 
+def _codex_wrapper_runnable(wrapper: Path) -> bool:
+    """Runs as the profile's user: codex launches the path through the shell, which
+    needs read and execute for that user."""
+    return os.access(wrapper, os.R_OK | os.X_OK)
+
+
 def _codex_detect_state(m, user_homes):
     """Install state before this run reasserts it, per profile, on the pair setup
     installs: the wrapper script and our hooks.json entry. Either alone leaves codex
@@ -1100,10 +1106,14 @@ def _codex_detect_state(m, user_homes):
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
             script = _codex_wrapper_present(wrapper)
+            if script:
+                script = m._run_as_user(username, _codex_wrapper_runnable, wrapper)
+                if script is False:
+                    return "tampered"  # our path holds a file this user can't run
             registered = False
             if os.path.lexists(hooks_path):
                 registered = m._run_as_user(username, _codex_hook_registered, hooks_path, wrapper)
-            if registered is None:
+            if registered is None or script is None:
                 indeterminate = True
             elif script and registered:
                 any_complete = True
