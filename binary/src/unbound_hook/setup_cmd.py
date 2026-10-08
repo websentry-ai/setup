@@ -135,8 +135,10 @@ def _detect_state(settings_path: Path, expected_hooks):
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
     if _holds_every_entry(hooks, expected_hooks) or (
-            script.is_file() and _runs_on_every_event(hooks, expected_hooks,
-                                                      lambda h: str(script) in h["command"])):
+            script.is_file() and _runs_on_every_event(
+                hooks, expected_hooks,
+                lambda h: h.get("type", "command") == "command"
+                and _runs_script(h["command"], script, settings_path.parent))):
         return "persisted"
     return "tampered"
 
@@ -161,12 +163,14 @@ def _same_entry(actual, ours) -> bool:
     return want is None or (isinstance(have, dict) and all(have.get(k) == v for k, v in want.items()))
 
 
-def _runs_on_every_event(hooks, events, runs) -> bool:
+def _runs_on_every_event(hooks, expected_hooks, runs) -> bool:
     """Every event has a handler passing ``runs`` (a python-era install being migrated),
-    flat or in a group that matches every tool."""
+    flat or in a group that matches every tool, no less able to block than ours: not
+    async where ours isn't, and no shorter timeout."""
     if not isinstance(hooks, dict):
         return False
-    for event in events:
+    for event, entries in expected_hooks.items():
+        ours = entries[0]["hooks"][0] if "hooks" in entries[0] else entries[0]
         handlers = []
         for entry in hooks.get(event) if isinstance(hooks.get(event), list) else []:
             if isinstance(entry, dict) and "hooks" in entry:
@@ -174,9 +178,38 @@ def _runs_on_every_event(hooks, events, runs) -> bool:
                     handlers += entry["hooks"]
             else:
                 handlers.append(entry)
-        if not any(isinstance(h, dict) and isinstance(h.get("command"), str) and runs(h) for h in handlers):
+        if not any(isinstance(h, dict) and isinstance(h.get("command"), str) and runs(h)
+                   and _no_weaker(h, ours) for h in handlers):
             return False
     return True
+
+
+def _no_weaker(handler, ours) -> bool:
+    if handler.get("async") is True and ours.get("async") is not True:
+        return False
+    for key in ("timeout", "timeoutSec"):
+        mine, theirs = ours.get(key), handler.get(key)
+        if theirs is not None and isinstance(mine, int) and not (
+                isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= mine):
+            return False
+    return True
+
+
+def _runs_script(command, script: Path, base: Path) -> bool:
+    """Whether ``command`` runs ``script`` itself, as the program or as a python
+    interpreter's script (the shapes the python installers wrote, relative paths from
+    ``base``). A command that only mentions the path doesn't."""
+    try:
+        tokens = [t for t in shlex.split(command) if t]
+    except ValueError:
+        return False
+    if tokens and os.path.basename(tokens[0]) in ("python", "python3", "py"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            if tokens[0] in ("-c", "-m"):
+                return False  # runs code or a module, not the script
+            tokens = tokens[1:]
+    return bool(tokens) and os.path.normpath(os.path.join(base, tokens[0])) == os.path.normpath(str(script))
 
 
 def _remove_stale_managed_script(managed_dir: Path) -> None:
@@ -1055,8 +1088,8 @@ def _setup_codex(opts):
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
-        elif state == "persisted" and not m._run_as_user(
-                username, _codex_wrapper_current, home_dir / ".codex" / "hooks" / "unbound.py"):
+        elif state == "persisted" and m._run_as_user(
+                username, _codex_wrapper_current, home_dir / ".codex" / "hooks" / "unbound.py") is False:
             state = "tampered"  # the install failed and our current wrapper isn't what's left
 
     if user_homes and installed == 0:
@@ -1294,15 +1327,16 @@ def _copilot_registered(path: Path) -> bool:
     with that script still there, is a legitimate install being migrated."""
     try:
         config = json.loads(_read_user_file(path, follow=True).decode("utf-8"))
-    except (OSError, ValueError):
+        hooks = config.get("hooks") if isinstance(config, dict) else None
+        expected = _copilot_hooks_config()["hooks"]
+        script = path.parent / "unbound.py"
+        quoted = f'"{script}"'
+        return _holds_every_entry(hooks, expected) or (
+            _codex_wrapper_present(script) and _codex_wrapper_runnable(script) and _runs_on_every_event(
+                hooks, expected, lambda h: h.get("type") == "command"
+                and h.get("command") == quoted and h.get("bash") == quoted))
+    except Exception:  # RecursionError included: Copilot can't load it either
         return False
-    hooks = config.get("hooks") if isinstance(config, dict) else None
-    expected = _copilot_hooks_config()["hooks"]
-    script = path.parent / "unbound.py"
-    quoted = f'"{script}"'
-    return _holds_every_entry(hooks, expected) or (
-        script.is_file() and _runs_on_every_event(
-            hooks, expected, lambda h: h.get("command") == quoted and h.get("bash") == quoted))
 
 
 def _setup_copilot(opts):
@@ -1333,6 +1367,9 @@ def _setup_copilot(opts):
             m.clear_otel_export_for_user(username, home_dir)
         if _install_copilot_hooks_for_user(m, username, home_dir):
             installed += 1
+        elif state == "persisted" and m._run_as_user(
+                username, _copilot_registered, home_dir / ".copilot" / "hooks" / "unbound.json") is False:
+            state = "tampered"  # the install failed and no working registration is left
 
     # Machine-wide, so once for the device rather than once per user. Called
     # explicitly: this command drives the vendored module's named functions rather

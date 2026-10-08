@@ -1722,8 +1722,52 @@ def _python_era_copilot(env, with_script=True):
     script = path.parent / "unbound.py"
     if with_script:
         script.write_text("#!/usr/bin/env python3\n")
+        script.chmod(0o755)
     path.write_text(json.dumps(env["modules"]["copilot"]._copilot_hooks_config(script)))
     return path
+
+
+@pytest.mark.parametrize("spoil", [
+    lambda path, script: script.chmod(0o644),                                   # can't execute
+    lambda path, script: (script.unlink(), script.symlink_to("/bin/true")),    # a stand-in
+    lambda path, script: path.write_text(path.read_text().replace('"timeoutSec": 600', '"timeoutSec": 0')),
+    lambda path, script: path.write_text(path.read_text().replace('"type": "command",', '')),
+])
+def test_a_python_era_copilot_install_that_cannot_enforce_is_tampered(env, spoil):
+    path = _python_era_copilot(env)
+    spoil(path, path.parent / "unbound.py")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == ["tampered"]
+
+
+def test_a_deeply_nested_copilot_file_is_tampered_not_unknown(env):
+    path = _copilot_file(env["home"])
+    path.parent.mkdir(parents=True)
+    path.write_text("[" * 100_000)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, "copilot") == ["tampered"]
+
+
+def test_a_copilot_registration_lost_to_a_failed_replace_reports_tampered(env, monkeypatch):
+    def _as_user(_u, fn, *a, **k):
+        try:
+            return fn(*a, **k)
+        except Exception:
+            return None
+
+    monkeypatch.setattr(env["modules"]["copilot"], "_run_as_user", _as_user)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    real_open = os.open
+
+    def _open(path, flags, *a, **k):
+        if str(path).endswith("unbound.json") and flags & os.O_EXCL:
+            raise OSError(28, "No space left on device")
+        return real_open(path, flags, *a, **k)
+
+    monkeypatch.setattr(setup_cmd.os, "open", _open)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert not _copilot_file(env["home"]).exists()
+    assert _states(env, "copilot") == ["fresh", "tampered"]
 
 
 @pytest.mark.parametrize("content, expected", [
@@ -1813,6 +1857,8 @@ def test_a_managed_install_reads_persisted(env, tool):
     ("changed_entry", "tampered"),  # a matcher that matches nothing, or a changed timeout
     ("python_era", "persisted"),    # a python-era install being migrated
     ("python_era_no_script", "tampered"),
+    ("python_era_decoy", "tampered"),   # names the script without running it
+    ("python_era_weaker", "tampered"),  # runs it, but async with a 1 ms timeout
 ])
 def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -1836,14 +1882,16 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
         path.write_text(json.dumps(config))
     else:
         script = path.parent / "hooks" / "unbound.py"
-        if spoil == "python_era":
+        if spoil != "python_era_no_script":
             script.parent.mkdir(parents=True, exist_ok=True)
             script.write_text("#!/usr/bin/env python3\n")
-        command = f'python3 "{script}"'
+        command = f'echo "{script}"' if spoil == "python_era_decoy" else (
+            "./hooks/unbound.py" if tool == "cursor" else f'python3 "{script}"')
+        extra = {"async": True, "timeout": 1} if spoil == "python_era_weaker" else {}
         grouped = tool != "cursor"
         path.write_text(json.dumps({"hooks": {
-            event: ([{"matcher": "*", "hooks": [{"type": "command", "command": command}]}] if grouped
-                    else [{"command": command}])
+            event: ([{"matcher": "*", "hooks": [{"type": "command", "command": command, **extra}]}] if grouped
+                    else [{"command": command, **extra}])
             for event in hooks_of(config)}}))
     state = setup_cmd._detect_state(path, {
         "claude-code": setup_cmd._claude_hooks_config(),
