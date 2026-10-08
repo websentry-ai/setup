@@ -624,15 +624,15 @@ def _codex_make_loadable(config) -> dict:
     return _drop_out_of_range(clean)
 
 
+_F64_MAX_INT = int(sys.float_info.max)
+
+
 def _out_of_range(value) -> bool:
     """A number serde_json rejects: NaN/Infinity, or an integer too large for an f64."""
     if isinstance(value, float):
         return not math.isfinite(value)
     if isinstance(value, int) and not isinstance(value, bool):
-        try:
-            float(value)
-        except OverflowError:
-            return True
+        return abs(value) >= _F64_MAX_INT  # serde_json gives up at f64's limit; Python rounds below it
     return False
 
 
