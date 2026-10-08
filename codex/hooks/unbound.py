@@ -2697,9 +2697,10 @@ def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
     # Shared services, not a company gateway: Unbound, OpenAI, and public model providers.
     shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com', 'openrouter.ai', 'groq.com', 'mistral.ai',
               'googleapis.com', 'anthropic.com', 'together.xyz', 'deepseek.com', 'x.ai', 'fireworks.ai',
-              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co', 'amazonaws.com', 'github.ai',
+              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co', 'github.ai',
               'githubcopilot.com', 'inference.ai.azure.com')
-    if (not host or any(d and (host == d or host.endswith('.' + d)) for d in shared)
+    bedrock = host.startswith('bedrock') and host.endswith('.amazonaws.com')
+    if (not host or bedrock or any(d and (host == d or host.endswith('.' + d)) for d in shared)
             or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
         return None
     return host
@@ -2745,13 +2746,15 @@ def read_account_identity() -> Dict:
         except Exception:
             config = {}
         store = config.get('credentials_store') or ''
-        if reason in (None, 'auth_json_missing', 'no_id_token') and store in ('keyring', 'auto', 'ephemeral'):
-            reason = 'credentials_' + store
+        if reason is None and auth_mode == 'api_key':
+            reason = 'api_key'
         elif reason == 'auth_json_missing' and (os.environ.get('OPENAI_API_KEY') or os.environ.get('CODEX_API_KEY')):
             auth_mode, reason = 'api_key', 'api_key_env'
+        elif reason in (None, 'auth_json_missing', 'no_id_token') and store in ('keyring', 'auto', 'ephemeral'):
+            reason = 'credentials_' + store
         elif reason is None:
-            reason = 'api_key' if auth_mode == 'api_key' else 'no_account_in_auth_json'
-        org_id = _codex_gateway_host(config.get('base_url'))
+            reason = 'no_account_in_auth_json'
+        org_id = _codex_gateway_host(config.get('base_url') or os.environ.get('OPENAI_BASE_URL'))
     identity = {
         'org_id': org_id,
         'plan': plan,

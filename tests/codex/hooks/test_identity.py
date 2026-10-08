@@ -183,7 +183,7 @@ class TestReadAccountIdentity(unittest.TestCase):
         env = patch.dict(os.environ, {})
         env.start()
         self.addCleanup(env.stop)
-        for var in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+        for var in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
             os.environ.pop(var, None)
 
     def _write_auth(self, data):
@@ -300,7 +300,7 @@ class TestBuildAccountIdentity(unittest.TestCase):
         env = patch.dict(os.environ, {})
         env.start()
         self.addCleanup(env.stop)
-        for var in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+        for var in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
             os.environ.pop(var, None)
 
     def _write_auth_with_org(self, org_id="org-test", email="test@example.com"):
@@ -423,6 +423,23 @@ class TestAccountReasonAndGateway(unittest.TestCase):
         self._write_auth({"auth_mode": "chatgpt", "tokens": {}})
         self._config('cli_auth_credentials_store = "keyring"\n')
         self.assertEqual(unbound.read_account_identity()["account_reason"], "credentials_keyring")
+
+    def test_an_api_key_outranks_the_credential_store(self):
+        self._config('cli_auth_credentials_store = "auto"\n')
+        self._write_auth({"auth_mode": "apikey", "OPENAI_API_KEY": "x"})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "api_key")
+        self.auth_file.unlink()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "x"}):
+            identity = unbound.read_account_identity()
+        self.assertEqual((identity["auth_mode"], identity["account_reason"]), ("api_key", "api_key_env"))
+
+    def test_a_company_gateway_on_aws_names_the_org(self):
+        self._config('openai_base_url = "https://abc123.execute-api.us-east-1.amazonaws.com/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "abc123.execute-api.us-east-1.amazonaws.com")
+
+    def test_the_openai_base_url_environment_variable_is_a_gateway(self):
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "https://ai-gateway.zende.sk/v1"}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "ai-gateway.zende.sk")
 
     def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
         self._write_auth(self._auth_with_token({
