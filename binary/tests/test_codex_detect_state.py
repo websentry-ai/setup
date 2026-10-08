@@ -7,6 +7,7 @@ import getpass
 import json
 import os
 import signal
+import time
 from pathlib import Path
 
 import pytest
@@ -434,25 +435,41 @@ def test_nesting_at_serde_json_s_limit_is_not_registered(m, tmp_path, depth, exp
     for _ in range(depth - 7):
         nested = [nested]
     _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": nested}})
-    assert setup_cmd._json_depth(json.dumps(cfg)) == depth
+    assert setup_cmd._SERDE_HANDLER_DEPTH + setup_cmd._value_depth({"a": nested}) == depth
     (home / ".codex" / "hooks.json").write_text(json.dumps(cfg))
     assert _state(m, home) == expected
 
 
-@pytest.mark.parametrize("arrays, expected", [(123, "persisted"), (124, "tampered")])
+@pytest.mark.parametrize("arrays, expected", [(120, "persisted"), (121, "tampered")])
 def test_a_repeated_key_s_earlier_value_counts_toward_nesting(m, tmp_path, arrays, expected):
-    """Parsing keeps the last value, but serde_json still has to get through the first."""
+    """Parsing keeps the last value, but serde_json still has to read the first: an
+    input key repeated with a deep value first fails at the same depth as a single one."""
     home = _profile(tmp_path, script=True)
-    text = json.dumps(_ours(home))
+    cfg = _ours(home)
+    _add_sibling(cfg, {"type": "mcp_tool", "server": "s", "tool": "t", "input": {"a": "__DEEP__"}})
     deep = "[" * arrays + "1" + "]" * arrays
-    group = '{"hooks": [{"type": "command"'
-    text = text.replace(group, '{"x": %s, "x": 1, "hooks": [{"type": "command"' % deep)
+    text = json.dumps(cfg).replace('"a": "__DEEP__"', '"a": %s, "a": 1' % deep)
     (home / ".codex" / "hooks.json").write_text(text)
     assert _state(m, home) == expected
 
 
-def test_brackets_inside_strings_do_not_count_as_nesting():
-    assert setup_cmd._json_depth('{"a": "[[[{{{\\"]]]", "b": [[1]]}') == 3
+def test_a_malformed_file_full_of_escaped_quotes_is_judged_quickly(m, tmp_path):
+    """An unterminated string of escaped quotes must not make the check quadratic."""
+    home = _profile(tmp_path, script=True)
+    (home / ".codex" / "hooks.json").write_text('{"a": "' + '\\"' * 1_000_000)
+    started = time.monotonic()
+    assert _state(m, home) == "tampered"
+    assert time.monotonic() - started < 5
+
+
+@pytest.mark.parametrize("arrays", [124, 200])
+def test_a_deep_value_in_a_field_codex_skips_is_not_counted(m, tmp_path, arrays):
+    """Codex skips a group's unknown field without its depth limit, and loads the file."""
+    home = _profile(tmp_path, script=True)
+    text = json.dumps(_ours(home)).replace(
+        '{"hooks": [{"type": "command"', '{"x": %s, "hooks": [{"type": "command"' % ("[" * arrays + "]" * arrays), 1)
+    (home / ".codex" / "hooks.json").write_text(text)
+    assert _state(m, home) == "persisted"
 
 
 # --- read the way codex does: a symlink is followed, a FIFO never blocks ------

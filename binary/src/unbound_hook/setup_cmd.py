@@ -22,7 +22,6 @@ import json
 import math
 import os
 import platform
-import re
 import shlex
 import stat
 import subprocess
@@ -447,8 +446,10 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
 
 
 class _JsonObject(dict):
-    """A parsed JSON object that remembers which keys appeared more than once."""
+    """A parsed JSON object that remembers which keys appeared more than once, and how
+    deep the values they replaced went (serde_json still parses those)."""
     dups = frozenset()
+    shadowed_depth = 0
 
 
 def _json_object(pairs):
@@ -458,6 +459,9 @@ def _json_object(pairs):
         for key, _ in pairs:
             (dups if key in seen else seen).add(key)
         obj.dups = frozenset(dups)
+        last = {key: i for i, (key, _) in enumerate(pairs)}
+        obj.shadowed_depth = max((_value_depth(v) for i, (k, v) in enumerate(pairs) if last[k] != i),
+                                 default=0)
     return obj
 
 
@@ -479,10 +483,7 @@ def _load_codex_json(data: bytes):
             return value
         return checked
 
-    text = data.decode("utf-8")
-    if _json_depth(text) >= _SERDE_MAX_DEPTH:
-        raise ValueError("nested deeper than serde_json allows")
-    config = json.loads(text, object_pairs_hook=_json_object, parse_constant=_constant,
+    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant,
                         parse_float=_number(float), parse_int=_number(int))
     json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
     return config
@@ -491,16 +492,27 @@ def _load_codex_json(data: bytes):
 _SERDE_MAX_DEPTH = 128  # serde_json fails on the 128th nested [ or {
 
 
-_JSON_STRING = re.compile(r'"(?:\\.|[^"\\])*"')
+# serde_json fails on the 128th nested [ or {, but only in values it deserializes:
+# a field codex doesn't know is skipped unchecked. The only nested value codex reads
+# is an mcp_tool handler's input, which sits under file, hooks, event, group, hooks
+# and handler.
+_SERDE_HANDLER_DEPTH = 6
 
 
-def _json_depth(text: str) -> int:
-    """Deepest [ / { nesting in the text: a repeated key's earlier value is gone once
-    parsed, but serde_json still has to parse it."""
-    deepest = depth = 0
-    for ch in re.findall(r"[\[\]{}]", _JSON_STRING.sub("", text)):
-        depth += 1 if ch in "[{" else -1
+def _value_depth(value) -> int:
+    """Nesting serde_json walks to read ``value``, counting values a repeated key replaced."""
+    deepest, stack = 0, [(value, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+            deepest = max(deepest, depth + getattr(node, "shadowed_depth", 0))
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
         deepest = max(deepest, depth)
+        stack.extend((child, depth + 1) for child in children)
     return deepest
 
 
@@ -553,7 +565,8 @@ def _field_ok(value, kind) -> bool:
         return value is None or (isinstance(value, int) and not isinstance(value, bool)
                                  and 0 <= value <= _U64_MAX)
     if kind == "toml_map":
-        return isinstance(value, dict) and _toml_ok(value)
+        return (isinstance(value, dict) and _toml_ok(value)
+                and _SERDE_HANDLER_DEPTH + _value_depth(value) < _SERDE_MAX_DEPTH)
     return True
 
 
