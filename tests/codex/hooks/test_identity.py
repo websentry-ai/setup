@@ -393,6 +393,10 @@ class TestAccountReasonAndGateway(unittest.TestCase):
                 self._config('openai_base_url = "%s"\n' % url)
                 self.assertIsNone(unbound.read_account_identity()["org_id"])
 
+    def test_a_company_host_that_merely_ends_like_openai_is_a_gateway(self):
+        self._config('openai_base_url = "https://gateway.company-openai.com/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.company-openai.com")
+
     def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
         self._write_auth(self._auth_with_token({
             "email": "dave@corp.com",

@@ -2678,8 +2678,9 @@ def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
     except ValueError:
         return None
     ours = urlparse(UNBOUND_GATEWAY_URL).hostname or ''
-    if (not host or host == ours or host.endswith('getunbound.ai') or host.endswith('openai.com')
-            or host.endswith('chatgpt.com') or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
+    shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com')
+    if (not host or any(d and (host == d or host.endswith('.' + d)) for d in shared)
+            or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
         return None
     return host
 

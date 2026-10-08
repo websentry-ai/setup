@@ -567,6 +567,10 @@ class TestCopilotNoAccountReason(_IsolatedConfig):
         with patch.dict(os.environ, {"GH_TOKEN": "x"}):
             self.assertEqual(self._reason("cli"), "env_token")
 
+    def test_a_cloud_turn_has_its_own_reason(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "x"}):
+            self.assertEqual(self._reason("cloud"), "cloud_no_login")
+
     def test_a_signed_in_turn_has_no_reason(self):
         self._write(SIGNED_IN)
         self.assertNotIn("account_reason", unbound.read_account_identity(surface="cli"))

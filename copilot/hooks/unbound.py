@@ -1802,7 +1802,7 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
     if not login:
         try:
             reason = (_vscode_no_account_reason(_vscode_user_dir_of(transcript_path)) if surface == 'vscode'
-                      else _copilot_cli_no_account_reason())
+                      else 'cloud_no_login' if surface == 'cloud' else _copilot_cli_no_account_reason())
         except Exception:
             reason = 'unknown'
         return {'org_id': None, 'plan': None, 'auth_mode': None,
