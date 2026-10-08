@@ -602,7 +602,10 @@ def _codex_make_loadable(config) -> dict:
             if not isinstance(group, dict) or not _field_ok(group.get("matcher"), "str?"):
                 continue
             group = dict(group)
-            hooks = group.get("hooks", [])
+            if "hooks" not in group:  # valid as is; adding the field would force a rewrite
+                kept.append(group)
+                continue
+            hooks = group["hooks"]
             group["hooks"] = ([h for h in hooks if _codex_handler_kept(h)]
                               if isinstance(hooks, list) else [])
             if group["hooks"] or not hooks:
