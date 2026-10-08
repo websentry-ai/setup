@@ -138,9 +138,9 @@ def test_the_account_list_keeps_homes_it_cannot_reach(tmp_path, monkeypatch):
     fenced = tmp_path / "fence"
     (fenced / "home").mkdir(parents=True)
     fenced.chmod(0)
-    accounts = [SimpleNamespace(pw_uid=501, pw_dir=str(fenced / "home")),
+    accounts = [SimpleNamespace(pw_uid=1001, pw_dir=str(fenced / "home")),
                 SimpleNamespace(pw_uid=0, pw_dir="/var/root"),
-                SimpleNamespace(pw_uid=502, pw_dir="")]
+                SimpleNamespace(pw_uid=1002, pw_dir="")]
     monkeypatch.setattr(pwd, "getpwall", lambda: accounts)
     try:
         assert _REAL_ACCOUNT_HOMES() == [fenced / "home"]
