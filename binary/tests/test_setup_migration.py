@@ -2208,3 +2208,17 @@ def test_copilot_s_powershell_command_must_be_ours_too(env):
     path.write_text(json.dumps(config))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _states(env, "copilot")[-1] == "tampered"
+
+
+@pytest.mark.parametrize("tool", ["claude-code", "augment_code", "cursor", "copilot"])
+def test_a_non_standard_json_constant_makes_the_file_unloadable(env, tool):
+    """Node's JSON.parse rejects NaN anywhere in the file, so no hook in it runs."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    if tool == "copilot":
+        path = _copilot_file(env["home"])
+    else:
+        folder, name, _ = MANAGED[tool]
+        path = env["tmp"] / folder / name
+    path.write_text(path.read_text().rstrip().rstrip("}") + ', "note": NaN}')
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _states(env, tool)[-1] == "tampered"

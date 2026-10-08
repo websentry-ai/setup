@@ -130,7 +130,7 @@ def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
               file=sys.stderr)
         return None
     try:
-        settings = json.loads(data.decode("utf-8"))
+        settings = _strict_json(data.decode("utf-8"))
     except (ValueError, RecursionError):  # the tool can't load it either
         return "tampered"
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
@@ -146,6 +146,14 @@ def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
                 lambda h: h.get("type", "command") == "command" and h["command"] in commands)):
         return "persisted"
     return "tampered"
+
+
+def _strict_json(text):
+    """JSON as these tools' JavaScript parsers read it: NaN and Infinity, which Python
+    accepts, make them reject the whole file."""
+    def _constant(name):
+        raise ValueError(name)
+    return json.loads(text, parse_constant=_constant)
 
 
 def _holds_every_entry(hooks, expected_hooks) -> bool:
@@ -1394,7 +1402,7 @@ def _copilot_registered(path: Path) -> bool:
     python-era file, every event running its own unbound.py (in both command and bash)
     with that script still there, is a legitimate install being migrated."""
     try:
-        config = json.loads(_read_user_file(path, follow=True).decode("utf-8"))
+        config = _strict_json(_read_user_file(path, follow=True).decode("utf-8"))
         hooks = config.get("hooks") if isinstance(config, dict) else None
         expected = _copilot_hooks_config()["hooks"]
         script = path.parent / "unbound.py"
