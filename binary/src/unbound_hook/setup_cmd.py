@@ -130,13 +130,14 @@ def _detect_state(settings_path: Path, expected_hooks):
         return None
     try:
         settings = json.loads(data.decode("utf-8"))
-    except ValueError:
+    except (ValueError, RecursionError):  # the tool can't load it either
         return "tampered"
     hooks = settings.get("hooks") if isinstance(settings, dict) else None
     script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
     commands = _python_era_commands(script, settings_path.parent)
     if _holds_every_entry(hooks, expected_hooks) or (
-            script.is_file() and not script.is_symlink() and _runs_on_every_event(
+            script.is_file() and not script.is_symlink() and script.stat().st_mode & 0o111
+            and _runs_on_every_event(
                 hooks, expected_hooks,
                 lambda h: h.get("type", "command") == "command" and h["command"] in commands)):
         return "persisted"
@@ -198,11 +199,12 @@ def _no_weaker(handler, ours) -> bool:
 
 
 def _python_era_commands(script: Path, base: Path) -> set:
-    """Exactly the commands the python installers wrote for ``script``: the path, bare
-    or quoted, run directly or by python, or relative to the settings folder (Cursor).
-    Anything more (a pipe, a redirect, an extra flag) can discard the hook's answer."""
-    quoted = f'"{script}"'
-    shapes = {quoted, str(script)} | {f"{launcher} {quoted}" for launcher in ("python3", "python", "py -3")}
+    """Exactly the commands the macOS python installers wrote for ``script``, each running
+    it directly: the quoted path, the bare one, or one relative to the settings folder
+    (Cursor). Anything more (a pipe, a redirect, a flag) can discard the hook's answer."""
+    shapes = {f'"{script}"'}
+    if not any(ch.isspace() or ch in _SHELL_SPECIAL for ch in str(script)):
+        shapes.add(str(script))  # bare only where the shell keeps it one word
     try:
         shapes.add("./" + script.relative_to(base).as_posix())
     except ValueError:

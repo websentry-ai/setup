@@ -1867,6 +1867,8 @@ def test_a_managed_install_reads_persisted(env, tool):
     ("python_era_flag", "tampered"),    # python3 --version "<script>" never runs it
     ("python_era_weaker", "tampered"),  # runs it, but async with a 1 ms timeout
     ("python_era_symlink", "tampered"), # the script is a stand-in
+    ("python_era_launcher", "tampered"),  # python3 "<script>": not a shape the macOS installers wrote
+    ("python_era_not_executable", "tampered"),
 ])
 def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expected):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
@@ -1898,10 +1900,12 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
         elif spoil != "python_era_no_script":
             script.parent.mkdir(parents=True, exist_ok=True)
             script.write_text("#!/usr/bin/env python3\n")
-        base = "./hooks/unbound.py" if tool == "cursor" else f'python3 "{script}"'
+            script.chmod(0o644 if spoil == "python_era_not_executable" else 0o755)
+        base = "./hooks/unbound.py" if tool == "cursor" else f'"{script}"'
         command = {"python_era_decoy": f'echo "{script}"', "python_era_piped": f'"{script}" | true',
                    "python_era_redirect": f'"{script}" > /dev/null',
-                   "python_era_flag": f'python3 --version "{script}"'}.get(spoil, base)
+                   "python_era_flag": f'python3 --version "{script}"',
+                   "python_era_launcher": f'python3 "{script}"'}.get(spoil, base)
         ours_config = {"claude-code": setup_cmd._claude_hooks_config(),
                        "augment_code": setup_cmd._augment_written_hooks(env["modules"]["augment"]),
                        "cursor": setup_cmd._cursor_hooks_json()["hooks"]}[tool]
@@ -1924,6 +1928,32 @@ def test_a_managed_file_is_judged_by_its_registrations(env, tool, spoil, expecte
         "cursor": setup_cmd._cursor_hooks_json()["hooks"],
     }[tool])
     assert state == expected
+
+
+def test_a_bare_python_era_path_with_a_space_never_runs(tmp_path):
+    """The macOS managed folder is under Application Support: the shell splits a bare path there."""
+    folder = tmp_path / "Application Support" / "ClaudeCode"
+    script = folder / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True)
+    script.write_text("#!/usr/bin/env python3\n")
+    script.chmod(0o755)
+    expected = setup_cmd._claude_hooks_config()
+
+    def _file(command):
+        return {"hooks": {e: [{"matcher": "*", "hooks": [dict(g[0]["hooks"][0], command=command)]}]
+                          for e, g in expected.items()}}
+
+    path = folder / "managed-settings.json"
+    path.write_text(json.dumps(_file(str(script))))
+    assert setup_cmd._detect_state(path, expected) == "tampered"
+    path.write_text(json.dumps(_file(f'"{script}"')))
+    assert setup_cmd._detect_state(path, expected) == "persisted"
+
+
+def test_a_managed_file_nested_too_deep_is_tampered(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text('{"hooks": ' + "[" * 100_000)
+    assert setup_cmd._detect_state(path, setup_cmd._augment_hooks_config()) == "tampered"
 
 
 def test_a_managed_file_that_cannot_be_read_is_unknown(tmp_path):
