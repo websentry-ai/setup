@@ -389,7 +389,8 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
-    if not command:
+    if not isinstance(command, str) or not command:
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     try:
         tokens = shlex.split(command, posix=(os.name != "nt"))
@@ -505,8 +506,13 @@ def configure_codex_hooks() -> bool:
                 our_hook_exists = False
                 for existing_item in existing_config:
                     if isinstance(existing_item, dict):
-                        existing_hooks = existing_item.get("hooks", [])
-                        for hook in existing_hooks:
+                        # .get's default only covers a missing key, so a
+                        # scalar would be iterated and raise, aborting the
+                        # merge and leaving our hook unregistered.
+                        existing_hooks = existing_item.get("hooks")
+                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                            if not isinstance(hook, dict):
+                                continue
                             existing_cmd = hook.get("command", "")
                             if _command_targets_hook(existing_cmd, script_path):
                                 our_hook_exists = True
@@ -555,11 +561,17 @@ def remove_hooks_from_config() -> str:
         modified = False
         for event in list(config["hooks"].keys()):
             event_config = config["hooks"][event]
+            if not isinstance(event_config, list):
+                # Nothing of ours can be registered in a non-list; skip it rather than raise.
+                continue
             new_config = []
             for item in event_config:
-                if isinstance(item, dict):
-                    hooks = item.get("hooks", [])
-                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                # Empty `hooks` reads as [] (item dropped); a truthy non-list is kept, not iterated.
+                if isinstance(item, dict) and isinstance(item.get("hooks") or [], list):
+                    hooks = item.get("hooks") or []
+                    new_hooks = [h for h in hooks
+                                 if not isinstance(h, dict)
+                                 or not _is_unbound(h.get("command", ""))]
                     if new_hooks != hooks:
                         modified = True
                         debug_print(f"Removed unbound hook from {event}")

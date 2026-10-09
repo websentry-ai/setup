@@ -500,7 +500,8 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, config_dir: Path = None)
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
-    if not command:
+    if not isinstance(command, str) or not command:
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     try:
         # posix=False on Windows: shlex still groups a quoted argument, so a home
@@ -646,8 +647,13 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                 our_hook_exists = False
                 for existing_item in existing_config:
                     if isinstance(existing_item, dict):
-                        existing_hooks = existing_item.get("hooks", [])
-                        for hook in existing_hooks:
+                        # .get's default only covers a missing key, so a
+                        # scalar would be iterated and raise, aborting the
+                        # merge and leaving our hook unregistered.
+                        existing_hooks = existing_item.get("hooks")
+                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                            if not isinstance(hook, dict):
+                                continue
                             existing_cmd = hook.get("command", "")
                             if _command_targets_hook(existing_cmd, script_path):
                                 our_hook_exists = True
@@ -655,8 +661,6 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)
-                # else:
-                #     print(f"  ✓ Unbound hook already configured for {event}")
             else:
                 settings["hooks"][event] = new_config
         
@@ -700,11 +704,17 @@ def remove_hooks_from_settings(config_dir: Path = None) -> str:
         modified = False
         for event in list(settings["hooks"].keys()):
             event_config = settings["hooks"][event]
+            if not isinstance(event_config, list):
+                # Nothing of ours can be registered in a non-list; skip it rather than raise.
+                continue
             new_config = []
             for item in event_config:
-                if isinstance(item, dict):
-                    hooks = item.get("hooks", [])
-                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                # Empty `hooks` reads as [] (item dropped); a truthy non-list is kept, not iterated.
+                if isinstance(item, dict) and isinstance(item.get("hooks") or [], list):
+                    hooks = item.get("hooks") or []
+                    new_hooks = [h for h in hooks
+                                 if not isinstance(h, dict)
+                                 or not _is_unbound(h.get("command", ""))]
                     if new_hooks != hooks:
                         modified = True
                         debug_print(f"Removed unbound hook from {event}")

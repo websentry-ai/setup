@@ -106,7 +106,9 @@ def _hook_command_matches(existing_cmd: str, hook_command: str, script_path: Pat
     by script path) OR references the /opt/unbound hook binary. Without the binary
     case a binary-install hook is never recognized, so clear leaves it behind and
     orphans the managed config. Mirrors augment/hooks/setup.py."""
-    if not existing_cmd:
+    if not isinstance(existing_cmd, str) or not existing_cmd:
+        # A non-string command is not ours, and the membership tests below
+        # raise on an int or a bool.
         return False
     if existing_cmd == hook_command:
         return True
@@ -792,6 +794,9 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     our_identities = {(r.get("toolName"), r.get("shellInputRegex")) for r in build_tool_permissions_block()}
 
     def _is_unbound(cmd: str) -> bool:
+        if not isinstance(cmd, str):
+            # Not ours, and the membership tests below raise on an int or bool.
+            return False
         return (cmd == hook_command
                 or (is_windows and bool(cmd) and hook_command in cmd)
                 or ("/opt/unbound/" in cmd and "unbound-hook" in cmd))
@@ -1013,7 +1018,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
                 our_hook_exists = any(
                     _hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
                     for item in existing_config if isinstance(item, dict)
-                    for hook in item.get("hooks", [])
+                    # .get's default only covers a missing key, so a scalar
+                    # would be iterated and raise, aborting the write.
+                    for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
+                    if isinstance(hook, dict)
                 )
                 if not our_hook_exists:
                     existing_config.extend(new_config)
@@ -1031,8 +1039,14 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             for item in blocks:
                 if not isinstance(item, dict):
                     continue
+                item_hooks = item.get("hooks")
+                if not isinstance(item_hooks, list):
+                    # .get's default only covers a missing key, so a scalar
+                    # would be iterated here and raise before the isinstance
+                    # filter below ever runs.
+                    continue
                 if any(_hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
-                       for hook in item.get("hooks", []) if isinstance(hook, dict)):
+                       for hook in item_hooks if isinstance(hook, dict)):
                     metadata = item.get("metadata")
                     if not isinstance(metadata, dict):
                         metadata = {}

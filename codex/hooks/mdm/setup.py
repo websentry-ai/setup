@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import signal
+import select
 import random
 import stat
 import re
@@ -51,7 +53,23 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
-def _run_as_user(username, fn, *args, **kwargs):
+def _become_user(info) -> None:
+    """Drop to the user with their own groups, as codex runs: a file shared through a
+    group must read the same here as it does to codex."""
+    try:
+        os.initgroups(info.pw_name, info.pw_gid)
+    except OSError:
+        os.setgroups([])
+    os.setgid(info.pw_gid)
+    os.setuid(info.pw_uid)
+
+
+# A limit for every privilege-dropped call, set by a caller that must not be held by
+# a user pausing one (the binary's setup); None (a backfill's case) waits as long as it takes.
+_RUN_AS_USER_TIMEOUT = None
+
+
+def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
 
@@ -76,16 +94,13 @@ def _run_as_user(username, fn, *args, **kwargs):
         info = pwd.getpwnam(username)
     except KeyError:
         return None
-    uid, gid = info.pw_uid, info.pw_gid
 
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
         try:
-            os.setgroups([])
-            os.setgid(gid)
-            os.setuid(uid)
+            _become_user(info)
             # setuid alone leaves $HOME pointing at root, so a Path.home() /
             # expanduser('~') inside fn would resolve to root's home, not the
             # user's. Callers pass explicit home_dir today; this hardens against
@@ -107,7 +122,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
+        # The child runs as the user, who can pause it: a caller can bound the wait
+        # (a backfill can't be bounded; a quick check can).
+        limit = _RUN_AS_USER_TIMEOUT if _timeout is None else _timeout
+        deadline = None if limit is None else time.monotonic() + limit
         while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
             try:
                 chunk = os.read(r_fd, 1 << 20)
             except OSError:
@@ -119,7 +145,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         data = b''.join(chunks)
         del chunks
         try:
-            _, status = os.waitpid(pid, 0)
+            if deadline is None:
+                _, status = os.waitpid(pid, 0)
+            else:  # paused after closing the pipe, it would still hold the wait
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        return None
+                    time.sleep(0.05)
         except OSError:
             return None
         if os.WEXITSTATUS(status) != 0:
@@ -643,6 +680,15 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
         debug_print(f"Could not write config for {username}")
 
 
+def _read_config_lines(config_path: Path):
+    """config.toml's lines, or None if it isn't a regular file: a FIFO would hang setup."""
+    fd = os.open(str(config_path), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(fd, 'r', encoding='utf-8') as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return f.readlines()
+
+
 def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
     """Remove OPENAI_API_KEY env var and openai_base_url from ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
@@ -654,8 +700,9 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
         return
 
     def _strip():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        lines = _read_config_lines(config_path)
+        if lines is None:
+            return False
         new_lines = [l for l in lines if not l.strip().startswith('openai_base_url')]
         if len(new_lines) == len(lines):
             return False
@@ -670,7 +717,8 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
-    if not command:
+    if not isinstance(command, str) or not command:
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     # Binary install: command invokes the /opt/unbound hook binary (require both
     # the prefix and the binary name so a foreign hook merely mentioning the path
@@ -1067,20 +1115,25 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
             config["hooks"] = {}
 
         for event, new_config in hooks_config.items():
-            if event in config["hooks"]:
-                existing_config = config["hooks"][event]
-                our_hook_exists = False
-                for existing_item in existing_config:
-                    if isinstance(existing_item, dict):
-                        for hook in existing_item.get("hooks", []):
-                            existing_cmd = hook.get("command", "")
-                            if _command_targets_hook(existing_cmd, script_path):
-                                our_hook_exists = True
-                                break
-                if not our_hook_exists:
-                    config["hooks"][event].extend(new_config)
-            else:
+            if event not in config["hooks"]:
                 config["hooks"][event] = new_config
+                continue
+            existing_config = config["hooks"][event]
+            our_hook_exists = False
+            for existing_item in existing_config:
+                if not isinstance(existing_item, dict):
+                    continue
+                # .get's default only applies to a missing key, so a scalar
+                # here would be iterated and raise before the command check ran.
+                existing_hooks = existing_item.get("hooks")
+                for hook in existing_hooks if isinstance(existing_hooks, list) else []:
+                    if not isinstance(hook, dict):
+                        continue
+                    if _command_targets_hook(hook.get("command", ""), script_path):
+                        our_hook_exists = True
+                        break
+            if not our_hook_exists:
+                existing_config.extend(new_config)
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(hooks_path), flags, 0o644)
@@ -1099,7 +1152,8 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     install prefix and the binary name, so a foreign hook in a shared/Enterprise
     config that merely references some other unbound.py / mentions /opt/unbound/
     isn't stripped."""
-    if not cmd:
+    if not isinstance(cmd, str) or not cmd:
+        # A non-string command is not ours; the checks below would raise on it.
         return False
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
@@ -1388,8 +1442,10 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
         if config_path.exists():
-            with open(config_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+            lines = _read_config_lines(config_path)
+            if lines is None:
+                print(f"{username}'s config.toml is not a regular file; hooks not enforced")
+                return False
         # Covers the inline spelling too, so a daily re-run does not rewrite a config that is
         # already correct.
         if tomllib is not None and _write_is_safe(''.join(lines), True):
@@ -1531,7 +1587,11 @@ def _unbound_hook_registered(hooks_path, script_path):
         for item in entries if isinstance(entries, list) else []:
             if not isinstance(item, dict):
                 continue
-            for hook in item.get('hooks') or []:
+            hooks = item.get('hooks')
+            # Shape-guard before iterating: a scalar here is truthy, so
+            # `or []` would iterate an int and abort detection for every
+            # profile on the device, not just this one.
+            for hook in hooks if isinstance(hooks, list) else []:
                 if isinstance(hook, dict) and _is_unbound_hook_command(
                         hook.get('command', ''), script_path):
                     return True
@@ -1555,8 +1615,9 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if registered:
             debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
             return False
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        lines = _read_config_lines(config_path)
+        if lines is None:
+            return False
         new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return False

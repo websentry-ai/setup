@@ -564,7 +564,7 @@ class TestShellDirectoryChanges(RepoGateCase):
 
     def test_cd_into_out_of_scope_repo_then_git_or_write_is_caught(self):
         self.set_policies([ORG_POLICY])
-        for tail in ('git commit -m wip', 'rm README.md', 'echo x > out.txt'):
+        for tail in ('git commit -m wip', 'git push', 'rm README.md', 'echo x > out.txt'):
             with self.subTest(tail=tail):
                 self.assertBlocked(
                     self.bash('cd %s && %s' % (self.out_scope, tail),
@@ -620,23 +620,31 @@ class TestBashPaths(RepoGateCase):
 
 
 class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
-    """A Bash call is in scope only when it runs git or mutates the working tree."""
+    """A Bash call is in scope only when it runs a git write subcommand or mutates the working tree."""
 
     # No absolute paths here: a command that names one resolves against THAT
     # path, not the cwd, which is a separate axis covered by TestBashPaths.
-    GATED = ['git push', 'git commit -m wip', '/usr/bin/git status',
-             'sudo git push', 'GIT_SSH_COMMAND=ssh git push', 'git log | head',
+    GATED = ['git push', 'git commit -m wip', '/usr/bin/git push',
+             'sudo git push', 'GIT_SSH_COMMAND=ssh git push', 'git stash | cat',
+             'git --no-pager commit -m wip', 'git -c user.name=x commit -m wip',
+             'git branch -d feature', 'git checkout .', 'git -C "a b" commit -m wip',
+             'git restore .', 'git apply fix.patch',
              'rm auth.py', 'rm -rf build/', 'mv a b', 'cp a b', 'touch new.py',
              'mkdir -p src/x', "sed -i 's/a/b/' f", "perl -pi -e 's/a/b/' f",
              'tee out.txt', 'truncate -s 0 f', 'dd if=a of=b', 'ln -s a b',
-             'patch < fix.diff', 'echo x > file', 'make >> build.log']
+             'patch < fix.diff', 'echo x > file', 'make >> build.log',
+             'make 2>/dev/null > build.log']
     # git or a write command appears in the LINE but is not what is invoked.
     UNGATED = ['ls -la', 'cat README.md', 'npm test', 'python -m pytest',
                'cat git-notes.md', 'cat rm-notes.md', 'git-lfs push',
                '/opt/homebrew/bin/git-lfs --help', 'grep -r "rm -rf" .',
                'grep git README.md', 'echo "moved to archive"',
                'echo "a && git push"', 'npm run remove-stale',
-               'make 2>&1', 'cmd 1>&2', 'chmod +x run.sh']
+               'make 2>&1', 'cmd 1>&2', 'chmod +x run.sh',
+               'git status --short', 'git diff --stat', 'git log | head',
+               '/usr/bin/git status', 'git fetch', 'git branch feature',
+               'git config user.name x', 'git some-alias',
+               'ls ~/.clasprc.json 2>/dev/null', 'cmd >/dev/null 2>&1']
 
     def test_gated_commands_are_caught_in_an_out_of_scope_repo(self):
         self.set_policies([ORG_POLICY])
@@ -658,19 +666,46 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
         self.assertFalse(unbound._is_shell_write_command('cmd 1>&2'))
         self.assertTrue(unbound._is_shell_write_command('make 2>&1 > out.txt'))
 
+    def test_a_redirect_into_a_device_is_not_a_write(self):
+        """A redirect into a device creates nothing on disk."""
+        for command in ('ls ~/.clasprc.json 2>/dev/null', 'cmd > /dev/null',
+                        'cmd >/dev/null; ls', 'echo x >/dev/stdout',
+                        'echo x > /dev/stderr', 'cat f > /dev/tty',
+                        'echo `git rev-parse HEAD 2>/dev/null`'):
+            with self.subTest(command=command):
+                self.assertFalse(unbound._is_shell_write_command(command))
+        self.assertTrue(unbound._is_shell_write_command('cmd 2>/dev/null > out.txt'))
+        self.assertTrue(unbound._is_shell_write_command('echo x >/dev/null >& README.md'))
+        self.assertFalse(unbound._is_shell_write_command('cmd >& /dev/null'))
+        self.assertFalse(unbound._is_shell_write_command('cmd >&2'))
+        self.assertTrue(unbound._is_shell_write_command('cmd >&1.log'))
+        self.assertTrue(unbound._is_shell_write_command('cmd >&-backup'))
+        self.assertTrue(unbound._is_shell_write_command('echo x > "out.txt"'))
+
     def test_indirect_invocation_is_deliberately_not_gated(self):
         """The documented conservative miss: a command reached through another
         program cannot be classified with confidence."""
         for command in ('xargs git commit', 'sh -c "git push"', 'xargs rm'):
             with self.subTest(command=command):
-                self.assertFalse(unbound._is_git_command(command))
+                self.assertFalse(unbound._is_git_write_command(command))
                 self.assertFalse(unbound._is_shell_write_command(command))
+
+    def test_unlisted_git_subcommands_are_deliberately_not_gated(self):
+        """Denylist by design; add to _GIT_WRITE_SUBCOMMANDS rather than widening detection."""
+        for command in ('git fetch', 'git branch feature', 'git config user.name x', 'git some-alias'):
+            with self.subTest(command=command):
+                self.assertFalse(unbound._is_git_write_command(command))
 
     def test_the_write_command_set_is_one_reviewable_constant(self):
         self.assertIn('rm', unbound._SHELL_WRITE_COMMANDS)
         # chmod/chown change metadata, not repository content.
         self.assertNotIn('chmod', unbound._SHELL_WRITE_COMMANDS)
         self.assertNotIn('chown', unbound._SHELL_WRITE_COMMANDS)
+
+    def test_the_git_write_subcommand_set_is_one_reviewable_constant(self):
+        self.assertIn('commit', unbound._GIT_WRITE_SUBCOMMANDS)
+        self.assertNotIn('status', unbound._GIT_WRITE_SUBCOMMANDS)
+        self.assertNotIn('branch', unbound._GIT_WRITE_SUBCOMMANDS)
 
     def test_homebrew_path_is_not_a_violation(self):
         """WEB-5433: system checkouts are dropped before git resolution, so a

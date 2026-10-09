@@ -103,7 +103,7 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
     def test_a_typed_skill_in_the_earlier_prompt_is_recovered(self):
         # the queued prompt follows it, so a last-wins read would never see the slash
         with patch.object(unbound, "_resolve_skill_path",
-                          side_effect=lambda name, _cwd: "/skills/%s" % name):
+                          side_effect=lambda name, _cwd, *_: "/skills/%s" % name):
             exchange = unbound.build_llm_exchange(
                 [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/deploy now"),
                  _log("UserPromptSubmit", SECOND_PROMPT, prompt="plain text")],
@@ -116,7 +116,7 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
     def test_each_queued_skill_resolves_with_its_own_cwd(self):
         seen = {}
 
-        def resolve(name, cwd):
+        def resolve(name, cwd, *_):
             seen[name] = cwd
             return "/skills/%s" % name
 
@@ -131,7 +131,7 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
     def test_a_prompt_without_a_cwd_falls_back_to_the_previous_one(self):
         seen = {}
         with patch.object(unbound, "_resolve_skill_path",
-                          side_effect=lambda name, cwd: seen.setdefault(name, cwd) and None):
+                          side_effect=lambda name, cwd, *_: seen.setdefault(name, cwd) and None):
             unbound.build_llm_exchange(
                 [_log("UserPromptSubmit", FIRST_PROMPT, prompt="plain", cwd="/repo/one"),
                  _log("UserPromptSubmit", SECOND_PROMPT, prompt="/beta")],
@@ -337,7 +337,7 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
     def _resolved_skills(events, cwd, queued):
         seen = {}
 
-        def resolve(name, directory):
+        def resolve(name, directory, *_):
             seen[name] = directory
             return "/skills/%s" % name
 
@@ -369,7 +369,7 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
         self.assertEqual(seen["deploy"], "/repo/one")
 
     def test_an_unresolved_queued_skill_still_reaches_the_message(self):
-        with patch.object(unbound, "_resolve_skill_path", side_effect=lambda n, d: None):
+        with patch.object(unbound, "_resolve_skill_path", side_effect=lambda n, d, *_: None):
             exchange = unbound.build_llm_exchange(
                 [_log("UserPromptSubmit", FIRST_PROMPT, prompt="hello", cwd="/repo/one")],
                 stop_assistant_message="done", cwd="/repo/two", queued_prompts=["/beta"])

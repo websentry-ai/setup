@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
 import re
+import shlex
 import shutil
 import tempfile
 import platform
@@ -4377,14 +4378,16 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
 
 
-# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+# --- Bash calls in scope for the repo gate: a segment runs a git write subcommand or writes the working tree; anything unclassifiable is not gated ---
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 _SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
-# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
-_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+# Creating or appending redirect and its target; `>& file` writes a file, `>&1` / `>&-` only move a descriptor; the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?:&(?!(?:\d+|-)(?:[\s;&|)`]|$)))?(?![&>])\s*([^\s;&|)`]*)')
+# A redirect into one of these touches no file.
+_DEVICE_REDIRECT_TARGETS = frozenset({'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'})
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -4398,6 +4401,17 @@ _SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
 _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
 # DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
 
+# git subcommands that change the repository; everything else (status, diff, log, fetch, config, aliases) passes.
+_GIT_WRITE_SUBCOMMANDS = frozenset({
+    'add', 'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
+    'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
+    'apply', 'am',
+})
+# `git branch` writes only when deleting.
+_GIT_BRANCH_DELETE_FLAGS = frozenset({'-d', '-D', '--delete'})
+# git's own options that take the next word as their value, so `git -C dir commit` reads as `commit`.
+_GIT_OPTIONS_WITH_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--attr-source'})
+
 
 def _mask_quoted_runs(command):
     """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
@@ -4408,8 +4422,12 @@ def _mask_quoted_runs(command):
 
 def _segment_words(segment):
     """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    try:
+        raw_words = shlex.split(segment)
+    except ValueError:  # unbalanced quote or trailing backslash
+        raw_words = segment.split()
     words = []
-    for word in segment.split():
+    for word in raw_words:
         word = word.strip('()`{}"\'')
         if not words and (not word or word.startswith('-')
                           or _ENV_ASSIGNMENT_RE.match(word)
@@ -4431,14 +4449,30 @@ def _segment_writes(words):
     return False
 
 
-def _is_git_command(command):
-    """Whether any segment of `command` directly invokes git; False on any error."""
+def _git_subcommand(words):
+    """The first word after git that is not one of git's own options."""
+    rest = iter(words[1:])
+    for word in rest:
+        if word in _GIT_OPTIONS_WITH_VALUE:
+            next(rest, None)
+        elif not word.startswith('-'):
+            return word
+    return None
+
+
+def _is_git_write_command(command):
+    """Whether any segment runs a git subcommand that changes the repository; False on any error."""
     try:
         if not isinstance(command, str) or 'git' not in command:
             return False
-        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+        for segment, _ in _shell_segments(command):  # unmasked, so a quoted option value resolves
             words = _segment_words(segment)
-            if words and os.path.basename(words[0]) == 'git':
+            if not words or os.path.basename(words[0]) != 'git':
+                continue
+            subcommand = _git_subcommand(words)
+            if subcommand in _GIT_WRITE_SUBCOMMANDS:
+                return True
+            if subcommand == 'branch' and _GIT_BRANCH_DELETE_FLAGS.intersection(words):
                 return True
         return False
     except Exception:
@@ -4446,12 +4480,12 @@ def _is_git_command(command):
 
 
 def _is_shell_write_command(command):
-    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    """Whether `command` mutates the working tree: a write command word in any segment, or a redirect into a file. False on any error."""
     try:
         if not isinstance(command, str) or not command:
             return False
         masked = _mask_quoted_runs(command)
-        if _REDIRECT_RE.search(masked):
+        if any(m.group(1) not in _DEVICE_REDIRECT_TARGETS for m in _REDIRECT_RE.finditer(masked)):
             return True
         for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
             words = _segment_words(segment)
@@ -4514,9 +4548,9 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
 
 
-# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
+# --- Repository-scope gate: blocks writes, git write subcommands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
 
-# Write tools, git commands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated.
+# Write tools, git write subcommands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated.
 _REPO_GATE_WRITE_TOOLS = frozenset(_WRITE_TOOLS)
 _REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
 _REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
@@ -4536,9 +4570,9 @@ def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
 
 
 def _repo_gate_applies(tool_name, command):
-    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it runs a git write or writes a file."""
     if tool_name in _REPO_GATE_SHELL_TOOLS:
-        return _is_git_command(command) or _is_shell_write_command(command)
+        return _is_git_write_command(command) or _is_shell_write_command(command)
     return tool_name in _REPO_GATE_WRITE_TOOLS
 
 
@@ -4838,7 +4872,8 @@ def _skill_content_hash(skill_path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[str]:
+def _resolve_skill_path(skill: Optional[str], cwd: Optional[str],
+                        transcript_path: Optional[str] = None) -> Optional[str]:
     """Absolute path of the invoked skill's SKILL.md. The tool call carries only
     the skill name, so map it back on device — the backend joins this against
     the skills discovery already reported. None when it can't be resolved."""
@@ -4848,6 +4883,14 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         if not _safe_skill_segment(name):
             return None
         if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+
+        # A Cowork run loads skills from Claude Desktop's own tree, never from Claude Code's dirs.
+        session = (_desktop_session_dir({'cwd': cwd, 'transcript_path': transcript_path})
+                   or _cowork_session_from_transcript(transcript_path))
+        if session is not None:
+            return _cowork_skill_path(prefix, name, session)
+        if _names_cowork_tree(cwd) or _names_cowork_tree(transcript_path):
             return None
 
         # Plugin skills ("<plugin>:<name>") live outside the project tree.
@@ -4908,6 +4951,119 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
 
 
+COWORK_BUNDLED_SKILLS_PREFIX = 'anthropic-skills'
+
+
+def _cowork_session_from_transcript(transcript_path: Optional[str]) -> Optional[Path]:
+    """The Cowork session of a run working in a folder the user picked. Its transcript
+    sits in a temp dir, under a project slug that is the session's outputs path with
+    every non-alphanumeric turned into '-'. None unless exactly one session matches."""
+    slug = Path(transcript_path).parent.name if transcript_path else ''
+    if _COWORK_SESSIONS_DIRNAME not in slug:
+        return None
+    try:
+        matches = [session
+                   for base in _claude_desktop_support_dirs()
+                   for session in (base / _COWORK_SESSIONS_DIRNAME).glob('*/*/local_*')
+                   if session.is_dir() and _is_slug_of(slug, session / 'outputs')]
+    except Exception:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _names_cowork_tree(value: Optional[str]) -> bool:
+    """True when ``value`` sits under Claude Desktop's Cowork sessions tree, or is a temp
+    transcript whose slug names it. A folder that merely shares the name is not."""
+    if not value or _COWORK_SESSIONS_DIRNAME not in value:
+        return False
+    try:
+        candidate = Path(value).resolve()
+        for base in _claude_desktop_support_dirs():
+            root = base / _COWORK_SESSIONS_DIRNAME
+            if root.resolve() in candidate.parents or _is_slug_of(candidate.parent.name, root):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _is_slug_of(slug: str, path: Path) -> bool:
+    """True when ``slug`` names ``path`` or a folder inside it."""
+    base = re.sub(r'[^A-Za-z0-9]', '-', str(path))
+    return slug == base or slug.startswith(base + '-')
+
+
+def _plugin_manifest_name(plugin: Path) -> Optional[str]:
+    """The name a plugin declares in .claude-plugin/plugin.json, which is the prefix
+    its skills are invoked under. None when it has no readable manifest."""
+    try:
+        name = json.loads((plugin / '.claude-plugin' / 'plugin.json').read_text(encoding='utf-8')).get('name')
+        return name if isinstance(name, str) else None
+    except Exception:
+        return None
+
+
+def _cowork_plugin_dirs(org_dir: Path):
+    """(source, plugin dir, registry name) for every plugin a Cowork session can load: the
+    org's plugins, and the install installed_plugins.json records for each installed or
+    uploaded plugin. Any other copy under cowork_plugins is a catalog entry or stale."""
+    for plugin in (org_dir / 'rpm').glob('*'):
+        yield plugin.name, plugin, None
+    plugins_root = org_dir / 'cowork_plugins'
+    for key, entries in _installed_plugins_registry(plugins_root).items():
+        # The first record that exists in this cowork_plugins dir is the copy the app loads.
+        for entry in entries if isinstance(entries, list) else []:
+            path = _cowork_install_dir(plugins_root, entry.get('installPath') if isinstance(entry, dict) else None)
+            if path is not None and path.is_dir():
+                yield 'installed:%s' % key, path, key.split('@', 1)[0]
+                break
+
+
+def _cowork_install_dir(plugins_root: Path, install_path) -> Optional[Path]:
+    """A recorded installPath, which may be the VM's view of it, re-rooted under this
+    host's cowork_plugins dir. None when it does not point inside cowork_plugins."""
+    parts = [p for p in re.split(r'[\\/]+', install_path) if p] if isinstance(install_path, str) else []
+    if 'cowork_plugins' not in parts:
+        return None
+    tail = parts[len(parts) - parts[::-1].index('cowork_plugins'):]
+    # ':' would let a drive letter re-root the join outside cowork_plugins on Windows.
+    if not tail or any(part in ('.', '..') or ':' in part for part in tail):
+        return None
+    return plugins_root.joinpath(*tail)
+
+
+def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
+    """The SKILL.md a Cowork run used: the session's own copy for a bare name, else the
+    newest version from the one source shipping it — the bundle for anthropic-skills,
+    the plugin declaring any other prefix. No source, or two, resolves nothing."""
+    own = session / '.claude' / 'skills' / name / 'SKILL.md'
+    if not prefix and own.is_file():
+        return str(own)
+    sources = {}
+    if prefix in ('', COWORK_BUNDLED_SKILLS_PREFIX):
+        # One bundle per account, kept at skills-plugin/<org>/<account> (the reverse of
+        # the sessions tree); another account's bundle on the same machine is theirs.
+        own = session.parent.parent.parent / 'skills-plugin' / session.parent.name / session.parent.parent.name
+        copies = list(own.glob('**/skills/%s/SKILL.md' % name))
+        if copies:
+            sources['bundle'] = copies
+    # A bare name is the bundle's when the bundle has it; plugin skills are namespaced.
+    if prefix != COWORK_BUNDLED_SKILLS_PREFIX and not (not prefix and sources):
+        for source, plugin, registry_name in _cowork_plugin_dirs(session.parent):
+            if not plugin.is_dir():
+                continue
+            # A plugin need not ship plugin.json; the registry key names it then.
+            if prefix and (_plugin_manifest_name(plugin) or registry_name) != prefix:
+                continue
+            copies = list(plugin.glob('skills/%s/SKILL.md' % name)) or list(plugin.glob('skills/*/%s/SKILL.md' % name))
+            if copies:
+                sources.setdefault(source, []).extend(copies)
+    if len(sources) != 1:
+        return None
+    (copies,) = sources.values()
+    return str(max(copies, key=lambda c: (c.stat().st_mtime, str(c))))
+
+
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
@@ -4916,6 +5072,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
     prompt_cwd = None
     session_id = None
+    transcript_path = None
     permission_mode = None
     # Per-tool-use project resolution state: the persistent shell starts at
     # the session cwd; origin lookups are cached per repo root.
@@ -4928,6 +5085,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if not session_id:
             session_id = event.get('session_id')
+        # Claude sends the literal 'undefined' when it has no transcript yet.
+        if event.get('transcript_path') not in (None, '', 'undefined'):
+            transcript_path = event['transcript_path']
 
         if not permission_mode:
             permission_mode = event.get('permission_mode')
@@ -4976,7 +5136,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 skill = tool_input.get('skill')
                 tool_use_entry['skill_name'] = skill
                 skill_path = _resolve_skill_path(
-                    skill, event.get('cwd') or prompt_cwd or cwd)
+                    skill, event.get('cwd') or prompt_cwd or cwd, transcript_path)
                 if skill_path:
                     tool_use_entry['skill_path'] = skill_path
                     tool_use_entry['content_hash'] = _skill_content_hash(skill_path)
@@ -5009,7 +5169,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if '/' in typed_skill or '\\' in typed_skill or '..' in typed_skill:
             # A skill name is a bare identifier; anything path-shaped is not one.
             continue
-        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd, transcript_path)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,

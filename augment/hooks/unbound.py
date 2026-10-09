@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
 import re
+import shlex
 import tempfile
 import platform
 import shutil
@@ -3271,14 +3272,16 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
 
 
-# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+# --- Bash calls in scope for the repo gate: a segment runs a git write subcommand or writes the working tree; anything unclassifiable is not gated ---
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 _SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
-# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
-_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+# Creating or appending redirect and its target; `>& file` writes a file, `>&1` / `>&-` only move a descriptor; the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?:&(?!(?:\d+|-)(?:[\s;&|)`]|$)))?(?![&>])\s*([^\s;&|)`]*)')
+# A redirect into one of these touches no file.
+_DEVICE_REDIRECT_TARGETS = frozenset({'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'})
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -3292,6 +3295,17 @@ _SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
 _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
 # DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
 
+# git subcommands that change the repository; everything else (status, diff, log, fetch, config, aliases) passes.
+_GIT_WRITE_SUBCOMMANDS = frozenset({
+    'add', 'commit', 'push', 'pull', 'merge', 'rebase', 'cherry-pick', 'revert',
+    'reset', 'checkout', 'switch', 'restore', 'tag', 'stash', 'clean', 'rm', 'mv',
+    'apply', 'am',
+})
+# `git branch` writes only when deleting.
+_GIT_BRANCH_DELETE_FLAGS = frozenset({'-d', '-D', '--delete'})
+# git's own options that take the next word as their value, so `git -C dir commit` reads as `commit`.
+_GIT_OPTIONS_WITH_VALUE = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--attr-source'})
+
 
 def _mask_quoted_runs(command):
     """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
@@ -3302,8 +3316,12 @@ def _mask_quoted_runs(command):
 
 def _segment_words(segment):
     """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    try:
+        raw_words = shlex.split(segment)
+    except ValueError:  # unbalanced quote or trailing backslash
+        raw_words = segment.split()
     words = []
-    for word in segment.split():
+    for word in raw_words:
         word = word.strip('()`{}"\'')
         if not words and (not word or word.startswith('-')
                           or _ENV_ASSIGNMENT_RE.match(word)
@@ -3325,14 +3343,30 @@ def _segment_writes(words):
     return False
 
 
-def _is_git_command(command):
-    """Whether any segment of `command` directly invokes git; False on any error."""
+def _git_subcommand(words):
+    """The first word after git that is not one of git's own options."""
+    rest = iter(words[1:])
+    for word in rest:
+        if word in _GIT_OPTIONS_WITH_VALUE:
+            next(rest, None)
+        elif not word.startswith('-'):
+            return word
+    return None
+
+
+def _is_git_write_command(command):
+    """Whether any segment runs a git subcommand that changes the repository; False on any error."""
     try:
         if not isinstance(command, str) or 'git' not in command:
             return False
-        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+        for segment, _ in _shell_segments(command):  # unmasked, so a quoted option value resolves
             words = _segment_words(segment)
-            if words and os.path.basename(words[0]) == 'git':
+            if not words or os.path.basename(words[0]) != 'git':
+                continue
+            subcommand = _git_subcommand(words)
+            if subcommand in _GIT_WRITE_SUBCOMMANDS:
+                return True
+            if subcommand == 'branch' and _GIT_BRANCH_DELETE_FLAGS.intersection(words):
                 return True
         return False
     except Exception:
@@ -3340,12 +3374,12 @@ def _is_git_command(command):
 
 
 def _is_shell_write_command(command):
-    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    """Whether `command` mutates the working tree: a write command word in any segment, or a redirect into a file. False on any error."""
     try:
         if not isinstance(command, str) or not command:
             return False
         masked = _mask_quoted_runs(command)
-        if _REDIRECT_RE.search(masked):
+        if any(m.group(1) not in _DEVICE_REDIRECT_TARGETS for m in _REDIRECT_RE.finditer(masked)):
             return True
         for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
             words = _segment_words(segment)
@@ -3356,9 +3390,9 @@ def _is_shell_write_command(command):
         return False
 
 
-# --- Repository-scope gate: blocks writes, git commands and shell writes outside the org's allowed scope; Augment (https://docs.augmentcode.com/cli/hooks) has no warning phase and denies from the first violating call ---
+# --- Repository-scope gate: blocks writes, git write subcommands and shell writes outside the org's allowed scope; Augment (https://docs.augmentcode.com/cli/hooks) has no warning phase and denies from the first violating call ---
 
-# Write tools, git commands and shell writes only; the read tools (view, read-file) are ungated, remove-files is a write, and every other shell command (ls, cat, npm test) is ungated.
+# Write tools, git write subcommands and shell writes only; the read tools (view, read-file) are ungated, remove-files is a write, and every other shell command (ls, cat, npm test) is ungated.
 _REPO_GATE_WRITE_TOOLS = frozenset({'str-replace-editor', 'save-file',
                                     'remove-files', 'apply_patch'})
 _REPO_GATE_SHELL_TOOLS = frozenset({'launch-process'})
@@ -3383,9 +3417,9 @@ def _repo_gate_command(tool_input):
 
 
 def _repo_gate_applies(tool_name, command):
-    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it runs a git write or writes a file."""
     if tool_name in _REPO_GATE_SHELL_TOOLS:
-        return _is_git_command(command) or _is_shell_write_command(command)
+        return _is_git_write_command(command) or _is_shell_write_command(command)
     return tool_name in _REPO_GATE_WRITE_TOOLS
 
 

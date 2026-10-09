@@ -1030,9 +1030,16 @@ def clear_managed_hooks() -> bool:
                             if not isinstance(group, dict):
                                 kept_groups.append(group)
                                 continue
+                            # Missing or empty reads as []; a truthy scalar is kept, not iterated.
                             entries = group.get("hooks") or []
+                            if not isinstance(entries, list):
+                                kept_groups.append(group)
+                                continue
+                            # A non-dict element is not ours: preserve it
+                            # rather than calling .get on it and raising.
                             kept = [h for h in entries
-                                    if str(h.get("command", "")).find(str(script_path)) == -1]
+                                    if not isinstance(h, dict)
+                                    or str(h.get("command", "")).find(str(script_path)) == -1]
                             if kept != entries:
                                 changed = True
                             if kept:
