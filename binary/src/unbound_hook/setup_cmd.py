@@ -19,9 +19,11 @@ but never aborts the remaining components.
 """
 
 import json
+import math
 import os
 import platform
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -108,21 +110,13 @@ def _normalized_urls(m, opts):
     return base, gateway
 
 
-def _detect_state(settings_path: Path):
-    """Binary-era analog of the python detect_install_state(): the python
-    version checked managed unbound.py existence, which no longer exists.
-    'persisted' = settings present and pointing at this binary OR at the
-    python-era unbound.py (a legitimate install being migrated — reporting
-    those as 'tampered' would flood the backend with false tamper signals on
-    rollout day); 'tampered' = settings present referencing neither. Callers that
-    do not own the settings file must not call this at all."""
+def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
+    """'persisted' if every event runs our exact command (or the python-era unbound.py being migrated),
+    'tampered' otherwise or if unparsable, 'fresh' with no file, None if unreadable. Admin-owned files only."""
     try:
-        if not settings_path.exists():
-            return "fresh"
-        text = settings_path.read_text(encoding="utf-8")
-        if str(HOOK_BINARY) in text or "unbound.py" in text:
-            return "persisted"
-        return "tampered"
+        data = _read_user_file(settings_path, follow=True)
+    except FileNotFoundError:
+        return "fresh"
     except Exception as e:
         # None = "unknown" — notify_setup_complete omits the field entirely,
         # which is more honest than guessing 'fresh' over an unreadable but
@@ -130,6 +124,118 @@ def _detect_state(settings_path: Path):
         print(f"[setup] install_state detection failed for {settings_path}: {e}",
               file=sys.stderr)
         return None
+    try:
+        settings = _strict_json(data.decode("utf-8"))
+    except (ValueError, RecursionError):  # the tool can't load it either
+        return "tampered"
+    hooks = settings.get("hooks") if isinstance(settings, dict) else None
+    script = settings_path.parent / "hooks" / "unbound.py"  # where the python era kept it
+    commands = _python_era_commands(script, settings_path.parent if relative_ok else None)
+    grouped = not relative_ok  # Cursor (the only relative one) runs flat handlers only
+    if _holds_every_entry(hooks, expected_hooks) or (
+            script.is_file() and not script.is_symlink()
+            # the agents' users must read and run it, and get through each folder to it
+            and script.stat().st_mode & 0o005 == 0o005
+            and all(os.stat(d).st_mode & 0o001 for d in (settings_path.parent, script.parent))
+            and _runs_on_every_event(
+                hooks, expected_hooks,
+                lambda h: h.get("type", "command") == "command" and h["command"] in commands,
+                grouped=grouped)):
+        return "persisted"
+    return "tampered"
+
+
+def _strict_json(text):
+    """JSON as these tools' JavaScript parsers read it: NaN and Infinity, which Python
+    accepts, make them reject the whole file."""
+    def _constant(name):
+        raise ValueError(name)
+    return json.loads(text, parse_constant=_constant)
+
+
+def _holds_every_entry(hooks, expected_hooks) -> bool:
+    """Every event still holds an entry that enforces like ours, so a release that tweaks a timeout or adds
+    a field doesn't read as tampering (detection runs before the rewrite)."""
+    return isinstance(hooks, dict) and all(
+        isinstance(hooks.get(event), list)
+        and all(any(_same_entry(actual, entry) for actual in hooks[event]) for entry in entries)
+        for event, entries in expected_hooks.items())
+
+
+def _same_entry(actual, ours) -> bool:
+    """Enforces like ours: a flat handler like ours; or a group with our matcher, a
+    handler like ours (beside any an organisation added) and our metadata flags."""
+    if not isinstance(actual, dict):
+        return False
+    if "hooks" not in ours:
+        return _handler_like(actual, ours)
+    have = actual.get("metadata") if isinstance(actual.get("metadata"), dict) else {}
+    return (actual.get("matcher") == ours.get("matcher")
+            and isinstance(actual.get("hooks"), list)
+            and all(any(_handler_like(h, o) for h in actual["hooks"]) for o in ours["hooks"])
+            and all(have.get(k) == v for k, v in (ours.get("metadata") or {}).items()))
+
+
+def _handler_like(handler, ours) -> bool:
+    """The same type and commands (command, bash, powershell) wherever ours sets them,
+    and no weaker."""
+    return (isinstance(handler, dict)
+            and all(handler.get(k) == ours[k] for k in ("type", "command", "bash", "powershell") if k in ours)
+            and _no_weaker(handler, ours))
+
+
+def _runs_on_every_event(hooks, expected_hooks, runs, grouped=True) -> bool:
+    """Every event has a handler passing ``runs`` (a python-era install being migrated), flat or in a
+    match-all group, no less able to block than ours: not async where ours isn't, no shorter timeout."""
+    if not isinstance(hooks, dict):
+        return False
+    for event, entries in expected_hooks.items():
+        ours = entries[0]["hooks"][0] if "hooks" in entries[0] else entries[0]
+        flags = entries[0].get("metadata") or {}
+        handlers = []
+        for entry in hooks.get(event) if isinstance(hooks.get(event), list) else []:
+            if isinstance(entry, dict) and "hooks" in entry:
+                if not grouped:
+                    continue  # this tool runs only flat handlers
+                have = entry.get("metadata") if isinstance(entry.get("metadata"), dict) else {}
+                if (entry.get("matcher") in (None, "", "*", ".*") and isinstance(entry["hooks"], list)
+                        and all(have.get(k) == v for k, v in flags.items())):  # e.g. Augment's capture flags
+                    handlers += entry["hooks"]
+            else:
+                handlers.append(entry)
+        if not any(isinstance(h, dict) and isinstance(h.get("command"), str) and runs(h)
+                   and _no_weaker(h, ours) for h in handlers):
+            return False
+    return True
+
+
+def _no_weaker(handler, ours) -> bool:
+    """Not async where ours isn't, and at least our timeout wherever we set one (Copilot fails a killed hook open).
+    A release that raises a timeout must accept the old value for a release, or every device reads tampered."""
+    if handler.get("async") is True and ours.get("async") is not True:
+        return False
+    for key in ("timeout", "timeoutSec"):
+        mine, theirs = ours.get(key), handler.get(key)
+        if isinstance(mine, int) and not (
+                isinstance(theirs, int) and not isinstance(theirs, bool) and theirs >= mine):
+            return False
+    return True
+
+
+def _python_era_commands(script: Path, base) -> set:
+    """Exactly a command the macOS python installers wrote to run ``script``: quoted, bare, or relative to the
+    settings folder (Cursor). Anything more (a pipe, a redirect, a flag) can discard the hook's answer."""
+    shapes = set()
+    if not any(ch in '$`\\"' for ch in str(script)):
+        shapes.add(f'"{script}"')  # double quotes still expand these
+    if not any(ch.isspace() or ch in _SHELL_SPECIAL for ch in str(script)):
+        shapes.add(str(script))  # bare only where the shell keeps it one word
+    if base is not None:  # Cursor runs hooks from the settings folder
+        try:
+            shapes.add("./" + script.relative_to(base).as_posix())
+        except ValueError:
+            pass
+    return shapes
 
 
 def _remove_stale_managed_script(managed_dir: Path) -> None:
@@ -242,6 +348,16 @@ def _augment_hooks_config():
     }
 
 
+def _augment_written_hooks(m):
+    """The Augment hooks as the writer leaves them: our groups plus the metadata flags
+    it sets on them."""
+    hooks = _augment_hooks_config()
+    for event, flags in m._HOOK_METADATA.items():
+        for group in hooks.get(event, []):
+            group["metadata"] = dict(flags)
+    return hooks
+
+
 def _copilot_hooks_config():
     """Port of _copilot_hooks_config with the binary command. Copilot is
     invoked per-user; field pairs (command/bash/powershell, timeout/
@@ -297,7 +413,8 @@ def _write_claude_managed_settings(m, skip_settings: bool = False) -> bool:
         if settings_path.exists():
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f) or {}
+                    # Drop NaN/Infinity: the tool rejects the whole file over one.
+                    settings = _drop_out_of_range(json.load(f) or {})
             except Exception:
                 settings = {}
 
@@ -346,7 +463,8 @@ def _write_augment_managed_settings(m) -> bool:
         if settings_path.exists():
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f) or {}
+                    # Drop NaN/Infinity: the tool rejects the whole file over one.
+                    settings = _drop_out_of_range(json.load(f) or {})
             except Exception:
                 settings = {}
         if not isinstance(settings, dict):
@@ -362,14 +480,20 @@ def _write_augment_managed_settings(m) -> bool:
             our_command = new_config[0]["hooks"][0]["command"]
             existing_config = settings["hooks"].get(event)
             if isinstance(existing_config, list):
-                our_hook_exists = any(
-                    hook.get("command", "") == our_command
-                    for item in existing_config if isinstance(item, dict)
-                    # .get's default only covers a missing key, so a scalar
-                    # would be iterated and raise, aborting the write.
-                    for hook in (item.get("hooks") if isinstance(item.get("hooks"), list) else [])
-                    if isinstance(hook, dict)
-                )
+                # Our group as written (metadata is set below). Take our handler out of any
+                # other group, so a changed matcher or timeout is replaced, not kept beside it.
+                ours = dict(new_config[0])
+                our_hook_exists = any(_same_entry(item, ours) for item in existing_config)
+                emptied = []
+                for item in existing_config:
+                    if isinstance(item, dict) and isinstance(item.get("hooks"), list) \
+                            and not _same_entry(item, ours):
+                        kept = [h for h in item["hooks"]
+                                if not (isinstance(h, dict) and h.get("command") == our_command)]
+                        if item["hooks"] and not kept:
+                            emptied.append(id(item))  # ours alone: drop it; an org's empty group stays
+                        item["hooks"] = kept
+                existing_config[:] = [item for item in existing_config if id(item) not in emptied]
                 if not our_hook_exists:
                     existing_config.extend(new_config)
             elif existing_config is None:
@@ -419,6 +543,283 @@ def _write_augment_managed_settings(m) -> bool:
         return False
 
 
+# Files in a user's home: never follow a link we write through, and never wait
+# on a FIFO planted in place of one.
+_USER_FILE_WRITE_FLAGS = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                          | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+_USER_FILE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _read_user_file(path: Path, follow: bool) -> bytes:
+    """A user-owned file's bytes, read non-blocking and capped. Raises OSError for
+    anything but a regular file within the cap."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if not follow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(_USER_FILE_MAX_BYTES + 1)
+    if len(data) > _USER_FILE_MAX_BYTES:
+        raise OSError(f"{path} is larger than {_USER_FILE_MAX_BYTES} bytes")
+    return data
+
+
+class _JsonObject(dict):
+    """A parsed JSON object that remembers which keys appeared more than once, and its
+    nesting depth as serde_json reads it, including values a repeated key replaced."""
+    dups = frozenset()
+
+
+def _json_object(pairs):
+    obj = _JsonObject(pairs)
+    # Built bottom-up, so nested objects already know their depth: linear overall.
+    obj.depth = 1 + max((_value_depth(v) for _, v in pairs), default=0)
+    if len(obj) != len(pairs):
+        seen, dups = set(), set()
+        for key, _ in pairs:
+            (dups if key in seen else seen).add(key)
+        obj.dups = frozenset(dups)
+    return obj
+
+
+def _load_codex_json(data: bytes):
+    """Parse as codex's serde_json would: reject a byte-order mark, NaN/Infinity, numbers past f64's range
+    and lone surrogates. Duplicate keys are kept for the schema check."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        raise ValueError("byte-order mark")
+
+    def _constant(name):
+        raise ValueError(name)
+
+    def _number(parse):
+        def checked(text):
+            value = parse(text)
+            if _out_of_range(value):
+                raise ValueError("number out of range")
+            return value
+        return checked
+
+    config = json.loads(data.decode("utf-8"), object_pairs_hook=_json_object, parse_constant=_constant,
+                        parse_float=_number(float), parse_int=_number(int))
+    json.dumps(config, ensure_ascii=False).encode("utf-8")  # raises on a lone surrogate
+    return config
+
+
+_SERDE_MAX_DEPTH = 128  # serde_json fails on the 128th nested [ or {
+
+
+# serde_json fails on the 128th nested [ or { only in values codex deserializes; the only nested one it
+# reads is an mcp_tool handler's input (file > hooks > event > group > hooks > handler).
+_SERDE_HANDLER_DEPTH = 6
+
+
+def _value_depth(value) -> int:
+    """Nesting serde_json walks to read ``value``, iteratively; a parsed object's own
+    depth (which counts values a repeated key replaced) ends the walk there."""
+    deepest, stack = 0, [(value, 0)]
+    while stack:
+        node, above = stack.pop()
+        depth = getattr(node, "depth", None)
+        if depth is not None:
+            deepest = max(deepest, above + depth)
+            continue
+        children = node.values() if isinstance(node, dict) else node if isinstance(node, list) else None
+        if children is None:
+            continue
+        deepest = max(deepest, above + 1)
+        stack.extend((child, above + 1) for child in children)
+    return deepest
+
+
+# Codex's hooks.json schema (codex-rs/config/src/hook_config.rs). It rejects the
+# whole file if any of this fails to deserialize, and no hook in it runs.
+_CODEX_FILE_FIELDS = ("description", "hooks")
+_CODEX_EVENT_FIELDS = (
+    "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact", "PostCompact",
+    "SessionStart", "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop",
+    "Stop", "Interrupt")
+_CODEX_HANDLER_FIELDS = {
+    "command": {"type": None, "command": str, "commandWindows": "str?", "command_windows": "str?",
+                "timeout": "u64?", "async": bool, "statusMessage": "str?",
+                "additionalContextLimit": "u64?"},
+    "mcp_tool": {"type": None, "server": str, "tool": str, "input": "toml_map",
+                 "timeout": "u64?", "statusMessage": "str?"},
+    "prompt": {"type": None},
+    "agent": {"type": None},
+}
+_U64_MAX = 2 ** 64 - 1
+
+
+def _struct_ok(obj, fields) -> bool:
+    """A serde-derived struct: a JSON object with no known field repeated."""
+    return isinstance(obj, dict) and not (getattr(obj, "dups", frozenset()) & set(fields))
+
+
+def _toml_ok(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, (bool, str)):
+        return True
+    if isinstance(value, int):
+        return -2 ** 63 <= value < 2 ** 63
+    if isinstance(value, list):
+        return all(_toml_ok(v) for v in value)
+    return isinstance(value, dict) and all(_toml_ok(v) for v in value.values())
+
+
+def _field_ok(value, kind) -> bool:
+    if kind is str:
+        return isinstance(value, str)
+    if kind is bool:
+        return isinstance(value, bool)
+    if kind == "str?":
+        return value is None or isinstance(value, str)
+    if kind == "u64?":
+        return value is None or (isinstance(value, int) and not isinstance(value, bool)
+                                 and 0 <= value <= _U64_MAX)
+    if kind == "toml_map":
+        # Depth first: it's iterative, and _toml_ok recurses.
+        return (isinstance(value, dict) and _SERDE_HANDLER_DEPTH + _value_depth(value) < _SERDE_MAX_DEPTH
+                and _toml_ok(value))
+    return True
+
+
+def _codex_handler_loads(handler) -> bool:
+    kind = handler.get("type") if isinstance(handler, dict) else None
+    fields = _CODEX_HANDLER_FIELDS.get(kind) if isinstance(kind, str) else None
+    if fields is None or not _struct_ok(handler, fields):
+        return False
+    if "commandWindows" in handler and "command_windows" in handler:
+        return False  # one field under two names
+    required = [k for k, kind in fields.items() if kind in (str,)]
+    return (all(k in handler for k in required)
+            and all(_field_ok(handler[k], kind) for k, kind in fields.items() if k in handler))
+
+
+def _codex_group_loads(group) -> bool:
+    if not _struct_ok(group, ("matcher", "hooks")):
+        return False
+    if not _field_ok(group.get("matcher"), "str?"):
+        return False
+    hooks = group.get("hooks", [])
+    return isinstance(hooks, list) and all(_codex_handler_loads(h) for h in hooks)
+
+
+def _codex_can_load(config) -> bool:
+    """Whether codex would load this hooks.json at all."""
+    if not _struct_ok(config, _CODEX_FILE_FIELDS) or set(config) - set(_CODEX_FILE_FIELDS):
+        return False
+    if not _field_ok(config.get("description"), "str?"):
+        return False
+    events = config.get("hooks", {})
+    if not _struct_ok(events, _CODEX_EVENT_FIELDS):
+        return False
+    return all(isinstance(events[e], list) and all(_codex_group_loads(g) for g in events[e])
+               for e in _CODEX_EVENT_FIELDS if e in events)
+
+
+def _codex_make_loadable(config) -> dict:
+    """Drop only content that breaks codex's known schema, so the hooks it can load run again. Unknown keys
+    and handler types are kept: a newer codex may define them."""
+    if not isinstance(config, dict):
+        return {}
+    clean = dict(config)
+    if not _field_ok(clean.get("description"), "str?"):
+        clean.pop("description")
+    events = clean.get("hooks")
+    clean["hooks"] = events = dict(events) if isinstance(events, dict) else {}
+    for event in _CODEX_EVENT_FIELDS:
+        if event not in events:
+            continue
+        groups = events[event] if isinstance(events[event], list) else []
+        kept = []
+        for group in groups:
+            if not isinstance(group, dict) or not _field_ok(group.get("matcher"), "str?"):
+                continue
+            group = dict(group)
+            if "hooks" not in group:  # valid as is; adding the field would force a rewrite
+                kept.append(group)
+                continue
+            hooks = group["hooks"]
+            # dict(): a repeated field collapses to its last value, as on rewrite.
+            group["hooks"] = ([dict(h) for h in hooks if isinstance(h, dict) and _codex_handler_kept(dict(h))]
+                              if isinstance(hooks, list) else [])
+            if group["hooks"] or not hooks:
+                kept.append(group)
+        events[event] = kept
+    return _drop_out_of_range(clean)
+
+
+_F64_MAX_INT = int(sys.float_info.max)
+
+
+def _out_of_range(value) -> bool:
+    """A number serde_json rejects: NaN/Infinity, or an integer too large for an f64."""
+    if isinstance(value, float):
+        return not math.isfinite(value)
+    if isinstance(value, int) and not isinstance(value, bool):
+        return abs(value) >= _F64_MAX_INT  # serde_json gives up at f64's limit; Python rounds below it
+    return False
+
+
+def _drop_out_of_range(value):
+    """Drop numbers codex can't parse wherever they sit: one rejects the whole file.
+    Iterative and in place, since a field codex skips can nest past Python's recursion."""
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key in [k for k, v in node.items() if _out_of_range(v)]:
+                del node[key]
+            stack.extend(v for v in node.values() if isinstance(v, (dict, list)))
+        elif isinstance(node, list):
+            node[:] = [v for v in node if not _out_of_range(v)]
+            stack.extend(v for v in node if isinstance(v, (dict, list)))
+    return value
+
+
+def _codex_handler_kept(handler) -> bool:
+    """Keep a handler unless it breaks the schema of a type we know."""
+    kind = handler.get("type") if isinstance(handler, dict) else None
+    if isinstance(kind, str) and kind not in _CODEX_HANDLER_FIELDS:
+        return True
+    return _codex_handler_loads(handler)
+
+
+# The user a check runs as can pause it; setup's own checks and installs are quick.
+_USER_CHECK_TIMEOUT = 30
+
+
+def _as_user(m, username, fn, *args):
+    """The module's _run_as_user, bounded: an answer of None (unknown) after the timeout."""
+    return m._run_as_user(username, fn, *args, _timeout=_USER_CHECK_TIMEOUT)
+
+
+def _replace_user_file(path: Path, data: bytes, mode: int) -> None:
+    """Write ``data`` beside ``path`` and rename it over: a symlink or FIFO there is replaced, not written
+    through, and a failed write leaves the old file in place."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if os.path.lexists(tmp):
+        tmp.unlink()
+    fd = os.open(str(tmp), _USER_FILE_WRITE_FLAGS | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            os.fchmod(f.fileno(), mode)
+        os.rename(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
     actually discovers them from), mirroring the python user-level
@@ -439,19 +840,11 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
 
     def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        # Replace a symlink at our own path rather than write through it
-        # (O_NOFOLLOW below would otherwise defer codex on every run).
-        if wrapper.is_symlink():
-            wrapper.unlink()
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(wrapper), flags, 0o755)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(_codex_wrapper_source())
-        os.chmod(wrapper, 0o755)
+        _replace_user_file(wrapper, _codex_wrapper_source().encode("utf-8"), 0o755)
         _merge_codex_hooks_json(hooks_path, hook_command)
         return True
 
-    return bool(m._run_as_user(username, _install))
+    return bool(_as_user(m, username, _install))
 
 
 def _command_targets_hook(command: str, target: Path) -> bool:
@@ -492,17 +885,30 @@ def _codex_wrapper_source() -> str:
     )
 
 
-def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
-    """Idempotent merge of the codex hook events into hooks.json, mirroring the
-    python configure_codex_hooks merge: re-runs don't duplicate our entry and
-    other tools' hooks are preserved."""
-    if hooks_path.exists():
-        with open(hooks_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-    else:
-        config = {}
+def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
+    """Idempotent merge of the codex hook events into hooks.json, keeping other tools' hooks. Writes only on
+    change, so a symlink we'd refuse to write is left alone when it already has our hook."""
+    wrapper = Path(wrapper_path)
+    command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
+    try:
+        raw = _read_user_file(hooks_path, follow=True)
+    except FileNotFoundError:
+        raw = b"{}"
+    if not raw.strip():
+        raw = b"{}"  # an empty file holds nothing to keep
+    try:
+        config = _load_codex_json(raw)
+        loadable = _codex_can_load(config)
+    except ValueError:
+        # Codex rejects it (byte-order mark, NaN, lone surrogate, too deep), so nothing
+        # in it runs; recover what Python can and rewrite only if that loads.
+        config = json.loads(raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8"),
+                            object_pairs_hook=_json_object)
+        loadable = False
+    before = json.dumps(config, sort_keys=True)
+    config = _codex_make_loadable(config)
 
-    hooks_config = _codex_hooks_config(hook_command)
+    hooks_config = _codex_hooks_config(command)
     if "hooks" not in config:
         config["hooks"] = {}
 
@@ -511,26 +917,45 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             config["hooks"][event] = new_config
             continue
         existing_config = config["hooks"][event]
-        our_hook_exists = False
-        for existing_item in existing_config:
-            if not isinstance(existing_item, dict):
+        if any(_codex_group_runs_wrapper(item, wrapper, event) for item in existing_config):
+            continue
+        # Drop our own entries that don't work (unquoted path the shell splits,
+        # async, short timeout, narrowed matcher) so the real group isn't doubled.
+        for existing_item in list(existing_config):
+            existing_hooks = existing_item.get("hooks") if isinstance(existing_item, dict) else None
+            if not isinstance(existing_hooks, list):
                 continue
-            # .get's default only applies to a missing key, so a scalar here
-            # would be iterated and raise before the command check ran.
-            existing_hooks = existing_item.get("hooks")
-            for hook in existing_hooks if isinstance(existing_hooks, list) else []:
-                if not isinstance(hook, dict):
-                    continue
-                if _command_targets_hook(hook.get("command", ""), Path(hook_command)):
-                    our_hook_exists = True
-                    break
-        if not our_hook_exists:
-            existing_config.extend(new_config)
+            kept = [h for h in existing_hooks if not (isinstance(h, dict) and (
+                h.get("command") == wrapper_path or _codex_runs_wrapper(h.get("command"), wrapper)))]
+            if len(kept) != len(existing_hooks):
+                existing_item["hooks"] = kept
+                if not kept:
+                    existing_config.remove(existing_item)
+        existing_config.extend(new_config)
 
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(hooks_path), flags, 0o644)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2)
+    try:
+        text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False)
+    except RecursionError:  # indent uses the recursive pure-Python encoder
+        text = json.dumps(config, ensure_ascii=False, allow_nan=False)
+    try:
+        rewritten_loads = _codex_can_load(_load_codex_json(text.encode("utf-8")))
+    except ValueError:
+        rewritten_loads = False
+    # Unchanged content is still rewritten when that alone makes it loadable
+    # (a repeated key collapses on rewrite); otherwise the file is left alone.
+    if json.dumps(config, sort_keys=True) == before and (loadable or not rewritten_loads):
+        return
+    data = text.encode("utf-8")
+    if len(data) > _USER_FILE_MAX_BYTES:
+        raise ValueError("hooks.json would outgrow what detection reads back")
+    # A dotfiles link stays a link: as the user, update the file it points at, which
+    # reaches nothing the user couldn't already write.
+    target = Path(os.path.realpath(hooks_path))
+    try:
+        mode = stat.S_IMODE(os.lstat(target).st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    _replace_user_file(target, data, mode)  # a failed write leaves the old file whole
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:
@@ -565,10 +990,7 @@ def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
 
     def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
-        fd = os.open(str(hooks_json), flags, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
+        _replace_user_file(hooks_json, json.dumps(config, indent=2).encode("utf-8"), 0o644)
         try:
             if stale_script.is_file():
                 stale_script.unlink()
@@ -576,7 +998,7 @@ def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
             pass  # stale script is inert once unbound.json points at the binary
         return True
 
-    return bool(m._run_as_user(username, _install))
+    return bool(_as_user(m, username, _install))
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +1035,7 @@ def _setup_claude_code(opts):
     # None (unknown) without looking: in skip mode managed-settings.json is the
     # admin's file, and unknown leaves the backend's tamper state untouched.
     state = None if skip_settings else _detect_state(
-        m.get_managed_settings_dir() / "managed-settings.json")
+        m.get_managed_settings_dir() / "managed-settings.json", _claude_hooks_config())
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
         return ("deferred", "managed settings update failed")
     if skip_settings:
@@ -668,7 +1090,7 @@ def _setup_augment(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
 
-    state = _detect_state(m.get_managed_settings_dir() / "settings.json")
+    state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
     if not _write_augment_managed_settings(m):
         return ("deferred", "managed settings write failed")
     _remove_stale_managed_script(m.get_managed_settings_dir())
@@ -687,6 +1109,7 @@ def _setup_augment(opts):
 
 def _setup_codex(opts):
     m = _module("codex")
+    m._RUN_AS_USER_TIMEOUT = _USER_CHECK_TIMEOUT  # until the report: a user can pause a call
     base, gateway = _normalized_urls(m, opts)
     device_id = m.get_device_identifier()
     if not device_id:
@@ -707,7 +1130,7 @@ def _setup_codex(opts):
     # setup. No managed write and no user-level strip (the install IS the user
     # registration).
     user_homes = m.get_all_user_homes()
-    state = _codex_detect_state(user_homes)
+    state = _codex_detect_state(m, user_homes)
     installed = 0
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -715,10 +1138,24 @@ def _setup_codex(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         m.enable_codex_hooks_feature_for_user(username, home_dir)
+        wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
+        had_wrapper = os.path.lexists(wrapper)  # a profile setup never reached isn't tampered
         if _install_codex_hooks_for_user(m, username, home_dir):
             installed += 1
+        elif state == "persisted" and had_wrapper and _as_user(m, 
+                username, _codex_wrapper_current, wrapper) is False and _as_user(m, 
+                username, _writable_dir, wrapper.parent) is False:
+            # The folder was locked against setup, and what's left isn't our wrapper. An
+            # ordinary failure (a full disk) leaves the working hook and its state alone.
+            state = "tampered"
 
     if user_homes and installed == 0:
+        # A user can make every install fail (a symlinked or FIFO hooks.json), so
+        # a detected tamper is still reported rather than lost with the deferral.
+        if state == "tampered":
+            m.notify_setup_complete(api_key, "codex", backend_url=base,
+                                    install_state=state, serial_number=device_id,
+                                    install_mode="binary")
         return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
@@ -726,31 +1163,163 @@ def _setup_codex(opts):
                             hook_hash=m.hook_script_hash(hook_source_path("codex")),
                             install_mode="binary")
     if opts["backfill"]:
+        m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
 
 
-def _codex_detect_state(user_homes) -> str:
-    """Per-user analog of the python detect_install_state(): now that codex
-    registers in ~/.codex/hooks.json, install state is read from there.
-    'fresh' = no user has a hooks.json; 'persisted' = at least one references
-    this binary or the python-era unbound.py; 'tampered' otherwise."""
-    saw_json = False
-    saw_known_ref = False
+# Characters the shell acts on in an unquoted word.
+_SHELL_SPECIAL = set(" \t\n\"'\\$`;&|<>()*?[]{}~#!")
+# Events where an async hook can't block, so codex wouldn't enforce our answer.
+# Older installs wrote async only on PostToolUse and SessionStart.
+_CODEX_BLOCKING_EVENTS = ("PreToolUse", "UserPromptSubmit", "Stop")
+# Codex ignores the matcher on these (matcher_pattern_for_event).
+_CODEX_UNMATCHED_EVENTS = ("UserPromptSubmit", "Stop", "Interrupt")
+
+
+def _codex_runs_wrapper(command, wrapper: Path) -> bool:
+    """The command is a way our installers write the wrapper: shell-quoted, or quoted or bare where the shell
+    expands nothing. Anything else can expand, redirect or skip it."""
+    if not isinstance(command, str):
+        return False
+    path = str(wrapper)
+    forms = {shlex.quote(path)}
+    if "'" not in path:
+        forms.add(f"'{path}'")
+    if not any(c in path for c in '"$`\\'):
+        forms.add(f'"{path}"')
+    if not any(c in _SHELL_SPECIAL for c in path):
+        forms.add(path)
+    return command in forms
+
+
+def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
+    """A group that fires our wrapper for every tool and lets it act: a match-all matcher (absent, "" or "*"),
+    the exact command, synchronous where it blocks, and no shorter timeout than any we've written."""
+    if not isinstance(group, dict):
+        return False
+    if event not in _CODEX_UNMATCHED_EVENTS and group.get("matcher") not in (None, "", "*"):
+        return False
+    floor = 10 if event == "PreToolUse" else 60
+    hooks = group.get("hooks")
+    for h in hooks if isinstance(hooks, list) else []:
+        if not (isinstance(h, dict) and h.get("type") == "command"
+                and _codex_runs_wrapper(h.get("command"), wrapper)):
+            continue
+        if h.get("async") and event in _CODEX_BLOCKING_EVENTS:
+            continue
+        timeout = h.get("timeout")  # an Option<u64>: null is unset, like a missing key
+        timeout = floor if timeout is None else timeout
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < floor:
+            continue
+        return True
+    return False
+
+
+try:
+    import tomllib
+except ImportError:  # python older than 3.11; the shipped binary bundles it
+    tomllib = None
+
+
+def _codex_hooks_disabled(config_path: Path) -> bool:
+    """Whether config.toml turns codex's hooks feature off (on by default; the legacy
+    key codex_hooks is an alias), or codex can't load it at all, so no hook runs."""
     try:
-        for _username, home_dir in user_homes:
-            p = home_dir / ".codex" / "hooks.json"
-            if p.exists():
-                saw_json = True
-                try:
-                    text = p.read_text(encoding="utf-8")
-                    if str(HOOK_BINARY) in text or "unbound.py" in text:
-                        saw_known_ref = True
-                except OSError:
-                    pass
-        if not saw_json:
-            return "fresh"
-        return "persisted" if saw_known_ref else "tampered"
+        data = _read_user_file(config_path, follow=True)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True  # a FIFO or oversized file can still hand codex hooks = false
+    if tomllib is None:
+        return False
+    try:
+        features = tomllib.loads(data.decode("utf-8")).get("features")
+    except (ValueError, RecursionError):
+        return True  # codex refuses the whole config, and setup won't rewrite it
+    if features is None:
+        return False
+    # Codex reads [features] as a table of booleans (a few features take a table);
+    # anything else there fails the whole load.
+    if not isinstance(features, dict) or not all(isinstance(v, (bool, dict)) for v in features.values()):
+        return True
+    return any(k in features and features[k] is not True for k in ("hooks", "codex_hooks"))
+
+
+def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
+    """Whether this hooks.json registers our wrapper for every event, read as the profile's user the way codex
+    does (following a symlink). Anything codex couldn't load counts as not registered."""
+    try:
+        config = _load_codex_json(_read_user_file(hooks_path, follow=True))
+        if not _codex_can_load(config):
+            return False
+    except Exception:  # RecursionError included: too deep for codex too
+        return False
+    events = config.get("hooks", {})
+    # Every event setup installs, or a dropped PreToolUse would still read healthy.
+    return all(any(_codex_group_runs_wrapper(group, wrapper, event)
+                   for group in (events.get(event) if isinstance(events.get(event), list) else []))
+               for event in _codex_hooks_config(None))
+
+
+def _writable_dir(path: Path) -> bool:
+    """Runs as the profile's user: setup could replace files in this folder."""
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def _codex_wrapper_current(wrapper: Path) -> bool:
+    """Runs as the profile's user: the file at our path is this release's wrapper."""
+    try:
+        return _read_user_file(wrapper, follow=False).decode("utf-8") == _codex_wrapper_source()
+    except (OSError, ValueError):
+        return False
+
+
+def _codex_wrapper_present(wrapper: Path) -> bool:
+    """A regular file at our path, not followed: a symlink there isn't something we installed."""
+    try:
+        return stat.S_ISREG(wrapper.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _codex_wrapper_runnable(wrapper: Path) -> bool:
+    """Runs as the profile's user: codex launches the path through the shell, which
+    needs read and execute for that user."""
+    return os.access(wrapper, os.R_OK | os.X_OK)
+
+
+def _codex_detect_state(m, user_homes):
+    """Per profile, on the pair setup installs (wrapper script and hooks.json entry): 'tampered' if any profile
+    has one alone or its check was stopped, 'fresh' if none has either, else 'persisted'; None on failure."""
+    try:
+        any_complete = False
+        for username, home_dir in user_homes:
+            wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
+            hooks_path = home_dir / ".codex" / "hooks.json"
+            script = _codex_wrapper_present(wrapper)
+            if script:
+                script = _as_user(m, username, _codex_wrapper_runnable, wrapper)
+                if script is False:
+                    return "tampered"  # our path holds a file this user can't run
+            registered = False
+            if os.path.lexists(hooks_path):
+                registered = _as_user(m, username, _codex_hook_registered, hooks_path, wrapper)
+            if registered is None or script is None:
+                # Only reached for a profile holding our files: its user can kill or stop
+                # the check, so a check that didn't answer doesn't keep the old state.
+                return "tampered"
+            elif script and registered:
+                # Both halves in place, yet codex may still run nothing: the hooks feature
+                # turned off, or a config.toml codex can't load.
+                disabled = _as_user(m, username, _codex_hooks_disabled, hooks_path.parent / "config.toml")
+                if disabled is None or disabled:
+                    return "tampered"
+                else:
+                    any_complete = True
+            elif script or registered:
+                return "tampered"
+        return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
         return None
@@ -778,7 +1347,8 @@ def _setup_cursor(opts):
                 urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
             m.remove_user_level_hooks(username, home_dir)
 
-    state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json")
+    state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"],
+                          relative_ok=True)
     hooks_ok, hooks_changed = _write_cursor_enterprise_hooks(m)
     if not hooks_ok:
         return ("deferred", "enterprise hooks.json write failed")
@@ -793,33 +1363,58 @@ def _setup_cursor(opts):
     return ("configured", None)
 
 
-def _copilot_detect_state(user_homes) -> str:
-    """Binary-era analog of copilot detect_install_state(): per-user files.
-    'fresh' = no user has an unbound.json; 'persisted' = at least one user's
-    unbound.json already points at the binary; 'tampered' otherwise."""
-    saw_json = False
-    saw_known_ref = False
+def _copilot_detect_state(m, user_homes):
+    """Per profile, as that user: ~/.copilot/hooks/unbound.json must run our command on every event. 'tampered'
+    if any doesn't or its check didn't answer, 'fresh' if none exists, else 'persisted'; None on failure."""
     try:
-        for _username, home_dir in user_homes:
-            p = home_dir / ".copilot" / "hooks" / "unbound.json"
-            if p.exists():
-                saw_json = True
-                try:
-                    text = p.read_text(encoding="utf-8")
-                    if str(HOOK_BINARY) in text or "unbound.py" in text:
-                        saw_known_ref = True
-                except OSError:
-                    pass
-        if not saw_json:
-            return "fresh"
-        return "persisted" if saw_known_ref else "tampered"
+        any_complete = False
+        for username, home_dir in user_homes:
+            if home_dir is None:
+                continue
+            path = home_dir / ".copilot" / "hooks" / "unbound.json"
+            if not os.path.lexists(path):
+                continue
+            # A check its user killed or stopped (None) doesn't keep the old state either.
+            if not _as_user(m, username, _copilot_registered, path):
+                return "tampered"
+            any_complete = True
+        return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] copilot install_state detection failed: {e}", file=sys.stderr)
         return None
 
 
+def _copilot_current(path: Path) -> bool:
+    """Runs as the profile's user: the file holds this release's registration."""
+    try:
+        config = _strict_json(_read_user_file(path, follow=True).decode("utf-8"))
+        hooks = config.get("hooks") if isinstance(config, dict) else None
+        return _holds_every_entry(hooks, _copilot_hooks_config()["hooks"])
+    except Exception:
+        return False
+
+
+def _copilot_registered(path: Path) -> bool:
+    """Runs as the profile's user: every event still holds the entry setup wrote, or (a python-era install
+    being migrated) runs its own still-present unbound.py in both command and bash."""
+    try:
+        config = _strict_json(_read_user_file(path, follow=True).decode("utf-8"))
+        hooks = config.get("hooks") if isinstance(config, dict) else None
+        expected = _copilot_hooks_config()["hooks"]
+        script = path.parent / "unbound.py"
+        quoted = f'"{script}"'
+        return _holds_every_entry(hooks, expected) or (
+            not any(ch in '$`\\"' for ch in str(script))  # double quotes still expand these
+            and _codex_wrapper_present(script) and _codex_wrapper_runnable(script) and _runs_on_every_event(
+                hooks, expected, lambda h: h.get("type") == "command"
+                and h.get("command") == quoted and h.get("bash") == quoted, grouped=False))
+    except Exception:  # RecursionError included: Copilot can't load it either
+        return False
+
+
 def _setup_copilot(opts):
     m = _module("copilot")
+    m._RUN_AS_USER_TIMEOUT = _USER_CHECK_TIMEOUT  # until the report: a user can pause a call
     base, gateway = _normalized_urls(m, opts)
     device_id = m.get_device_identifier()
     if not device_id:
@@ -833,19 +1428,29 @@ def _setup_copilot(opts):
         return ("deferred", "failed to set UNBOUND_COPILOT_API_KEY")
 
     user_homes = m.get_all_user_homes()
-    state = _copilot_detect_state(user_homes)
+    state = _copilot_detect_state(m, user_homes)
     installed = 0
     for username, home_dir in user_homes:
+        if home_dir is None:
+            continue  # no home to hold a config or a registration
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         # Earlier versions configured the exporter here, per user, in VS Code
         # settings. The managed file written below outranks those, so they are only
         # taken back out.
-        if home_dir is not None:
-            m.clear_otel_export_for_user(username, home_dir)
+        m.clear_otel_export_for_user(username, home_dir)
+        registration = home_dir / ".copilot" / "hooks" / "unbound.json"
+        had_registration = os.path.lexists(registration)  # a profile setup never reached isn't tampered
         if _install_copilot_hooks_for_user(m, username, home_dir):
             installed += 1
+        elif state == "persisted" and had_registration and (
+                _as_user(m, username, _copilot_registered, registration) is False
+                # A folder locked against setup keeps whatever's there, which only
+                # today's registration vouches for (a python-era script isn't checked).
+                or (_as_user(m, username, _writable_dir, registration.parent) is False
+                    and _as_user(m, username, _copilot_current, registration) is False)):
+            state = "tampered"
 
     # Machine-wide, so once for the device rather than once per user. Called
     # explicitly: this command drives the vendored module's named functions rather
@@ -853,6 +1458,11 @@ def _setup_copilot(opts):
     m.configure_managed_telemetry(api_key, gateway_url=gateway)
 
     if user_homes and installed == 0:
+        # A user can make every install fail, so a detected tamper is still reported.
+        if state == "tampered":
+            m.notify_setup_complete(api_key, "copilot", backend_url=base,
+                                    install_state=state, serial_number=device_id,
+                                    install_mode="binary")
         return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "copilot", backend_url=base,
@@ -861,6 +1471,7 @@ def _setup_copilot(opts):
                             install_mode="binary")
     if opts["backfill"]:
         hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
+        m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, user_homes, hook_source)
     return ("configured", None)
 

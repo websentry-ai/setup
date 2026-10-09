@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import signal
+import select
 import random
 import stat
 import shutil
@@ -60,7 +62,23 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
-def _run_as_user(username, fn, *args, **kwargs):
+def _become_user(info) -> None:
+    """Drop to the user with their own groups, as Copilot runs: a file shared through
+    a group must read the same here as it does to Copilot."""
+    try:
+        os.initgroups(info.pw_name, info.pw_gid)
+    except OSError:
+        os.setgroups([])
+    os.setgid(info.pw_gid)
+    os.setuid(info.pw_uid)
+
+
+# A limit for every privilege-dropped call, set by a caller that must not be held by
+# a user pausing one (the binary's setup); None (a backfill's case) waits as long as it takes.
+_RUN_AS_USER_TIMEOUT = None
+
+
+def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
 
@@ -85,16 +103,13 @@ def _run_as_user(username, fn, *args, **kwargs):
         info = pwd.getpwnam(username)
     except KeyError:
         return None
-    uid, gid = info.pw_uid, info.pw_gid
 
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
         try:
-            os.setgroups([])
-            os.setgid(gid)
-            os.setuid(uid)
+            _become_user(info)
             # setuid alone leaves $HOME pointing at root, so a Path.home() /
             # expanduser('~') inside fn would resolve to root's home, not the
             # user's. Callers pass explicit home_dir today; this hardens against
@@ -116,7 +131,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
+        # The child runs as the user, who can pause it: a caller can bound the wait
+        # (a backfill can't be bounded; a quick check can).
+        limit = _RUN_AS_USER_TIMEOUT if _timeout is None else _timeout
+        deadline = None if limit is None else time.monotonic() + limit
         while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
             try:
                 chunk = os.read(r_fd, 1 << 20)
             except OSError:
@@ -128,7 +154,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         data = b''.join(chunks)
         del chunks
         try:
-            _, status = os.waitpid(pid, 0)
+            if deadline is None:
+                _, status = os.waitpid(pid, 0)
+            else:  # paused after closing the pipe, it would still hold the wait
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        return None
+                    time.sleep(0.05)
         except OSError:
             return None
         if os.WEXITSTATUS(status) != 0:
