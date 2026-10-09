@@ -986,9 +986,8 @@ def test_a_home_with_a_space_gets_one_working_entry(env, monkeypatch):
 
 @pytest.mark.parametrize("ours", [True, False])
 def test_a_symlinked_hooks_json_is_updated_where_it_points(env, monkeypatch, ours):
-    """A dotfiles link stays a link. One that already registers our hook needs no
-    write; one that doesn't gets our registration in the file it points at, as the
-    user, keeping what was there."""
+    """A dotfiles link stays a link: one that registers our hook isn't written, one that doesn't gets our
+    registration in its target, as the user, keeping what was there."""
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
@@ -1981,9 +1980,8 @@ def test_augment_metadata_extras_are_fine_but_ours_must_hold(env, change, expect
 @pytest.mark.parametrize("script, expected", [("#!/bin/sh\nexit 0\n", ["fresh", "tampered"]),
                                               (None, ["fresh"])])
 def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch, script, expected):
-    """A no-op in a read-only hooks dir can't be unlinked, so it must not keep reading
-    persisted. Our own wrapper there still works: nothing new is reported, so the
-    last persisted stands."""
+    """A no-op in a read-only hooks dir can't be unlinked, so it mustn't read persisted. Our own wrapper there
+    still works, so nothing new is reported and the last persisted stands."""
     def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
         try:
             return fn(*a, **k)

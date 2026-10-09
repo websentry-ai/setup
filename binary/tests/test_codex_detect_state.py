@@ -1,6 +1,4 @@
-"""The binary's codex install-state detector, judged per profile on the pair setup
-installs: the wrapper script and our entry in that user's ~/.codex/hooks.json.
-Runs the real detector against sandboxed homes; only the privilege drop is
+"""The binary's codex detector, per profile, run against sandboxed homes. Only the privilege drop is
 stubbed (it needs root), except where a test exercises its failure."""
 
 import getpass

@@ -111,12 +111,8 @@ def _normalized_urls(m, opts):
 
 
 def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
-    """Binary-era analog of the python detect_install_state(), for the admin-owned
-    hook settings. 'persisted' = every event setup installs runs our exact command,
-    or the file still points at the python-era unbound.py (a legitimate install being
-    migrated; flagging those would flood the backend on rollout day); 'tampered' =
-    anything else, a file the tool can't parse included; 'fresh' = no file; None if
-    it couldn't be read. Callers that do not own the settings file must not call this."""
+    """'persisted' if every event runs our exact command (or the python-era unbound.py being migrated),
+    'tampered' otherwise or if unparsable, 'fresh' with no file, None if unreadable. Admin-owned files only."""
     try:
         data = _read_user_file(settings_path, follow=True)
     except FileNotFoundError:
@@ -158,9 +154,8 @@ def _strict_json(text):
 
 
 def _holds_every_entry(hooks, expected_hooks) -> bool:
-    """Every event still holds an entry that enforces like ours. Detection runs before
-    the rewrite, so a release that tweaks a timeout or adds a field mustn't read as
-    tampering on every device."""
+    """Every event still holds an entry that enforces like ours, so a release that tweaks a timeout or adds
+    a field doesn't read as tampering (detection runs before the rewrite)."""
     return isinstance(hooks, dict) and all(
         isinstance(hooks.get(event), list)
         and all(any(_same_entry(actual, entry) for actual in hooks[event]) for entry in entries)
@@ -190,9 +185,8 @@ def _handler_like(handler, ours) -> bool:
 
 
 def _runs_on_every_event(hooks, expected_hooks, runs, grouped=True) -> bool:
-    """Every event has a handler passing ``runs`` (a python-era install being migrated),
-    flat or in a group that matches every tool, no less able to block than ours: not
-    async where ours isn't, and no shorter timeout."""
+    """Every event has a handler passing ``runs`` (a python-era install being migrated), flat or in a
+    match-all group, no less able to block than ours: not async where ours isn't, no shorter timeout."""
     if not isinstance(hooks, dict):
         return False
     for event, entries in expected_hooks.items():
@@ -216,10 +210,8 @@ def _runs_on_every_event(hooks, expected_hooks, runs, grouped=True) -> bool:
 
 
 def _no_weaker(handler, ours) -> bool:
-    """Not async where ours isn't, and at least our timeout wherever we set one: the
-    policy check needs most of it (Copilot fails a killed pre-tool hook open), and a
-    missing one falls back to the tool's shorter default. A release that raises a
-    timeout must accept the old value for a release, or every device reads tampered."""
+    """Not async where ours isn't, and at least our timeout wherever we set one (Copilot fails a killed hook open).
+    A release that raises a timeout must accept the old value for a release, or every device reads tampered."""
     if handler.get("async") is True and ours.get("async") is not True:
         return False
     for key in ("timeout", "timeoutSec"):
@@ -231,9 +223,8 @@ def _no_weaker(handler, ours) -> bool:
 
 
 def _python_era_commands(script: Path, base) -> set:
-    """Exactly the commands the macOS python installers wrote for ``script``, each running
-    it directly: the quoted path, the bare one, or one relative to the settings folder
-    (Cursor). Anything more (a pipe, a redirect, a flag) can discard the hook's answer."""
+    """Exactly a command the macOS python installers wrote to run ``script``: quoted, bare, or relative to the
+    settings folder (Cursor). Anything more (a pipe, a redirect, a flag) can discard the hook's answer."""
     shapes = set()
     if not any(ch in '$`\\"' for ch in str(script)):
         shapes.add(f'"{script}"')  # double quotes still expand these
@@ -595,9 +586,8 @@ def _json_object(pairs):
 
 
 def _load_codex_json(data: bytes):
-    """Parse the way codex's serde_json would see it: no byte-order mark, NaN/Infinity,
-    a number past f64's range (1e400, or a 400-digit integer) or lone surrogates.
-    Duplicate keys are kept for the schema check."""
+    """Parse as codex's serde_json would: reject a byte-order mark, NaN/Infinity, numbers past f64's range
+    and lone surrogates. Duplicate keys are kept for the schema check."""
     if data.startswith(b"\xef\xbb\xbf"):
         raise ValueError("byte-order mark")
 
@@ -621,10 +611,8 @@ def _load_codex_json(data: bytes):
 _SERDE_MAX_DEPTH = 128  # serde_json fails on the 128th nested [ or {
 
 
-# serde_json fails on the 128th nested [ or {, but only in values it deserializes:
-# a field codex doesn't know is skipped unchecked. The only nested value codex reads
-# is an mcp_tool handler's input, which sits under file, hooks, event, group, hooks
-# and handler.
+# serde_json fails on the 128th nested [ or { only in values codex deserializes; the only nested one it
+# reads is an mcp_tool handler's input (file > hooks > event > group > hooks > handler).
 _SERDE_HANDLER_DEPTH = 6
 
 
@@ -736,9 +724,8 @@ def _codex_can_load(config) -> bool:
 
 
 def _codex_make_loadable(config) -> dict:
-    """Drop only content that breaks codex's known schema (wrong types, malformed
-    groups or handlers), so the hooks it can load run again. Keys and handler types
-    this check doesn't know are kept: a newer codex may define them."""
+    """Drop only content that breaks codex's known schema, so the hooks it can load run again. Unknown keys
+    and handler types are kept: a newer codex may define them."""
     if not isinstance(config, dict):
         return {}
     clean = dict(config)
@@ -814,9 +801,8 @@ def _as_user(m, username, fn, *args):
 
 
 def _replace_user_file(path: Path, data: bytes, mode: int) -> None:
-    """Write ``data`` beside ``path`` and rename it over whatever is there: a symlink or
-    FIFO at ``path`` is replaced rather than written through, and a write that fails
-    leaves the old file in place."""
+    """Write ``data`` beside ``path`` and rename it over: a symlink or FIFO there is replaced, not written
+    through, and a failed write leaves the old file in place."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     if os.path.lexists(tmp):
         tmp.unlink()
@@ -900,9 +886,8 @@ def _codex_wrapper_source() -> str:
 
 
 def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
-    """Idempotent merge of the codex hook events into hooks.json, preserving other
-    tools' hooks. Writes only when something changed, so a file that already has
-    our hook is left alone even when it's a symlink we would refuse to write."""
+    """Idempotent merge of the codex hook events into hooks.json, keeping other tools' hooks. Writes only on
+    change, so a symlink we'd refuse to write is left alone when it already has our hook."""
     wrapper = Path(wrapper_path)
     command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
     try:
@@ -1193,9 +1178,8 @@ _CODEX_UNMATCHED_EVENTS = ("UserPromptSubmit", "Stop", "Interrupt")
 
 
 def _codex_runs_wrapper(command, wrapper: Path) -> bool:
-    """The command is literally a way our installers write the wrapper: shell-
-    quoted, or single/double-quoted or bare where the shell expands nothing.
-    Anything else can expand, redirect or skip it."""
+    """The command is a way our installers write the wrapper: shell-quoted, or quoted or bare where the shell
+    expands nothing. Anything else can expand, redirect or skip it."""
     if not isinstance(command, str):
         return False
     path = str(wrapper)
@@ -1210,9 +1194,8 @@ def _codex_runs_wrapper(command, wrapper: Path) -> bool:
 
 
 def _codex_group_runs_wrapper(group, wrapper: Path, event: str) -> bool:
-    """A hooks.json group that fires our wrapper for every tool and lets it act: a
-    match-all matcher (codex treats absent, "" and "*" alike), the exact command,
-    synchronous where it blocks, and no shorter timeout than any we've written."""
+    """A group that fires our wrapper for every tool and lets it act: a match-all matcher (absent, "" or "*"),
+    the exact command, synchronous where it blocks, and no shorter timeout than any we've written."""
     if not isinstance(group, dict):
         return False
     if event not in _CODEX_UNMATCHED_EVENTS and group.get("matcher") not in (None, "", "*"):
@@ -1264,9 +1247,8 @@ def _codex_hooks_disabled(config_path: Path) -> bool:
 
 
 def _codex_hook_registered(hooks_path: Path, wrapper: Path) -> bool:
-    """Whether this hooks.json registers our wrapper for every event. Runs as the
-    profile's user and reads the file as codex does, following a symlink.
-    Anything codex couldn't load counts as not registered."""
+    """Whether this hooks.json registers our wrapper for every event, read as the profile's user the way codex
+    does (following a symlink). Anything codex couldn't load counts as not registered."""
     try:
         config = _load_codex_json(_read_user_file(hooks_path, follow=True))
         if not _codex_can_load(config):
@@ -1308,11 +1290,8 @@ def _codex_wrapper_runnable(wrapper: Path) -> bool:
 
 
 def _codex_detect_state(m, user_homes):
-    """Install state before this run reasserts it, per profile, on the pair setup
-    installs: the wrapper script and our hooks.json entry. Either alone leaves codex
-    unenforced for that user. 'fresh' (no profile has either), 'persisted' (one has
-    both), 'tampered' (any has one without the other, or a check its user stopped; wins),
-    None if detection itself failed."""
+    """Per profile, on the pair setup installs (wrapper script and hooks.json entry): 'tampered' if any profile
+    has one alone or its check was stopped, 'fresh' if none has either, else 'persisted'; None on failure."""
     try:
         any_complete = False
         for username, home_dir in user_homes:
@@ -1385,10 +1364,8 @@ def _setup_cursor(opts):
 
 
 def _copilot_detect_state(m, user_homes):
-    """Per user, like codex: each profile's ~/.copilot/hooks/unbound.json is read as
-    that user and must run our exact command on every event. 'fresh' (no profile has
-    the file), 'persisted' (one has a working one), 'tampered' (any profile's file
-    doesn't, or its check didn't answer; wins), None if detection itself failed."""
+    """Per profile, as that user: ~/.copilot/hooks/unbound.json must run our command on every event. 'tampered'
+    if any doesn't or its check didn't answer, 'fresh' if none exists, else 'persisted'; None on failure."""
     try:
         any_complete = False
         for username, home_dir in user_homes:
@@ -1418,9 +1395,8 @@ def _copilot_current(path: Path) -> bool:
 
 
 def _copilot_registered(path: Path) -> bool:
-    """Runs as the profile's user: every event still holds the entry setup wrote. A
-    python-era file, every event running its own unbound.py (in both command and bash)
-    with that script still there, is a legitimate install being migrated."""
+    """Runs as the profile's user: every event still holds the entry setup wrote, or (a python-era install
+    being migrated) runs its own still-present unbound.py in both command and bash."""
     try:
         config = _strict_json(_read_user_file(path, follow=True).decode("utf-8"))
         hooks = config.get("hooks") if isinstance(config, dict) else None
