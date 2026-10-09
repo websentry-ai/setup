@@ -528,5 +528,53 @@ class TestCopilotUserCachePath(unittest.TestCase):
             self.assertEqual(unbound._copilot_user_cache_path(), Path("/tmp/xdg/copilot/copilot-user-cache.json"))
 
 
+class TestCopilotNoAccountReason(_IsolatedConfig):
+    """A turn with no account says why."""
+
+    def _reason(self, surface):
+        return unbound.read_account_identity(surface=surface)["account_reason"]
+
+    def test_vscode_not_installed(self):
+        self.assertEqual(self._reason("vscode"), "vscode_not_found")
+
+    def test_vscode_signed_out(self):
+        self._vscode(login="gone-user", sku=None)
+        self.assertEqual(self._reason("vscode"), "vscode_signed_out")
+
+    def test_vscode_never_signed_in_to_copilot(self):
+        self._vscode(login=None, sku=None)
+        self.assertEqual(self._reason("vscode"), "vscode_no_copilot_login")
+
+    def test_a_signed_out_older_install_is_found_past_a_newer_one_without_copilot(self):
+        self._vscode(login="gone-user", sku=None, install=0, mtime=1_000)
+        self._vscode(login=None, sku=None, install=1, mtime=2_000)
+        self.assertEqual(self._reason("vscode"), "vscode_signed_out")
+
+    def test_vscode_unreadable(self):
+        path = self.vscode_dirs[0] / "globalStorage" / "state.vscdb"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"not a database")
+        with patch.object(unbound, "log_error"):
+            self.assertEqual(self._reason("vscode"), "vscode_unreadable")
+
+    def test_cli_without_a_login(self):
+        with patch.dict(os.environ, {}):
+            for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+                os.environ.pop(var, None)
+            self.assertEqual(self._reason("cli"), "cli_no_login")
+
+    def test_cli_signed_in_by_an_env_token(self):
+        with patch.dict(os.environ, {"GH_TOKEN": "x"}):
+            self.assertEqual(self._reason("cli"), "env_token")
+
+    def test_a_cloud_turn_has_its_own_reason(self):
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "x"}):
+            self.assertEqual(self._reason("cloud"), "cloud_no_login")
+
+    def test_a_signed_in_turn_has_no_reason(self):
+        self._write(SIGNED_IN)
+        self.assertNotIn("account_reason", unbound.read_account_identity(surface="cli"))
+
+
 if __name__ == "__main__":
     unittest.main()

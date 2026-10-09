@@ -10,7 +10,9 @@ Covers:
 """
 
 import base64
+import importlib.util
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -173,9 +175,16 @@ class TestReadAccountIdentity(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.auth_file = self.tmp / "auth.json"
-        self._p = patch.object(unbound, "CODEX_AUTH_PATH", self.auth_file)
-        self._p.start()
-        self.addCleanup(self._p.stop)
+        self.config_file = self.tmp / "config.toml"
+        for name, value in (("CODEX_AUTH_PATH", self.auth_file), ("CODEX_CONFIG_PATH", self.config_file)):
+            p = patch.object(unbound, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        env = patch.dict(os.environ, {})
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
+            os.environ.pop(var, None)
 
     def _write_auth(self, data):
         self.auth_file.write_text(json.dumps(data), encoding="utf-8")
@@ -283,9 +292,16 @@ class TestBuildAccountIdentity(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.auth_file = self.tmp / "auth.json"
-        self._p = patch.object(unbound, "CODEX_AUTH_PATH", self.auth_file)
-        self._p.start()
-        self.addCleanup(self._p.stop)
+        self.config_file = self.tmp / "config.toml"
+        for name, value in (("CODEX_AUTH_PATH", self.auth_file), ("CODEX_CONFIG_PATH", self.config_file)):
+            p = patch.object(unbound, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        env = patch.dict(os.environ, {})
+        env.start()
+        self.addCleanup(env.stop)
+        for var in ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"):
+            os.environ.pop(var, None)
 
     def _write_auth_with_org(self, org_id="org-test", email="test@example.com"):
         token = _make_jwt({
@@ -312,6 +328,7 @@ class TestBuildAccountIdentity(unittest.TestCase):
         """device_serial is the one optional key: a host with no readable serial
         and a cold cache omits it, so pin both shapes rather than the host's."""
         always = {"org_id", "plan", "auth_mode", "email_domain", "user_email"}
+        self._write_auth_with_org()
         with patch.object(unbound, "_device_serial", return_value=None):
             self.assertEqual(set(unbound.build_account_identity().keys()), always)
         with patch.object(unbound, "_device_serial", return_value="SERIAL1"):
@@ -319,6 +336,163 @@ class TestBuildAccountIdentity(unittest.TestCase):
                 set(unbound.build_account_identity().keys()),
                 always | {"device_serial"},
             )
+
+
+class TestAccountReasonAndGateway(unittest.TestCase):
+    """An empty account says why, and a gateway-routed Codex is named by its gateway host."""
+
+    setUp = TestReadAccountIdentity.setUp
+    _write_auth = TestReadAccountIdentity._write_auth
+    _auth_with_token = TestReadAccountIdentity._auth_with_token
+
+    def _config(self, body):
+        self.config_file.write_text(body, encoding="utf-8")
+
+    def test_no_auth_json_says_so(self):
+        identity = unbound.read_account_identity()
+        self.assertEqual((identity["user_email"], identity["account_reason"]), (None, "auth_json_missing"))
+
+    def test_credentials_kept_in_the_keyring(self):
+        for store in ("keyring", "auto", "ephemeral"):
+            with self.subTest(store=store):
+                self._config('cli_auth_credentials_store = "%s"\n' % store)
+                self.assertEqual(unbound.read_account_identity()["account_reason"], "credentials_" + store)
+
+    def test_an_api_key_in_the_environment(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "x"}):
+            identity = unbound.read_account_identity()
+        self.assertEqual((identity["auth_mode"], identity["account_reason"]), ("api_key", "api_key_env"))
+
+    def test_an_api_key_sign_in(self):
+        self._write_auth({"auth_mode": "apikey", "OPENAI_API_KEY": "x"})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "api_key")
+
+    def test_a_subscription_without_an_id_token(self):
+        self._write_auth({"auth_mode": "chatgpt", "tokens": {}})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "no_id_token")
+
+    def test_an_id_token_that_cannot_be_decoded(self):
+        self._write_auth({"auth_mode": "chatgpt", "tokens": {"id_token": "bad.!!!.token"}})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "id_token_unreadable")
+
+    def test_an_unreadable_auth_json(self):
+        self.auth_file.write_text("{not json", encoding="utf-8")
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "auth_json_unreadable")
+
+    def test_the_gateway_host_names_an_api_key_account(self):
+        self._write_auth({"auth_mode": "apikey", "OPENAI_API_KEY": "x"})
+        self._config('openai_base_url = "https://AI-Gateway.zende.sk/v1"\n')
+        identity = unbound.read_account_identity()
+        self.assertEqual((identity["org_id"], identity["account_reason"]), ("ai-gateway.zende.sk", "api_key"))
+
+    def test_the_chosen_provider_base_url_wins(self):
+        self._config('model_provider = "corp"\nopenai_base_url = "https://other.example"\n\n'
+                     '[model_providers.corp]\nname = "Corp"\nbase_url = "https://llm.corp.example/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "llm.corp.example")
+
+    def test_openai_unbound_and_loopback_hosts_name_no_one(self):
+        for url in ("https://api.openai.com/v1", "https://chatgpt.com/backend-api", "https://api.getunbound.ai/v1",
+                    "http://localhost:8080", "http://127.0.0.1:4000", "https://openrouter.ai/api/v1",
+                    "https://api.groq.com/openai/v1", "https://generativelanguage.googleapis.com/v1beta",
+                    "https://bedrock-runtime.us-east-1.amazonaws.com", "https://models.github.ai/inference",
+                    "https://models.inference.ai.azure.com"):
+            with self.subTest(url=url):
+                self._config('openai_base_url = "%s"\n' % url)
+                self.assertIsNone(unbound.read_account_identity()["org_id"])
+
+    def test_a_company_host_that_merely_ends_like_openai_is_a_gateway(self):
+        self._config('openai_base_url = "https://gateway.company-openai.com/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.company-openai.com")
+
+    def test_a_company_azure_openai_host_is_a_gateway(self):
+        self._config('openai_base_url = "https://acme.openai.azure.com/openai"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "acme.openai.azure.com")
+
+    def test_the_active_profile_chooses_the_provider(self):
+        self._config('model_provider = "personal"\nprofile = "work"\n\n'
+                     '[profiles.work]\nmodel_provider = "corp"\n\n'
+                     '[model_providers.personal]\nbase_url = "https://me.example/v1"\n\n'
+                     '[model_providers.corp]\nbase_url = "https://llm.corp.example/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "llm.corp.example")
+
+    def test_a_readable_auth_json_with_no_sign_in_says_so(self):
+        self._write_auth({"last_refresh": "2026-10-01"})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "no_account_in_auth_json")
+
+    def test_a_keyring_store_explains_a_token_less_auth_json(self):
+        self._write_auth({"auth_mode": "chatgpt", "tokens": {}})
+        self._config('cli_auth_credentials_store = "keyring"\n')
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "credentials_keyring")
+
+    def test_an_api_key_outranks_the_credential_store(self):
+        self._config('cli_auth_credentials_store = "auto"\n')
+        self._write_auth({"auth_mode": "apikey", "OPENAI_API_KEY": "x"})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "api_key")
+        self.auth_file.unlink()
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "x"}):
+            identity = unbound.read_account_identity()
+        self.assertEqual((identity["auth_mode"], identity["account_reason"]), ("api_key", "api_key_env"))
+
+    def test_a_company_gateway_on_aws_names_the_org(self):
+        self._config('openai_base_url = "https://abc123.execute-api.us-east-1.amazonaws.com/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "abc123.execute-api.us-east-1.amazonaws.com")
+
+    def test_the_openai_base_url_environment_variable_is_a_gateway(self):
+        with patch.dict(os.environ, {"OPENAI_BASE_URL": "https://ai-gateway.zende.sk/v1"}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "ai-gateway.zende.sk")
+
+    def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
+        self._write_auth(self._auth_with_token({
+            "email": "dave@corp.com",
+            "https://api.openai.com/auth": {"organizations": [{"id": "org-b", "is_default": True}]},
+        }))
+        self._config('openai_base_url = "https://ai-gateway.zende.sk/v1"\n')
+        identity = unbound.read_account_identity()
+        self.assertEqual(identity["org_id"], "org-b")
+        self.assertNotIn("account_reason", identity)
+
+    def test_the_regex_fallback_accepts_a_commented_provider_header(self):
+        raw = ('model_provider = "corp"\nopenai_base_url = "https://root.example"\n\n'
+               '[model_providers.corp] # Corporate gateway\nbase_url = "https://llm.corp.example/v1"\n')
+        self.assertEqual(unbound._codex_account_config_regex(raw)["model_providers"]["corp"]["base_url"],
+                         "https://llm.corp.example/v1")
+
+    def test_the_regex_fallback_ignores_keys_inside_a_leading_table(self):
+        raw = '[profiles.x]\ncli_auth_credentials_store = "keyring"\nopenai_base_url = "https://x.example"\n'
+        self.assertEqual(unbound._codex_account_config_regex(raw), {})
+
+    def test_a_config_that_fails_to_parse_never_breaks_the_identity(self):
+        self._config('openai_base_url = "https://ai-gateway.zende.sk/v1"\n')
+        with patch.object(unbound, "_codex_account_config", side_effect=RuntimeError("boom")):
+            identity = unbound.read_account_identity()
+        self.assertEqual((identity["org_id"], identity["account_reason"]), (None, "auth_json_missing"))
+
+    def test_the_regex_fallback_resolves_the_active_profile(self):
+        raw = ('model_provider = "personal"\nprofile = "work"\n\n'
+               '[profiles.work]\nmodel_provider = "corp"\n\n'
+               '[model_providers.personal]\nbase_url = "https://me.example/v1"\n\n'
+               '[model_providers.corp] # Corporate\nbase_url = "https://llm.corp.example/v1"\n')
+        with patch.object(unbound, "CODEX_CONFIG_PATH", self.config_file), \
+                patch.dict("sys.modules", {"tomllib": None}):
+            self.config_file.write_text(raw, encoding="utf-8")
+            self.assertEqual(unbound._codex_account_config()["base_url"], "https://llm.corp.example/v1")
+
+    def test_the_regex_fallback_reads_the_same_keys(self):
+        raw = ('model_provider = "corp"\ncli_auth_credentials_store = "keyring"\n\n'
+               '[model_providers.corp]\nbase_url = "https://llm.corp.example/v1"\n')
+        data = unbound._codex_account_config_regex(raw)
+        self.assertEqual(data["cli_auth_credentials_store"], "keyring")
+        self.assertEqual(data["model_providers"]["corp"]["base_url"], "https://llm.corp.example/v1")
+
+
+class TestCodexHome(unittest.TestCase):
+    def test_codex_home_moves_auth_and_config(self):
+        with patch.dict(os.environ, {"CODEX_HOME": "/tmp/relocated-codex"}):
+            spec = importlib.util.spec_from_file_location("codex_home_probe", unbound.__file__)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        self.assertEqual(module.CODEX_AUTH_PATH, Path("/tmp/relocated-codex/auth.json"))
+        self.assertEqual(module.CODEX_CONFIG_PATH, Path("/tmp/relocated-codex/config.toml"))
 
 
 class TestStopExchangeCarriesTheAccount(unittest.TestCase):

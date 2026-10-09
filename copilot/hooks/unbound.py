@@ -1752,6 +1752,32 @@ def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[s
     return None, None
 
 
+def _vscode_no_account_reason(user_dir: Optional[Path] = None) -> str:
+    paths = [d / 'globalStorage' / 'state.vscdb' for d in ([user_dir] if user_dir else _vscode_user_dirs())]
+    paths = [p for p in paths if p.is_file()]
+    if not paths:
+        return 'vscode_not_found'
+    unreadable = False
+    for path in sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True):
+        try:
+            with closing(sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True, timeout=1.0)) as connection:
+                row = connection.execute('SELECT value FROM ItemTable WHERE key = ?',
+                                         (_VSCODE_COPILOT_ACCOUNT_KEY,)).fetchone()
+        except (OSError, sqlite3.Error):
+            unreadable = True
+            continue
+        login = row[0] if row else None
+        login = login.decode('utf-8', 'replace') if isinstance(login, bytes) else login
+        if isinstance(login, str) and login.strip():
+            return 'vscode_signed_out'
+    return 'vscode_unreadable' if unreadable else 'vscode_no_copilot_login'
+
+
+def _copilot_cli_no_account_reason() -> str:
+    tokens = ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
+    return 'env_token' if any(os.environ.get(v) for v in tokens) else 'cli_no_login'
+
+
 def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
                           transcript_path: Optional[str] = None) -> Dict:
     """The signed-in account, keyed by GitHub login rather than address."""
@@ -1774,9 +1800,14 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
                 if vscode_login and vscode_login.lower() == login.lower():
                     plan = vscode_plan
     if not login:
+        try:
+            reason = (_vscode_no_account_reason(_vscode_user_dir_of(transcript_path)) if surface == 'vscode'
+                      else 'cloud_no_login' if surface == 'cloud' else _copilot_cli_no_account_reason())
+        except Exception:
+            reason = 'unknown'
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None,
-                'account_login': None, 'account_host': None}
+                'account_login': None, 'account_host': None, 'account_reason': reason}
     return {
         'org_id': org,
         'plan': plan,

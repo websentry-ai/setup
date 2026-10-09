@@ -24,10 +24,11 @@ from urllib.parse import unquote, urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", "").strip() or Path.home() / ".codex").expanduser()
+CODEX_AUTH_PATH = CODEX_HOME / "auth.json"
 # Shared with the cursor and claude-code hooks, so one probe serves all three.
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
-CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
+CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
@@ -2634,12 +2635,84 @@ def _codex_org_id(auth_claim: Dict) -> Optional[str]:
     return first.get('id') if isinstance(first, dict) else None
 
 
+def _codex_account_config() -> Dict:
+    """config.toml's credential store and the base URL Codex sends model traffic to."""
+    try:
+        raw = CODEX_CONFIG_PATH.read_text(encoding='utf-8')
+        try:
+            import tomllib
+            data = tomllib.loads(raw)
+        except ImportError:
+            data = _codex_account_config_regex(raw)
+    except Exception:
+        return {}
+    profiles = data.get('profiles') if isinstance(data.get('profiles'), dict) else {}
+    profile = profiles.get(data.get('profile')) if isinstance(data.get('profile'), str) else None
+    profile = profile if isinstance(profile, dict) else {}
+    provider = profile.get('model_provider') or data.get('model_provider')
+    providers = data.get('model_providers') if isinstance(data.get('model_providers'), dict) else {}
+    chosen = providers.get(provider) if isinstance(provider, str) else None
+    base_url = ((chosen.get('base_url') if isinstance(chosen, dict) else None)
+                or profile.get('openai_base_url') or data.get('openai_base_url'))
+    store = data.get('cli_auth_credentials_store')
+    return {'base_url': base_url if isinstance(base_url, str) else None,
+            'credentials_store': store if isinstance(store, str) else None}
+
+
+def _codex_account_config_regex(raw: str) -> Dict:
+    def section(name: str) -> Optional[str]:
+        m = re.search(r'^\s*\[%s\][^\n]*\n(.*?)(?=^\s*\[|\Z)' % name, raw, re.M | re.S)
+        return m.group(1) if m else None
+
+    def values(body: str, keys) -> Dict:
+        found = {}
+        for key in keys:
+            m = re.search(rf'^\s*{key}\s*=\s*["\']([^"\']*)["\']', body, re.M)
+            if m:
+                found[key] = m.group(1)
+        return found
+
+    data = values(re.split(r'^\s*\[', raw, maxsplit=1, flags=re.M)[0],
+                  ('model_provider', 'openai_base_url', 'cli_auth_credentials_store', 'profile'))
+    profile_name = data.get('profile')
+    body = section(r'profiles\.["\']?%s["\']?' % re.escape(profile_name)) if profile_name else None
+    profile = values(body, ('model_provider', 'openai_base_url')) if body else {}
+    if profile:
+        data['profiles'] = {profile_name: profile}
+    provider = profile.get('model_provider') or data.get('model_provider')
+    body = section(r'model_providers\.["\']?%s["\']?' % re.escape(provider)) if provider else None
+    url = values(body, ('base_url',)) if body else {}
+    if url:
+        data['model_providers'] = {provider: url}
+    return data
+
+
+def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
+    """The host of a company gateway Codex is routed through; None for OpenAI, Unbound or loopback."""
+    try:
+        host = (urlparse(base_url.strip()).hostname or '').lower() if base_url and base_url.strip() else ''
+    except ValueError:
+        return None
+    ours = urlparse(UNBOUND_GATEWAY_URL).hostname or ''
+    # Shared services, not a company gateway: Unbound, OpenAI, and public model providers.
+    shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com', 'openrouter.ai', 'groq.com', 'mistral.ai',
+              'googleapis.com', 'anthropic.com', 'together.xyz', 'deepseek.com', 'x.ai', 'fireworks.ai',
+              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co', 'github.ai',
+              'githubcopilot.com', 'inference.ai.azure.com')
+    bedrock = host.startswith('bedrock') and host.endswith('.amazonaws.com')
+    if (not host or bedrock or any(d and (host == d or host.endswith('.' + d)) for d in shared)
+            or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
+        return None
+    return host
+
+
 def read_account_identity() -> Dict:
     org_id = None
     plan = None
     auth_mode = None
     email = None
     email_domain = None
+    reason = None
     try:
         auth = json.loads(CODEX_AUTH_PATH.read_text(encoding='utf-8'))
         raw_mode = auth.get('auth_mode')
@@ -2653,21 +2726,45 @@ def read_account_identity() -> Dict:
         id_token = (auth.get('tokens') or {}).get('id_token')
         if id_token:
             claims = _decode_jwt_claims(id_token)
+            if not claims:
+                reason = 'id_token_unreadable'
             auth_claim = claims.get('https://api.openai.com/auth') or {}
             if isinstance(auth_claim, dict):
                 org_id = _codex_org_id(auth_claim)
                 plan = auth_claim.get('chatgpt_plan_type') or None
             email = claims.get('email') or None
             email_domain = _email_domain(email)
+        elif auth_mode == 'subscription':
+            reason = 'no_id_token'
+    except FileNotFoundError:
+        reason = 'auth_json_missing'
     except Exception:
-        pass
-    return {
+        reason = 'auth_json_unreadable'
+    if not org_id and not email:
+        try:
+            config = _codex_account_config()
+        except Exception:
+            config = {}
+        store = config.get('credentials_store') or ''
+        if reason is None and auth_mode == 'api_key':
+            reason = 'api_key'
+        elif reason == 'auth_json_missing' and (os.environ.get('OPENAI_API_KEY') or os.environ.get('CODEX_API_KEY')):
+            auth_mode, reason = 'api_key', 'api_key_env'
+        elif reason in (None, 'auth_json_missing', 'no_id_token') and store in ('keyring', 'auto', 'ephemeral'):
+            reason = 'credentials_' + store
+        elif reason is None:
+            reason = 'no_account_in_auth_json'
+        org_id = _codex_gateway_host(config.get('base_url') or os.environ.get('OPENAI_BASE_URL'))
+    identity = {
         'org_id': org_id,
         'plan': plan,
         'auth_mode': auth_mode,
         'user_email': email,
         'email_domain': email_domain,
     }
+    if reason:
+        identity['account_reason'] = reason
+    return identity
 
 
 # DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
