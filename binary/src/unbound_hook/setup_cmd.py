@@ -313,7 +313,8 @@ def _strip_codex_user_hooks(m, username, home_dir) -> None:
     updated where it points. A file that can't be read safely is left, with the script it may name."""
     hooks_path = home_dir / ".codex" / "hooks.json"
     wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
-    ours = lambda cmd: m._is_unbound_hook_command(cmd, wrapper) or _codex_runs_wrapper(cmd, wrapper)
+    command = _codex_system_hooks_config()["Stop"][0]["hooks"][0]["command"]
+    ours = lambda cmd: cmd == command or _codex_runs_wrapper(cmd, wrapper)
 
     def _strip():
         try:

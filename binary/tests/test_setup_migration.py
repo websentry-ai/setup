@@ -891,6 +891,16 @@ def test_a_symlinked_per_user_hooks_json_loses_only_our_entry(env):
     assert not wrapper.exists()
 
 
+def test_a_user_hook_that_only_mentions_our_binary_is_kept(env):
+    home = env["home"]
+    hooks_json = home / ".codex" / "hooks.json"
+    hooks_json.parent.mkdir(parents=True)
+    audit = {"type": "command", "command": f"/usr/local/bin/org-audit --target {BIN}"}
+    hooks_json.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [audit]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert json.loads(hooks_json.read_text())["hooks"]["Stop"] == [{"hooks": [audit]}]
+
+
 def test_a_fifo_at_the_per_user_hooks_json_does_not_hang_setup(env):
     """The strip reads as the user without blocking; what it can't read it leaves, script and all."""
     home = env["home"]
