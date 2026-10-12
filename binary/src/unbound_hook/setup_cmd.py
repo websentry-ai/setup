@@ -308,6 +308,51 @@ def _codex_hooks_config(hook_command):
     }
 
 
+def _codex_system_hooks_config():
+    """Our hooks for codex's system hooks.json; codex runs the command through the user's shell."""
+    return _codex_hooks_config(f'"{HOOK_BINARY}" hook codex')
+
+
+def _write_codex_system_hooks(m) -> bool:
+    """Merge our hooks into codex's system hooks.json, keeping any other hooks there. Codex runs this file
+    as a managed hook for every user, with no trust prompt, and only root can change it."""
+    try:
+        managed_dir = m.get_managed_settings_dir()
+        path = managed_dir / "hooks.json"
+        script = managed_dir / "hooks" / "unbound.py"
+        try:
+            existing = _load_codex_json(path.read_bytes()) if path.is_file() else {}
+        except (OSError, ValueError, RecursionError):
+            existing = {}
+        if not _codex_can_load(existing):
+            existing = {}  # codex refuses the whole file, so nothing in it runs today
+        hooks = dict(existing.get("hooks") or {})
+        for event, groups in _codex_system_hooks_config().items():
+            kept = []
+            for group in hooks.get(event) if isinstance(hooks.get(event), list) else []:
+                handlers = group.get("hooks") if isinstance(group, dict) else None
+                if isinstance(handlers, list):
+                    mine = [h for h in handlers
+                            if isinstance(h, dict) and m._is_unbound_hook_command(h.get("command"), script)]
+                    if mine and len(mine) == len(handlers):
+                        continue
+                    if mine:
+                        group = {**group, "hooks": [h for h in handlers if h not in mine]}
+                kept.append(group)
+            hooks[event] = kept + groups
+        config = {"hooks": hooks}
+        if "description" in existing:
+            config["description"] = existing["description"]
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        _atomic_write_text(path, json.dumps(config, indent=2))
+        if platform.system().lower() in ("darwin", "linux"):
+            os.chmod(path, 0o644)
+        return True
+    except Exception as e:
+        print(f"Failed to write codex system hooks.json: {e}")
+        return False
+
+
 def _cursor_hooks_json():
     """cursor/hooks.json with binary commands; events/timeouts verbatim."""
     cmd = lambda ev: hook_command_for_event("cursor", ev)
@@ -723,38 +768,6 @@ def _codex_can_load(config) -> bool:
                for e in _CODEX_EVENT_FIELDS if e in events)
 
 
-def _codex_make_loadable(config) -> dict:
-    """Drop only content that breaks codex's known schema, so the hooks it can load run again. Unknown keys
-    and handler types are kept: a newer codex may define them."""
-    if not isinstance(config, dict):
-        return {}
-    clean = dict(config)
-    if not _field_ok(clean.get("description"), "str?"):
-        clean.pop("description")
-    events = clean.get("hooks")
-    clean["hooks"] = events = dict(events) if isinstance(events, dict) else {}
-    for event in _CODEX_EVENT_FIELDS:
-        if event not in events:
-            continue
-        groups = events[event] if isinstance(events[event], list) else []
-        kept = []
-        for group in groups:
-            if not isinstance(group, dict) or not _field_ok(group.get("matcher"), "str?"):
-                continue
-            group = dict(group)
-            if "hooks" not in group:  # valid as is; adding the field would force a rewrite
-                kept.append(group)
-                continue
-            hooks = group["hooks"]
-            # dict(): a repeated field collapses to its last value, as on rewrite.
-            group["hooks"] = ([dict(h) for h in hooks if isinstance(h, dict) and _codex_handler_kept(dict(h))]
-                              if isinstance(hooks, list) else [])
-            if group["hooks"] or not hooks:
-                kept.append(group)
-        events[event] = kept
-    return _drop_out_of_range(clean)
-
-
 _F64_MAX_INT = int(sys.float_info.max)
 
 
@@ -781,14 +794,6 @@ def _drop_out_of_range(value):
             node[:] = [v for v in node if not _out_of_range(v)]
             stack.extend(v for v in node if isinstance(v, (dict, list)))
     return value
-
-
-def _codex_handler_kept(handler) -> bool:
-    """Keep a handler unless it breaks the schema of a type we know."""
-    kind = handler.get("type") if isinstance(handler, dict) else None
-    if isinstance(kind, str) and kind not in _CODEX_HANDLER_FIELDS:
-        return True
-    return _codex_handler_loads(handler)
 
 
 # The user a check runs as can pause it; setup's own checks and installs are quick.
@@ -820,33 +825,6 @@ def _replace_user_file(path: Path, data: bytes, mode: int) -> None:
         raise
 
 
-def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
-    """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
-    actually discovers them from), mirroring the python user-level
-    configure_codex_hooks exactly. Codex runs the registered ~/.codex/hooks/
-    unbound.py as a PYTHON program (its native hook contract — the real
-    python-era file is `#!/usr/bin/env python3`, and the python installer's
-    Windows branch invokes it as `py -3 "<path>"`). A `#!/bin/sh` wrapper at a
-    `.py` path is therefore NOT valid python and codex silently drops it (the
-    bug this replaces). So the wrapper is a tiny python shim that execs the
-    binary (the event is read from stdin) — valid whether codex honors the
-    shebang OR runs it through a python interpreter by extension. The registered
-    command is that bare wrapper PATH. Privilege-dropped; merge is idempotent
-    (match-by-command) and preserves other tools' hooks."""
-    hooks_dir = home_dir / ".codex" / "hooks"
-    wrapper = hooks_dir / "unbound.py"
-    hooks_path = home_dir / ".codex" / "hooks.json"
-    hook_command = str(wrapper)
-
-    def _install():
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        _replace_user_file(wrapper, _codex_wrapper_source().encode("utf-8"), 0o755)
-        _merge_codex_hooks_json(hooks_path, hook_command)
-        return True
-
-    return bool(_as_user(m, username, _install))
-
-
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not isinstance(command, str) or not command:
         # A non-string command is not ours; the checks below would raise on it.
@@ -870,92 +848,6 @@ def _command_targets_hook(command: str, target: Path) -> bool:
         return False
     normalized_target = os.path.normcase(os.path.normpath(str(target)))
     return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
-
-
-def _codex_wrapper_source() -> str:
-    """Python shim written to ~/.codex/hooks/unbound.py. Must be valid python
-    (codex runs it as a python program) AND exec the binary with no python
-    dependency beyond the interpreter that launches it. os.execv replaces the
-    process so stdin/stdout/stderr (the hook payload + response) pass straight
-    through. repr() safely embeds the binary path as a python string literal."""
-    return (
-        "#!/usr/bin/env python3\n"
-        "import os\n"
-        'os.execv(%s, ["unbound-hook", "hook", "codex"])\n' % repr(str(HOOK_BINARY))
-    )
-
-
-def _merge_codex_hooks_json(hooks_path: Path, wrapper_path: str) -> None:
-    """Idempotent merge of the codex hook events into hooks.json, keeping other tools' hooks. Writes only on
-    change, so a symlink we'd refuse to write is left alone when it already has our hook."""
-    wrapper = Path(wrapper_path)
-    command = shlex.quote(wrapper_path)  # codex runs it via `$SHELL -lc`
-    try:
-        raw = _read_user_file(hooks_path, follow=True)
-    except FileNotFoundError:
-        raw = b"{}"
-    if not raw.strip():
-        raw = b"{}"  # an empty file holds nothing to keep
-    try:
-        config = _load_codex_json(raw)
-        loadable = _codex_can_load(config)
-    except ValueError:
-        # Codex rejects it (byte-order mark, NaN, lone surrogate, too deep), so nothing
-        # in it runs; recover what Python can and rewrite only if that loads.
-        config = json.loads(raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8"),
-                            object_pairs_hook=_json_object)
-        loadable = False
-    before = json.dumps(config, sort_keys=True)
-    config = _codex_make_loadable(config)
-
-    hooks_config = _codex_hooks_config(command)
-    if "hooks" not in config:
-        config["hooks"] = {}
-
-    for event, new_config in hooks_config.items():
-        if event not in config["hooks"]:
-            config["hooks"][event] = new_config
-            continue
-        existing_config = config["hooks"][event]
-        if any(_codex_group_runs_wrapper(item, wrapper, event) for item in existing_config):
-            continue
-        # Drop our own entries that don't work (unquoted path the shell splits,
-        # async, short timeout, narrowed matcher) so the real group isn't doubled.
-        for existing_item in list(existing_config):
-            existing_hooks = existing_item.get("hooks") if isinstance(existing_item, dict) else None
-            if not isinstance(existing_hooks, list):
-                continue
-            kept = [h for h in existing_hooks if not (isinstance(h, dict) and (
-                h.get("command") == wrapper_path or _codex_runs_wrapper(h.get("command"), wrapper)))]
-            if len(kept) != len(existing_hooks):
-                existing_item["hooks"] = kept
-                if not kept:
-                    existing_config.remove(existing_item)
-        existing_config.extend(new_config)
-
-    try:
-        text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False)
-    except RecursionError:  # indent uses the recursive pure-Python encoder
-        text = json.dumps(config, ensure_ascii=False, allow_nan=False)
-    try:
-        rewritten_loads = _codex_can_load(_load_codex_json(text.encode("utf-8")))
-    except ValueError:
-        rewritten_loads = False
-    # Unchanged content is still rewritten when that alone makes it loadable
-    # (a repeated key collapses on rewrite); otherwise the file is left alone.
-    if json.dumps(config, sort_keys=True) == before and (loadable or not rewritten_loads):
-        return
-    data = text.encode("utf-8")
-    if len(data) > _USER_FILE_MAX_BYTES:
-        raise ValueError("hooks.json would outgrow what detection reads back")
-    # A dotfiles link stays a link: as the user, update the file it points at, which
-    # reaches nothing the user couldn't already write.
-    target = Path(os.path.realpath(hooks_path))
-    try:
-        mode = stat.S_IMODE(os.lstat(target).st_mode)
-    except FileNotFoundError:
-        mode = 0o644
-    _replace_user_file(target, data, mode)  # a failed write leaves the old file whole
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:
@@ -1125,38 +1017,20 @@ def _setup_codex(opts):
     if not success:
         return ("deferred", "failed to set UNBOUND_CODEX_API_KEY")
 
-    # codex 0.125 discovers hooks from ~/.codex/hooks.json (user layer), not the
-    # managed dir — so register per-user there, mirroring the python user-level
-    # setup. No managed write and no user-level strip (the install IS the user
-    # registration).
+    # A user-level hook runs only after its user trusts it, so ours goes in codex's system
+    # hooks.json instead, which codex runs as a managed hook. The per-user copy is removed
+    # once that's written: codex doesn't de-duplicate, so a trusted one would run twice.
     user_homes = m.get_all_user_homes()
     state = _codex_detect_state(m, user_homes)
-    installed = 0
+    if not _write_codex_system_hooks(m):
+        return ("deferred", "codex system hooks.json write failed")
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         m.enable_codex_hooks_feature_for_user(username, home_dir)
-        wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
-        had_wrapper = os.path.lexists(wrapper)  # a profile setup never reached isn't tampered
-        if _install_codex_hooks_for_user(m, username, home_dir):
-            installed += 1
-        elif state == "persisted" and had_wrapper and _as_user(m, 
-                username, _codex_wrapper_current, wrapper) is False and _as_user(m, 
-                username, _writable_dir, wrapper.parent) is False:
-            # The folder was locked against setup, and what's left isn't our wrapper. An
-            # ordinary failure (a full disk) leaves the working hook and its state alone.
-            state = "tampered"
-
-    if user_homes and installed == 0:
-        # A user can make every install fail (a symlinked or FIFO hooks.json), so
-        # a detected tamper is still reported rather than lost with the deferral.
-        if state == "tampered":
-            m.notify_setup_complete(api_key, "codex", backend_url=base,
-                                    install_state=state, serial_number=device_id,
-                                    install_mode="binary")
-        return ("deferred", "hook install failed for all users")
+        m.remove_user_level_hooks_for_user(username, home_dir)
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1267,14 +1141,6 @@ def _writable_dir(path: Path) -> bool:
     return os.access(path, os.W_OK | os.X_OK)
 
 
-def _codex_wrapper_current(wrapper: Path) -> bool:
-    """Runs as the profile's user: the file at our path is this release's wrapper."""
-    try:
-        return _read_user_file(wrapper, follow=False).decode("utf-8") == _codex_wrapper_source()
-    except (OSError, ValueError):
-        return False
-
-
 def _codex_wrapper_present(wrapper: Path) -> bool:
     """A regular file at our path, not followed: a symlink there isn't something we installed."""
     try:
@@ -1290,9 +1156,18 @@ def _codex_wrapper_runnable(wrapper: Path) -> bool:
 
 
 def _codex_detect_state(m, user_homes):
-    """Per profile, on the pair setup installs (wrapper script and hooks.json entry): 'tampered' if any profile
-    has one alone or its check was stopped, 'fresh' if none has either, else 'persisted'; None on failure."""
+    """Our entry in codex's system hooks.json, and no profile turning codex hooks off. Before setup
+    first writes that file, the per-user install it replaces is judged instead."""
     try:
+        system = m.get_managed_settings_dir() / "hooks.json"
+        if os.path.lexists(system) and str(HOOK_BINARY) in system.read_text(encoding="utf-8", errors="replace"):
+            state = _detect_state(system, _codex_system_hooks_config())
+            for username, home_dir in user_homes if state == "persisted" else ():
+                disabled = _as_user(m, username, _codex_hooks_disabled, home_dir / ".codex" / "config.toml")
+                if disabled is None or disabled:
+                    return "tampered"
+            return state
+        # Per profile, on the pair the user-level install wrote (wrapper script and hooks.json entry).
         any_complete = False
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
