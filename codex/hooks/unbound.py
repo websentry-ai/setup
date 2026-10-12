@@ -2688,12 +2688,16 @@ def _codex_account_config_regex(raw: str) -> Dict:
 
 
 def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
-    """The host Codex sends requests to, when the user set one and it is not Unbound."""
+    """The host Codex sends requests to. Same rule as the Claude Code hook, plus OpenAI itself:
+    shared hosts would put every developer in one fake account."""
     try:
-        host = urlparse((base_url or '').strip()).hostname
+        host = (urlparse((base_url or '').strip()).hostname or '').lower()
     except ValueError:
         return None
-    return host if host and host != urlparse(UNBOUND_GATEWAY_URL).hostname else None
+    shared = (host == urlparse(UNBOUND_GATEWAY_URL).hostname or host in ('getunbound.ai', 'openai.com')
+              or host.endswith(('.getunbound.ai', '.openai.com'))
+              or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.'))
+    return host if host and not shared else None
 
 
 def read_account_identity() -> Dict:

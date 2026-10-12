@@ -385,14 +385,21 @@ class TestAccountReasonAndGateway(unittest.TestCase):
         identity = unbound.read_account_identity()
         self.assertEqual((identity["org_id"], identity["account_reason"]), ("ai-gateway.zende.sk", "api_key"))
 
+    def test_a_company_host_that_ends_like_openai_is_a_gateway(self):
+        self._config('openai_base_url = "https://gateway.company-openai.com/v1"\n')
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.company-openai.com")
+
     def test_the_chosen_provider_base_url_wins(self):
         self._config('model_provider = "corp"\nopenai_base_url = "https://other.example"\n\n'
                      '[model_providers.corp]\nname = "Corp"\nbase_url = "https://llm.corp.example/v1"\n')
         self.assertEqual(unbound.read_account_identity()["org_id"], "llm.corp.example")
 
-    def test_the_unbound_gateway_names_no_one(self):
-        self._config('openai_base_url = "%s/v1"\n' % unbound.UNBOUND_GATEWAY_URL)
-        self.assertIsNone(unbound.read_account_identity()["org_id"])
+    def test_shared_hosts_name_no_one(self):
+        for url in (unbound.UNBOUND_GATEWAY_URL, "https://api.getunbound.ai/v1", "https://api.openai.com/v1",
+                    "http://localhost:11434/v1", "http://127.0.0.1:4000", "http://[::1]:8080"):
+            with self.subTest(url=url):
+                self._config('openai_base_url = "%s"\n' % url)
+                self.assertIsNone(unbound.read_account_identity()["org_id"])
     def test_the_active_profile_chooses_the_provider(self):
         self._config('model_provider = "personal"\nprofile = "work"\n\n'
                      '[profiles.work]\nmodel_provider = "corp"\n\n'
