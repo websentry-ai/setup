@@ -371,7 +371,7 @@ def _write_codex_system_hooks(m) -> bool:
             existing = {}
         if not _codex_can_load(existing):
             # codex refuses the whole file; keep what it can load and drop only the broken pieces
-            existing = _codex_make_loadable(existing)
+            existing = {k: v for k, v in _codex_make_loadable(existing).items() if k in _CODEX_FILE_FIELDS}
             if not _codex_can_load(existing):
                 existing = {}
         hooks = dict(existing.get("hooks") or {})

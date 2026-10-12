@@ -690,6 +690,18 @@ def test_a_system_hooks_json_codex_refuses_is_replaced(env, spoiled):
     assert set(_codex_system_commands(env)) == CODEX_EVENTS
 
 
+def test_an_unknown_top_level_key_does_not_cost_the_organisation_its_hooks(env):
+    """Codex denies unknown top-level keys, so the key goes and the hooks beside it stay."""
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    path.write_text(json.dumps({"x-owner": "it", "hooks": {"Stop": [{"hooks": [org]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert "x-owner" not in written and setup_cmd._codex_can_load(written)
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+
+
 def test_a_link_at_the_system_hooks_json_is_not_written_through(env):
     """Setup runs as root, so it never follows a link it finds there."""
     target = env["tmp"] / "elsewhere.json"
