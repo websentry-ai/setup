@@ -172,10 +172,12 @@ def test_the_codex_merge_survives_a_scalar_hooks_value(tmp_path):
     our hook never got registered for that user."""
     hooks_path = tmp_path / "hooks.json"
     wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
+    valid_foreign = {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/audit"}]}
     hooks_path.write_text(json.dumps({"hooks": {
         "PreToolUse": [
             {"matcher": "foreign", "hooks": 1},          # the shape that raised
             {"matcher": "other", "hooks": ["not-a-dict"]},
+            valid_foreign,
         ],
     }}))
 
@@ -189,8 +191,10 @@ def test_the_codex_merge_survives_a_scalar_hooks_value(tmp_path):
         for h in item["hooks"] if isinstance(h, dict)
     ]
     assert str(wrapper) in commands, "our hook was never registered"
-    # The foreign entries are still there, untouched.
-    assert {"matcher": "foreign", "hooks": 1} in config["hooks"]["PreToolUse"]
+    # Codex refuses the whole file over the malformed groups, so they're dropped;
+    # the foreign hook codex can load is kept untouched.
+    assert valid_foreign in config["hooks"]["PreToolUse"]
+    assert setup_cmd._codex_can_load(config)
 
 
 def test_the_gateway_strip_preserves_a_non_dict_element(tmp_path, monkeypatch):

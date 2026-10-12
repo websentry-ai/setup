@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import signal
+import select
 import random
 import stat
 import re
@@ -51,7 +53,23 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
-def _run_as_user(username, fn, *args, **kwargs):
+def _become_user(info) -> None:
+    """Drop to the user with their own groups, as codex runs: a file shared through a
+    group must read the same here as it does to codex."""
+    try:
+        os.initgroups(info.pw_name, info.pw_gid)
+    except OSError:
+        os.setgroups([])
+    os.setgid(info.pw_gid)
+    os.setuid(info.pw_uid)
+
+
+# A limit for every privilege-dropped call, set by a caller that must not be held by
+# a user pausing one (the binary's setup); None (a backfill's case) waits as long as it takes.
+_RUN_AS_USER_TIMEOUT = None
+
+
+def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
 
@@ -76,16 +94,13 @@ def _run_as_user(username, fn, *args, **kwargs):
         info = pwd.getpwnam(username)
     except KeyError:
         return None
-    uid, gid = info.pw_uid, info.pw_gid
 
     r_fd, w_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
         os.close(r_fd)
         try:
-            os.setgroups([])
-            os.setgid(gid)
-            os.setuid(uid)
+            _become_user(info)
             # setuid alone leaves $HOME pointing at root, so a Path.home() /
             # expanduser('~') inside fn would resolve to root's home, not the
             # user's. Callers pass explicit home_dir today; this hardens against
@@ -107,7 +122,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
+        # The child runs as the user, who can pause it: a caller can bound the wait
+        # (a backfill can't be bounded; a quick check can).
+        limit = _RUN_AS_USER_TIMEOUT if _timeout is None else _timeout
+        deadline = None if limit is None else time.monotonic() + limit
         while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
             try:
                 chunk = os.read(r_fd, 1 << 20)
             except OSError:
@@ -119,7 +145,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         data = b''.join(chunks)
         del chunks
         try:
-            _, status = os.waitpid(pid, 0)
+            if deadline is None:
+                _, status = os.waitpid(pid, 0)
+            else:  # paused after closing the pipe, it would still hold the wait
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        return None
+                    time.sleep(0.05)
         except OSError:
             return None
         if os.WEXITSTATUS(status) != 0:
@@ -643,6 +680,15 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
         debug_print(f"Could not write config for {username}")
 
 
+def _read_config_lines(config_path: Path):
+    """config.toml's lines, or None if it isn't a regular file: a FIFO would hang setup."""
+    fd = os.open(str(config_path), os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+    with os.fdopen(fd, 'r', encoding='utf-8') as f:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        return f.readlines()
+
+
 def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
     """Remove OPENAI_API_KEY env var and openai_base_url from ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
@@ -654,8 +700,9 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
         return
 
     def _strip():
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        lines = _read_config_lines(config_path)
+        if lines is None:
+            return False
         new_lines = [l for l in lines if not l.strip().startswith('openai_base_url')]
         if len(new_lines) == len(lines):
             return False
@@ -1395,8 +1442,10 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         config_path.parent.mkdir(parents=True, exist_ok=True)
         lines = []
         if config_path.exists():
-            with open(config_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+            lines = _read_config_lines(config_path)
+            if lines is None:
+                print(f"{username}'s config.toml is not a regular file; hooks not enforced")
+                return False
         # Covers the inline spelling too, so a daily re-run does not rewrite a config that is
         # already correct.
         if tomllib is not None and _write_is_safe(''.join(lines), True):
@@ -1566,8 +1615,9 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if registered:
             debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
             return False
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        lines = _read_config_lines(config_path)
+        if lines is None:
+            return False
         new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return False
