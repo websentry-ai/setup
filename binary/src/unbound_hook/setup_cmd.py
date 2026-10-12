@@ -364,7 +364,8 @@ def _write_codex_system_hooks(m) -> bool:
     try:
         managed_dir = m.get_managed_settings_dir()
         path = managed_dir / "hooks.json"
-        script = managed_dir / "hooks" / "unbound.py"
+        script = managed_dir / "hooks" / "unbound.py"  # where a python-era install kept it
+        command = _codex_system_hooks_config()["Stop"][0]["hooks"][0]["command"]
         try:
             existing = _load_codex_json(path.read_bytes()) if path.is_file() else {}
         except (OSError, ValueError, RecursionError):
@@ -372,6 +373,13 @@ def _write_codex_system_hooks(m) -> bool:
         if not _codex_can_load(existing):
             # codex refuses the whole file; keep what it can load and drop only the broken pieces
             existing = {k: v for k, v in _codex_make_loadable(existing).items() if k in _CODEX_FILE_FIELDS}
+            hooks = {e: g for e, g in existing.get("hooks", {}).items() if e in _CODEX_EVENT_FIELDS}
+            for event, groups in hooks.items():
+                for group in groups:
+                    if isinstance(group.get("hooks"), list):  # a type this codex doesn't know fails it too
+                        group["hooks"] = [h for h in group["hooks"] if _codex_handler_loads(h)]
+                hooks[event] = [g for g in groups if g.get("hooks") != []]
+            existing["hooks"] = hooks
             if not _codex_can_load(existing):
                 existing = {}
         hooks = dict(existing.get("hooks") or {})
@@ -380,8 +388,8 @@ def _write_codex_system_hooks(m) -> bool:
             for group in hooks.get(event) if isinstance(hooks.get(event), list) else []:
                 handlers = group.get("hooks") if isinstance(group, dict) else None
                 if isinstance(handlers, list):
-                    mine = [h for h in handlers
-                            if isinstance(h, dict) and m._is_unbound_hook_command(h.get("command"), script)]
+                    mine = [h for h in handlers if isinstance(h, dict) and (
+                        h.get("command") == command or _codex_runs_wrapper(h.get("command"), script))]
                     if mine and len(mine) == len(handlers):
                         continue
                     if mine:

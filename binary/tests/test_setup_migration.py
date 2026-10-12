@@ -702,6 +702,29 @@ def test_an_unknown_top_level_key_does_not_cost_the_organisation_its_hooks(env):
     assert written["hooks"]["Stop"][0] == {"hooks": [org]}
 
 
+def test_a_handler_type_codex_does_not_know_costs_only_itself(env):
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    path.write_text(json.dumps({"hooks": {
+        "Stop": [{"hooks": [org, {"type": "http", "url": "https://example.com"}]}],
+        "PreToolUse": [{"matcher": "*", "hooks": [org]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert setup_cmd._codex_can_load(written)
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+    assert written["hooks"]["PreToolUse"][0] == {"matcher": "*", "hooks": [org]}
+
+
+def test_a_hook_that_only_mentions_our_binary_is_not_ours(env):
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    audit = {"type": "command", "command": f"/usr/local/bin/org-audit --target {BIN}"}
+    path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [audit]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert json.loads(path.read_text())["hooks"]["Stop"][0] == {"hooks": [audit]}
+
+
 def test_a_link_at_the_system_hooks_json_is_not_written_through(env):
     """Setup runs as root, so it never follows a link it finds there."""
     target = env["tmp"] / "elsewhere.json"
