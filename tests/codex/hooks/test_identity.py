@@ -390,24 +390,9 @@ class TestAccountReasonAndGateway(unittest.TestCase):
                      '[model_providers.corp]\nname = "Corp"\nbase_url = "https://llm.corp.example/v1"\n')
         self.assertEqual(unbound.read_account_identity()["org_id"], "llm.corp.example")
 
-    def test_openai_unbound_and_loopback_hosts_name_no_one(self):
-        for url in ("https://api.openai.com/v1", "https://chatgpt.com/backend-api", "https://api.getunbound.ai/v1",
-                    "http://localhost:8080", "http://127.0.0.1:4000", "https://openrouter.ai/api/v1",
-                    "https://api.groq.com/openai/v1", "https://generativelanguage.googleapis.com/v1beta",
-                    "https://bedrock-runtime.us-east-1.amazonaws.com", "https://models.github.ai/inference",
-                    "https://models.inference.ai.azure.com"):
-            with self.subTest(url=url):
-                self._config('openai_base_url = "%s"\n' % url)
-                self.assertIsNone(unbound.read_account_identity()["org_id"])
-
-    def test_a_company_host_that_merely_ends_like_openai_is_a_gateway(self):
-        self._config('openai_base_url = "https://gateway.company-openai.com/v1"\n')
-        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.company-openai.com")
-
-    def test_a_company_azure_openai_host_is_a_gateway(self):
-        self._config('openai_base_url = "https://acme.openai.azure.com/openai"\n')
-        self.assertEqual(unbound.read_account_identity()["org_id"], "acme.openai.azure.com")
-
+    def test_the_unbound_gateway_names_no_one(self):
+        self._config('openai_base_url = "%s/v1"\n' % unbound.UNBOUND_GATEWAY_URL)
+        self.assertIsNone(unbound.read_account_identity()["org_id"])
     def test_the_active_profile_chooses_the_provider(self):
         self._config('model_provider = "personal"\nprofile = "work"\n\n'
                      '[profiles.work]\nmodel_provider = "corp"\n\n'
@@ -433,10 +418,6 @@ class TestAccountReasonAndGateway(unittest.TestCase):
             identity = unbound.read_account_identity()
         self.assertEqual((identity["auth_mode"], identity["account_reason"]), ("api_key", "api_key_env"))
 
-    def test_a_company_gateway_on_aws_names_the_org(self):
-        self._config('openai_base_url = "https://abc123.execute-api.us-east-1.amazonaws.com/v1"\n')
-        self.assertEqual(unbound.read_account_identity()["org_id"], "abc123.execute-api.us-east-1.amazonaws.com")
-
     def test_the_openai_base_url_environment_variable_is_a_gateway(self):
         with patch.dict(os.environ, {"OPENAI_BASE_URL": "https://ai-gateway.zende.sk/v1"}):
             self.assertEqual(unbound.read_account_identity()["org_id"], "ai-gateway.zende.sk")
@@ -451,13 +432,6 @@ class TestAccountReasonAndGateway(unittest.TestCase):
     def test_an_api_key_sign_in_with_a_broken_id_token_is_still_an_api_key(self):
         self._write_auth({"auth_mode": "apikey", "OPENAI_API_KEY": "x", "tokens": {"id_token": "bad.!!!.token"}})
         self.assertEqual(unbound.read_account_identity()["account_reason"], "api_key")
-
-    def test_a_model_server_on_the_local_network_names_no_one(self):
-        for url in ("http://192.168.1.20:11434/v1", "http://10.0.0.5/v1", "http://172.20.1.1/v1",
-                    "http://host.docker.internal:1234", "http://studio.local:1234/v1", "http://[fe80::1]:8080"):
-            with self.subTest(url=url):
-                self._config('openai_base_url = "%s"\n' % url)
-                self.assertIsNone(unbound.read_account_identity()["org_id"])
 
     def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
         self._write_auth(self._auth_with_token({

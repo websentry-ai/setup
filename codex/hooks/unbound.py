@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
-import ipaddress
 import re
 import shlex
 import tempfile
@@ -2689,26 +2688,12 @@ def _codex_account_config_regex(raw: str) -> Dict:
 
 
 def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
-    """The host of a company gateway Codex is routed through; None for OpenAI, Unbound or loopback."""
+    """The host Codex sends requests to, when the user set one and it is not Unbound."""
     try:
-        host = (urlparse(base_url.strip()).hostname or '').lower() if base_url and base_url.strip() else ''
+        host = urlparse((base_url or '').strip()).hostname
     except ValueError:
         return None
-    ours = urlparse(UNBOUND_GATEWAY_URL).hostname or ''
-    # Shared services, not a company gateway: Unbound, OpenAI, and public model providers.
-    shared = (ours, 'getunbound.ai', 'openai.com', 'chatgpt.com', 'openrouter.ai', 'groq.com', 'mistral.ai',
-              'googleapis.com', 'anthropic.com', 'together.xyz', 'deepseek.com', 'x.ai', 'fireworks.ai',
-              'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co', 'github.ai',
-              'githubcopilot.com', 'inference.ai.azure.com')
-    bedrock = host.startswith('bedrock') and host.endswith('.amazonaws.com')
-    try:
-        ip = ipaddress.ip_address(host)
-        private = ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified
-    except ValueError:
-        private = host == 'localhost' or host.endswith(('.local', '.internal', '.localhost', '.lan'))
-    if not host or bedrock or private or any(d and (host == d or host.endswith('.' + d)) for d in shared):
-        return None
-    return host
+    return host if host and host != urlparse(UNBOUND_GATEWAY_URL).hostname else None
 
 
 def read_account_identity() -> Dict:
