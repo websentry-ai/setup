@@ -835,27 +835,58 @@ def _codex_commands(home, event):
     return [h["command"] for grp in hooks[event] for h in grp["hooks"]]
 
 
-@pytest.mark.parametrize("ours", [True, False])
-def test_a_symlinked_hooks_json_is_updated_where_it_points(env, monkeypatch, ours):
-    """A dotfiles link stays a link: one that registers our hook isn't written, one that doesn't gets our
-    registration in its target, as the user, keeping what was there."""
+def test_a_symlinked_per_user_hooks_json_loses_only_our_entry(env):
+    """A dotfiles link stays a link. Our entry comes out of the file it points at, as the user, and the
+    user's own hooks stay: codex follows the link, so a trusted leftover would run our hook twice."""
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
     dotfile = env["tmp"] / "dotfiles" / "hooks.json"
     dotfile.parent.mkdir()
-    command = str(wrapper) if ours else "/usr/local/bin/other-hook"
-    dotfile.write_text(json.dumps({"hooks": {
-        e: [{"hooks": [{"type": "command", "command": command}]}] for e in CODEX_EVENTS}}))
+    dotfile.write_text(json.dumps({"hooks": {e: [{"hooks": [
+        {"type": "command", "command": str(wrapper)},
+        {"type": "command", "command": "/usr/local/bin/other-hook"}]}] for e in CODEX_EVENTS}}))
     (home / ".codex" / "hooks.json").symlink_to(dotfile)
-    before = dotfile.read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert (home / ".codex" / "hooks.json").is_symlink()
-    if ours:
-        assert dotfile.read_text() == before
-    else:
-        assert set(_codex_registrations(home)) == CODEX_EVENTS
-        assert "/usr/local/bin/other-hook" in dotfile.read_text()
+    assert not any(_codex_registrations(home).values())
+    assert all(grp["hooks"] == [{"type": "command", "command": "/usr/local/bin/other-hook"}]
+               for groups in json.loads(dotfile.read_text())["hooks"].values() for grp in groups)
+    assert not wrapper.exists()
+
+
+def test_a_fifo_at_the_per_user_hooks_json_does_not_hang_setup(env):
+    """The strip reads as the user without blocking; what it can't read it leaves, script and all."""
+    home = env["home"]
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    os.mkfifo(home / ".codex" / "hooks.json")
+    _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
+    assert wrapper.exists()
+
+
+def test_the_system_folder_is_readable_by_every_user(env):
+    """Codex reads the file as each user, so a folder left at root's umask would hide our hook."""
+    folder = env["tmp"] / "managed-codex"
+    folder.mkdir(mode=0o700)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert folder.stat().st_mode & 0o777 == 0o755
+
+
+def test_a_broken_handler_beside_an_organisations_is_dropped_alone(env):
+    """One handler codex can't load makes it refuse the whole file; only that handler goes."""
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [org, {"type": "command", "timeout": "x"}]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert setup_cmd._codex_can_load(written)
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
 
 
 def _with_mcp_nan(config):

@@ -1154,7 +1154,8 @@ def check_enterprise_hooks_conflict() -> bool:
             return True
         hooks_json = managed_dir / "hooks.json"
         # The binary's managed install has no script, only our command in hooks.json.
-        return hooks_json.is_file() and "/opt/unbound/" in hooks_json.read_text(encoding="utf-8", errors="replace")
+        text = hooks_json.read_text(encoding="utf-8", errors="replace") if hooks_json.is_file() else ""
+        return "/opt/unbound/" in text and "unbound-hook" in text
     except Exception as e:
         print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False

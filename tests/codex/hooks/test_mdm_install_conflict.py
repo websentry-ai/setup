@@ -26,6 +26,11 @@ class TestMdmInstallConflict(unittest.TestCase):
             {"type": "command", "command": command}]}]}}))
         self.assertTrue(setup.check_enterprise_hooks_conflict())
 
+    def test_a_command_that_only_shares_our_prefix_is_not_an_mdm_install(self):
+        (self.dir / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "/opt/unbound/other-tool"}]}]}}))
+        self.assertFalse(setup.check_enterprise_hooks_conflict())
+
     def test_an_organisations_own_hooks_are_not_an_mdm_install(self):
         (self.dir / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [
             {"type": "command", "command": "/usr/local/bin/org-hook"}]}]}}))

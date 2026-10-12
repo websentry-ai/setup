@@ -308,6 +308,51 @@ def _codex_hooks_config(hook_command):
     }
 
 
+def _strip_codex_user_hooks(m, username, home_dir) -> None:
+    """As the user, remove our per-user entry and script, keeping their own hooks. A dotfiles link is
+    updated where it points. A file that can't be read safely is left, with the script it may name."""
+    hooks_path = home_dir / ".codex" / "hooks.json"
+    wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
+    ours = lambda cmd: m._is_unbound_hook_command(cmd, wrapper) or _codex_runs_wrapper(cmd, wrapper)
+
+    def _strip():
+        try:
+            config = _load_codex_json(_read_user_file(hooks_path, follow=True))
+        except FileNotFoundError:
+            config = None
+        except (OSError, ValueError, RecursionError):
+            return False
+        hooks = config.get("hooks") if isinstance(config, dict) else None
+        changed = False
+        for event, groups in (hooks.items() if isinstance(hooks, dict) else ()):
+            if not isinstance(groups, list):
+                continue
+            kept = []
+            for group in groups:
+                handlers = group.get("hooks") if isinstance(group, dict) else None
+                if isinstance(handlers, list):
+                    rest = [h for h in handlers if not (isinstance(h, dict) and ours(h.get("command")))]
+                    if len(rest) != len(handlers):
+                        changed = True
+                        if not rest:
+                            continue
+                        group = {**group, "hooks": rest}
+                kept.append(group)
+            hooks[event] = kept
+        if changed:
+            target = Path(os.path.realpath(hooks_path))
+            try:
+                text = json.dumps(config, indent=2, ensure_ascii=False, allow_nan=False)
+            except RecursionError:  # indent uses the recursive pure-Python encoder
+                text = json.dumps(config, ensure_ascii=False, allow_nan=False)
+            _replace_user_file(target, text.encode("utf-8"), stat.S_IMODE(os.lstat(target).st_mode))
+        if os.path.lexists(wrapper) and not os.path.isdir(wrapper):
+            os.unlink(wrapper)
+        return True
+
+    _as_user(m, username, _strip)
+
+
 def _codex_system_hooks_config():
     """Our hooks for codex's system hooks.json; codex runs the command through the user's shell."""
     return _codex_hooks_config(f'"{HOOK_BINARY}" hook codex')
@@ -325,7 +370,10 @@ def _write_codex_system_hooks(m) -> bool:
         except (OSError, ValueError, RecursionError):
             existing = {}
         if not _codex_can_load(existing):
-            existing = {}  # codex refuses the whole file, so nothing in it runs today
+            # codex refuses the whole file; keep what it can load and drop only the broken pieces
+            existing = _codex_make_loadable(existing)
+            if not _codex_can_load(existing):
+                existing = {}
         hooks = dict(existing.get("hooks") or {})
         for event, groups in _codex_system_hooks_config().items():
             kept = []
@@ -346,6 +394,7 @@ def _write_codex_system_hooks(m) -> bool:
         managed_dir.mkdir(parents=True, exist_ok=True)
         _atomic_write_text(path, json.dumps(config, indent=2))
         if platform.system().lower() in ("darwin", "linux"):
+            os.chmod(managed_dir, 0o755)  # codex reads it as each user, whatever root's umask
             os.chmod(path, 0o644)
         return True
     except Exception as e:
@@ -768,6 +817,46 @@ def _codex_can_load(config) -> bool:
                for e in _CODEX_EVENT_FIELDS if e in events)
 
 
+def _codex_make_loadable(config) -> dict:
+    """Drop only content that breaks codex's known schema, so the hooks it can load run again. Unknown keys
+    and handler types are kept: a newer codex may define them."""
+    if not isinstance(config, dict):
+        return {}
+    clean = dict(config)
+    if not _field_ok(clean.get("description"), "str?"):
+        clean.pop("description")
+    events = clean.get("hooks")
+    clean["hooks"] = events = dict(events) if isinstance(events, dict) else {}
+    for event in _CODEX_EVENT_FIELDS:
+        if event not in events:
+            continue
+        groups = events[event] if isinstance(events[event], list) else []
+        kept = []
+        for group in groups:
+            if not isinstance(group, dict) or not _field_ok(group.get("matcher"), "str?"):
+                continue
+            group = dict(group)
+            if "hooks" not in group:  # valid as is; adding the field would force a rewrite
+                kept.append(group)
+                continue
+            hooks = group["hooks"]
+            # dict(): a repeated field collapses to its last value, as on rewrite.
+            group["hooks"] = ([dict(h) for h in hooks if isinstance(h, dict) and _codex_handler_kept(dict(h))]
+                              if isinstance(hooks, list) else [])
+            if group["hooks"] or not hooks:
+                kept.append(group)
+        events[event] = kept
+    return _drop_out_of_range(clean)
+
+
+def _codex_handler_kept(handler) -> bool:
+    """Keep a handler unless it breaks the schema of a type we know."""
+    kind = handler.get("type") if isinstance(handler, dict) else None
+    if isinstance(kind, str) and kind not in _CODEX_HANDLER_FIELDS:
+        return True
+    return _codex_handler_loads(handler)
+
+
 _F64_MAX_INT = int(sys.float_info.max)
 
 
@@ -1030,7 +1119,7 @@ def _setup_codex(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         m.enable_codex_hooks_feature_for_user(username, home_dir)
-        m.remove_user_level_hooks_for_user(username, home_dir)
+        _strip_codex_user_hooks(m, username, home_dir)
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1162,6 +1251,13 @@ def _codex_detect_state(m, user_homes):
         system = m.get_managed_settings_dir() / "hooks.json"
         if os.path.lexists(system) and str(HOOK_BINARY) in system.read_text(encoding="utf-8", errors="replace"):
             state = _detect_state(system, _codex_system_hooks_config())
+            if state == "persisted":
+                try:
+                    loads = _codex_can_load(_load_codex_json(_read_user_file(system, follow=True)))
+                except (OSError, ValueError, RecursionError):
+                    loads = False
+                if not loads:
+                    return "tampered"  # codex refuses the whole file, our entries included
             for username, home_dir in user_homes if state == "persisted" else ():
                 disabled = _as_user(m, username, _codex_hooks_disabled, home_dir / ".codex" / "config.toml")
                 if disabled is None or disabled:

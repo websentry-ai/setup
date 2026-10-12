@@ -666,3 +666,14 @@ def test_a_profile_turning_codex_hooks_off_is_tampered(m, tmp_path):
     (off / ".codex" / "config.toml").write_text("[features]\nhooks = false\n")
     assert _state(m, healthy) == "persisted"
     assert _state(m, healthy, off) == "tampered"
+
+
+@pytest.mark.parametrize("spoil", [
+    lambda c: c.update(unknown=True),                                         # codex denies unknown keys
+    lambda c: c["hooks"]["Stop"].append({"hooks": [{"type": "command", "timeout": "x"}]}),
+])
+def test_a_system_file_codex_refuses_is_tampered_even_with_our_entries(m, tmp_path, spoil):
+    config = {"hooks": setup_cmd._codex_system_hooks_config()}
+    spoil(config)
+    _system(m, config)
+    assert _state(m, _profile(tmp_path)) == "tampered"
