@@ -557,6 +557,15 @@ class TestCopilotNoAccountReason(_IsolatedConfig):
         with patch.object(unbound, "log_error"):
             self.assertEqual(self._reason("vscode"), "vscode_unreadable")
 
+    def test_an_unreadable_older_install_does_not_hide_a_readable_newer_one(self):
+        self._vscode(login=None, sku=None, install=1, mtime=2_000)
+        path = self.vscode_dirs[0] / "globalStorage" / "state.vscdb"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"not a database")
+        os.utime(path, (1_000, 1_000))
+        with patch.object(unbound, "log_error"):
+            self.assertEqual(self._reason("vscode"), "vscode_no_copilot_login")
+
     def test_cli_without_a_login(self):
         with patch.dict(os.environ, {}):
             for var in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):

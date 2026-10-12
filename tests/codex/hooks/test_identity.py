@@ -441,6 +441,24 @@ class TestAccountReasonAndGateway(unittest.TestCase):
         with patch.dict(os.environ, {"OPENAI_BASE_URL": "https://ai-gateway.zende.sk/v1"}):
             self.assertEqual(unbound.read_account_identity()["org_id"], "ai-gateway.zende.sk")
 
+    def test_an_environment_api_key_with_a_sign_in_less_auth_json(self):
+        self._write_auth({"last_refresh": "2026-10-01"})
+        self._config('cli_auth_credentials_store = "auto"\n')
+        with patch.dict(os.environ, {"CODEX_API_KEY": "x"}):
+            identity = unbound.read_account_identity()
+        self.assertEqual((identity["auth_mode"], identity["account_reason"]), ("api_key", "api_key_env"))
+
+    def test_an_api_key_sign_in_with_a_broken_id_token_is_still_an_api_key(self):
+        self._write_auth({"auth_mode": "apikey", "OPENAI_API_KEY": "x", "tokens": {"id_token": "bad.!!!.token"}})
+        self.assertEqual(unbound.read_account_identity()["account_reason"], "api_key")
+
+    def test_a_model_server_on_the_local_network_names_no_one(self):
+        for url in ("http://192.168.1.20:11434/v1", "http://10.0.0.5/v1", "http://172.20.1.1/v1",
+                    "http://host.docker.internal:1234", "http://studio.local:1234/v1", "http://[fe80::1]:8080"):
+            with self.subTest(url=url):
+                self._config('openai_base_url = "%s"\n' % url)
+                self.assertIsNone(unbound.read_account_identity()["org_id"])
+
     def test_a_signed_in_account_has_no_reason_and_keeps_its_org(self):
         self._write_auth(self._auth_with_token({
             "email": "dave@corp.com",

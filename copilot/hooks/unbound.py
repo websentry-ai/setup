@@ -1757,20 +1757,20 @@ def _vscode_no_account_reason(user_dir: Optional[Path] = None) -> str:
     paths = [p for p in paths if p.is_file()]
     if not paths:
         return 'vscode_not_found'
-    unreadable = False
+    read_any = False
     for path in sorted(paths, key=lambda p: p.stat().st_mtime_ns, reverse=True):
         try:
             with closing(sqlite3.connect(f'{path.resolve().as_uri()}?mode=ro', uri=True, timeout=1.0)) as connection:
                 row = connection.execute('SELECT value FROM ItemTable WHERE key = ?',
                                          (_VSCODE_COPILOT_ACCOUNT_KEY,)).fetchone()
         except (OSError, sqlite3.Error):
-            unreadable = True
             continue
+        read_any = True
         login = row[0] if row else None
         login = login.decode('utf-8', 'replace') if isinstance(login, bytes) else login
         if isinstance(login, str) and login.strip():
             return 'vscode_signed_out'
-    return 'vscode_unreadable' if unreadable else 'vscode_no_copilot_login'
+    return 'vscode_no_copilot_login' if read_any else 'vscode_unreadable'
 
 
 def _copilot_cli_no_account_reason() -> str:

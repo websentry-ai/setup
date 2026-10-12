@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
+import ipaddress
 import re
 import shlex
 import tempfile
@@ -2700,8 +2701,12 @@ def _codex_gateway_host(base_url: Optional[str]) -> Optional[str]:
               'perplexity.ai', 'cohere.com', 'cohere.ai', 'huggingface.co', 'github.ai',
               'githubcopilot.com', 'inference.ai.azure.com')
     bedrock = host.startswith('bedrock') and host.endswith('.amazonaws.com')
-    if (not host or bedrock or any(d and (host == d or host.endswith('.' + d)) for d in shared)
-            or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.')):
+    try:
+        ip = ipaddress.ip_address(host)
+        private = ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_unspecified
+    except ValueError:
+        private = host == 'localhost' or host.endswith(('.local', '.internal', '.localhost', '.lan'))
+    if not host or bedrock or private or any(d and (host == d or host.endswith('.' + d)) for d in shared):
         return None
     return host
 
@@ -2746,9 +2751,9 @@ def read_account_identity() -> Dict:
         except Exception:
             config = {}
         store = config.get('credentials_store') or ''
-        if reason is None and auth_mode == 'api_key':
+        if auth_mode == 'api_key':
             reason = 'api_key'
-        elif reason == 'auth_json_missing' and (os.environ.get('OPENAI_API_KEY') or os.environ.get('CODEX_API_KEY')):
+        elif reason in (None, 'auth_json_missing') and (os.environ.get('OPENAI_API_KEY') or os.environ.get('CODEX_API_KEY')):
             auth_mode, reason = 'api_key', 'api_key_env'
         elif reason in (None, 'auth_json_missing', 'no_id_token') and store in ('keyring', 'auto', 'ephemeral'):
             reason = 'credentials_' + store
