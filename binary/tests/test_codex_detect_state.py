@@ -1,6 +1,5 @@
-"""The binary's codex detector, run against sandboxed homes and a sandboxed system folder. Without our
-entry in codex's system hooks.json, it judges the per-user install that file replaces. Only the
-privilege drop is stubbed (it needs root), except where a test exercises its failure."""
+"""The binary's codex detector, per profile, run against sandboxed homes. Only the privilege drop is
+stubbed (it needs root), except where a test exercises its failure."""
 
 import getpass
 import json
@@ -17,16 +16,12 @@ from unbound_hook._resources import HOOK_BINARY
 
 ME = getpass.getuser()
 EVENTS = ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart")
-# The python shim earlier binary releases wrote at ~/.codex/hooks/unbound.py.
-WRAPPER_SOURCE = ('#!/usr/bin/env python3\nimport os\n'
-                  'os.execv(%s, ["unbound-hook", "hook", "codex"])\n' % repr(str(HOOK_BINARY)))
 
 
 @pytest.fixture
-def m(monkeypatch, tmp_path):
+def m(monkeypatch):
     mod = load_mdm_setup_module("codex")
     monkeypatch.setattr(mod, "_run_as_user", lambda u, fn, *a, _timeout=None, **k: fn(*a, **k))
-    monkeypatch.setattr(mod, "get_managed_settings_dir", lambda: tmp_path / "system-codex")
     return mod
 
 
@@ -42,7 +37,7 @@ def _profile(tmp_path, name="u", *, script=False, config=None, raw=None) -> Path
     home = tmp_path / name
     (home / ".codex" / "hooks").mkdir(parents=True)
     if script:
-        _wrapper(home).write_text(WRAPPER_SOURCE)
+        _wrapper(home).write_text(setup_cmd._codex_wrapper_source())
         _wrapper(home).chmod(0o755)  # every installer sets it
     hooks_json = home / ".codex" / "hooks.json"
     if raw is not None:
@@ -252,7 +247,7 @@ def test_an_oversized_file_is_not_read(m, tmp_path, monkeypatch):
     home = _profile(tmp_path, script=True)
     (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
     # Big enough for the wrapper, too small for hooks.json.
-    monkeypatch.setattr(setup_cmd, "_USER_FILE_MAX_BYTES", len(WRAPPER_SOURCE) + 1)
+    monkeypatch.setattr(setup_cmd, "_USER_FILE_MAX_BYTES", len(setup_cmd._codex_wrapper_source()) + 1)
     assert _state(m, home) == "tampered"
 
 
@@ -621,59 +616,3 @@ def test_a_config_toml_too_deep_to_parse_does_not_hide_a_tamper(m, tmp_path):
     (home / ".codex" / "config.toml").write_text("a = " + "[" * 100000 + "]" * 100000)
     assert _state(m, home) == "tampered"
 
-
-
-# --- codex's system hooks.json ---------------------------------------------
-
-def _system(m, config):
-    path = m.get_managed_settings_dir() / "hooks.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config))
-    return path
-
-
-def test_our_system_entry_is_persisted(m, tmp_path):
-    _system(m, {"hooks": setup_cmd._codex_system_hooks_config()})
-    assert _state(m, _profile(tmp_path)) == "persisted"
-
-
-def test_the_system_entry_wins_over_a_leftover_per_user_one(m, tmp_path):
-    """A half-removed per-user install no longer decides the state once the system hook is in."""
-    _system(m, {"hooks": setup_cmd._codex_system_hooks_config()})
-    assert _state(m, _profile(tmp_path, script=True)) == "persisted"
-
-
-@pytest.mark.parametrize("dropped", EVENTS)
-def test_a_system_entry_missing_an_event_is_tampered(m, tmp_path, dropped):
-    hooks = setup_cmd._codex_system_hooks_config()
-    del hooks[dropped]
-    _system(m, {"hooks": hooks})
-    assert _state(m, _profile(tmp_path)) == "tampered"
-
-
-def test_a_system_file_without_us_falls_back_to_the_per_user_install(m, tmp_path):
-    """An organisation's own codex hooks there say nothing about ours."""
-    _system(m, _registration("/usr/local/bin/org-hook"))
-    home = _profile(tmp_path, script=True)
-    (home / ".codex" / "hooks.json").write_text(json.dumps(_ours(home)))
-    assert _state(m, home) == "persisted"
-
-
-@pytest.mark.skipif(setup_cmd.tomllib is None, reason="tomllib is python 3.11+; the binary bundles it")
-def test_a_profile_turning_codex_hooks_off_is_tampered(m, tmp_path):
-    _system(m, {"hooks": setup_cmd._codex_system_hooks_config()})
-    healthy, off = _profile(tmp_path, "a"), _profile(tmp_path, "b")
-    (off / ".codex" / "config.toml").write_text("[features]\nhooks = false\n")
-    assert _state(m, healthy) == "persisted"
-    assert _state(m, healthy, off) == "tampered"
-
-
-@pytest.mark.parametrize("spoil", [
-    lambda c: c.update(unknown=True),                                         # codex denies unknown keys
-    lambda c: c["hooks"]["Stop"].append({"hooks": [{"type": "command", "timeout": "x"}]}),
-])
-def test_a_system_file_codex_refuses_is_tampered_even_with_our_entries(m, tmp_path, spoil):
-    config = {"hooks": setup_cmd._codex_system_hooks_config()}
-    spoil(config)
-    _system(m, config)
-    assert _state(m, _profile(tmp_path)) == "tampered"

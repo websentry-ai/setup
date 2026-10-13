@@ -166,6 +166,37 @@ def test_detection_survives_mixed_junk_beside_a_real_entry(codex_mdm, tmp_path,
 
 # --- the merge and the gateway strip: callers that raised before the matcher --
 
+def test_the_codex_merge_survives_a_scalar_hooks_value(tmp_path):
+    """`.get("hooks", [])` only defaults a *missing* key, so a scalar was
+    returned and iterated — the merge aborted before the command check ran, and
+    our hook never got registered for that user."""
+    hooks_path = tmp_path / "hooks.json"
+    wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
+    valid_foreign = {"matcher": "Bash", "hooks": [{"type": "command", "command": "/usr/bin/audit"}]}
+    hooks_path.write_text(json.dumps({"hooks": {
+        "PreToolUse": [
+            {"matcher": "foreign", "hooks": 1},          # the shape that raised
+            {"matcher": "other", "hooks": ["not-a-dict"]},
+            valid_foreign,
+        ],
+    }}))
+
+    setup_cmd._merge_codex_hooks_json(hooks_path, str(wrapper))
+
+    config = json.loads(hooks_path.read_text())
+    commands = [
+        h.get("command")
+        for item in config["hooks"]["PreToolUse"]
+        if isinstance(item, dict) and isinstance(item.get("hooks"), list)
+        for h in item["hooks"] if isinstance(h, dict)
+    ]
+    assert str(wrapper) in commands, "our hook was never registered"
+    # Codex refuses the whole file over the malformed groups, so they're dropped;
+    # the foreign hook codex can load is kept untouched.
+    assert valid_foreign in config["hooks"]["PreToolUse"]
+    assert setup_cmd._codex_can_load(config)
+
+
 def test_the_gateway_strip_preserves_a_non_dict_element(tmp_path, monkeypatch):
     """A non-dict element had `.get` called on it and raised AttributeError.
     The surrounding handler swallowed that, the file was left alone, and our

@@ -101,6 +101,7 @@ _SAFE_STUBS = {
     "get_device_identifier": lambda *a, **k: "DEV-SERIAL",
     "fetch_api_key_from_mdm": lambda *a, **k: "RESOLVED-KEY",
     "detect_install_state": lambda *a, **k: None,
+    "setup_managed_hooks": lambda *a, **k: True,
     "_freeze_ownership_evidence": lambda *a, **k: None,
     "remove_env_var_from_user": lambda *a, **k: None,
     "remove_gateway_artifacts_for_user": lambda *a, **k: None,
@@ -108,7 +109,6 @@ _SAFE_STUBS = {
     "remove_user_level_hooks": lambda *a, **k: None,
     "set_env_var_system_wide": lambda *a, **k: (True, False),
     "set_env_var": lambda *a, **k: (True, False, "ok"),
-    "setup_managed_hooks": lambda *a, **k: True,
     "download_file": _stub_download_file,
 }
 
