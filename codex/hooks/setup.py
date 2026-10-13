@@ -1135,14 +1135,13 @@ def detect_install_state() -> str:
 
 
 def get_managed_settings_dir() -> Path:
-    """System-wide managed (MDM) settings directory for Codex. Mirrors the path
-    the MDM setup writes to; keep this in sync with mdm/setup.py."""
+    """Codex's system config folder. A hooks.json here is a managed hook: codex runs it for every user
+    without asking them to trust it."""
     system = platform.system().lower()
     if system in ("darwin", "linux"):
         return Path("/etc/codex")
     elif system == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        return Path(program_files) / "Codex"
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
     raise OSError(f"Unsupported operating system: {system}")
 
 
@@ -1179,10 +1178,12 @@ def check_enterprise_hooks_conflict() -> bool:
     make every hook fire twice. Read-only; fails open (False) on any error."""
     try:
         managed_dir = get_managed_settings_dir()
-        markers = [
-            managed_dir / "hooks" / "unbound.py",
-        ]
-        return any(marker.exists() for marker in markers)
+        if (managed_dir / "hooks" / "unbound.py").exists():
+            return True
+        hooks_json = managed_dir / "hooks.json"
+        # The binary's managed install has no script, only our command in hooks.json.
+        text = hooks_json.read_text(encoding="utf-8", errors="replace") if hooks_json.is_file() else ""
+        return "/opt/unbound/" in text and "unbound-hook" in text
     except Exception as e:
         print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False
