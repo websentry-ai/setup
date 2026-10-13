@@ -848,17 +848,14 @@ def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
 
 
 def get_managed_settings_dir() -> Path:
-    """Get the system-wide managed settings directory for Codex."""
+    """Codex's system config folder. A hooks.json here is a managed hook: codex runs it for every user
+    without asking them to trust it."""
     system = platform.system().lower()
-    if system == "darwin":
-        return Path("/Library/Application Support/Codex")
-    elif system == "linux":
+    if system in ("darwin", "linux"):
         return Path("/etc/codex")
     elif system == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        return Path(program_files) / "Codex"
-    else:
-        raise OSError(f"Unsupported operating system: {system}")
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
+    raise OSError(f"Unsupported operating system: {system}")
 
 
 def download_file(url: str, dest_path: Path) -> bool:
