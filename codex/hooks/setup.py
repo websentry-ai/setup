@@ -1146,8 +1146,8 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
-# Also matches inside the JSON-escaped TOML of codex's cloud policy cache.
-_MANAGED_HOOKS_ONLY_RE = re.compile(r'(?:^|\\n)[ \t]*allow_managed_hooks_only[ \t]*=[ \t]*true\b', re.MULTILINE)
+# Also matches inside the JSON-escaped TOML string of codex's cloud policy cache.
+_MANAGED_HOOKS_ONLY_RE = re.compile(r'(?:^|\\n|"|\ufeff)[ \t]*allow_managed_hooks_only[ \t]*=[ \t]*true\b', re.MULTILINE)
 
 
 def managed_hooks_only() -> Optional[str]:

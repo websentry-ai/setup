@@ -996,7 +996,15 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             ]
         }
 
-        settings["hooks"] = hooks_config
+        # Replace only our entries; codex rejects the whole file over any top-level key but these two.
+        hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+        for event, ours in hooks_config.items():
+            kept = [g for g in (hooks.get(event) if isinstance(hooks.get(event), list) else [])
+                    if not (isinstance(g, dict) and any(isinstance(h, dict) and _is_unbound_hook_command(h.get("command"), script_path)
+                                                        for h in (g.get("hooks") if isinstance(g.get("hooks"), list) else [])))]
+            hooks[event] = kept + ours
+        settings = {k: v for k, v in settings.items() if k == "description"}
+        settings["hooks"] = hooks
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 
@@ -2204,9 +2212,10 @@ def detect_install_state() -> Optional[str]:
     alone instead of being guessed healthy or guessed tampered."""
     try:
         managed_script = get_managed_settings_dir() / "hooks" / "unbound.py"
-        if _is_our_hook_file(managed_script):
-            registered = _unbound_hook_registered(managed_script.parent.parent / "hooks.json", managed_script)
-            return None if registered is None else ('persisted' if registered else 'tampered')
+        script = _is_our_hook_file(managed_script)
+        registered = _unbound_hook_registered(managed_script.parent.parent / "hooks.json", managed_script)
+        if script or registered:
+            return None if registered is None else ('persisted' if script and registered else 'tampered')
         any_complete = False
         indeterminate = False
         for _username, home_dir in get_all_user_homes():

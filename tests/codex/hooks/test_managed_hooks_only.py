@@ -66,3 +66,30 @@ def test_mdm_installs_system_hooks_except_on_windows(tmp_path, monkeypatch, os_n
         assert calls == ["setup_managed_hooks", "remove_user_level_hooks_for_user"]
     else:
         assert calls == ["configure_codex_hooks_for_user"]
+
+
+def test_setting_on_the_first_line_of_the_cloud_cache_turns_it_on(codex):
+    (codex[1] / "cloud-config-bundle-cache.json").write_text(json.dumps({"toml": "allow_managed_hooks_only = true\n"}))
+    assert setup.managed_hooks_only().endswith("cloud-config-bundle-cache.json")
+
+
+def test_mdm_keeps_foreign_hooks_and_replaces_ours(tmp_path, monkeypatch):
+    monkeypatch.setattr(mdm, "get_managed_settings_dir", lambda: tmp_path)
+    monkeypatch.setattr(mdm, "download_file", lambda _u, dest: Path(dest).write_text("#") or True)
+    ours = str(tmp_path / "hooks" / "unbound.py")
+    foreign = {"hooks": [{"type": "command", "command": "/usr/local/bin/audit"}]}
+    (tmp_path / "hooks.json").write_text(json.dumps({"version": 2, "hooks": {"Stop": [
+        foreign, {"hooks": [{"type": "command", "command": f'"{ours}"'}]}]}}))
+    assert mdm.setup_managed_hooks() is True
+    config = json.loads((tmp_path / "hooks.json").read_text())
+    assert "version" not in config
+    assert config["hooks"]["Stop"][0] == foreign
+    assert len(config["hooks"]["Stop"]) == 2
+
+
+def test_mdm_registered_hook_with_its_script_deleted_is_tampered(tmp_path, monkeypatch):
+    monkeypatch.setattr(mdm, "get_managed_settings_dir", lambda: tmp_path)
+    monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [])
+    script = tmp_path / "hooks" / "unbound.py"
+    (tmp_path / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": f'"{script}"'}]}]}}))
+    assert mdm.detect_install_state() == "tampered"
