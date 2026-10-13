@@ -1757,5 +1757,84 @@ class TestDenyMergesAdditionalContext(unittest.TestCase):
         )
 
 
+# --------------------------------------------------------------------------- #
+# WEB-6172: gateway->Augment rendering contract for transform_response_for_claude #
+# (warn_unsupported_action org setting converts WARN->deny upstream; Augment    #
+# renders ONLY deny today, so ask/allow/unknown/empty must all stay {})         #
+# --------------------------------------------------------------------------- #
+class TestWarnFallbackRenderingContract(unittest.TestCase):
+    def test_deny_emits_full_popup_shape_with_merged_context(self):
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked by policy",
+            "additionalContext": "do not attempt workarounds",
+        })
+        self.assertEqual(set(out.keys()), {"hookSpecificOutput"})
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertEqual(
+            hso["permissionDecisionReason"],
+            "blocked by policy\n\ndo not attempt workarounds",
+        )
+
+    def test_deny_moves_attribution_footer_after_additional_context(self):
+        """A gateway reason ending in the attribution footer has the footer split
+        off (_split_attribution_footer) and re-appended LAST, after the merged
+        additionalContext, so the user always reads it at the end."""
+        footer = unbound._attribution_footer("trace-42")
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked by policy" + footer,
+            "additionalContext": "do not attempt workarounds",
+            "unbound_trace_id": "trace-42",
+        })
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "blocked by policy\n\ndo not attempt workarounds" + footer,
+        )
+
+    def test_deny_footer_without_trace_id_is_also_relocated(self):
+        footer = unbound._attribution_footer()
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked" + footer,
+            "additionalContext": "ctx",
+        })
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "blocked\n\nctx" + footer,
+        )
+
+    def test_ask_returns_empty(self):
+        """Augment cannot render ask today -> {} (the gateway's new
+        warn_unsupported_action org setting compensates by converting WARN->deny
+        before it reaches this hook)."""
+        out = unbound.transform_response_for_claude({"decision": "ask", "reason": "?"})
+        self.assertEqual(out, {})
+
+    def test_allow_unknown_and_empty_return_empty(self):
+        self.assertEqual(unbound.transform_response_for_claude({"decision": "allow"}), {})
+        self.assertEqual(unbound.transform_response_for_claude({"decision": "something-new", "reason": "x"}), {})
+        self.assertEqual(unbound.transform_response_for_claude({}), {})
+        self.assertEqual(unbound.transform_response_for_claude(None), {})
+
+    def test_warn_converted_to_deny_renders_full_deny_popup(self):
+        """A gateway WARN converted to deny (warn_unsupported_action) arrives as a
+        plain deny ({'decision': 'deny', 'reason': <warn reason>, ...}) and must
+        emit the full deny popup output."""
+        warn_payload = {
+            "decision": "deny",
+            "reason": "WARN: risky command, proceed with caution",
+            "additionalContext": "do not attempt workarounds",
+            "unbound_trace_id": "trace-7",
+        }
+        converted = unbound.transform_response_for_claude(warn_payload)
+        hso = converted["hookSpecificOutput"]
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertIn("WARN: risky command, proceed with caution", hso["permissionDecisionReason"])
+        self.assertIn("do not attempt workarounds", hso["permissionDecisionReason"])
+
+
 if __name__ == "__main__":
     unittest.main()
