@@ -975,13 +975,10 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Codex."""
     system = platform.system().lower()
-    if system == "darwin":
-        return Path("/Library/Application Support/Codex")
-    elif system == "linux":
+    if system in ("darwin", "linux"):
         return Path("/etc/codex")
     elif system == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        return Path(program_files) / "Codex"
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
     else:
         raise OSError(f"Unsupported operating system: {system}")
 

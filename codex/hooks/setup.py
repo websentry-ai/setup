@@ -1145,8 +1145,14 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
-# Also matches inside the JSON-escaped TOML string of codex's cloud policy cache.
-_MANAGED_HOOKS_ONLY_RE = re.compile(r'(?:^|\\n|"|\ufeff)[ \t]*\\?["\']?allow_managed_hooks_only\\?["\']?[ \t]*=[ \t]*true\b', re.MULTILINE)
+_MANAGED_HOOKS_ONLY_RE = re.compile(r'^[ \t]*["\']?allow_managed_hooks_only["\']?[ \t]*=[ \t]*true\b', re.MULTILINE)
+
+
+def _json_strings(value) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
+    return [s for item in items for s in _json_strings(item)]
 
 
 def managed_hooks_only() -> Optional[str]:
@@ -1161,10 +1167,12 @@ def managed_hooks_only() -> Optional[str]:
         try:
             if path.suffix == ".plist":
                 with open(path, "rb") as f:
-                    text = base64.b64decode(plistlib.load(f).get("requirements_toml_base64", "")).decode("utf-8")
+                    texts = [base64.b64decode(plistlib.load(f).get("requirements_toml_base64", "")).decode("utf-8")]
+            elif path.suffix == ".json":
+                texts = _json_strings(json.loads(path.read_text(encoding="utf-8")))  # TOML lives in JSON strings
             else:
-                text = path.read_text(encoding="utf-8", errors="replace")
-            if _MANAGED_HOOKS_ONLY_RE.search(text):
+                texts = [path.read_text(encoding="utf-8", errors="replace")]
+            if any(_MANAGED_HOOKS_ONLY_RE.search(t.lstrip("\ufeff")) for t in texts):
                 return str(path)
         except Exception:
             continue

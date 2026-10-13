@@ -863,13 +863,10 @@ def get_managed_settings_dir() -> Path:
     """System-wide managed (MDM) settings directory for Codex. Mirrors the path
     the MDM setup writes to; keep this in sync with mdm/setup.py."""
     system = platform.system().lower()
-    if system == "darwin":
-        return Path("/Library/Application Support/Codex")
-    elif system == "linux":
+    if system in ("darwin", "linux"):
         return Path("/etc/codex")
     elif system == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        return Path(program_files) / "Codex"
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
     raise OSError(f"Unsupported operating system: {system}")
 
 

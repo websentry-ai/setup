@@ -110,3 +110,8 @@ def test_mdm_keeps_a_foreign_handler_that_shares_a_group_with_ours(tmp_path, mon
     stop = json.loads((tmp_path / "hooks.json").read_text())["hooks"]["Stop"]
     assert stop[0] == {"hooks": [audit]}
     assert len(stop) == 2
+
+
+def test_a_quoted_key_inside_a_comment_does_not_count(codex):
+    (codex[0] / "requirements.toml").write_text('# "allow_managed_hooks_only" = true\nallow_managed_hooks_only = false\n')
+    assert setup.managed_hooks_only() is None
