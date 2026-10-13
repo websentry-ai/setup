@@ -25,10 +25,11 @@ def codex_module():
 
 
 @pytest.fixture
-def detect(codex_module, monkeypatch):
+def detect(codex_module, monkeypatch, tmp_path):
     """Run the real detector over exactly the profiles a test builds."""
     def _detect(homes):
         monkeypatch.setattr(codex_module, "get_all_user_homes", lambda: homes)
+        monkeypatch.setattr(codex_module, "get_managed_settings_dir", lambda: tmp_path / "system")
         return codex_module.detect_install_state()
     return _detect
 

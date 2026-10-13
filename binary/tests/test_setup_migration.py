@@ -111,34 +111,19 @@ def test_setup_full_run_configures_everything(env):
             {"type": "command", "command": _cmd("claude-code", "SessionEnd"), "async": True, "timeout": 60}]}],
     }
 
-    # codex hooks.json — codex 0.125 discovers hooks from ~/.codex/hooks.json
-    # (the user layer), so every event registers the BARE wrapper PATH (no
-    # quotes, no " hook codex" args leaking into the registered command), and a
-    # python shim that execs the binary lives at ~/.codex/hooks/unbound.py.
-    # Codex runs that file as a PYTHON program (its native hook contract — the
-    # python-era file is `#!/usr/bin/env python3`), so a `#!/bin/sh` wrapper at
-    # a `.py` path is invalid python and codex silently drops it (the bug this
-    # replaces).
-    codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    codex_cmd = str(codex_wrapper)
-    codex = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
+    # codex: one system hooks.json, which codex runs as a managed hook (no trust prompt).
+    # The command calls the binary directly; codex runs it through the user's shell.
+    codex = json.loads((env["tmp"] / "managed-codex" / "hooks.json").read_text())
+    codex_cmd = f'"{BIN}" hook codex'
     assert set(codex["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"}
     assert codex["hooks"]["PreToolUse"][0]["hooks"][0] == {
         "type": "command", "command": codex_cmd, "timeout": 15000}
     assert codex["hooks"]["PostToolUse"][0]["hooks"][0] == {
         "type": "command", "command": codex_cmd, "timeout": 60}
-    for ev in codex["hooks"]:
-        c = codex["hooks"][ev][0]["hooks"][0]["command"]
-        assert c == codex_cmd and " hook codex" not in c
-    # the wrapper is an executable python shim that execs the binary
-    assert codex_wrapper.exists() and (codex_wrapper.stat().st_mode & 0o111)
-    body = codex_wrapper.read_text()
-    assert body.startswith("#!/usr/bin/env python3")
-    assert not body.startswith("#!/bin/sh")
-    compile(body, "unbound.py", "exec")  # must be valid python — codex runs it as one
-    assert "os.execv" in body and BIN in body and '"codex"' in body
-    # the dead managed hooks.json location is NOT written
-    assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
+    assert all(groups[0]["hooks"][0]["command"] == codex_cmd for groups in codex["hooks"].values())
+    # nothing per user: a user-level hook would wait for that user to trust it
+    assert not (env["home"] / ".codex" / "hooks.json").exists()
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
 
     # cursor enterprise hooks.json — 12 events, 15000 on the 3 pre-execution
     # events, no timeout key on the rest (verbatim from cursor/hooks.json).
@@ -229,7 +214,7 @@ def test_setup_component_failure_does_not_abort_others(env, monkeypatch):
     rc = setup_cmd.run(["--api-key", "admin-key"])
     assert rc == 1  # deferred component surfaces in the exit code
     assert not (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
-    assert (env["home"] / ".codex" / "hooks.json").exists()
+    assert (env["tmp"] / "managed-codex" / "hooks.json").exists()
     assert (env["tmp"] / "enterprise-cursor" / "hooks.json").exists()
     assert (env["home"] / ".copilot" / "hooks" / "unbound.json").exists()
 
@@ -315,64 +300,6 @@ def test_augment_rerun_keeps_the_metadata_stable(env):
     first = (env["tmp"] / "managed-augment" / "settings.json").read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert (env["tmp"] / "managed-augment" / "settings.json").read_text() == first
-
-
-def test_setup_codex_user_hooks_idempotent(env):
-    """A second run must not duplicate the codex hook entry in ~/.codex/hooks.json
-    nor clobber the per-user wrapper."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_path = env["home"] / ".codex" / "hooks.json"
-    first = json.loads(hooks_path.read_text())
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    second = json.loads(hooks_path.read_text())
-    assert first == second
-    for ev in second["hooks"]:
-        # exactly one item, one hook entry per event — no duplication
-        assert len(second["hooks"][ev]) == 1
-        assert len(second["hooks"][ev][0]["hooks"]) == 1
-
-
-def test_codex_wrapper_is_valid_python_execing_the_binary():
-    """WEB-4850 root-cause lock-in. Codex runs ~/.codex/hooks/unbound.py as a
-    PYTHON program (its native hook contract). The pre-fix binary installer wrote
-    a `#!/bin/sh` wrapper there — not valid python — so codex silently dropped it
-    (fail-open) and was ungoverned while the shell-executed tools worked. The
-    wrapper MUST be valid python that execs the binary with `hook codex`."""
-    body = setup_cmd._codex_wrapper_source()
-
-    # (a) valid python — the exact failure mode of the sh wrapper was a parse error
-    compile(body, "unbound.py", "exec")
-    # (b) execs the binary with `hook codex` via os.execv (event read from stdin)
-    assert "os.execv" in body
-    assert BIN in body
-    assert '"hook"' in body and '"codex"' in body
-    # (c) NOT a /bin/sh script (the regression)
-    assert body.startswith("#!/usr/bin/env python3")
-    assert not body.startswith("#!/bin/sh")
-    # no stray shell-isms leaked from the old wrapper
-    assert "exec " not in body  # the sh builtin; os.execv is the python call
-
-
-def test_codex_wrapper_written_to_disk_is_valid_python(env):
-    """End-to-end: the file setup_cmd.run(...) actually writes at
-    ~/.codex/hooks/unbound.py is valid python execing the binary — not a sh
-    wrapper, executable, registered by bare path in hooks.json."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    body = wrapper.read_text()
-    compile(body, "unbound.py", "exec")
-    assert body.startswith("#!/usr/bin/env python3")
-    assert not body.startswith("#!/bin/sh")
-    assert "os.execv" in body and BIN in body and '"codex"' in body
-    assert wrapper.stat().st_mode & 0o111  # executable
-
-    # the registered command is the bare wrapper path — no " hook codex" args
-    hooks = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
-    for ev in hooks["hooks"]:
-        cmd = hooks["hooks"][ev][0]["hooks"][0]["command"]
-        assert cmd == str(wrapper)
-        assert " hook codex" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -571,16 +498,11 @@ def test_sweep_runs_inside_setup(env):
     assert not (env["home"] / ".claude" / "hooks" / "unbound.py").exists()
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
     assert json.loads((env["home"] / ".unbound" / "config.json").read_text())["api_key"] == "per-device-key"
-    # claude/cursor remove their python-era managed script; codex instead hosts
-    # a binary wrapper at the per-user ~/.codex/hooks/unbound.py (its hook target).
+    # the python-era managed scripts are removed; codex now lives in its system hooks.json
     for tool in ("managed-claude", "enterprise-cursor"):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
-    codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    assert codex_wrapper.exists()
-    wrapper_body = codex_wrapper.read_text()
-    compile(wrapper_body, "unbound.py", "exec")  # codex runs it as a python program
-    assert "os.execv" in wrapper_body and BIN in wrapper_body and '"codex"' in wrapper_body
-    assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
+    assert (env["tmp"] / "managed-codex" / "hooks.json").exists()
+    assert not (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
     # python-era copilot registration replaced by a binary-era one, and the
     # now-unreferenced python script removed by the adapter (B2)
     copilot = json.loads((env["home"] / ".copilot" / "hooks" / "unbound.json").read_text())
@@ -612,9 +534,8 @@ def test_failed_component_keeps_python_serving_path(env, monkeypatch):
     # claude-code deferred -> its managed script intact; others rewritten + cleaned
     assert (env["tmp"] / "managed-claude" / "hooks" / "unbound.py").exists()
     assert not (env["tmp"] / "enterprise-cursor" / "hooks" / "unbound.py").exists()
-    # codex configured fine -> per-user hooks.json registered, no managed write
-    assert (env["home"] / ".codex" / "hooks.json").exists()
-    assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
+    # codex configured fine -> its system hooks.json is written
+    assert (env["tmp"] / "managed-codex" / "hooks.json").exists()
 
 
 def test_sweep_scoped_to_tools_leaves_other_tools_alone(env):
@@ -686,6 +607,14 @@ def _plant_python_era_codex(home: Path, command: str):
     return script
 
 
+def _codex_system_commands(env):
+    """Our command per event in codex's system hooks.json."""
+    hooks = json.loads((env["tmp"] / "managed-codex" / "hooks.json").read_text())["hooks"]
+    commands = {ev: [h["command"] for grp in groups for h in grp.get("hooks", []) if BIN in h.get("command", "")]
+                for ev, groups in hooks.items()}
+    return {ev: cmds for ev, cmds in commands.items() if cmds}
+
+
 def _codex_states(env):
     return [k["install_state"] for a, k in env["notified"] if a[1] == "codex"]
 
@@ -698,6 +627,141 @@ def _codex_registrations(home: Path):
             for ev, groups in hooks.items()}
 
 
+def test_codex_goes_in_its_system_hooks_json_once(env):
+    """Codex runs the system hooks.json as a managed hook, so every event holds our command exactly once,
+    however often setup runs."""
+    for _ in range(3):
+        assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    commands = _codex_system_commands(env)
+    assert set(commands) == CODEX_EVENTS
+    assert all(cmds == [f'"{BIN}" hook codex'] for cmds in commands.values()), commands
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    assert path.stat().st_mode & 0o777 == 0o644
+
+
+def test_an_organisations_own_codex_hooks_are_kept(env):
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook", "timeout": 5}
+    path.write_text(json.dumps({"description": "org", "hooks": {
+        "Stop": [{"hooks": [org]}], "Notification": [{"hooks": [org]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert written["description"] == "org"
+    assert written["hooks"]["Notification"] == [{"hooks": [org]}]
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
+
+
+def test_a_shared_group_keeps_the_organisations_handler(env):
+    """Our old entry sharing a group with an organisation's hook: ours moves out, theirs stays."""
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    stale = {"type": "command", "command": f'"{BIN}" hook codex', "timeout": 1}
+    path.write_text(json.dumps({"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [org, stale]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    groups = json.loads(path.read_text())["hooks"]["PreToolUse"]
+    assert groups[0] == {"matcher": "*", "hooks": [org]}
+    assert _codex_system_commands(env)["PreToolUse"] == [f'"{BIN}" hook codex']
+    assert groups[1]["hooks"][0]["timeout"] == 15000
+
+
+def test_a_system_hooks_json_codex_cannot_load_is_replaced(env):
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not json")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
+
+
+@pytest.mark.parametrize("spoiled", [
+    {"hooks": {"Stop": [{"hooks": 1}]}},                       # a group's hooks must be a list
+    {"hooks": {"Stop": []}, "unknown": True},                 # codex denies unknown top-level keys
+])
+def test_a_system_hooks_json_codex_refuses_is_replaced(env, spoiled):
+    """Codex rejects the whole file, so keeping it would leave our hook with it."""
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(spoiled))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert setup_cmd._codex_can_load(written)
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
+
+
+def test_an_unknown_top_level_key_does_not_cost_the_organisation_its_hooks(env):
+    """Codex denies unknown top-level keys, so the key goes and the hooks beside it stay."""
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    path.write_text(json.dumps({"x-owner": "it", "hooks": {"Stop": [{"hooks": [org]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert "x-owner" not in written and setup_cmd._codex_can_load(written)
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+
+
+def test_a_handler_type_codex_does_not_know_costs_only_itself(env):
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    path.write_text(json.dumps({"hooks": {
+        "Stop": [{"hooks": [org, {"type": "http", "url": "https://example.com"}]}],
+        "PreToolUse": [{"matcher": "*", "hooks": [org]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = json.loads(path.read_text())
+    assert setup_cmd._codex_can_load(written)
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+    assert written["hooks"]["PreToolUse"][0] == {"matcher": "*", "hooks": [org]}
+
+
+def test_a_hook_that_only_mentions_our_binary_is_not_ours(env):
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    audit = {"type": "command", "command": f"/usr/local/bin/org-audit --target {BIN}"}
+    path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [audit]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert json.loads(path.read_text())["hooks"]["Stop"][0] == {"hooks": [audit]}
+
+
+def test_a_link_at_the_system_hooks_json_is_not_written_through(env):
+    """Setup runs as root, so it never follows a link it finds there."""
+    target = env["tmp"] / "elsewhere.json"
+    target.write_text("{}")
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    path.symlink_to(target)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert target.read_text() == "{}"
+
+
+@pytest.mark.parametrize("python_era_command", ["{script}", '"{script}"'])
+def test_a_per_user_install_moves_to_the_system_file(env, python_era_command):
+    """The per-user entry and its script go, the user's own hooks stay, and the first run is judged on
+    the per-user install it replaces: a healthy device isn't reported tampered on rollout day."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, python_era_command)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted"]
+    assert not script.exists()
+    assert not any(_codex_registrations(home).values())
+    stop = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["Stop"]
+    assert any(h["command"] == "/usr/local/bin/other-hook" for grp in stop for h in grp["hooks"])
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert _codex_states(env) == ["persisted", "persisted"]
+
+
+def test_codex_deferral_keeps_the_per_user_install(env, monkeypatch):
+    """When the system file can't be written, the per-user hook stays as the only coverage."""
+    home = env["home"]
+    script = _plant_python_era_codex(home, '"{script}"')
+    monkeypatch.setattr(setup_cmd, "_write_codex_system_hooks", lambda m: False)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert script.exists() and set(_codex_registrations(home)) >= CODEX_EVENTS
+
+
 def test_codex_rerun_reports_persisted_not_tampered(env):
     """The sweep runs before the codex adapter. If it strips codex's user-level
     hook, every re-run sees it missing and reports a healthy install as
@@ -706,37 +770,6 @@ def test_codex_rerun_reports_persisted_not_tampered(env):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert _codex_states(env) == ["fresh", "persisted", "persisted"]
-
-
-def test_sweep_keeps_the_binary_codex_install(env):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    before = (wrapper.read_text(), hooks_json.read_text())
-    status, _ = migration.run_sweep(log=lambda *_: None)
-    assert status == "configured"
-    assert (wrapper.read_text(), hooks_json.read_text()) == before
-
-
-@pytest.mark.parametrize("python_era_command", [
-    "{script}",              # python user-level installer
-    '"{script}"',            # python MDM installer
-])
-def test_python_era_codex_install_upgrades_in_place(env, python_era_command):
-    """A python-era codex hook is the same file + hooks.json entry the binary
-    writes, so setup upgrades it in place: one registration per event, the
-    file becomes the binary wrapper, and the run reports persisted."""
-    home = env["home"]
-    script = _plant_python_era_codex(home, python_era_command)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["persisted"]
-    assert "os.execv" in script.read_text()
-    regs = _codex_registrations(home)
-    assert set(regs) == CODEX_EVENTS
-    assert all(len(cmds) == 1 for cmds in regs.values()), regs
-    stop = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]["Stop"]
-    assert any(h["command"] == "/usr/local/bin/other-hook"
-               for grp in stop for h in grp["hooks"])
 
 
 def test_codex_deferred_keeps_python_era(env, monkeypatch):
@@ -759,46 +792,6 @@ def test_codex_clear_still_removes_the_binary_install(env):
     hooks_json = env["home"] / ".codex" / "hooks.json"
     if hooks_json.exists():
         assert not any(_codex_registrations(env["home"]).values())
-
-
-def test_codex_replaces_a_symlink_at_its_hook_path(env):
-    """The sweep used to delete a symlinked ~/.codex/hooks/unbound.py before the
-    adapter's O_NOFOLLOW write; now the adapter replaces the link itself, never
-    writing through it."""
-    target = env["tmp"] / "elsewhere.py"
-    target.write_text("# not ours\n")
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.symlink_to(target)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert not wrapper.is_symlink() and "os.execv" in wrapper.read_text()
-    assert target.read_text() == "# not ours\n"
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
-
-
-def test_codex_replaces_a_read_only_script_at_its_hook_path(env):
-    """A no-op made read-only can't be truncated in place, so it would survive every run."""
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("#!/bin/sh\nexit 0\n")
-    wrapper.chmod(0o555)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert "os.execv" in wrapper.read_text() and wrapper.stat().st_mode & 0o777 == 0o755
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
-
-
-def test_codex_defers_on_an_unusable_hooks_json(env):
-    """A hooks.json we can't safely merge into defers codex without touching it,
-    and the other tools still configure."""
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    hooks_json.parent.mkdir(parents=True)
-    hooks_json.write_text("{not json")
-    watched = hooks_json
-    before = watched.read_text()
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
-    assert watched.read_text() == before
-    assert not _codex_states(env)
-    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
 
 
 def test_clear_command_removes_the_codex_install(env, monkeypatch):
@@ -834,31 +827,6 @@ def _without_hanging(fn, seconds=5):
     return result
 
 
-def test_a_fifo_at_hooks_json_does_not_hang_setup(env):
-    fifo = env["home"] / ".codex" / "hooks.json"
-    fifo.parent.mkdir(parents=True, exist_ok=True)
-    os.mkfifo(fifo)
-    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
-    assert __import__("stat").S_ISFIFO(fifo.lstat().st_mode)
-    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
-
-
-def test_a_file_raced_into_the_temporary_path_fails_the_codex_install(env, monkeypatch):
-    """The replacement is created exclusively, so a FIFO raced into its path isn't written into."""
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text("#!/bin/sh\nexit 0\n")
-    real_open = os.open
-
-    def _plant_then_open(path, flags, *a, **k):
-        if str(path).endswith(".tmp") and flags & os.O_EXCL:
-            os.mkfifo(path)
-        return real_open(path, flags, *a, **k)
-    monkeypatch.setattr(setup_cmd.os, "open", _plant_then_open)
-    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
-    assert wrapper.read_text() == "#!/bin/sh\nexit 0\n"
-
-
 def _failing_replacement(monkeypatch):
     real_open = os.open
 
@@ -867,18 +835,6 @@ def _failing_replacement(monkeypatch):
             raise OSError(28, "No space left on device")
         return real_open(path, flags, *a, **k)
     monkeypatch.setattr(setup_cmd.os, "open", _open)
-
-
-def test_a_failed_replace_keeps_the_working_codex_wrapper(env, monkeypatch):
-    """The replacement is written beside the wrapper and renamed over it, so a write that
-    fails leaves the working one in place, and nothing is reported as tampered."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    before = wrapper.read_text()
-    _failing_replacement(monkeypatch)
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert wrapper.read_text() == before
-    assert "tampered" not in _codex_states(env)
 
 
 def test_the_user_check_keeps_the_user_s_groups(monkeypatch):
@@ -893,16 +849,6 @@ def test_the_user_check_keeps_the_user_s_groups(monkeypatch):
     assert calls == [("initgroups", ("alice", 20)), ("setgid", (20,)), ("setuid", (501,))]
 
 
-def test_a_fifo_at_the_codex_hook_path_is_replaced(env):
-    """Opened for writing, a FIFO with a reader attached would take the wrapper and stay a FIFO."""
-    fifo = env["home"] / ".codex" / "hooks" / "unbound.py"
-    fifo.parent.mkdir(parents=True)
-    os.mkfifo(fifo)
-    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 0
-    assert fifo.is_file() and "os.execv" in fifo.read_text()
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
-
-
 def test_a_fifo_at_config_toml_does_not_hang_setup(env):
     fifo = env["home"] / ".codex" / "config.toml"
     fifo.parent.mkdir(parents=True, exist_ok=True)
@@ -910,52 +856,8 @@ def test_a_fifo_at_config_toml_does_not_hang_setup(env):
     _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
     _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
     assert __import__("stat").S_ISFIFO(fifo.lstat().st_mode)
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
     assert _codex_states(env)[-1] == "tampered"  # codex can read hooks = false from it
-
-
-def test_a_fifo_in_one_profile_reports_tampered_from_the_others(env, monkeypatch):
-    other = env["tmp"] / "other"
-    other.mkdir()
-    homes = [(ME, env["home"]), (ME, other)]
-    for mod in env["modules"].values():
-        monkeypatch.setattr(mod, "get_all_user_homes", lambda: homes)
-
-    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = other / ".codex" / "hooks.json"
-    hooks_json.unlink()
-    os.mkfifo(hooks_json)
-    _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
-    assert _codex_states(env) == ["fresh", "tampered"]
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
-
-
-@pytest.mark.parametrize("decoy_shape", ['python3 -c "{w}"', '"{w}/"'])
-def test_setup_repairs_a_decoy_registration(env, decoy_shape):
-    """A command that names the wrapper but skips it is not ours to the install
-    either, so setup registers the real hook beside it and the next run is clean."""
-    home = env["home"]
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text(setup_cmd._codex_wrapper_source())
-    wrapper.chmod(0o755)
-    decoy = decoy_shape.format(w=wrapper)
-    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
-        e: [{"hooks": [{"type": "command", "command": decoy}]}] for e in CODEX_EVENTS}}))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["tampered", "persisted"]
-    hooks = json.loads((home / ".codex" / "hooks.json").read_text())["hooks"]
-    for event in CODEX_EVENTS:
-        cmds = [h["command"] for grp in hooks[event] for h in grp["hooks"]]
-        assert cmds.count(str(wrapper)) == 1 and decoy in cmds
 
 
 def _only_home(env, monkeypatch, home):
@@ -968,278 +870,68 @@ def _codex_commands(home, event):
     return [h["command"] for grp in hooks[event] for h in grp["hooks"]]
 
 
-def test_a_home_with_a_space_gets_one_working_entry(env, monkeypatch):
-    """Codex runs the command via `$SHELL -lc`, so the path is shell-quoted; the
-    old unquoted entry (split by the shell, never run) is replaced, not duplicated."""
-    home = env["tmp"] / "Jane Doe"
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": {
-        e: [{"hooks": [{"type": "command", "command": str(wrapper)}]}] for e in CODEX_EVENTS}}))
-    _only_home(env, monkeypatch, home)
-    for _ in range(3):
-        assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "persisted", "persisted"]
-    for event in CODEX_EVENTS:
-        assert _codex_commands(home, event) == [__import__("shlex").quote(str(wrapper))]
-
-
-@pytest.mark.parametrize("ours", [True, False])
-def test_a_symlinked_hooks_json_is_updated_where_it_points(env, monkeypatch, ours):
-    """A dotfiles link stays a link: one that registers our hook isn't written, one that doesn't gets our
-    registration in its target, as the user, keeping what was there."""
+def test_a_symlinked_per_user_hooks_json_loses_only_our_entry(env):
+    """A dotfiles link stays a link. Our entry comes out of the file it points at, as the user, and the
+    user's own hooks stay: codex follows the link, so a trusted leftover would run our hook twice."""
     home = env["home"]
     wrapper = home / ".codex" / "hooks" / "unbound.py"
     wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
     dotfile = env["tmp"] / "dotfiles" / "hooks.json"
     dotfile.parent.mkdir()
-    command = str(wrapper) if ours else "/usr/local/bin/other-hook"
-    dotfile.write_text(json.dumps({"hooks": {
-        e: [{"hooks": [{"type": "command", "command": command}]}] for e in CODEX_EVENTS}}))
+    dotfile.write_text(json.dumps({"hooks": {e: [{"hooks": [
+        {"type": "command", "command": str(wrapper)},
+        {"type": "command", "command": "/usr/local/bin/other-hook"}]}] for e in CODEX_EVENTS}}))
     (home / ".codex" / "hooks.json").symlink_to(dotfile)
-    before = dotfile.read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert (home / ".codex" / "hooks.json").is_symlink()
-    if ours:
-        assert dotfile.read_text() == before
-    else:
-        assert set(_codex_registrations(home)) == CODEX_EVENTS
-        assert "/usr/local/bin/other-hook" in dotfile.read_text()
+    assert not any(_codex_registrations(home).values())
+    assert all(grp["hooks"] == [{"type": "command", "command": "/usr/local/bin/other-hook"}]
+               for groups in json.loads(dotfile.read_text())["hooks"].values() for grp in groups)
+    assert not wrapper.exists()
 
 
-def test_an_unchanged_hooks_json_is_not_rewritten(env):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    os.utime(hooks_json, (1_000_000_000, 1_000_000_000))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert hooks_json.stat().st_mtime == 1_000_000_000
-
-
-def test_setup_repairs_a_narrowed_matcher(env):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["hooks"]["PreToolUse"][0]["matcher"] = "^$"
-    hooks_json.write_text(json.dumps(config))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
-    # The narrowed copy is ours, so it's replaced rather than kept firing beside it.
-    matchers = [g.get("matcher") for g in json.loads(hooks_json.read_text())["hooks"]["PreToolUse"]]
-    assert matchers == ["*"]
-
-
-def test_a_working_non_ascii_entry_on_a_symlink_is_left_alone(env, monkeypatch):
-    """`/Users/José/...` is one shell word unquoted, so it already runs; only a
-    path the shell would split is replaced."""
-    home = env["tmp"] / "José"
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text(setup_cmd._codex_wrapper_source())
-    wrapper.chmod(0o755)
-    dotfile = env["tmp"] / "dotfiles" / "hooks.json"
-    dotfile.parent.mkdir()
-    dotfile.write_text(json.dumps({"hooks": setup_cmd._codex_hooks_config(str(wrapper))}))
-    (home / ".codex" / "hooks.json").symlink_to(dotfile)
-    before = dotfile.read_text()
-    _only_home(env, monkeypatch, home)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["persisted"]
-    assert dotfile.read_text() == before
-
-
-def test_an_old_era_install_is_not_duplicated(env):
-    """Pre-May installs carry a 10s PreToolUse timeout and async PostToolUse /
-    SessionStart; they're ours, so setup must not add a second copy."""
+def test_a_user_hook_that_only_mentions_our_binary_is_kept(env):
     home = env["home"]
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text(setup_cmd._codex_wrapper_source())
-    wrapper.chmod(0o755)
-    config = {}
-    for event in CODEX_EVENTS:
-        hook = {"type": "command", "command": str(wrapper),
-                "timeout": 10 if event == "PreToolUse" else 60}
-        if event in ("PostToolUse", "SessionStart"):
-            hook["async"] = True
-        config[event] = [{"matcher": "*", "hooks": [hook]}]
-    (home / ".codex" / "hooks.json").write_text(json.dumps({"hooks": config}))
-    before = (home / ".codex" / "hooks.json").read_text()
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["persisted"]
-    assert (home / ".codex" / "hooks.json").read_text() == before
-
-
-@pytest.mark.parametrize("bad", [{"async": True}, {"timeout": 9.5}, {"timeout": True}, {"timeout": 15000.0}])
-def test_a_disqualified_entry_of_ours_is_replaced_not_doubled(env, bad):
-    """Codex would still run (or fail to load) our non-qualifying entry, so it's
-    removed when the real group is added: the wrapper fires once per event."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["hooks"]["PreToolUse"][0]["hooks"][0].update(bad)
-    hooks_json.write_text(json.dumps(config))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "tampered"]
-    pre = json.loads(hooks_json.read_text())["hooks"]["PreToolUse"]
-    assert pre == setup_cmd._codex_hooks_config(str(env["home"] / ".codex" / "hooks" / "unbound.py"))["PreToolUse"]
-
-
-def test_setup_repairs_an_async_pretooluse(env):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["hooks"]["PreToolUse"][0]["hooks"][0]["async"] = True
-    hooks_json.write_text(json.dumps(config))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
-
-
-@pytest.mark.parametrize("blocker", ["fifo"])
-def test_a_tamper_is_reported_even_when_the_only_install_fails(env, monkeypatch, blocker):
-    """One profile whose hooks.json the install can't touch: setup defers, but the
-    tamper it detected still reaches the dashboard."""
-    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
-    home = env["home"]
-    wrapper = home / ".codex" / "hooks" / "unbound.py"
-    wrapper.parent.mkdir(parents=True)
-    wrapper.write_text(setup_cmd._codex_wrapper_source())
-    wrapper.chmod(0o755)
     hooks_json = home / ".codex" / "hooks.json"
-    if blocker == "symlink":
-        target = env["tmp"] / "dotfiles.json"
-        target.write_text(json.dumps({"hooks": {}}))
-        hooks_json.symlink_to(target)
-    else:
-        os.mkfifo(hooks_json)
-    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
-    assert _codex_states(env) == ["tampered"]
-
-
-def test_a_fresh_install_that_fails_reports_nothing(env, monkeypatch):
-    def _as_user(_u, fn, *a, _timeout=None, **k):
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
-    hooks_json = env["home"] / ".codex" / "hooks.json"
     hooks_json.parent.mkdir(parents=True)
-    os.mkfifo(hooks_json)
-    assert _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"])) == 1
-    assert _codex_states(env) == []
-
-
-def test_setup_repairs_malformed_known_content(env):
-    """A malformed handler of a type codex knows makes it refuse the file, so setup
-    drops just that and keeps everything codex can load."""
+    audit = {"type": "command", "command": f"/usr/local/bin/org-audit --target {BIN}"}
+    hooks_json.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [audit]}]}}))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    foreign = {"type": "command", "command": "/usr/bin/audit", "timeout": 30}
-    config["hooks"]["PreToolUse"][0]["hooks"].append(foreign)
-    config["hooks"]["PreToolUse"].append({"hooks": [{"type": "command", "command": "/y", "timeout": 1.5}]})
-    config["hooks"]["PreToolUse"].append({"hooks": [{"type": [], "command": "/z"}]})
-    hooks_json.write_text(json.dumps(config))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
-    repaired = json.loads(hooks_json.read_text())
-    assert setup_cmd._codex_can_load(repaired)
-    assert foreign in repaired["hooks"]["PreToolUse"][0]["hooks"]
+    assert json.loads(hooks_json.read_text())["hooks"]["Stop"] == [{"hooks": [audit]}]
 
 
-def test_setup_keeps_keys_and_handler_types_it_does_not_know(env):
-    """A newer codex may define them, so they're never deleted; the profile reads
-    tampered against the codex this check knows, and the file is left alone."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["futureField"] = {"x": 1}
-    config["hooks"]["Stop"].append({"hooks": [{"type": "future_kind", "anything": 1}]})
-    hooks_json.write_text(json.dumps(config))
-    before = hooks_json.read_text()
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "tampered"]
-    assert hooks_json.read_text() == before
+def test_a_fifo_at_the_per_user_hooks_json_does_not_hang_setup(env):
+    """The strip reads as the user without blocking; what it can't read it leaves, script and all."""
+    home = env["home"]
+    wrapper = home / ".codex" / "hooks" / "unbound.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n")
+    os.mkfifo(home / ".codex" / "hooks.json")
+    _without_hanging(lambda: setup_cmd.run(["--api-key", "admin-key"]))
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
+    assert wrapper.exists()
 
 
-def test_setup_collapses_a_repeated_key(env):
-    """Rewriting is what makes a file with a repeated field loadable again."""
+def test_the_system_folder_is_readable_by_every_user(env):
+    """Codex reads the file as each user, so a folder left at root's umask would hide our hook."""
+    folder = env["tmp"] / "managed-codex"
+    folder.mkdir(mode=0o700)
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    body = json.loads(hooks_json.read_text())["hooks"]
-    hooks_json.write_text('{"hooks": {}, "hooks": ' + json.dumps(body) + "}")
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env) == ["fresh", "tampered", "persisted"]
-    assert hooks_json.read_text().count('"hooks"') >= 1 and setup_cmd._codex_can_load(json.loads(hooks_json.read_text()))
+    assert folder.stat().st_mode & 0o777 == 0o755
 
 
-@pytest.mark.parametrize("spoil, repaired", [
-    (lambda text: "\ufeff" + text, True),                                     # byte-order mark
-    (lambda text: text.replace('"timeout": 60', '"timeout": NaN', 1), True),  # NaN in our handler
-    (lambda text: text[:-1] + ', "description": "x\\ud800"}', False),        # lone surrogate
-])
-def test_setup_recovers_a_hooks_json_codex_rejects_at_parse_time(env, spoil, repaired):
-    """Codex refuses the whole file, so nothing runs. Setup recovers what Python can
-    parse and rewrites it when that loads; a value it can't write validly is left."""
+def test_a_broken_handler_beside_an_organisations_is_dropped_alone(env):
+    """One handler codex can't load makes it refuse the whole file; only that handler goes."""
+    path = env["tmp"] / "managed-codex" / "hooks.json"
+    path.parent.mkdir(parents=True)
+    org = {"type": "command", "command": "/usr/local/bin/org-hook"}
+    path.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [org, {"type": "command", "timeout": "x"}]}]}}))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    hooks_json.write_text(spoil(hooks_json.read_text()), encoding="utf-8")
-    setup_cmd.run(["--api-key", "admin-key"])
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert _codex_states(env)[1] == "tampered"
-    assert _codex_states(env)[-1] == ("persisted" if repaired else "tampered")
-
-
-def test_a_group_without_hooks_is_left_as_is(env):
-    """Codex accepts a group with no hooks field; repair must not add one and rewrite."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["hooks"]["PreToolUse"].append({"matcher": "Bash"})
-    text = json.dumps(config)
-    hooks_json.write_text(text)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert hooks_json.read_text() == text
-    assert _codex_states(env)[-1] == "persisted"
-
-
-def test_a_rewrite_too_large_to_read_back_is_not_written(env):
-    """Detection reads at most the size cap; a bigger file would read as tampered forever."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    del config["hooks"]["Stop"]  # forces a write that adds a registration
-    config["description"] = ""
-    pad = setup_cmd._USER_FILE_MAX_BYTES - len(json.dumps(config)) - 100
-    config["description"] = "x" * pad
-    text = json.dumps(config)
-    hooks_json.write_text(text)
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert hooks_json.read_text() == text
-
-
-def test_a_write_that_cannot_be_encoded_leaves_hooks_json_intact(env):
-    """Encoding happens before the truncating open, so a value that can't be
-    written as UTF-8 never empties the user's file."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    del config["hooks"]["Stop"]  # forces a write
-    text = json.dumps(config)[:-1] + ', "description": "x\\ud800"}'
-    hooks_json.write_text(text, encoding="utf-8")
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert hooks_json.read_text(encoding="utf-8") == text
+    written = json.loads(path.read_text())
+    assert setup_cmd._codex_can_load(written)
+    assert written["hooks"]["Stop"][0] == {"hooks": [org]}
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
 
 
 def _with_mcp_nan(config):
@@ -1263,60 +955,18 @@ def _with_f64_max_integer(config):
     config["hooks"]["Stop"][0]["hooks"][0]["note"] = "__F64MAX__"
 
 
-@pytest.mark.parametrize("plant", [_with_mcp_nan, _with_handler_nan, _with_overflowing_number,
-                                   _with_overflowing_integer, _with_f64_max_integer])
-def test_a_nan_anywhere_is_repaired(env, plant):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    plant(config)
-    text = (json.dumps(config).replace('"__NAN__"', "NaN").replace('"__1E400__"', "1e400")
-            .replace('"__BIGINT__"', "1" + "0" * 400).replace('"__F64MAX__"', str(int(sys.float_info.max))))
-    hooks_json.write_text(text)
-    assert setup_cmd._codex_hook_registered(hooks_json, hooks_json.parent / "hooks" / "unbound.py") is False  # codex rejects it
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _codex_states(env)[-1] == "persisted"
-    assert setup_cmd._codex_can_load(setup_cmd._load_codex_json(hooks_json.read_bytes()))
-
-
-def test_another_tool_s_repeated_field_is_collapsed_not_deleted(env):
-    """Codex rejects the repeat; rewriting keeps the last value, so that tool's hook survives."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["hooks"]["PreToolUse"][0]["hooks"].append({"type": "command", "command": "__CMD__"})
-    hooks_json.write_text(json.dumps(config).replace('"command": "__CMD__"', '"command": "/a", "command": "/b"'))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    handlers = json.loads(hooks_json.read_text())["hooks"]["PreToolUse"][0]["hooks"]
-    assert {"type": "command", "command": "/b"} in handlers
-
-
 @pytest.mark.skipif(sys.version_info < (3, 12), reason="older json can't parse it; the binary ships 3.12")
 def test_a_deep_field_codex_skips_does_not_break_the_install(env):
-    """Codex skips an unknown group field without its depth limit; repair must not
+    """Codex skips an unknown group field without its depth limit; the system rewrite must not
     crash on it either."""
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
+    hooks_json = env["tmp"] / "managed-codex" / "hooks.json"
     config = json.loads(hooks_json.read_text())
     config["hooks"]["PreToolUse"][0]["x"] = "__DEEP__"
-    del config["hooks"]["Stop"]  # forces a rewrite
+    del config["hooks"]["Stop"]
     hooks_json.write_text(json.dumps(config).replace('"__DEEP__"', "[" * 1000 + "]" * 1000))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
-
-
-def test_a_nan_on_an_unknown_top_level_key_is_dropped(env):
-    """The key is kept, as any unknown key is; the NaN codex can't parse is not."""
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["x"] = {"keep": 1, "bad": "__NAN__"}
-    del config["hooks"]["Stop"]  # forces a write
-    hooks_json.write_text(json.dumps(config).replace('"__NAN__"', "NaN"))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    repaired = setup_cmd._load_codex_json(hooks_json.read_bytes())
-    assert repaired["x"] == {"keep": 1} and "Stop" in repaired["hooks"]
+    assert set(_codex_system_commands(env)) == CODEX_EVENTS
 
 
 # --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
@@ -1724,28 +1374,6 @@ def test_a_python_era_copilot_path_the_shell_would_expand_is_tampered(env, monke
     assert _states(env, "copilot") == ["tampered"]
 
 
-def test_a_failed_install_on_a_profile_setup_never_reached_is_not_tampered(env, monkeypatch):
-    """Another profile is fine; this one never had our hook, and its install failing
-    leaves it unenforced but not interfered with."""
-    other = env["tmp"] / "other"
-    other.mkdir()
-    for tool in ("codex", "copilot"):
-        monkeypatch.setattr(env["modules"][tool], "get_all_user_homes",
-                            lambda: [(ME, env["home"]), (ME, other)])
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0  # both profiles installed
-    for path in (other / ".codex", other / ".copilot"):
-        __import__("shutil").rmtree(path)
-    monkeypatch.setattr(setup_cmd, "_install_codex_hooks_for_user",
-                        lambda m, u, h, real_fn=setup_cmd._install_codex_hooks_for_user:
-                        False if h == other else real_fn(m, u, h))
-    monkeypatch.setattr(setup_cmd, "_install_copilot_hooks_for_user",
-                        lambda m, u, h, real_fn=setup_cmd._install_copilot_hooks_for_user:
-                        False if h == other else real_fn(m, u, h))
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _states(env, "codex")[-1] == "persisted"
-    assert _states(env, "copilot")[-1] == "persisted"
-
-
 def test_a_deeply_nested_copilot_file_is_tampered_not_unknown(env):
     path = _copilot_file(env["home"])
     path.parent.mkdir(parents=True)
@@ -1977,30 +1605,6 @@ def test_augment_metadata_extras_are_fine_but_ours_must_hold(env, change, expect
     assert setup_cmd._detect_state(path, setup_cmd._augment_written_hooks(env["modules"]["augment"])) == expected
 
 
-@pytest.mark.parametrize("script, expected", [("#!/bin/sh\nexit 0\n", ["fresh", "tampered"]),
-                                              (None, ["fresh"])])
-def test_a_script_setup_cannot_replace_reports_tampered(env, monkeypatch, script, expected):
-    """A no-op in a read-only hooks dir can't be unlinked, so it mustn't read persisted. Our own wrapper there
-    still works, so nothing new is reported and the last persisted stands."""
-    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_dir = env["home"] / ".codex" / "hooks"
-    if script is not None:
-        (hooks_dir / "unbound.py").write_text(script)
-    hooks_dir.chmod(0o555)
-    try:
-        setup_cmd.run(["--api-key", "admin-key"])
-    finally:
-        hooks_dir.chmod(0o755)
-    assert _codex_states(env) == expected
-
-
 @pytest.mark.parametrize("content, expected", [
     ("{not json", "tampered"),
     ('{"note": "unbound.py", "hooks": {}}', "tampered"),                 # the name, registered nowhere
@@ -2071,64 +1675,12 @@ def test_a_python_era_script_behind_a_locked_folder_is_tampered(tmp_path):
         script.parent.chmod(0o755)
 
 
-def test_a_full_disk_doesn_t_make_an_older_working_wrapper_tampered(env, monkeypatch):
-    """Only a folder locked against setup turns a failed upgrade into tampering."""
-    def _as_user(_u, fn, *a, _timeout=None, **k):  # the real helper returns None when fn raises
-        try:
-            return fn(*a, **k)
-        except Exception:
-            return None
-
-    monkeypatch.setattr(env["modules"]["codex"], "_run_as_user", _as_user)
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
-    wrapper.write_text("#!/usr/bin/env python3\n# an older working hook\n")
-    wrapper.chmod(0o755)
-    _failing_replacement(monkeypatch)
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert "tampered" not in _codex_states(env)
-    assert "older working hook" in wrapper.read_text()
-    wrapper.parent.chmod(0o555)  # the same failure in a folder locked against setup is tampering
-    try:
-        setup_cmd.run(["--api-key", "admin-key"])
-    finally:
-        wrapper.parent.chmod(0o755)
-    assert _codex_states(env)[-1] == "tampered"
-
-
-def test_a_failed_hooks_json_write_leaves_it_whole(env, monkeypatch):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    config = json.loads(hooks_json.read_text())
-    config["description"] = "keep me"
-    del config["hooks"]["Stop"]  # forces a rewrite
-    hooks_json.write_text(json.dumps(config))
-    before = hooks_json.read_text()
-    real_open = os.open
-
-    def _open(path, flags, *a, **k):
-        if str(path).endswith(".tmp") and ".hooks.json." in str(path) and flags & os.O_EXCL:
-            raise OSError(28, "No space left on device")
-        return real_open(path, flags, *a, **k)
-    monkeypatch.setattr(setup_cmd.os, "open", _open)
-    setup_cmd.run(["--api-key", "admin-key"])
-    assert hooks_json.read_text() == before
-
-
 def test_a_profile_without_a_home_doesn_t_stop_the_copilot_install(env, monkeypatch):
     monkeypatch.setattr(env["modules"]["copilot"], "get_all_user_homes",
                         lambda: [("ghost", None), (ME, env["home"])])
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert setup_cmd._copilot_registered(_copilot_file(env["home"]))
     assert _states(env, "copilot") == ["fresh"]
-
-
-def test_an_empty_hooks_json_is_repaired(env):
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    hooks_json = env["home"] / ".codex" / "hooks.json"
-    hooks_json.write_text("")
-    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert set(_codex_registrations(env["home"])) == CODEX_EVENTS
 
 
 @pytest.mark.parametrize("tool", list(MANAGED))

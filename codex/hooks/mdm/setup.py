@@ -8,6 +8,7 @@ import stat
 import re
 import shutil
 import sys
+import tempfile
 import time
 import platform
 import subprocess
@@ -848,17 +849,14 @@ def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
 
 
 def get_managed_settings_dir() -> Path:
-    """Get the system-wide managed settings directory for Codex."""
+    """Codex's system config folder. A hooks.json here is a managed hook: codex runs it for every user
+    without asking them to trust it."""
     system = platform.system().lower()
-    if system == "darwin":
-        return Path("/Library/Application Support/Codex")
-    elif system == "linux":
+    if system in ("darwin", "linux"):
         return Path("/etc/codex")
     elif system == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        return Path(program_files) / "Codex"
-    else:
-        raise OSError(f"Unsupported operating system: {system}")
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
+    raise OSError(f"Unsupported operating system: {system}")
 
 
 def download_file(url: str, dest_path: Path) -> bool:
@@ -892,10 +890,8 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
 
 
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
-    """
-    Set up system-wide managed hooks for Codex.
-    Downloads unbound.py and configures hooks.json with hooks.
-    """
+    """Download unbound.py into codex's system folder and merge our hooks into its hooks.json,
+    keeping every other hook and key there."""
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
@@ -925,13 +921,18 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         if settings_path.exists():
             try:
                 with open(settings_path, 'r', encoding='utf-8') as f:
-                    settings = json.load(f) or {}
+                    settings = json.load(f)
             except Exception:
+                settings = None
+            if not isinstance(settings, dict):
+                # Codex rejects the whole file, so ours replaces it; the admin's original is kept beside it.
+                os.replace(settings_path, managed_dir / "hooks.json.unbound-bak")
+                print(f"Moved unreadable {settings_path} to hooks.json.unbound-bak")
                 settings = {}
 
-        # Configure hooks - quote the path to handle spaces (e.g. macOS
-        # "Application Support"). On Windows, invoke via `py -3` (falling back
-        # to `python`) so the hook can actually execute the .py file.
+        # Configure hooks - quote the path to handle spaces. On Windows, invoke
+        # via `py -3` (falling back to `python`) so the hook can actually execute
+        # the .py file.
         if system == "windows":
             launcher = "py -3" if shutil.which("py") else "python"
             hook_command = f'{launcher} "{script_path}"'
@@ -998,8 +999,39 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             ]
         }
 
-        settings["hooks"] = hooks_config
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        hooks_block = settings.get("hooks")
+        if not isinstance(hooks_block, dict):
+            hooks_block = {}
+        for event, new_config in hooks_config.items():
+            existing_config = hooks_block.get(event)
+            kept = []
+            for item in existing_config if isinstance(existing_config, list) else []:
+                hooks = item.get("hooks") if isinstance(item, dict) else None
+                if isinstance(hooks, list):
+                    rest = [h for h in hooks if not (
+                        isinstance(h, dict) and _is_unbound_hook_command(h.get("command", ""), script_path))]
+                    if hooks and not rest:
+                        continue
+                    if len(rest) != len(hooks):
+                        item = {**item, "hooks": rest}
+                kept.append(item)
+            hooks_block[event] = kept + new_config
+        settings["hooks"] = hooks_block
+
+        # Replace rather than write in place: a link at the destination is swapped, never followed as root.
+        fd, tmp_path = tempfile.mkstemp(dir=str(managed_dir), prefix=".hooks.json.")
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+            if system in ["darwin", "linux"]:
+                os.chmod(tmp_path, 0o644)
+            os.replace(tmp_path, settings_path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         debug_print(f"Created managed settings: {settings_path}")
 
         # Set permissions - readable by all users
@@ -2181,8 +2213,10 @@ def _is_our_hook_file(path) -> bool:
 
 
 def _installed_hook_script() -> Optional[Path]:
-    """The per-user hook script, from the first home that has one. Codex installs
-    the same file for every user, so any one of them identifies the install."""
+    """The managed hook script when present, else the per-user one from the first home that has one."""
+    managed_script = get_managed_settings_dir() / "hooks" / "unbound.py"
+    if _is_our_hook_file(managed_script):
+        return managed_script
     for _username, home_dir in get_all_user_homes():
         candidate = home_dir / ".codex" / "hooks" / "unbound.py"
         if _is_our_hook_file(candidate):
@@ -2191,18 +2225,19 @@ def _installed_hook_script() -> Optional[Path]:
 
 
 def detect_install_state() -> Optional[str]:
-    """Inspect the install target BEFORE this run reasserts it.
-    Codex discovers hooks from the user layer, so the install writes nothing to
-    the managed dir. Setup installs for every profile it finds, so the state is
-    per profile: the pair is the hook script and our entry in that user's
-    hooks.json, and either one alone leaves Codex unenforced for them.
-    'fresh' (no profile has either), 'persisted' (at least one has both),
-    'tampered' (any profile has one without the other), None on any error.
-    Tampered wins, matching the copilot detector.
-    A hooks.json we declined to read leaves the answer undetermined rather than
-    assumed: None omits install_state from the report, so the stored state is left
-    alone instead of being guessed healthy or guessed tampered."""
+    """Judge the managed script and its entry in the system hooks.json before this run reasserts them;
+    with neither present, judge the per-user install it replaces, per profile. None when undetermined."""
     try:
+        managed_dir = get_managed_settings_dir()
+        managed_script = managed_dir / "hooks" / "unbound.py"
+        script = _is_our_hook_file(managed_script)
+        registered = _unbound_hook_registered(managed_dir / "hooks.json", managed_script)
+        if registered is None:
+            return None
+        if script and registered:
+            return 'persisted'
+        if script or registered:
+            return 'tampered'
         any_complete = False
         indeterminate = False
         for _username, home_dir in get_all_user_homes():
@@ -2395,30 +2430,35 @@ def main():
         print("Failed to set UNBOUND_BACKEND_URL")
         return False
 
-    # codex 0.125 discovers hooks from ~/.codex/hooks.json (user layer), not the
-    # managed dir — so remove gateway artifacts, write unbound config, enable the
-    # codex_hooks feature flag, and register the hook per-user (the install IS the
-    # user registration; no managed write and no user-level strip).
+    # Codex runs the system hooks.json as a managed hook for every user, with no trust prompt.
     state = detect_install_state()
 
-    print("\nConfiguring Codex user hooks...")
-    installed = 0
-    user_homes = get_all_user_homes()
-    for username, home_dir in user_homes:
-        remove_gateway_artifacts_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
-        enable_codex_hooks_feature_for_user(username, home_dir)
-        if configure_codex_hooks_for_user(username, home_dir, gateway_url):
-            print(f"Registered codex hooks for {username}")
-            installed += 1
-
-    success = bool(user_homes) and installed == len(user_homes)
-    if not user_homes:
-        print("No user home directories found")
-    elif success:
-        print(f"Registered codex hooks for {installed} user(s)")
+    if platform.system().lower() == "windows":
+        # Users can create files under %ProgramData%, so Windows keeps the per-user install.
+        print("\nConfiguring Codex user hooks...")
+        installed = 0
+        user_homes = get_all_user_homes()
+        for username, home_dir in user_homes:
+            remove_gateway_artifacts_for_user(username, home_dir)
+            write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+            enable_codex_hooks_feature_for_user(username, home_dir)
+            if configure_codex_hooks_for_user(username, home_dir, gateway_url):
+                installed += 1
+        success = bool(user_homes) and installed == len(user_homes)
+        print(f"Registered codex hooks for {installed} of {len(user_homes)} user(s)")
     else:
-        print(f"Registered codex hooks for {installed} of {len(user_homes)} user(s) — {len(user_homes) - installed} failed")
+        print("\nConfiguring Codex managed hooks...")
+        success = setup_managed_hooks(gateway_url)
+        if success:
+            print("Registered codex managed hooks")
+            for username, home_dir in get_all_user_homes():
+                remove_gateway_artifacts_for_user(username, home_dir)
+                write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+                enable_codex_hooks_feature_for_user(username, home_dir)
+                # Codex doesn't de-duplicate hooks, so a trusted per-user copy would run beside the managed one.
+                remove_user_level_hooks_for_user(username, home_dir)
+        else:
+            print("Failed to register codex managed hooks")
 
     print("\n" + "=" * 60)
     print("Setup Complete!" if success else "Setup Failed")

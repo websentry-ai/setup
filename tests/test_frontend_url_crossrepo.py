@@ -108,6 +108,7 @@ _SAFE_STUBS = {
     "remove_user_level_hooks": lambda *a, **k: None,
     "set_env_var_system_wide": lambda *a, **k: (True, False),
     "set_env_var": lambda *a, **k: (True, False, "ok"),
+    "setup_managed_hooks": lambda *a, **k: True,
     "download_file": _stub_download_file,
 }
 

@@ -1,7 +1,10 @@
 
 #!/usr/bin/env python3
 
+import base64
+import getpass
 import os
+import plistlib
 import re
 import stat
 import shutil
@@ -1133,16 +1136,13 @@ def detect_install_state() -> str:
 
 
 def get_managed_settings_dir() -> Path:
-    """System-wide managed (MDM) settings directory for Codex. Mirrors the path
-    the MDM setup writes to; keep this in sync with mdm/setup.py."""
+    """Codex's system config folder. A hooks.json here is a managed hook: codex runs it for every user
+    without asking them to trust it."""
     system = platform.system().lower()
-    if system == "darwin":
-        return Path("/Library/Application Support/Codex")
-    elif system == "linux":
+    if system in ("darwin", "linux"):
         return Path("/etc/codex")
     elif system == "windows":
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        return Path(program_files) / "Codex"
+        return Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
     raise OSError(f"Unsupported operating system: {system}")
 
 
@@ -1153,13 +1153,97 @@ def check_enterprise_hooks_conflict() -> bool:
     make every hook fire twice. Read-only; fails open (False) on any error."""
     try:
         managed_dir = get_managed_settings_dir()
-        markers = [
-            managed_dir / "hooks" / "unbound.py",
-        ]
-        return any(marker.exists() for marker in markers)
+        if (managed_dir / "hooks" / "unbound.py").exists():
+            return True
+        hooks_json = managed_dir / "hooks.json"
+        # The binary's managed install has no script, only our command in hooks.json.
+        text = hooks_json.read_text(encoding="utf-8", errors="replace") if hooks_json.is_file() else ""
+        return "/opt/unbound/" in text and "unbound-hook" in text
     except Exception as e:
         print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False
+
+
+_MANAGED_HOOKS_ONLY_RE = re.compile(r'^[ \t]*"?allow_managed_hooks_only"?[ \t]*=[ \t]*(true|false)\b', re.MULTILINE)
+_TOML_TABLE_RE = re.compile(r'^[ \t]*\[', re.MULTILINE)
+
+
+def _json_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _json_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _json_strings(item)
+
+
+def _codex_requirements() -> List[Tuple[str, str]]:
+    """(source, TOML text) for each Codex requirements layer, lowest precedence first.
+    A missing or unreadable source is skipped."""
+    sources = []
+    try:
+        system_file = get_managed_settings_dir() / "requirements.toml"
+        if system_file.is_file():
+            sources.append((str(system_file), system_file.read_text(encoding="utf-8", errors="replace")))
+    except Exception as e:
+        debug_print(f"Could not read the system requirements.toml: {e!r}")
+
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    cache = (Path(codex_home) if codex_home else Path.home() / ".codex") / "cloud-config-bundle-cache.json"
+    try:
+        if cache.is_file():
+            # The fragment shape isn't pinned, so every string in the bundle is read as TOML.
+            label = f"ChatGPT workspace policy ({cache})"
+            sources.extend((label, text) for text in _json_strings(json.loads(cache.read_text(encoding="utf-8"))))
+    except Exception as e:
+        debug_print(f"Could not read {cache}: {e!r}")
+
+    if platform.system().lower() == "darwin":
+        managed_prefs = Path("/Library/Managed Preferences")
+        plists = [managed_prefs / "com.openai.codex.plist"]
+        try:
+            plists.append(managed_prefs / (os.environ.get("USER") or getpass.getuser()) / "com.openai.codex.plist")
+        except Exception as e:
+            debug_print(f"Could not resolve the current user: {e!r}")
+        for plist in plists:
+            try:
+                if not plist.is_file():
+                    continue
+                with open(plist, "rb") as f:
+                    encoded = plistlib.load(f).get("requirements_toml_base64")
+                text = base64.b64decode(encoded).decode("utf-8")
+                sources.append(("macOS MDM profile (com.openai.codex)", text))
+            except Exception as e:
+                debug_print(f"Could not read {plist}: {e!r}")
+    return sources
+
+
+def managed_hooks_only() -> Optional[str]:
+    """Where Codex is set to run only managed hooks, so a user-level hook never runs; None when it
+    isn't, when our hook is already managed, or on any error."""
+    try:
+        sources = _codex_requirements()
+        texts = [text for _source, text in sources]
+        try:
+            system_hooks = get_managed_settings_dir() / "hooks.json"
+            if system_hooks.is_file():
+                texts.append(system_hooks.read_text(encoding="utf-8", errors="replace"))
+        except Exception as e:
+            debug_print(f"Could not read the system hooks.json: {e!r}")
+        if any("unbound.py" in t or ("/opt/unbound/" in t and "unbound-hook" in t) for t in texts):
+            return None
+        effective = None
+        for source, text in sources:
+            # The key is top-level only, so text from the first [table] header on doesn't count.
+            values = _MANAGED_HOOKS_ONLY_RE.findall(_TOML_TABLE_RE.split(text.lstrip("\ufeff"), 1)[0])
+            if values:
+                effective = source if values[-1] == "true" else None
+        return effective
+    except Exception as e:
+        debug_print(f"managed_hooks_only check failed: {e!r}")
+        return None
 
 
 def hook_script_hash(script_path) -> Optional[str]:
@@ -1639,6 +1723,17 @@ def main():
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Codex is managed by your organization (MDM).")
         raise SystemExit(3)
+
+    managed_only_source = managed_hooks_only()
+    if managed_only_source:
+        print(f"\nCodex on this device only runs managed hooks (allow_managed_hooks_only = true, set in {managed_only_source}). "
+              "A user-level Unbound hook would never run.")
+        if platform.system().lower() == "windows":
+            print("Fix: ask your IT admin to deploy Unbound as a managed Codex hook.")
+        else:
+            print("Fix: run `sudo unbound setup codex-subscription` to install Unbound as a managed Codex hook, "
+                  "or ask your IT admin to deploy Unbound through MDM.")
+        return False
 
     install_macos_certificates()
 
