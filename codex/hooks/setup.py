@@ -1147,7 +1147,7 @@ def get_managed_settings_dir() -> Path:
 
 
 # Also matches inside the JSON-escaped TOML string of codex's cloud policy cache.
-_MANAGED_HOOKS_ONLY_RE = re.compile(r'(?:^|\\n|"|\ufeff)[ \t]*allow_managed_hooks_only[ \t]*=[ \t]*true\b', re.MULTILINE)
+_MANAGED_HOOKS_ONLY_RE = re.compile(r'(?:^|\\n|"|\ufeff)[ \t]*\\?["\']?allow_managed_hooks_only\\?["\']?[ \t]*=[ \t]*true\b', re.MULTILINE)
 
 
 def managed_hooks_only() -> Optional[str]:
@@ -1669,7 +1669,10 @@ def main():
     source = managed_hooks_only()
     if source:
         print(f"\nCodex only runs managed hooks on this device (allow_managed_hooks_only in {source}), so a user-level hook never runs.")
-        print("Fix: run `sudo unbound setup codex-subscription`, or ask your IT admin to deploy Unbound through MDM.")
+        if platform.system().lower() == "windows":
+            print("Fix: ask your IT admin to deploy Unbound as a managed Codex hook.")
+        else:
+            print("Fix: run `sudo unbound setup codex-subscription`, or ask your IT admin to deploy Unbound through MDM.")
         return False
 
     install_macos_certificates()

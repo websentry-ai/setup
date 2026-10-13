@@ -998,10 +998,14 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
 
         # Replace only our entries; codex rejects the whole file over any top-level key but these two.
         hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else {}
+        mine = lambda h: isinstance(h, dict) and _is_unbound_hook_command(h.get("command"), script_path)
         for event, ours in hooks_config.items():
-            kept = [g for g in (hooks.get(event) if isinstance(hooks.get(event), list) else [])
-                    if not (isinstance(g, dict) and any(isinstance(h, dict) and _is_unbound_hook_command(h.get("command"), script_path)
-                                                        for h in (g.get("hooks") if isinstance(g.get("hooks"), list) else [])))]
+            kept = []
+            for g in hooks.get(event) if isinstance(hooks.get(event), list) else []:
+                handlers = g.get("hooks") if isinstance(g, dict) and isinstance(g.get("hooks"), list) else None
+                rest = [h for h in handlers if not mine(h)] if handlers else None
+                if rest is None or rest:
+                    kept.append({**g, "hooks": rest} if rest is not None and len(rest) != len(handlers) else g)
             hooks[event] = kept + ours
         settings = {k: v for k, v in settings.items() if k == "description"}
         settings["hooks"] = hooks
@@ -2410,7 +2414,8 @@ def main():
 
     state = detect_install_state()
     # /etc/codex/hooks.json is a managed hook: codex runs it for every user, even under
-    # allow_managed_hooks_only. Windows stays per-user: users can write under %ProgramData%.
+    # allow_managed_hooks_only. Codex reads it since 0.115 (managed, no trust prompt, since 0.129).
+    # Windows stays per-user: users can write under %ProgramData%.
     system_wide = platform.system().lower() != "windows"
     if system_wide and not setup_managed_hooks(gateway_url):
         print("Failed to set up codex managed hooks")

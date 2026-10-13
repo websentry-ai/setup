@@ -93,3 +93,20 @@ def test_mdm_registered_hook_with_its_script_deleted_is_tampered(tmp_path, monke
     script = tmp_path / "hooks" / "unbound.py"
     (tmp_path / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": f'"{script}"'}]}]}}))
     assert mdm.detect_install_state() == "tampered"
+
+
+def test_quoted_key_turns_it_on(codex):
+    (codex[0] / "requirements.toml").write_text('"allow_managed_hooks_only" = true\n')
+    assert setup.managed_hooks_only() == str(codex[0] / "requirements.toml")
+
+
+def test_mdm_keeps_a_foreign_handler_that_shares_a_group_with_ours(tmp_path, monkeypatch):
+    monkeypatch.setattr(mdm, "get_managed_settings_dir", lambda: tmp_path)
+    monkeypatch.setattr(mdm, "download_file", lambda _u, dest: Path(dest).write_text("#") or True)
+    audit = {"type": "command", "command": "/usr/local/bin/audit"}
+    ours = {"type": "command", "command": f'"{tmp_path / "hooks" / "unbound.py"}"'}
+    (tmp_path / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [audit, ours]}]}}))
+    assert mdm.setup_managed_hooks() is True
+    stop = json.loads((tmp_path / "hooks.json").read_text())["hooks"]["Stop"]
+    assert stop[0] == {"hooks": [audit]}
+    assert len(stop) == 2
