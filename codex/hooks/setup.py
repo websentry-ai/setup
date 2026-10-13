@@ -1,7 +1,9 @@
 
 #!/usr/bin/env python3
 
+import base64
 import os
+import plistlib
 import re
 import stat
 import shutil
@@ -1143,6 +1145,40 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
+_MANAGED_HOOKS_ONLY_RE = re.compile(r'^[ \t]*["\']?allow_managed_hooks_only["\']?[ \t]*=[ \t]*true\b', re.MULTILINE)
+
+
+def _json_strings(value) -> List[str]:
+    if isinstance(value, str):
+        return [value]
+    items = value.values() if isinstance(value, dict) else value if isinstance(value, list) else []
+    return [s for item in items for s in _json_strings(item)]
+
+
+def managed_hooks_only() -> Optional[str]:
+    """Where codex is set to run only managed hooks, so a user-level hook never runs; else None."""
+    if platform.system().lower() == "windows":
+        system_dir = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "OpenAI" / "Codex"
+    else:
+        system_dir = Path("/etc/codex")
+    codex_home = Path(os.environ.get("CODEX_HOME", "").strip() or Path.home() / ".codex")
+    for path in (system_dir / "requirements.toml", codex_home / "cloud-config-bundle-cache.json",
+                 Path("/Library/Managed Preferences/com.openai.codex.plist")):
+        try:
+            if path.suffix == ".plist":
+                with open(path, "rb") as f:
+                    texts = [base64.b64decode(plistlib.load(f).get("requirements_toml_base64", "")).decode("utf-8")]
+            elif path.suffix == ".json":
+                texts = _json_strings(json.loads(path.read_text(encoding="utf-8")))  # TOML lives in JSON strings
+            else:
+                texts = [path.read_text(encoding="utf-8", errors="replace")]
+            if any(_MANAGED_HOOKS_ONLY_RE.search(t.lstrip("\ufeff")) for t in texts):
+                return str(path)
+        except Exception:
+            continue
+    return None
+
+
 def check_enterprise_hooks_conflict() -> bool:
     """True if an Unbound MDM (managed) setup already exists for Codex on this
     device. User-level setup must not run alongside it — the managed config
@@ -1638,6 +1674,15 @@ def main():
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Codex is managed by your organization (MDM).")
         raise SystemExit(3)
+
+    source = managed_hooks_only()
+    if source:
+        print(f"\nCodex only runs managed hooks on this device (allow_managed_hooks_only in {source}), so a user-level hook never runs.")
+        if platform.system().lower() == "windows":
+            print("Fix: ask your IT admin to deploy Unbound as a managed Codex hook.")
+        else:
+            print("Fix: run `sudo unbound setup codex-subscription`, or ask your IT admin to deploy Unbound through MDM.")
+        return False
 
     install_macos_certificates()
 
