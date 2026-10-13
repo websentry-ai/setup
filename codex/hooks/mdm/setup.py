@@ -889,6 +889,66 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         debug_print(f"Could not rewrite gateway URL in {path}: {e}")
 
 
+# Codex's hooks.json schema (codex-rs/config/src/hook_config.rs); one bad entry and it loads none of the file.
+_CODEX_EVENTS = (
+    "PreToolUse", "PermissionRequest", "PostToolUse", "PreCompact", "PostCompact", "SessionStart",
+    "SessionEnd", "UserPromptSubmit", "SubagentStart", "SubagentStop", "Stop", "Interrupt")
+_CODEX_HANDLER_REQUIRED = {"command": ("command",), "mcp_tool": ("server", "tool"), "prompt": (), "agent": ()}
+
+
+def _reject_json_constant(name):
+    raise ValueError(f"{name} is not valid JSON for codex")
+
+
+def _codex_handler_ok(handler) -> bool:
+    if not isinstance(handler, dict) or not isinstance(handler.get("type"), str):
+        return False
+    required = _CODEX_HANDLER_REQUIRED.get(handler["type"])
+    if required is None:
+        return True  # a type this file doesn't know; a newer codex may
+    if not all(isinstance(handler.get(k), str) for k in required):
+        return False
+    timeout = handler.get("timeout")
+    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 0):
+        return False
+    if "async" in handler and not isinstance(handler["async"], bool):
+        return False
+    return all(handler.get(k) is None or isinstance(handler[k], str)
+               for k in ("statusMessage", "commandWindows", "command_windows"))
+
+
+def _codex_loadable_hooks(config) -> dict:
+    """The part of a parsed hooks.json codex can load: only description and hooks at the top, and
+    known events hold only well-formed groups and handlers."""
+    if not isinstance(config, dict):
+        return {}
+    clean = {}
+    if isinstance(config.get("description"), str):
+        clean["description"] = config["description"]
+    events = config.get("hooks")
+    if not isinstance(events, dict):
+        return clean
+    clean["hooks"] = {}
+    for event, groups in events.items():
+        if event not in _CODEX_EVENTS:
+            clean["hooks"][event] = groups
+            continue
+        kept = []
+        for group in groups if isinstance(groups, list) else []:
+            if not isinstance(group, dict) or not (group.get("matcher") is None or isinstance(group["matcher"], str)):
+                continue
+            if "hooks" in group:
+                handlers = group["hooks"] if isinstance(group["hooks"], list) else []
+                good = [h for h in handlers if _codex_handler_ok(h)]
+                if handlers and not good:
+                    continue
+                if len(good) != len(handlers) or not isinstance(group["hooks"], list):
+                    group = {**group, "hooks": good}
+            kept.append(group)
+        clean["hooks"][event] = kept
+    return clean
+
+
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
     """Download unbound.py into codex's system folder and merge our hooks into its hooks.json,
     keeping every other hook and key there."""
@@ -921,14 +981,15 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         if settings_path.exists():
             try:
                 with open(settings_path, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
+                    settings = json.load(f, parse_constant=_reject_json_constant)
             except Exception:
                 settings = None
-            if not isinstance(settings, dict):
-                # Codex rejects the whole file, so ours replaces it; the admin's original is kept beside it.
+            loadable = _codex_loadable_hooks(settings)
+            if loadable != settings:
+                # Codex rejects the whole file over one bad entry; keep what it loads, the original beside it.
                 os.replace(settings_path, managed_dir / "hooks.json.unbound-bak")
-                print(f"Moved unreadable {settings_path} to hooks.json.unbound-bak")
-                settings = {}
+                print(f"Moved {settings_path} to hooks.json.unbound-bak: Codex could not load all of it")
+            settings = loadable
 
         # Configure hooks - quote the path to handle spaces. On Windows, invoke
         # via `py -3` (falling back to `python`) so the hook can actually execute

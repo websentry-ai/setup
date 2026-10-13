@@ -91,7 +91,7 @@ class TestSetupManagedHooks:
         (group,) = _hooks_json(system)["hooks"]["Stop"]
         assert _commands(group) == [f'{launcher} "{_script(system)}"']
 
-    def test_keeps_foreign_keys_events_groups_and_handlers(self, system):
+    def test_keeps_foreign_events_groups_and_handlers(self, system):
         _write_hooks(system, {
             "version": 2,
             "hooks": {
@@ -104,7 +104,9 @@ class TestSetupManagedHooks:
         })
         assert mdm.setup_managed_hooks() is True
         config = _hooks_json(system)
-        assert config["version"] == 2
+        # codex denies unknown top-level fields, so the key goes and the original is kept beside it
+        assert "version" not in config
+        assert json.loads((system / "hooks.json.unbound-bak").read_text())["version"] == 2
         assert config["hooks"]["Notification"] == [{"hooks": [{"type": "command", "command": FOREIGN}]}]
         stop = config["hooks"]["Stop"]
         assert stop[0] == {"hooks": [{"type": "command", "command": FOREIGN}]}
@@ -112,6 +114,36 @@ class TestSetupManagedHooks:
         pre = config["hooks"]["PreToolUse"]
         assert pre[0] == {"matcher": "Bash", "hooks": [{"type": "command", "command": FOREIGN}]}
         assert len(_our_groups(config, system, "PreToolUse")) == 1
+
+    @pytest.mark.parametrize("bad", [
+        {"type": "command"},
+        {"type": "command", "command": FOREIGN, "timeout": -1},
+        {"type": "command", "command": FOREIGN, "async": "yes"},
+        {"command": FOREIGN},
+        "not a handler",
+    ])
+    def test_a_handler_codex_rejects_is_dropped_so_the_file_still_loads(self, system, bad):
+        _write_hooks(system, {"hooks": {"Stop": [{"hooks": [bad, {"type": "command", "command": FOREIGN}]}]}})
+        assert mdm.setup_managed_hooks() is True
+        stop = _hooks_json(system)["hooks"]["Stop"]
+        assert stop[0] == {"hooks": [{"type": "command", "command": FOREIGN}]}
+        assert (system / "hooks.json.unbound-bak").exists()
+
+    def test_nan_counts_as_unreadable(self, system):
+        system.mkdir(parents=True)
+        (system / "hooks.json").write_text('{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "x", "timeout": NaN}]}]}}')
+        assert mdm.setup_managed_hooks() is True
+        assert "NaN" not in (system / "hooks.json").read_text()
+        assert "NaN" in (system / "hooks.json.unbound-bak").read_text()
+
+    def test_unknown_handler_types_and_events_are_kept(self, system):
+        foreign = {"hooks": {"Notification": [{"x": 1}], "Stop": [{"hooks": [{"type": "future", "k": 1}]}]}}
+        _write_hooks(system, foreign)
+        assert mdm.setup_managed_hooks() is True
+        config = _hooks_json(system)
+        assert config["hooks"]["Notification"] == [{"x": 1}]
+        assert config["hooks"]["Stop"][0] == {"hooks": [{"type": "future", "k": 1}]}
+        assert not (system / "hooks.json.unbound-bak").exists()
 
     def test_a_second_run_is_byte_identical(self, system):
         _write_hooks(system, {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": FOREIGN}]}]}})
