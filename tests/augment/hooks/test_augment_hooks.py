@@ -1757,11 +1757,7 @@ class TestDenyMergesAdditionalContext(unittest.TestCase):
         )
 
 
-# --------------------------------------------------------------------------- #
-# WEB-6172: gateway->Augment rendering contract for transform_response_for_claude #
-# (warn_unsupported_action org setting converts WARN->deny upstream; Augment    #
-# renders ONLY deny today, so ask/allow/unknown/empty must all stay {})         #
-# --------------------------------------------------------------------------- #
+# Augment renders only deny today, so ask/allow/unknown/empty must all stay {}.
 class TestWarnFallbackRenderingContract(unittest.TestCase):
     def test_deny_emits_full_popup_shape_with_merged_context(self):
         out = unbound.transform_response_for_claude({
@@ -1779,9 +1775,7 @@ class TestWarnFallbackRenderingContract(unittest.TestCase):
         )
 
     def test_deny_moves_attribution_footer_after_additional_context(self):
-        """A gateway reason ending in the attribution footer has the footer split
-        off (_split_attribution_footer) and re-appended LAST, after the merged
-        additionalContext, so the user always reads it at the end."""
+        # Footer is split off and re-appended last, after the merged additionalContext.
         footer = unbound._attribution_footer("trace-42")
         out = unbound.transform_response_for_claude({
             "decision": "deny",
@@ -1807,9 +1801,6 @@ class TestWarnFallbackRenderingContract(unittest.TestCase):
         )
 
     def test_ask_returns_empty(self):
-        """Augment cannot render ask today -> {} (the gateway's new
-        warn_unsupported_action org setting compensates by converting WARN->deny
-        before it reaches this hook)."""
         out = unbound.transform_response_for_claude({"decision": "ask", "reason": "?"})
         self.assertEqual(out, {})
 
@@ -1820,9 +1811,7 @@ class TestWarnFallbackRenderingContract(unittest.TestCase):
         self.assertEqual(unbound.transform_response_for_claude(None), {})
 
     def test_warn_converted_to_deny_renders_full_deny_popup(self):
-        """A gateway WARN converted to deny (warn_unsupported_action) arrives as a
-        plain deny ({'decision': 'deny', 'reason': <warn reason>, ...}) and must
-        emit the full deny popup output."""
+        # A gateway WARN converted to deny arrives as a plain deny and must emit the full popup.
         warn_payload = {
             "decision": "deny",
             "reason": "WARN: risky command, proceed with caution",
