@@ -1810,19 +1810,10 @@ class TestWarnFallbackRenderingContract(unittest.TestCase):
         self.assertEqual(unbound.transform_response_for_claude({}), {})
         self.assertEqual(unbound.transform_response_for_claude(None), {})
 
-    def test_warn_converted_to_deny_renders_full_deny_popup(self):
-        # A gateway WARN converted to deny arrives as a plain deny and must emit the full popup.
-        warn_payload = {
-            "decision": "deny",
-            "reason": "WARN: risky command, proceed with caution",
-            "additionalContext": "do not attempt workarounds",
-            "unbound_trace_id": "trace-7",
-        }
-        converted = unbound.transform_response_for_claude(warn_payload)
-        hso = converted["hookSpecificOutput"]
-        self.assertEqual(hso["permissionDecision"], "deny")
-        self.assertIn("WARN: risky command, proceed with caution", hso["permissionDecisionReason"])
-        self.assertIn("do not attempt workarounds", hso["permissionDecisionReason"])
+    def test_unconverted_warn_returns_empty(self):
+        # A gateway WARN that was not converted to deny must fall through to {} like ask/allow.
+        out = unbound.transform_response_for_claude({"decision": "warn", "reason": "risky command"})
+        self.assertEqual(out, {})
 
 
 if __name__ == "__main__":
