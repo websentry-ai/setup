@@ -1599,7 +1599,7 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
 
 
 def _refresh_claude_ai_connectors() -> None:
-    claude = os.environ.get('CLAUDE_CODE_EXECPATH') or shutil.which('claude')
+    claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
     if not claude:
         return
     proc = timer = None
@@ -1610,6 +1610,7 @@ def _refresh_claude_ai_connectors() -> None:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', cwd=str(Path.home()),
             env={**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'},
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
         )
         timer = threading.Timer(CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS, proc.kill)
         timer.start()
@@ -1637,6 +1638,7 @@ def _refresh_claude_ai_connectors() -> None:
                 CLAUDE_AI_CONNECTORS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
                 tmp = CLAUDE_AI_CONNECTORS_CACHE_PATH.parent / ('.claude-ai-connectors.%d.tmp' % os.getpid())
                 tmp.write_text(json.dumps(connector_urls), encoding='utf-8')
+                os.chmod(tmp, 0o600)
                 os.replace(str(tmp), str(CLAUDE_AI_CONNECTORS_CACHE_PATH))
                 break
             # The claude.ai list loads after startup and no event marks it.
@@ -6817,11 +6819,6 @@ def main():
         _refresh_claude_ai_connectors()
         return
 
-    # The refresh's own Claude Code process: its SessionStart would start another refresh.
-    if os.environ.get(CLAUDE_AI_CONNECTORS_REFRESH_ENV):
-        _emit('{"suppressOutput": true}')
-        return
-
     try:
         input_data = _read_stdin()
 
@@ -6842,8 +6839,10 @@ def main():
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _dispatch_discovery()
-            _dispatch_skills_sync(api_key)
-            _dispatch_claude_ai_connectors_refresh()
+            # The refresh's own Claude Code process: keep it out of the gateway and don't start another refresh.
+            if not os.environ.get(CLAUDE_AI_CONNECTORS_REFRESH_ENV):
+                _dispatch_skills_sync(api_key)
+                _dispatch_claude_ai_connectors_refresh()
             _emit("{}")
             return
         session_id = event.get('session_id')
