@@ -1028,6 +1028,7 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
     # Only a hard BLOCK (decision == 'deny') is rendered by Augment today.
     # Everything else (allow, warn, ask, approval_required, unexpected) returns
     # empty and is left to the native toolPermissions ask-user layer.
+    # Gateway may convert WARN->deny via org setting; map ASK->permissionDecision 'ask' once Augment ships ask/allow rendering.
     if decision == 'deny':
         # Augment renders ONLY permissionDecisionReason on a PreToolUse deny, so
         # merge any additionalContext (our deny/block-failure responses put

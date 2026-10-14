@@ -1757,5 +1757,64 @@ class TestDenyMergesAdditionalContext(unittest.TestCase):
         )
 
 
+# Augment renders only deny today, so ask/allow/unknown/empty must all stay {}.
+class TestWarnFallbackRenderingContract(unittest.TestCase):
+    def test_deny_emits_full_popup_shape_with_merged_context(self):
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked by policy",
+            "additionalContext": "do not attempt workarounds",
+        })
+        self.assertEqual(set(out.keys()), {"hookSpecificOutput"})
+        hso = out["hookSpecificOutput"]
+        self.assertEqual(hso["hookEventName"], "PreToolUse")
+        self.assertEqual(hso["permissionDecision"], "deny")
+        self.assertEqual(
+            hso["permissionDecisionReason"],
+            "blocked by policy\n\ndo not attempt workarounds",
+        )
+
+    def test_deny_moves_attribution_footer_after_additional_context(self):
+        # Footer is split off and re-appended last, after the merged additionalContext.
+        footer = unbound._attribution_footer("trace-42")
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked by policy" + footer,
+            "additionalContext": "do not attempt workarounds",
+            "unbound_trace_id": "trace-42",
+        })
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "blocked by policy\n\ndo not attempt workarounds" + footer,
+        )
+
+    def test_deny_footer_without_trace_id_is_also_relocated(self):
+        footer = unbound._attribution_footer()
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked" + footer,
+            "additionalContext": "ctx",
+        })
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "blocked\n\nctx" + footer,
+        )
+
+    def test_ask_returns_empty(self):
+        out = unbound.transform_response_for_claude({"decision": "ask", "reason": "?"})
+        self.assertEqual(out, {})
+
+    def test_allow_unknown_and_empty_return_empty(self):
+        self.assertEqual(unbound.transform_response_for_claude({"decision": "allow"}), {})
+        self.assertEqual(unbound.transform_response_for_claude({"decision": "something-new", "reason": "x"}), {})
+        self.assertEqual(unbound.transform_response_for_claude({}), {})
+        self.assertEqual(unbound.transform_response_for_claude(None), {})
+
+    def test_unconverted_warn_returns_empty(self):
+        # A gateway WARN that was not converted to deny must fall through to {} like ask/allow.
+        out = unbound.transform_response_for_claude({"decision": "warn", "reason": "risky command"})
+        self.assertEqual(out, {})
+
+
 if __name__ == "__main__":
     unittest.main()
