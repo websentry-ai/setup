@@ -4,7 +4,7 @@ Subcommands:
   hook <tool> [<event>]   stdin/stdout hook dispatch (fail-open, exit 0)
   mcp-diagnostic <tool>   detached null-fp diagnostic (env-driven, exit 0)
   sync-skills <tool>      detached injected-skill reconcile (exit 0)
-  refresh-claude-ai-connectors <tool>
+  refresh-claude-ai-connectors <tool> <session-id>
                           detached claude.ai connector URL cache refresh (exit 0)
   setup [...]             MDM onboarding (port of mdm/onboard.py)
   backfill [...]          historical transcript seeding
@@ -52,7 +52,7 @@ Usage:
   unbound-hook hook <tool> [<event>]      tools: claude-code|cursor|copilot|codex|augment
   unbound-hook mcp-diagnostic <tool>      internal: detached null-fp diagnostic (env-driven)
   unbound-hook sync-skills <tool>         internal: detached injected-skill reconcile
-  unbound-hook refresh-claude-ai-connectors <tool>
+  unbound-hook refresh-claude-ai-connectors <tool> <session-id>
                                           internal: detached claude.ai connector URL cache refresh
   unbound-hook setup --api-key <key> [options]
   unbound-hook backfill (--all | --user <name>) [--dry-run] [options]

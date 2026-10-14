@@ -81,7 +81,7 @@ def run_claude_ai_connectors_refresh(args) -> int:
         module = load_hook_module(args[0])
         refresh = getattr(module, "_refresh_claude_ai_connectors", None)
         if refresh is not None:
-            refresh()
+            refresh(args[1] if len(args) > 1 else '')
     except Exception:
         pass
     return 0

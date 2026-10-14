@@ -53,6 +53,7 @@ SKILL_LOADED_WINDOW = 10
 CLAUDE_AI_CONNECTORS_CACHE_PATH = _CONFIG_DIR / 'hooks' / 'claude-ai-connectors.json'
 CLAUDE_AI_CONNECTORS_REFRESH_ENV = 'UNBOUND_CLAUDE_AI_CONNECTORS_REFRESH'
 CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS = 20
+CLAUDE_AI_CONNECTORS_CACHE_SESSIONS = 20
 # unbound-<slug> is the skill name, so the slug carries the spec's name rules.
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
@@ -1560,7 +1561,8 @@ def _resolve_plugin_mcp_config_by_server_key(server_name: str, cache_dir: Path =
         return None
 
 
-def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH) -> Optional[tuple]:
+def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH,
+                                 session_id: Optional[str] = None) -> Optional[tuple]:
     if not server_name.startswith('claude_ai_'):
         return None
     try:
@@ -1570,9 +1572,11 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.loads(f.read())
         try:
-            connector_urls = json.loads(CLAUDE_AI_CONNECTORS_CACHE_PATH.read_text(encoding='utf-8'))
+            sessions = json.loads(CLAUDE_AI_CONNECTORS_CACHE_PATH.read_text(encoding='utf-8'))
         except (OSError, ValueError):
-            connector_urls = {}
+            sessions = {}
+        # Only this session's own refresh: an older session's map can hold a replaced connector's URL.
+        connector_urls = sessions.get(session_id) if isinstance(sessions, dict) and session_id else None
         if not isinstance(connector_urls, dict):
             connector_urls = {}
         ever_connected = config.get('claudeAiMcpEverConnected', [])
@@ -1598,16 +1602,15 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
         return None
 
 
-def _refresh_claude_ai_connectors() -> None:
+def _refresh_claude_ai_connectors(session_id: str) -> None:
     claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
     env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'}
     if _env_config_dir:
         # Resolved here: the refresh runs from home, where a relative CLAUDE_CONFIG_DIR points elsewhere.
         env['CLAUDE_CONFIG_DIR'] = str(_CONFIG_DIR)
     proc = timer = None
-    written = False
     try:
-        if not claude:
+        if not claude or not session_id:
             return
         proc = subprocess.Popen(
             [claude, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
@@ -1640,12 +1643,20 @@ def _refresh_claude_ai_connectors() -> None:
                 if server.get('scope') == 'claudeai' and (server.get('config') or {}).get('type') == 'claudeai-proxy'
             }
             if connector_urls:
+                try:
+                    sessions = json.loads(CLAUDE_AI_CONNECTORS_CACHE_PATH.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    sessions = {}
+                if not isinstance(sessions, dict):
+                    sessions = {}
+                sessions.pop(session_id, None)
+                sessions[session_id] = connector_urls
+                sessions = dict(list(sessions.items())[-CLAUDE_AI_CONNECTORS_CACHE_SESSIONS:])
                 CLAUDE_AI_CONNECTORS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
                 tmp = CLAUDE_AI_CONNECTORS_CACHE_PATH.parent / ('.claude-ai-connectors.%d.tmp' % os.getpid())
-                tmp.write_text(json.dumps(connector_urls), encoding='utf-8')
+                tmp.write_text(json.dumps(sessions), encoding='utf-8')
                 os.chmod(tmp, 0o600)
                 os.replace(str(tmp), str(CLAUDE_AI_CONNECTORS_CACHE_PATH))
-                written = True
                 break
             # The claude.ai list loads after startup and no event marks it.
             time.sleep(0.5)
@@ -1657,20 +1668,14 @@ def _refresh_claude_ai_connectors() -> None:
             timer.cancel()
         if proc is not None:
             proc.kill()
-        if not written:
-            # An old map could hold a replaced connector's URL; without one the hook sends the name only.
-            try:
-                CLAUDE_AI_CONNECTORS_CACHE_PATH.unlink(missing_ok=True)
-            except OSError:
-                pass
 
 
-def _dispatch_claude_ai_connectors_refresh() -> None:
+def _dispatch_claude_ai_connectors_refresh(session_id: str) -> None:
     try:
         if RUNNING_FROZEN:
-            cmd = [sys.executable, 'refresh-claude-ai-connectors', 'claude-code']
+            cmd = [sys.executable, 'refresh-claude-ai-connectors', 'claude-code', session_id]
         else:
-            cmd = [sys.executable, os.path.abspath(__file__), '--refresh-claude-ai-connectors']
+            cmd = [sys.executable, os.path.abspath(__file__), '--refresh-claude-ai-connectors', session_id]
         popen_kwargs = {
             'stdin': subprocess.DEVNULL,
             'stdout': subprocess.DEVNULL,
@@ -4030,7 +4035,8 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
                 metadata['mcp_server_config'] = server_cfg
 
             if not server_cfg:
-                connector = _resolve_claude_ai_connector(mcp_server_name, config_path=CLAUDE_MCP_CONFIG_PATH)
+                connector = _resolve_claude_ai_connector(
+                    mcp_server_name, config_path=CLAUDE_MCP_CONFIG_PATH, session_id=event.get('session_id'))
                 if connector:
                     display_name, connector_cfg = connector
                     metadata['mcp_server'] = display_name
@@ -6828,7 +6834,7 @@ def main():
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == '--refresh-claude-ai-connectors':
-        _refresh_claude_ai_connectors()
+        _refresh_claude_ai_connectors(sys.argv[2] if len(sys.argv) > 2 else '')
         return
 
     try:
@@ -6854,7 +6860,7 @@ def main():
             # The refresh's own Claude Code process: keep it out of the gateway and don't start another refresh.
             if not os.environ.get(CLAUDE_AI_CONNECTORS_REFRESH_ENV):
                 _dispatch_skills_sync(api_key)
-                _dispatch_claude_ai_connectors_refresh()
+                _dispatch_claude_ai_connectors_refresh(session_id or '')
             _emit("{}")
             return
         session_id = event.get('session_id')
