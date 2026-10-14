@@ -74,6 +74,19 @@ def run_skills_sync(args) -> int:
     return 0
 
 
+def run_claude_ai_connectors_refresh(args) -> int:
+    if not args or args[0] not in TOOLS:
+        return 0
+    try:
+        module = load_hook_module(args[0])
+        refresh = getattr(module, "_refresh_claude_ai_connectors", None)
+        if refresh is not None:
+            refresh()
+    except Exception:
+        pass
+    return 0
+
+
 def run_mcp_diagnostic(args) -> int:
     """Build + upload the null-fingerprint diagnostic (env-driven, detached).
     Fail-open: never raises. Only tools whose module defines the entry run it."""
