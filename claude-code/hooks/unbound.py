@@ -1600,14 +1600,15 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
 
 def _refresh_claude_ai_connectors() -> None:
     claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
-    if not claude:
-        return
     env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'}
     if _env_config_dir:
         # Resolved here: the refresh runs from home, where a relative CLAUDE_CONFIG_DIR points elsewhere.
         env['CLAUDE_CONFIG_DIR'] = str(_CONFIG_DIR)
     proc = timer = None
+    written = False
     try:
+        if not claude:
+            return
         proc = subprocess.Popen(
             [claude, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
              '--verbose', '--no-session-persistence'],
@@ -1644,6 +1645,7 @@ def _refresh_claude_ai_connectors() -> None:
                 tmp.write_text(json.dumps(connector_urls), encoding='utf-8')
                 os.chmod(tmp, 0o600)
                 os.replace(str(tmp), str(CLAUDE_AI_CONNECTORS_CACHE_PATH))
+                written = True
                 break
             # The claude.ai list loads after startup and no event marks it.
             time.sleep(0.5)
@@ -1655,6 +1657,12 @@ def _refresh_claude_ai_connectors() -> None:
             timer.cancel()
         if proc is not None:
             proc.kill()
+        if not written:
+            # An old map could hold a replaced connector's URL; without one the hook sends the name only.
+            try:
+                CLAUDE_AI_CONNECTORS_CACHE_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _dispatch_claude_ai_connectors_refresh() -> None:
