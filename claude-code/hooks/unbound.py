@@ -50,7 +50,7 @@ SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 20
 SKILL_LOADED_WINDOW = 10
-CLAUDE_AI_CONNECTORS_CACHE_PATH = Path.home() / '.unbound' / 'claude-ai-connectors.json'
+CLAUDE_AI_CONNECTORS_CACHE_PATH = _CONFIG_DIR / 'hooks' / 'claude-ai-connectors.json'
 CLAUDE_AI_CONNECTORS_REFRESH_ENV = 'UNBOUND_CLAUDE_AI_CONNECTORS_REFRESH'
 CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS = 20
 # unbound-<slug> is the skill name, so the slug carries the spec's name rules.
@@ -1602,6 +1602,10 @@ def _refresh_claude_ai_connectors() -> None:
     claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
     if not claude:
         return
+    env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'}
+    if _env_config_dir:
+        # Resolved here: the refresh runs from home, where a relative CLAUDE_CONFIG_DIR points elsewhere.
+        env['CLAUDE_CONFIG_DIR'] = str(_CONFIG_DIR)
     proc = timer = None
     try:
         proc = subprocess.Popen(
@@ -1609,7 +1613,7 @@ def _refresh_claude_ai_connectors() -> None:
              '--verbose', '--no-session-persistence'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', cwd=str(Path.home()),
-            env={**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'},
+            env=env,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
         )
         timer = threading.Timer(CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS, proc.kill)
