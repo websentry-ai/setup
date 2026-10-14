@@ -1610,21 +1610,22 @@ def _claude_ai_connectors_cache_path(session_id) -> Optional[Path]:
 
 def _refresh_claude_ai_connectors(session_id: str) -> None:
     claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
-    env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'}
+    cache_path = _claude_ai_connectors_cache_path(session_id)
+    if not claude or not cache_path:
+        return
+    # A throwaway cwd keeps this run's MCP logs (cached per cwd) and npm logs out of the user's own.
+    work = os.path.realpath(tempfile.mkdtemp(prefix='unbound-claude-ai-'))
+    env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1', 'npm_config_logs_dir': work}
     if _env_config_dir:
-        # Resolved here: the refresh runs from home, where a relative CLAUDE_CONFIG_DIR points elsewhere.
+        # Resolved here: the refresh runs elsewhere, where a relative CLAUDE_CONFIG_DIR points to another dir.
         env['CLAUDE_CONFIG_DIR'] = str(_CONFIG_DIR)
     proc = timer = None
     try:
-        cache_path = _claude_ai_connectors_cache_path(session_id)
-        if not claude or not cache_path:
-            return
         proc = subprocess.Popen(
             [claude, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
              '--verbose', '--no-session-persistence', '--settings', '{"disableAllHooks": true}'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding='utf-8', cwd=str(Path.home()),
-            env=env,
+            text=True, encoding='utf-8', cwd=work, env=env,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
         )
         timer = threading.Timer(CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS, proc.kill)
@@ -1662,13 +1663,23 @@ def _refresh_claude_ai_connectors(session_id: str) -> None:
             # The claude.ai list loads after startup and no event marks it.
             time.sleep(0.5)
             send('status', 'mcp_status')
+        # A clean exit lets Claude Code remove its own session registry entry, locks and plugin markers.
+        proc.stdin.close()
+        proc.wait(timeout=10)
     except Exception as exc:
         log_error(f"claude.ai connector refresh failed: {exc}", 'mcp_connector')
     finally:
         if timer is not None:
             timer.cancel()
-        if proc is not None:
+        if proc is not None and proc.poll() is None:
             proc.kill()
+            proc.wait()
+        shutil.rmtree(work, ignore_errors=True)
+        cache_key = re.sub(r'[^a-zA-Z0-9]', '-', work)
+        for cache_root in (Path.home() / 'Library' / 'Caches' / 'claude-cli-nodejs',
+                           Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'claude-cli-nodejs',
+                           Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'claude-cli-nodejs' / 'Cache'):
+            shutil.rmtree(cache_root / cache_key, ignore_errors=True)
 
 
 def _dispatch_claude_ai_connectors_refresh(session_id: str) -> None:
