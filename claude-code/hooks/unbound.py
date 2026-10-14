@@ -17,6 +17,7 @@ import shutil
 import tempfile
 import platform
 import uuid
+import threading
 from urllib.parse import unquote, urlparse
 
 
@@ -49,6 +50,10 @@ SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 20
 SKILL_LOADED_WINDOW = 10
+CLAUDE_AI_CONNECTORS_CACHE_DIR = _CONFIG_DIR / 'hooks' / 'claude-ai-connectors'
+CLAUDE_AI_CONNECTORS_REFRESH_ENV = 'UNBOUND_CLAUDE_AI_CONNECTORS_REFRESH'
+CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS = 20
+CLAUDE_AI_CONNECTORS_CACHE_MAX_AGE_SECONDS = 7 * 24 * 3600
 # unbound-<slug> is the skill name, so the slug carries the spec's name rules.
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
@@ -1556,7 +1561,8 @@ def _resolve_plugin_mcp_config_by_server_key(server_name: str, cache_dir: Path =
         return None
 
 
-def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH) -> Optional[tuple]:
+def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH,
+                                 session_id: Optional[str] = None) -> Optional[tuple]:
     if not server_name.startswith('claude_ai_'):
         return None
     try:
@@ -1565,15 +1571,27 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
             return None
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.loads(f.read())
+        # Only this session's own refresh: an older session's map can hold a replaced connector's URL.
+        cache_path = _claude_ai_connectors_cache_path(session_id)
+        try:
+            connector_urls = json.loads(cache_path.read_text(encoding='utf-8')) if cache_path else {}
+        except (OSError, ValueError):
+            connector_urls = {}
+        if not isinstance(connector_urls, dict):
+            connector_urls = {}
         ever_connected = config.get('claudeAiMcpEverConnected', [])
+        candidates = list(ever_connected) if isinstance(ever_connected, list) else []
+        candidates.extend(connector_urls)
         distinct = []
-        if isinstance(ever_connected, list):
-            for display in ever_connected:
-                if isinstance(display, str) and _norm_mcp_token(_mangle_mcp_token(display)) == _norm_mcp_token(server_name):
-                    if display not in distinct:
-                        distinct.append(display)
+        for display in candidates:
+            if isinstance(display, str) and _norm_mcp_token(_mangle_mcp_token(display)) == _norm_mcp_token(server_name):
+                if display not in distinct:
+                    distinct.append(display)
         if len(distinct) == 1:
-            return (distinct[0], {"additional_data": {"scope": "claudeai"}})
+            connector_cfg = {"additional_data": {"scope": "claudeai"}}
+            if connector_urls.get(distinct[0]):
+                connector_cfg["url"] = connector_urls[distinct[0]]
+            return (distinct[0], connector_cfg)
         if not distinct:
             log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
             return None
@@ -1582,6 +1600,111 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
     except Exception as exc:
         log_error(f"mcp connector resolve error: {server_name}: {exc}", 'mcp_connector')
         return None
+
+
+def _claude_ai_connectors_cache_path(session_id) -> Optional[Path]:
+    if not isinstance(session_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', session_id):
+        return None
+    return CLAUDE_AI_CONNECTORS_CACHE_DIR / f'{session_id}.json'
+
+
+def _refresh_claude_ai_connectors(session_id: str) -> None:
+    claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
+    cache_path = _claude_ai_connectors_cache_path(session_id)
+    if not claude or not cache_path:
+        return
+    # A throwaway cwd keeps this run's MCP logs (cached per cwd) and npm logs out of the user's own.
+    work = os.path.realpath(tempfile.mkdtemp(prefix='unbound-claude-ai-'))
+    env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1', 'npm_config_logs_dir': work}
+    if _env_config_dir:
+        # Resolved here: the refresh runs elsewhere, where a relative CLAUDE_CONFIG_DIR points to another dir.
+        env['CLAUDE_CONFIG_DIR'] = str(_CONFIG_DIR)
+    proc = timer = None
+    try:
+        proc = subprocess.Popen(
+            [claude, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
+             '--verbose', '--no-session-persistence', '--settings', '{"disableAllHooks": true}'],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, encoding='utf-8', cwd=work, env=env,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        )
+        timer = threading.Timer(CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS, proc.kill)
+        timer.start()
+
+        def send(request_id, subtype):
+            request = {'type': 'control_request', 'request_id': request_id, 'request': {'subtype': subtype}}
+            proc.stdin.write(json.dumps(request) + '\n')
+            proc.stdin.flush()
+
+        send('init', 'initialize')
+        for line in proc.stdout:
+            message = json.loads(line)
+            response = message.get('response') or {}
+            if message.get('type') != 'control_response' or response.get('subtype') != 'success':
+                continue
+            if response.get('request_id') == 'init':
+                send('status', 'mcp_status')
+                continue
+            connector_urls = {
+                server['name']: server['config']['url']
+                for server in response['response']['mcpServers']
+                if server.get('scope') == 'claudeai' and (server.get('config') or {}).get('type') == 'claudeai-proxy'
+            }
+            if connector_urls:
+                CLAUDE_AI_CONNECTORS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = CLAUDE_AI_CONNECTORS_CACHE_DIR / ('.%s.%d.tmp' % (session_id, os.getpid()))
+                tmp.write_text(json.dumps(connector_urls), encoding='utf-8')
+                os.chmod(tmp, 0o600)
+                os.replace(str(tmp), str(cache_path))
+                for old in CLAUDE_AI_CONNECTORS_CACHE_DIR.glob('*.json'):
+                    if time.time() - old.stat().st_mtime > CLAUDE_AI_CONNECTORS_CACHE_MAX_AGE_SECONDS:
+                        old.unlink(missing_ok=True)
+                break
+            # The claude.ai list loads after startup and no event marks it.
+            time.sleep(0.5)
+            send('status', 'mcp_status')
+        # A clean exit lets Claude Code remove its own session registry entry, locks and plugin markers.
+        proc.stdin.close()
+        proc.wait(timeout=10)
+    except Exception as exc:
+        log_error(f"claude.ai connector refresh failed: {exc}", 'mcp_connector')
+    finally:
+        if timer is not None:
+            timer.cancel()
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        shutil.rmtree(work, ignore_errors=True)
+        cache_key = re.sub(r'[^a-zA-Z0-9]', '-', work)
+        for cache_root in (Path.home() / 'Library' / 'Caches' / 'claude-cli-nodejs',
+                           Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'claude-cli-nodejs',
+                           Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'claude-cli-nodejs' / 'Cache'):
+            shutil.rmtree(cache_root / cache_key, ignore_errors=True)
+
+
+def _dispatch_claude_ai_connectors_refresh(session_id: str) -> None:
+    try:
+        # A resumed session keeps its id: its old map must not be read while the new refresh runs.
+        cache_path = _claude_ai_connectors_cache_path(session_id)
+        if cache_path:
+            cache_path.unlink(missing_ok=True)
+        if RUNNING_FROZEN:
+            cmd = [sys.executable, 'refresh-claude-ai-connectors', 'claude-code', session_id]
+        else:
+            cmd = [sys.executable, os.path.abspath(__file__), '--refresh-claude-ai-connectors', session_id]
+        popen_kwargs = {
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL,
+            'close_fds': True,
+        }
+        if os.name == 'nt':
+            popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as exc:
+        log_error(f"claude.ai connector refresh dispatch failed: {exc}", 'mcp_connector')
 
 
 _MCP_UUID_RE = re.compile(
@@ -3928,7 +4051,8 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
                 metadata['mcp_server_config'] = server_cfg
 
             if not server_cfg:
-                connector = _resolve_claude_ai_connector(mcp_server_name, config_path=CLAUDE_MCP_CONFIG_PATH)
+                connector = _resolve_claude_ai_connector(
+                    mcp_server_name, config_path=CLAUDE_MCP_CONFIG_PATH, session_id=event.get('session_id'))
                 if connector:
                     display_name, connector_cfg = connector
                     metadata['mcp_server'] = display_name
@@ -6725,6 +6849,10 @@ def main():
         _sync_skills_once(api_key)
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == '--refresh-claude-ai-connectors':
+        _refresh_claude_ai_connectors(sys.argv[2] if len(sys.argv) > 2 else '')
+        return
+
     try:
         input_data = _read_stdin()
 
@@ -6745,7 +6873,12 @@ def main():
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _dispatch_discovery()
-            _dispatch_skills_sync(api_key)
+            # The refresh's own Claude Code process: keep it out of the gateway and don't start another refresh.
+            if not os.environ.get(CLAUDE_AI_CONNECTORS_REFRESH_ENV):
+                _dispatch_skills_sync(api_key)
+                # Compaction keeps the same process and connectors, and the session's map.
+                if event.get('source') != 'compact':
+                    _dispatch_claude_ai_connectors_refresh(session_id or '')
             _emit("{}")
             return
         session_id = event.get('session_id')
