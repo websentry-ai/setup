@@ -1621,7 +1621,7 @@ def _refresh_claude_ai_connectors(session_id: str) -> None:
             return
         proc = subprocess.Popen(
             [claude, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
-             '--verbose', '--no-session-persistence'],
+             '--verbose', '--no-session-persistence', '--settings', '{"disableAllHooks": true}'],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             text=True, encoding='utf-8', cwd=str(Path.home()),
             env=env,
@@ -6865,7 +6865,9 @@ def main():
             # The refresh's own Claude Code process: keep it out of the gateway and don't start another refresh.
             if not os.environ.get(CLAUDE_AI_CONNECTORS_REFRESH_ENV):
                 _dispatch_skills_sync(api_key)
-                _dispatch_claude_ai_connectors_refresh(session_id or '')
+                # Compaction keeps the same process and connectors, and the session's map.
+                if event.get('source') != 'compact':
+                    _dispatch_claude_ai_connectors_refresh(session_id or '')
             _emit("{}")
             return
         session_id = event.get('session_id')
