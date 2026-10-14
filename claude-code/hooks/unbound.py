@@ -50,10 +50,10 @@ SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 20
 SKILL_LOADED_WINDOW = 10
-CLAUDE_AI_CONNECTORS_CACHE_PATH = _CONFIG_DIR / 'hooks' / 'claude-ai-connectors.json'
+CLAUDE_AI_CONNECTORS_CACHE_DIR = _CONFIG_DIR / 'hooks' / 'claude-ai-connectors'
 CLAUDE_AI_CONNECTORS_REFRESH_ENV = 'UNBOUND_CLAUDE_AI_CONNECTORS_REFRESH'
 CLAUDE_AI_CONNECTORS_REFRESH_TIMEOUT_SECONDS = 20
-CLAUDE_AI_CONNECTORS_CACHE_SESSIONS = 20
+CLAUDE_AI_CONNECTORS_CACHE_MAX_AGE_SECONDS = 7 * 24 * 3600
 # unbound-<slug> is the skill name, so the slug carries the spec's name rules.
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
@@ -1571,12 +1571,12 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
             return None
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.loads(f.read())
-        try:
-            sessions = json.loads(CLAUDE_AI_CONNECTORS_CACHE_PATH.read_text(encoding='utf-8'))
-        except (OSError, ValueError):
-            sessions = {}
         # Only this session's own refresh: an older session's map can hold a replaced connector's URL.
-        connector_urls = sessions.get(session_id) if isinstance(sessions, dict) and session_id else None
+        cache_path = _claude_ai_connectors_cache_path(session_id)
+        try:
+            connector_urls = json.loads(cache_path.read_text(encoding='utf-8')) if cache_path else {}
+        except (OSError, ValueError):
+            connector_urls = {}
         if not isinstance(connector_urls, dict):
             connector_urls = {}
         ever_connected = config.get('claudeAiMcpEverConnected', [])
@@ -1602,6 +1602,12 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
         return None
 
 
+def _claude_ai_connectors_cache_path(session_id) -> Optional[Path]:
+    if not isinstance(session_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]+', session_id):
+        return None
+    return CLAUDE_AI_CONNECTORS_CACHE_DIR / f'{session_id}.json'
+
+
 def _refresh_claude_ai_connectors(session_id: str) -> None:
     claude = shutil.which('claude') or shutil.which(str(Path.home() / '.local' / 'bin' / 'claude'))
     env = {**os.environ, CLAUDE_AI_CONNECTORS_REFRESH_ENV: '1'}
@@ -1610,7 +1616,8 @@ def _refresh_claude_ai_connectors(session_id: str) -> None:
         env['CLAUDE_CONFIG_DIR'] = str(_CONFIG_DIR)
     proc = timer = None
     try:
-        if not claude or not session_id:
+        cache_path = _claude_ai_connectors_cache_path(session_id)
+        if not claude or not cache_path:
             return
         proc = subprocess.Popen(
             [claude, '--print', '--input-format', 'stream-json', '--output-format', 'stream-json',
@@ -1643,20 +1650,14 @@ def _refresh_claude_ai_connectors(session_id: str) -> None:
                 if server.get('scope') == 'claudeai' and (server.get('config') or {}).get('type') == 'claudeai-proxy'
             }
             if connector_urls:
-                try:
-                    sessions = json.loads(CLAUDE_AI_CONNECTORS_CACHE_PATH.read_text(encoding='utf-8'))
-                except (OSError, ValueError):
-                    sessions = {}
-                if not isinstance(sessions, dict):
-                    sessions = {}
-                sessions.pop(session_id, None)
-                sessions[session_id] = connector_urls
-                sessions = dict(list(sessions.items())[-CLAUDE_AI_CONNECTORS_CACHE_SESSIONS:])
-                CLAUDE_AI_CONNECTORS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-                tmp = CLAUDE_AI_CONNECTORS_CACHE_PATH.parent / ('.claude-ai-connectors.%d.tmp' % os.getpid())
-                tmp.write_text(json.dumps(sessions), encoding='utf-8')
+                CLAUDE_AI_CONNECTORS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                tmp = CLAUDE_AI_CONNECTORS_CACHE_DIR / ('.%s.%d.tmp' % (session_id, os.getpid()))
+                tmp.write_text(json.dumps(connector_urls), encoding='utf-8')
                 os.chmod(tmp, 0o600)
-                os.replace(str(tmp), str(CLAUDE_AI_CONNECTORS_CACHE_PATH))
+                os.replace(str(tmp), str(cache_path))
+                for old in CLAUDE_AI_CONNECTORS_CACHE_DIR.glob('*.json'):
+                    if time.time() - old.stat().st_mtime > CLAUDE_AI_CONNECTORS_CACHE_MAX_AGE_SECONDS:
+                        old.unlink(missing_ok=True)
                 break
             # The claude.ai list loads after startup and no event marks it.
             time.sleep(0.5)
