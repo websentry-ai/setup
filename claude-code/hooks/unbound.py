@@ -1673,6 +1673,10 @@ def _refresh_claude_ai_connectors(session_id: str) -> None:
 
 def _dispatch_claude_ai_connectors_refresh(session_id: str) -> None:
     try:
+        # A resumed session keeps its id: its old map must not be read while the new refresh runs.
+        cache_path = _claude_ai_connectors_cache_path(session_id)
+        if cache_path:
+            cache_path.unlink(missing_ok=True)
         if RUNNING_FROZEN:
             cmd = [sys.executable, 'refresh-claude-ai-connectors', 'claude-code', session_id]
         else:
