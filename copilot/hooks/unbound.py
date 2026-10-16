@@ -5020,6 +5020,21 @@ def _get_project(cwd):
         return None
 
 
+def _git_branch(root):
+    """Checked-out branch of the repo at `root`; None on detached HEAD or any git failure."""
+    try:
+        if not root:
+            return None
+        result = subprocess.run(
+            ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
+            capture_output=True, text=True, timeout=_git_remote_timeout(),
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else None
+    except Exception:
+        return None
+
+
 def _find_git_root(path):
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
@@ -5276,10 +5291,8 @@ def _is_shell_write_command(command):
         return False
 
 
-def _project_for_paths(candidates, root_projects):
-    """First project ("<org>/<repo>") resolved from `candidates` paths.
-    `root_projects` caches origin lookups so `git remote get-url` runs at
-    most once per distinct repo. None when nothing resolves (fail-open)."""
+def _repo_for_paths(candidates, root_projects):
+    """First (project, branch) resolved from `candidates`, cached per repo root; (None, None) when nothing resolves."""
     try:
         for candidate in candidates:
             if not candidate:
@@ -5288,12 +5301,14 @@ def _project_for_paths(candidates, root_projects):
             if not root:
                 continue
             if root not in root_projects:
-                root_projects[root] = _get_project(root)
-            if root_projects[root]:
-                return root_projects[root]
+                project = _get_project(root)
+                root_projects[root] = (project, _git_branch(root) if project else None)
+            project, branch = root_projects[root]
+            if project:
+                return project, branch
     except Exception:
         pass
-    return None
+    return None, None
 
 
 # --- Repository-scope gate: blocks writes, git write subcommands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
@@ -5595,9 +5610,9 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
 
     When `shell_state` ({'dir': <path>} tracked across the turn) and
     `root_projects` (per-repo origin cache) are provided, each entry gets a
-    per-call `project` ("<org>/<repo>") — file entries resolve from their
-    file path (relative paths joined onto the shell dir), shell entries from
-    absolute paths in the command or the tracked shell dir.
+    per-call `project` ("<org>/<repo>") and `git_branch` — file entries
+    resolve from their file path (relative paths joined onto the shell dir),
+    shell entries from absolute paths in the command or the tracked shell dir.
     """
     if not isinstance(name, str) or not name:
         return None
@@ -5612,7 +5627,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         base = shell_state.get('dir')
         return os.path.normpath(os.path.join(base, path)) if base else None
 
-    project = None
+    project = branch = None
     if name in SHELL_TOOLS:
         command = args.get('command') or args.get('input') or args.get('text') or ''
         entry = {
@@ -5627,7 +5642,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
         if not candidates and shell_state.get('dir'):
             candidates.append(shell_state['dir'])
-        project = _project_for_paths(candidates, root_projects)
+        project, branch = _repo_for_paths(candidates, root_projects)
     elif name in READ_TOOLS:
         file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {
@@ -5638,7 +5653,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         abs_path = _abs(file_path)
         if abs_path and _is_system_checkout_path(abs_path):
             abs_path = None
-        project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
+        project, branch = _repo_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     elif name in WRITE_TOOLS or name in EDIT_TOOLS:
         file_path = (args.get('filePath') or args.get('path') or args.get('file_path')
                      or _extract_patch_target_path(args) or '')
@@ -5650,7 +5665,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         abs_path = _abs(file_path)
         if abs_path and _is_system_checkout_path(abs_path):
             abs_path = None
-        project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
+        project, branch = _repo_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
         mcp_servers = mcp_servers or {}
         lowered_name = name.lower()
@@ -5680,12 +5695,14 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             candidates = [p for p in _ABS_PATH_RE.findall(json.dumps(args)) if not _is_system_checkout_path(p)]
         except Exception:
             candidates = []
-        project = _project_for_paths(candidates, root_projects)
+        project, branch = _repo_for_paths(candidates, root_projects)
 
     # Drop empty-string values.
     mapped = {k: v for k, v in entry.items() if v != ''}
     if project:
         mapped['project'] = project
+    if branch:
+        mapped['git_branch'] = branch
     return mapped
 
 
@@ -6289,7 +6306,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     tool_use = []
     # Per-call project attribution state: the shell starts at the session
-    # cwd; origin lookups are cached once per repo across the turn.
+    # cwd; origin and branch lookups are cached once per repo across the turn.
     shell_state = {'dir': cwd}
     root_projects = {}
     mcp_servers = read_copilot_mcp_servers(cwd)
@@ -6362,6 +6379,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         log_error("transcript produced no messages", 'transcript')
         return None, set(), None, set(), None
 
+    turn_project = _get_project(cwd)
     return {
         'conversation_id': conversation_id,
         'model': served_model or model or session_start_model or 'auto',
@@ -6369,7 +6387,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'agent_surface': copilot_surface(transcript_path),
         # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
         # rotates or collides across sessions. The github block below is the provenance.
