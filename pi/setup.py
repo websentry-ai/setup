@@ -49,7 +49,7 @@ DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
 # the installed pi is older; it never refuses, because an old pi still loads the bundle.
 TESTED_PI_VERSION = "0.87.1"
 
-# hooks-ts/packages/core/src/constants.ts:27 PI_AGENT_DIR_SEGMENTS -- keep in lockstep.
+# hooks-ts/packages/pi/src/agentDir.ts PI_AGENT_DIR_SEGMENTS / ENV_PI_AGENT_DIR -- keep in lockstep.
 PI_AGENT_DIR_SEGMENTS = (".pi", "agent")
 ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR"
 
@@ -132,9 +132,9 @@ def _expand_tilde(raw, home_dir: str) -> Optional[str]:
 
 
 def resolve_agent_dir(home, env=None) -> Optional[Path]:
-    """The pi agent directory, resolved exactly as resolveCachePath does.
+    """The pi agent directory, resolved exactly as resolvePiAgentDir does.
 
-    hooks-ts/packages/core/src/cache.ts:68-95 is the authority: PI_CODING_AGENT_DIR wins,
+    hooks-ts/packages/pi/src/agentDir.ts is the authority: PI_CODING_AGENT_DIR wins,
     `~` and `~/x` expand against home, and anything that is not absolute after that --
     including a RELATIVE value like `pitest` -- falls back to the home default.
 

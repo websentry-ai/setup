@@ -1,0 +1,6 @@
+{
+  "//": "Host-type conformance against the REAL @opencode/plugin@2.0.x types (tested: 2.0.22, 2.0.24). Not in the root tsconfig: the package is installed only with --no-save, for a local check or by the nightly job. skipLibCheck (inherited) keeps effect/zod declaration internals out of the check.",
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": { "skipLibCheck": true },
+  "include": ["v2.ts", "../src/hostTypesV2.ts"]
+}

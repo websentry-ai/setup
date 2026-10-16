@@ -6,7 +6,7 @@
 //
 //   * a **named pipe** with no writer — `open`/`read` block indefinitely, never return, never throw.
 //     Both of this extension's reads sit on paths an attacker can choose: `resolveCachePath` honours
-//     `PI_CODING_AGENT_DIR` and both readers resolve `$HOME` (`keyState.ts` names a hostile repo's
+//     the agent's own relocation variable and both readers resolve `$HOME` (`keyState.ts` names a hostile repo's
 //     `.envrc` under direnv as a realistic way to set either). Point one at a directory holding a
 //     FIFO named `policy_cache.json` and pi wedges on the first statement of its first handler —
 //     `init()` runs there, and pi awaits both `session_start` and `prepareToolCall`. Quieter and

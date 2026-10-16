@@ -19,7 +19,6 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { createApiClient } from "../../core/src/client.ts";
-import { TURNLOG_PATH } from "../../core/src/constants.ts";
 import { turnStore } from "../../core/src/turn.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import { createPolicyState } from "../../core/src/policyState.ts";
@@ -40,8 +39,18 @@ import {
 } from "./helpers/fakeCtx.ts";
 import type { FakeCtxOptions } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 const TIMEOUT_MS = 50;
+/**
+ * The client timeout for a mock that answers. Only `failBlock` needs the short one (it hangs after
+ * the warm-up, so the check must time out). A mock that answers gets a generous bound: with the
+ * 50 ms one, the first request of this file raced the client timeout on a loaded CI runner, and an
+ * allow that "was genuinely checked" fails open before the mock saw it.
+ */
+const ANSWERING_TIMEOUT_MS = 2_000;
 const PRETOOL_PATH = "/v1/hooks/pretool";
 
 // The locked literals, spelled out rather than imported: a typo in `constants.ts` must fail here
@@ -56,13 +65,13 @@ const UNAVAILABLE = "Unbound policy engine unavailable — please retry";
 /** `/^ubash_[0-9a-f]{20}$/`, built without a literal so the prefix constant is the only source. */
 const UBASH_ID = new RegExp("^ubash_[0-9a-f]{20}$");
 
-function depsFor(api: MockApi, state: PolicyState = createPolicyState()): DecideDeps {
-  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+function depsFor(api: MockApi, state: PolicyState = createPolicyState(), timeoutMs: number = TIMEOUT_MS): DecideDeps {
+  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs, profile: PI_PROFILE });
   return {
     checker: createPolicyChecker({
       client,
       state,
-      telemetry: createTelemetry({ client, apiKey: TEST_KEY }),
+      telemetry: createTelemetry({ client, apiKey: TEST_KEY, profile: PI_PROFILE }),
     }),
     apiKey: TEST_KEY,
     entrypoint: "pi/0.87.1",
@@ -127,7 +136,7 @@ async function run(
 }> {
   const api = await startMockApi({ mode });
   const ctx = createFakeCtx(opts.ctx);
-  const deps = depsFor(api);
+  const deps = depsFor(api, createPolicyState(), mode === "failBlock" ? TIMEOUT_MS : ANSWERING_TIMEOUT_MS);
   try {
     for (let i = 0; i < (opts.warmups ?? 0); i += 1) {
       await decideUserBash(createFakeUserBashEvent("echo warmup"), ctx, deps);
@@ -280,7 +289,7 @@ test("HOOK-04 the recorded decision carries the typed command as its tool_input"
   const entries: { tool_name: string; decision: string; tool_input?: Record<string, unknown> }[] = [];
   try {
     await decideUserBash(createFakeUserBashEvent("echo hi"), ctx, {
-      ...depsFor(api),
+      ...depsFor(api, createPolicyState(), ANSWERING_TIMEOUT_MS),
       onDecision: (entry) => entries.push(entry),
     });
 
@@ -295,7 +304,7 @@ test("HOOK-04 the recorded decision carries the typed command as its tool_input"
 test("HOOK-04 tool_use_id is a generated ubash_ id, and two calls never share one", async () => {
   const api = await startMockApi({ mode: "allow" });
   const ctx = createFakeCtx();
-  const deps = depsFor(api);
+  const deps = depsFor(api, createPolicyState(), ANSWERING_TIMEOUT_MS);
   try {
     await decideUserBash(createFakeUserBashEvent("echo one"), ctx, deps);
     await decideUserBash(createFakeUserBashEvent("echo two"), ctx, deps);
@@ -327,7 +336,7 @@ test("HOOK-04 user_bash is never cache-skipped, even with an empty fresh tools_t
     const result = await decideUserBash(
       createFakeUserBashEvent("cat /etc/shadow"),
       ctx,
-      { ...depsFor(api, state), now: clock.now },
+      { ...depsFor(api, state, ANSWERING_TIMEOUT_MS), now: clock.now },
     );
 
     assert.equal(outputOf(result), `${DENY_PREFIX}Reading secrets is blocked.`);

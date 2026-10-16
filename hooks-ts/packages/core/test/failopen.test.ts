@@ -37,6 +37,7 @@ import type { MockApi } from "./helpers/mockApi.ts";
 // dependency on the pi package.
 import { createFakeClock } from "../../pi/test/helpers/fakeCtx.ts";
 import { TEST_KEY } from "./helpers/testKey.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
 
 const TIMEOUT_MS = 50;
 
@@ -58,7 +59,7 @@ function payload(): PretoolRequestBody {
 }
 
 function clientFor(baseUrl: string) {
-  return createApiClient({ baseUrl, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+  return createApiClient({ baseUrl, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: TEST_PROFILE });
 }
 
 /** A plain call, for the modes that are expected to answer. */
@@ -372,9 +373,10 @@ function checkerFor(api: MockApi, client?: Pick<ApiClient, "postPretool" | "post
       apiKey: TEST_KEY,
       timeoutMs: TIMEOUT_MS,
       errorsTimeoutMs: TIMEOUT_MS,
+      profile: TEST_PROFILE,
     });
   // A fixed clock keeps every bypass in this file inside one 60 s window.
-  const telemetry = createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW });
+  const telemetry = createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW, profile: TEST_PROFILE });
   return createPolicyChecker({ client: wire, state: createPolicyState(), telemetry });
 }
 
@@ -433,9 +435,9 @@ test("RES-01 a refused connection fails open", async () => {
   await api.close();
 
   const checker = createPolicyChecker({
-    client: createApiClient({ baseUrl: deadUrl, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS }),
+    client: createApiClient({ baseUrl: deadUrl, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: TEST_PROFILE }),
     state: createPolicyState(),
-    telemetry: createTelemetry({ client: { postHookErrors: async () => true } }),
+    telemetry: createTelemetry({ client: { postHookErrors: async () => true }, profile: TEST_PROFILE }),
   });
   let outcome: unknown;
   await assert.doesNotReject(async () => {
@@ -496,7 +498,7 @@ test("RES-01 a client that throws synchronously still yields an allow", async ()
   const checker = createPolicyChecker({
     client: throwing,
     state: createPolicyState(),
-    telemetry: createTelemetry({ client: throwing, apiKey: TEST_KEY }),
+    telemetry: createTelemetry({ client: throwing, apiKey: TEST_KEY, profile: TEST_PROFILE }),
   });
 
   let outcome: unknown;
@@ -528,7 +530,7 @@ function stubClient(
 }
 
 function telemetryFor(client: Pick<ApiClient, "postHookErrors">) {
-  return createTelemetry({ client, apiKey: TEST_KEY, now: () => FIXED_NOW });
+  return createTelemetry({ client, apiKey: TEST_KEY, now: () => FIXED_NOW, profile: TEST_PROFILE });
 }
 
 test("RES-03 onSync fires exactly once per successful response, with the recorded snapshot", async () => {
@@ -653,12 +655,13 @@ function breakerHarness(api: MockApi, state = createPolicyState()) {
     apiKey: TEST_KEY,
     timeoutMs: TIMEOUT_MS,
     errorsTimeoutMs: TIMEOUT_MS,
+    profile: TEST_PROFILE,
   });
   const notices: Notice[] = [];
   const checker = createPolicyChecker({
     client: wire,
     state,
-    telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+    telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW, profile: TEST_PROFILE }),
     breaker: createBreaker({ now: clock.now }),
   });
   const hooks = {
@@ -770,11 +773,11 @@ test("WR-02 a fail-closed org is never disarmed by the breaker (§F8)", async ()
 test("WR-02 a notify that throws changes neither the verdict nor the outcome", async () => {
   const api = await startMockApi({ mode: "500" });
   try {
-    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: TEST_PROFILE });
     const checker = createPolicyChecker({
       client: wire,
       state: createPolicyState(),
-      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW, profile: TEST_PROFILE }),
       breaker: createBreaker({ now: () => FIXED_NOW }),
     });
     const hostile = {
@@ -796,11 +799,11 @@ test("WR-02 a notify that throws changes neither the verdict nor the outcome", a
 test("WR-02 hooks is optional: a checker called without it still opens the breaker", async () => {
   const api = await startMockApi({ mode: "500" });
   try {
-    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: TEST_PROFILE });
     const checker = createPolicyChecker({
       client: wire,
       state: createPolicyState(),
-      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW, profile: TEST_PROFILE }),
     });
     for (let i = 0; i < 4; i += 1) {
       assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });

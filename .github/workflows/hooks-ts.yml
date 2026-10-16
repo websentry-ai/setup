@@ -1,9 +1,12 @@
 name: hooks-ts
 
-# Gate on the TypeScript hooks core + pi extension under hooks-ts/.
+# Gate on the TypeScript hooks core + agent extensions under hooks-ts/.
 # test.yml / static-checks.yml gate the Python tree; this one gates the TS tree
-# and — critically — that the committed build output pi/index.js is not stale.
+# and — critically — that every committed build target (<name>/index.js and its
+# .sha256 sidecar, one per entry in hooks-ts/scripts/targets.mjs) is not stale.
 # Same triggers as test.yml, narrowed by paths so Python-only PRs skip it.
+# The index.js path filters below match any top-level directory, so adding a
+# build target needs no edit here.
 
 on:
   workflow_dispatch:
@@ -13,15 +16,15 @@ on:
       - staging
     paths:
       - "hooks-ts/**"
-      - "pi/index.js"
-      - "pi/index.js.sha256"
+      - "*/index.js"
+      - "*/index.js.sha256"
       - ".github/workflows/hooks-ts.yml"
   push:
     branches: [staging, main]
     paths:
       - "hooks-ts/**"
-      - "pi/index.js"
-      - "pi/index.js.sha256"
+      - "*/index.js"
+      - "*/index.js.sha256"
       - ".github/workflows/hooks-ts.yml"
 
 # This job runs `npm ci` over third-party devDependencies (esbuild, typescript,
@@ -59,31 +62,33 @@ jobs:
       - name: Build assertions
         run: npm run test:build
 
-      # The committed artifact is what users download; a stale copy would ship
-      # behaviour that no longer matches the source in this same commit.
-      - name: pi/index.js matches a fresh build
-        run: |
-          cmp -s dist/pi/index.js ../pi/index.js || {
-            echo "::error::pi/index.js is stale — run: cd hooks-ts && npm run build && cp dist/pi/index.js ../pi/index.js"
-            exit 1
-          }
-          echo "pi/index.js is byte-identical to dist/pi/index.js ($(wc -c < ../pi/index.js) bytes)."
+      # The committed artifacts are what users download; a stale copy would ship
+      # behaviour that no longer matches the source in this same commit. For every
+      # target in scripts/targets.mjs this compares the committed artifact with the
+      # fresh build byte for byte, and its sidecar with both (hash and path field).
+      # A target with no build output fails; it is never skipped.
+      - name: Committed artifacts match a fresh build (every target)
+        run: npm run artifacts:check
 
-      # pi/setup.py refuses to install unless the artifact it downloads matches this
-      # sidecar, so a rotted sidecar breaks every `unbound setup pi` while cmp stays green.
-      # Run from the repo root, not hooks-ts: the sidecar names the path `pi/index.js`, and
-      # that is the path `shasum -c` resolves relative to its own working directory.
-      - name: pi/index.js.sha256 matches a fresh build
+      # Each installer refuses to install unless the artifact it downloads matches its
+      # sidecar, so a rotted sidecar breaks every install while a byte compare stays green.
+      # artifacts:check already verified the hashes; this repeats it with the system tool,
+      # because `shasum -c` is the check users can run themselves.
+      # Run from the repo root, not hooks-ts: a sidecar names the path `<name>/index.js`,
+      # and that is the path `shasum -c` resolves relative to its own working directory.
+      - name: Committed sidecars verify with shasum (every target)
         working-directory: .
         run: |
-          shasum -a 256 -c pi/index.js.sha256 || {
-            echo "::error::pi/index.js.sha256 does not match pi/index.js — run: cd hooks-ts && npm run build && cp dist/pi/index.js ../pi/index.js && cd .. && shasum -a 256 pi/index.js > pi/index.js.sha256"
+          SIDECARS="$(node hooks-ts/scripts/targets.mjs --sidecars)"
+          [ -n "$SIDECARS" ] || {
+            echo "::error::hooks-ts/scripts/targets.mjs listed no sidecars"
             exit 1
           }
-          FRESH="$(shasum -a 256 hooks-ts/dist/pi/index.js | cut -d' ' -f1)"
-          COMMITTED="$(cut -d' ' -f1 < pi/index.js.sha256)"
-          [ "$FRESH" = "$COMMITTED" ] || {
-            echo "::error::pi/index.js.sha256 ($COMMITTED) does not match a fresh build ($FRESH) — run: cd hooks-ts && npm run build && cp dist/pi/index.js ../pi/index.js && cd .. && shasum -a 256 pi/index.js > pi/index.js.sha256"
-            exit 1
-          }
-          echo "pi/index.js.sha256 matches both the committed artifact and a fresh build ($COMMITTED)."
+          FAILED=0
+          for sidecar in $SIDECARS; do
+            shasum -a 256 -c "$sidecar" || {
+              echo "::error::$sidecar does not verify — run: cd hooks-ts && npm run build && npm run artifacts:sync"
+              FAILED=1
+            }
+          done
+          exit "$FAILED"

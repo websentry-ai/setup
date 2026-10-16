@@ -35,15 +35,13 @@
 // what the user typed, so it is checked as typed; the *expanded* body is never seen by us, which is a
 // documented parity gap, not a bug to fix here.
 
-import {
-  DENY_PREFIX,
-  ENGINE_UNAVAILABLE_REASON,
-  GENERIC_DENY_REASON,
-} from "../../core/src/constants.ts";
+import { GENERIC_DENY_REASON } from "../../core/src/constants.ts";
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
-import { buildPromptPayload } from "../../core/src/payload.ts";
+import { evaluatePrompt, verdictMessage } from "../../core/src/evaluate.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import { policyState } from "../../core/src/policyState.ts";
 import { noteSafe } from "./decide.ts";
+import { PI_PROFILE } from "./profile.ts";
 import { notifySafe } from "./ui.ts";
 import type { UiCtx } from "./ui.ts";
 
@@ -90,37 +88,49 @@ export async function decideInput(
   deps: InputDeps,
 ): Promise<InputDecision> {
   try {
-    if (event.source === "extension") return undefined;
     const text = typeof event.text === "string" ? event.text : "";
-    if (text.trim() === "") return undefined;
 
-    const payload = buildPromptPayload({
-      prompt: text,
-      cwd: ctx.cwd,
-      sessionId: ctx.sessionManager.getSessionId(),
-      model: ctx.model?.id,
-      clientEntrypoint: deps.entrypoint,
-      hasUI: ctx.hasUI,
-      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
-    });
+    // Core makes the two skips above (extension source, blank text), builds the payload and runs the
+    // check as `user_prompt`. Its function is total: the result is a verdict or a skip.
+    const verdict = await evaluatePrompt(
+      {
+        text,
+        source: event.source,
+        cwd: ctx.cwd,
+        // A getter, so a skipped prompt never touches the live session.
+        get sessionId(): string {
+          return ctx.sessionManager.getSessionId();
+        },
+        get model(): string | undefined {
+          return ctx.model?.id;
+        },
+        hasUI: ctx.hasUI,
+      },
+      {
+        checker: deps.checker,
+        profile: PI_PROFILE,
+        entrypoint: deps.entrypoint,
+        // pi's one-key, one-gateway process: the process-wide policy memory, named explicitly
+        // because core has no default (WR-03).
+        state: policyState,
+        hooks: deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) },
+        accountIdentity: deps.accountIdentity,
+      },
+    );
 
-    const hooks: CheckHooks =
-      deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
-    // The tool-name argument is only ever used as a telemetry label, so the event name is the
-    // informative thing to pass: a bypass on this path is a prompt check, not a tool call.
-    const outcome = await deps.checker.checkTool(payload, "user_prompt", hooks);
+    switch (verdict.kind) {
+      case "skip":
+        return undefined;
 
-    switch (outcome.kind) {
-      case "deny": {
-        const reason = outcome.reason;
-        notifySafe(ctx, reason === undefined ? GENERIC_DENY_REASON : DENY_PREFIX + reason, "error");
+      case "deny":
+        // `DENY_PREFIX + reason`, or the generic text when the API gave no reason.
+        notifySafe(ctx, verdictMessage(verdict), "error");
         return { action: "handled" };
-      }
 
       case "unavailable":
         // Only reachable for an org whose last-good failure action was `block`; every other failure
         // resolves to `allow` in core and takes the branch below.
-        notifySafe(ctx, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
+        notifySafe(ctx, verdictMessage(verdict), "error");
         return { action: "handled" };
 
       case "confirm":
@@ -128,7 +138,7 @@ export async function decideInput(
         // deny a prompt check can produce today is a BLOCK-action guardrail — an `ask` cannot happen.
         // If one ever does, interrupting a developer mid-sentence with a modal is the wrong answer,
         // so the reason is surfaced and the prompt proceeds.
-        notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
+        notifySafe(ctx, verdict.reason ?? GENERIC_DENY_REASON, "warning");
         noteSafe(() => deps.onPrompt?.(text));
         return undefined;
 

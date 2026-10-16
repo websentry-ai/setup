@@ -95,9 +95,11 @@ enforces independently under its own `conversation_id`. Both verified — see `d
 | Command | What it does |
 | --- | --- |
 | `npm run typecheck` | `tsc -p tsconfig.json` (no emit) across both packages, tests and scripts |
-| `npm run build` | esbuild -> `dist/pi/index.js` (ESM, `node22`, bundled, nothing external) |
-| `npm run test:unit` | `node --test --experimental-strip-types` over `packages/*/test/*.test.ts` |
-| `npm run test:build` | the INST-05 build assertions against a built `dist/pi/index.js` |
+| `npm run build` | esbuild -> `dist/<name>/index.js` for every target in `scripts/targets.mjs` (today: `dist/pi/index.js`; ESM, `node22`, bundled, nothing external) |
+| `npm run artifacts:check` | every committed `<name>/index.js` and its `.sha256` sidecar match the fresh build |
+| `npm run artifacts:sync` | copy each fresh build to `<name>/index.js` at the repo root and rewrite its sidecar |
+| `npm run test:unit` | `node --test --experimental-strip-types` over `packages/*/test/*.test.ts`, `scripts/targets.test.ts` and `scripts/targets.build.test.ts` (the build assertions need `npm run build` first, which `npm test` does) |
+| `npm run test:build` | the INST-05 build assertions: the supply-chain checks for every built `dist/<name>/index.js` in `scripts/targets.mjs` (`scripts/targets.build.test.ts`), plus pi's event-registration check (`packages/pi/test/build.test.ts`) |
 | `npm test` | `typecheck` + `build` + `test:unit` |
 | `npm run mock-api` | standalone scripted mock gateway for the manual pi smoke test |
 
@@ -125,15 +127,19 @@ import { buildPretoolPayload } from "../../core/src/payload.ts";
 the extension is deliberately not published to npm, exactly like `unbound.py` and
 `cursor/hooks.json`, which the other installers already fetch raw from here.
 
-Refresh it in the same commit as any source change:
+Refresh it, and its `pi/index.js.sha256` sidecar, in the same commit as any source change:
 
 ```bash
 cd hooks-ts
-npm run build && cp dist/pi/index.js ../pi/index.js
+npm run build && npm run artifacts:sync
 ```
 
-`.github/workflows/hooks-ts.yml` rebuilds and `cmp`s the two on every PR, so a stale `pi/index.js`
-fails CI rather than shipping behaviour that no longer matches the source beside it.
+`.github/workflows/hooks-ts.yml` rebuilds and runs `npm run artifacts:check` on every PR, so a stale
+`pi/index.js` or sidecar fails CI rather than shipping behaviour that no longer matches the source
+beside it.
+
+The list of build targets is the `TARGETS` table in `scripts/targets.mjs`. The build, both
+`artifacts:*` commands and the CI gate read it, so adding a target is one new entry there.
 
 The **install path does not change**: pi loads the extension from
 `~/.pi/agent/extensions/unbound/index.js`, and Phase 10's `setup/pi/setup.py` is what drops

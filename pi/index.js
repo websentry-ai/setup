@@ -19,23 +19,16 @@ import { homedir } from "node:os";
 // packages/core/src/accountIdentity.ts
 import { execFile as nodeExecFile } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 
 // packages/core/src/constants.ts
-var ENV_API_KEY_PI = "UNBOUND_PI_API_KEY";
 var ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
 var ENV_GATEWAY_URL = "UNBOUND_GATEWAY_URL";
-var ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
 var DEFAULT_GATEWAY_URL = "https://api.getunbound.ai";
 var CONFIG_DIR_NAME = ".unbound";
 var CONFIG_FILE_NAME = "config.json";
 var CACHE_DIR_NAME = ".unbound";
 var CACHE_FILE_NAME = "policy_cache.json";
-var PI_AGENT_DIR_SEGMENTS = [".pi", "agent"];
-var ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
 var KEY_FINGERPRINT_PREFIX = "sha256:";
-var APP_LABEL = "pi";
-var HOOK_SOURCE = "pi";
 var EVENT_NAME_TOOL_USE = "tool_use";
 var EVENT_NAME_SESSION_START = "session_start";
 var SESSION_PRESENCE_ROW_ENABLED = false;
@@ -43,10 +36,11 @@ var EVENT_NAME_USER_PROMPT = "user_prompt";
 var USER_BASH_ID_PREFIX = "ubash_";
 var PRETOOL_PATH = "/v1/hooks/pretool";
 var ERRORS_PATH = "/v1/hooks/errors";
-var TURNLOG_PATH = "/v1/hooks/pi";
 var TURNLOG_MODEL = "auto";
 var TURNLOG_TOOL_USE_TYPE = "PostToolUse";
 var PRETOOL_TIMEOUT_MS = 2e4;
+var EVALUATE_DEADLINE_SLACK_MS = 2e3;
+var EVALUATE_DEADLINE_ERROR_CLASS = "EvaluateDeadline";
 var ERRORS_TIMEOUT_MS = 1e4;
 var TURNLOG_TIMEOUT_MS = 1e4;
 var CONFIRM_TIMEOUT_MS = 12e4;
@@ -75,6 +69,7 @@ var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
 var MAX_ASSISTANT_CHARS = 16384;
 var MAX_TOOL_INPUT_VALUE_BYTES = 2048;
+var MAX_MCP_NAME_CHARS = 256;
 var TOOL_INPUT_ALLOWLIST = [
   "path",
   "pattern",
@@ -90,17 +85,14 @@ var GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 var DECLINED_REASON = "Declined by user (Unbound policy)";
 var CONFIRM_TITLE = "Unbound policy";
 var CONFIRM_QUESTION = "Run this command?";
-var NO_UI_REASON = "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 var ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable \u2014 please retry";
 var NO_KEY_NOTICE = "Unbound: no API key found \u2014 extension inactive";
 var BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable \u2014 allowing tool calls for 60 s";
 var BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again \u2014 enforcement resumed";
 var KEY_REJECTED_NOTICE = "Unbound: API key rejected \u2014 enforcement inactive";
 var KEY_REJECTED_BLOCK_REASON = "Unbound API key rejected \u2014 this organisation enforces fail-closed; contact your admin";
-var PI_AUTH_FILE_NAME = "auth.json";
 var MAX_AUTH_FILE_BYTES = 65536;
 var ANTHROPIC_PROVIDER_ID = "anthropic";
-var PI_AUTH_TYPE_OAUTH = "oauth";
 var ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
 var ANTHROPIC_OAUTH_BETA_HEADER = "anthropic-beta";
 var ANTHROPIC_OAUTH_BETA_VALUE = "oauth-2025-04-20";
@@ -136,18 +128,8 @@ var PLACEHOLDER_SERIALS = [
   "123456789",
   "xxxxxxxx"
 ];
-var MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
-var MCP_PROXY_TOOL_NAME = "mcp";
-var MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
-var MCP_BROKER_ID_PREFIX = "mcpb_";
-var MAX_INFLIGHT_MCP_CALLS = 64;
 var MAX_MCP_ARGS_BYTES = 524288;
 var MAX_PRETOOL_BODY_BYTES = 921600;
-var MCP_INFLIGHT_MAX_AGE_MS = 3e5;
-var ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
-var MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
-var MCP_CONFIG_FLAG = "--mcp-config";
-var MAX_MCP_CONFIG_BYTES = 1048576;
 
 // packages/core/src/safeRead.ts
 import { lstatSync, readFileSync } from "node:fs";
@@ -204,40 +186,6 @@ function attempt(fn) {
     return Promise.reject(error);
   }
 }
-function readPiAuth(agentDir) {
-  try {
-    if (typeof agentDir !== "string" || agentDir === "") return void 0;
-    const raw = readSmallRegularFile(join(agentDir, PI_AUTH_FILE_NAME), MAX_AUTH_FILE_BYTES);
-    if (raw === void 0) return void 0;
-    const parsed = JSON.parse(raw);
-    if (!isRecord(parsed)) return void 0;
-    const out = {};
-    for (const [provider, value] of Object.entries(parsed)) {
-      if (!isRecord(value) || typeof value.type !== "string") continue;
-      const entry = { type: value.type };
-      if (typeof value.access === "string" && value.access.length > 0) entry.access = value.access;
-      if (typeof value.expires === "number" && Number.isFinite(value.expires)) entry.expires = value.expires;
-      out[provider] = entry;
-    }
-    return out;
-  } catch {
-    return void 0;
-  }
-}
-function chooseProvider(auth, modelProvider) {
-  try {
-    const fromModel = label(modelProvider);
-    if (fromModel !== void 0) return fromModel;
-    if (!isRecord(auth)) return void 0;
-    const providers = Object.keys(auth);
-    return providers.length === 1 ? providers[0] : void 0;
-  } catch {
-    return void 0;
-  }
-}
-function isAnthropicOAuth(provider, entry) {
-  return provider === ANTHROPIC_PROVIDER_ID && entry?.type === PI_AUTH_TYPE_OAUTH;
-}
 async function fetchAnthropicProfile(token, opts = {}) {
   try {
     if (typeof token !== "string" || token.length === 0) return void 0;
@@ -291,10 +239,9 @@ function buildAccountIdentity(input) {
   try {
     if (!isRecord(input?.auth)) return void 0;
     const identity = {};
-    const provider = input.provider;
-    const entry = provider === void 0 ? void 0 : input.auth[provider];
-    if (entry !== void 0) {
-      if (isAnthropicOAuth(provider, entry)) {
+    const auth = input.auth;
+    if (auth.hasCredential === true) {
+      if (auth.anthropicOAuth === true) {
         identity.auth_mode = AUTH_MODE_SUBSCRIPTION;
         const profile = input.profile;
         const email = label(profile?.email);
@@ -310,6 +257,10 @@ function buildAccountIdentity(input) {
       } else {
         identity.auth_mode = AUTH_MODE_API_KEY;
       }
+    } else {
+      const mode = label(auth.authMode);
+      if (mode === AUTH_MODE_API_KEY) identity.auth_mode = mode;
+      else if (mode === AUTH_MODE_SUBSCRIPTION && auth.provider === ANTHROPIC_PROVIDER_ID) identity.auth_mode = mode;
     }
     const serial = label(input.deviceSerial);
     if (serial !== void 0 && isValidSerial(serial)) identity.device_serial = serial;
@@ -403,15 +354,18 @@ function createAccountIdentityLoader(opts) {
   let pending;
   let settled;
   async function compute(modelProvider) {
-    const auth = readPiAuth(opts.agentDir);
-    if (auth === void 0) return void 0;
-    const provider = chooseProvider(auth, modelProvider);
-    const entry = provider === void 0 ? void 0 : auth[provider];
+    let auth;
+    try {
+      auth = opts.readAuth(opts.agentDir, modelProvider);
+    } catch {
+      auth = void 0;
+    }
+    if (!isRecord(auth)) return void 0;
     const now = (opts.now ?? Date.now)();
-    const live = isAnthropicOAuth(provider, entry) && entry?.access !== void 0 && entry.expires !== void 0 && entry.expires > now;
+    const token = auth.hasCredential === true && auth.anthropicOAuth === true && typeof auth.accessToken === "string" && auth.accessToken.length > 0 && typeof auth.expiresAt === "number" && auth.expiresAt > now ? auth.accessToken : void 0;
     const timeoutMs = opts.timeoutMs ?? ACCOUNT_IDENTITY_TIMEOUT_MS;
     const [profile, deviceSerial] = await Promise.all([
-      live && entry?.access !== void 0 ? fetchAnthropicProfile(entry.access, {
+      token !== void 0 ? fetchAnthropicProfile(token, {
         timeoutMs,
         ...opts.fetch === void 0 ? {} : { fetch: opts.fetch },
         ...opts.profileUrl === void 0 ? {} : { url: opts.profileUrl }
@@ -420,7 +374,6 @@ function createAccountIdentityLoader(opts) {
     ]);
     return buildAccountIdentity({
       auth,
-      provider,
       ...profile === void 0 ? {} : { profile },
       ...deviceSerial === void 0 ? {} : { deviceSerial }
     });
@@ -484,7 +437,7 @@ function createBreaker(opts = {}) {
 // packages/core/src/cache.ts
 import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { dirname, isAbsolute, join as join2 } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 // packages/core/src/policyState.ts
 function parseFailureAction(raw) {
@@ -576,22 +529,74 @@ function createPolicyState() {
 var policyState = createPolicyState();
 
 // packages/core/src/payload.ts
-var PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"];
-var PATH_REQUIRED_TOOLS = ["read", "write", "edit"];
-var PATH_DEFAULTING = new Set(PATH_DEFAULTING_TOOLS);
-var PATH_REQUIRED = new Set(PATH_REQUIRED_TOOLS);
-var NATIVE_FILE_TOOLS = /* @__PURE__ */ new Set([
-  ...PATH_DEFAULTING_TOOLS,
-  ...PATH_REQUIRED_TOOLS
-]);
-function resolveFilePath(toolName, toolInput, cwd) {
-  const isDefaulting = PATH_DEFAULTING.has(toolName);
-  if (!isDefaulting && !PATH_REQUIRED.has(toolName)) return void 0;
-  const path = toolInput.path;
+var NO_FILE_TOOLS = /* @__PURE__ */ new Set();
+var nativeFileToolsMemo = /* @__PURE__ */ new WeakMap();
+function nativeFileTools(fileTools) {
+  try {
+    if (fileTools === null || typeof fileTools !== "object") return NO_FILE_TOOLS;
+    const known = nativeFileToolsMemo.get(fileTools);
+    if (known !== void 0) return known;
+    const union = /* @__PURE__ */ new Set();
+    for (const name of fileTools.defaulting) if (typeof name === "string") union.add(name);
+    for (const name of fileTools.required) if (typeof name === "string") union.add(name);
+    nativeFileToolsMemo.set(fileTools, union);
+    return union;
+  } catch {
+    return NO_FILE_TOOLS;
+  }
+}
+function resolveFilePath(toolName, toolInput, cwd, fileTools) {
+  let isDefaulting;
+  try {
+    isDefaulting = fileTools.defaulting.has(toolName) === true;
+    if (!isDefaulting && fileTools.required.has(toolName) !== true) return void 0;
+  } catch {
+    return void 0;
+  }
+  let path;
+  try {
+    path = fileTools.pathOf(toolName, toolInput);
+  } catch {
+    path = void 0;
+  }
   if (typeof path === "string" && path.length > 0) return path;
   return isDefaulting ? cwd : void 0;
 }
 var ALLOWED_TOOL_INPUT_KEYS = new Set(TOOL_INPUT_ALLOWLIST);
+function allowedKeysFor(extraKeys) {
+  try {
+    if (!Array.isArray(extraKeys) || extraKeys.length === 0) return ALLOWED_TOOL_INPUT_KEYS;
+    const allowed = new Set(ALLOWED_TOOL_INPUT_KEYS);
+    for (const key of extraKeys) if (typeof key === "string" && key !== "") allowed.add(key);
+    return allowed;
+  } catch {
+    return ALLOWED_TOOL_INPUT_KEYS;
+  }
+}
+function profileExtraToolInputKeys(profile) {
+  try {
+    if (profile === null || typeof profile !== "object") return void 0;
+    const keys = profile.extraToolInputKeys;
+    return Array.isArray(keys) ? keys : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function validMcpName(value) {
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAX_MCP_NAME_CHARS) return void 0;
+  return value;
+}
+function normaliseMcp(raw) {
+  try {
+    if (raw === null || typeof raw !== "object") return void 0;
+    const server = validMcpName(raw.server);
+    if (server === void 0) return void 0;
+    const tool = validMcpName(raw.tool);
+    return tool === void 0 ? { server } : { server, tool };
+  } catch {
+    return void 0;
+  }
+}
 function sliceToBytes(value, maxBytes) {
   if (Buffer.byteLength(value) <= maxBytes) return value;
   let out = "";
@@ -604,13 +609,14 @@ function sliceToBytes(value, maxBytes) {
   }
   return out;
 }
-function sanitizeToolInput(toolInput) {
+function sanitizeToolInput(toolInput, extraKeys) {
   const out = {};
   if (toolInput === null || typeof toolInput !== "object" || Array.isArray(toolInput)) return out;
+  const allowed = allowedKeysFor(extraKeys);
   let dropped = false;
   let truncated = false;
   for (const [key, value] of Object.entries(toolInput)) {
-    if (!ALLOWED_TOOL_INPUT_KEYS.has(key)) {
+    if (!allowed.has(key)) {
       dropped = true;
       continue;
     }
@@ -662,11 +668,11 @@ function capCommand(command, maxChars = MAX_COMMAND_CHARS) {
     truncated: true
   };
 }
-function auditToolInput(toolInput, command) {
+function auditToolInput(toolInput, command, extraKeys) {
   const isObject = toolInput !== null && typeof toolInput === "object" && !Array.isArray(toolInput);
   const source = isObject ? { ...toolInput } : {};
   delete source.command;
-  const out = sanitizeToolInput(source);
+  const out = sanitizeToolInput(source, extraKeys);
   if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
   return capToolInput(out);
 }
@@ -806,30 +812,46 @@ function auditMcpArgs(args, maxBytes = MAX_TOOL_INPUT_BYTES) {
     return { _truncated: true };
   }
 }
-function buildPretoolPayload(input) {
-  const mcp = input.mcp;
+function brokeredMcpCall(raw) {
+  try {
+    if (raw === null || typeof raw !== "object") return void 0;
+    const args = raw.args;
+    return args !== null && typeof args === "object" ? raw : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function buildPretoolPayload(input, profile) {
+  const brokered = brokeredMcpCall(input.mcp);
   const metadata = { cwd: input.cwd };
-  if (mcp !== void 0) {
-    metadata.mcp_server = mcp.server;
-    metadata.mcp_tool = mcp.tool;
-    applyWireArgs(metadata, mcpArgsForWire(mcp.args));
-    if (mcp.serverConfig !== void 0) metadata.mcp_server_config = mcp.serverConfig;
-    if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
+  if (brokered !== void 0) {
+    metadata.mcp_server = brokered.server;
+    metadata.mcp_tool = brokered.tool;
+    applyWireArgs(metadata, mcpArgsForWire(brokered.args));
+    if (brokered.serverConfig !== void 0) metadata.mcp_server_config = brokered.serverConfig;
+    if (typeof brokered.origin === "string" && brokered.origin !== "") metadata.mcp_origin = brokered.origin;
   } else {
-    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));
-    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
+    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput, profileExtraToolInputKeys(profile)));
+    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
     if (filePath !== void 0) metadata.file_path = filePath;
   }
-  const capped = capCommand(mcp === void 0 ? input.command : "");
-  if (capped.truncated) {
+  const capped = capCommand(brokered === void 0 ? input.command : "");
+  const preCapped = brokered === void 0 ? adapterOriginalChars(input) : void 0;
+  if (capped.truncated || preCapped !== void 0) {
     metadata.command_truncated = true;
-    metadata.command_original_chars = input.command.length;
+    metadata.command_original_chars = Math.max(preCapped ?? 0, input.command.length);
   }
+  const mcp = brokered === void 0 ? normaliseMcp(input.mcp) : void 0;
+  if (mcp !== void 0) {
+    metadata.mcp_server = mcp.server;
+    if (mcp.tool !== void 0) metadata.mcp_tool = mcp.tool;
+  }
+  if (input.patchOperation === "delete") metadata.patch_operation = "delete";
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
     // server never matches the tool and enforcement silently disappears. A resolved MCP call is
     // named the way the gateway and the backend parse MCP names, `mcp__<server>__<tool>`.
-    tool_name: mcp === void 0 ? input.toolName : `mcp__${mcp.server}__${mcp.tool}`,
+    tool_name: brokered === void 0 ? input.toolName : `mcp__${brokered.server}__${brokered.tool}`,
     command: capped.command,
     metadata
   };
@@ -844,13 +866,22 @@ function buildPretoolPayload(input) {
     event_name: EVENT_NAME_TOOL_USE,
     pre_tool_use_data: preToolUseData,
     messages: [{ role: "user", content: input.lastUserPrompt ?? "" }],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint
   };
   if (input.pullPolicies === true) body.pull_policies = true;
   const finished = withAccountIdentity(body, input.accountIdentity);
-  if (mcp !== void 0) fitMcpBody(finished, mcp.args);
+  if (brokered !== void 0) fitMcpBody(finished, brokered.args);
   return finished;
+}
+function adapterOriginalChars(input) {
+  try {
+    const raw = input.commandOriginalChars;
+    if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return void 0;
+    return raw > input.command.length ? raw : void 0;
+  } catch {
+    return void 0;
+  }
 }
 function applyWireArgs(metadata, wire) {
   metadata.tool_input = wire.toolInput;
@@ -891,7 +922,7 @@ function fitMcpBody(body, args) {
   } catch {
   }
 }
-function buildPromptPayload(input) {
+function buildPromptPayload(input, profile) {
   const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
   const metadata = { cwd: input.cwd, has_ui: input.hasUI };
   if (capped.truncated) {
@@ -904,7 +935,7 @@ function buildPromptPayload(input) {
     event_name: EVENT_NAME_USER_PROMPT,
     pre_tool_use_data: { tool_name: "", command: "", metadata },
     messages: [{ role: "user", content: capped.command }],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint
   };
   if (input.pullPolicies === true) body.pull_policies = true;
@@ -917,25 +948,18 @@ function expandTilde(raw, homeDir) {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return void 0;
   if (trimmed === "~") return homeDir;
-  if (trimmed.startsWith("~/")) return join2(homeDir, trimmed.slice(2));
+  if (trimmed.startsWith("~/")) return join(homeDir, trimmed.slice(2));
   return trimmed;
 }
-function resolveCachePath(env, homeDir) {
-  const base = resolvePiAgentDir(env, homeDir);
-  if (base === void 0) return void 0;
-  return join2(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
-}
-function resolvePiAgentDir(env, homeDir) {
+function resolveCachePath(env, homeDir, profile) {
+  let base;
   try {
-    let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
-    if (base === void 0 || !isAbsolute(base)) {
-      if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return void 0;
-      base = join2(homeDir, ...PI_AGENT_DIR_SEGMENTS);
-    }
-    return isAbsolute(base) ? base : void 0;
+    base = profile.resolveAgentDir(env, homeDir);
   } catch {
     return void 0;
   }
+  if (typeof base !== "string" || base.length === 0 || !isAbsolute(base)) return void 0;
+  return join(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
 }
 function keyFingerprint(apiKey) {
   const material = typeof apiKey === "string" ? apiKey : "";
@@ -1014,18 +1038,19 @@ function areToolsFresh(toolsSyncedAt, now, ttlMs = CACHE_TTL_MS) {
 function isToolsFresh(cache, now, ttlMs = CACHE_TTL_MS) {
   return areToolsFresh(cache?.tools_synced_at, now, ttlMs);
 }
-function shouldSkipFileTool(toolName, cache, now) {
-  if (typeof toolName !== "string" || !NATIVE_FILE_TOOLS.has(toolName)) return false;
+function shouldSkipFileTool(toolName, cache, now, fileTools) {
+  if (typeof toolName !== "string" || !nativeFileTools(fileTools).has(toolName)) return false;
   if (!isToolsFresh(cache, now)) return false;
   const tools = cache?.tools_to_check;
   if (!Array.isArray(tools)) return false;
   return !tools.includes(toolName);
 }
-function shouldSkipFileToolFromState(toolName, state, now) {
+function shouldSkipFileToolFromState(toolName, state, now, fileTools) {
   return shouldSkipFileTool(
     toolName,
     { tools_synced_at: state.getToolsSyncedAt(), tools_to_check: state.getToolsToCheck() },
-    now
+    now,
+    fileTools
   );
 }
 
@@ -1102,7 +1127,7 @@ function createApiClient(opts) {
   }
   async function postTurnLog(body) {
     try {
-      const res = await resolveFetch()(`${opts.baseUrl}${TURNLOG_PATH}`, {
+      const res = await resolveFetch()(`${opts.baseUrl}${opts.profile.turnLogPath}`, {
         method: "POST",
         headers: headers(),
         body: JSON.stringify(body),
@@ -1117,8 +1142,21 @@ function createApiClient(opts) {
   return { postPretool, postHookErrors, postTurnLog };
 }
 
+// packages/pi/src/constants.ts
+var NO_UI_REASON = "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
+var MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
+var MCP_PROXY_TOOL_NAME = "mcp";
+var MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
+var MCP_BROKER_ID_PREFIX = "mcpb_";
+var MAX_INFLIGHT_MCP_CALLS = 64;
+var MCP_INFLIGHT_MAX_AGE_MS = 3e5;
+var ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
+var MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
+var MCP_CONFIG_FLAG = "--mcp-config";
+var MAX_MCP_CONFIG_BYTES = 1048576;
+
 // packages/core/src/heartbeat.ts
-function buildHeartbeatPayload(input) {
+function buildHeartbeatPayload(input, profile) {
   const body = {
     conversation_id: input.sessionId,
     model: input.model !== void 0 && input.model.length > 0 ? input.model : TURNLOG_MODEL,
@@ -1128,13 +1166,13 @@ function buildHeartbeatPayload(input) {
     pre_tool_use_data: {
       tool_name: "",
       command: "",
-      metadata: { cwd: input.cwd, has_ui: input.hasUI, pi_version: input.piVersion }
+      metadata: { cwd: input.cwd, has_ui: input.hasUI, [profile.versionMetadataKey]: input.agentVersion }
     },
     // Empty rather than absent: the field is required by the server type, and a heartbeat has no
     // prompt to report. Sending a blank prompt through the guardrail path is exactly what §C2 warns
     // against, which is why `event_name` above is not `user_prompt`.
     messages: [],
-    unbound_app_label: APP_LABEL,
+    unbound_app_label: profile.appLabel,
     client_entrypoint: input.clientEntrypoint,
     // Harmless here (the fall-through attaches no payload) and future-proof if the API later answers
     // this shape with one — at which point `recordSuccess` already handles the fields correctly.
@@ -1168,11 +1206,11 @@ function createHeartbeatGate(opts) {
 }
 
 // packages/core/src/config.ts
-import { isAbsolute as isAbsolute2, join as join3 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 function readUnboundConfig(homeDir) {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute2(homeDir)) return {};
-  const raw = readSmallRegularFile(join3(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  const raw = readSmallRegularFile(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
   if (raw === void 0) return {};
   try {
     const parsed = JSON.parse(raw);
@@ -1187,8 +1225,8 @@ function usableString(candidate) {
   const trimmed = candidate.trim();
   return trimmed.length > 0 ? trimmed : void 0;
 }
-function resolveApiKey(env, homeDir) {
-  const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
+function resolveApiKey(env, homeDir, profile) {
+  const fromEnv = usableString(env[profile.envApiKey]) ?? usableString(env[ENV_API_KEY_GENERIC]);
   if (fromEnv !== void 0) return fromEnv;
   return usableString(readUnboundConfig(homeDir).api_key);
 }
@@ -1374,57 +1412,6 @@ function createKeyState(opts = {}) {
 }
 var keyState = createKeyState();
 
-// packages/core/src/piVersion.ts
-import { readFileSync as readFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join4 } from "node:path";
-var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-var MAX_WALK_UP_LEVELS = 8;
-var MAX_VERSION_CHARS = 32;
-function readManagedInstallVersion(env) {
-  const root = env[ENV_PI_INSTALL_ROOT];
-  if (typeof root !== "string" || root.length === 0) return void 0;
-  try {
-    const version = readFileSync2(join4(root, "current-version"), "utf8").trim();
-    return version.length > 0 ? version : void 0;
-  } catch {
-    return void 0;
-  }
-}
-function readVersionFromArgv(argv1) {
-  if (typeof argv1 !== "string" || argv1.length === 0) return void 0;
-  let dir = dirname2(argv1);
-  for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
-    try {
-      const parsed = JSON.parse(readFileSync2(join4(dir, "package.json"), "utf8"));
-      if (parsed !== null && typeof parsed === "object") {
-        const pkg = parsed;
-        if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
-          return pkg.version;
-        }
-      }
-    } catch {
-    }
-    const parent = dirname2(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return void 0;
-}
-function sanitizeVersion(version) {
-  const cleaned = version.replace(/[^A-Za-z0-9._+-]/g, "").slice(0, MAX_VERSION_CHARS);
-  return cleaned.length > 0 ? cleaned : "unknown";
-}
-function resolveClientEntrypoint(env, argv1) {
-  let version = "unknown";
-  try {
-    const found = readManagedInstallVersion(env) ?? readVersionFromArgv(argv1);
-    if (found !== void 0) version = sanitizeVersion(found);
-  } catch {
-    version = "unknown";
-  }
-  return `pi/${version}`;
-}
-
 // packages/core/src/verdict.ts
 var CONTROL_CHARS = new RegExp(
   "[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
@@ -1527,12 +1514,12 @@ function createTelemetry(opts) {
       lastReportAtMs = at;
       reporting = true;
       const message = redactSecrets(
-        `pi hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
+        `${opts.profile.hookSource} hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
         apiKey
       );
       const body = {
         errors: [{ message, timestamp: new Date(at).toISOString(), category }],
-        hook_source: HOOK_SOURCE
+        hook_source: opts.profile.hookSource
       };
       void opts.client.postHookErrors(body).catch(() => false).finally(() => {
         reporting = false;
@@ -1941,6 +1928,188 @@ function postStandaloneTurn(entry, ctx, sessionId, deps) {
   return void 0;
 }
 
+// packages/core/src/evaluate.ts
+var HOST_GENERATED_SOURCE = "extension";
+var MAX_TIMER_MS = 2147483647;
+function noteSafe(fn) {
+  try {
+    fn?.();
+  } catch {
+  }
+}
+function noteDecision(deps, entry) {
+  noteSafe(() => deps.onDecision?.(entry));
+}
+function isRecord2(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function asString(value) {
+  return typeof value === "string" ? value : "";
+}
+function readPrompt(source) {
+  try {
+    return asString(source.lastUserPrompt);
+  } catch {
+    return "";
+  }
+}
+function resolveState(raw) {
+  return raw !== null && typeof raw === "object" ? raw : createPolicyState();
+}
+function resolveDeadlineMs(raw) {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) return Math.min(raw, MAX_TIMER_MS);
+  return PRETOOL_TIMEOUT_MS + EVALUATE_DEADLINE_SLACK_MS;
+}
+function safeHooks(hooks) {
+  if (hooks === void 0 || hooks === null) return void 0;
+  return {
+    notify(message, level) {
+      noteSafe(() => hooks.notify?.(message, level));
+    }
+  };
+}
+function raceDeadline(start, deadlineMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    let timer;
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      if (timer !== void 0) clearTimeout(timer);
+      resolve(result);
+    };
+    try {
+      timer = setTimeout(() => finish({ state: "timed-out" }), deadlineMs);
+      Promise.resolve(start()).then(
+        (value) => finish({ state: "answered", value }),
+        () => finish({ state: "faulted" })
+      );
+    } catch {
+      finish({ state: "faulted" });
+    }
+  });
+}
+function normaliseOutcome(raw) {
+  if (raw === null || typeof raw !== "object") return { kind: "allow" };
+  const kind = raw.kind;
+  if (kind !== "deny" && kind !== "confirm" && kind !== "unavailable") return { kind: "allow" };
+  const reason = raw.reason;
+  return typeof reason === "string" ? { kind, reason } : { kind };
+}
+async function check(payload, label2, deps, state) {
+  const hooks = safeHooks(deps.hooks);
+  const deadlineMs = resolveDeadlineMs(deps.deadlineMs);
+  const raced = await raceDeadline(() => deps.checker.checkTool(payload, label2, hooks), deadlineMs);
+  if (raced.state === "answered") return normaliseOutcome(raced.value);
+  if (raced.state === "faulted") return void 0;
+  const blocked = state.getFailureAction() === "block";
+  noteSafe(
+    () => deps.telemetry?.reportBypass({
+      errorClass: EVALUATE_DEADLINE_ERROR_CLASS,
+      toolName: label2,
+      elapsedMs: deadlineMs,
+      blocked
+    })
+  );
+  return blocked ? { kind: "unavailable" } : { kind: "allow" };
+}
+async function evaluateToolCall(call, deps) {
+  try {
+    const source = isRecord2(call) ? call : {};
+    const toolName = asString(source.toolName);
+    const toolCallId = asString(source.toolCallId);
+    const command = asString(source.command);
+    const toolInput = isRecord2(source.toolInput) ? source.toolInput : {};
+    const cwd = asString(source.cwd);
+    const profile = deps.profile;
+    const mcp = normaliseMcp(source.mcp);
+    const filePath = resolveFilePath(toolName, toolInput, cwd, profile.fileTools);
+    const sendUnattributed = source.sendUnattributed === true;
+    if (!sendUnattributed && command.trim() === "" && filePath === void 0 && mcp === void 0) {
+      return { kind: "skip", why: "nothing-evaluable" };
+    }
+    const extraKeys = profileExtraToolInputKeys(profile);
+    const auditInput = auditToolInput(toolInput, command, extraKeys);
+    const now = (deps.now ?? Date.now)();
+    const state = resolveState(deps.state);
+    const toolsConfirmed = state.getToolsConfirmed();
+    if (toolsConfirmed && nativeFileTools(profile.fileTools).has(toolName) && shouldSkipFileToolFromState(toolName, state, now, profile.fileTools)) {
+      noteDecision(deps, {
+        tool_name: toolName,
+        tool_use_id: toolCallId,
+        decision: "skipped",
+        tool_input: auditInput
+      });
+      return { kind: "skip", why: "cached" };
+    }
+    const pullPolicies = !toolsConfirmed || !areToolsFresh(state.getToolsSyncedAt(), now);
+    const model = source.model;
+    const payload = buildPretoolPayload({
+      toolName,
+      command,
+      toolUseId: toolCallId,
+      toolInput,
+      cwd,
+      sessionId: asString(source.sessionId),
+      model: typeof model === "string" ? model : void 0,
+      clientEntrypoint: asString(deps.entrypoint),
+      pullPolicies,
+      lastUserPrompt: readPrompt(source),
+      ...typeof source.commandOriginalChars === "number" ? { commandOriginalChars: source.commandOriginalChars } : {},
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
+      ...mcp === void 0 ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } },
+      ...source.patchOperation === "delete" ? { patchOperation: "delete" } : {}
+    }, profile);
+    const outcome = await check(payload, toolName, deps, state);
+    if (outcome === void 0) return { kind: "allow" };
+    noteDecision(deps, {
+      tool_name: toolName,
+      tool_use_id: toolCallId,
+      decision: outcome.kind,
+      tool_input: auditInput
+    });
+    return outcome;
+  } catch {
+    return { kind: "allow" };
+  }
+}
+async function evaluatePrompt(input, deps) {
+  try {
+    const source = isRecord2(input) ? input : {};
+    if (source.source === HOST_GENERATED_SOURCE) return { kind: "skip", why: "nothing-evaluable" };
+    const prompt = asString(source.text);
+    if (prompt.trim() === "") return { kind: "skip", why: "nothing-evaluable" };
+    const state = resolveState(deps.state);
+    const model = source.model;
+    const payload = buildPromptPayload({
+      prompt,
+      cwd: asString(source.cwd),
+      sessionId: asString(source.sessionId),
+      model: typeof model === "string" ? model : void 0,
+      clientEntrypoint: asString(deps.entrypoint),
+      hasUI: source.hasUI === true,
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
+    }, deps.profile);
+    const outcome = await check(payload, "user_prompt", deps, state);
+    return outcome ?? { kind: "allow" };
+  } catch {
+    return { kind: "allow" };
+  }
+}
+function verdictMessage(verdict) {
+  try {
+    if (verdict === null || typeof verdict !== "object") return GENERIC_DENY_REASON;
+    const kind = verdict.kind;
+    if (kind === "allow" || kind === "skip") return "";
+    const reason = sanitizeReason(verdict.reason);
+    if (kind === "deny") return reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason;
+    if (kind === "unavailable") return reason ?? ENGINE_UNAVAILABLE_REASON;
+    return reason ?? GENERIC_DENY_REASON;
+  } catch {
+    return GENERIC_DENY_REASON;
+  }
+}
+
 // packages/pi/src/narrow.ts
 var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
 function isShellCall(e) {
@@ -1948,6 +2117,170 @@ function isShellCall(e) {
   const input = e.input;
   return typeof input === "object" && input !== null && typeof input.command === "string";
 }
+
+// packages/pi/src/agentDir.ts
+import { isAbsolute as isAbsolute3, join as join3 } from "node:path";
+var PI_AGENT_DIR_SEGMENTS = [".pi", "agent"];
+var ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
+function resolvePiAgentDir(env, homeDir) {
+  try {
+    let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
+    if (base === void 0 || !isAbsolute3(base)) {
+      if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute3(homeDir)) return void 0;
+      base = join3(homeDir, ...PI_AGENT_DIR_SEGMENTS);
+    }
+    return isAbsolute3(base) ? base : void 0;
+  } catch {
+    return void 0;
+  }
+}
+
+// packages/pi/src/auth.ts
+import { join as join4 } from "node:path";
+var PI_AUTH_FILE_NAME = "auth.json";
+var PI_AUTH_TYPE_OAUTH = "oauth";
+function isRecord3(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function readPiAuth(agentDir) {
+  try {
+    if (typeof agentDir !== "string" || agentDir === "") return void 0;
+    const raw = readSmallRegularFile(join4(agentDir, PI_AUTH_FILE_NAME), MAX_AUTH_FILE_BYTES);
+    if (raw === void 0) return void 0;
+    const parsed = JSON.parse(raw);
+    if (!isRecord3(parsed)) return void 0;
+    const out = {};
+    for (const [provider, value] of Object.entries(parsed)) {
+      if (!isRecord3(value) || typeof value.type !== "string") continue;
+      const entry = { type: value.type };
+      if (typeof value.access === "string" && value.access.length > 0) entry.access = value.access;
+      if (typeof value.expires === "number" && Number.isFinite(value.expires)) entry.expires = value.expires;
+      out[provider] = entry;
+    }
+    return out;
+  } catch {
+    return void 0;
+  }
+}
+function chooseProvider(auth, modelProvider) {
+  try {
+    const fromModel = label(modelProvider);
+    if (fromModel !== void 0) return fromModel;
+    if (!isRecord3(auth)) return void 0;
+    const providers = Object.keys(auth);
+    return providers.length === 1 ? providers[0] : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function isAnthropicOAuth(provider, entry) {
+  return provider === ANTHROPIC_PROVIDER_ID && entry?.type === PI_AUTH_TYPE_OAUTH;
+}
+function readPiAuthSummary(agentDir, modelProvider) {
+  try {
+    const auth = readPiAuth(agentDir);
+    if (auth === void 0) return void 0;
+    const provider = chooseProvider(auth, modelProvider);
+    const entry = provider !== void 0 && Object.hasOwn(auth, provider) ? auth[provider] : void 0;
+    const summary = {
+      provider,
+      hasCredential: entry !== void 0,
+      anthropicOAuth: isAnthropicOAuth(provider, entry)
+    };
+    if (entry?.access !== void 0) summary.accessToken = entry.access;
+    if (entry?.expires !== void 0) summary.expiresAt = entry.expires;
+    return summary;
+  } catch {
+    return void 0;
+  }
+}
+
+// packages/pi/src/version.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+import { dirname as dirname2, join as join5 } from "node:path";
+var ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
+var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+var MAX_WALK_UP_LEVELS = 8;
+var MAX_VERSION_CHARS = 32;
+function readManagedInstallVersion(env) {
+  const root = env[ENV_PI_INSTALL_ROOT];
+  if (typeof root !== "string" || root.length === 0) return void 0;
+  try {
+    const version = readFileSync2(join5(root, "current-version"), "utf8").trim();
+    return version.length > 0 ? version : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function readVersionFromArgv(argv1) {
+  if (typeof argv1 !== "string" || argv1.length === 0) return void 0;
+  let dir = dirname2(argv1);
+  for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
+    try {
+      const parsed = JSON.parse(readFileSync2(join5(dir, "package.json"), "utf8"));
+      if (parsed !== null && typeof parsed === "object") {
+        const pkg = parsed;
+        if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
+          return pkg.version;
+        }
+      }
+    } catch {
+    }
+    const parent = dirname2(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return void 0;
+}
+function sanitizeVersion(version) {
+  const cleaned = version.replace(/[^A-Za-z0-9._+-]/g, "").slice(0, MAX_VERSION_CHARS);
+  return cleaned.length > 0 ? cleaned : "unknown";
+}
+function resolveClientEntrypoint(env, argv1) {
+  let version = "unknown";
+  try {
+    const found = readManagedInstallVersion(env) ?? readVersionFromArgv(argv1);
+    if (found !== void 0) version = sanitizeVersion(found);
+  } catch {
+    version = "unknown";
+  }
+  return `pi/${version}`;
+}
+
+// packages/pi/src/profile.ts
+var UNKNOWN_ENTRYPOINT = "pi/unknown";
+var PI_PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"];
+var PI_PATH_REQUIRED_TOOLS = ["read", "write", "edit"];
+var PI_FILE_TOOLS = Object.freeze({
+  defaulting: new Set(PI_PATH_DEFAULTING_TOOLS),
+  required: new Set(PI_PATH_REQUIRED_TOOLS),
+  /** Every pi file tool names its target `path`. The value is returned raw; the caller validates. */
+  pathOf(_toolName, input) {
+    try {
+      return input?.path;
+    } catch {
+      return void 0;
+    }
+  }
+});
+var PI_NATIVE_FILE_TOOLS = nativeFileTools(PI_FILE_TOOLS);
+var PI_PROFILE = Object.freeze({
+  appLabel: "pi",
+  hookSource: "pi",
+  turnLogPath: "/v1/hooks/pi",
+  envApiKey: "UNBOUND_PI_API_KEY",
+  versionMetadataKey: "pi_version",
+  resolveClientEntrypoint(env, argv1) {
+    try {
+      return resolveClientEntrypoint(env, argv1);
+    } catch {
+      return UNKNOWN_ENTRYPOINT;
+    }
+  },
+  resolveAgentDir: resolvePiAgentDir,
+  fileTools: PI_FILE_TOOLS,
+  readAuth: readPiAuthSummary
+});
 
 // packages/pi/src/ui.ts
 function notifySafe(ctx, message, level) {
@@ -1980,61 +2313,68 @@ function promptOf(deps) {
     return "";
   }
 }
-function noteDecision(deps, entry) {
-  noteSafe(() => deps.onDecision?.(entry));
-}
-function noteSafe(fn) {
-  try {
-    fn?.();
-  } catch {
-  }
-}
 async function decideToolCall(event, ctx, deps) {
   try {
     const shell = isShellCall(event);
     const command = shell ? event.input.command : "";
-    const toolInput = event.input ?? {};
-    const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
-    if (command.trim() === "" && filePath === void 0) return void 0;
-    const auditInput = auditToolInput(toolInput, command);
-    const now = (deps.now ?? Date.now)();
-    const state = deps.state ?? policyState;
-    const toolsConfirmed = state.getToolsConfirmed();
-    if (toolsConfirmed && NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
-      noteDecision(deps, {
-        tool_name: event.toolName,
-        tool_use_id: event.toolCallId,
-        decision: "skipped",
-        // Recorded on this path too: a skip is still a call the developer made, and the path it was
-        // made against is what makes the row readable.
-        tool_input: auditInput
-      });
-      return void 0;
+    const verdict = await evaluateToolCall(
+      {
+        toolName: event.toolName,
+        toolCallId: event.toolCallId,
+        command,
+        // `null` and `undefined` inputs both become `{}` here — see `narrow.ts` on why `input` is
+        // `unknown` and can genuinely be either (WR-07).
+        toolInput: event.input ?? {},
+        cwd: ctx.cwd,
+        // Getters, so the live session is read only when a payload is actually built — a skipped
+        // call never touches it, exactly as before this path moved into core. A read that fails
+        // there is core's fault path: the call is allowed.
+        get sessionId() {
+          return ctx.sessionManager.getSessionId();
+        },
+        get model() {
+          return ctx.model?.id;
+        },
+        // Read by core only when a payload is built, after both early returns: a skipped call never
+        // pays for it. `promptOf` is total.
+        get lastUserPrompt() {
+          return promptOf(deps);
+        }
+      },
+      {
+        checker: deps.checker,
+        profile: PI_PROFILE,
+        entrypoint: deps.entrypoint,
+        // pi has one key and one gateway per process, so its policy memory is the process-wide
+        // singleton. Core requires the state explicitly (it has no default of its own), so pi's
+        // wiring names it here; a test may still inject a fresh one.
+        state: deps.state ?? policyState,
+        now: deps.now,
+        // `notifySafe` already swallows its own failures, and core wraps the call again: a notice
+        // must never be able to change a verdict.
+        hooks: deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) },
+        onDecision: deps.onDecision,
+        accountIdentity: deps.accountIdentity
+      }
+    );
+    switch (verdict.kind) {
+      case "skip":
+      case "allow":
+        return void 0;
+      case "deny": {
+        notifySafe(ctx, verdict.reason ?? GENERIC_DENY_REASON, "error");
+        return { block: true, reason: verdictMessage(verdict) };
+      }
+      case "confirm": {
+        if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
+        const reason = verdict.reason ?? GENERIC_DENY_REASON;
+        notifySafe(ctx, reason, "warning");
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
+        return accepted ? void 0 : { block: true, reason: DECLINED_REASON };
+      }
+      case "unavailable":
+        return { block: true, reason: verdictMessage(verdict) };
     }
-    const pullPolicies = !toolsConfirmed || !areToolsFresh(state.getToolsSyncedAt(), now);
-    const payload = buildPretoolPayload({
-      toolName: event.toolName,
-      command,
-      toolUseId: event.toolCallId,
-      toolInput,
-      cwd: ctx.cwd,
-      sessionId: ctx.sessionManager.getSessionId(),
-      model: ctx.model?.id,
-      clientEntrypoint: deps.entrypoint,
-      pullPolicies,
-      // Read here, after both early returns: a skipped call never pays for it.
-      lastUserPrompt: promptOf(deps),
-      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
-    });
-    const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
-    const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
-    noteDecision(deps, {
-      tool_name: event.toolName,
-      tool_use_id: event.toolCallId,
-      decision: outcome.kind,
-      tool_input: auditInput
-    });
-    return await applyOutcome(outcome, ctx);
   } catch {
     return void 0;
   }
@@ -2046,7 +2386,9 @@ async function confirmBrokered(ui, reason, signal) {
       return "deny";
     }
     notifySafe(ui, reason, "warning");
-    const signals = [ui.signal, signal].filter((s) => s instanceof AbortSignal);
+    const signals = [ui.signal, signal].filter(
+      (s) => s instanceof AbortSignal && (s === signal || !s.aborted)
+    );
     const combined = signals.length === 0 ? void 0 : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
     const dialogCtx = { hasUI: true, ui: ui.ui, signal: combined };
     const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
@@ -2075,7 +2417,7 @@ async function decideMcpApproval(input, deps) {
       lastUserPrompt: promptOf(deps),
       mcp: call,
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
-    });
+    }, PI_PROFILE);
     const ui = input.ui;
     const hooks = deps.hooks ?? { notify: (message, level) => ui === void 0 ? void 0 : notifySafe(ui, message, level) };
     const outcome = await deps.checker.checkTool(payload, toolName, hooks);
@@ -2104,39 +2446,15 @@ async function decideMcpApproval(input, deps) {
     return "abstain";
   }
 }
-async function applyOutcome(outcome, ctx) {
-  switch (outcome.kind) {
-    case "allow":
-      return void 0;
-    case "deny": {
-      const reason = outcome.reason;
-      notifySafe(ctx, reason ?? GENERIC_DENY_REASON, "error");
-      return {
-        block: true,
-        reason: reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason
-      };
-    }
-    case "confirm": {
-      if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
-      const reason = outcome.reason ?? GENERIC_DENY_REASON;
-      notifySafe(ctx, reason, "warning");
-      const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
-      return accepted ? void 0 : { block: true, reason: DECLINED_REASON };
-    }
-    case "unavailable":
-      return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
-  }
-  return void 0;
-}
 
 // packages/pi/src/mcpBroker.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 var ANSWERS = /* @__PURE__ */ new Set(["allow_once", "deny", "abstain"]);
-function isRecord2(value) {
+function isRecord4(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function snapshot(data) {
-  if (!isRecord2(data)) return void 0;
+  if (!isRecord4(data)) return void 0;
   const claim = data.claim;
   if (typeof claim !== "function") return void 0;
   const serverName = data.serverName;
@@ -2144,7 +2462,7 @@ function snapshot(data) {
   if (typeof serverName !== "string" || serverName === "") return void 0;
   if (typeof originalToolName !== "string" || originalToolName === "") return void 0;
   const prefixedToolName = typeof data.prefixedToolName === "string" ? data.prefixedToolName : "";
-  const args = isRecord2(data.args) ? data.args : {};
+  const args = isRecord4(data.args) ? data.args : {};
   const origin = typeof data.origin === "string" ? data.origin : "";
   const signal = data.signal;
   return {
@@ -2221,7 +2539,7 @@ function mayBeWrapper(toolName) {
 }
 function wrapperArgsKey(input) {
   try {
-    const raw = isRecord2(input) ? input.args : void 0;
+    const raw = isRecord4(input) ? input.args : void 0;
     if (raw === void 0 || raw === "") return stableKey({});
     if (typeof raw === "string") return stableKey(JSON.parse(raw));
     return stableKey(raw);
@@ -2230,7 +2548,7 @@ function wrapperArgsKey(input) {
   }
 }
 function directArgsKey(input) {
-  return stableKey(isRecord2(input) ? input : {});
+  return stableKey(isRecord4(input) ? input : {});
 }
 function createInflightCalls(max, maxAgeMs, now = Date.now) {
   let entries = [];
@@ -2245,7 +2563,7 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
         if (typeof entry.toolCallId !== "string" || entry.toolCallId === "") return;
         if (typeof entry.toolName !== "string" || entry.toolName === "") return;
         let tool;
-        if (isRecord2(entry.input) && typeof entry.input.tool === "string") tool = entry.input.tool;
+        if (isRecord4(entry.input) && typeof entry.input.tool === "string") tool = entry.input.tool;
         expire();
         entries.push({
           toolCallId: entry.toolCallId,
@@ -2277,7 +2595,7 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
     claim(prefixedToolName, originalToolName, args) {
       try {
         expire();
-        const argsKey = stableKey(isRecord2(args) ? args : {});
+        const argsKey = stableKey(isRecord4(args) ? args : {});
         if (argsKey === void 0) return void 0;
         const index = entries.findIndex((entry) => {
           if (prefixedToolName !== "" && entry.toolName === prefixedToolName && entry.directKey === argsKey) {
@@ -2303,7 +2621,7 @@ function mintBrokerId() {
 
 // packages/pi/src/mcpConfig.ts
 import { closeSync, constants as fsConstants, fstatSync, lstatSync as lstatSync2, openSync, readSync, statSync } from "node:fs";
-import { isAbsolute as isAbsolute3, join as join5 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join6 } from "node:path";
 var KNOWN_SERVER_KEYS = /* @__PURE__ */ new Set([
   "command",
   "args",
@@ -2366,34 +2684,34 @@ function mcpConfigSources(options, cwd) {
   try {
     const env = options.env ?? {};
     const homeDir = options.homeDir;
-    if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute3(homeDir)) return void 0;
-    if (typeof cwd !== "string" || cwd === "" || !isAbsolute3(cwd)) return void 0;
+    if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute4(homeDir)) return void 0;
+    if (typeof cwd !== "string" || cwd === "" || !isAbsolute4(cwd)) return void 0;
     if (hasMcpConfigFlag(options.argv)) return void 0;
     const packageDir = env[ENV_PI_PACKAGE_DIR];
     if (typeof packageDir === "string" && packageDir !== "") return void 0;
     const agentEnv = env[ENV_PI_AGENT_DIR];
     let agentDir;
     if (typeof agentEnv === "string" && agentEnv !== "") {
-      if (!isAbsolute3(agentEnv)) return void 0;
+      if (!isAbsolute4(agentEnv)) return void 0;
       agentDir = agentEnv;
     } else {
-      agentDir = join5(homeDir, ".pi", "agent");
+      agentDir = join6(homeDir, ".pi", "agent");
     }
-    const adapterFile = join5(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
+    const adapterFile = join6(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
     const mode = env[ENV_PI_MCP_CONFIG_MODE];
     if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") return [adapterFile];
     const sources = [];
     for (const path of [
-      join5(homeDir, ".config", "mcp", "mcp.json"),
-      join5(homeDir, ".agents", "mcp.json"),
-      join5(homeDir, ".agents", "mcp", "mcp.json")
+      join6(homeDir, ".config", "mcp", "mcp.json"),
+      join6(homeDir, ".agents", "mcp.json"),
+      join6(homeDir, ".agents", "mcp", "mcp.json")
     ]) {
       if (path !== adapterFile) sources.push(path);
     }
     sources.push(adapterFile);
-    const project = join5(cwd, ".mcp.json");
+    const project = join6(cwd, ".mcp.json");
     if (project !== adapterFile) sources.push(project);
-    sources.push(join5(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
+    sources.push(join6(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
     return [...new Set(sources)];
   } catch {
     return void 0;
@@ -2573,31 +2891,43 @@ function createMcpConfigReader(options) {
 // packages/pi/src/prompt.ts
 async function decideInput(event, ctx, deps) {
   try {
-    if (event.source === "extension") return void 0;
     const text = typeof event.text === "string" ? event.text : "";
-    if (text.trim() === "") return void 0;
-    const payload = buildPromptPayload({
-      prompt: text,
-      cwd: ctx.cwd,
-      sessionId: ctx.sessionManager.getSessionId(),
-      model: ctx.model?.id,
-      clientEntrypoint: deps.entrypoint,
-      hasUI: ctx.hasUI,
-      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
-    });
-    const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
-    const outcome = await deps.checker.checkTool(payload, "user_prompt", hooks);
-    switch (outcome.kind) {
-      case "deny": {
-        const reason = outcome.reason;
-        notifySafe(ctx, reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason, "error");
-        return { action: "handled" };
+    const verdict = await evaluatePrompt(
+      {
+        text,
+        source: event.source,
+        cwd: ctx.cwd,
+        // A getter, so a skipped prompt never touches the live session.
+        get sessionId() {
+          return ctx.sessionManager.getSessionId();
+        },
+        get model() {
+          return ctx.model?.id;
+        },
+        hasUI: ctx.hasUI
+      },
+      {
+        checker: deps.checker,
+        profile: PI_PROFILE,
+        entrypoint: deps.entrypoint,
+        // pi's one-key, one-gateway process: the process-wide policy memory, named explicitly
+        // because core has no default (WR-03).
+        state: policyState,
+        hooks: deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) },
+        accountIdentity: deps.accountIdentity
       }
+    );
+    switch (verdict.kind) {
+      case "skip":
+        return void 0;
+      case "deny":
+        notifySafe(ctx, verdictMessage(verdict), "error");
+        return { action: "handled" };
       case "unavailable":
-        notifySafe(ctx, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
+        notifySafe(ctx, verdictMessage(verdict), "error");
         return { action: "handled" };
       case "confirm":
-        notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
+        notifySafe(ctx, verdict.reason ?? GENERIC_DENY_REASON, "warning");
         noteSafe(() => deps.onPrompt?.(text));
         return void 0;
       case "allow":
@@ -2663,7 +2993,7 @@ async function decideUserBash(event, ctx, deps) {
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
-    });
+    }, PI_PROFILE);
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
     noteDecision(deps, {
@@ -2729,7 +3059,7 @@ function versionOf(entrypoint) {
 }
 var processHeartbeatGate = createHeartbeatGate({ now: Date.now, ttlMs: CACHE_TTL_MS });
 function makeCacheSync(apiKey, baseUrl, env = {}, homeDir = "") {
-  const cachePath = resolveCachePath(env, homeDir);
+  const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
   if (cachePath === void 0) return void 0;
   const fingerprint = keyFingerprint(apiKey);
   return (snapshot2) => {
@@ -2741,11 +3071,16 @@ function makeCacheSync(apiKey, baseUrl, env = {}, homeDir = "") {
   };
 }
 function defaultMakeChecker(apiKey, baseUrl, env = {}, homeDir = "") {
-  const client = createApiClient({ baseUrl, apiKey });
+  const client = createApiClient({ baseUrl, apiKey, profile: PI_PROFILE });
   return createPolicyChecker({
     client,
     state: policyState,
-    telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+    telemetry: createTelemetry({
+      client,
+      apiKey,
+      profile: PI_PROFILE,
+      isInactive: () => keyState.isInactive()
+    }),
     breaker: createBreaker({ now: Date.now }),
     keyState,
     onSync: makeCacheSync(apiKey, baseUrl, env, homeDir)
@@ -2753,7 +3088,7 @@ function defaultMakeChecker(apiKey, baseUrl, env = {}, homeDir = "") {
 }
 function hydrateFromCache(apiKey, baseUrl, env, homeDir) {
   try {
-    const cachePath = resolveCachePath(env, homeDir);
+    const cachePath = resolveCachePath(env, homeDir, PI_PROFILE);
     if (cachePath === void 0) return;
     const onDisk = readCache(cachePath, { gatewayUrl: baseUrl, fingerprint: keyFingerprint(apiKey) });
     if (onDisk !== void 0) policyState.hydrate(onDisk);
@@ -2783,7 +3118,9 @@ function createExtension(overrides = {}) {
   };
   const identityLoader = createAccountIdentityLoader({
     ...deps.identity,
-    agentDir: resolvePiAgentDir(env, homeDir)
+    agentDir: PI_PROFILE.resolveAgentDir(env, homeDir),
+    // A profile may omit `readAuth`; then there is no credential store and no identity is sent.
+    readAuth: PI_PROFILE.readAuth ?? (() => void 0)
   });
   function identityOption() {
     try {
@@ -2803,19 +3140,24 @@ function createExtension(overrides = {}) {
   let notified = false;
   function init() {
     if (resolved === void 0) {
-      const apiKey = resolveApiKey(deps.env, deps.homeDir);
+      const apiKey = resolveApiKey(deps.env, deps.homeDir, PI_PROFILE);
       const baseUrl = apiKey === void 0 ? void 0 : resolveGatewayUrl(deps.env, deps.homeDir);
       if (apiKey !== void 0 && baseUrl !== void 0) {
         hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
       }
       const inactive = apiKey === void 0 || baseUrl === void 0;
-      const client = inactive ? void 0 : createApiClient({ baseUrl, apiKey });
+      const client = inactive ? void 0 : createApiClient({ baseUrl, apiKey, profile: PI_PROFILE });
       resolved = {
         apiKey,
-        entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
+        entrypoint: deps.entrypoint ?? PI_PROFILE.resolveClientEntrypoint(deps.env, process.argv[1]),
         checker: inactive ? void 0 : deps.makeChecker(apiKey, baseUrl),
         client,
-        telemetry: client === void 0 ? void 0 : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+        telemetry: client === void 0 ? void 0 : createTelemetry({
+          client,
+          apiKey,
+          profile: PI_PROFILE,
+          isInactive: () => keyState.isInactive()
+        }),
         cacheSync: inactive ? void 0 : makeCacheSync(apiKey, baseUrl, deps.env, deps.homeDir)
       };
     }
@@ -2934,15 +3276,18 @@ function createExtension(overrides = {}) {
           model: ctx.model?.id,
           clientEntrypoint: state.entrypoint,
           hasUI: ctx.hasUI === true,
-          piVersion: versionOf(state.entrypoint)
+          agentVersion: versionOf(state.entrypoint)
         };
         const client = state.client;
         void identityPending.then(
           (identity) => client.postPretool(
-            buildHeartbeatPayload({
-              ...heartbeatInput,
-              ...identity === void 0 ? {} : { accountIdentity: identity }
-            })
+            buildHeartbeatPayload(
+              {
+                ...heartbeatInput,
+                ...identity === void 0 ? {} : { accountIdentity: identity }
+              },
+              PI_PROFILE
+            )
           )
         ).then((result) => {
           if (!result.ok) return;
@@ -2971,7 +3316,7 @@ function createExtension(overrides = {}) {
         const state = init();
         if (state.apiKey === void 0 || state.checker === void 0) return void 0;
         seeCtx(ctx);
-        if (recordingActive(state) && !isShellCall(event) && !NATIVE_FILE_TOOLS.has(event.toolName)) {
+        if (recordingActive(state) && !isShellCall(event) && !nativeFileTools(PI_PROFILE.fileTools).has(event.toolName)) {
           inflight.remember(
             { toolCallId: event.toolCallId, toolName: event.toolName, input: event.input },
             sessionIdOf(ctx)

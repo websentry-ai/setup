@@ -23,11 +23,11 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import { createApiClient } from "../../core/src/client.ts";
-import { TURNLOG_PATH } from "../../core/src/constants.ts";
 import { keyState } from "../../core/src/keyState.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import { createPolicyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
+import { PI_PROFILE } from "../src/profile.ts";
 import { turnStore } from "../../core/src/turn.ts";
 import { createFakeHome } from "../../core/test/helpers/fakeHome.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
@@ -45,6 +45,8 @@ import {
   createFakeToolResultEvent,
 } from "./helpers/fakeCtx.ts";
 import type { FakeCtx, FakeCtxOptions } from "./helpers/fakeCtx.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 const EVENT = "pi-mcp-adapter:tool-approval-request";
 const PRETOOL_PATH = "/v1/hooks/pretool";
@@ -136,11 +138,11 @@ const closedGate: Deps["heartbeatGate"] = { shouldSend: () => false, markSent: (
 
 /** A short-timeout checker on a FRESH policy state, so cases cannot leak policy memory. */
 function fastChecker(apiKey: string, baseUrl: string): PolicyChecker {
-  const client = createApiClient({ baseUrl, apiKey, timeoutMs: 80 });
+  const client = createApiClient({ baseUrl, apiKey, timeoutMs: 80, profile: PI_PROFILE });
   return createPolicyChecker({
     client,
     state: createPolicyState(),
-    telemetry: createTelemetry({ client, apiKey }),
+    telemetry: createTelemetry({ client, apiKey, profile: PI_PROFILE }),
     keyState,
   });
 }
@@ -276,6 +278,31 @@ test("confirm ⇒ asks through the live ctx: yes ⇒ allow_once, no ⇒ deny, no
       const { decision } = await brokerRequest(f.bus, { serverName: "s", originalToolName: "t" });
       assert.equal(decision, expected, JSON.stringify(ctx));
       assert.equal(f.ctx.confirmCalls.length, asked);
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+test("confirm: a run signal that was already aborted (Esc earlier) does not cancel a later brokered dialog", async () => {
+  // The last ctx a handler saw belongs to a run the developer aborted. A brokered call that arrives
+  // later without any handler in between (an mcpScript / resource / iframe call) must still be asked,
+  // not denied by that stale signal. The broker request's own live signal still bounds the dialog.
+  const stale = new AbortController();
+  stale.abort();
+  for (const withBrokerSignal of [false, true]) {
+    const f = await fixture("ask", { ctx: { hasUI: true, confirmResult: true, signal: stale.signal } });
+    try {
+      const live = new AbortController();
+      const { decision } = await brokerRequest(f.bus, {
+        serverName: "s",
+        originalToolName: "t",
+        ...(withBrokerSignal ? { signal: live.signal } : {}),
+      });
+      assert.equal(f.ctx.confirmCalls.length, 1, "the developer is asked");
+      const dialogSignal = (f.ctx.confirmCalls[0]?.opts as { signal?: AbortSignal } | undefined)?.signal;
+      assert.notEqual(dialogSignal?.aborted, true, "the dialog is not handed an already-aborted signal");
+      assert.equal(decision, "allow_once");
     } finally {
       await f.close();
     }

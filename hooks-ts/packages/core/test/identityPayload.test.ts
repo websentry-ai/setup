@@ -8,6 +8,7 @@ import type { AccountIdentity } from "../src/accountIdentity.ts";
 import { buildHeartbeatPayload } from "../src/heartbeat.ts";
 import { buildPretoolPayload, buildPromptPayload } from "../src/payload.ts";
 import { buildTurnLogBody } from "../src/turnLog.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
 
 const IDENTITY: AccountIdentity = {
   auth_mode: "subscription",
@@ -28,7 +29,7 @@ const pretool = (accountIdentity?: AccountIdentity) =>
     model: undefined,
     clientEntrypoint: "pi/0.87.1",
     ...(accountIdentity === undefined ? {} : { accountIdentity }),
-  });
+  }, TEST_PROFILE);
 
 const prompt = (accountIdentity?: AccountIdentity) =>
   buildPromptPayload({
@@ -39,7 +40,7 @@ const prompt = (accountIdentity?: AccountIdentity) =>
     clientEntrypoint: "pi/0.87.1",
     hasUI: true,
     ...(accountIdentity === undefined ? {} : { accountIdentity }),
-  });
+  }, TEST_PROFILE);
 
 const heartbeat = (accountIdentity?: AccountIdentity) =>
   buildHeartbeatPayload({
@@ -48,9 +49,9 @@ const heartbeat = (accountIdentity?: AccountIdentity) =>
     model: undefined,
     clientEntrypoint: "pi/0.87.1",
     hasUI: true,
-    piVersion: "0.87.1",
+    agentVersion: "0.87.1",
     ...(accountIdentity === undefined ? {} : { accountIdentity }),
-  });
+  }, TEST_PROFILE);
 
 const turnLog = (accountIdentity?: AccountIdentity) =>
   buildTurnLogBody(

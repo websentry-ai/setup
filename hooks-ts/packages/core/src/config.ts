@@ -20,10 +20,10 @@ import {
   CONFIG_FILE_NAME,
   DEFAULT_GATEWAY_URL,
   ENV_API_KEY_GENERIC,
-  ENV_API_KEY_PI,
   ENV_GATEWAY_URL,
   MAX_CONFIG_BYTES,
 } from "./constants.ts";
+import type { AgentProfile } from "./profile.ts";
 import { readSmallRegularFile } from "./safeRead.ts";
 
 /** Hosts for which plain `http:` is allowed — the documented mock-API-smoke exemption (§E4a). */
@@ -75,12 +75,17 @@ function usableString(candidate: unknown): string | undefined {
 }
 
 /**
- * The four locked key tiers: the pi-specific env var, the generic env var (6 other tools honour
- * it), then `api_key` from the config file, then `undefined` — which means "extension inactive",
- * never "block" (RES-06).
+ * The four locked key tiers: the agent-specific env var (`AgentProfile.envApiKey`), the generic env
+ * var (6 other tools honour it), then `api_key` from the config file, then `undefined` — which means
+ * "extension inactive", never "block" (RES-06). The order is a security property and is the same for
+ * every agent; a profile only names the first tier.
  */
-export function resolveApiKey(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
-  const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
+export function resolveApiKey(
+  env: NodeJS.ProcessEnv,
+  homeDir: string,
+  profile: Pick<AgentProfile, "envApiKey">,
+): string | undefined {
+  const fromEnv = usableString(env[profile.envApiKey]) ?? usableString(env[ENV_API_KEY_GENERIC]);
   if (fromEnv !== undefined) return fromEnv;
   return usableString(readUnboundConfig(homeDir).api_key);
 }

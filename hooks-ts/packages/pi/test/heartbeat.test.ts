@@ -24,7 +24,6 @@ import {
   NO_KEY_NOTICE,
   PRETOOL_PATH,
   SESSION_PRESENCE_ROW_ENABLED,
-  TURNLOG_PATH,
 } from "../../core/src/constants.ts";
 import { buildHeartbeatPayload, createHeartbeatGate } from "../../core/src/heartbeat.ts";
 import { createPolicyState, policyState } from "../../core/src/policyState.ts";
@@ -35,6 +34,9 @@ import type { Deps } from "../src/index.ts";
 import { createFakeClock, createFakeCtx, createFakeSessionStartEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 const ENTRYPOINT = "pi/0.87.1";
 
@@ -98,8 +100,8 @@ test("the heartbeat payload carries the locked fields and nothing tool-shaped", 
     model: undefined,
     clientEntrypoint: ENTRYPOINT,
     hasUI: true,
-    piVersion: "0.87.1",
-  });
+    agentVersion: "0.87.1",
+  }, PI_PROFILE);
 
   assert.equal(payload.event_name, "session_start");
   assert.equal(payload.pull_policies, true);
@@ -134,8 +136,8 @@ test("the payload reports has_ui false under pi -p", () => {
     model: undefined,
     clientEntrypoint: ENTRYPOINT,
     hasUI: false,
-    piVersion: "unknown",
-  });
+    agentVersion: "unknown",
+  }, PI_PROFILE);
   assert.equal(payload.pre_tool_use_data.metadata["has_ui"], false);
   assert.equal(payload.pre_tool_use_data.metadata["pi_version"], "unknown");
 });

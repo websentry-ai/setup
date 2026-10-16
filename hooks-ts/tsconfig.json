@@ -5,6 +5,8 @@
     "packages/core/test",
     "packages/pi/src",
     "packages/pi/test",
+    "packages/opencode/src",
+    "packages/opencode/test",
     "scripts"
   ]
 }

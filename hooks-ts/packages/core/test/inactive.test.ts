@@ -42,6 +42,7 @@ import type { PretoolRequestBody } from "../src/types.ts";
 import { startMockApi } from "./helpers/mockApi.ts";
 import type { MockApi } from "./helpers/mockApi.ts";
 import { TEST_KEY } from "./helpers/testKey.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
 
 const TIMEOUT_MS = 50;
 const FIXED_NOW = 1_700_000_000_000;
@@ -82,6 +83,7 @@ function harness(api: MockApi, opts: { failureAction?: "allow" | "block" } = {})
     apiKey: TEST_KEY,
     timeoutMs: TIMEOUT_MS,
     errorsTimeoutMs: TIMEOUT_MS,
+    profile: TEST_PROFILE,
   });
   const keyState = createKeyState();
   const state = createPolicyState();
@@ -98,6 +100,7 @@ function harness(api: MockApi, opts: { failureAction?: "allow" | "block" } = {})
       now: () => FIXED_NOW,
       intervalMs: 0,
       isInactive: () => keyState.isInactive(),
+      profile: TEST_PROFILE,
     }),
     keyState,
   });
@@ -419,11 +422,11 @@ test("WR-01 the latch is checked before the breaker, so a latched session makes 
 test("WR-01 keyState is optional: a checker built without one behaves as in Phase 8", async () => {
   const api = await startMockApi({ mode: "401" });
   try {
-    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: TEST_PROFILE });
     const checker = createPolicyChecker({
       client: wire,
       state: createPolicyState(),
-      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW, profile: TEST_PROFILE }),
     });
     // The internal default still latches — the option exists so the composition root can SHARE one
     // instance with the reporter, not to make the behaviour opt-in.
@@ -450,7 +453,7 @@ test("WR-01 an inactive session cannot reject: checkTool stays total", async () 
   const checker = createPolicyChecker({
     client: hostile,
     state: createPolicyState(),
-    telemetry: createTelemetry({ client: hostile, apiKey: TEST_KEY }),
+    telemetry: createTelemetry({ client: hostile, apiKey: TEST_KEY, profile: TEST_PROFILE }),
     keyState,
   });
 

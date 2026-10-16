@@ -37,7 +37,6 @@ import {
   DENY_PREFIX,
   ENGINE_UNAVAILABLE_REASON,
   GENERIC_DENY_REASON,
-  NO_UI_REASON,
   USER_BASH_ID_PREFIX,
 } from "../../core/src/constants.ts";
 import { auditToolInput, buildPretoolPayload } from "../../core/src/payload.ts";
@@ -45,6 +44,8 @@ import type { CheckHooks } from "../../core/src/policy.ts";
 import { denyBashResult } from "./bashResult.ts";
 import { noteDecision } from "./decide.ts";
 import type { DecideCtx, DecideDeps } from "./decide.ts";
+import { NO_UI_REASON } from "./constants.ts";
+import { PI_PROFILE } from "./profile.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 
 /** The structural slice of `UserBashEvent` this adapter reads. */
@@ -97,7 +98,7 @@ export async function decideUserBash(
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
-    });
+    }, PI_PROFILE);
 
     const hooks: CheckHooks =
       deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };

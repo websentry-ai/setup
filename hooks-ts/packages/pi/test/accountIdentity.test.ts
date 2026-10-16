@@ -17,7 +17,7 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import type { ExecFileLike } from "../../core/src/accountIdentity.ts";
-import { CACHE_TTL_MS, EVENT_NAME_SESSION_START, PRETOOL_PATH, TURNLOG_PATH } from "../../core/src/constants.ts";
+import { CACHE_TTL_MS, EVENT_NAME_SESSION_START, PRETOOL_PATH } from "../../core/src/constants.ts";
 import { createHeartbeatGate } from "../../core/src/heartbeat.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
@@ -33,6 +33,9 @@ import {
   createFakeToolCallEvent,
 } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
+import { PI_PROFILE } from "../src/profile.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 const TOKEN = "sk-ant-oat01-PI-IDENTITY-TEST-TOKEN";
 const REFRESH = "sk-ant-ort01-PI-IDENTITY-REFRESH";
