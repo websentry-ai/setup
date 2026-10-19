@@ -320,6 +320,26 @@ class DestinationAccountTests(unittest.TestCase):
                 self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
         self.assertFalse(os.path.exists(marker))
 
+    def test_quoted_ssh_keywords_are_read_as_ssh_reads_them(self):
+        marker = os.path.join(self.ssh_dir, 'ran-keyword')
+        inner = os.path.join(self.ssh_dir, 'inner-keyword')
+        Path(inner).write_text(f'"Match" host * exec "touch {marker}"\n')
+        for body in (f'"Match" exec "touch {marker}"\n', f'"Include" "{inner}"\n', f'Match host * "exec" "touch {marker}"\n'):
+            config = os.path.join(self.ssh_dir, 'keyword')
+            Path(config).write_text(body + 'Host prod-bastion\n  HostName 10.0.4.12\n')
+            for hook, account in self._each(f'ssh -F {config} prod-bastion'):
+                with self.subTest(hook=hook, body=body):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        self.assertFalse(os.path.exists(marker))
+
+    def test_bracketed_ipv6_copy_destinations_resolve(self):
+        for command in ('scp -F none dump.sql deploy@[2001:db8::1]:/tmp/',
+                        'scp -F none dump.sql deploy@[2001:db8:0:0:0:0:0:1]:/tmp/'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account['user'], 'deploy')
+                    self.assertIn(account['host'], ('2001:db8::1', '2001:db8:0:0:0:0:0:1'))
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:

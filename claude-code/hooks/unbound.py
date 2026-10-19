@@ -5448,11 +5448,12 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 def _account_remote_operand(operands: List[str]) -> Optional[str]:
     """The last [user@]host: operand, which is where a copy goes; None for an rsync daemon or only local paths."""
     for arg in reversed(operands):
-        if arg.startswith('rsync://') or '::' in arg:
+        if arg.startswith('rsync://'):
             return None
-        match = re.match(r'^((?:[^@/:]+@)?\[?[^/:\]]+\]?):', arg)
+        # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
+        match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
         if match and not re.match(r'^[A-Za-z]:\\', arg):
-            return match.group(1)
+            return None if match.group(2) else match.group(1)
     return None
 
 
@@ -5526,7 +5527,7 @@ def _account_ssh_destination(program: str, args: List[str]) -> tuple:
     if destination:
         return destination, passthrough
     # sftp also takes a plain [user@]host with no path.
-    if program == 'sftp' and operands and re.match(r'^(?:[^@/:]+@)?\[?[^/:\]]+\]?$', operands[0]):
+    if program == 'sftp' and operands and re.match(r'^(?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)$', operands[0]):
         return operands[0], passthrough
     return None, []
 
@@ -5570,14 +5571,18 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
         except OSError:
             return True
         for line in lines:
-            if re.match(r'\s*match\b.*\bexec\b', line, re.IGNORECASE):
-                return True
-            include = re.match(r'\s*include\s*[=\s]\s*(.+)', line, re.IGNORECASE)
+            # Split the way ssh does, so a quoted keyword or path is read as ssh reads it.
             try:
-                patterns = shlex.split(include.group(1)) if include else []
+                words = shlex.split(line, comments=True)
             except ValueError:
                 return True
-            for pattern in patterns:
+            if not words:
+                continue
+            keyword, _, attached = words[0].partition('=')
+            words = ([attached] if attached else []) + words[1:]
+            if keyword.lower() == 'match' and any(w.lower().lstrip('!').startswith('exec') for w in words):
+                return True
+            for pattern in (words if keyword.lower() == 'include' else []):
                 pattern = os.path.expanduser(pattern)
                 pending += [(found, base) for found in sorted(glob.glob(os.path.join(base, pattern)))]
     return False
@@ -5590,7 +5595,7 @@ def _account_ssh(program: str, args: List[str], cwd: Optional[str], state: Dict)
         return None
     if _account_ssh_config_runs_commands(passthrough, cwd):
         return {'platform': 'ssh', 'source': 'unknown'}
-    out = _account_run(['ssh', '-G'] + passthrough + [destination], cwd, state)
+    out = _account_run(['ssh', '-G'] + passthrough + [destination.replace('[', '').replace(']', '')], cwd, state)
     if not out:
         return {'platform': 'ssh', 'source': 'unknown'}
     settings = {}
