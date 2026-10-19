@@ -1853,6 +1853,7 @@ import { homedir } from "node:os";
 var ALLOWED_RUNS = [
   ["git", "remote", "get-url", "--push"],
   ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name"],
+  ["git", "symbolic-ref", "--short", "-q", "HEAD"],
   ["git", "config", "--get"],
   ["gh", "config", "get", "-h"],
   ["ssh", "-G"]
@@ -1991,6 +1992,15 @@ async function ghUser(host, env, state) {
   state.ghUser.set(host, user);
   return user;
 }
+async function defaultRemote(base, state) {
+  const branch = firstLine(await run([...base, "symbolic-ref", "--short", "-q", "HEAD"], state));
+  const keys = branch ? [`branch.${branch}.pushRemote`, "remote.pushDefault", `branch.${branch}.remote`] : ["remote.pushDefault"];
+  for (const key of keys) {
+    const value = firstLine(await run([...base, "config", "--get", key], state));
+    if (value) return value;
+  }
+  return "origin";
+}
 async function gitPush(args, env, cwd, state) {
   let gitDir = cwd;
   let overridden = GIT_OVERRIDE_ENV.some((k) => env[k]);
@@ -2038,7 +2048,7 @@ async function gitPush(args, env, cwd, state) {
     remote = target ?? "";
     if (remote === "") {
       const out = firstLine(await run([...base, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"], state));
-      remote = out.includes("/") ? out.split("/")[0] : "origin";
+      remote = out.includes("/") ? out.split("/")[0] : await defaultRemote(base, state);
     }
     url = firstLine(await run([...base, "remote", "get-url", "--push", remote], state)) || void 0;
   }
@@ -2166,14 +2176,36 @@ function sshDestination(name, args) {
 function expandHome(path) {
   return path === "~" || path.startsWith("~/") ? join5(homedir(), path.slice(1)) : path;
 }
+function globMatch(pattern, name) {
+  let p = 0;
+  let n = 0;
+  let star = -1;
+  let mark = 0;
+  while (n < name.length) {
+    if (p < pattern.length && (pattern[p] === "?" || pattern[p] === name[n])) {
+      p++;
+      n++;
+    } else if (p < pattern.length && pattern[p] === "*") {
+      star = p++;
+      mark = n;
+    } else if (star >= 0) {
+      p = star + 1;
+      n = ++mark;
+    } else {
+      return false;
+    }
+  }
+  while (pattern[p] === "*") p++;
+  return p === pattern.length;
+}
 function includeTargets(pattern, base) {
-  const path = expandHome(pattern.replace(/^"|"$/g, ""));
+  if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/")) return void 0;
+  const path = expandHome(pattern);
   const full = isAbsolute3(path) ? path : join5(base, path);
   if (!/[*?[]/.test(full)) return [full];
-  if (/[*?[]/.test(dirname3(full))) return void 0;
-  const glob = new RegExp(`^${basename(full).replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+  if (/[*?[]/.test(dirname3(full)) || basename(full).includes("[")) return void 0;
   try {
-    return readdirSync(dirname3(full)).filter((entry) => glob.test(entry)).sort().map((entry) => join5(dirname3(full), entry));
+    return readdirSync(dirname3(full)).filter((entry) => globMatch(basename(full), entry)).sort().map((entry) => join5(dirname3(full), entry));
   } catch {
     return [];
   }
@@ -2202,7 +2234,7 @@ function configRunsCommands(passthrough) {
     for (const line of text.split(/\r?\n/)) {
       if (/^\s*match\b.*\bexec\b/i.test(line)) return true;
       const include = /^\s*include\s*[=\s]\s*(.+)/i.exec(line);
-      for (const pattern of include?.[1]?.trim().split(/\s+/) ?? []) {
+      for (const pattern of include?.[1] === void 0 ? [] : segments(include[1])[0] ?? []) {
         const targets = includeTargets(pattern, base);
         if (targets === void 0) return true;
         pending.push(...targets.map((target) => [target, base]));

@@ -25,6 +25,7 @@ export interface DestinationAccount {
 const ALLOWED_RUNS: readonly (readonly string[])[] = [
   ["git", "remote", "get-url", "--push"],
   ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name"],
+  ["git", "symbolic-ref", "--short", "-q", "HEAD"],
   ["git", "config", "--get"],
   ["gh", "config", "get", "-h"],
   ["ssh", "-G"],
@@ -188,6 +189,17 @@ async function ghUser(host: string, env: Record<string, string>, state: State): 
   return user;
 }
 
+/** The remote a bare git push uses before its branch tracks one: pushRemote, pushDefault, the branch's remote, origin. */
+async function defaultRemote(base: string[], state: State): Promise<string> {
+  const branch = firstLine(await run([...base, "symbolic-ref", "--short", "-q", "HEAD"], state));
+  const keys = branch ? [`branch.${branch}.pushRemote`, "remote.pushDefault", `branch.${branch}.remote`] : ["remote.pushDefault"];
+  for (const key of keys) {
+    const value = firstLine(await run([...base, "config", "--get", key], state));
+    if (value) return value;
+  }
+  return "origin";
+}
+
 async function gitPush(
   args: string[], env: Record<string, string>, cwd: string | undefined, state: State,
 ): Promise<DestinationAccount | undefined> {
@@ -239,7 +251,7 @@ async function gitPush(
     remote = target ?? "";
     if (remote === "") {
       const out = firstLine(await run([...base, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"], state));
-      remote = out.includes("/") ? (out.split("/")[0] as string) : "origin";
+      remote = out.includes("/") ? (out.split("/")[0] as string) : await defaultRemote(base, state);
     }
     url = firstLine(await run([...base, "remote", "get-url", "--push", remote], state)) || undefined;
   }
@@ -386,15 +398,40 @@ function expandHome(path: string): string {
   return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
 }
 
+/** Whether a file name matches a glob of literal characters, `*` and `?`. */
+function globMatch(pattern: string, name: string): boolean {
+  let p = 0;
+  let n = 0;
+  let star = -1;
+  let mark = 0;
+  while (n < name.length) {
+    if (p < pattern.length && (pattern[p] === "?" || pattern[p] === name[n])) {
+      p++;
+      n++;
+    } else if (p < pattern.length && pattern[p] === "*") {
+      star = p++;
+      mark = n;
+    } else if (star >= 0) {
+      p = star + 1;
+      n = ++mark;
+    } else {
+      return false;
+    }
+  }
+  while (pattern[p] === "*") p++;
+  return p === pattern.length;
+}
+
 /** The files an ssh Include pattern names; undefined when it can't be expanded, so the caller refuses. */
 function includeTargets(pattern: string, base: string): string[] | undefined {
-  const path = expandHome(pattern.replace(/^"|"$/g, ""));
+  // `~user` names another account's home, which only ssh itself can resolve.
+  if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/")) return undefined;
+  const path = expandHome(pattern);
   const full = isAbsolute(path) ? path : join(base, path);
   if (!/[*?[]/.test(full)) return [full];
-  if (/[*?[]/.test(dirname(full))) return undefined;
-  const glob = new RegExp(`^${basename(full).replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+  if (/[*?[]/.test(dirname(full)) || basename(full).includes("[")) return undefined;
   try {
-    return readdirSync(dirname(full)).filter((entry) => glob.test(entry)).sort().map((entry) => join(dirname(full), entry));
+    return readdirSync(dirname(full)).filter((entry) => globMatch(basename(full), entry)).sort().map((entry) => join(dirname(full), entry));
   } catch {
     return [];
   }
@@ -427,7 +464,8 @@ function configRunsCommands(passthrough: readonly string[]): boolean {
     for (const line of text.split(/\r?\n/)) {
       if (/^\s*match\b.*\bexec\b/i.test(line)) return true;
       const include = /^\s*include\s*[=\s]\s*(.+)/i.exec(line);
-      for (const pattern of include?.[1]?.trim().split(/\s+/) ?? []) {
+      // Quoted paths may hold spaces, so the arguments are split the way a shell would.
+      for (const pattern of include?.[1] === undefined ? [] : (segments(include[1])[0] ?? [])) {
         const targets = includeTargets(pattern, base);
         if (targets === undefined) return true;
         pending.push(...targets.map((target): [string, string] => [target, base]));

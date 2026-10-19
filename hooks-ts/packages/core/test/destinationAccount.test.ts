@@ -247,3 +247,26 @@ test("gh commands that reach no repo report nothing", async () => {
     assert.equal(await resolve(command, dir), undefined, command);
   }
 });
+
+test("a bare push before tracking uses the remote git would", async () => {
+  for (const setting of [["remote.pushDefault", "personal"], ["branch.main.remote", "personal"], ["branch.main.pushRemote", "personal"]]) {
+    const dir = repo({ origin: "https://github.com/acme/app.git", personal: "https://github.com/jdoe-dev/app.git" });
+    execFileSync("git", ["-C", dir, "config", ...setting]);
+    const account = await resolve("git push", dir);
+    assert.deepEqual([account?.account, account?.context], ["jdoe-dev", "personal"], setting.join("="));
+  }
+});
+
+test("quoted and wildcard includes are scanned", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-quoted-"));
+  const folder = join(dir, "with space");
+  run("mkdir", [folder]);
+  const marker = join(dir, "ran");
+  writeFileSync(join(folder, "inner.conf"), `Match host * exec "touch ${marker}"\n`);
+  for (const include of [`"${folder}/inner.conf"`, `"${folder}/*.conf"`]) {
+    const outer = join(dir, "outer");
+    writeFileSync(outer, `Include ${include}\nHost prod-bastion\n  HostName 10.0.4.12\n`);
+    assert.deepEqual(await resolve(`ssh -F ${outer} prod-bastion`), { platform: "ssh", source: "unknown" }, include);
+  }
+  assert.equal(existsSync(marker), false);
+});
