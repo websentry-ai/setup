@@ -299,6 +299,27 @@ class DestinationAccountTests(unittest.TestCase):
                 self.assertEqual(account['account'], 'acme')
                 self.assertNotIn('user', account)
 
+    def test_a_bare_push_before_tracking_uses_the_remote_git_would(self):
+        for setting in (('remote.pushDefault', 'personal'), ('branch.main.remote', 'personal'),
+                        ('branch.main.pushRemote', 'personal')):
+            repo = _repo({'origin': 'https://github.com/acme/app.git', 'personal': 'https://github.com/jdoe-dev/app.git'})
+            _git(repo, 'config', *setting)
+            for hook, account in self._each('git push', repo):
+                with self.subTest(hook=hook, setting=setting):
+                    self.assertEqual((account['account'], account['context']), ('jdoe-dev', 'personal'))
+
+    def test_a_quoted_include_with_a_space_is_scanned(self):
+        folder = os.path.join(self.ssh_dir, 'with space')
+        os.makedirs(folder)
+        marker = os.path.join(self.ssh_dir, 'ran-quoted')
+        Path(folder, 'inner').write_text(f'Match host * exec "touch {marker}"\n')
+        outer = os.path.join(self.ssh_dir, 'outer-quoted')
+        Path(outer).write_text(f'Include "{folder}/inner"\nHost prod-bastion\n  HostName 10.0.4.12\n')
+        for hook, account in self._each(f'ssh -F {outer} prod-bastion'):
+            with self.subTest(hook=hook):
+                self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        self.assertFalse(os.path.exists(marker))
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:

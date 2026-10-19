@@ -5195,6 +5195,7 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
 _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name'),
+    ('git', 'symbolic-ref', '--short', '-q', 'HEAD'),
     ('git', 'config', '--get'),
     ('gh', 'config', 'get', '-h'),
     ('ssh', '-G'),
@@ -5330,6 +5331,18 @@ def _account_gh_user(host: str, env: Dict, cwd: Optional[str], state: Dict) -> s
     return state[key]
 
 
+def _account_default_remote(base: List[str], git_dir: Optional[str], state: Dict) -> str:
+    """The remote a bare git push uses before its branch tracks one: pushRemote, pushDefault, the branch's remote, origin."""
+    branch = (_account_run(base + ['symbolic-ref', '--short', '-q', 'HEAD'], git_dir, state) or '').strip()
+    keys = ([f'branch.{branch}.pushRemote', 'remote.pushDefault', f'branch.{branch}.remote']
+            if branch else ['remote.pushDefault'])
+    for key in keys:
+        value = (_account_run(base + ['config', '--get', key], git_dir, state) or '').strip()
+        if value:
+            return value
+    return 'origin'
+
+
 def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The account a `git push` reaches: the push remote's host and owner, and the gh login pushing over https."""
     git_dir, rest = cwd, list(args)
@@ -5377,7 +5390,7 @@ def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dic
         remote = target
         if not remote:
             out = _account_run(base + ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'], git_dir, state)
-            remote = out.strip().split('/', 1)[0] if out and '/' in out else 'origin'
+            remote = out.strip().split('/', 1)[0] if out and '/' in out else _account_default_remote(base, git_dir, state)
         url = _account_run(base + ['remote', 'get-url', '--push', remote], git_dir, state)
     host, owner, _repo = _account_remote_parts(url.strip().splitlines()[0]) if url else ('', '', '')
     if not host:
@@ -5560,8 +5573,12 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
             if re.match(r'\s*match\b.*\bexec\b', line, re.IGNORECASE):
                 return True
             include = re.match(r'\s*include\s*[=\s]\s*(.+)', line, re.IGNORECASE)
-            for pattern in (include.group(1).split() if include else []):
-                pattern = os.path.expanduser(pattern.strip('"'))
+            try:
+                patterns = shlex.split(include.group(1)) if include else []
+            except ValueError:
+                return True
+            for pattern in patterns:
+                pattern = os.path.expanduser(pattern)
                 pending += [(found, base) for found in sorted(glob.glob(os.path.join(base, pattern)))]
     return False
 
