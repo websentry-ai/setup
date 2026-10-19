@@ -231,6 +231,74 @@ class DestinationAccountTests(unittest.TestCase):
                     self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
         self.assertFalse(os.path.exists(marker))
 
+    def test_what_follows_an_ssh_destination_is_the_remote_command(self):
+        for command in (f'ssh -F {self.ssh_config} prod-bastion ls -la /var/log',
+                        f'ssh -F {self.ssh_config} prod-bastion ps -p 123 -o user',
+                        f'ssh -vF {self.ssh_config} prod-bastion'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['user']), ('10.0.4.12:2222', 'deploy'))
+
+    def test_rsync_reads_its_remote_shell_and_skips_option_values(self):
+        cases = {
+            f'rsync -a -e "ssh -F {self.ssh_config} -p 2200" src prod-bastion:/dest': ('10.0.4.12:2200', 'deploy'),
+            f"rsync -avze 'ssh -F {self.ssh_config}' src prod-bastion:/dest --exclude foo:bar": ('10.0.4.12:2222', 'deploy'),
+            f'rsync -a --rsh="ssh -F {self.ssh_config}" src prod-bastion:/dest': ('10.0.4.12:2222', 'deploy'),
+        }
+        for command, expected in cases.items():
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['user']), expected)
+        for hook, account in self._each('rsync -a -e /usr/local/bin/custom-shell src prod-bastion:/dest'):
+            with self.subTest(hook=hook):
+                self.assertIsNone(account, 'a remote shell other than ssh reads no ssh config')
+
+    def test_ssh_configs_are_scanned_through_includes_and_only_as_regular_files(self):
+        marker = os.path.join(self.ssh_dir, 'ran')
+        inner = os.path.join(self.ssh_dir, 'inner_exec')
+        Path(inner).write_text(f'Match host * exec "touch {marker}"\n')
+        outer = os.path.join(self.ssh_dir, 'outer')
+        Path(outer).write_text(f'Include {inner}\nHost prod-bastion\n  HostName 10.0.4.12\n')
+        safe = os.path.join(self.ssh_dir, 'safe')
+        Path(safe).write_text(f'Include {self.ssh_config}\n')
+        fifo = os.path.join(self.ssh_dir, 'fifo')
+        os.mkfifo(fifo)
+        for hook, account in self._each(f'ssh -F {outer} prod-bastion'):
+            with self.subTest(hook=hook):
+                self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        for hook, account in self._each(f'ssh -F {fifo} prod-bastion'):
+            with self.subTest(hook=hook, config='fifo'):
+                self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        for hook, account in self._each(f'ssh -F {safe} prod-bastion'):
+            with self.subTest(hook=hook, config='include without exec'):
+                self.assertEqual((account['host'], account['user']), ('10.0.4.12:2222', 'deploy'))
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_push_that_moves_the_repository_or_rewrites_its_config_is_unknown(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        for command in ('git -c remote.origin.pushurl=https://github.com/evil/secret.git push',
+                        'git --git-dir=/elsewhere/.git push', 'GIT_DIR=/elsewhere/.git git push origin main'):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account, {'platform': 'git', 'source': 'unknown'})
+
+    def test_gh_commands_that_reach_no_repo_report_nothing(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        for command in ('gh help', 'gh auth status', 'gh version', 'gh --version'):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertIsNone(account)
+
+    def test_another_gh_config_drops_the_login(self):
+        if not shutil.which('gh'):
+            self.skipTest('needs gh')
+        Path(os.environ['GH_CONFIG_DIR'], 'hosts.yml').write_text(
+            'github.com:\n    users:\n        jdoe: {}\n    user: jdoe\n    git_protocol: https\n')
+        for hook, account in self._each(f'GH_CONFIG_DIR={tempfile.mkdtemp()} gh pr create -R acme/app'):
+            with self.subTest(hook=hook):
+                self.assertEqual(account['account'], 'acme')
+                self.assertNotIn('user', account)
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:

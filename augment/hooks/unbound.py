@@ -3794,6 +3794,20 @@ _ACCOUNT_SSH_TOOLS = frozenset({'ssh', 'scp', 'sftp', 'rsync'})
 # Options that take a value, per program; every other option is a switch.
 _ACCOUNT_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': frozenset('cDFiJloPSX'),
                             'sftp': frozenset('BbcDFiJloPRSsX')}
+# Of ssh's -o settings, only these change which host or user ssh -G resolves.
+_ACCOUNT_SSH_IDENTITY_OPTIONS = frozenset({'hostname', 'user', 'port', 'proxyjump'})
+_ACCOUNT_SSH_CONFIG_MAX_BYTES = 256 * 1024
+_ACCOUNT_SSH_CONFIG_MAX_FILES = 32
+_ACCOUNT_RSYNC_VALUE_OPTIONS = frozenset({
+    '--exclude', '--include', '--filter', '-f', '--exclude-from', '--include-from', '--files-from', '--rsync-path',
+    '--log-file', '--partial-dir', '--temp-dir', '-T', '--compare-dest', '--copy-dest', '--link-dest', '--backup-dir',
+    '--chmod', '--chown', '--suffix', '--password-file', '--port', '--bwlimit', '--timeout', '--max-size',
+    '--min-size', '--out-format', '--remote-option', '-M'})
+# gh commands that reach no repository.
+_ACCOUNT_GH_NO_REPO = frozenset({'auth', 'help', 'version', 'config', 'alias', 'extension', 'completion',
+                                 '--help', '-h', '--version'})
+# Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to.
+_ACCOUNT_GIT_OVERRIDE_ENV = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')
 _ACCOUNT_GH_HOSTS_ENV = ('GH_HOST',)
 _ACCOUNT_GH_TOKEN_ENV = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
 
@@ -3893,8 +3907,8 @@ def _account_platform_for_host(host: str) -> str:
 
 
 def _account_gh_user(host: str, env: Dict, cwd: Optional[str], state: Dict) -> str:
-    """The gh login for a host, read from gh's local config; empty when a token variable overrides the stored login."""
-    if any(env.get(k) or os.environ.get(k) for k in _ACCOUNT_GH_TOKEN_ENV):
+    """The gh login for a host, read from gh's local config; empty when a token or another config overrides it."""
+    if any(env.get(k) or os.environ.get(k) for k in _ACCOUNT_GH_TOKEN_ENV) or env.get('GH_CONFIG_DIR'):
         return ''
     key = ('gh-user', host)
     if key not in state:
@@ -3906,15 +3920,24 @@ def _account_gh_user(host: str, env: Dict, cwd: Optional[str], state: Dict) -> s
 def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The account a `git push` reaches: the push remote's host and owner, and the gh login pushing over https."""
     git_dir, rest = cwd, list(args)
+    overridden = any(env.get(k) for k in _ACCOUNT_GIT_OVERRIDE_ENV)
     while rest and rest[0].startswith('-'):
         flag = rest.pop(0)
         if flag == '-C' and rest:
             path = os.path.expanduser(rest.pop(0))
             git_dir = path if os.path.isabs(path) else (os.path.join(git_dir, path) if git_dir else None)
-        elif flag in ('-c', '--git-dir', '--work-tree', '--namespace') and rest:
+        elif flag in ('-c', '--git-dir', '--work-tree') and rest:
+            rest.pop(0)
+            overridden = True
+        elif flag.startswith(('--git-dir=', '--work-tree=', '--config-env')) or (flag.startswith('-c') and len(flag) > 2):
+            overridden = True
+        elif flag == '--namespace' and rest:
             rest.pop(0)
     if not rest or rest[0] != 'push':
         return None
+    if overridden:
+        # Unknown is safe; the cwd repo's remote would be a confident wrong answer.
+        return {'platform': 'git', 'source': 'unknown'}
     target, positional, push_args, i = None, [], rest[1:], 0
     while i < len(push_args):
         arg = push_args[i]
@@ -3958,6 +3981,8 @@ def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dic
 
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The account a gh command reaches: host and owner from -R, a repo argument, GH_REPO or the repo's remote, plus the gh login."""
+    if not args or args[0] in _ACCOUNT_GH_NO_REPO:
+        return None
     repo, flag_host = '', ''
     for i, arg in enumerate(args):
         if arg in ('-R', '--repo') and i + 1 < len(args):
@@ -3994,61 +4019,138 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
             'context': '', 'source': 'command'}
 
 
+def _account_remote_operand(operands: List[str]) -> Optional[str]:
+    """The last [user@]host: operand, which is where a copy goes; None for an rsync daemon or only local paths."""
+    for arg in reversed(operands):
+        if arg.startswith('rsync://') or '::' in arg:
+            return None
+        match = re.match(r'^((?:[^@/:]+@)?\[?[^/:\]]+\]?):', arg)
+        if match and not re.match(r'^[A-Za-z]:\\', arg):
+            return match.group(1)
+    return None
+
+
+def _account_rsync_destination(args: List[str]) -> tuple:
+    """(destination, ssh identity options) for rsync: the last remote operand, reached through its remote shell."""
+    shell, operands, i = None, [], 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--rsh' and i + 1 < len(args):
+            shell, i = args[i + 1], i + 2
+            continue
+        if arg.startswith('--rsh='):
+            shell = arg.split('=', 1)[1]
+        elif arg.startswith('-') and not arg.startswith('--') and 'e' in arg[1:]:
+            rest = arg[arg.index('e', 1) + 1:]
+            if rest:
+                shell = rest
+            elif i + 1 < len(args):
+                shell, i = args[i + 1], i + 1
+        elif arg in _ACCOUNT_RSYNC_VALUE_OPTIONS:
+            i += 1
+        elif not arg.startswith('-'):
+            operands.append(arg)
+        i += 1
+    passthrough = []
+    if shell is not None:
+        try:
+            shell_argv = shlex.split(shell)
+        except ValueError:
+            return None, []
+        # A remote shell other than ssh never reads the ssh config.
+        if not shell_argv or os.path.basename(shell_argv[0]) != 'ssh':
+            return None, []
+        passthrough = _account_ssh_destination('ssh', shell_argv[1:] + ['-'])[1]
+    destination = _account_remote_operand(operands)
+    return (destination, passthrough) if destination else (None, [])
+
+
 def _account_ssh_destination(program: str, args: List[str]) -> tuple:
     """(destination, identity options to pass to ssh -G) for ssh, scp, sftp or rsync; (None, []) when there is none."""
-    passthrough, positional, i = [], [], 0
+    if program == 'rsync':
+        return _account_rsync_destination(args)
+    passthrough, operands, i = [], [], 0
     value_flags = _ACCOUNT_SSH_VALUE_FLAGS.get(program, frozenset())
     # Only the options that change which host or user ssh -G resolves are passed through; scp's -l is a bandwidth limit.
     identity_flags = ('l', 'o', 'F', 'J', 'p') if program == 'ssh' else ('o', 'F', 'J', 'P')
     while i < len(args):
         arg = args[i]
-        if program == 'rsync':
-            if arg in ('-e', '--rsh'):
-                i += 2
-                continue
-            if not arg.startswith('-'):
-                positional.append(arg)
-            i += 1
-            continue
-        if arg.startswith('-') and len(arg) >= 2 and arg != '--':
-            flag, attached = arg[1], arg[2:]
-            takes_value = flag in value_flags
-            value = attached if attached else (args[i + 1] if takes_value and i + 1 < len(args) else None)
-            if takes_value and value is not None and flag in identity_flags:
-                passthrough += ['-p' if flag == 'P' else '-' + flag, value]
-            i += 1 if (attached or not takes_value) else 2
-            continue
-        positional.append(arg)
         i += 1
+        # Options end at the first operand: what follows an ssh destination is the remote command.
+        if operands or not arg.startswith('-') or arg == '-':
+            operands.append(arg)
+            continue
+        if arg == '--':
+            operands.extend(args[i:])
+            break
+        # Walk a cluster such as -vF: the first option that takes a value takes the rest of it, or the next word.
+        for j, flag in enumerate(arg[1:], start=2):
+            if flag not in value_flags:
+                continue
+            value = arg[j:]
+            if not value and i < len(args):
+                value, i = args[i], i + 1
+            option = re.split(r'[\s=]', value.strip(), maxsplit=1)[0].lower()
+            if value and flag in identity_flags and (flag != 'o' or option in _ACCOUNT_SSH_IDENTITY_OPTIONS):
+                passthrough += ['-p' if flag == 'P' else '-' + flag, value]
+            break
     if program == 'ssh':
-        return (positional[0], passthrough) if positional else (None, [])
-    # The last remote operand is where the copy goes.
-    for arg in reversed(positional):
-        if arg.startswith('rsync://') or '::' in arg:
-            return None, []
-        match = re.match(r'^((?:[^@/:]+@)?\[?[^/:\]]+\]?):', arg)
-        if match and not re.match(r'^[A-Za-z]:\\', arg):
-            return match.group(1), passthrough
+        return (operands[0], passthrough) if operands else (None, [])
+    destination = _account_remote_operand(operands)
+    if destination:
+        return destination, passthrough
     # sftp also takes a plain [user@]host with no path.
-    if program == 'sftp' and positional and re.match(r'^(?:[^@/:]+@)?\[?[^/:\]]+\]?$', positional[0]):
-        return positional[0], passthrough
+    if program == 'sftp' and operands and re.match(r'^(?:[^@/:]+@)?\[?[^/:\]]+\]?$', operands[0]):
+        return operands[0], passthrough
     return None, []
 
 
 def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]) -> bool:
-    """Whether the ssh config that ssh -G would read has a Match exec, which ssh runs while resolving."""
-    path = '~/.ssh/config'
+    """Whether ssh -G could run a command while reading its configs: a Match exec anywhere, or a file it can't check."""
+    import glob
+    import stat
+    home_ssh = os.path.expanduser('~/.ssh')
+    config = None
     for flag, value in zip(passthrough[::2], passthrough[1::2]):
         if flag == '-F':
-            path = value
-    path = os.path.expanduser(path)
-    if not os.path.isabs(path):
-        path = os.path.join(cwd or '', path)
-    try:
-        with open(path, errors='ignore') as config:
-            return any(re.match(r'\s*match\b.*\bexec\b', line, re.IGNORECASE) for line in config)
-    except OSError:
+            config = os.path.expanduser(value)
+    if config == 'none':
         return False
+    if config is None:
+        pending = [(os.path.join(home_ssh, 'config'), home_ssh), ('/etc/ssh/ssh_config', '/etc/ssh')]
+    elif os.path.isabs(config) or cwd:
+        pending = [(os.path.join(cwd or '', config), home_ssh)]
+    else:
+        return True
+    seen = set()
+    while pending:
+        path, base = pending.pop()
+        if path in seen:
+            continue
+        seen.add(path)
+        try:
+            info = os.stat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+        # Only small regular files are read, so a fifo or a huge file can't hold up the turn.
+        if len(seen) > _ACCOUNT_SSH_CONFIG_MAX_FILES or not stat.S_ISREG(info.st_mode) or \
+                info.st_size > _ACCOUNT_SSH_CONFIG_MAX_BYTES:
+            return True
+        try:
+            with open(path, errors='ignore') as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return True
+        for line in lines:
+            if re.match(r'\s*match\b.*\bexec\b', line, re.IGNORECASE):
+                return True
+            include = re.match(r'\s*include\s*[=\s]\s*(.+)', line, re.IGNORECASE)
+            for pattern in (include.group(1).split() if include else []):
+                pattern = os.path.expanduser(pattern.strip('"'))
+                pending += [(found, base) for found in sorted(glob.glob(os.path.join(base, pattern)))]
+    return False
 
 
 def _account_ssh(program: str, args: List[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
