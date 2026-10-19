@@ -5636,6 +5636,7 @@ def _account_segments(command: str) -> List[List[str]]:
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
         lexer.whitespace_split = True
+        lexer.whitespace = ' \t\r'
         segments, current = [], []
         for token in lexer:
             if token and set(token) <= set(';&|\n'):
@@ -5722,8 +5723,22 @@ def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dic
             rest.pop(0)
     if not rest or rest[0] != 'push':
         return None
-    positional = [a for a in rest[1:] if not a.startswith('-')]
-    target = positional[0] if positional else None
+    target, positional, push_args, i = None, [], rest[1:], 0
+    while i < len(push_args):
+        arg = push_args[i]
+        if arg in ('-o', '--push-option', '--receive-pack', '--exec'):
+            i += 2
+            continue
+        if arg == '--repo' and i + 1 < len(push_args):
+            target = push_args[i + 1]
+            i += 2
+            continue
+        if arg.startswith('--repo='):
+            target = arg.split('=', 1)[1]
+        elif not arg.startswith('-'):
+            positional.append(arg)
+        i += 1
+    target = target or (positional[0] if positional else None)
     base = ['git', '-C', git_dir or '.']
     if target and re.search(r'://|^[^/:]+@[^/:]+:|^[^/:]+:[^/]', target):
         url, remote = target, ''
@@ -5777,28 +5792,29 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 
 
 def _account_ssh_destination(program: str, args: List[str]) -> tuple:
-    """(destination, ssh options to pass through) for ssh, scp, sftp or rsync; (None, []) when there is none."""
+    """(destination, identity options to pass to ssh -G) for ssh, scp, sftp or rsync; (None, []) when there is none."""
     passthrough, positional, i = [], [], 0
+    port_flag = 'p' if program == 'ssh' else 'P'
     while i < len(args):
         arg = args[i]
         if program == 'rsync':
-            if arg in ('-e', '--rsh') or arg.startswith('--rsh='):
-                i += 1 if arg.startswith('--rsh=') else 2
-                continue
-            if arg.startswith('-'):
-                i += 1
-                continue
-            positional.append(arg)
-        elif arg.startswith('-') and len(arg) >= 2:
-            flag = arg[1]
-            if flag in _ACCOUNT_SSH_VALUE_FLAGS and len(arg) == 2 and i + 1 < len(args):
-                value = args[i + 1]
-                if flag in 'lF' or (flag == 'p' and program == 'ssh') or (flag == 'P' and program != 'ssh'):
-                    passthrough += ['-p' if flag == 'P' else '-' + flag, value]
+            if arg in ('-e', '--rsh'):
                 i += 2
                 continue
-        else:
-            positional.append(arg)
+            if not arg.startswith('-'):
+                positional.append(arg)
+            i += 1
+            continue
+        if arg.startswith('-') and len(arg) >= 2 and arg != '--':
+            flag, attached = arg[1], arg[2:]
+            takes_value = flag in _ACCOUNT_SSH_VALUE_FLAGS
+            value = attached if attached else (args[i + 1] if takes_value and i + 1 < len(args) else None)
+            # Only the options that change which host or user ssh -G resolves are passed through.
+            if takes_value and value is not None and flag in ('l', 'o', 'F', 'J', port_flag):
+                passthrough += ['-p' if flag == port_flag else '-' + flag, value]
+            i += 1 if (attached or not takes_value) else 2
+            continue
+        positional.append(arg)
         i += 1
     if program == 'ssh':
         return (positional[0], passthrough) if positional else (None, [])
@@ -5808,6 +5824,9 @@ def _account_ssh_destination(program: str, args: List[str]) -> tuple:
         match = re.match(r'^((?:[^@/:]+@)?\[?[^/:\]]+\]?):', arg)
         if match and not re.match(r'^[A-Za-z]:\\', arg):
             return match.group(1), passthrough
+    # sftp also takes a plain [user@]host with no path.
+    if program == 'sftp' and positional and re.match(r'^(?:[^@/:]+@)?\[?[^/:\]]+\]?$', positional[0]):
+        return positional[0], passthrough
     return None, []
 
 
@@ -5841,6 +5860,11 @@ def _destination_account(command: Optional[str], cwd: Optional[str], state: Dict
         for argv in _account_segments(command):
             program, args, env = _account_program(argv)
             account = None
+            if program == 'cd':
+                # Later segments run in the folder this one moves to.
+                target = os.path.expanduser(args[0]) if args else os.path.expanduser('~')
+                cwd = target if os.path.isabs(target) else os.path.normpath(os.path.join(cwd or '', target))
+                continue
             if program == 'git':
                 account = _account_git_push(args, env, cwd, state)
             elif program == 'gh':
@@ -5890,6 +5914,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             'output': result_content or '',
         }
         candidates = []
+        start_dir = shell_state.get('dir')
         if isinstance(command, str):
             candidates.extend(p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p))
             candidates.extend(_git_path_opt_targets(command, shell_state.get('dir')))
@@ -5897,7 +5922,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         if not candidates and shell_state.get('dir'):
             candidates.append(shell_state['dir'])
         project = _project_for_paths(candidates, root_projects)
-        account = _destination_account(command, shell_state.get('dir'), shell_state.setdefault('accounts', {}))
+        account = _destination_account(command, start_dir, shell_state.setdefault('accounts', {}))
     elif name in READ_TOOLS:
         file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {

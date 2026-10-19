@@ -143,6 +143,34 @@ class DestinationAccountTests(unittest.TestCase):
                     self.assertEqual(account, {'platform': 'ssh', 'host': '10.0.4.12:2222', 'user': 'deploy',
                                                'context': 'prod-bastion', 'source': 'command'})
 
+    def test_newlines_separate_commands_and_push_options_are_not_taken_for_the_remote(self):
+        repo = _repo({'personal': 'https://github.com/jdoe-dev/app.git'})
+        for command in ('echo ready\ngit push personal main', 'git push -o ci.skip personal main',
+                        'git push --push-option=ci.skip --repo personal'):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['account'], account['context']), ('jdoe-dev', 'personal'))
+
+    def test_each_segment_resolves_in_the_folder_it_runs_in(self):
+        mine = _repo({'origin': 'https://github.com/jdoe-dev/app.git'})
+        other = _repo({'origin': 'https://github.com/acme/other.git'})
+        for command, cwd in ((f'git push origin main; cd {other}', mine),
+                             (f'cd {mine} && git push origin main', other)):
+            for hook, account in self._each(command, cwd):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account['account'], 'jdoe-dev')
+
+    def test_ssh_options_that_change_the_host_or_user_and_plain_sftp_are_honoured(self):
+        cases = {
+            f'ssh -F {self.ssh_config} -o HostName=10.9.9.9 -o User=ops -p2200 prod-bastion': ('10.9.9.9:2200', 'ops'),
+            f'ssh -F{self.ssh_config} -lops prod-bastion': ('10.0.4.12:2222', 'ops'),
+            f'sftp -F {self.ssh_config} deploy2@prod-bastion': ('10.0.4.12:2222', 'deploy2'),
+        }
+        for command, expected in cases.items():
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['user']), expected)
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:
