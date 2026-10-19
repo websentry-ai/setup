@@ -1847,6 +1847,7 @@ function createTurnStore() {
 var turnStore = createTurnStore();
 
 // packages/core/src/destinationAccount.ts
+import { readFileSync as readFileSync3 } from "node:fs";
 import { isAbsolute as isAbsolute3, join as join5, normalize, basename } from "node:path";
 import { homedir } from "node:os";
 var ALLOWED_RUNS = [
@@ -1861,9 +1862,10 @@ var TURN_BUDGET_MS = 1e4;
 var MAX_OUTPUT_BYTES = 64 * 1024;
 var WRAPPERS = /* @__PURE__ */ new Set(["sudo", "env", "command", "exec", "time", "nohup"]);
 var SSH_TOOLS = /* @__PURE__ */ new Set(["ssh", "scp", "sftp", "rsync"]);
-var SSH_VALUE_FLAGS = "bcDEeFIiJLlmOoPpQRSWw";
+var SSH_VALUE_FLAGS = { ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX" };
 var GH_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
+var NEVER_RAN = /* @__PURE__ */ new Set(["deny", "unavailable"]);
 function stripGitDir(argv) {
   return argv.length >= 3 && argv[0] === "git" && argv[1] === "-C" ? [argv[0], ...argv.slice(3)] : argv;
 }
@@ -1907,6 +1909,10 @@ function segments(command) {
     if (ch === "'" || ch === '"') {
       quote = ch;
       inWord = true;
+    } else if (ch === "\\" && command[i + 1] === "\n") {
+      i++;
+    } else if (ch === "#" && !inWord) {
+      while (i + 1 < command.length && command[i + 1] !== "\n") i++;
     } else if (ch === "\\" && i + 1 < command.length) {
       word += command[++i];
       inWord = true;
@@ -1972,8 +1978,8 @@ async function gitPush(args, env, cwd, state) {
   while (rest.length > 0 && rest[0].startsWith("-")) {
     const flag = rest.shift();
     if (flag === "-C" && rest.length > 0) {
-      const path = rest.shift();
-      gitDir = isAbsolute3(path) ? path : join5(gitDir ?? process.cwd(), path);
+      const path = expandHome(rest.shift());
+      gitDir = isAbsolute3(path) ? path : gitDir === void 0 ? void 0 : join5(gitDir, path);
     } else if (["-c", "--git-dir", "--work-tree", "--namespace"].includes(flag) && rest.length > 0) {
       rest.shift();
     }
@@ -2000,6 +2006,8 @@ async function gitPush(args, env, cwd, state) {
   let remote = "";
   if (target !== void 0 && /:\/\/|^[^/:]+@[^/:]+:|^[^/:]+:[^/]/.test(target)) {
     url = target;
+  } else if (gitDir === void 0) {
+    return { platform: "git", source: "unknown" };
   } else {
     remote = target ?? "";
     if (remote === "") {
@@ -2018,7 +2026,7 @@ async function gitPush(args, env, cwd, state) {
   return { platform: platformForHost(host), host, account: owner, user, context: remote, source: "command" };
 }
 async function gh(args, env, cwd, state) {
-  let repo = env.GH_REPO ?? state.env.GH_REPO ?? "";
+  let repo = "";
   let flagHost = "";
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
@@ -2030,19 +2038,31 @@ async function gh(args, env, cwd, state) {
   if (repo === "" && args[0] === "repo" && third !== void 0 && !third.startsWith("-") && third.includes("/")) {
     repo = third;
   }
+  let lookupDir = cwd;
+  if (repo === "" && args[0] === "api") {
+    const named = args.slice(1).map((a) => /^\/?repos\/([^/{}]+\/[^/{}]+)/.exec(a)).find((m) => m !== null);
+    if (named) repo = named[1];
+    else if (!args.some((a) => a.includes("{owner}") || a.includes("{repo}"))) lookupDir = void 0;
+  }
+  repo = repo || env.GH_REPO || state.env.GH_REPO || "";
   const envHost = (env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase();
   let host = "";
   let owner = "";
   if (repo !== "") {
-    const parts = repo.replace(/^[a-z]+:\/\//, "").split("/").filter(Boolean);
-    if (parts.length >= 3) {
-      host = parts[0].toLowerCase();
-      owner = parts[1];
+    repo = repo.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/@]*@/, "$1");
+    if (repo.includes(":")) {
+      ({ host, owner } = remoteParts(repo));
     } else {
-      owner = parts[0] ?? "";
+      const parts = repo.split("/").filter(Boolean);
+      if (parts.length >= 3) {
+        host = parts[0].toLowerCase();
+        owner = parts[1];
+      } else {
+        owner = parts[0] ?? "";
+      }
     }
-  } else if (cwd !== void 0) {
-    const url = firstLine(await run(["git", "-C", cwd, "remote", "get-url", "--push", "origin"], state));
+  } else if (lookupDir !== void 0) {
+    const url = firstLine(await run(["git", "-C", lookupDir, "remote", "get-url", "--push", "origin"], state));
     if (url !== "") ({ host, owner } = remoteParts(url));
   }
   host = flagHost || host || envHost || "github.com";
@@ -2051,7 +2071,8 @@ async function gh(args, env, cwd, state) {
 function sshDestination(name, args) {
   const passthrough = [];
   const positional = [];
-  const portFlag = name === "ssh" ? "p" : "P";
+  const valueFlags = SSH_VALUE_FLAGS[name] ?? "";
+  const identityFlags = name === "ssh" ? ["l", "o", "F", "J", "p"] : ["o", "F", "J", "P"];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (name === "rsync") {
@@ -2062,10 +2083,10 @@ function sshDestination(name, args) {
     if (arg.startsWith("-") && arg.length >= 2 && arg !== "--") {
       const flag = arg[1];
       const attached = arg.slice(2);
-      const takesValue = SSH_VALUE_FLAGS.includes(flag);
+      const takesValue = valueFlags.includes(flag);
       const value = attached !== "" ? attached : takesValue ? args[i + 1] : void 0;
-      if (takesValue && value !== void 0 && ["l", "o", "F", "J", portFlag].includes(flag)) {
-        passthrough.push(flag === portFlag ? "-p" : `-${flag}`, value);
+      if (takesValue && value !== void 0 && identityFlags.includes(flag)) {
+        passthrough.push(flag === "P" ? "-p" : `-${flag}`, value);
       }
       if (attached === "" && takesValue) i++;
       continue;
@@ -2073,7 +2094,7 @@ function sshDestination(name, args) {
     positional.push(arg);
   }
   if (name === "ssh") return positional[0] === void 0 ? { passthrough: [] } : { destination: positional[0], passthrough };
-  for (const arg of positional) {
+  for (const arg of [...positional].reverse()) {
     if (arg.startsWith("rsync://") || arg.includes("::")) return { passthrough: [] };
     const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
     if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return { destination: match[1], passthrough };
@@ -2084,9 +2105,26 @@ function sshDestination(name, args) {
   }
   return { passthrough: [] };
 }
-async function ssh(name, args, state) {
+function expandHome(path) {
+  return path === "~" || path.startsWith("~/") ? join5(homedir(), path.slice(1)) : path;
+}
+function configRunsCommands(passthrough) {
+  let path = "~/.ssh/config";
+  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") path = passthrough[i + 1];
+  try {
+    return /^\s*match\b.*\bexec\b/im.test(readFileSync3(expandHome(path), "utf8"));
+  } catch {
+    return false;
+  }
+}
+async function ssh(name, args, dir, state) {
   const { destination, passthrough } = sshDestination(name, args);
   if (destination === void 0) return void 0;
+  for (let i = 0; i + 1 < passthrough.length; i += 2) {
+    const value = expandHome(passthrough[i + 1]);
+    if (passthrough[i] === "-F" && !isAbsolute3(value) && value !== "none") passthrough[i + 1] = join5(dir ?? "", value);
+  }
+  if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
   const out = await run(["ssh", "-G", ...passthrough, destination], state);
   if (out === void 0) return { platform: "ssh", source: "unknown" };
   const settings = /* @__PURE__ */ new Map();
@@ -2117,21 +2155,23 @@ function compact(account) {
 }
 async function resolveOne(command, cwd, state) {
   let dir = cwd;
+  let unresolved;
   for (const argv of segments(command)) {
     const { name, args, env } = program(argv);
     let account;
     if (name === "cd") {
-      const raw = args[0] ?? "~";
-      const target = raw.startsWith("~") ? join5(homedir(), raw.slice(1)) : raw;
+      const target = expandHome(args[0] ?? "~");
       dir = isAbsolute3(target) ? target : normalize(join5(dir ?? "", target));
       continue;
     }
     if (name === "git") account = await gitPush(args, env, dir, state);
     else if (name === "gh") account = await gh(args, env, dir, state);
-    else if (name !== void 0 && SSH_TOOLS.has(name)) account = await ssh(name, args, state);
-    if (account !== void 0) return compact(account);
+    else if (name !== void 0 && SSH_TOOLS.has(name)) account = await ssh(name, args, dir, state);
+    if (account === void 0) continue;
+    if (account.source !== "unknown") return compact(account);
+    unresolved ??= compact(account);
   }
-  return void 0;
+  return unresolved;
 }
 async function resolveDestinationAccounts(calls, cwd, opts = {}) {
   const accounts = /* @__PURE__ */ new Map();
@@ -2148,6 +2188,7 @@ async function resolveDestinationAccounts(calls, cwd, opts = {}) {
       const input = call.tool_input;
       const command = input !== null && typeof input === "object" && !Array.isArray(input) ? input.command : void 0;
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
+      if (typeof call.decision === "string" && NEVER_RAN.has(call.decision)) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
       const account = await resolveOne(command, cwd, state);
       if (account !== void 0) accounts.set(call.tool_use_id, account);

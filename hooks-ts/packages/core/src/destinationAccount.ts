@@ -1,4 +1,4 @@
-// Destination account — which account a shell call reached (WEB-6171 catalog), identity fields only.
+// Destination account — which account a shell call reached, identity fields only.
 // Parity with the Python hooks' `_destination_account` block: the same platforms (git push, gh, the ssh
 // family), the same allowlisted local lookups, the same wire object on each `tool_use` entry.
 //
@@ -6,6 +6,7 @@
 // a command that reaches no account is `undefined`. Every lookup has a deadline and the turn shares one
 // budget, so the turn log is never held up for long.
 
+import { readFileSync } from "node:fs";
 import { isAbsolute, join, normalize, basename } from "node:path";
 import { homedir } from "node:os";
 
@@ -33,9 +34,12 @@ const TURN_BUDGET_MS = 10_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const WRAPPERS: ReadonlySet<string> = new Set(["sudo", "env", "command", "exec", "time", "nohup"]);
 const SSH_TOOLS: ReadonlySet<string> = new Set(["ssh", "scp", "sftp", "rsync"]);
-const SSH_VALUE_FLAGS = "bcDEeFIiJLlmOoPpQRSWw";
+/** Options that take a value, per program; every other option is a switch. */
+const SSH_VALUE_FLAGS: Record<string, string> = { ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX" };
 const GH_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 const SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "powershell"]);
+/** Policy outcomes under which the call never ran, so there is nothing to resolve. */
+const NEVER_RAN: ReadonlySet<string> = new Set(["deny", "unavailable"]);
 
 export interface ResolveOptions {
   execFile?: ExecFileLike;
@@ -97,6 +101,10 @@ export function segments(command: string): string[][] {
     if (ch === "'" || ch === '"') {
       quote = ch;
       inWord = true;
+    } else if (ch === "\\" && command[i + 1] === "\n") {
+      i++; // a backslash-newline continues the line
+    } else if (ch === "#" && !inWord) {
+      while (i + 1 < command.length && command[i + 1] !== "\n") i++; // a comment runs to the end of its line
     } else if (ch === "\\" && i + 1 < command.length) {
       word += command[++i];
       inWord = true;
@@ -172,8 +180,8 @@ async function gitPush(
   while (rest.length > 0 && (rest[0] as string).startsWith("-")) {
     const flag = rest.shift() as string;
     if (flag === "-C" && rest.length > 0) {
-      const path = rest.shift() as string;
-      gitDir = isAbsolute(path) ? path : join(gitDir ?? process.cwd(), path);
+      const path = expandHome(rest.shift() as string);
+      gitDir = isAbsolute(path) ? path : gitDir === undefined ? undefined : join(gitDir, path);
     } else if (["-c", "--git-dir", "--work-tree", "--namespace"].includes(flag) && rest.length > 0) {
       rest.shift();
     }
@@ -200,6 +208,9 @@ async function gitPush(
   let remote = "";
   if (target !== undefined && /:\/\/|^[^/:]+@[^/:]+:|^[^/:]+:[^/]/.test(target)) {
     url = target;
+  } else if (gitDir === undefined) {
+    // Without the folder the push ran in, its remotes can't be read.
+    return { platform: "git", source: "unknown" };
   } else {
     remote = target ?? "";
     if (remote === "") {
@@ -224,7 +235,7 @@ async function gitPush(
 async function gh(
   args: string[], env: Record<string, string>, cwd: string | undefined, state: State,
 ): Promise<DestinationAccount> {
-  let repo = env.GH_REPO ?? state.env.GH_REPO ?? "";
+  let repo = "";
   let flagHost = "";
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string;
@@ -232,23 +243,36 @@ async function gh(
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
     else if (arg === "--hostname" && i + 1 < args.length) flagHost = (args[i + 1] as string).toLowerCase();
   }
+  // `gh repo view|clone|fork|… OWNER/REPO` and `gh api repos/OWNER/REPO/…` name the repository themselves.
   const third = args[2];
   if (repo === "" && args[0] === "repo" && third !== undefined && !third.startsWith("-") && third.includes("/")) {
     repo = third;
   }
+  let lookupDir = cwd;
+  if (repo === "" && args[0] === "api") {
+    const named = args.slice(1).map((a) => /^\/?repos\/([^/{}]+\/[^/{}]+)/.exec(a)).find((m) => m !== null);
+    if (named) repo = named[1] as string;
+    else if (!args.some((a) => a.includes("{owner}") || a.includes("{repo}"))) lookupDir = undefined;
+  }
+  repo = repo || env.GH_REPO || state.env.GH_REPO || "";
   const envHost = (env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase();
   let host = "";
   let owner = "";
   if (repo !== "") {
-    const parts = repo.replace(/^[a-z]+:\/\//, "").split("/").filter(Boolean);
-    if (parts.length >= 3) {
-      host = (parts[0] as string).toLowerCase();
-      owner = parts[1] as string;
+    repo = repo.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/@]*@/, "$1"); // never keep a login or token
+    if (repo.includes(":")) {
+      ({ host, owner } = remoteParts(repo));
     } else {
-      owner = parts[0] ?? "";
+      const parts = repo.split("/").filter(Boolean);
+      if (parts.length >= 3) {
+        host = (parts[0] as string).toLowerCase();
+        owner = parts[1] as string;
+      } else {
+        owner = parts[0] ?? "";
+      }
     }
-  } else if (cwd !== undefined) {
-    const url = firstLine(await run(["git", "-C", cwd, "remote", "get-url", "--push", "origin"], state));
+  } else if (lookupDir !== undefined) {
+    const url = firstLine(await run(["git", "-C", lookupDir, "remote", "get-url", "--push", "origin"], state));
     if (url !== "") ({ host, owner } = remoteParts(url));
   }
   host = flagHost || host || envHost || "github.com";
@@ -258,7 +282,9 @@ async function gh(
 function sshDestination(name: string, args: string[]): { destination?: string; passthrough: string[] } {
   const passthrough: string[] = [];
   const positional: string[] = [];
-  const portFlag = name === "ssh" ? "p" : "P";
+  const valueFlags = SSH_VALUE_FLAGS[name] ?? "";
+  // Only the options that change which host or user ssh -G resolves are passed through; scp's -l is a bandwidth limit.
+  const identityFlags = name === "ssh" ? ["l", "o", "F", "J", "p"] : ["o", "F", "J", "P"];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string;
     if (name === "rsync") {
@@ -269,10 +295,10 @@ function sshDestination(name: string, args: string[]): { destination?: string; p
     if (arg.startsWith("-") && arg.length >= 2 && arg !== "--") {
       const flag = arg[1] as string;
       const attached = arg.slice(2);
-      const takesValue = SSH_VALUE_FLAGS.includes(flag);
+      const takesValue = valueFlags.includes(flag);
       const value = attached !== "" ? attached : takesValue ? args[i + 1] : undefined;
-      if (takesValue && value !== undefined && ["l", "o", "F", "J", portFlag].includes(flag)) {
-        passthrough.push(flag === portFlag ? "-p" : `-${flag}`, value);
+      if (takesValue && value !== undefined && identityFlags.includes(flag)) {
+        passthrough.push(flag === "P" ? "-p" : `-${flag}`, value);
       }
       if (attached === "" && takesValue) i++;
       continue;
@@ -280,7 +306,8 @@ function sshDestination(name: string, args: string[]): { destination?: string; p
     positional.push(arg);
   }
   if (name === "ssh") return positional[0] === undefined ? { passthrough: [] } : { destination: positional[0], passthrough };
-  for (const arg of positional) {
+  // The last remote operand is where the copy goes.
+  for (const arg of [...positional].reverse()) {
     if (arg.startsWith("rsync://") || arg.includes("::")) return { passthrough: [] };
     const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
     if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return { destination: match[1], passthrough };
@@ -292,9 +319,30 @@ function sshDestination(name: string, args: string[]): { destination?: string; p
   return { passthrough: [] };
 }
 
-async function ssh(name: string, args: string[], state: State): Promise<DestinationAccount | undefined> {
+function expandHome(path: string): string {
+  return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
+}
+
+/** Whether the ssh config that ssh -G would read has a Match exec, which ssh runs while resolving. */
+function configRunsCommands(passthrough: readonly string[]): boolean {
+  let path = "~/.ssh/config";
+  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") path = passthrough[i + 1] as string;
+  try {
+    return /^\s*match\b.*\bexec\b/im.test(readFileSync(expandHome(path), "utf8"));
+  } catch {
+    return false;
+  }
+}
+
+async function ssh(name: string, args: string[], dir: string | undefined, state: State): Promise<DestinationAccount | undefined> {
   const { destination, passthrough } = sshDestination(name, args);
   if (destination === undefined) return undefined;
+  // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
+  for (let i = 0; i + 1 < passthrough.length; i += 2) {
+    const value = expandHome(passthrough[i + 1] as string);
+    if (passthrough[i] === "-F" && !isAbsolute(value) && value !== "none") passthrough[i + 1] = join(dir ?? "", value);
+  }
+  if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
   const out = await run(["ssh", "-G", ...passthrough, destination], state);
   if (out === undefined) return { platform: "ssh", source: "unknown" };
   const settings = new Map<string, string>();
@@ -328,28 +376,31 @@ function compact(account: DestinationAccount): DestinationAccount {
 
 async function resolveOne(command: string, cwd: string | undefined, state: State): Promise<DestinationAccount | undefined> {
   let dir = cwd;
+  let unresolved: DestinationAccount | undefined;
   for (const argv of segments(command)) {
     const { name, args, env } = program(argv);
     let account: DestinationAccount | undefined;
     if (name === "cd") {
       // Later segments run in the folder this one moves to.
-      const raw = args[0] ?? "~";
-      const target = raw.startsWith("~") ? join(homedir(), raw.slice(1)) : raw;
+      const target = expandHome(args[0] ?? "~");
       dir = isAbsolute(target) ? target : normalize(join(dir ?? "", target));
       continue;
     }
     if (name === "git") account = await gitPush(args, env, dir, state);
     else if (name === "gh") account = await gh(args, env, dir, state);
-    else if (name !== undefined && SSH_TOOLS.has(name)) account = await ssh(name, args, state);
-    if (account !== undefined) return compact(account);
+    else if (name !== undefined && SSH_TOOLS.has(name)) account = await ssh(name, args, dir, state);
+    if (account === undefined) continue;
+    if (account.source !== "unknown") return compact(account);
+    unresolved ??= compact(account);
   }
-  return undefined;
+  return unresolved;
 }
 
 export interface ShellCall {
   tool_name?: unknown;
   tool_use_id?: unknown;
   tool_input?: unknown;
+  decision?: unknown;
 }
 
 /** The account each shell call of a turn reached, keyed by `tool_use_id`; each call starts in `cwd`. Never rejects. */
@@ -373,6 +424,7 @@ export async function resolveDestinationAccounts(
           ? (input as Record<string, unknown>).command
           : undefined;
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
+      if (typeof call.decision === "string" && NEVER_RAN.has(call.decision)) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
       const account = await resolveOne(command, cwd, state);
       if (account !== undefined) accounts.set(call.tool_use_id, account);

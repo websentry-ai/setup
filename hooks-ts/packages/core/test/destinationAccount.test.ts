@@ -3,9 +3,9 @@
 
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import { resolveDestinationAccounts, type DestinationAccount } from "../src/destinationAccount.ts";
@@ -114,4 +114,82 @@ test("only shell calls are resolved", async () => {
     [{ tool_name: "read", tool_use_id: "c1", tool_input: { command: "ssh prod-bastion" } }], undefined, { env: NO_GH },
   );
   assert.equal(accounts.size, 0);
+});
+
+test("a gh repo URL never carries its login or token", async () => {
+  for (const command of [
+    `gh pr create -R https://jdoe:${FAKE_TOKEN}@github.com/acme/app --fill`,
+    `GH_REPO=https://jdoe:${FAKE_TOKEN}@github.com/acme/app gh repo view`,
+  ]) {
+    const account = await resolve(command);
+    assert.deepEqual([account?.host, account?.account], ["github.com", "acme"], command);
+    assert.ok(!JSON.stringify(account).toLowerCase().includes(FAKE_TOKEN.toLowerCase()), command);
+  }
+});
+
+test("gh names the repo the command reaches", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  const cases: [string, string | undefined][] = [
+    ["GH_REPO=acme/app gh repo view other-org/other-repo", "other-org"],
+    ["gh api repos/other-org/svc/pulls", "other-org"],
+    ["gh api repos/{owner}/{repo}/pulls", "acme"],
+    ["gh api user", undefined],
+  ];
+  for (const [command, owner] of cases) assert.equal((await resolve(command, dir))?.account, owner, command);
+});
+
+test("comments, line continuations and a failed earlier lookup keep the push", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git", personal: "https://github.com/jdoe-dev/app.git" });
+  for (const [command, cwd] of [
+    [`cd ${dir} # into the repo; git push origin\ngit push personal main`, "/"],
+    ["git push \\\n  personal main", dir],
+    ["git push missing main; git push personal main", dir],
+  ] as const) {
+    assert.equal((await resolve(command, cwd))?.account, "jdoe-dev", command);
+  }
+});
+
+test("a push with no known folder is unknown rather than the hook's own", async () => {
+  assert.deepEqual(await resolve("git push origin main"), { platform: "git", source: "unknown" });
+});
+
+test("scp switches and bandwidth limits are not read as values or logins, and the destination wins", async () => {
+  for (const command of [
+    `scp -p -F ${sshConfig} prod-bastion:/var/log/app.log .`,
+    `scp -l 8192 -F ${sshConfig} dump.sql prod-bastion:/tmp/`,
+    `scp -F ${sshConfig} notes:draft prod-bastion:/tmp/`,
+  ]) {
+    const account = await resolve(command);
+    assert.deepEqual([account?.host, account?.user], ["10.0.4.12:2222", "deploy"], command);
+  }
+});
+
+test("a relative ssh config is read from the folder the command ran in", async () => {
+  const account = await resolve("ssh -F ./config prod-bastion", dirname(sshConfig));
+  assert.deepEqual([account?.host, account?.user], ["10.0.4.12:2222", "deploy"]);
+});
+
+test("an ssh config that runs commands is never read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-exec-"));
+  const marker = join(dir, "ran");
+  const config = join(dir, "config");
+  writeFileSync(config, `Match host * exec "touch ${marker}"\n  HostName 10.9.9.9\n`);
+  assert.deepEqual(await resolve(`ssh -F ${config} prod-bastion`), { platform: "ssh", source: "unknown" });
+  assert.equal(existsSync(marker), false);
+});
+
+test("calls the policy blocked never run a lookup", async () => {
+  const ran: string[][] = [];
+  const execFile = async (file: string, args: readonly string[]) => {
+    ran.push([file, ...args]);
+    return undefined;
+  };
+  const accounts = await resolveDestinationAccounts(
+    ["deny", "unavailable"].map((decision, i) => ({
+      tool_name: "bash", tool_use_id: `c${i}`, decision, tool_input: { command: "ssh prod-bastion" },
+    })),
+    undefined, { execFile, env: NO_GH },
+  );
+  assert.equal(accounts.size, 0);
+  assert.deepEqual(ran, []);
 });
