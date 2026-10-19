@@ -54,7 +54,9 @@ const GH_NO_REPO: ReadonlySet<string> = new Set([
   "auth", "help", "version", "config", "alias", "extension", "completion", "--help", "-h", "--version",
 ]);
 /** Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to. */
-const GIT_OVERRIDE_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+const GIT_OVERRIDE_ENV = [
+  "GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+];
 /** Policy outcomes under which the call never ran, so there is nothing to resolve. */
 const NEVER_RAN: ReadonlySet<string> = new Set(["deny", "unavailable"]);
 
@@ -156,8 +158,9 @@ function program(argv: string[]): { name?: string; args: string[]; env: Record<s
   return { args: [], env };
 }
 
+/** A remote URL with any login removed: everything up to the last @ before the path, with or without a scheme. */
 function stripLogin(url: string): string {
-  return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1");
+  return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/]*@/, "$1");
 }
 
 function remoteParts(raw: string): { host: string; owner: string } {
@@ -166,8 +169,10 @@ function remoteParts(raw: string): { host: string; owner: string } {
     /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/:]+)(?::\d+)?\/(.*)$/.exec(url) ?? /^(?:[^@/:]+@)?([^/:]+):(?!\/\/)(.*)$/.exec(url);
   if (match === null) return { host: "", owner: "" };
   const host = (match[1] ?? "").toLowerCase();
+  if (host.includes("@")) return { host: "", owner: "" };
   const parts = (match[2] ?? "").replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/").filter(Boolean);
-  return { host, owner: parts[0] ?? "" };
+  const owner = parts[0] ?? "";
+  return { host, owner: owner.includes("@") || owner.includes(":") ? "" : owner };
 }
 
 function platformForHost(host: string): string {
@@ -278,7 +283,9 @@ async function gh(
     const arg = args[i] as string;
     if ((arg === "-R" || arg === "--repo") && i + 1 < args.length) repo = args[i + 1] as string;
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
+    else if (arg.startsWith("-R") && !arg.startsWith("--")) repo = arg.slice(2).replace(/^=/, "");
     else if (arg === "--hostname" && i + 1 < args.length) flagHost = (args[i + 1] as string).toLowerCase();
+    else if (arg.startsWith("--hostname=")) flagHost = arg.slice("--hostname=".length).toLowerCase();
   }
   // `gh repo view|clone|fork|… OWNER/REPO` and `gh api repos/OWNER/REPO/…` name the repository themselves.
   const third = args[2];
@@ -467,7 +474,8 @@ function configRunsCommands(passthrough: readonly string[]): boolean {
       const words = segments(line).flat();
       const [first = "", ...rest] = words;
       const [keyword = "", attached = ""] = first.split(/=(.*)/s);
-      const args = attached ? [attached, ...rest] : rest;
+      // ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
+      const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
       if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) {
         return true;
       }

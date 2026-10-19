@@ -302,3 +302,39 @@ test("bracketed IPv6 copy destinations resolve", async () => {
     assert.ok(["2001:db8::1", "2001:db8:0:0:0:0:0:1"].includes(account?.host ?? ""), command);
   }
 });
+
+test("a token in any remote shape never reaches the account", async () => {
+  const dir = repo({ weird: `jdoe:${FAKE_TOKEN}@github.com:acme/app.git`, double: `https://x@${FAKE_TOKEN}@github.com/acme/app.git` });
+  for (const command of ["git push weird main", "git push double main", `git push https://x@${FAKE_TOKEN}@github.com/acme/app.git main`]) {
+    const account = await resolve(command, dir);
+    assert.deepEqual([account?.host, account?.account], ["github.com", "acme"], command);
+    assert.ok(!JSON.stringify(account).toLowerCase().includes(FAKE_TOKEN.toLowerCase()), command);
+  }
+});
+
+test("another global git config and gh flag forms are read", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  for (const command of ["GIT_CONFIG_GLOBAL=/elsewhere/gitconfig git push", "GIT_CONFIG_SYSTEM=/elsewhere/gitconfig git push"]) {
+    assert.deepEqual(await resolve(command, dir), { platform: "git", source: "unknown" }, command);
+  }
+  const cases: [string, string, string][] = [
+    ["gh pr create --hostname=ghe.example.com -R acme/app", "ghe.example.com", "acme"],
+    ["gh pr create -Rother/app", "github.com", "other"],
+    ["gh pr create -R=other/app", "github.com", "other"],
+  ];
+  for (const [command, host, owner] of cases) {
+    const account = await resolve(command, dir);
+    assert.deepEqual([account?.host, account?.account], [host, owner], command);
+  }
+});
+
+test("an equals before an ssh config argument is only a separator", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-equals-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "inner"), `Match exec "touch ${marker}"\n`);
+  for (const body of [`Match =exec "touch ${marker}"`, `Include =${join(dir, "inner")}`]) {
+    writeFileSync(join(dir, "config"), `${body}\nHost prod-bastion\n  HostName 10.0.4.12\n`);
+    assert.deepEqual(await resolve(`ssh -F ${join(dir, "config")} prod-bastion`), { platform: "ssh", source: "unknown" }, body);
+  }
+  assert.equal(existsSync(marker), false);
+});

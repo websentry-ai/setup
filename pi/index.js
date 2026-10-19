@@ -1884,7 +1884,14 @@ var GH_NO_REPO = /* @__PURE__ */ new Set([
   "-h",
   "--version"
 ]);
-var GIT_OVERRIDE_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
+var GIT_OVERRIDE_ENV = [
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_CONFIG_PARAMETERS",
+  "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM"
+];
 var NEVER_RAN = /* @__PURE__ */ new Set(["deny", "unavailable"]);
 function stripGitDir(argv) {
   return argv.length >= 3 && argv[0] === "git" && argv[1] === "-C" ? [argv[0], ...argv.slice(3)] : argv;
@@ -1966,15 +1973,17 @@ function program(argv) {
   return { args: [], env };
 }
 function stripLogin(url) {
-  return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1");
+  return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/]*@/, "$1");
 }
 function remoteParts(raw) {
   const url = stripLogin(raw);
   const match = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/:]+)(?::\d+)?\/(.*)$/.exec(url) ?? /^(?:[^@/:]+@)?([^/:]+):(?!\/\/)(.*)$/.exec(url);
   if (match === null) return { host: "", owner: "" };
   const host = (match[1] ?? "").toLowerCase();
+  if (host.includes("@")) return { host: "", owner: "" };
   const parts = (match[2] ?? "").replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/").filter(Boolean);
-  return { host, owner: parts[0] ?? "" };
+  const owner = parts[0] ?? "";
+  return { host, owner: owner.includes("@") || owner.includes(":") ? "" : owner };
 }
 function platformForHost(host) {
   if (host === "github.com" || host.endsWith(".ghe.com")) return "github";
@@ -2069,7 +2078,9 @@ async function gh(args, env, cwd, state) {
     const arg = args[i];
     if ((arg === "-R" || arg === "--repo") && i + 1 < args.length) repo = args[i + 1];
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
+    else if (arg.startsWith("-R") && !arg.startsWith("--")) repo = arg.slice(2).replace(/^=/, "");
     else if (arg === "--hostname" && i + 1 < args.length) flagHost = args[i + 1].toLowerCase();
+    else if (arg.startsWith("--hostname=")) flagHost = arg.slice("--hostname=".length).toLowerCase();
   }
   const third = args[2];
   if (repo === "" && args[0] === "repo" && third !== void 0 && !third.startsWith("-") && third.includes("/")) {
@@ -2235,7 +2246,7 @@ function configRunsCommands(passthrough) {
       const words = segments(line).flat();
       const [first = "", ...rest] = words;
       const [keyword = "", attached = ""] = first.split(/=(.*)/s);
-      const args = attached ? [attached, ...rest] : rest;
+      const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
       if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) {
         return true;
       }
