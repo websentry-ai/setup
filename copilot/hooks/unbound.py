@@ -5587,6 +5587,274 @@ def _extract_patch_target_path(args):
     return m.group(1).strip() if m else ''
 
 
+# KEEP IN SYNC: destination-account resolution — all 5 hook copies, byte-identical, do not diverge.
+# --- Destination account: which account a shell command reached (WEB-6171 catalog), identity fields only, fail-open ---
+
+# Only these commands are ever run to resolve an account; everything else is refused.
+_ACCOUNT_ALLOWED_RUNS = (
+    ('git', 'remote', 'get-url', '--push'),
+    ('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name'),
+    ('git', 'config', '--get'),
+    ('gh', 'config', 'get', '-h'),
+    ('ssh', '-G'),
+)
+_ACCOUNT_RUN_TIMEOUT = 5
+# Wall-clock budget for all lookups in one turn, so a slow tool never delays the agent.
+_ACCOUNT_TURN_BUDGET = 10.0
+_ACCOUNT_WRAPPERS = frozenset({'sudo', 'env', 'command', 'exec', 'time', 'nohup'})
+_ACCOUNT_SSH_TOOLS = frozenset({'ssh', 'scp', 'sftp', 'rsync'})
+_ACCOUNT_SSH_VALUE_FLAGS = frozenset('bcDEeFIiJLlmOoPpQRSWw')
+_ACCOUNT_GH_HOSTS_ENV = ('GH_HOST',)
+_ACCOUNT_GH_TOKEN_ENV = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
+
+
+def _account_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[str]:
+    """Run one allowlisted identity lookup with a timeout; None when refused, slow, failing or over budget."""
+    try:
+        if not any(tuple(_account_strip_git_dir(argv)[:len(p)]) == p for p in _ACCOUNT_ALLOWED_RUNS):
+            return None
+        deadline = state.setdefault('deadline', time.monotonic() + _ACCOUNT_TURN_BUDGET)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        result = subprocess.run(argv, cwd=cwd if cwd and os.path.isdir(cwd) else None, capture_output=True,
+                                text=True, timeout=min(_ACCOUNT_RUN_TIMEOUT, remaining), stdin=subprocess.DEVNULL)
+        return result.stdout if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _account_strip_git_dir(argv: List[str]) -> List[str]:
+    """argv without git's leading -C <dir>, so the allowlist matches the subcommand."""
+    if len(argv) >= 3 and argv[0] == 'git' and argv[1] == '-C':
+        return [argv[0]] + argv[3:]
+    return argv
+
+
+def _account_segments(command: str) -> List[List[str]]:
+    """The command split into simple commands on ; && || | and newlines, each as argv; [] when it can't be parsed."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
+        lexer.whitespace_split = True
+        segments, current = [], []
+        for token in lexer:
+            if token and set(token) <= set(';&|\n'):
+                if current:
+                    segments.append(current)
+                current = []
+            else:
+                current.append(token)
+        if current:
+            segments.append(current)
+        return segments
+    except Exception:
+        return []
+
+
+def _account_program(argv: List[str]) -> tuple:
+    """(program, its args, inline VAR=value settings) after leading assignments and wrappers like sudo or env."""
+    env, i = {}, 0
+    while i < len(argv):
+        token = argv[i]
+        if '=' in token and not token.startswith('-') and token.split('=', 1)[0].replace('_', '').isalnum():
+            key, value = token.split('=', 1)
+            env[key] = value
+        elif os.path.basename(token) in _ACCOUNT_WRAPPERS:
+            pass
+        elif token.startswith('-') and i > 0 and os.path.basename(argv[i - 1]) in _ACCOUNT_WRAPPERS:
+            pass
+        else:
+            return os.path.basename(token), argv[i + 1:], env
+        i += 1
+    return None, [], env
+
+
+def _account_strip_login(url: str) -> str:
+    """A remote URL with any user:password@ removed."""
+    return re.sub(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@', r'\1', url.strip())
+
+
+def _account_remote_parts(url: str) -> tuple:
+    """(host, owner, repo) from an https or scp-style git remote; empty strings for what it doesn't name."""
+    url = _account_strip_login(url)
+    match = re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://([^/:]+)(?::\d+)?/(.*)$', url)
+    if not match:
+        match = re.match(r'^(?:[^@/:]+@)?([^/:]+):(?!//)(.*)$', url)
+    if not match:
+        return '', '', ''
+    host, path = match.group(1).lower(), match.group(2).strip('/')
+    if path.endswith('.git'):
+        path = path[:-4]
+    parts = [p for p in path.split('/') if p]
+    owner = parts[0] if parts else ''
+    repo = parts[-1] if len(parts) > 1 else ''
+    return host, owner, repo
+
+
+def _account_platform_for_host(host: str) -> str:
+    if host == 'github.com' or host.endswith('.ghe.com'):
+        return 'github'
+    if host == 'gitlab.com':
+        return 'gitlab'
+    return 'git'
+
+
+def _account_gh_user(host: str, env: Dict, cwd: Optional[str], state: Dict) -> str:
+    """The gh login for a host, read from gh's local config; empty when a token variable overrides the stored login."""
+    if any(env.get(k) or os.environ.get(k) for k in _ACCOUNT_GH_TOKEN_ENV):
+        return ''
+    key = ('gh-user', host)
+    if key not in state:
+        out = _account_run(['gh', 'config', 'get', '-h', host, 'user'], cwd, state)
+        state[key] = (out or '').strip().splitlines()[0] if out and out.strip() else ''
+    return state[key]
+
+
+def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
+    """The account a `git push` reaches: the push remote's host and owner, and the gh login pushing over https."""
+    git_dir, rest = cwd, list(args)
+    while rest and rest[0].startswith('-'):
+        flag = rest.pop(0)
+        if flag == '-C' and rest:
+            path = rest.pop(0)
+            git_dir = path if os.path.isabs(path) else os.path.join(git_dir or os.getcwd(), path)
+        elif flag in ('-c', '--git-dir', '--work-tree', '--namespace') and rest:
+            rest.pop(0)
+    if not rest or rest[0] != 'push':
+        return None
+    positional = [a for a in rest[1:] if not a.startswith('-')]
+    target = positional[0] if positional else None
+    base = ['git', '-C', git_dir or '.']
+    if target and re.search(r'://|^[^/:]+@[^/:]+:|^[^/:]+:[^/]', target):
+        url, remote = target, ''
+    else:
+        remote = target
+        if not remote:
+            out = _account_run(base + ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'], git_dir, state)
+            remote = out.strip().split('/', 1)[0] if out and '/' in out else 'origin'
+        url = _account_run(base + ['remote', 'get-url', '--push', remote], git_dir, state)
+    host, owner, _repo = _account_remote_parts(url.strip().splitlines()[0]) if url else ('', '', '')
+    if not host:
+        return {'platform': 'git', 'source': 'unknown'}
+    user = ''
+    if re.match(r'^https?://', url.strip()):
+        helper = _account_run(base + ['config', '--get', f'credential.https://{host}.helper'], git_dir, state) or \
+            _account_run(base + ['config', '--get', 'credential.helper'], git_dir, state) or ''
+        if 'auth git-credential' in helper:
+            user = _account_gh_user(host, env, git_dir, state)
+    return {'platform': _account_platform_for_host(host), 'host': host, 'account': owner, 'user': user,
+            'context': remote or '', 'source': 'command'}
+
+
+def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
+    """The account a gh command reaches: host and owner from -R, GH_REPO, a repo argument or the repo's remote, plus the gh login."""
+    repo, flag_host = env.get('GH_REPO') or os.environ.get('GH_REPO') or '', ''
+    for i, arg in enumerate(args):
+        if arg in ('-R', '--repo') and i + 1 < len(args):
+            repo = args[i + 1]
+        elif arg.startswith('--repo='):
+            repo = arg.split('=', 1)[1]
+        elif arg == '--hostname' and i + 1 < len(args):
+            flag_host = args[i + 1].lower()
+    # `gh repo view|clone|fork|… OWNER/REPO` names the repository as its first argument.
+    if not repo and len(args) > 2 and args[0] == 'repo' and not args[2].startswith('-') and '/' in args[2]:
+        repo = args[2]
+    env_host = (env.get('GH_HOST') or os.environ.get('GH_HOST') or '').lower()
+    host, owner = '', ''
+    if repo:
+        parts = [p for p in re.sub(r'^[a-z]+://', '', repo).split('/') if p]
+        if len(parts) >= 3:
+            host, owner = parts[0].lower(), parts[1]
+        elif parts:
+            owner = parts[0]
+    elif cwd:
+        url = _account_run(['git', '-C', cwd, 'remote', 'get-url', '--push', 'origin'], cwd, state)
+        if url:
+            host, owner, _repo = _account_remote_parts(url.strip().splitlines()[0])
+    host = flag_host or host or env_host or 'github.com'
+    return {'platform': 'github', 'host': host, 'account': owner, 'user': _account_gh_user(host, env, cwd, state),
+            'context': '', 'source': 'command'}
+
+
+def _account_ssh_destination(program: str, args: List[str]) -> tuple:
+    """(destination, ssh options to pass through) for ssh, scp, sftp or rsync; (None, []) when there is none."""
+    passthrough, positional, i = [], [], 0
+    while i < len(args):
+        arg = args[i]
+        if program == 'rsync':
+            if arg in ('-e', '--rsh') or arg.startswith('--rsh='):
+                i += 1 if arg.startswith('--rsh=') else 2
+                continue
+            if arg.startswith('-'):
+                i += 1
+                continue
+            positional.append(arg)
+        elif arg.startswith('-') and len(arg) >= 2:
+            flag = arg[1]
+            if flag in _ACCOUNT_SSH_VALUE_FLAGS and len(arg) == 2 and i + 1 < len(args):
+                value = args[i + 1]
+                if flag in 'lF' or (flag == 'p' and program == 'ssh') or (flag == 'P' and program != 'ssh'):
+                    passthrough += ['-p' if flag == 'P' else '-' + flag, value]
+                i += 2
+                continue
+        else:
+            positional.append(arg)
+        i += 1
+    if program == 'ssh':
+        return (positional[0], passthrough) if positional else (None, [])
+    for arg in positional:
+        if arg.startswith('rsync://') or '::' in arg:
+            return None, []
+        match = re.match(r'^((?:[^@/:]+@)?\[?[^/:\]]+\]?):', arg)
+        if match and not re.match(r'^[A-Za-z]:\\', arg):
+            return match.group(1), passthrough
+    return None, []
+
+
+def _account_ssh(program: str, args: List[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
+    """The host and user an ssh-family command reaches, resolved through ssh -G."""
+    destination, passthrough = _account_ssh_destination(program, args)
+    if not destination:
+        return None
+    out = _account_run(['ssh', '-G'] + passthrough + [destination], cwd, state)
+    if not out:
+        return {'platform': 'ssh', 'source': 'unknown'}
+    settings = {}
+    for line in out.splitlines():
+        key, _, value = line.strip().partition(' ')
+        if key in ('hostname', 'user', 'port', 'proxyjump') and key not in settings:
+            settings[key] = value.strip()
+    host = settings.get('hostname', '').lower()
+    if not host:
+        return {'platform': 'ssh', 'source': 'unknown'}
+    port = settings.get('port', '22')
+    alias = destination.rsplit('@', 1)[-1].strip('[]')
+    return {'platform': 'ssh', 'host': host if port in ('', '22') else f'{host}:{port}', 'account': '',
+            'user': settings.get('user', ''), 'context': alias if alias.lower() != host else '', 'source': 'command'}
+
+
+def _destination_account(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
+    """The account the first account-bearing command in a shell call reached, or None; never raises."""
+    try:
+        if not isinstance(command, str) or not command.strip():
+            return None
+        for argv in _account_segments(command):
+            program, args, env = _account_program(argv)
+            account = None
+            if program == 'git':
+                account = _account_git_push(args, env, cwd, state)
+            elif program == 'gh':
+                account = _account_gh(args, env, cwd, state)
+            elif program in _ACCOUNT_SSH_TOOLS:
+                account = _account_ssh(program, args, cwd, state)
+            if account:
+                return {k: v for k, v in account.items() if v or k in ('platform', 'source')}
+        return None
+    except Exception:
+        return None
+# --- end destination account ---
+
+
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
                      mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
@@ -5613,6 +5881,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         return os.path.normpath(os.path.join(base, path)) if base else None
 
     project = None
+    account = None
     if name in SHELL_TOOLS:
         command = args.get('command') or args.get('input') or args.get('text') or ''
         entry = {
@@ -5628,6 +5897,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         if not candidates and shell_state.get('dir'):
             candidates.append(shell_state['dir'])
         project = _project_for_paths(candidates, root_projects)
+        account = _destination_account(command, shell_state.get('dir'), shell_state.setdefault('accounts', {}))
     elif name in READ_TOOLS:
         file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {
@@ -5686,6 +5956,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     mapped = {k: v for k, v in entry.items() if v != ''}
     if project:
         mapped['project'] = project
+    if account:
+        mapped['destination_account'] = account
     return mapped
 
 
