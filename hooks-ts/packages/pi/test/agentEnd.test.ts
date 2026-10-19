@@ -655,3 +655,35 @@ test("the handler survives a ctx that raises and a store that raises", async () 
     await api.close();
   }
 });
+
+test("a shell call's destination account rides on its tool_use entry", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  process.env.GH_CONFIG_DIR = mkdtempSync(join(tmpdir(), "gh-"));
+  const repo = mkdtempSync(join(tmpdir(), "repo-"));
+  execFileSync("git", ["-C", repo, "init", "-q", "-b", "main"]);
+  execFileSync("git", ["-C", repo, "remote", "add", "personal", "https://github.com/jdoe-dev/app.git"]);
+
+  const api = await startMockApi();
+  try {
+    const store = createTurnStore();
+    store.recordPrompt("push it", "sess-account", 1_000);
+    store.recordToolCall(
+      { tool_name: "bash", tool_use_id: "call_push", decision: "allow", tool_input: { command: "git push personal main" } },
+      "sess-account",
+      1_001,
+    );
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx({ cwd: repo }), { client: client(api), store, now: () => 5_000 });
+    await sleep(500);
+
+    const body = turnLogs(api)[0]?.body as
+      | { messages?: { tool_use?: { destination_account?: Record<string, string> }[] }[] }
+      | undefined;
+    const account = body?.messages?.[1]?.tool_use?.[0]?.destination_account;
+    assert.deepEqual(account, { platform: "github", source: "command", host: "github.com", account: "jdoe-dev", context: "personal" });
+  } finally {
+    await api.close();
+  }
+});

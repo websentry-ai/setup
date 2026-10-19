@@ -41,6 +41,7 @@
 // `unbound_app_label` either: the route already labels this `pi`, which is what makes
 // `metadata.source = 'hooks'` true (`add_gateway_metrics_task.py:676-677`).
 
+import type { DestinationAccount } from "./destinationAccount.ts";
 import { redactSecrets } from "./config.ts";
 import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
@@ -75,6 +76,8 @@ export interface TurnLogToolUse {
    */
   tool_input: Record<string, unknown>;
   tool_response: ToolResponse;
+  /** The account a shell call reached, resolved locally from identity fields only; absent when none. */
+  destination_account?: DestinationAccount;
 }
 
 export interface TurnLogMessage {
@@ -132,6 +135,8 @@ export interface TurnLogOptions {
   apiKey?: string;
   /** The process's settled account identity; attached as `account_identity` when present. */
   accountIdentity?: AccountIdentity;
+  /** Each shell call's destination account, keyed by `tool_use_id`. */
+  destinationAccounts?: ReadonlyMap<string, DestinationAccount>;
 }
 
 /**
@@ -300,19 +305,21 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
         ? Math.floor(safe.tool_calls_truncated)
         : undefined;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
-    toolUse = calls.map((call) => ({
-      type: TURNLOG_TOOL_USE_TYPE,
-      tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
-      tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // `call`-derived, and still never `event.input`-derived: what the record holds was already
-      // allowlisted and capped by `auditToolInput` — header decision 2.
-      tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
-      tool_response: toolResponseFor(
-        safe,
-        typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-        opts?.apiKey,
-      ),
-    }));
+    toolUse = calls.map((call) => {
+      const toolUseId = typeof call?.tool_use_id === "string" ? call.tool_use_id : "";
+      const entry: TurnLogToolUse = {
+        type: TURNLOG_TOOL_USE_TYPE,
+        tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
+        tool_use_id: toolUseId,
+        // `call`-derived, and still never `event.input`-derived: what the record holds was already
+        // allowlisted and capped by `auditToolInput` — header decision 2.
+        tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
+        tool_response: toolResponseFor(safe, toolUseId, opts?.apiKey),
+      };
+      const account = toolUseId === "" ? undefined : opts?.destinationAccounts?.get(toolUseId);
+      if (account !== undefined) entry.destination_account = account;
+      return entry;
+    });
   } catch {
     // Fall through with the defaults above: a degraded row beats a thrown handler.
   }

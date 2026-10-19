@@ -14,7 +14,7 @@
  */
 
 // packages/pi/src/index.ts
-import { homedir } from "node:os";
+import { homedir as homedir2 } from "node:os";
 
 // packages/core/src/accountIdentity.ts
 import { execFile as nodeExecFile } from "node:child_process";
@@ -349,8 +349,8 @@ function firstValid(stdout) {
   return stdout !== void 0 && isValidSerial(stdout) ? stdout.trim() : void 0;
 }
 async function probeSerial(opts, timeoutMs) {
-  const run = opts.execFile ?? defaultExecFile;
-  const exec = (file, args) => attempt(() => run(file, args, { timeoutMs, maxBytes: MAX_SERIAL_PROBE_BYTES })).catch(() => void 0);
+  const run2 = opts.execFile ?? defaultExecFile;
+  const exec = (file, args) => attempt(() => run2(file, args, { timeoutMs, maxBytes: MAX_SERIAL_PROBE_BYTES })).catch(() => void 0);
   const platform = opts.platform ?? process.platform;
   if (platform === "darwin") {
     const out = await exec(probeToolPath("system_profiler"), ["SPHardwareDataType"]);
@@ -1309,19 +1309,21 @@ function buildTurnLogBody(record, opts) {
     truncated = typeof safe.results_truncated === "number" && Number.isFinite(safe.results_truncated) && safe.results_truncated > 0 ? Math.floor(safe.results_truncated) : void 0;
     callsTruncated = typeof safe.tool_calls_truncated === "number" && Number.isFinite(safe.tool_calls_truncated) && safe.tool_calls_truncated > 0 ? Math.floor(safe.tool_calls_truncated) : void 0;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
-    toolUse = calls.map((call) => ({
-      type: TURNLOG_TOOL_USE_TYPE,
-      tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
-      tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // `call`-derived, and still never `event.input`-derived: what the record holds was already
-      // allowlisted and capped by `auditToolInput` — header decision 2.
-      tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
-      tool_response: toolResponseFor(
-        safe,
-        typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-        opts?.apiKey
-      )
-    }));
+    toolUse = calls.map((call) => {
+      const toolUseId = typeof call?.tool_use_id === "string" ? call.tool_use_id : "";
+      const entry = {
+        type: TURNLOG_TOOL_USE_TYPE,
+        tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
+        tool_use_id: toolUseId,
+        // `call`-derived, and still never `event.input`-derived: what the record holds was already
+        // allowlisted and capped by `auditToolInput` — header decision 2.
+        tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
+        tool_response: toolResponseFor(safe, toolUseId, opts?.apiKey)
+      };
+      const account = toolUseId === "" ? void 0 : opts?.destinationAccounts?.get(toolUseId);
+      if (account !== void 0) entry.destination_account = account;
+      return entry;
+    });
   } catch {
   }
   const assistant = capAssistantText(opts?.assistantText, opts?.apiKey);
@@ -1606,21 +1608,21 @@ function textOf(part) {
 function flatten(value) {
   return Buffer.from(value, "utf8").toString("utf8");
 }
-function headOf(segments, n) {
+function headOf(segments2, n) {
   let out = "";
-  for (const segment of segments) {
+  for (const segment of segments2) {
     const room = n - out.length;
     if (room <= 0) break;
     out += segment.length <= room ? segment : segment.slice(0, room);
   }
   return out;
 }
-function tailOf(segments, n) {
+function tailOf(segments2, n) {
   let out = "";
-  for (let i = segments.length - 1; i >= 0; i -= 1) {
+  for (let i = segments2.length - 1; i >= 0; i -= 1) {
     const room = n - out.length;
     if (room <= 0) break;
-    const segment = segments[i];
+    const segment = segments2[i];
     out = (segment.length <= room ? segment : segment.slice(segment.length - room)) + out;
   }
   return out;
@@ -1642,13 +1644,13 @@ function captureText(parts, maxChars, redact, margin = OUTPUT_REDACTION_MARGIN_C
     const headBudget = Math.ceil(cap / 2);
     const tailBudget = cap - headBudget;
     const extra = Number.isFinite(margin) && margin > 0 ? Math.floor(margin) : 0;
-    const segments = [];
+    const segments2 = [];
     for (let i = 0; i < texts.length; i += 1) {
-      if (i > 0) segments.push("\n");
-      segments.push(texts[i]);
+      if (i > 0) segments2.push("\n");
+      segments2.push(texts[i]);
     }
-    const head = clean(headOf(segments, headBudget + extra)).slice(0, headBudget);
-    const redactedTail = clean(tailOf(segments, tailBudget + extra));
+    const head = clean(headOf(segments2, headBudget + extra)).slice(0, headBudget);
+    const redactedTail = clean(tailOf(segments2, tailBudget + extra));
     const tail = redactedTail.slice(Math.max(0, redactedTail.length - tailBudget));
     return {
       text: flatten(head) + OUTPUT_TRUNCATION_MARKER + flatten(tail),
@@ -1844,6 +1846,317 @@ function createTurnStore() {
 }
 var turnStore = createTurnStore();
 
+// packages/core/src/destinationAccount.ts
+import { isAbsolute as isAbsolute3, join as join5, normalize, basename } from "node:path";
+import { homedir } from "node:os";
+var ALLOWED_RUNS = [
+  ["git", "remote", "get-url", "--push"],
+  ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name"],
+  ["git", "config", "--get"],
+  ["gh", "config", "get", "-h"],
+  ["ssh", "-G"]
+];
+var RUN_TIMEOUT_MS = 5e3;
+var TURN_BUDGET_MS = 1e4;
+var MAX_OUTPUT_BYTES = 64 * 1024;
+var WRAPPERS = /* @__PURE__ */ new Set(["sudo", "env", "command", "exec", "time", "nohup"]);
+var SSH_TOOLS = /* @__PURE__ */ new Set(["ssh", "scp", "sftp", "rsync"]);
+var SSH_VALUE_FLAGS = "bcDEeFIiJLlmOoPpQRSWw";
+var GH_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
+var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
+function stripGitDir(argv) {
+  return argv.length >= 3 && argv[0] === "git" && argv[1] === "-C" ? [argv[0], ...argv.slice(3)] : argv;
+}
+async function run(argv, state) {
+  try {
+    const bare = stripGitDir(argv);
+    if (!ALLOWED_RUNS.some((p) => p.every((part, i) => bare[i] === part))) return void 0;
+    const remaining = state.deadline - state.now();
+    if (remaining <= 0) return void 0;
+    const [file, ...args] = argv;
+    if (file === void 0) return void 0;
+    return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
+  } catch {
+    return void 0;
+  }
+}
+function segments(command) {
+  const out = [];
+  let current = [];
+  let word = "";
+  let inWord = false;
+  let quote;
+  const endWord = () => {
+    if (inWord) current.push(word);
+    word = "";
+    inWord = false;
+  };
+  const endSegment = () => {
+    endWord();
+    if (current.length > 0) out.push(current);
+    current = [];
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote !== void 0) {
+      if (ch === quote) quote = void 0;
+      else if (ch === "\\" && quote === '"' && i + 1 < command.length) word += command[++i];
+      else word += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+    } else if (ch === "\\" && i + 1 < command.length) {
+      word += command[++i];
+      inWord = true;
+    } else if (ch === ";" || ch === "&" || ch === "|" || ch === "\n") {
+      endSegment();
+    } else if (ch === " " || ch === "	" || ch === "\r") {
+      endWord();
+    } else {
+      word += ch;
+      inWord = true;
+    }
+  }
+  endSegment();
+  return out;
+}
+function program(argv) {
+  const env = {};
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    const eq = token.indexOf("=");
+    if (eq > 0 && !token.startsWith("-") && /^[A-Za-z0-9_]+$/.test(token.slice(0, eq))) {
+      env[token.slice(0, eq)] = token.slice(eq + 1);
+    } else if (WRAPPERS.has(basename(token))) {
+      continue;
+    } else if (token.startsWith("-") && i > 0 && WRAPPERS.has(basename(argv[i - 1]))) {
+      continue;
+    } else {
+      return { name: basename(token), args: argv.slice(i + 1), env };
+    }
+  }
+  return { args: [], env };
+}
+function stripLogin(url) {
+  return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^/@]*@/, "$1");
+}
+function remoteParts(raw) {
+  const url = stripLogin(raw);
+  const match = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/:]+)(?::\d+)?\/(.*)$/.exec(url) ?? /^(?:[^@/:]+@)?([^/:]+):(?!\/\/)(.*)$/.exec(url);
+  if (match === null) return { host: "", owner: "" };
+  const host = (match[1] ?? "").toLowerCase();
+  const parts = (match[2] ?? "").replace(/^\/+|\/+$/g, "").replace(/\.git$/, "").split("/").filter(Boolean);
+  return { host, owner: parts[0] ?? "" };
+}
+function platformForHost(host) {
+  if (host === "github.com" || host.endsWith(".ghe.com")) return "github";
+  if (host === "gitlab.com") return "gitlab";
+  return "git";
+}
+function firstLine(out) {
+  return (out ?? "").trim().split(/\r?\n/)[0] ?? "";
+}
+async function ghUser(host, env, state) {
+  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k])) return "";
+  const cached = state.ghUser.get(host);
+  if (cached !== void 0) return cached;
+  const user = firstLine(await run(["gh", "config", "get", "-h", host, "user"], state));
+  state.ghUser.set(host, user);
+  return user;
+}
+async function gitPush(args, env, cwd, state) {
+  let gitDir = cwd;
+  const rest = [...args];
+  while (rest.length > 0 && rest[0].startsWith("-")) {
+    const flag = rest.shift();
+    if (flag === "-C" && rest.length > 0) {
+      const path = rest.shift();
+      gitDir = isAbsolute3(path) ? path : join5(gitDir ?? process.cwd(), path);
+    } else if (["-c", "--git-dir", "--work-tree", "--namespace"].includes(flag) && rest.length > 0) {
+      rest.shift();
+    }
+  }
+  if (rest[0] !== "push") return void 0;
+  const pushArgs = rest.slice(1);
+  let target;
+  const positional = [];
+  for (let i = 0; i < pushArgs.length; i++) {
+    const arg = pushArgs[i];
+    if (["-o", "--push-option", "--receive-pack", "--exec"].includes(arg)) {
+      i++;
+    } else if (arg === "--repo" && i + 1 < pushArgs.length) {
+      target = pushArgs[++i];
+    } else if (arg.startsWith("--repo=")) {
+      target = arg.slice("--repo=".length);
+    } else if (!arg.startsWith("-")) {
+      positional.push(arg);
+    }
+  }
+  target = target ?? positional[0];
+  const base = ["git", "-C", gitDir ?? "."];
+  let url;
+  let remote = "";
+  if (target !== void 0 && /:\/\/|^[^/:]+@[^/:]+:|^[^/:]+:[^/]/.test(target)) {
+    url = target;
+  } else {
+    remote = target ?? "";
+    if (remote === "") {
+      const out = firstLine(await run([...base, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{push}"], state));
+      remote = out.includes("/") ? out.split("/")[0] : "origin";
+    }
+    url = firstLine(await run([...base, "remote", "get-url", "--push", remote], state)) || void 0;
+  }
+  const { host, owner } = url === void 0 ? { host: "", owner: "" } : remoteParts(url);
+  if (host === "" || url === void 0) return { platform: "git", source: "unknown" };
+  let user = "";
+  if (/^https?:\/\//.test(url.trim())) {
+    const helper = await run([...base, "config", "--get", `credential.https://${host}.helper`], state) ?? await run([...base, "config", "--get", "credential.helper"], state) ?? "";
+    if (helper.includes("auth git-credential")) user = await ghUser(host, env, state);
+  }
+  return { platform: platformForHost(host), host, account: owner, user, context: remote, source: "command" };
+}
+async function gh(args, env, cwd, state) {
+  let repo = env.GH_REPO ?? state.env.GH_REPO ?? "";
+  let flagHost = "";
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if ((arg === "-R" || arg === "--repo") && i + 1 < args.length) repo = args[i + 1];
+    else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
+    else if (arg === "--hostname" && i + 1 < args.length) flagHost = args[i + 1].toLowerCase();
+  }
+  const third = args[2];
+  if (repo === "" && args[0] === "repo" && third !== void 0 && !third.startsWith("-") && third.includes("/")) {
+    repo = third;
+  }
+  const envHost = (env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase();
+  let host = "";
+  let owner = "";
+  if (repo !== "") {
+    const parts = repo.replace(/^[a-z]+:\/\//, "").split("/").filter(Boolean);
+    if (parts.length >= 3) {
+      host = parts[0].toLowerCase();
+      owner = parts[1];
+    } else {
+      owner = parts[0] ?? "";
+    }
+  } else if (cwd !== void 0) {
+    const url = firstLine(await run(["git", "-C", cwd, "remote", "get-url", "--push", "origin"], state));
+    if (url !== "") ({ host, owner } = remoteParts(url));
+  }
+  host = flagHost || host || envHost || "github.com";
+  return { platform: "github", host, account: owner, user: await ghUser(host, env, state), context: "", source: "command" };
+}
+function sshDestination(name, args) {
+  const passthrough = [];
+  const positional = [];
+  const portFlag = name === "ssh" ? "p" : "P";
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (name === "rsync") {
+      if (arg === "-e" || arg === "--rsh") i++;
+      else if (!arg.startsWith("-")) positional.push(arg);
+      continue;
+    }
+    if (arg.startsWith("-") && arg.length >= 2 && arg !== "--") {
+      const flag = arg[1];
+      const attached = arg.slice(2);
+      const takesValue = SSH_VALUE_FLAGS.includes(flag);
+      const value = attached !== "" ? attached : takesValue ? args[i + 1] : void 0;
+      if (takesValue && value !== void 0 && ["l", "o", "F", "J", portFlag].includes(flag)) {
+        passthrough.push(flag === portFlag ? "-p" : `-${flag}`, value);
+      }
+      if (attached === "" && takesValue) i++;
+      continue;
+    }
+    positional.push(arg);
+  }
+  if (name === "ssh") return positional[0] === void 0 ? { passthrough: [] } : { destination: positional[0], passthrough };
+  for (const arg of positional) {
+    if (arg.startsWith("rsync://") || arg.includes("::")) return { passthrough: [] };
+    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
+    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return { destination: match[1], passthrough };
+  }
+  const first = positional[0];
+  if (name === "sftp" && first !== void 0 && /^(?:[^@/:]+@)?\[?[^/:\]]+\]?$/.test(first)) {
+    return { destination: first, passthrough };
+  }
+  return { passthrough: [] };
+}
+async function ssh(name, args, state) {
+  const { destination, passthrough } = sshDestination(name, args);
+  if (destination === void 0) return void 0;
+  const out = await run(["ssh", "-G", ...passthrough, destination], state);
+  if (out === void 0) return { platform: "ssh", source: "unknown" };
+  const settings = /* @__PURE__ */ new Map();
+  for (const line of out.split(/\r?\n/)) {
+    const [key, ...value] = line.trim().split(" ");
+    if (key !== void 0 && ["hostname", "user", "port"].includes(key) && !settings.has(key)) {
+      settings.set(key, value.join(" ").trim());
+    }
+  }
+  const host = (settings.get("hostname") ?? "").toLowerCase();
+  if (host === "") return { platform: "ssh", source: "unknown" };
+  const port = settings.get("port") ?? "22";
+  const alias = (destination.split("@").pop() ?? "").replace(/^\[|\]$/g, "");
+  return {
+    platform: "ssh",
+    host: port === "" || port === "22" ? host : `${host}:${port}`,
+    user: settings.get("user") ?? "",
+    context: alias.toLowerCase() !== host ? alias : "",
+    source: "command"
+  };
+}
+function compact(account) {
+  const out = { platform: account.platform, source: account.source };
+  for (const key of ["host", "account", "user", "context"]) {
+    if (account[key]) out[key] = account[key];
+  }
+  return out;
+}
+async function resolveOne(command, cwd, state) {
+  let dir = cwd;
+  for (const argv of segments(command)) {
+    const { name, args, env } = program(argv);
+    let account;
+    if (name === "cd") {
+      const raw = args[0] ?? "~";
+      const target = raw.startsWith("~") ? join5(homedir(), raw.slice(1)) : raw;
+      dir = isAbsolute3(target) ? target : normalize(join5(dir ?? "", target));
+      continue;
+    }
+    if (name === "git") account = await gitPush(args, env, dir, state);
+    else if (name === "gh") account = await gh(args, env, dir, state);
+    else if (name !== void 0 && SSH_TOOLS.has(name)) account = await ssh(name, args, state);
+    if (account !== void 0) return compact(account);
+  }
+  return void 0;
+}
+async function resolveDestinationAccounts(calls, cwd, opts = {}) {
+  const accounts = /* @__PURE__ */ new Map();
+  try {
+    const now = opts.now ?? Date.now;
+    const state = {
+      run: opts.execFile ?? defaultExecFile,
+      env: opts.env ?? process.env,
+      now,
+      deadline: now() + TURN_BUDGET_MS,
+      ghUser: /* @__PURE__ */ new Map()
+    };
+    for (const call of calls) {
+      const input = call.tool_input;
+      const command = input !== null && typeof input === "object" && !Array.isArray(input) ? input.command : void 0;
+      if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
+      if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
+      const account = await resolveOne(command, cwd, state);
+      if (account !== void 0) accounts.set(call.tool_use_id, account);
+    }
+  } catch {
+  }
+  return accounts;
+}
+
 // packages/pi/src/agentEnd.ts
 function assistantTextFrom(messages) {
   try {
@@ -1881,15 +2194,18 @@ function cwdOf(ctx) {
 function dispatchTurnLog(record, cwd, assistantText, label2, deps) {
   try {
     const completedAtMs = (deps.now ?? Date.now)();
-    const body = buildTurnLogBody(record, {
-      cwd,
-      completedAtMs,
-      assistantText,
-      ...deps.apiKey === void 0 ? {} : { apiKey: deps.apiKey },
-      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
-    });
     const dispatchedAtMs = completedAtMs;
-    void deps.client.postTurnLog(body).then((ok) => {
+    const post = (destinationAccounts) => deps.client.postTurnLog(
+      buildTurnLogBody(record, {
+        cwd,
+        completedAtMs,
+        assistantText,
+        ...deps.apiKey === void 0 ? {} : { apiKey: deps.apiKey },
+        ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity },
+        destinationAccounts
+      })
+    );
+    void resolveDestinationAccounts(record.tool_calls ?? [], cwd).catch(() => /* @__PURE__ */ new Map()).then(post).then((ok) => {
       if (ok) return;
       deps.telemetry?.reportTurnLogFailure({
         errorClass: "TurnLogFailed",
@@ -1942,9 +2258,9 @@ function postStandaloneTurn(entry, ctx, sessionId, deps) {
 }
 
 // packages/pi/src/narrow.ts
-var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
+var SHELL_TOOLS2 = /* @__PURE__ */ new Set(["bash", "powershell"]);
 function isShellCall(e) {
-  if (!SHELL_TOOLS.has(e.toolName)) return false;
+  if (!SHELL_TOOLS2.has(e.toolName)) return false;
   const input = e.input;
   return typeof input === "object" && input !== null && typeof input.command === "string";
 }
@@ -2303,7 +2619,7 @@ function mintBrokerId() {
 
 // packages/pi/src/mcpConfig.ts
 import { closeSync, constants as fsConstants, fstatSync, lstatSync as lstatSync2, openSync, readSync, statSync } from "node:fs";
-import { isAbsolute as isAbsolute3, join as join5 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join6 } from "node:path";
 var KNOWN_SERVER_KEYS = /* @__PURE__ */ new Set([
   "command",
   "args",
@@ -2366,34 +2682,34 @@ function mcpConfigSources(options, cwd) {
   try {
     const env = options.env ?? {};
     const homeDir = options.homeDir;
-    if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute3(homeDir)) return void 0;
-    if (typeof cwd !== "string" || cwd === "" || !isAbsolute3(cwd)) return void 0;
+    if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute4(homeDir)) return void 0;
+    if (typeof cwd !== "string" || cwd === "" || !isAbsolute4(cwd)) return void 0;
     if (hasMcpConfigFlag(options.argv)) return void 0;
     const packageDir = env[ENV_PI_PACKAGE_DIR];
     if (typeof packageDir === "string" && packageDir !== "") return void 0;
     const agentEnv = env[ENV_PI_AGENT_DIR];
     let agentDir;
     if (typeof agentEnv === "string" && agentEnv !== "") {
-      if (!isAbsolute3(agentEnv)) return void 0;
+      if (!isAbsolute4(agentEnv)) return void 0;
       agentDir = agentEnv;
     } else {
-      agentDir = join5(homeDir, ".pi", "agent");
+      agentDir = join6(homeDir, ".pi", "agent");
     }
-    const adapterFile = join5(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
+    const adapterFile = join6(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
     const mode = env[ENV_PI_MCP_CONFIG_MODE];
     if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") return [adapterFile];
     const sources = [];
     for (const path of [
-      join5(homeDir, ".config", "mcp", "mcp.json"),
-      join5(homeDir, ".agents", "mcp.json"),
-      join5(homeDir, ".agents", "mcp", "mcp.json")
+      join6(homeDir, ".config", "mcp", "mcp.json"),
+      join6(homeDir, ".agents", "mcp.json"),
+      join6(homeDir, ".agents", "mcp", "mcp.json")
     ]) {
       if (path !== adapterFile) sources.push(path);
     }
     sources.push(adapterFile);
-    const project = join5(cwd, ".mcp.json");
+    const project = join6(cwd, ".mcp.json");
     if (project !== adapterFile) sources.push(project);
-    sources.push(join5(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
+    sources.push(join6(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
     return [...new Set(sources)];
   } catch {
     return void 0;
@@ -2762,7 +3078,7 @@ function hydrateFromCache(apiKey, baseUrl, env, homeDir) {
 }
 function safeHomeDir() {
   try {
-    return homedir();
+    return homedir2();
   } catch {
     return "";
   }
