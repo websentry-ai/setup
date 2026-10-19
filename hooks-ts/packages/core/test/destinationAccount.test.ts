@@ -338,3 +338,28 @@ test("an equals before an ssh config argument is only a separator", async () => 
   }
   assert.equal(existsSync(marker), false);
 });
+
+test("a token in any gh repo shape never reaches the account", async () => {
+  for (const command of [
+    `GH_REPO=x@${FAKE_TOKEN}@github.com/acme/app gh pr list`,
+    `gh pr create -Rx@${FAKE_TOKEN}@github.com/acme/app`,
+    `gh api repos/x@${FAKE_TOKEN}@github.com/acme/contents`,
+  ]) {
+    assert.ok(!JSON.stringify(await resolve(command)).toLowerCase().includes(FAKE_TOKEN.toLowerCase()), command);
+  }
+});
+
+test("gh follows the repo origin fetches from", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  execFileSync("git", ["-C", dir, "remote", "set-url", "--push", "origin", "https://github.com/personal/app.git"]);
+  assert.equal((await resolve("gh pr view 1", dir))?.account, "acme");
+});
+
+test("a semicolon in an included path is part of the path", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-semi-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "inner;config"), `Match exec "touch ${marker}"\n`);
+  writeFileSync(join(dir, "config"), `Include ${join(dir, "inner;config")}\nHost prod-bastion\n  HostName 10.0.4.12\n`);
+  assert.deepEqual(await resolve(`ssh -F ${join(dir, "config")} prod-bastion`), { platform: "ssh", source: "unknown" });
+  assert.equal(existsSync(marker), false);
+});

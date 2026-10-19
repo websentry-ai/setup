@@ -1851,7 +1851,7 @@ import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
 import { isAbsolute as isAbsolute3, join as join5, normalize, basename, dirname as dirname3 } from "node:path";
 import { homedir } from "node:os";
 var ALLOWED_RUNS = [
-  ["git", "remote", "get-url", "--push"],
+  ["git", "remote", "get-url"],
   ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name"],
   ["git", "symbolic-ref", "--short", "-q", "HEAD"],
   ["git", "config", "--get"],
@@ -2097,7 +2097,7 @@ async function gh(args, env, cwd, state) {
   let host = "";
   let owner = "";
   if (repo !== "") {
-    repo = repo.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/@]*@/, "$1");
+    repo = stripLogin(repo);
     if (repo.includes(":")) {
       ({ host, owner } = remoteParts(repo));
     } else {
@@ -2110,8 +2110,12 @@ async function gh(args, env, cwd, state) {
       }
     }
   } else if (lookupDir !== void 0) {
-    const url = firstLine(await run(["git", "-C", lookupDir, "remote", "get-url", "--push", "origin"], state));
+    const url = firstLine(await run(["git", "-C", lookupDir, "remote", "get-url", "origin"], state));
     if (url !== "") ({ host, owner } = remoteParts(url));
+  }
+  if (host.includes("@") || owner.includes("@")) {
+    host = "";
+    owner = "";
   }
   host = flagHost || host || envHost || "github.com";
   return { platform: "github", host, account: owner, user: await ghUser(host, env, state), context: "", source: "command" };
@@ -2221,6 +2225,32 @@ function includeTargets(pattern, base) {
     return [];
   }
 }
+function configWords(line) {
+  const words = [];
+  let word = "";
+  let inWord = false;
+  let quote;
+  for (const ch of line) {
+    if (quote !== void 0) {
+      if (ch === quote) quote = void 0;
+      else word += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      inWord = true;
+    } else if (ch === " " || ch === "	" || ch === "\r") {
+      if (inWord) words.push(word);
+      word = "";
+      inWord = false;
+    } else if (ch === "#" && !inWord) {
+      break;
+    } else {
+      word += ch;
+      inWord = true;
+    }
+  }
+  if (inWord) words.push(word);
+  return words;
+}
 function configRunsCommands(passthrough) {
   const homeSsh = join5(homedir(), ".ssh");
   let config;
@@ -2243,7 +2273,7 @@ function configRunsCommands(passthrough) {
       return true;
     }
     for (const line of text.split(/\r?\n/)) {
-      const words = segments(line).flat();
+      const words = configWords(line);
       const [first = "", ...rest] = words;
       const [keyword = "", attached = ""] = first.split(/=(.*)/s);
       const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);

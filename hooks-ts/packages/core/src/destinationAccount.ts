@@ -23,7 +23,7 @@ export interface DestinationAccount {
 
 /** Only these lookups are ever run; anything else is refused before it starts. */
 const ALLOWED_RUNS: readonly (readonly string[])[] = [
-  ["git", "remote", "get-url", "--push"],
+  ["git", "remote", "get-url"],
   ["git", "rev-parse", "--abbrev-ref", "--symbolic-full-name"],
   ["git", "symbolic-ref", "--short", "-q", "HEAD"],
   ["git", "config", "--get"],
@@ -303,7 +303,7 @@ async function gh(
   let host = "";
   let owner = "";
   if (repo !== "") {
-    repo = repo.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/@]*@/, "$1"); // never keep a login or token
+    repo = stripLogin(repo); // never keep a login or token
     if (repo.includes(":")) {
       ({ host, owner } = remoteParts(repo));
     } else {
@@ -316,8 +316,13 @@ async function gh(
       }
     }
   } else if (lookupDir !== undefined) {
-    const url = firstLine(await run(["git", "-C", lookupDir, "remote", "get-url", "--push", "origin"], state));
+    // gh queries the repo origin fetches from, not the one it pushes to.
+    const url = firstLine(await run(["git", "-C", lookupDir, "remote", "get-url", "origin"], state));
     if (url !== "") ({ host, owner } = remoteParts(url));
+  }
+  if (host.includes("@") || owner.includes("@")) {
+    host = "";
+    owner = "";
   }
   host = flagHost || host || envHost || "github.com";
   return { platform: "github", host, account: owner, user: await ghUser(host, env, state), context: "", source: "command" };
@@ -445,6 +450,34 @@ function includeTargets(pattern: string, base: string): string[] | undefined {
   }
 }
 
+/** An ssh config line as words: split on whitespace, quotes honoured, a # outside quotes starts a comment. */
+function configWords(line: string): string[] {
+  const words: string[] = [];
+  let word = "";
+  let inWord = false;
+  let quote: string | undefined;
+  for (const ch of line) {
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      else word += ch;
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      inWord = true;
+    } else if (ch === " " || ch === "\t" || ch === "\r") {
+      if (inWord) words.push(word);
+      word = "";
+      inWord = false;
+    } else if (ch === "#" && !inWord) {
+      break;
+    } else {
+      word += ch;
+      inWord = true;
+    }
+  }
+  if (inWord) words.push(word);
+  return words;
+}
+
 /** Whether ssh -G could run a command while reading its configs: a Match exec anywhere, or a file it can't check. */
 function configRunsCommands(passthrough: readonly string[]): boolean {
   const homeSsh = join(homedir(), ".ssh");
@@ -471,7 +504,7 @@ function configRunsCommands(passthrough: readonly string[]): boolean {
     }
     for (const line of text.split(/\r?\n/)) {
       // Split the way ssh does, so a quoted keyword or path is read as ssh reads it.
-      const words = segments(line).flat();
+      const words = configWords(line);
       const [first = "", ...rest] = words;
       const [keyword = "", attached = ""] = first.split(/=(.*)/s);
       // ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
