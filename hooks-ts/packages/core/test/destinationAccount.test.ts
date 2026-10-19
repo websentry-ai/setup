@@ -270,3 +270,16 @@ test("quoted and wildcard includes are scanned", async () => {
   }
   assert.equal(existsSync(marker), false);
 });
+
+test("an ssh config named from the home folder is read", async () => {
+  const home = mkdtempSync(join(tmpdir(), "home-"));
+  writeFileSync(join(home, "bastion.cfg"), "Host prod-bastion\n  HostName 10.0.4.12\n  User deploy\n");
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const account = await resolve("ssh -F ~/bastion.cfg prod-bastion");
+    assert.deepEqual([account?.host, account?.user], ["10.0.4.12", "deploy"]);
+  } finally {
+    process.env.HOME = previous;
+  }
+});

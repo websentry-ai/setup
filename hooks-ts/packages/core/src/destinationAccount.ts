@@ -481,7 +481,7 @@ async function ssh(name: string, args: string[], dir: string | undefined, state:
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1] as string);
-    if (passthrough[i] === "-F" && !isAbsolute(value) && value !== "none") passthrough[i + 1] = join(dir ?? "", value);
+    if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute(value) ? value : join(dir ?? "", value);
   }
   if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
   const out = await run(["ssh", "-G", ...passthrough, destination], state);

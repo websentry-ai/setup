@@ -2248,7 +2248,7 @@ async function ssh(name, args, dir, state) {
   if (destination === void 0) return void 0;
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1]);
-    if (passthrough[i] === "-F" && !isAbsolute3(value) && value !== "none") passthrough[i + 1] = join5(dir ?? "", value);
+    if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute3(value) ? value : join5(dir ?? "", value);
   }
   if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
   const out = await run(["ssh", "-G", ...passthrough, destination], state);
