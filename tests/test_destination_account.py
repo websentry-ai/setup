@@ -171,6 +171,66 @@ class DestinationAccountTests(unittest.TestCase):
                 with self.subTest(hook=hook, command=command):
                     self.assertEqual((account['host'], account['user']), expected)
 
+    def test_a_gh_repo_url_never_carries_its_login_or_token(self):
+        for command in (f'gh pr create -R https://jdoe:{FAKE_TOKEN}@github.com/acme/app --fill',
+                        f'GH_REPO=https://jdoe:{FAKE_TOKEN}@github.com/acme/app gh repo view',
+                        f'gh repo view https://jdoe:{FAKE_TOKEN}@github.com/acme/app'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['account']), ('github.com', 'acme'))
+                    self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
+    def test_gh_names_the_repo_the_command_reaches(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        cases = {
+            'GH_REPO=acme/app gh repo view other-org/other-repo': 'other-org',
+            'gh api repos/other-org/svc/pulls': 'other-org',
+            'gh api -X GET /repos/other-org/svc/issues': 'other-org',
+            'gh api repos/{owner}/{repo}/pulls': 'acme',
+            'gh api user': None,
+        }
+        for command, owner in cases.items():
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account.get('account'), owner)
+
+    def test_comments_and_line_continuations_keep_the_push(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git', 'personal': 'https://github.com/jdoe-dev/app.git'})
+        for command, cwd in ((f'cd {repo} # into the repo\ngit push personal main', '/'),
+                             ('git push \\\n  personal main', repo)):
+            for hook, account in self._each(command, cwd):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['account'], account['context']), ('jdoe-dev', 'personal'))
+
+    def test_scp_switches_and_bandwidth_limits_are_not_read_as_values_or_logins(self):
+        for command in (f'scp -p -F {self.ssh_config} prod-bastion:/var/log/app.log .',
+                        f'scp -l 8192 -F {self.ssh_config} dump.sql prod-bastion:/tmp/',
+                        f'scp -F {self.ssh_config} notes:draft prod-bastion:/tmp/'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['user']), ('10.0.4.12:2222', 'deploy'))
+
+    def test_a_failed_lookup_does_not_hide_a_later_push(self):
+        repo = _repo({'personal': 'https://github.com/jdoe-dev/app.git'})
+        for hook, account in self._each('git push missing main; git push personal main', repo):
+            with self.subTest(hook=hook):
+                self.assertEqual(account['account'], 'jdoe-dev')
+
+    def test_a_push_with_no_known_folder_is_unknown_rather_than_the_hooks_own(self):
+        for hook, account in self._each('git push origin main'):
+            with self.subTest(hook=hook):
+                self.assertEqual(account, {'platform': 'git', 'source': 'unknown'})
+
+    def test_an_ssh_config_that_runs_commands_is_never_read(self):
+        marker = os.path.join(self.ssh_dir, 'ran')
+        config = os.path.join(self.ssh_dir, 'exec_config')
+        Path(config).write_text(f'Match host * exec "touch {marker}"\n  HostName 10.9.9.9\n')
+        for command in (f'ssh -F {config} prod-bastion', f'false && scp -F {config} f prod-bastion:/tmp/'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        self.assertFalse(os.path.exists(marker))
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:
