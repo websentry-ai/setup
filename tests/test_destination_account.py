@@ -390,6 +390,20 @@ class DestinationAccountTests(unittest.TestCase):
             with self.subTest(hook=hook):
                 self.assertEqual(account['account'], 'acme')
 
+    def test_ssh_options_right_after_the_destination_are_read(self):
+        for hook, account in self._each(f'ssh -F {self.ssh_config} prod-bastion -p 2200 -l ops uptime'):
+            with self.subTest(hook=hook):
+                self.assertEqual((account['host'], account['user']), ('10.0.4.12:2200', 'ops'))
+
+    def test_scp_uris_and_a_login_in_gh_host_are_never_misread(self):
+        for hook, account in self._each('scp dump.sql scp://deploy@prod-bastion:2222/tmp/'):
+            with self.subTest(hook=hook):
+                self.assertIsNone(account)
+        for hook, account in self._each(f'GH_HOST=jdoe:{FAKE_TOKEN}@ghe.example.com gh pr create -R acme/app'):
+            with self.subTest(hook=hook):
+                self.assertEqual(account['host'], 'ghe.example.com')
+                self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:

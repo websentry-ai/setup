@@ -5820,9 +5820,9 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         elif arg.startswith('-R') and not arg.startswith('--'):
             repo = arg[2:].lstrip('=')
         elif arg == '--hostname' and i + 1 < len(args):
-            flag_host = args[i + 1].lower()
+            flag_host = args[i + 1].lower().rsplit('@', 1)[-1]
         elif arg.startswith('--hostname='):
-            flag_host = arg.split('=', 1)[1].lower()
+            flag_host = arg.split('=', 1)[1].lower().rsplit('@', 1)[-1]
     # `gh repo view|clone|fork|… OWNER/REPO` and `gh api repos/OWNER/REPO/…` name the repository themselves.
     if not repo and len(args) > 2 and args[0] == 'repo' and not args[2].startswith('-') and '/' in args[2]:
         repo = args[2]
@@ -5833,7 +5833,8 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         elif not any('{owner}' in a or '{repo}' in a for a in args):
             cwd = None  # an api path that names no repo reaches no repo of this checkout
     repo = repo or env.get('GH_REPO') or os.environ.get('GH_REPO') or ''
-    env_host = (env.get('GH_HOST') or os.environ.get('GH_HOST') or '').lower()
+    # A host never carries a login, so anything before an @ is dropped.
+    env_host = (env.get('GH_HOST') or os.environ.get('GH_HOST') or '').lower().rsplit('@', 1)[-1]
     host, owner = '', ''
     if repo:
         repo = _account_strip_login(repo)  # never keep a login or token
@@ -5857,7 +5858,8 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 def _account_remote_operand(operands: List[str]) -> Optional[str]:
     """The last [user@]host: operand, which is where a copy goes; None for an rsync daemon or only local paths."""
     for arg in reversed(operands):
-        if arg.startswith('rsync://'):
+        # A scp://, sftp:// or rsync:// URI is left unresolved rather than read as a host named after its scheme.
+        if '://' in arg:
             return None
         # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
         match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
@@ -5912,8 +5914,9 @@ def _account_ssh_destination(program: str, args: List[str]) -> tuple:
     while i < len(args):
         arg = args[i]
         i += 1
-        # Options end at the first operand: what follows an ssh destination is the remote command.
-        if operands or not arg.startswith('-') or arg == '-':
+        # ssh reads options before and right after its destination; the first other word starts the remote command.
+        reading_options = not operands or (program == 'ssh' and len(operands) == 1)
+        if not reading_options or not arg.startswith('-') or arg == '-':
             operands.append(arg)
             continue
         if arg == '--':
