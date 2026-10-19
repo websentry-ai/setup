@@ -3803,7 +3803,7 @@ def _cursor_turn_prompts(transcript_path):
 
 # Only these commands are ever run to resolve an account; everything else is refused.
 _ACCOUNT_ALLOWED_RUNS = (
-    ('git', 'remote', 'get-url', '--push'),
+    ('git', 'remote', 'get-url'),
     ('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name'),
     ('git', 'symbolic-ref', '--short', '-q', 'HEAD'),
     ('git', 'config', '--get'),
@@ -4047,14 +4047,17 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     env_host = (env.get('GH_HOST') or os.environ.get('GH_HOST') or '').lower()
     host, owner = '', ''
     if repo:
-        repo = re.sub(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)?[^/@]*@', r'\1', repo.strip())  # never keep a login or token
+        repo = _account_strip_login(repo)  # never keep a login or token
         if ':' in repo:
             host, owner, _repo = _account_remote_parts(repo)
         else:
             parts = [p for p in repo.split('/') if p]
             host, owner = (parts[0].lower(), parts[1]) if len(parts) >= 3 else ('', parts[0] if parts else '')
+        if '@' in host or '@' in owner:
+            host, owner = '', ''
     elif cwd:
-        url = _account_run(['git', '-C', cwd, 'remote', 'get-url', '--push', 'origin'], cwd, state)
+        # gh queries the repo origin fetches from, not the one it pushes to.
+        url = _account_run(['git', '-C', cwd, 'remote', 'get-url', 'origin'], cwd, state)
         if url:
             host, owner, _repo = _account_remote_parts(url.strip().splitlines()[0])
     host = flag_host or host or env_host or 'github.com'

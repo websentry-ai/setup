@@ -375,6 +375,21 @@ class DestinationAccountTests(unittest.TestCase):
                     self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
         self.assertFalse(os.path.exists(marker))
 
+    def test_a_token_in_any_gh_repo_shape_never_reaches_the_account(self):
+        for command in (f'GH_REPO=x@{FAKE_TOKEN}@github.com/acme/app gh pr list',
+                        f'gh pr create -Rx@{FAKE_TOKEN}@github.com/acme/app', f'gh pr create --repo=x@{FAKE_TOKEN}@github.com/acme/app',
+                        f'gh api repos/x@{FAKE_TOKEN}@github.com/acme/contents'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
+    def test_gh_follows_the_repo_origin_fetches_from(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        _git(repo, 'remote', 'set-url', '--push', 'origin', 'https://github.com/personal/app.git')
+        for hook, account in self._each('gh pr view 1', repo):
+            with self.subTest(hook=hook):
+                self.assertEqual(account['account'], 'acme')
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:
