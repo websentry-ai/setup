@@ -2107,9 +2107,9 @@ async function gh(args, env, cwd, state) {
 }
 function remoteOperand(operands) {
   for (const arg of [...operands].reverse()) {
-    if (arg.startsWith("rsync://") || arg.includes("::")) return void 0;
-    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[1];
+    if (arg.startsWith("rsync://")) return void 0;
+    const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
+    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[2] === void 0 ? match[1] : void 0;
   }
   return void 0;
 }
@@ -2168,7 +2168,7 @@ function sshDestination(name, args) {
   const destination = remoteOperand(operands);
   if (destination !== void 0) return { destination, passthrough };
   const first = operands[0];
-  if (name === "sftp" && first !== void 0 && /^(?:[^@/:]+@)?\[?[^/:\]]+\]?$/.test(first)) {
+  if (name === "sftp" && first !== void 0 && /^(?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)$/.test(first)) {
     return { destination: first, passthrough };
   }
   return { passthrough: [] };
@@ -2232,9 +2232,14 @@ function configRunsCommands(passthrough) {
       return true;
     }
     for (const line of text.split(/\r?\n/)) {
-      if (/^\s*match\b.*\bexec\b/i.test(line)) return true;
-      const include = /^\s*include\s*[=\s]\s*(.+)/i.exec(line);
-      for (const pattern of include?.[1] === void 0 ? [] : segments(include[1])[0] ?? []) {
+      const words = segments(line).flat();
+      const [first = "", ...rest] = words;
+      const [keyword = "", attached = ""] = first.split(/=(.*)/s);
+      const args = attached ? [attached, ...rest] : rest;
+      if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) {
+        return true;
+      }
+      for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
         const targets = includeTargets(pattern, base);
         if (targets === void 0) return true;
         pending.push(...targets.map((target) => [target, base]));
@@ -2251,7 +2256,7 @@ async function ssh(name, args, dir, state) {
     if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute3(value) ? value : join5(dir ?? "", value);
   }
   if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
-  const out = await run(["ssh", "-G", ...passthrough, destination], state);
+  const out = await run(["ssh", "-G", ...passthrough, destination.replace(/[[\]]/g, "")], state);
   if (out === void 0) return { platform: "ssh", source: "unknown" };
   const settings = /* @__PURE__ */ new Map();
   for (const line of out.split(/\r?\n/)) {

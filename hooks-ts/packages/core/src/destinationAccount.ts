@@ -319,9 +319,10 @@ async function gh(
 /** The last [user@]host: operand, which is where a copy goes; undefined for an rsync daemon or only local paths. */
 function remoteOperand(operands: readonly string[]): string | undefined {
   for (const arg of [...operands].reverse()) {
-    if (arg.startsWith("rsync://") || arg.includes("::")) return undefined;
-    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[1];
+    if (arg.startsWith("rsync://")) return undefined;
+    // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
+    const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
+    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[2] === undefined ? match[1] : undefined;
   }
   return undefined;
 }
@@ -388,7 +389,7 @@ function sshDestination(name: string, args: string[]): { destination?: string; p
   if (destination !== undefined) return { destination, passthrough };
   // sftp also takes a plain [user@]host with no path.
   const first = operands[0];
-  if (name === "sftp" && first !== undefined && /^(?:[^@/:]+@)?\[?[^/:\]]+\]?$/.test(first)) {
+  if (name === "sftp" && first !== undefined && /^(?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)$/.test(first)) {
     return { destination: first, passthrough };
   }
   return { passthrough: [] };
@@ -462,10 +463,15 @@ function configRunsCommands(passthrough: readonly string[]): boolean {
       return true;
     }
     for (const line of text.split(/\r?\n/)) {
-      if (/^\s*match\b.*\bexec\b/i.test(line)) return true;
-      const include = /^\s*include\s*[=\s]\s*(.+)/i.exec(line);
-      // Quoted paths may hold spaces, so the arguments are split the way a shell would.
-      for (const pattern of include?.[1] === undefined ? [] : (segments(include[1])[0] ?? [])) {
+      // Split the way ssh does, so a quoted keyword or path is read as ssh reads it.
+      const words = segments(line).flat();
+      const [first = "", ...rest] = words;
+      const [keyword = "", attached = ""] = first.split(/=(.*)/s);
+      const args = attached ? [attached, ...rest] : rest;
+      if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) {
+        return true;
+      }
+      for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
         const targets = includeTargets(pattern, base);
         if (targets === undefined) return true;
         pending.push(...targets.map((target): [string, string] => [target, base]));
@@ -484,7 +490,7 @@ async function ssh(name: string, args: string[], dir: string | undefined, state:
     if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute(value) ? value : join(dir ?? "", value);
   }
   if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
-  const out = await run(["ssh", "-G", ...passthrough, destination], state);
+  const out = await run(["ssh", "-G", ...passthrough, destination.replace(/[[\]]/g, "")], state);
   if (out === undefined) return { platform: "ssh", source: "unknown" };
   const settings = new Map<string, string>();
   for (const line of out.split(/\r?\n/)) {

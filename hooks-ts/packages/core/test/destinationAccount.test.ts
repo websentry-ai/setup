@@ -283,3 +283,22 @@ test("an ssh config named from the home folder is read", async () => {
     process.env.HOME = previous;
   }
 });
+
+test("quoted ssh keywords are read as ssh reads them", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-keyword-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "inner"), `"Match" host * exec "touch ${marker}"\n`);
+  for (const body of [`"Match" exec "touch ${marker}"`, `"Include" "${join(dir, "inner")}"`, `Match host * "exec" "touch ${marker}"`]) {
+    writeFileSync(join(dir, "config"), `${body}\nHost prod-bastion\n  HostName 10.0.4.12\n`);
+    assert.deepEqual(await resolve(`ssh -F ${join(dir, "config")} prod-bastion`), { platform: "ssh", source: "unknown" }, body);
+  }
+  assert.equal(existsSync(marker), false);
+});
+
+test("bracketed IPv6 copy destinations resolve", async () => {
+  for (const command of ["scp -F none dump.sql deploy@[2001:db8::1]:/tmp/", "scp -F none dump.sql deploy@[2001:db8:0:0:0:0:0:1]:/tmp/"]) {
+    const account = await resolve(command);
+    assert.equal(account?.user, "deploy", command);
+    assert.ok(["2001:db8::1", "2001:db8:0:0:0:0:0:1"].includes(account?.host ?? ""), command);
+  }
+});
