@@ -3808,7 +3808,8 @@ _ACCOUNT_RSYNC_VALUE_OPTIONS = frozenset({
 _ACCOUNT_GH_NO_REPO = frozenset({'auth', 'help', 'version', 'config', 'alias', 'extension', 'completion',
                                  '--help', '-h', '--version'})
 # Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to.
-_ACCOUNT_GIT_OVERRIDE_ENV = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT')
+_ACCOUNT_GIT_OVERRIDE_ENV = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
+                             'GIT_CONFIG_SYSTEM')
 _ACCOUNT_GH_HOSTS_ENV = ('GH_HOST',)
 _ACCOUNT_GH_TOKEN_ENV = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
 
@@ -3878,8 +3879,8 @@ def _account_program(argv: List[str]) -> tuple:
 
 
 def _account_strip_login(url: str) -> str:
-    """A remote URL with any user:password@ removed."""
-    return re.sub(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@', r'\1', url.strip())
+    """A remote URL with any login removed: everything up to the last @ before the path, with or without a scheme."""
+    return re.sub(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)?[^/]*@', r'\1', url.strip())
 
 
 def _account_remote_parts(url: str) -> tuple:
@@ -3891,10 +3892,12 @@ def _account_remote_parts(url: str) -> tuple:
     if not match:
         return '', '', ''
     host, path = match.group(1).lower(), match.group(2).strip('/')
+    if '@' in host:
+        return '', '', ''
     if path.endswith('.git'):
         path = path[:-4]
     parts = [p for p in path.split('/') if p]
-    owner = parts[0] if parts else ''
+    owner = parts[0] if parts and '@' not in parts[0] and ':' not in parts[0] else ''
     repo = parts[-1] if len(parts) > 1 else ''
     return host, owner, repo
 
@@ -4002,8 +4005,12 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
             repo = args[i + 1]
         elif arg.startswith('--repo='):
             repo = arg.split('=', 1)[1]
+        elif arg.startswith('-R') and not arg.startswith('--'):
+            repo = arg[2:].lstrip('=')
         elif arg == '--hostname' and i + 1 < len(args):
             flag_host = args[i + 1].lower()
+        elif arg.startswith('--hostname='):
+            flag_host = arg.split('=', 1)[1].lower()
     # `gh repo view|clone|fork|… OWNER/REPO` and `gh api repos/OWNER/REPO/…` name the repository themselves.
     if not repo and len(args) > 2 and args[0] == 'repo' and not args[2].startswith('-') and '/' in args[2]:
         repo = args[2]
@@ -4166,7 +4173,8 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
             if not words:
                 continue
             keyword, _, attached = words[0].partition('=')
-            words = ([attached] if attached else []) + words[1:]
+            # ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
+            words = [w.lstrip('=') for w in ([attached] if attached else []) + words[1:] if w.lstrip('=')]
             if keyword.lower() == 'match' and any(w.lower().lstrip('!').startswith('exec') for w in words):
                 return True
             for pattern in (words if keyword.lower() == 'include' else []):

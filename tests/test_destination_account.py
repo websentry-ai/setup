@@ -340,6 +340,41 @@ class DestinationAccountTests(unittest.TestCase):
                     self.assertEqual(account['user'], 'deploy')
                     self.assertIn(account['host'], ('2001:db8::1', '2001:db8:0:0:0:0:0:1'))
 
+    def test_a_token_in_any_remote_shape_never_reaches_the_account(self):
+        repo = _repo({'weird': f'jdoe:{FAKE_TOKEN}@github.com:acme/app.git',
+                      'double': f'https://x@{FAKE_TOKEN}@github.com/acme/app.git'})
+        for command in ('git push weird main', 'git push double main',
+                        f'git push https://x@{FAKE_TOKEN}@github.com/acme/app.git main'):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['account']), ('github.com', 'acme'))
+                    self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
+    def test_another_global_git_config_or_gh_flag_forms_are_read(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        for command in ('GIT_CONFIG_GLOBAL=/elsewhere/gitconfig git push', 'GIT_CONFIG_SYSTEM=/elsewhere/gitconfig git push'):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account, {'platform': 'git', 'source': 'unknown'})
+        cases = {'gh pr create --hostname=ghe.example.com -R acme/app': ('ghe.example.com', 'acme'),
+                 'gh pr create -Rother/app': ('github.com', 'other'), 'gh pr create -R=other/app': ('github.com', 'other')}
+        for command, expected in cases.items():
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['account']), expected)
+
+    def test_an_equals_before_an_ssh_argument_is_only_a_separator(self):
+        marker = os.path.join(self.ssh_dir, 'ran-equals')
+        inner = os.path.join(self.ssh_dir, 'inner-equals')
+        Path(inner).write_text(f'Match exec "touch {marker}"\n')
+        for body in (f'Match =exec "touch {marker}"\n', f'Include ={inner}\n'):
+            config = os.path.join(self.ssh_dir, 'equals')
+            Path(config).write_text(body + 'Host prod-bastion\n  HostName 10.0.4.12\n')
+            for hook, account in self._each(f'ssh -F {config} prod-bastion'):
+                with self.subTest(hook=hook, body=body):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        self.assertFalse(os.path.exists(marker))
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:
