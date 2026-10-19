@@ -363,3 +363,24 @@ test("a semicolon in an included path is part of the path", async () => {
   assert.deepEqual(await resolve(`ssh -F ${join(dir, "config")} prod-bastion`), { platform: "ssh", source: "unknown" });
   assert.equal(existsSync(marker), false);
 });
+
+test("ssh options right after the destination are read", async () => {
+  const account = await resolve(`ssh -F ${sshConfig} prod-bastion -p 2200 -l ops uptime`);
+  assert.deepEqual([account?.host, account?.user], ["10.0.4.12:2200", "ops"]);
+});
+
+test("scp URIs and a login in GH_HOST are never misread", async () => {
+  assert.equal(await resolve("scp dump.sql scp://deploy@prod-bastion:2222/tmp/"), undefined);
+  const account = await resolve(`GH_HOST=jdoe:${FAKE_TOKEN}@ghe.example.com gh pr create -R acme/app`);
+  assert.equal(account?.host, "ghe.example.com");
+  assert.ok(!JSON.stringify(account).toLowerCase().includes(FAKE_TOKEN.toLowerCase()));
+});
+
+test("a backslash escape in an included path is read as ssh reads it", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-escape-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "inner_config"), `Match exec "touch ${marker}"\n`);
+  writeFileSync(join(dir, "config"), `Include ${join(dir, "inner\\_config")}\nHost prod-bastion\n  HostName 10.0.4.12\n`);
+  assert.deepEqual(await resolve(`ssh -F ${join(dir, "config")} prod-bastion`), { platform: "ssh", source: "unknown" });
+  assert.equal(existsSync(marker), false);
+});

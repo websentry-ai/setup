@@ -158,6 +158,10 @@ function program(argv: string[]): { name?: string; args: string[]; env: Record<s
   return { args: [], env };
 }
 
+function withoutLogin(host: string): string {
+  return host.slice(host.lastIndexOf("@") + 1);
+}
+
 /** A remote URL with any login removed: everything up to the last @ before the path, with or without a scheme. */
 function stripLogin(url: string): string {
   return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/]*@/, "$1");
@@ -284,8 +288,8 @@ async function gh(
     if ((arg === "-R" || arg === "--repo") && i + 1 < args.length) repo = args[i + 1] as string;
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
     else if (arg.startsWith("-R") && !arg.startsWith("--")) repo = arg.slice(2).replace(/^=/, "");
-    else if (arg === "--hostname" && i + 1 < args.length) flagHost = (args[i + 1] as string).toLowerCase();
-    else if (arg.startsWith("--hostname=")) flagHost = arg.slice("--hostname=".length).toLowerCase();
+    else if (arg === "--hostname" && i + 1 < args.length) flagHost = withoutLogin((args[i + 1] as string).toLowerCase());
+    else if (arg.startsWith("--hostname=")) flagHost = withoutLogin(arg.slice("--hostname=".length).toLowerCase());
   }
   // `gh repo view|clone|fork|… OWNER/REPO` and `gh api repos/OWNER/REPO/…` name the repository themselves.
   const third = args[2];
@@ -299,7 +303,8 @@ async function gh(
     else if (!args.some((a) => a.includes("{owner}") || a.includes("{repo}"))) lookupDir = undefined;
   }
   repo = repo || env.GH_REPO || state.env.GH_REPO || "";
-  const envHost = (env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase();
+  // A host never carries a login, so anything before an @ is dropped.
+  const envHost = withoutLogin((env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase());
   let host = "";
   let owner = "";
   if (repo !== "") {
@@ -331,7 +336,8 @@ async function gh(
 /** The last [user@]host: operand, which is where a copy goes; undefined for an rsync daemon or only local paths. */
 function remoteOperand(operands: readonly string[]): string | undefined {
   for (const arg of [...operands].reverse()) {
-    if (arg.startsWith("rsync://")) return undefined;
+    // A scp://, sftp:// or rsync:// URI is left unresolved rather than read as a host named after its scheme.
+    if (arg.includes("://")) return undefined;
     // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
     if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[2] === undefined ? match[1] : undefined;
@@ -374,8 +380,9 @@ function sshDestination(name: string, args: string[]): { destination?: string; p
   const identityFlags = name === "ssh" ? ["l", "o", "F", "J", "p"] : ["o", "F", "J", "P"];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string;
-    // Options end at the first operand: what follows an ssh destination is the remote command.
-    if (operands.length > 0 || !arg.startsWith("-") || arg === "-") {
+    // ssh reads options before and right after its destination; the first other word starts the remote command.
+    const readingOptions = operands.length === 0 || (name === "ssh" && operands.length === 1);
+    if (!readingOptions || !arg.startsWith("-") || arg === "-") {
       operands.push(arg);
       continue;
     }
@@ -456,8 +463,15 @@ function configWords(line: string): string[] {
   let word = "";
   let inWord = false;
   let quote: string | undefined;
+  let escaped = false;
   for (const ch of line) {
-    if (quote !== undefined) {
+    if (escaped) {
+      word += ch;
+      inWord = true;
+      escaped = false;
+    } else if (ch === "\\" && quote !== "'") {
+      escaped = true; // ssh, like a shell, takes the next character literally
+    } else if (quote !== undefined) {
       if (ch === quote) quote = undefined;
       else word += ch;
     } else if (ch === '"' || ch === "'") {

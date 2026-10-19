@@ -1972,6 +1972,9 @@ function program(argv) {
   }
   return { args: [], env };
 }
+function withoutLogin(host) {
+  return host.slice(host.lastIndexOf("@") + 1);
+}
 function stripLogin(url) {
   return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/]*@/, "$1");
 }
@@ -2079,8 +2082,8 @@ async function gh(args, env, cwd, state) {
     if ((arg === "-R" || arg === "--repo") && i + 1 < args.length) repo = args[i + 1];
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
     else if (arg.startsWith("-R") && !arg.startsWith("--")) repo = arg.slice(2).replace(/^=/, "");
-    else if (arg === "--hostname" && i + 1 < args.length) flagHost = args[i + 1].toLowerCase();
-    else if (arg.startsWith("--hostname=")) flagHost = arg.slice("--hostname=".length).toLowerCase();
+    else if (arg === "--hostname" && i + 1 < args.length) flagHost = withoutLogin(args[i + 1].toLowerCase());
+    else if (arg.startsWith("--hostname=")) flagHost = withoutLogin(arg.slice("--hostname=".length).toLowerCase());
   }
   const third = args[2];
   if (repo === "" && args[0] === "repo" && third !== void 0 && !third.startsWith("-") && third.includes("/")) {
@@ -2093,7 +2096,7 @@ async function gh(args, env, cwd, state) {
     else if (!args.some((a) => a.includes("{owner}") || a.includes("{repo}"))) lookupDir = void 0;
   }
   repo = repo || env.GH_REPO || state.env.GH_REPO || "";
-  const envHost = (env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase();
+  const envHost = withoutLogin((env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase());
   let host = "";
   let owner = "";
   if (repo !== "") {
@@ -2122,7 +2125,7 @@ async function gh(args, env, cwd, state) {
 }
 function remoteOperand(operands) {
   for (const arg of [...operands].reverse()) {
-    if (arg.startsWith("rsync://")) return void 0;
+    if (arg.includes("://")) return void 0;
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
     if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[2] === void 0 ? match[1] : void 0;
   }
@@ -2159,7 +2162,8 @@ function sshDestination(name, args) {
   const identityFlags = name === "ssh" ? ["l", "o", "F", "J", "p"] : ["o", "F", "J", "P"];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (operands.length > 0 || !arg.startsWith("-") || arg === "-") {
+    const readingOptions = operands.length === 0 || name === "ssh" && operands.length === 1;
+    if (!readingOptions || !arg.startsWith("-") || arg === "-") {
       operands.push(arg);
       continue;
     }
@@ -2230,8 +2234,15 @@ function configWords(line) {
   let word = "";
   let inWord = false;
   let quote;
+  let escaped = false;
   for (const ch of line) {
-    if (quote !== void 0) {
+    if (escaped) {
+      word += ch;
+      inWord = true;
+      escaped = false;
+    } else if (ch === "\\" && quote !== "'") {
+      escaped = true;
+    } else if (quote !== void 0) {
       if (ch === quote) quote = void 0;
       else word += ch;
     } else if (ch === '"' || ch === "'") {
