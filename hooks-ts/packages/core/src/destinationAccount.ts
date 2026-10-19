@@ -6,8 +6,8 @@
 // a command that reaches no account is `undefined`. Every lookup has a deadline and the turn shares one
 // budget, so the turn log is never held up for long.
 
-import { readFileSync } from "node:fs";
-import { isAbsolute, join, normalize, basename } from "node:path";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { isAbsolute, join, normalize, basename, dirname } from "node:path";
 import { homedir } from "node:os";
 
 import { defaultExecFile, type ExecFileLike } from "./accountIdentity.ts";
@@ -38,6 +38,22 @@ const SSH_TOOLS: ReadonlySet<string> = new Set(["ssh", "scp", "sftp", "rsync"]);
 const SSH_VALUE_FLAGS: Record<string, string> = { ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX" };
 const GH_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 const SHELL_TOOLS: ReadonlySet<string> = new Set(["bash", "powershell"]);
+/** Of ssh's -o settings, only these change which host or user ssh -G resolves. */
+const SSH_IDENTITY_OPTIONS: ReadonlySet<string> = new Set(["hostname", "user", "port", "proxyjump"]);
+const SSH_CONFIG_MAX_BYTES = 256 * 1024;
+const SSH_CONFIG_MAX_FILES = 32;
+// One string, because a bundle-check treats `-from", "` between literals as an import.
+const RSYNC_VALUE_OPTIONS: ReadonlySet<string> = new Set(
+  ("--exclude --include --filter -f --exclude-from --include-from --files-from --rsync-path --log-file " +
+    "--partial-dir --temp-dir -T --compare-dest --copy-dest --link-dest --backup-dir --chmod --chown --suffix " +
+    "--password-file --port --bwlimit --timeout --max-size --min-size --out-format --remote-option -M").split(" "),
+);
+/** gh commands that reach no repository. */
+const GH_NO_REPO: ReadonlySet<string> = new Set([
+  "auth", "help", "version", "config", "alias", "extension", "completion", "--help", "-h", "--version",
+]);
+/** Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to. */
+const GIT_OVERRIDE_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
 /** Policy outcomes under which the call never ran, so there is nothing to resolve. */
 const NEVER_RAN: ReadonlySet<string> = new Set(["deny", "unavailable"]);
 
@@ -164,7 +180,7 @@ function firstLine(out: string | undefined): string {
 }
 
 async function ghUser(host: string, env: Record<string, string>, state: State): Promise<string> {
-  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k])) return "";
+  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k]) || env.GH_CONFIG_DIR) return "";
   const cached = state.ghUser.get(host);
   if (cached !== undefined) return cached;
   const user = firstLine(await run(["gh", "config", "get", "-h", host, "user"], state));
@@ -176,17 +192,25 @@ async function gitPush(
   args: string[], env: Record<string, string>, cwd: string | undefined, state: State,
 ): Promise<DestinationAccount | undefined> {
   let gitDir = cwd;
+  let overridden = GIT_OVERRIDE_ENV.some((k) => env[k]);
   const rest = [...args];
   while (rest.length > 0 && (rest[0] as string).startsWith("-")) {
     const flag = rest.shift() as string;
     if (flag === "-C" && rest.length > 0) {
       const path = expandHome(rest.shift() as string);
       gitDir = isAbsolute(path) ? path : gitDir === undefined ? undefined : join(gitDir, path);
-    } else if (["-c", "--git-dir", "--work-tree", "--namespace"].includes(flag) && rest.length > 0) {
+    } else if (["-c", "--git-dir", "--work-tree"].includes(flag) && rest.length > 0) {
+      rest.shift();
+      overridden = true;
+    } else if (/^(--git-dir=|--work-tree=|--config-env)/.test(flag) || (flag.startsWith("-c") && flag.length > 2)) {
+      overridden = true;
+    } else if (flag === "--namespace" && rest.length > 0) {
       rest.shift();
     }
   }
   if (rest[0] !== "push") return undefined;
+  // Unknown is safe; the cwd repo's remote would be a confident wrong answer.
+  if (overridden) return { platform: "git", source: "unknown" };
   const pushArgs = rest.slice(1);
   let target: string | undefined;
   const positional: string[] = [];
@@ -234,7 +258,8 @@ async function gitPush(
 
 async function gh(
   args: string[], env: Record<string, string>, cwd: string | undefined, state: State,
-): Promise<DestinationAccount> {
+): Promise<DestinationAccount | undefined> {
+  if (args[0] === undefined || GH_NO_REPO.has(args[0])) return undefined;
   let repo = "";
   let flagHost = "";
   for (let i = 0; i < args.length; i++) {
@@ -279,40 +304,78 @@ async function gh(
   return { platform: "github", host, account: owner, user: await ghUser(host, env, state), context: "", source: "command" };
 }
 
+/** The last [user@]host: operand, which is where a copy goes; undefined for an rsync daemon or only local paths. */
+function remoteOperand(operands: readonly string[]): string | undefined {
+  for (const arg of [...operands].reverse()) {
+    if (arg.startsWith("rsync://") || arg.includes("::")) return undefined;
+    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
+    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[1];
+  }
+  return undefined;
+}
+
+/** rsync's last remote operand, reached through its remote shell, with that shell's ssh identity options. */
+function rsyncDestination(args: string[]): { destination?: string; passthrough: string[] } {
+  let shell: string | undefined;
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i] as string;
+    if (arg === "--rsh" && i + 1 < args.length) shell = args[++i];
+    else if (arg.startsWith("--rsh=")) shell = arg.slice("--rsh=".length);
+    else if (arg.startsWith("-") && !arg.startsWith("--") && arg.indexOf("e", 1) > 0) {
+      const rest = arg.slice(arg.indexOf("e", 1) + 1);
+      if (rest !== "") shell = rest;
+      else if (i + 1 < args.length) shell = args[++i];
+    } else if (RSYNC_VALUE_OPTIONS.has(arg)) i++;
+    else if (!arg.startsWith("-")) operands.push(arg);
+  }
+  let passthrough: string[] = [];
+  if (shell !== undefined) {
+    const shellArgv = segments(shell)[0] ?? [];
+    // A remote shell other than ssh never reads the ssh config.
+    if (shellArgv[0] === undefined || basename(shellArgv[0]) !== "ssh") return { passthrough: [] };
+    passthrough = sshDestination("ssh", [...shellArgv.slice(1), "-"]).passthrough;
+  }
+  const destination = remoteOperand(operands);
+  return destination === undefined ? { passthrough: [] } : { destination, passthrough };
+}
+
 function sshDestination(name: string, args: string[]): { destination?: string; passthrough: string[] } {
+  if (name === "rsync") return rsyncDestination(args);
   const passthrough: string[] = [];
-  const positional: string[] = [];
+  const operands: string[] = [];
   const valueFlags = SSH_VALUE_FLAGS[name] ?? "";
   // Only the options that change which host or user ssh -G resolves are passed through; scp's -l is a bandwidth limit.
   const identityFlags = name === "ssh" ? ["l", "o", "F", "J", "p"] : ["o", "F", "J", "P"];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] as string;
-    if (name === "rsync") {
-      if (arg === "-e" || arg === "--rsh") i++;
-      else if (!arg.startsWith("-")) positional.push(arg);
+    // Options end at the first operand: what follows an ssh destination is the remote command.
+    if (operands.length > 0 || !arg.startsWith("-") || arg === "-") {
+      operands.push(arg);
       continue;
     }
-    if (arg.startsWith("-") && arg.length >= 2 && arg !== "--") {
-      const flag = arg[1] as string;
-      const attached = arg.slice(2);
-      const takesValue = valueFlags.includes(flag);
-      const value = attached !== "" ? attached : takesValue ? args[i + 1] : undefined;
-      if (takesValue && value !== undefined && identityFlags.includes(flag)) {
+    if (arg === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    // Walk a cluster such as -vF: the first option that takes a value takes the rest of it, or the next word.
+    for (let j = 1; j < arg.length; j++) {
+      const flag = arg[j] as string;
+      if (!valueFlags.includes(flag)) continue;
+      let value = arg.slice(j + 1);
+      if (value === "" && i + 1 < args.length) value = args[++i] as string;
+      const option = (value.trim().split(/[\s=]/)[0] ?? "").toLowerCase();
+      if (value !== "" && identityFlags.includes(flag) && (flag !== "o" || SSH_IDENTITY_OPTIONS.has(option))) {
         passthrough.push(flag === "P" ? "-p" : `-${flag}`, value);
       }
-      if (attached === "" && takesValue) i++;
-      continue;
+      break;
     }
-    positional.push(arg);
   }
-  if (name === "ssh") return positional[0] === undefined ? { passthrough: [] } : { destination: positional[0], passthrough };
-  // The last remote operand is where the copy goes.
-  for (const arg of [...positional].reverse()) {
-    if (arg.startsWith("rsync://") || arg.includes("::")) return { passthrough: [] };
-    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return { destination: match[1], passthrough };
-  }
-  const first = positional[0];
+  if (name === "ssh") return operands[0] === undefined ? { passthrough: [] } : { destination: operands[0], passthrough };
+  const destination = remoteOperand(operands);
+  if (destination !== undefined) return { destination, passthrough };
+  // sftp also takes a plain [user@]host with no path.
+  const first = operands[0];
   if (name === "sftp" && first !== undefined && /^(?:[^@/:]+@)?\[?[^/:\]]+\]?$/.test(first)) {
     return { destination: first, passthrough };
   }
@@ -323,15 +386,55 @@ function expandHome(path: string): string {
   return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
 }
 
-/** Whether the ssh config that ssh -G would read has a Match exec, which ssh runs while resolving. */
-function configRunsCommands(passthrough: readonly string[]): boolean {
-  let path = "~/.ssh/config";
-  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") path = passthrough[i + 1] as string;
+/** The files an ssh Include pattern names; undefined when it can't be expanded, so the caller refuses. */
+function includeTargets(pattern: string, base: string): string[] | undefined {
+  const path = expandHome(pattern.replace(/^"|"$/g, ""));
+  const full = isAbsolute(path) ? path : join(base, path);
+  if (!/[*?[]/.test(full)) return [full];
+  if (/[*?[]/.test(dirname(full))) return undefined;
+  const glob = new RegExp(`^${basename(full).replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
   try {
-    return /^\s*match\b.*\bexec\b/im.test(readFileSync(expandHome(path), "utf8"));
+    return readdirSync(dirname(full)).filter((entry) => glob.test(entry)).sort().map((entry) => join(dirname(full), entry));
   } catch {
-    return false;
+    return [];
   }
+}
+
+/** Whether ssh -G could run a command while reading its configs: a Match exec anywhere, or a file it can't check. */
+function configRunsCommands(passthrough: readonly string[]): boolean {
+  const homeSsh = join(homedir(), ".ssh");
+  let config: string | undefined;
+  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
+  if (config === "none") return false;
+  if (config !== undefined && !isAbsolute(config)) return true;
+  const pending: [string, string][] =
+    config === undefined ? [[join(homeSsh, "config"), homeSsh], ["/etc/ssh/ssh_config", "/etc/ssh"]] : [[config, homeSsh]];
+  const seen = new Set<string>();
+  while (pending.length > 0) {
+    const [path, base] = pending.pop() as [string, string];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    let text: string;
+    try {
+      const info = statSync(path, { throwIfNoEntry: false });
+      if (info === undefined) continue;
+      // Only small regular files are read, so a fifo or a huge file can't hold up the turn.
+      if (seen.size > SSH_CONFIG_MAX_FILES || !info.isFile() || info.size > SSH_CONFIG_MAX_BYTES) return true;
+      text = readFileSync(path, "utf8");
+    } catch {
+      return true;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (/^\s*match\b.*\bexec\b/i.test(line)) return true;
+      const include = /^\s*include\s*[=\s]\s*(.+)/i.exec(line);
+      for (const pattern of include?.[1]?.trim().split(/\s+/) ?? []) {
+        const targets = includeTargets(pattern, base);
+        if (targets === undefined) return true;
+        pending.push(...targets.map((target): [string, string] => [target, base]));
+      }
+    }
+  }
+  return false;
 }
 
 async function ssh(name: string, args: string[], dir: string | undefined, state: State): Promise<DestinationAccount | undefined> {

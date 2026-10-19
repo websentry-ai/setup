@@ -1847,8 +1847,8 @@ function createTurnStore() {
 var turnStore = createTurnStore();
 
 // packages/core/src/destinationAccount.ts
-import { readFileSync as readFileSync3 } from "node:fs";
-import { isAbsolute as isAbsolute3, join as join5, normalize, basename } from "node:path";
+import { readdirSync, readFileSync as readFileSync3, statSync } from "node:fs";
+import { isAbsolute as isAbsolute3, join as join5, normalize, basename, dirname as dirname3 } from "node:path";
 import { homedir } from "node:os";
 var ALLOWED_RUNS = [
   ["git", "remote", "get-url", "--push"],
@@ -1865,6 +1865,25 @@ var SSH_TOOLS = /* @__PURE__ */ new Set(["ssh", "scp", "sftp", "rsync"]);
 var SSH_VALUE_FLAGS = { ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX" };
 var GH_TOKEN_ENV = ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"];
 var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
+var SSH_IDENTITY_OPTIONS = /* @__PURE__ */ new Set(["hostname", "user", "port", "proxyjump"]);
+var SSH_CONFIG_MAX_BYTES = 256 * 1024;
+var SSH_CONFIG_MAX_FILES = 32;
+var RSYNC_VALUE_OPTIONS = new Set(
+  "--exclude --include --filter -f --exclude-from --include-from --files-from --rsync-path --log-file --partial-dir --temp-dir -T --compare-dest --copy-dest --link-dest --backup-dir --chmod --chown --suffix --password-file --port --bwlimit --timeout --max-size --min-size --out-format --remote-option -M".split(" ")
+);
+var GH_NO_REPO = /* @__PURE__ */ new Set([
+  "auth",
+  "help",
+  "version",
+  "config",
+  "alias",
+  "extension",
+  "completion",
+  "--help",
+  "-h",
+  "--version"
+]);
+var GIT_OVERRIDE_ENV = ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"];
 var NEVER_RAN = /* @__PURE__ */ new Set(["deny", "unavailable"]);
 function stripGitDir(argv) {
   return argv.length >= 3 && argv[0] === "git" && argv[1] === "-C" ? [argv[0], ...argv.slice(3)] : argv;
@@ -1965,7 +1984,7 @@ function firstLine(out) {
   return (out ?? "").trim().split(/\r?\n/)[0] ?? "";
 }
 async function ghUser(host, env, state) {
-  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k])) return "";
+  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k]) || env.GH_CONFIG_DIR) return "";
   const cached = state.ghUser.get(host);
   if (cached !== void 0) return cached;
   const user = firstLine(await run(["gh", "config", "get", "-h", host, "user"], state));
@@ -1974,17 +1993,24 @@ async function ghUser(host, env, state) {
 }
 async function gitPush(args, env, cwd, state) {
   let gitDir = cwd;
+  let overridden = GIT_OVERRIDE_ENV.some((k) => env[k]);
   const rest = [...args];
   while (rest.length > 0 && rest[0].startsWith("-")) {
     const flag = rest.shift();
     if (flag === "-C" && rest.length > 0) {
       const path = expandHome(rest.shift());
       gitDir = isAbsolute3(path) ? path : gitDir === void 0 ? void 0 : join5(gitDir, path);
-    } else if (["-c", "--git-dir", "--work-tree", "--namespace"].includes(flag) && rest.length > 0) {
+    } else if (["-c", "--git-dir", "--work-tree"].includes(flag) && rest.length > 0) {
+      rest.shift();
+      overridden = true;
+    } else if (/^(--git-dir=|--work-tree=|--config-env)/.test(flag) || flag.startsWith("-c") && flag.length > 2) {
+      overridden = true;
+    } else if (flag === "--namespace" && rest.length > 0) {
       rest.shift();
     }
   }
   if (rest[0] !== "push") return void 0;
+  if (overridden) return { platform: "git", source: "unknown" };
   const pushArgs = rest.slice(1);
   let target;
   const positional = [];
@@ -2026,6 +2052,7 @@ async function gitPush(args, env, cwd, state) {
   return { platform: platformForHost(host), host, account: owner, user, context: remote, source: "command" };
 }
 async function gh(args, env, cwd, state) {
+  if (args[0] === void 0 || GH_NO_REPO.has(args[0])) return void 0;
   let repo = "";
   let flagHost = "";
   for (let i = 0; i < args.length; i++) {
@@ -2068,38 +2095,69 @@ async function gh(args, env, cwd, state) {
   host = flagHost || host || envHost || "github.com";
   return { platform: "github", host, account: owner, user: await ghUser(host, env, state), context: "", source: "command" };
 }
+function remoteOperand(operands) {
+  for (const arg of [...operands].reverse()) {
+    if (arg.startsWith("rsync://") || arg.includes("::")) return void 0;
+    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
+    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[1];
+  }
+  return void 0;
+}
+function rsyncDestination(args) {
+  let shell;
+  const operands = [];
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--rsh" && i + 1 < args.length) shell = args[++i];
+    else if (arg.startsWith("--rsh=")) shell = arg.slice("--rsh=".length);
+    else if (arg.startsWith("-") && !arg.startsWith("--") && arg.indexOf("e", 1) > 0) {
+      const rest = arg.slice(arg.indexOf("e", 1) + 1);
+      if (rest !== "") shell = rest;
+      else if (i + 1 < args.length) shell = args[++i];
+    } else if (RSYNC_VALUE_OPTIONS.has(arg)) i++;
+    else if (!arg.startsWith("-")) operands.push(arg);
+  }
+  let passthrough = [];
+  if (shell !== void 0) {
+    const shellArgv = segments(shell)[0] ?? [];
+    if (shellArgv[0] === void 0 || basename(shellArgv[0]) !== "ssh") return { passthrough: [] };
+    passthrough = sshDestination("ssh", [...shellArgv.slice(1), "-"]).passthrough;
+  }
+  const destination = remoteOperand(operands);
+  return destination === void 0 ? { passthrough: [] } : { destination, passthrough };
+}
 function sshDestination(name, args) {
+  if (name === "rsync") return rsyncDestination(args);
   const passthrough = [];
-  const positional = [];
+  const operands = [];
   const valueFlags = SSH_VALUE_FLAGS[name] ?? "";
   const identityFlags = name === "ssh" ? ["l", "o", "F", "J", "p"] : ["o", "F", "J", "P"];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
-    if (name === "rsync") {
-      if (arg === "-e" || arg === "--rsh") i++;
-      else if (!arg.startsWith("-")) positional.push(arg);
+    if (operands.length > 0 || !arg.startsWith("-") || arg === "-") {
+      operands.push(arg);
       continue;
     }
-    if (arg.startsWith("-") && arg.length >= 2 && arg !== "--") {
-      const flag = arg[1];
-      const attached = arg.slice(2);
-      const takesValue = valueFlags.includes(flag);
-      const value = attached !== "" ? attached : takesValue ? args[i + 1] : void 0;
-      if (takesValue && value !== void 0 && identityFlags.includes(flag)) {
+    if (arg === "--") {
+      operands.push(...args.slice(i + 1));
+      break;
+    }
+    for (let j = 1; j < arg.length; j++) {
+      const flag = arg[j];
+      if (!valueFlags.includes(flag)) continue;
+      let value = arg.slice(j + 1);
+      if (value === "" && i + 1 < args.length) value = args[++i];
+      const option = (value.trim().split(/[\s=]/)[0] ?? "").toLowerCase();
+      if (value !== "" && identityFlags.includes(flag) && (flag !== "o" || SSH_IDENTITY_OPTIONS.has(option))) {
         passthrough.push(flag === "P" ? "-p" : `-${flag}`, value);
       }
-      if (attached === "" && takesValue) i++;
-      continue;
+      break;
     }
-    positional.push(arg);
   }
-  if (name === "ssh") return positional[0] === void 0 ? { passthrough: [] } : { destination: positional[0], passthrough };
-  for (const arg of [...positional].reverse()) {
-    if (arg.startsWith("rsync://") || arg.includes("::")) return { passthrough: [] };
-    const match = /^((?:[^@/:]+@)?\[?[^/:\]]+\]?):/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return { destination: match[1], passthrough };
-  }
-  const first = positional[0];
+  if (name === "ssh") return operands[0] === void 0 ? { passthrough: [] } : { destination: operands[0], passthrough };
+  const destination = remoteOperand(operands);
+  if (destination !== void 0) return { destination, passthrough };
+  const first = operands[0];
   if (name === "sftp" && first !== void 0 && /^(?:[^@/:]+@)?\[?[^/:\]]+\]?$/.test(first)) {
     return { destination: first, passthrough };
   }
@@ -2108,14 +2166,50 @@ function sshDestination(name, args) {
 function expandHome(path) {
   return path === "~" || path.startsWith("~/") ? join5(homedir(), path.slice(1)) : path;
 }
-function configRunsCommands(passthrough) {
-  let path = "~/.ssh/config";
-  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") path = passthrough[i + 1];
+function includeTargets(pattern, base) {
+  const path = expandHome(pattern.replace(/^"|"$/g, ""));
+  const full = isAbsolute3(path) ? path : join5(base, path);
+  if (!/[*?[]/.test(full)) return [full];
+  if (/[*?[]/.test(dirname3(full))) return void 0;
+  const glob = new RegExp(`^${basename(full).replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
   try {
-    return /^\s*match\b.*\bexec\b/im.test(readFileSync3(expandHome(path), "utf8"));
+    return readdirSync(dirname3(full)).filter((entry) => glob.test(entry)).sort().map((entry) => join5(dirname3(full), entry));
   } catch {
-    return false;
+    return [];
   }
+}
+function configRunsCommands(passthrough) {
+  const homeSsh = join5(homedir(), ".ssh");
+  let config;
+  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
+  if (config === "none") return false;
+  if (config !== void 0 && !isAbsolute3(config)) return true;
+  const pending = config === void 0 ? [[join5(homeSsh, "config"), homeSsh], ["/etc/ssh/ssh_config", "/etc/ssh"]] : [[config, homeSsh]];
+  const seen = /* @__PURE__ */ new Set();
+  while (pending.length > 0) {
+    const [path, base] = pending.pop();
+    if (seen.has(path)) continue;
+    seen.add(path);
+    let text;
+    try {
+      const info = statSync(path, { throwIfNoEntry: false });
+      if (info === void 0) continue;
+      if (seen.size > SSH_CONFIG_MAX_FILES || !info.isFile() || info.size > SSH_CONFIG_MAX_BYTES) return true;
+      text = readFileSync3(path, "utf8");
+    } catch {
+      return true;
+    }
+    for (const line of text.split(/\r?\n/)) {
+      if (/^\s*match\b.*\bexec\b/i.test(line)) return true;
+      const include = /^\s*include\s*[=\s]\s*(.+)/i.exec(line);
+      for (const pattern of include?.[1]?.trim().split(/\s+/) ?? []) {
+        const targets = includeTargets(pattern, base);
+        if (targets === void 0) return true;
+        pending.push(...targets.map((target) => [target, base]));
+      }
+    }
+  }
+  return false;
 }
 async function ssh(name, args, dir, state) {
   const { destination, passthrough } = sshDestination(name, args);
@@ -2659,7 +2753,7 @@ function mintBrokerId() {
 }
 
 // packages/pi/src/mcpConfig.ts
-import { closeSync, constants as fsConstants, fstatSync, lstatSync as lstatSync2, openSync, readSync, statSync } from "node:fs";
+import { closeSync, constants as fsConstants, fstatSync, lstatSync as lstatSync2, openSync, readSync, statSync as statSync2 } from "node:fs";
 import { isAbsolute as isAbsolute4, join as join6 } from "node:path";
 var KNOWN_SERVER_KEYS = /* @__PURE__ */ new Set([
   "command",
@@ -2878,7 +2972,7 @@ function signatureOf(paths) {
   const parts = [];
   for (const path of paths) {
     let part = `${path}=`;
-    for (const stat of [lstatSync2, statSync]) {
+    for (const stat of [lstatSync2, statSync2]) {
       try {
         const s = stat(path);
         part += `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs};`;
