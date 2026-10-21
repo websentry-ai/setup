@@ -508,6 +508,49 @@ class DestinationAccountTests(unittest.TestCase):
                     self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
         self.assertFalse(os.path.exists(marker))
 
+    def test_redirections_are_not_arguments_and_heredoc_bodies_are_not_commands(self):
+        repo = _repo({'personal': 'https://github.com/jdoe-dev/app.git'})
+        for command in ('git push personal main 2>&1 | tail -5', 'git push > /tmp/push.log personal main',
+                        'git push personal main &>/dev/null', "cat <<'EOF'\nnotes\nEOF\ngit push personal main"):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account['account'], 'jdoe-dev')
+        for command in (f"cat > deploy.sh <<'EOF'\nssh -F {self.ssh_config} prod-bastion uptime\ngit push personal main\nEOF",
+                        f"cat <<-EOF\n\tssh -F {self.ssh_config} prod-bastion\n\tEOF"):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertIsNone(account)
+
+    def test_gh_commands_outside_the_checkout_and_urls_with_a_login(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        for command in ('gh search repos unbound', 'gh gist create notes.md', 'gh repo create scratch --private'):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertNotIn('account', account)
+        for hook, account in self._each('gh pr view https://jdoe@github.com/other/app/pull/1', repo):
+            with self.subTest(hook=hook, command='url with login'):
+                self.assertEqual(account['account'], 'other')
+
+    def test_scp_uris_drive_letters_and_sudo_are_never_misread(self):
+        for command in (f'scp -F {self.ssh_config} dump.sql scp://deploy:p@ss@prod-bastion:2200/tmp/',):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertIsNone(account)
+        for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file C:/Users/me/out'):
+            with self.subTest(hook=hook, command='drive letter'):
+                self.assertEqual((account['host'], account['user']), ('10.0.4.12:2222', 'deploy'))
+        for hook, account in self._each('sudo -u nobody ssh prod-bastion'):
+            with self.subTest(hook=hook, command='sudo without -F'):
+                self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+
+    def test_git_config_set_rewrites_count_as_rewrites(self):
+        repo = _repo({'personal': 'https://github.com/decoy/app.git'})
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(hook._destination_account(
+                    'git push personal main; git config set remote.personal.url https://github.com/decoy/app.git', repo, {}),
+                    {'platform': 'git', 'source': 'unknown'})
+
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook.subprocess, 'run') as run:

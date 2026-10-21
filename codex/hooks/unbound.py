@@ -3890,6 +3890,8 @@ _ACCOUNT_RSYNC_VALUE_OPTIONS = frozenset({
 # gh commands that reach no repository.
 _ACCOUNT_GH_NO_REPO = frozenset({'auth', 'help', 'version', 'config', 'alias', 'extension', 'completion',
                                  '--help', '-h', '--version'})
+# gh commands that reach GitHub but not the checkout's repository, so only the host and login are known.
+_ACCOUNT_GH_NO_CHECKOUT = frozenset({'search', 'gist', 'org', 'codespace', 'ssh-key', 'gpg-key', 'status', 'project'})
 # gh options whose value is never a repository, skipped so a value such as --title '-Rx/y' is not read as one.
 _ACCOUNT_GH_VALUE_OPTIONS = frozenset({
     '-t', '--title', '-b', '--body', '-F', '--body-file', '-B', '--base', '-H', '--head', '-l', '--label', '-a',
@@ -3928,28 +3930,105 @@ def _account_strip_git_dir(argv: List[str]) -> List[str]:
     return argv
 
 
-def _account_segments(command: str) -> List[tuple]:
-    """The command as (argv, operator before it) per simple command, split on ; && || | and newlines; [] if unparsable."""
-    try:
-        # A backslash-newline continues the line; a comment swallows its newline, so a doubled one survives it.
-        text = command.replace('\\\n', ' ').replace('\n', '\n\n')
-        lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|\n')
-        lexer.whitespace_split = True
-        lexer.whitespace = ' \t\r'
-        segments, current, operator = [], [], ''
-        for token in lexer:
-            if token and set(token) <= set(';&|\n'):
-                if current:
-                    segments.append((current, operator))
-                    operator = token.strip('\n') if token.strip('\n') in ('&&', '||') else ';'
-                current = []
+def _account_read_word(text: str, i: int) -> tuple:
+    """(the shell word starting at i after blanks, the index after it); quotes and backslashes are undone."""
+    while i < len(text) and text[i] in ' \t':
+        i += 1
+    word, quote = '', None
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == '\\' and quote == '"' and i + 1 < len(text):
+                i += 1
+                word += text[i]
             else:
-                current.append(token)
-        if current:
-            segments.append((current, operator))
-        return segments
-    except Exception:
+                word += ch
+        elif ch in '\'"':
+            quote = ch
+        elif ch == '\\' and i + 1 < len(text):
+            i += 1
+            word += text[i]
+        elif ch in ' \t\r\n;&|<>':
+            break
+        else:
+            word += ch
+        i += 1
+    return word, i
+
+
+def _account_segments(command: str) -> List[tuple]:
+    """The command as (argv, operator before it) per simple command; redirections and heredoc bodies are left out."""
+    segments, argv, word, in_word, operator, quote, heredocs, i = [], [], '', False, '', None, [], 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == '\\' and quote == '"' and i + 1 < len(command):
+                i += 1
+                word += command[i]
+            else:
+                word += ch
+            i += 1
+            continue
+        if ch in '\'"':
+            quote, in_word = ch, True
+        elif ch == '\\' and command[i + 1:i + 2] == '\n':
+            i += 1  # a backslash-newline continues the line
+        elif ch == '\\' and i + 1 < len(command):
+            i += 1
+            word, in_word = word + command[i], True
+        elif ch == '#' and not in_word:
+            while i + 1 < len(command) and command[i + 1] != '\n':
+                i += 1  # a comment runs to the end of its line
+        elif ch in '<>' or command[i:i + 2] == '&>':
+            # A redirection's operator, an fd number written against it, and its target are not arguments.
+            if in_word and not (word.isdigit() and ch != '&'):
+                argv.append(word)
+            word, in_word = '', False
+            op = re.match(r'&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>', command[i:]).group(0)
+            target, i = _account_read_word(command, i + len(op))
+            if op in ('<<', '<<-'):
+                heredocs.append((target, op == '<<-'))
+            continue
+        elif ch in ';&|\n':
+            if in_word:
+                argv.append(word)
+            word, in_word = '', False
+            pair = command[i:i + 2]
+            following = pair if pair in ('&&', '||') else ';'
+            i += 1 if following != ';' else 0
+            if argv:
+                segments.append((argv, operator))
+                operator = following
+            elif following != ';':
+                operator = following
+            argv = []
+            # A heredoc's body starts on the next line and is input, not commands.
+            while ch == '\n' and heredocs:
+                delimiter, strip_tabs = heredocs.pop(0)
+                while i + 1 < len(command):
+                    end = command.find('\n', i + 1)
+                    line = command[i + 1:] if end < 0 else command[i + 1:end]
+                    i = len(command) - 1 if end < 0 else end
+                    if (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                        break
+        elif ch in ' \t\r':
+            if in_word:
+                argv.append(word)
+            word, in_word = '', False
+        else:
+            word, in_word = word + ch, True
+        i += 1
+    if quote:
         return []
+    if in_word:
+        argv.append(word)
+    if argv:
+        segments.append((argv, operator))
+    return segments
 
 
 def _account_is_assignment(token: str) -> bool:
@@ -3957,8 +4036,8 @@ def _account_is_assignment(token: str) -> bool:
 
 
 def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
-    """(program, its args, inline VAR=value settings, folder it runs in) after assignments and wrappers like sudo."""
-    env, argv, i, wrapper, operands, options_done = {}, list(argv), 0, None, 0, False
+    """(program, its args, inline VAR=value settings, folder it runs in, whether it runs as another user)."""
+    env, argv, i, wrapper, operands, options_done, other_user = {}, list(argv), 0, None, 0, False, False
     while i < len(argv):
         token = argv[i]
         i += 1
@@ -3972,7 +4051,7 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
         if wrapper is not None and not options_done and token.startswith('-') and token != '-':
             short_flags, long_flags, _ = _ACCOUNT_WRAPPERS[wrapper]
             if wrapper == 'command' and token in ('-v', '-V'):
-                return None, [], env, cwd  # only looks the command up
+                return None, [], env, cwd, other_user  # only looks the command up
             name, value = token, None
             if token.startswith('--'):
                 name, eq, attached = token.partition('=')
@@ -3991,10 +4070,7 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
                 path = os.path.expanduser(value)
                 cwd = path if os.path.isabs(path) else os.path.normpath(os.path.join(cwd or '', path))
             elif value is not None and name in ('-S', '--split-string') and wrapper == 'env':
-                try:
-                    argv[i:i] = shlex.split(value)
-                except ValueError:
-                    return None, [], env, cwd
+                argv[i:i] = [w for segment, _ in _account_segments(value) for w in segment]
             continue
         if wrapper is not None and operands > 0:
             operands -= 1
@@ -4002,9 +4078,10 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
         if os.path.basename(token) in _ACCOUNT_WRAPPERS:
             wrapper, options_done = os.path.basename(token), False
             operands = _ACCOUNT_WRAPPERS[wrapper][2]
+            other_user = other_user or wrapper in ('sudo', 'doas')
             continue
-        return os.path.basename(token), argv[i:], env, cwd
-    return None, [], env, cwd
+        return os.path.basename(token), argv[i:], env, cwd, other_user
+    return None, [], env, cwd, other_user
 
 
 def _account_strip_login(url: str) -> str:
@@ -4213,7 +4290,11 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     if not repo and len(positional) > 2 and positional[0] == 'repo' and '/' in positional[2]:
         repo = positional[2]
     if not repo and positional[:1] != ['api']:
-        repo = next((m.group(1) for m in (re.match(r'^https?://([^/@]+/[^/@]+/[^/@]+)', a) for a in positional[1:]) if m), '')
+        repo = next((m.group(1) for m in (re.match(r'^https?://([^/@]+/[^/@]+/[^/@]+)', _account_strip_login(a))
+                                           for a in positional[1:]) if m), '')
+    if positional[:1] and positional[0] in _ACCOUNT_GH_NO_CHECKOUT or \
+            positional[:2] in (['repo', 'list'], ['repo', 'create']) and not repo:
+        cwd = None
     if not repo and positional[:1] == ['api']:
         named = next((m for m in (re.match(r'^/?repos/([^/{}@]+/[^/{}@]+)', a) for a in positional[1:]) if m), None)
         if named:
@@ -4246,7 +4327,7 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 def _account_remote_operand(operands: List[str]) -> tuple:
     """(the last remote [user@]host operand, its port) for a copy; (None, None) for an rsync daemon or local paths."""
     for arg in reversed(operands):
-        uri = re.match(r'^(scp|sftp)://(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:\[\]@]+)(?::(\d+))?', arg)
+        uri = re.match(r'^(scp|sftp)://(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:\[\]@]+)(?::(\d+))?(?=/|$)', arg)
         if uri:
             # A scp:// or sftp:// URI names the login and port itself; anything after the user (a password) is dropped.
             return (f'{uri.group(2)}@{uri.group(3)}' if uri.group(2) else uri.group(3)), uri.group(4)
@@ -4254,7 +4335,8 @@ def _account_remote_operand(operands: List[str]) -> tuple:
             return None, None
         # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
         match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
-        if match and not re.match(r'^[A-Za-z]:\\', arg):
+        # A drive letter (C:\x or C:/x) is a local path, not a host.
+        if match and not re.match(r'^[A-Za-z]:[\\/]', arg):
             return (None, None) if match.group(2) else (match.group(1), None)
     return None, None
 
@@ -4286,10 +4368,7 @@ def _account_rsync_destination(args: List[str], env: Dict) -> tuple:
             operands.append(arg)
     passthrough = []
     if shell:
-        try:
-            shell_argv = shlex.split(shell)
-        except ValueError:
-            return None, []
+        shell_argv = [w for segment, _ in _account_segments(shell) for w in segment]
         # A remote shell other than ssh never reads the ssh config.
         if not shell_argv or os.path.basename(shell_argv[0]) != 'ssh':
             return None, []
@@ -4429,11 +4508,15 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
     return False
 
 
-def _account_ssh(program: str, args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
+def _account_ssh(program: str, args: List[str], env: Dict, cwd: Optional[str], state: Dict,
+                 other_user: bool = False) -> Optional[Dict]:
     """The host and user an ssh-family command reaches, resolved through ssh -G."""
     destination, passthrough = _account_ssh_destination(program, args, env)
     if not destination:
         return None
+    if other_user and '-F' not in passthrough[::2]:
+        # Under sudo, ssh reads that user's config, which this hook can't.
+        return {'platform': 'ssh', 'source': 'unknown'}
     if _account_ssh_config_runs_commands(passthrough, cwd):
         return {'platform': 'ssh', 'source': 'unknown'}
     out = _account_run(['ssh', '-G'] + passthrough + [destination.replace('[', '').replace(']', '')], cwd, state)
@@ -4469,7 +4552,10 @@ def _account_rewrites_remotes(args: List[str], cwd: Optional[str]) -> tuple:
     if rest[:1] == ['config']:
         options = [a for a in rest[1:] if a.startswith('-')]
         keys = [a.lower() for a in rest[1:] if not a.startswith('-')]
-        reads = {'--get', '--get-all', '--get-regexp', '--list', '-l', '--get-urlmatch'} & set(options)
+        reads = {'--get', '--get-all', '--get-regexp', '--list', '-l', '--get-urlmatch'} & set(options) or \
+            keys[:1] in (['get'], ['list'])
+        # git 2.46 also takes `git config set|unset <key>`.
+        keys = keys[1:] if keys[:1] in (['set'], ['unset']) else keys
         if not reads and keys and keys[0].startswith(('remote.', 'url.', 'branch.')):
             scoped = {'--global', '--system', '--file', '-f'} & set(options)
             return True, None if scoped else git_dir
@@ -4486,7 +4572,7 @@ def _destination_account(command: Optional[str], cwd: Optional[str], state: Dict
             # A literal true or false decides whether && or || runs the next command; any other status is unknown.
             if (operator == '&&' and status == 1) or (operator == '||' and status == 0):
                 continue
-            program, args, env, seg_cwd = _account_program(argv, cwd)
+            program, args, env, seg_cwd, other_user = _account_program(argv, cwd)
             env = {**exported, **env}
             status = 0 if program in ('true', ':') else 1 if program == 'false' else None
             if program == 'export':
@@ -4519,7 +4605,7 @@ def _destination_account(command: Optional[str], cwd: Optional[str], state: Dict
             elif program == 'gh':
                 account = _account_gh(args, env, seg_cwd, state)
             elif program in _ACCOUNT_SSH_TOOLS:
-                account = _account_ssh(program, args, env, seg_cwd, state)
+                account = _account_ssh(program, args, env, seg_cwd, state, other_user)
             # The folder whose remotes this answer was read from, if it was read from a remote.
             push_dir = state.pop('_push_dir', None)
             if account:
