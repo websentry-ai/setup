@@ -1917,6 +1917,7 @@ var GH_NO_REPO = /* @__PURE__ */ new Set([
 var GH_VALUE_OPTIONS = new Set(
   "-t --title -b --body -F --body-file -B --base -H --head -l --label -a --assignee -r --reviewer -m --milestone --project -q --jq -T --template --json -S --search -s --state -L --limit -A --author -f --field --raw-field --header -X --method --input --workflow --ref -n --notes --notes-file --target -j --job --branch --message --name --description --visibility --color --env --org --key".split(" ")
 );
+var GH_NO_CHECKOUT = /* @__PURE__ */ new Set(["search", "gist", "org", "codespace", "ssh-key", "gpg-key", "status", "project"]);
 var GH_REMOTE_ORDER = ["upstream", "github", "origin"];
 var GIT_OVERRIDE_ENV = [
   "GIT_DIR",
@@ -1943,6 +1944,29 @@ async function run(argv, state) {
     return void 0;
   }
 }
+function readWord(text, start) {
+  let i = start;
+  while (i < text.length && (text[i] === " " || text[i] === "	")) i++;
+  let word = "";
+  let quote;
+  for (; i < text.length; i++) {
+    const ch = text[i];
+    if (quote !== void 0) {
+      if (ch === quote) quote = void 0;
+      else if (ch === "\\" && quote === '"' && i + 1 < text.length) word += text[++i];
+      else word += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "\\" && i + 1 < text.length) {
+      word += text[++i];
+    } else if (" 	\r\n;&|<>".includes(ch)) {
+      break;
+    } else {
+      word += ch;
+    }
+  }
+  return [word, i];
+}
 function segments(command) {
   const out = [];
   let current = [];
@@ -1950,6 +1974,7 @@ function segments(command) {
   let inWord = false;
   let quote;
   let operator = "";
+  const heredocs = [];
   const endWord = () => {
     if (inWord) current.push(word);
     word = "";
@@ -1983,11 +2008,28 @@ function segments(command) {
     } else if (ch === "\\" && i + 1 < command.length) {
       word += command[++i];
       inWord = true;
+    } else if (ch === "<" || ch === ">" || ch === "&" && command[i + 1] === ">") {
+      if (inWord && !(/^\d+$/.test(word) && ch !== "&")) current.push(word);
+      word = "";
+      inWord = false;
+      const op = /^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(command.slice(i))[0];
+      const [target, next] = readWord(command, i + op.length);
+      if (op === "<<" || op === "<<-") heredocs.push([target, op === "<<-"]);
+      i = next - 1;
     } else if ((ch === "&" || ch === "|") && command[i + 1] === ch) {
       i++;
       endSegment(ch + ch);
     } else if (ch === ";" || ch === "&" || ch === "|" || ch === "\n") {
       endSegment(";");
+      while (ch === "\n" && heredocs.length > 0) {
+        const [delimiter, stripTabs] = heredocs.shift();
+        while (i + 1 < command.length) {
+          const end = command.indexOf("\n", i + 1);
+          const line = end < 0 ? command.slice(i + 1) : command.slice(i + 1, end);
+          i = end < 0 ? command.length - 1 : end;
+          if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        }
+      }
     } else if (ch === " " || ch === "	" || ch === "\r") {
       endWord();
     } else {
@@ -1995,6 +2037,7 @@ function segments(command) {
       inWord = true;
     }
   }
+  if (quote !== void 0) return [];
   endSegment(";");
   return out;
 }
@@ -2012,6 +2055,7 @@ function moveTo(cwd, path) {
 function program(input, cwd) {
   const env = {};
   const argv = [...input];
+  let otherUser = false;
   let wrapper;
   let operands = 0;
   let optionsDone = false;
@@ -2028,7 +2072,7 @@ function program(input, cwd) {
     }
     if (wrapper !== void 0 && !optionsDone && token.startsWith("-") && token !== "-") {
       const spec = WRAPPERS[wrapper];
-      if (wrapper === "command" && (token === "-v" || token === "-V")) return { args: [], env, cwd };
+      if (wrapper === "command" && (token === "-v" || token === "-V")) return { args: [], env, cwd, otherUser };
       let name = token;
       let value;
       if (token.startsWith("--")) {
@@ -2064,11 +2108,12 @@ function program(input, cwd) {
       wrapper = base;
       optionsDone = false;
       operands = WRAPPERS[base].operands;
+      otherUser ||= base === "sudo" || base === "doas";
       continue;
     }
-    return { name: base, args: argv.slice(i), env, cwd };
+    return { name: base, args: argv.slice(i), env, cwd, otherUser };
   }
-  return { args: [], env, cwd };
+  return { args: [], env, cwd, otherUser };
 }
 function withoutLogin(host) {
   return host.slice(host.lastIndexOf("@") + 1);
@@ -2255,10 +2300,12 @@ async function gh(args, env, cwd, state) {
   const third = positional[2];
   if (repo === "" && positional[0] === "repo" && third !== void 0 && third.includes("/")) repo = third;
   if (repo === "" && positional[0] !== "api") {
-    const url = positional.slice(1).map((a) => /^https?:\/\/([^/@]+\/[^/@]+\/[^/@]+)/.exec(a)).find((m) => m !== null);
+    const url = positional.slice(1).map((a) => /^https?:\/\/([^/@]+\/[^/@]+\/[^/@]+)/.exec(stripLogin(a))).find((m) => m !== null);
     if (url) repo = url[1];
   }
   let lookupDir = cwd;
+  const listOrCreate = positional[0] === "repo" && (positional[1] === "list" || positional[1] === "create");
+  if (GH_NO_CHECKOUT.has(positional[0] ?? "") || listOrCreate && repo === "") lookupDir = void 0;
   if (repo === "" && positional[0] === "api") {
     const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
     if (named) repo = named[1];
@@ -2301,14 +2348,14 @@ async function gh(args, env, cwd, state) {
 }
 function remoteOperand(operands) {
   for (const arg of [...operands].reverse()) {
-    const uri = /^(scp|sftp):\/\/(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:[\]@]+)(?::(\d+))?/.exec(arg);
+    const uri = /^(scp|sftp):\/\/(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:[\]@]+)(?::(\d+))?(?=\/|$)/.exec(arg);
     if (uri !== null) {
       const destination = uri[2] === void 0 ? uri[3] : `${uri[2]}@${uri[3]}`;
       return uri[4] === void 0 ? { destination } : { destination, port: uri[4] };
     }
     if (arg.includes("://")) return {};
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[2] === void 0 ? { destination: match[1] } : {};
+    if (match !== null && !/^[A-Za-z]:[\\/]/.test(arg)) return match[2] === void 0 ? { destination: match[1] } : {};
   }
   return {};
 }
@@ -2488,9 +2535,10 @@ function configRunsCommands(passthrough) {
   }
   return false;
 }
-async function ssh(name, args, env, dir, state) {
+async function ssh(name, args, env, dir, state, otherUser = false) {
   const { destination, passthrough } = sshDestination(name, args, env, state.env);
   if (destination === void 0) return void 0;
+  if (otherUser && !passthrough.some((flag, i) => i % 2 === 0 && flag === "-F")) return { platform: "ssh", source: "unknown" };
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1]);
     if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute3(value) ? value : join5(dir ?? "", value);
@@ -2536,8 +2584,9 @@ function rewritesRemotes(args, cwd) {
   }
   if (at(0) === "config") {
     const options = new Set(rest.slice(1).filter((a) => a.startsWith("-")));
-    const keys = rest.slice(1).filter((a) => !a.startsWith("-")).map((a) => a.toLowerCase());
-    const reads = ["--get", "--get-all", "--get-regexp", "--list", "-l", "--get-urlmatch"].some((o) => options.has(o));
+    let keys = rest.slice(1).filter((a) => !a.startsWith("-")).map((a) => a.toLowerCase());
+    const reads = ["--get", "--get-all", "--get-regexp", "--list", "-l", "--get-urlmatch"].some((o) => options.has(o)) || keys[0] === "get" || keys[0] === "list";
+    if (keys[0] === "set" || keys[0] === "unset") keys = keys.slice(1);
     if (!reads && /^(remote|url|branch)\./.test(keys[0] ?? "")) {
       const scoped = ["--global", "--system", "--file", "-f"].some((o) => options.has(o));
       return scoped || dir === void 0 ? { rewrites: true } : { rewrites: true, dir };
@@ -2592,7 +2641,7 @@ async function resolveOne(command, cwd, state) {
     let pushDir;
     if (name === "git") ({ account, dir: pushDir } = await gitPush(args, env, parsed.cwd, state));
     else if (name === "gh") ({ account, dir: pushDir } = await gh(args, env, parsed.cwd, state));
-    else if (name !== void 0 && SSH_TOOLS.has(name)) account = await ssh(name, args, env, parsed.cwd, state);
+    else if (name !== void 0 && SSH_TOOLS.has(name)) account = await ssh(name, args, env, parsed.cwd, state, parsed.otherUser);
     if (account === void 0) continue;
     const result = compact(account);
     if (result.source === "unknown") {
@@ -3839,7 +3888,8 @@ function createExtension(overrides = {}) {
           // here for the same reason as on `tool_call`: this very call may have latched the key.
           onDecision: (entry) => {
             if (recordingActive(state)) {
-              postStandaloneTurn(entry, ctx, sessionIdOf(ctx), {
+              const ranIn = typeof event.cwd === "string" && event.cwd !== "" ? { cwd: event.cwd } : ctx;
+              postStandaloneTurn(entry, ranIn, sessionIdOf(ctx), {
                 client: state.client,
                 apiKey: state.apiKey,
                 ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry },

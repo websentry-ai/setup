@@ -84,6 +84,8 @@ const GH_VALUE_OPTIONS: ReadonlySet<string> = new Set(
     "--header -X --method --input --workflow --ref -n --notes --notes-file --target -j --job --branch --message --name " +
     "--description --visibility --color --env --org --key").split(" "),
 );
+/** gh commands that reach GitHub but not the checkout's repository, so only the host and login are known. */
+const GH_NO_CHECKOUT: ReadonlySet<string> = new Set(["search", "gist", "org", "codespace", "ssh-key", "gpg-key", "status", "project"]);
 /** gh picks among unresolved remotes in this order. */
 const GH_REMOTE_ORDER = ["upstream", "github", "origin"];
 /** Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to. */
@@ -134,7 +136,32 @@ export interface Segment {
   operator: string;
 }
 
-/** The command split into simple commands on ; && || | and newlines, each with the operator before it. */
+/** The shell word starting at `start` after blanks, and the index after it; quotes and backslashes are undone. */
+function readWord(text: string, start: number): [string, number] {
+  let i = start;
+  while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+  let word = "";
+  let quote: string | undefined;
+  for (; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      else if (ch === "\\" && quote === '"' && i + 1 < text.length) word += text[++i];
+      else word += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "\\" && i + 1 < text.length) {
+      word += text[++i];
+    } else if (" \t\r\n;&|<>".includes(ch)) {
+      break;
+    } else {
+      word += ch;
+    }
+  }
+  return [word, i];
+}
+
+/** The command split into simple commands with the operator before each; redirections and heredoc bodies are left out. */
 export function segments(command: string): Segment[] {
   const out: Segment[] = [];
   let current: string[] = [];
@@ -142,6 +169,7 @@ export function segments(command: string): Segment[] {
   let inWord = false;
   let quote: "'" | '"' | undefined;
   let operator = "";
+  const heredocs: [string, boolean][] = [];
   const endWord = (): void => {
     if (inWord) current.push(word);
     word = "";
@@ -175,11 +203,30 @@ export function segments(command: string): Segment[] {
     } else if (ch === "\\" && i + 1 < command.length) {
       word += command[++i];
       inWord = true;
+    } else if (ch === "<" || ch === ">" || (ch === "&" && command[i + 1] === ">")) {
+      // A redirection's operator, an fd number written against it, and its target are not arguments.
+      if (inWord && !(/^\d+$/.test(word) && ch !== "&")) current.push(word);
+      word = "";
+      inWord = false;
+      const op = (/^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(command.slice(i)) as RegExpExecArray)[0];
+      const [target, next] = readWord(command, i + op.length);
+      if (op === "<<" || op === "<<-") heredocs.push([target, op === "<<-"]);
+      i = next - 1;
     } else if ((ch === "&" || ch === "|") && command[i + 1] === ch) {
       i++;
       endSegment(ch + ch);
     } else if (ch === ";" || ch === "&" || ch === "|" || ch === "\n") {
       endSegment(";");
+      // A heredoc's body starts on the next line and is input, not commands.
+      while (ch === "\n" && heredocs.length > 0) {
+        const [delimiter, stripTabs] = heredocs.shift() as [string, boolean];
+        while (i + 1 < command.length) {
+          const end = command.indexOf("\n", i + 1);
+          const line = end < 0 ? command.slice(i + 1) : command.slice(i + 1, end);
+          i = end < 0 ? command.length - 1 : end;
+          if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        }
+      }
     } else if (ch === " " || ch === "\t" || ch === "\r") {
       endWord();
     } else {
@@ -187,6 +234,7 @@ export function segments(command: string): Segment[] {
       inWord = true;
     }
   }
+  if (quote !== undefined) return [];
   endSegment(";");
   return out;
 }
@@ -209,9 +257,10 @@ function moveTo(cwd: string | undefined, path: string): string {
 /** The program a simple command runs, its args, inline VAR=value settings and folder, past assignments and wrappers. */
 function program(
   input: string[], cwd: string | undefined,
-): { name?: string; args: string[]; env: Record<string, string>; cwd: string | undefined } {
+): { name?: string; args: string[]; env: Record<string, string>; cwd: string | undefined; otherUser: boolean } {
   const env: Record<string, string> = {};
   const argv = [...input];
+  let otherUser = false;
   let wrapper: string | undefined;
   let operands = 0;
   let optionsDone = false;
@@ -228,7 +277,7 @@ function program(
     }
     if (wrapper !== undefined && !optionsDone && token.startsWith("-") && token !== "-") {
       const spec = WRAPPERS[wrapper] as { short: string; long: readonly string[] };
-      if (wrapper === "command" && (token === "-v" || token === "-V")) return { args: [], env, cwd }; // only looks it up
+      if (wrapper === "command" && (token === "-v" || token === "-V")) return { args: [], env, cwd, otherUser }; // only looks it up
       let name = token;
       let value: string | undefined;
       if (token.startsWith("--")) {
@@ -264,11 +313,12 @@ function program(
       wrapper = base;
       optionsDone = false;
       operands = (WRAPPERS[base] as { operands: number }).operands;
+      otherUser ||= base === "sudo" || base === "doas";
       continue;
     }
-    return { name: base, args: argv.slice(i), env, cwd };
+    return { name: base, args: argv.slice(i), env, cwd, otherUser };
   }
-  return { args: [], env, cwd };
+  return { args: [], env, cwd, otherUser };
 }
 
 function withoutLogin(host: string): string {
@@ -490,10 +540,12 @@ async function gh(
   const third = positional[2];
   if (repo === "" && positional[0] === "repo" && third !== undefined && third.includes("/")) repo = third;
   if (repo === "" && positional[0] !== "api") {
-    const url = positional.slice(1).map((a) => /^https?:\/\/([^/@]+\/[^/@]+\/[^/@]+)/.exec(a)).find((m) => m !== null);
+    const url = positional.slice(1).map((a) => /^https?:\/\/([^/@]+\/[^/@]+\/[^/@]+)/.exec(stripLogin(a))).find((m) => m !== null);
     if (url) repo = url[1] as string;
   }
   let lookupDir = cwd;
+  const listOrCreate = positional[0] === "repo" && (positional[1] === "list" || positional[1] === "create");
+  if (GH_NO_CHECKOUT.has(positional[0] ?? "") || (listOrCreate && repo === "")) lookupDir = undefined;
   if (repo === "" && positional[0] === "api") {
     const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
     if (named) repo = named[1] as string;
@@ -540,7 +592,7 @@ async function gh(
 function remoteOperand(operands: readonly string[]): { destination?: string; port?: string } {
   for (const arg of [...operands].reverse()) {
     // A scp:// or sftp:// URI names the login and port itself; anything after the user (a password) is dropped.
-    const uri = /^(scp|sftp):\/\/(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:[\]@]+)(?::(\d+))?/.exec(arg);
+    const uri = /^(scp|sftp):\/\/(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:[\]@]+)(?::(\d+))?(?=\/|$)/.exec(arg);
     if (uri !== null) {
       const destination = uri[2] === undefined ? (uri[3] as string) : `${uri[2]}@${uri[3]}`;
       return uri[4] === undefined ? { destination } : { destination, port: uri[4] };
@@ -548,7 +600,8 @@ function remoteOperand(operands: readonly string[]): { destination?: string; por
     if (arg.includes("://")) return {};
     // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:\\/.test(arg)) return match[2] === undefined ? { destination: match[1] as string } : {};
+    // A drive letter (C:\x or C:/x) is a local path, not a host.
+    if (match !== null && !/^[A-Za-z]:[\\/]/.test(arg)) return match[2] === undefined ? { destination: match[1] as string } : {};
   }
   return {};
 }
@@ -758,10 +811,12 @@ function configRunsCommands(passthrough: readonly string[]): boolean {
 }
 
 async function ssh(
-  name: string, args: string[], env: Record<string, string>, dir: string | undefined, state: State,
+  name: string, args: string[], env: Record<string, string>, dir: string | undefined, state: State, otherUser = false,
 ): Promise<DestinationAccount | undefined> {
   const { destination, passthrough } = sshDestination(name, args, env, state.env);
   if (destination === undefined) return undefined;
+  // Under sudo, ssh reads that user's config, which this hook can't.
+  if (otherUser && !passthrough.some((flag, i) => i % 2 === 0 && flag === "-F")) return { platform: "ssh", source: "unknown" };
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1] as string);
@@ -810,8 +865,12 @@ function rewritesRemotes(args: string[], cwd: string | undefined): { rewrites: b
   }
   if (at(0) === "config") {
     const options = new Set(rest.slice(1).filter((a) => a.startsWith("-")));
-    const keys = rest.slice(1).filter((a) => !a.startsWith("-")).map((a) => a.toLowerCase());
-    const reads = ["--get", "--get-all", "--get-regexp", "--list", "-l", "--get-urlmatch"].some((o) => options.has(o));
+    let keys = rest.slice(1).filter((a) => !a.startsWith("-")).map((a) => a.toLowerCase());
+    const reads =
+      ["--get", "--get-all", "--get-regexp", "--list", "-l", "--get-urlmatch"].some((o) => options.has(o)) ||
+      keys[0] === "get" || keys[0] === "list";
+    // git 2.46 also takes `git config set|unset <key>`.
+    if (keys[0] === "set" || keys[0] === "unset") keys = keys.slice(1);
     if (!reads && /^(remote|url|branch)\./.test(keys[0] ?? "")) {
       const scoped = ["--global", "--system", "--file", "-f"].some((o) => options.has(o));
       return scoped || dir === undefined ? { rewrites: true } : { rewrites: true, dir };
@@ -872,7 +931,7 @@ async function resolveOne(command: string, cwd: string | undefined, state: State
     let pushDir: string | undefined;
     if (name === "git") ({ account, dir: pushDir } = await gitPush(args, env, parsed.cwd, state));
     else if (name === "gh") ({ account, dir: pushDir } = await gh(args, env, parsed.cwd, state));
-    else if (name !== undefined && SSH_TOOLS.has(name)) account = await ssh(name, args, env, parsed.cwd, state);
+    else if (name !== undefined && SSH_TOOLS.has(name)) account = await ssh(name, args, env, parsed.cwd, state, parsed.otherUser);
     if (account === undefined) continue;
     const result = compact(account);
     if (result.source === "unknown") {

@@ -513,3 +513,44 @@ test("a call known not to have run is never resolved", async () => {
   assert.equal(accounts.size, 0);
   assert.deepEqual(ran, []);
 });
+
+test("redirections are not arguments and heredoc bodies are not commands", async () => {
+  const dir = repo({ personal: "https://github.com/jdoe-dev/app.git" });
+  for (const command of [
+    "git push personal main 2>&1 | tail -5",
+    "git push > /tmp/push.log personal main",
+    "git push personal main &>/dev/null",
+    "cat <<'EOF'\nnotes\nEOF\ngit push personal main",
+  ]) {
+    assert.equal((await resolve(command, dir))?.account, "jdoe-dev", command);
+  }
+  for (const command of [
+    `cat > deploy.sh <<'EOF'\nssh -F ${sshConfig} prod-bastion uptime\ngit push personal main\nEOF`,
+    `cat <<-EOF\n\tssh -F ${sshConfig} prod-bastion\n\tEOF`,
+  ]) {
+    assert.equal(await resolve(command, dir), undefined, command);
+  }
+});
+
+test("gh commands outside the checkout and urls with a login", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  for (const command of ["gh search repos unbound", "gh gist create notes.md", "gh repo create scratch --private"]) {
+    assert.equal((await resolve(command, dir))?.account, undefined, command);
+  }
+  assert.equal((await resolve("gh pr view https://jdoe@github.com/other/app/pull/1", dir))?.account, "other");
+});
+
+test("scp uris, drive letters and sudo are never misread", async () => {
+  assert.equal(await resolve(`scp -F ${sshConfig} dump.sql scp://deploy:p@ss@prod-bastion:2200/tmp/`), undefined);
+  const drive = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file C:/Users/me/out`);
+  assert.deepEqual([drive?.host, drive?.user], ["10.0.4.12:2222", "deploy"]);
+  assert.deepEqual(await resolve("sudo -u nobody ssh prod-bastion"), { platform: "ssh", source: "unknown" });
+});
+
+test("git config set rewrites count as rewrites", async () => {
+  const dir = repo({ personal: "https://github.com/decoy/app.git" });
+  assert.deepEqual(
+    await resolve("git push personal main; git config set remote.personal.url https://github.com/decoy/app.git", dir),
+    { platform: "git", source: "unknown" },
+  );
+});
