@@ -395,7 +395,7 @@ test("a backslash escape in an included path is read as ssh reads it", async () 
 test("wrappers and their option values never hide the command", async () => {
   const dir = repo({ personal: "https://github.com/jdoe-dev/app.git" });
   const cases: [string, string | undefined][] = [
-    [`sudo -u deploy ssh -F ${sshConfig} prod-bastion`, undefined],
+    ["sudo -u deploy git push personal main", dir],
     ["env -u HOME git push personal main", dir],
     ["timeout -s KILL 30 git push personal main", dir],
     ["nice -n 10 git push personal main", dir],
@@ -542,12 +542,16 @@ test("gh commands outside the checkout and urls with a login", async () => {
 
 test("scp uris, drive letters and sudo are never misread", async () => {
   assert.equal(await resolve(`scp -F ${sshConfig} dump.sql scp://deploy:p@ss@prod-bastion:2200/tmp/`), undefined);
-  // scp reads C:\x as a local path everywhere, and C:/x as host C except on Windows.
-  const backslash = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file C:\\\\Users\\\\me`);
-  assert.deepEqual([backslash?.host, backslash?.user], ["10.0.4.12:2222", "deploy"]);
-  const slash = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file C:/Users/me/out`);
-  assert.equal(slash?.host, process.platform === "win32" ? "10.0.4.12:2222" : "c");
-  assert.deepEqual(await resolve("sudo -u nobody ssh prod-bastion"), { platform: "ssh", source: "unknown" });
+  // scp reads a drive letter as a local path only on Windows; elsewhere it dials host C.
+  for (const target of ["C:\\\\Users\\\\me", "'C:\\Users\\me'", "C:/Users/me/out"]) {
+    const account = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file ${target}`);
+    assert.equal(account?.host, process.platform === "win32" ? "10.0.4.12:2222" : "c", target);
+  }
+  // Under sudo, ssh's config and default login are the other user's, with or without -F.
+  for (const command of ["sudo -u nobody ssh prod-bastion", `sudo -u nobody ssh -F ${sshConfig} prod-bastion`,
+    `sudo ssh -F ${sshConfig} prod-bastion`]) {
+    assert.deepEqual(await resolve(command), { platform: "ssh", source: "unknown" }, command);
+  }
 });
 
 test("git config set rewrites count as rewrites", async () => {
@@ -577,5 +581,88 @@ test("a destination starting with a dash never reaches ssh as an option", async 
   const marker = join(dir, "ran");
   writeFileSync(join(dir, "evil"), `Match exec "touch ${marker}"\n`);
   assert.equal(await resolve(`ssh -- -F${join(dir, "evil")} prod-bastion`), undefined);
+  assert.equal(existsSync(marker), false);
+});
+
+test("subshells, groups and keywords keep the folder each command runs in", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  const nested = join(dir, "frontend");
+  execFileSync("git", ["init", "-q", "-b", "main", nested]);
+  execFileSync("git", ["-C", nested, "remote", "add", "origin", "https://github.com/front/web.git"]);
+  const cases: [string, string | undefined][] = [
+    ["(cd frontend && git push origin main)", "front"],
+    ["cd frontend; (cd .. && true); git push origin main", "front"],
+    ["(cd frontend; git status) && git push origin main", "acme"],
+    ["if cd frontend; then git push origin main; fi", "front"],
+    ["{ cd frontend; git push origin main; }", "front"],
+    ["echo $(cd frontend && git push origin main)", "front"],
+    ["cat <(git push origin main)", "acme"],
+    ["false && (git push origin main)", undefined],
+  ];
+  for (const [command, owner] of cases) assert.equal((await resolve(command, dir))?.account, owner, command);
+});
+
+test("env -u and env -i hide inherited values", async () => {
+  const inherited = { GH_HOST: "ghe.example.com" };
+  const cases: [string, string][] = [
+    ["env -u GH_HOST gh repo view acme/app", "github.com"],
+    ["env --unset=GH_HOST gh repo view acme/app", "github.com"],
+    ["env -i gh repo view acme/app", "github.com"],
+    ["env - gh repo view acme/app", "github.com"],
+    ["export GH_HOST=ghe.example.com; env -i gh repo view acme/app", "github.com"],
+    ["env -i GH_HOST=other.example.com gh repo view acme/app", "other.example.com"],
+  ];
+  for (const [command, host] of cases) assert.equal((await resolve(command, undefined, inherited))?.host, host, command);
+});
+
+test("gh org scope, the cs alias, url ports and host settings are read as gh reads them", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  const cases: [string, string, string | undefined][] = [
+    ["gh secret list --org acme-org", "github.com", "acme-org"],
+    ["gh variable set X -o acme-org", "github.com", "acme-org"],
+    ["gh cs create", "github.com", undefined],
+    ["gh api https://ghe.example.com:8443/api/v3/repos/other/app", "ghe.example.com", "other"],
+    ["gh pr view https://ghe.example.com:8443/other/app/pull/1", "ghe.example.com", "other"],
+    ["gh api --hostname ghe.example.com https://api.github.com/repos/other/app", "api.github.com", "other"],
+    ["GH_HOST=https://ghe.example.com gh repo view other/app", "ghe.example.com", "other"],
+    [`GH_HOST=https://jdoe:${FAKE_TOKEN} gh repo view other/app`, "github.com", "other"],
+  ];
+  for (const [command, host, owner] of cases) {
+    const account = await resolve(command, dir);
+    assert.deepEqual([account?.host, account?.account], [host, owner], command);
+    assert.ok(!JSON.stringify(account).toLowerCase().includes(FAKE_TOKEN.toLowerCase()), command);
+  }
+});
+
+test("ssh configs ssh could expand or canonicalize are never read", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-unsafe-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "inner"), `Match exec "touch ${marker}"\n`);
+  const configs = {
+    variable: `Include \${HOME}/../${dir}/inner\n`,
+    token: "Include %d/inner\n",
+    canonicalize: "CanonicalizeHostname yes\nHost prod-bastion\n  HostName 10.0.4.12\n",
+  };
+  for (const [name, text] of Object.entries(configs)) {
+    writeFileSync(join(dir, name), text);
+    assert.deepEqual(await resolve(`ssh -F ${join(dir, name)} prod-bastion`), { platform: "ssh", source: "unknown" }, name);
+  }
+  assert.equal(existsSync(marker), false);
+});
+
+test("the ssh config scan reads the account's home, not the HOME variable", async (t) => {
+  const baseline = await resolve("ssh prod-bastion");
+  if (baseline?.source === "unknown") return t.skip("this machine's own ssh config is not scannable");
+  const home = mkdtempSync(join(tmpdir(), "home-"));
+  const marker = join(home, "ran");
+  execFileSync("mkdir", ["-p", join(home, ".ssh")]);
+  writeFileSync(join(home, ".ssh", "config"), `Match exec "touch ${marker}"\n`);
+  const previous = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    assert.deepEqual(await resolve("ssh prod-bastion"), baseline);
+  } finally {
+    process.env.HOME = previous;
+  }
   assert.equal(existsSync(marker), false);
 });

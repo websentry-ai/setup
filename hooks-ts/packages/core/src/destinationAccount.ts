@@ -8,7 +8,7 @@
 
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, join, normalize, basename, dirname } from "node:path";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 
 import { defaultExecFile, type ExecFileLike } from "./accountIdentity.ts";
 
@@ -82,10 +82,18 @@ const GH_VALUE_OPTIONS: ReadonlySet<string> = new Set(
   ("-t --title -b --body -F --body-file -B --base -H --head -l --label -a --assignee -r --reviewer -m --milestone " +
     "--project -q --jq -T --template --json -S --search -s --state -L --limit -A --author -f --field --raw-field " +
     "--header -X --method --input --workflow --ref -n --notes --notes-file --target -j --job --branch --message --name " +
-    "--description --visibility --color --env --org --key").split(" "),
+    "--description --visibility --color --env --key").split(" "),
 );
 /** gh commands that reach GitHub but not the checkout's repository, so only the host and login are known. */
-const GH_NO_CHECKOUT: ReadonlySet<string> = new Set(["search", "gist", "org", "codespace", "ssh-key", "gpg-key", "status", "project"]);
+const GH_NO_CHECKOUT: ReadonlySet<string> = new Set([
+  "search", "gist", "org", "codespace", "cs", "ssh-key", "gpg-key", "status", "project",
+]);
+/** gh commands whose -o names an organization, as --org does everywhere. */
+const GH_ORG_SHORT: ReadonlySet<string> = new Set(["secret", "variable", "ruleset"]);
+/** Reserved words that lead a command without being its program. */
+const SHELL_KEYWORDS: ReadonlySet<string> = new Set(["{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"]);
+/** Set in a command's env by `env -i`: nothing is inherited from the hook's environment. */
+const CLEAN_ENV = "\0clean";
 /** gh picks among unresolved remotes in this order. */
 const GH_REMOTE_ORDER = ["upstream", "github", "origin"];
 /** Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to. */
@@ -131,6 +139,7 @@ async function run(argv: string[], state: State): Promise<string | undefined> {
 }
 
 export interface Segment {
+  /** Empty only around a subshell, where the operator is "(" or ")". */
   argv: string[];
   /** The operator before this command: "" for the first, "&&", "||", or ";" for any other separator. */
   operator: string;
@@ -161,7 +170,8 @@ function readWord(text: string, start: number): [string, number] {
   return [word, i];
 }
 
-/** The command split into simple commands with the operator before each; redirections and heredoc bodies are left out. */
+/** The command split into simple commands with the operator before each, and markers around each subshell.
+ *  Redirections and heredoc bodies are left out. */
 export function segments(command: string): Segment[] {
   const out: Segment[] = [];
   let current: string[] = [];
@@ -203,6 +213,15 @@ export function segments(command: string): Segment[] {
     } else if (ch === "\\" && i + 1 < command.length) {
       word += command[++i];
       inWord = true;
+    } else if ((ch === "<" || ch === ">") && command[i + 1] === "(") {
+      endWord(); // a process substitution runs its commands in a subshell, like $( ... )
+    } else if (ch === "(" || ch === ")") {
+      // Commands inside keep the operator before the subshell; its cd and exports end at the close.
+      endWord();
+      if (current.length > 0) out.push({ argv: current, operator });
+      current = [];
+      out.push({ argv: [], operator: ch });
+      if (ch === ")") operator = ";";
     } else if (ch === "<" || ch === ">" || (ch === "&" && command[i + 1] === ">")) {
       // A redirection's operator, an fd number written against it, and its target are not arguments.
       if (inWord && !(/^\d+$/.test(word) && ch !== "&")) current.push(word);
@@ -246,7 +265,8 @@ function shellWords(text: string): string[] {
 
 /** A variable as the command sees it: set or unset in the command, else inherited from the hook's environment. */
 function envValue(env: Record<string, string>, processEnv: Record<string, string | undefined>, key: string): string {
-  return key in env ? (env[key] as string) : (processEnv[key] ?? "");
+  if (key in env) return env[key] as string;
+  return CLEAN_ENV in env ? "" : (processEnv[key] ?? "");
 }
 
 function isAssignment(token: string): boolean {
@@ -263,7 +283,7 @@ function moveTo(cwd: string | undefined, path: string): string {
 function program(
   input: string[], cwd: string | undefined,
 ): { name?: string; args: string[]; env: Record<string, string>; cwd: string | undefined; otherUser: boolean } {
-  const env: Record<string, string> = {};
+  let env: Record<string, string> = {};
   const argv = [...input];
   let otherUser = false;
   let wrapper: string | undefined;
@@ -278,6 +298,10 @@ function program(
     }
     if (wrapper !== undefined && !optionsDone && token === "--") {
       optionsDone = true;
+      continue;
+    }
+    if (wrapper === "env" && !optionsDone && (token === "-" || token === "--ignore-environment")) {
+      env = { [CLEAN_ENV]: "" };
       continue;
     }
     if (wrapper !== undefined && !optionsDone && token.startsWith("-") && token !== "-") {
@@ -296,6 +320,7 @@ function program(
       } else {
         for (let j = 1; j < token.length; j++) {
           const flag = token[j] as string;
+          if (wrapper === "env" && flag === "i") env = { [CLEAN_ENV]: "" };
           if (!spec.short.includes(flag)) continue;
           name = `-${flag}`;
           value = token.slice(j + 1);
@@ -306,6 +331,8 @@ function program(
       if (value !== undefined && (WRAPPER_CHDIR[wrapper] ?? []).includes(name)) cwd = moveTo(cwd, value);
       else if (value !== undefined && wrapper === "env" && (name === "-S" || name === "--split-string")) {
         argv.splice(i, 0, ...shellWords(value));
+      } else if (value !== undefined && wrapper === "env" && (name === "-u" || name === "--unset")) {
+        env[value] = "";
       }
       continue;
     }
@@ -326,8 +353,11 @@ function program(
   return { args: [], env, cwd, otherUser };
 }
 
-function withoutLogin(host: string): string {
-  return host.slice(host.lastIndexOf("@") + 1);
+/** The host a host setting names, with any scheme, login, port or path dropped; empty when it names none. */
+function hostOf(value: string): string {
+  const authority = value.trim().toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, "").split("/")[0] ?? "";
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  return /^[a-z0-9.-]+(:\d*)?$/.test(host) ? (host.split(":")[0] as string) : "";
 }
 
 /** A remote URL with any login removed: everything up to the last @ before the path, with or without a scheme. */
@@ -531,22 +561,28 @@ async function gh(
   if (args[0] === undefined || GH_NO_REPO.has(args[0])) return {};
   let repo = "";
   let flagHost = "";
+  let org = "";
   const positional: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
     if ((arg === "-R" || arg === "--repo") && i < args.length) repo = args[i++] as string;
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
     else if (arg.startsWith("-R") && !arg.startsWith("--")) repo = arg.slice(2).replace(/^=/, "");
-    else if (arg === "--hostname" && i < args.length) flagHost = withoutLogin((args[i++] as string).toLowerCase());
-    else if (arg.startsWith("--hostname=")) flagHost = withoutLogin(arg.slice("--hostname=".length).toLowerCase());
-    else if (GH_VALUE_OPTIONS.has(arg)) i++;
+    else if (arg === "--hostname" && i < args.length) flagHost = hostOf(args[i++] as string);
+    else if (arg.startsWith("--hostname=")) flagHost = hostOf(arg.slice("--hostname=".length));
+    else if (arg === "--org" && i < args.length) org = args[i++] as string;
+    else if (arg.startsWith("--org=")) org = arg.slice("--org=".length);
+    else if (arg.startsWith("-o") && GH_ORG_SHORT.has(positional[0] ?? "")) {
+      org = arg.slice(2).replace(/^=/, "");
+      if (org === "" && i < args.length) org = args[i++] as string;
+    } else if (GH_VALUE_OPTIONS.has(arg)) i++;
     else if (!arg.startsWith("-")) positional.push(arg);
   }
   // `gh repo view|clone|fork|… OWNER/REPO`, a pr or issue URL, and `gh api repos/OWNER/REPO/…` name the repository.
   const third = positional[2];
   if (repo === "" && positional[0] === "repo" && third !== undefined && third.includes("/")) repo = third;
   if (repo === "" && positional[0] !== "api") {
-    const url = positional.slice(1).map((a) => /^https?:\/\/([^/@]+\/[^/@]+\/[^/@]+)/.exec(stripLogin(a))).find((m) => m !== null);
+    const url = positional.slice(1).map((a) => /^(https?:\/\/[^/@]+\/[^/@]+\/[^/@]+)/.exec(stripLogin(a))).find((m) => m !== null);
     if (url) repo = url[1] as string;
   }
   let lookupDir = cwd;
@@ -558,21 +594,27 @@ async function gh(
   }
   if (repo === "" && positional[0] === "api") {
     const url = stripLogin(positional.slice(1).find((a) => /^https?:\/\//.test(a)) ?? "");
-    const full = /^https?:\/\/([^/]+)\/(?:api\/v3\/)?repos\/([^/{}@]+\/[^/{}@]+)/.exec(url);
-    const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
-    if (full) repo = `${full[1] as string}/${full[2] as string}`;
-    else if (named) repo = named[1] as string;
+    // A full URL names the host gh requests, whatever --hostname says.
+    if (url !== "") flagHost = hostOf(url);
+    const named =
+      /^https?:\/\/[^/]+\/(?:api\/v3\/)?repos\/([^/{}@]+\/[^/{}@]+)/.exec(url) ??
+      positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
+    if (named) repo = named[1] as string;
     else {
-      // An api path that names no repo reaches no repo of this checkout; a full URL still names its host.
-      flagHost ||= (/^https?:\/\/([^/]+)/.exec(url)?.[1] ?? "").toLowerCase();
+      // An api path that names no repo reaches no repo of this checkout.
       checkoutBound = positional.some((a) => a.includes("{owner}") || a.includes("{repo}"));
       if (!checkoutBound) lookupDir = undefined;
     }
   }
+  if (org !== "") {
+    // An organization's secrets, variables and rulesets are not the checkout's.
+    repo = org;
+    lookupDir = undefined;
+    checkoutBound = false;
+  }
   // GH_REPO only stands in for a command that works on a repository.
   repo = repo || (lookupDir === undefined && !checkoutBound ? "" : envValue(env, state.env, "GH_REPO"));
-  // A host never carries a login, so anything before an @ is dropped.
-  const envHost = withoutLogin(envValue(env, state.env, "GH_HOST").toLowerCase());
+  const envHost = hostOf(envValue(env, state.env, "GH_HOST"));
   let host = "";
   let owner = "";
   let dir: string | undefined;
@@ -619,9 +661,9 @@ function remoteOperand(operands: readonly string[]): { destination?: string; por
     if (arg.includes("://")) return {};
     // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-    // A drive letter is local in C:\x form, and in C:/x form too on Windows; elsewhere scp dials host C.
-    const drive = process.platform === "win32" ? /^[A-Za-z]:[\\/]/ : /^[A-Za-z]:\\/;
-    if (match !== null && !drive.test(arg)) return match[2] === undefined ? { destination: match[1] as string } : {};
+    // A drive letter is a local path only on Windows; elsewhere scp dials host C.
+    const local = process.platform === "win32" && /^[A-Za-z]:[\\/]/.test(arg);
+    if (match !== null && !local) return match[2] === undefined ? { destination: match[1] as string } : {};
   }
   return {};
 }
@@ -706,8 +748,17 @@ function sshDestination(
   return { passthrough: [] };
 }
 
-function expandHome(path: string): string {
-  return path === "~" || path.startsWith("~/") ? join(homedir(), path.slice(1)) : path;
+function expandHome(path: string, home = homedir()): string {
+  return path === "~" || path.startsWith("~/") ? join(home, path.slice(1)) : path;
+}
+
+/** The home folder ssh reads its config from: the account's own, which $HOME does not change. */
+function accountHome(): string {
+  try {
+    return userInfo().homedir || homedir();
+  } catch {
+    return homedir();
+  }
 }
 
 /** Whether a file name matches a glob of literal characters, `*` and `?`. */
@@ -736,10 +787,10 @@ function globMatch(pattern: string, name: string): boolean {
 
 /** The files an ssh Include pattern names; undefined when it can't be expanded, so the caller refuses. */
 function includeTargets(pattern: string, base: string): string[] | undefined {
-  // `~user` names another account's home, which only ssh itself can resolve.
-  if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/")) return undefined;
+  // `~user` names another account's home, and ssh may expand a variable or token, so only ssh can resolve those.
+  if ((pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/")) || /[$%]/.test(pattern)) return undefined;
   // ssh globs the path, and glob reads a backslash as escaping the next character.
-  const path = expandHome(pattern).replace(/\\(.)/g, "$1");
+  const path = expandHome(pattern, accountHome()).replace(/\\(.)/g, "$1");
   const full = isAbsolute(path) ? path : join(base, path);
   if (!/[*?[]/.test(full)) return [full];
   if (/[*?[]/.test(dirname(full)) || basename(full).includes("[")) return undefined;
@@ -786,9 +837,9 @@ function configWords(line: string): string[] | undefined {
   return words;
 }
 
-/** Whether ssh -G could run a command while reading its configs: a Match exec anywhere, or a file it can't check. */
-function configRunsCommands(passthrough: readonly string[]): boolean {
-  const homeSsh = join(homedir(), ".ssh");
+/** Whether ssh -G could run a command or a DNS lookup while reading its configs, or reads a file this can't check. */
+function configUnsafe(passthrough: readonly string[]): boolean {
+  const homeSsh = join(accountHome(), ".ssh");
   let config: string | undefined;
   for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
   if (config === "none") return false;
@@ -820,6 +871,9 @@ function configRunsCommands(passthrough: readonly string[]): boolean {
       if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) {
         return true;
       }
+      if (keyword.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) {
+        return true;
+      }
       for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
         const targets = includeTargets(pattern, base);
         if (targets === undefined) return true;
@@ -835,14 +889,14 @@ async function ssh(
 ): Promise<DestinationAccount | undefined> {
   const { destination, passthrough } = sshDestination(name, args, env, state.env);
   if (destination === undefined || destination.startsWith("-")) return undefined; // a - word would be an ssh -G option
-  // Under sudo, ssh reads that user's config, which this hook can't.
-  if (otherUser && !passthrough.some((flag, i) => i % 2 === 0 && flag === "-F")) return { platform: "ssh", source: "unknown" };
+  // Under sudo, ssh runs as that user, with that user's config and default login.
+  if (otherUser) return { platform: "ssh", source: "unknown" };
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1] as string);
     if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute(value) ? value : join(dir ?? "", value);
   }
-  if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
+  if (configUnsafe(passthrough)) return { platform: "ssh", source: "unknown" };
   const out = await run(["ssh", "-G", ...passthrough, destination.replace(/[[\]]/g, "")], state);
   if (out === undefined) return { platform: "ssh", source: "unknown" };
   const settings = new Map<string, string>();
@@ -912,14 +966,25 @@ async function resolveOne(command: string, cwd: string | undefined, state: State
   let dir = cwd;
   let found: DestinationAccount | undefined;
   let unresolved: DestinationAccount | undefined;
-  const exported: Record<string, string> = {};
+  let exported: Record<string, string> = {};
   let status: number | undefined;
-  for (const { argv, operator } of segments(command)) {
+  const subshells: [string | undefined, Record<string, string>][] = [];
+  for (const segment of segments(command)) {
+    const { operator } = segment;
+    if (segment.argv.length === 0) {
+      // A subshell's cd and exports end with it.
+      if (operator === "(") subshells.push([dir, { ...exported }]);
+      else if (subshells.length > 0) [dir, exported] = subshells.pop() as [string | undefined, Record<string, string>];
+      continue;
+    }
+    let argv = segment.argv;
+    while (argv.length > 0 && SHELL_KEYWORDS.has(argv[0] as string)) argv = argv.slice(1);
+    if (argv.length === 0) continue;
     // A literal true or false decides whether && or || runs the next command; any other status is unknown.
     if ((operator === "&&" && status === 1) || (operator === "||" && status === 0)) continue;
     const parsed = program(argv, dir);
     const { name, args } = parsed;
-    const env = { ...exported, ...parsed.env };
+    const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exported, ...parsed.env };
     status = name === "true" || name === ":" ? 0 : name === "false" ? 1 : undefined;
     if (name === "export") {
       for (const arg of args) if (isAssignment(arg)) exported[arg.slice(0, arg.indexOf("="))] = arg.slice(arg.indexOf("=") + 1);

@@ -1855,7 +1855,7 @@ var turnStore = createTurnStore();
 // packages/core/src/destinationAccount.ts
 import { readdirSync, readFileSync as readFileSync3, realpathSync, statSync } from "node:fs";
 import { isAbsolute as isAbsolute3, join as join5, normalize, basename, dirname as dirname3 } from "node:path";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 var ALLOWED_RUNS = [
   ["git", "remote", "get-url"],
   ["git", "rev-parse", "--symbolic-full-name"],
@@ -1915,9 +1915,22 @@ var GH_NO_REPO = /* @__PURE__ */ new Set([
   "--version"
 ]);
 var GH_VALUE_OPTIONS = new Set(
-  "-t --title -b --body -F --body-file -B --base -H --head -l --label -a --assignee -r --reviewer -m --milestone --project -q --jq -T --template --json -S --search -s --state -L --limit -A --author -f --field --raw-field --header -X --method --input --workflow --ref -n --notes --notes-file --target -j --job --branch --message --name --description --visibility --color --env --org --key".split(" ")
+  "-t --title -b --body -F --body-file -B --base -H --head -l --label -a --assignee -r --reviewer -m --milestone --project -q --jq -T --template --json -S --search -s --state -L --limit -A --author -f --field --raw-field --header -X --method --input --workflow --ref -n --notes --notes-file --target -j --job --branch --message --name --description --visibility --color --env --key".split(" ")
 );
-var GH_NO_CHECKOUT = /* @__PURE__ */ new Set(["search", "gist", "org", "codespace", "ssh-key", "gpg-key", "status", "project"]);
+var GH_NO_CHECKOUT = /* @__PURE__ */ new Set([
+  "search",
+  "gist",
+  "org",
+  "codespace",
+  "cs",
+  "ssh-key",
+  "gpg-key",
+  "status",
+  "project"
+]);
+var GH_ORG_SHORT = /* @__PURE__ */ new Set(["secret", "variable", "ruleset"]);
+var SHELL_KEYWORDS = /* @__PURE__ */ new Set(["{", "}", "if", "then", "else", "elif", "fi", "do", "done", "while", "until"]);
+var CLEAN_ENV = "\0clean";
 var GH_REMOTE_ORDER = ["upstream", "github", "origin"];
 var GIT_OVERRIDE_ENV = [
   "GIT_DIR",
@@ -2008,6 +2021,14 @@ function segments(command) {
     } else if (ch === "\\" && i + 1 < command.length) {
       word += command[++i];
       inWord = true;
+    } else if ((ch === "<" || ch === ">") && command[i + 1] === "(") {
+      endWord();
+    } else if (ch === "(" || ch === ")") {
+      endWord();
+      if (current.length > 0) out.push({ argv: current, operator });
+      current = [];
+      out.push({ argv: [], operator: ch });
+      if (ch === ")") operator = ";";
     } else if (ch === "<" || ch === ">" || ch === "&" && command[i + 1] === ">") {
       if (inWord && !(/^\d+$/.test(word) && ch !== "&")) current.push(word);
       word = "";
@@ -2045,7 +2066,8 @@ function shellWords(text) {
   return segments(text).flatMap((segment) => segment.argv);
 }
 function envValue(env, processEnv, key) {
-  return key in env ? env[key] : processEnv[key] ?? "";
+  if (key in env) return env[key];
+  return CLEAN_ENV in env ? "" : processEnv[key] ?? "";
 }
 function isAssignment(token) {
   const eq = token.indexOf("=");
@@ -2056,7 +2078,7 @@ function moveTo(cwd, path) {
   return isAbsolute3(target) ? target : normalize(join5(cwd ?? "", target));
 }
 function program(input, cwd) {
-  const env = {};
+  let env = {};
   const argv = [...input];
   let otherUser = false;
   let wrapper;
@@ -2071,6 +2093,10 @@ function program(input, cwd) {
     }
     if (wrapper !== void 0 && !optionsDone && token === "--") {
       optionsDone = true;
+      continue;
+    }
+    if (wrapper === "env" && !optionsDone && (token === "-" || token === "--ignore-environment")) {
+      env = { [CLEAN_ENV]: "" };
       continue;
     }
     if (wrapper !== void 0 && !optionsDone && token.startsWith("-") && token !== "-") {
@@ -2089,6 +2115,7 @@ function program(input, cwd) {
       } else {
         for (let j = 1; j < token.length; j++) {
           const flag = token[j];
+          if (wrapper === "env" && flag === "i") env = { [CLEAN_ENV]: "" };
           if (!spec.short.includes(flag)) continue;
           name = `-${flag}`;
           value = token.slice(j + 1);
@@ -2099,6 +2126,8 @@ function program(input, cwd) {
       if (value !== void 0 && (WRAPPER_CHDIR[wrapper] ?? []).includes(name)) cwd = moveTo(cwd, value);
       else if (value !== void 0 && wrapper === "env" && (name === "-S" || name === "--split-string")) {
         argv.splice(i, 0, ...shellWords(value));
+      } else if (value !== void 0 && wrapper === "env" && (name === "-u" || name === "--unset")) {
+        env[value] = "";
       }
       continue;
     }
@@ -2118,8 +2147,10 @@ function program(input, cwd) {
   }
   return { args: [], env, cwd, otherUser };
 }
-function withoutLogin(host) {
-  return host.slice(host.lastIndexOf("@") + 1);
+function hostOf(value) {
+  const authority = value.trim().toLowerCase().replace(/^[a-z][a-z0-9+.-]*:\/\//, "").split("/")[0] ?? "";
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  return /^[a-z0-9.-]+(:\d*)?$/.test(host) ? host.split(":")[0] : "";
 }
 function stripLogin(url) {
   return url.trim().replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)?[^/]*@/, "$1");
@@ -2289,21 +2320,27 @@ async function gh(args, env, cwd, state) {
   if (args[0] === void 0 || GH_NO_REPO.has(args[0])) return {};
   let repo = "";
   let flagHost = "";
+  let org = "";
   const positional = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
     if ((arg === "-R" || arg === "--repo") && i < args.length) repo = args[i++];
     else if (arg.startsWith("--repo=")) repo = arg.slice("--repo=".length);
     else if (arg.startsWith("-R") && !arg.startsWith("--")) repo = arg.slice(2).replace(/^=/, "");
-    else if (arg === "--hostname" && i < args.length) flagHost = withoutLogin(args[i++].toLowerCase());
-    else if (arg.startsWith("--hostname=")) flagHost = withoutLogin(arg.slice("--hostname=".length).toLowerCase());
-    else if (GH_VALUE_OPTIONS.has(arg)) i++;
+    else if (arg === "--hostname" && i < args.length) flagHost = hostOf(args[i++]);
+    else if (arg.startsWith("--hostname=")) flagHost = hostOf(arg.slice("--hostname=".length));
+    else if (arg === "--org" && i < args.length) org = args[i++];
+    else if (arg.startsWith("--org=")) org = arg.slice("--org=".length);
+    else if (arg.startsWith("-o") && GH_ORG_SHORT.has(positional[0] ?? "")) {
+      org = arg.slice(2).replace(/^=/, "");
+      if (org === "" && i < args.length) org = args[i++];
+    } else if (GH_VALUE_OPTIONS.has(arg)) i++;
     else if (!arg.startsWith("-")) positional.push(arg);
   }
   const third = positional[2];
   if (repo === "" && positional[0] === "repo" && third !== void 0 && third.includes("/")) repo = third;
   if (repo === "" && positional[0] !== "api") {
-    const url = positional.slice(1).map((a) => /^https?:\/\/([^/@]+\/[^/@]+\/[^/@]+)/.exec(stripLogin(a))).find((m) => m !== null);
+    const url = positional.slice(1).map((a) => /^(https?:\/\/[^/@]+\/[^/@]+\/[^/@]+)/.exec(stripLogin(a))).find((m) => m !== null);
     if (url) repo = url[1];
   }
   let lookupDir = cwd;
@@ -2315,18 +2352,21 @@ async function gh(args, env, cwd, state) {
   }
   if (repo === "" && positional[0] === "api") {
     const url = stripLogin(positional.slice(1).find((a) => /^https?:\/\//.test(a)) ?? "");
-    const full = /^https?:\/\/([^/]+)\/(?:api\/v3\/)?repos\/([^/{}@]+\/[^/{}@]+)/.exec(url);
-    const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
-    if (full) repo = `${full[1]}/${full[2]}`;
-    else if (named) repo = named[1];
+    if (url !== "") flagHost = hostOf(url);
+    const named = /^https?:\/\/[^/]+\/(?:api\/v3\/)?repos\/([^/{}@]+\/[^/{}@]+)/.exec(url) ?? positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
+    if (named) repo = named[1];
     else {
-      flagHost ||= (/^https?:\/\/([^/]+)/.exec(url)?.[1] ?? "").toLowerCase();
       checkoutBound = positional.some((a) => a.includes("{owner}") || a.includes("{repo}"));
       if (!checkoutBound) lookupDir = void 0;
     }
   }
+  if (org !== "") {
+    repo = org;
+    lookupDir = void 0;
+    checkoutBound = false;
+  }
   repo = repo || (lookupDir === void 0 && !checkoutBound ? "" : envValue(env, state.env, "GH_REPO"));
-  const envHost = withoutLogin(envValue(env, state.env, "GH_HOST").toLowerCase());
+  const envHost = hostOf(envValue(env, state.env, "GH_HOST"));
   let host = "";
   let owner = "";
   let dir;
@@ -2369,8 +2409,8 @@ function remoteOperand(operands) {
     }
     if (arg.includes("://")) return {};
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-    const drive = process.platform === "win32" ? /^[A-Za-z]:[\\/]/ : /^[A-Za-z]:\\/;
-    if (match !== null && !drive.test(arg)) return match[2] === void 0 ? { destination: match[1] } : {};
+    const local = process.platform === "win32" && /^[A-Za-z]:[\\/]/.test(arg);
+    if (match !== null && !local) return match[2] === void 0 ? { destination: match[1] } : {};
   }
   return {};
 }
@@ -2441,8 +2481,15 @@ function sshDestination(name, args, env, processEnv) {
   }
   return { passthrough: [] };
 }
-function expandHome(path) {
-  return path === "~" || path.startsWith("~/") ? join5(homedir(), path.slice(1)) : path;
+function expandHome(path, home = homedir()) {
+  return path === "~" || path.startsWith("~/") ? join5(home, path.slice(1)) : path;
+}
+function accountHome() {
+  try {
+    return userInfo().homedir || homedir();
+  } catch {
+    return homedir();
+  }
 }
 function globMatch(pattern, name) {
   let p = 0;
@@ -2467,8 +2514,8 @@ function globMatch(pattern, name) {
   return p === pattern.length;
 }
 function includeTargets(pattern, base) {
-  if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/")) return void 0;
-  const path = expandHome(pattern).replace(/\\(.)/g, "$1");
+  if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/") || /[$%]/.test(pattern)) return void 0;
+  const path = expandHome(pattern, accountHome()).replace(/\\(.)/g, "$1");
   const full = isAbsolute3(path) ? path : join5(base, path);
   if (!/[*?[]/.test(full)) return [full];
   if (/[*?[]/.test(dirname3(full)) || basename(full).includes("[")) return void 0;
@@ -2511,8 +2558,8 @@ function configWords(line) {
   if (inWord) words.push(word);
   return words;
 }
-function configRunsCommands(passthrough) {
-  const homeSsh = join5(homedir(), ".ssh");
+function configUnsafe(passthrough) {
+  const homeSsh = join5(accountHome(), ".ssh");
   let config;
   for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
   if (config === "none") return false;
@@ -2541,6 +2588,9 @@ function configRunsCommands(passthrough) {
       if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) {
         return true;
       }
+      if (keyword.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) {
+        return true;
+      }
       for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
         const targets = includeTargets(pattern, base);
         if (targets === void 0) return true;
@@ -2553,12 +2603,12 @@ function configRunsCommands(passthrough) {
 async function ssh(name, args, env, dir, state, otherUser = false) {
   const { destination, passthrough } = sshDestination(name, args, env, state.env);
   if (destination === void 0 || destination.startsWith("-")) return void 0;
-  if (otherUser && !passthrough.some((flag, i) => i % 2 === 0 && flag === "-F")) return { platform: "ssh", source: "unknown" };
+  if (otherUser) return { platform: "ssh", source: "unknown" };
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1]);
     if (passthrough[i] === "-F") passthrough[i + 1] = value === "none" || isAbsolute3(value) ? value : join5(dir ?? "", value);
   }
-  if (configRunsCommands(passthrough)) return { platform: "ssh", source: "unknown" };
+  if (configUnsafe(passthrough)) return { platform: "ssh", source: "unknown" };
   const out = await run(["ssh", "-G", ...passthrough, destination.replace(/[[\]]/g, "")], state);
   if (out === void 0) return { platform: "ssh", source: "unknown" };
   const settings = /* @__PURE__ */ new Map();
@@ -2620,13 +2670,23 @@ async function resolveOne(command, cwd, state) {
   let dir = cwd;
   let found;
   let unresolved;
-  const exported = {};
+  let exported = {};
   let status;
-  for (const { argv, operator } of segments(command)) {
+  const subshells = [];
+  for (const segment of segments(command)) {
+    const { operator } = segment;
+    if (segment.argv.length === 0) {
+      if (operator === "(") subshells.push([dir, { ...exported }]);
+      else if (subshells.length > 0) [dir, exported] = subshells.pop();
+      continue;
+    }
+    let argv = segment.argv;
+    while (argv.length > 0 && SHELL_KEYWORDS.has(argv[0])) argv = argv.slice(1);
+    if (argv.length === 0) continue;
     if (operator === "&&" && status === 1 || operator === "||" && status === 0) continue;
     const parsed = program(argv, dir);
     const { name, args } = parsed;
-    const env = { ...exported, ...parsed.env };
+    const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exported, ...parsed.env };
     status = name === "true" || name === ":" ? 0 : name === "false" ? 1 : void 0;
     if (name === "export") {
       for (const arg of args) if (isAssignment(arg)) exported[arg.slice(0, arg.indexOf("="))] = arg.slice(arg.indexOf("=") + 1);
