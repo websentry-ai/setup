@@ -135,7 +135,6 @@ class DestinationAccountTests(unittest.TestCase):
         cases = [
             f'ssh -F {self.ssh_config} prod-bastion uptime',
             f'scp -F {self.ssh_config} dump.sql prod-bastion:/tmp/',
-            f'sudo ssh -F {self.ssh_config} prod-bastion',
         ]
         for command in cases:
             for hook, account in self._each(command):
@@ -411,7 +410,7 @@ class DestinationAccountTests(unittest.TestCase):
 
     def test_wrappers_and_their_option_values_never_hide_the_command(self):
         repo = _repo({'personal': 'https://github.com/jdoe-dev/app.git'})
-        for command, cwd in ((f'sudo -u deploy ssh -F {self.ssh_config} prod-bastion', None),
+        for command, cwd in (('sudo -u deploy git push personal main', repo),
                              ('env -u HOME git push personal main', repo), ('timeout -s KILL 30 git push personal main', repo),
                              ('nice -n 10 git push personal main', repo), (f'env -C {repo} git push personal main', '/'),
                              (f'sudo -D {repo} git push personal main', '/'), ("env -S 'git push personal main'", repo)):
@@ -536,17 +535,18 @@ class DestinationAccountTests(unittest.TestCase):
             for hook, account in self._each(command):
                 with self.subTest(hook=hook, command=command):
                     self.assertIsNone(account)
-        # scp reads C:\\x as a local path everywhere, and C:/x as host C except on Windows.
-        for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file C:\\\\Users\\\\me'):
-            with self.subTest(hook=hook, command='backslash drive letter'):
-                self.assertEqual((account['host'], account['user']), ('10.0.4.12:2222', 'deploy'))
-        for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file C:/Users/me/out'):
-            with self.subTest(hook=hook, command='slash drive letter'):
-                self.assertEqual(account.get('context') or account.get('host'),
-                                 '10.0.4.12:2222' if os.name == 'nt' else 'c')
-        for hook, account in self._each('sudo -u nobody ssh prod-bastion'):
-            with self.subTest(hook=hook, command='sudo without -F'):
-                self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        # scp reads a drive letter as a local path only on Windows; elsewhere it dials host C.
+        for target in ('C:\\\\Users\\\\me', "'C:\\Users\\me'", 'C:/Users/me/out'):
+            for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file {target}'):
+                with self.subTest(hook=hook, command=target):
+                    self.assertEqual(account.get('context') or account.get('host'),
+                                     '10.0.4.12:2222' if os.name == 'nt' else 'c')
+        # Under sudo, ssh's config and default login are the other user's, with or without -F.
+        for command in ('sudo -u nobody ssh prod-bastion', f'sudo -u nobody ssh -F {self.ssh_config} prod-bastion',
+                        f'sudo ssh -F {self.ssh_config} prod-bastion', f'sudo -u nobody scp -F none f host:/tmp'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
 
     def test_git_config_set_rewrites_count_as_rewrites(self):
         repo = _repo({'personal': 'https://github.com/decoy/app.git'})
@@ -592,6 +592,91 @@ class DestinationAccountTests(unittest.TestCase):
             with self.subTest(hook=hook):
                 self.assertEqual(account['account'], 'jdoe-dev')
                 self.assertNotIn('user', account)
+
+    def test_subshells_groups_and_keywords_keep_the_folder_each_command_runs_in(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        nested = os.path.join(repo, 'frontend')
+        os.makedirs(nested)
+        _git(nested, 'init', '-q', '-b', 'main')
+        _git(nested, 'remote', 'add', 'origin', 'https://github.com/front/web.git')
+        cases = {
+            '(cd frontend && git push origin main)': 'front',
+            'cd frontend; (cd .. && true); git push origin main': 'front',
+            '(cd frontend; git status) && git push origin main': 'acme',
+            '(export X=1; cd frontend) ; git push origin main': 'acme',
+            'if cd frontend; then git push origin main; fi': 'front',
+            '{ cd frontend; git push origin main; }': 'front',
+            'echo $(cd frontend && git push origin main)': 'front',
+            'cat <(git push origin main)': 'acme',
+            'false && (git push origin main)': None,
+        }
+        for command, owner in cases.items():
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account and account['account'], owner)
+
+    def test_env_unset_and_ignore_environment_hide_inherited_values(self):
+        cases = {'env -u GH_HOST gh repo view acme/app': 'github.com',
+                 'env --unset=GH_HOST gh repo view acme/app': 'github.com',
+                 'env -i gh repo view acme/app': 'github.com',
+                 'env - gh repo view acme/app': 'github.com',
+                 'export GH_HOST=ghe.example.com; env -i gh repo view acme/app': 'github.com',
+                 'env -i GH_HOST=other.example.com gh repo view acme/app': 'other.example.com'}
+        with patch.dict(os.environ, {'GH_HOST': 'ghe.example.com'}):
+            for command, host in cases.items():
+                for hook, account in self._each(command):
+                    with self.subTest(hook=hook, command=command):
+                        self.assertEqual(account['host'], host)
+
+    def test_gh_org_scope_the_cs_alias_url_ports_and_host_settings_are_read_as_gh_reads_them(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        cases = {
+            'gh secret list --org acme-org': ('github.com', 'acme-org'),
+            'gh variable set X -o acme-org': ('github.com', 'acme-org'),
+            'gh cs create': ('github.com', None),
+            'gh api https://ghe.example.com:8443/api/v3/repos/other/app': ('ghe.example.com', 'other'),
+            'gh pr view https://ghe.example.com:8443/other/app/pull/1': ('ghe.example.com', 'other'),
+            'gh api --hostname ghe.example.com https://api.github.com/repos/other/app': ('api.github.com', 'other'),
+            'GH_HOST=https://ghe.example.com gh repo view other/app': ('ghe.example.com', 'other'),
+            f'GH_HOST=https://jdoe:{FAKE_TOKEN} gh repo view other/app': ('github.com', 'other'),
+        }
+        for command, (host, owner) in cases.items():
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account.get('account')), (host, owner))
+                    self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
+    def test_ssh_configs_ssh_could_expand_canonicalize_or_not_find_are_never_read(self):
+        marker = os.path.join(self.ssh_dir, 'ran-unsafe')
+        Path(self.ssh_dir, 'inner').write_text(f'Match exec "touch {marker}"\n')
+        configs = {'variable include': 'Include ${HOME}/../' + self.ssh_dir + '/inner\n',
+                   'token include': 'Include %d/inner\n',
+                   'canonicalize': 'CanonicalizeHostname yes\nHost prod-bastion\n  HostName 10.0.4.12\n'}
+        for name, text in configs.items():
+            config = os.path.join(self.ssh_dir, name.replace(' ', '_'))
+            Path(config).write_text(text)
+            for hook, account in self._each(f'ssh -F {config} prod-bastion'):
+                with self.subTest(hook=hook, config=name):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        # A relative -F from a folder that isn't there would be opened from wherever ssh -G runs.
+        Path(self.ssh_dir, 'relative_cfg').write_text(f'Match exec "touch {marker}"\n')
+        here = os.getcwd()
+        os.chdir(self.ssh_dir)
+        try:
+            for hook, account in self._each('ssh -F relative_cfg prod-bastion', '/nonexistent/folder'):
+                with self.subTest(hook=hook, config='relative -F'):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        finally:
+            os.chdir(here)
+        self.assertFalse(os.path.exists(marker))
+
+    @unittest.skipIf(os.name == 'nt', 'POSIX account database')
+    def test_the_ssh_config_scan_reads_the_accounts_home_not_home_variable(self):
+        import pwd
+        with patch.dict(os.environ, {'HOME': tempfile.mkdtemp()}):
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__):
+                    self.assertEqual(hook._account_home(), pwd.getpwuid(os.getuid()).pw_dir)
 
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
@@ -660,6 +745,26 @@ class EachHookCarriesTheAccountTests(unittest.TestCase):
                   {'event': {'hook_event_name': 'afterShellExecution', 'command': self.command, 'output': '', **roots}},
                   {'event': {'hook_event_name': 'afterAgentResponse', 'text': 'pushed', **roots}}]
         self._check(hook.build_llm_exchange(events))
+
+    def test_cursor_gives_no_account_to_a_command_noted_in_two_folders(self):
+        hook = load_module('cursor/unbound.py')
+        other = _repo({'personal': 'https://github.com/other-owner/app.git'})
+        roots = {'workspace_roots': [self.repo], 'conversation_id': 'c1', 'generation_id': 'g1'}
+
+        def exchange(folders):
+            log = os.path.join(tempfile.mkdtemp(), 'agent-audit.log')
+            with patch.object(hook, 'AUDIT_LOG', Path(log)):
+                for folder in folders:
+                    hook._note_shell_cwd({'hook_event_name': 'preToolUse', 'tool_name': 'Shell', **roots,
+                                          'tool_input': {'command': self.command, 'working_directory': folder}})
+            noted = [json.loads(line) for line in Path(log).read_text().splitlines()]
+            after = {'event': {'hook_event_name': 'afterShellExecution', 'command': self.command, 'output': '', **roots}}
+            return hook.build_llm_exchange([{'event': {'hook_event_name': 'beforeSubmitPrompt', 'prompt': 'push', **roots}},
+                                            *noted, after, after,
+                                            {'event': {'hook_event_name': 'afterAgentResponse', 'text': 'ok', **roots}}])
+
+        self.assertIsNone(_account_in(exchange([self.repo, other])))
+        self._check(exchange([self.repo, self.repo]))
 
     def test_copilot(self):
         hook = load_module('copilot/hooks/unbound.py')

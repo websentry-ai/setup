@@ -3891,20 +3891,27 @@ _ACCOUNT_RSYNC_VALUE_OPTIONS = frozenset({
 _ACCOUNT_GH_NO_REPO = frozenset({'auth', 'help', 'version', 'config', 'alias', 'extension', 'completion',
                                  '--help', '-h', '--version'})
 # gh commands that reach GitHub but not the checkout's repository, so only the host and login are known.
-_ACCOUNT_GH_NO_CHECKOUT = frozenset({'search', 'gist', 'org', 'codespace', 'ssh-key', 'gpg-key', 'status', 'project'})
+_ACCOUNT_GH_NO_CHECKOUT = frozenset({'search', 'gist', 'org', 'codespace', 'cs', 'ssh-key', 'gpg-key', 'status',
+                                     'project'})
+# gh commands whose -o names an organization, as --org does everywhere.
+_ACCOUNT_GH_ORG_SHORT = frozenset({'secret', 'variable', 'ruleset'})
 # gh options whose value is never a repository, skipped so a value such as --title '-Rx/y' is not read as one.
 _ACCOUNT_GH_VALUE_OPTIONS = frozenset({
     '-t', '--title', '-b', '--body', '-F', '--body-file', '-B', '--base', '-H', '--head', '-l', '--label', '-a',
     '--assignee', '-r', '--reviewer', '-m', '--milestone', '--project', '-q', '--jq', '-T', '--template', '--json',
     '-S', '--search', '-s', '--state', '-L', '--limit', '-A', '--author', '-f', '--field', '--raw-field', '--header',
     '-X', '--method', '--input', '--workflow', '--ref', '-n', '--notes', '--notes-file', '--target', '-j', '--job',
-    '--branch', '--message', '--name', '--description', '--visibility', '--color', '--env', '--org', '--key'})
+    '--branch', '--message', '--name', '--description', '--visibility', '--color', '--env', '--key'})
 # gh picks among unresolved remotes in this order.
 _ACCOUNT_GH_REMOTE_ORDER = ('upstream', 'github', 'origin')
 # Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to.
 _ACCOUNT_GIT_OVERRIDE_ENV = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
                              'GIT_CONFIG_SYSTEM')
 _ACCOUNT_GH_TOKEN_ENV = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
+# Reserved words that lead a command without being its program.
+_ACCOUNT_SHELL_KEYWORDS = frozenset({'{', '}', 'if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until'})
+# Set in a command's env by `env -i`: nothing is inherited from the hook's environment.
+_ACCOUNT_CLEAN_ENV = '\0clean'
 
 
 def _account_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[str]:
@@ -3959,7 +3966,8 @@ def _account_read_word(text: str, i: int) -> tuple:
 
 
 def _account_segments(command: str) -> List[tuple]:
-    """The command as (argv, operator before it) per simple command; redirections and heredoc bodies are left out."""
+    """The command as (argv, operator before it) per simple command, and (None, '(' or ')') around each subshell;
+    redirections and heredoc bodies are left out."""
     segments, argv, word, in_word, operator, quote, heredocs, i = [], [], '', False, '', None, [], 0
     while i < len(command):
         ch = command[i]
@@ -3983,6 +3991,22 @@ def _account_segments(command: str) -> List[tuple]:
         elif ch == '#' and not in_word:
             while i + 1 < len(command) and command[i + 1] != '\n':
                 i += 1  # a comment runs to the end of its line
+        elif ch in '<>' and command[i + 1:i + 2] == '(':
+            # A process substitution runs its commands in a subshell, like $( ... ).
+            if in_word:
+                argv.append(word)
+            word, in_word = '', False
+        elif ch in '()':
+            # Commands inside keep the operator before the subshell; its cd and exports end at the close.
+            if in_word:
+                argv.append(word)
+            word, in_word = '', False
+            if argv:
+                segments.append((argv, operator))
+            argv = []
+            segments.append((None, ch))
+            if ch == ')':
+                operator = ';'
         elif ch in '<>' or command[i:i + 2] == '&>':
             # A redirection's operator, an fd number written against it, and its target are not arguments.
             if in_word and not (word.isdigit() and ch != '&'):
@@ -4033,7 +4057,9 @@ def _account_segments(command: str) -> List[tuple]:
 
 def _account_env(env: Dict, key: str) -> str:
     """A variable as the command sees it: set or unset in the command, else inherited from the hook's environment."""
-    return env[key] if key in env else os.environ.get(key, '')
+    if key in env:
+        return env[key]
+    return '' if _ACCOUNT_CLEAN_ENV in env else os.environ.get(key, '')
 
 
 def _account_is_assignment(token: str) -> bool:
@@ -4053,6 +4079,10 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
         if wrapper is not None and not options_done and token == '--':
             options_done = True
             continue
+        if wrapper == 'env' and not options_done and token in ('-', '--ignore-environment'):
+            env.clear()
+            env[_ACCOUNT_CLEAN_ENV] = ''
+            continue
         if wrapper is not None and not options_done and token.startswith('-') and token != '-':
             short_flags, long_flags, _ = _ACCOUNT_WRAPPERS[wrapper]
             if wrapper == 'command' and token in ('-v', '-V'):
@@ -4066,6 +4096,9 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
                     value, i = argv[i], i + 1
             else:
                 for j, flag in enumerate(token[1:], start=2):
+                    if wrapper == 'env' and flag == 'i':
+                        env.clear()
+                        env[_ACCOUNT_CLEAN_ENV] = ''
                     if flag in short_flags:
                         name, value = '-' + flag, token[j:]
                         if not value and i < len(argv):
@@ -4075,7 +4108,9 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
                 path = os.path.expanduser(value)
                 cwd = path if os.path.isabs(path) else os.path.normpath(os.path.join(cwd or '', path))
             elif value is not None and name in ('-S', '--split-string') and wrapper == 'env':
-                argv[i:i] = [w for segment, _ in _account_segments(value) for w in segment]
+                argv[i:i] = [w for segment, _ in _account_segments(value) if segment for w in segment]
+            elif value is not None and name in ('-u', '--unset') and wrapper == 'env':
+                env[value] = ''
             continue
         if wrapper is not None and operands > 0:
             operands -= 1
@@ -4092,6 +4127,12 @@ def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
 def _account_strip_login(url: str) -> str:
     """A remote URL with any login removed: everything up to the last @ before the path, with or without a scheme."""
     return re.sub(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)?[^/]*@', r'\1', url.strip())
+
+
+def _account_host(value: str) -> str:
+    """The host a host setting names, with any scheme, login, port or path dropped; empty when it names none."""
+    authority = re.sub(r'^[a-z][a-z0-9+.-]*://', '', value.strip().lower()).split('/')[0].rsplit('@', 1)[-1]
+    return authority.split(':')[0] if re.match(r'^[a-z0-9.-]+(:\d*)?$', authority) else ''
 
 
 def _account_looks_like_url(value: str) -> bool:
@@ -4274,7 +4315,7 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     """The account a gh command reaches: host and owner from -R, a repo argument, GH_REPO or the repo's remote, plus the gh login."""
     if not args or args[0] in _ACCOUNT_GH_NO_REPO:
         return None
-    repo, flag_host, positional, i, checkout_bound = '', '', [], 0, True
+    repo, flag_host, org, positional, i, checkout_bound = '', '', '', [], 0, True
     while i < len(args):
         arg = args[i]
         i += 1
@@ -4285,9 +4326,17 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         elif arg.startswith('-R') and not arg.startswith('--'):
             repo = arg[2:].lstrip('=')
         elif arg == '--hostname' and i < len(args):
-            flag_host, i = args[i].lower().rsplit('@', 1)[-1], i + 1
+            flag_host, i = _account_host(args[i]), i + 1
         elif arg.startswith('--hostname='):
-            flag_host = arg.split('=', 1)[1].lower().rsplit('@', 1)[-1]
+            flag_host = _account_host(arg.split('=', 1)[1])
+        elif arg == '--org' and i < len(args):
+            org, i = args[i], i + 1
+        elif arg.startswith('--org='):
+            org = arg.split('=', 1)[1]
+        elif arg.startswith('-o') and positional[:1] and positional[0] in _ACCOUNT_GH_ORG_SHORT:
+            org = arg[2:].lstrip('=')
+            if not org and i < len(args):
+                org, i = args[i], i + 1
         elif arg in _ACCOUNT_GH_VALUE_OPTIONS:
             i += 1
         elif not arg.startswith('-'):
@@ -4296,7 +4345,7 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     if not repo and len(positional) > 2 and positional[0] == 'repo' and '/' in positional[2]:
         repo = positional[2]
     if not repo and positional[:1] != ['api']:
-        repo = next((m.group(1) for m in (re.match(r'^https?://([^/@]+/[^/@]+/[^/@]+)', _account_strip_login(a))
+        repo = next((m.group(1) for m in (re.match(r'^(https?://[^/@]+/[^/@]+/[^/@]+)', _account_strip_login(a))
                                            for a in positional[1:]) if m), '')
     if positional[:1] and positional[0] in _ACCOUNT_GH_NO_CHECKOUT or \
             positional[:2] in (['repo', 'list'], ['repo', 'create']) and not repo:
@@ -4304,21 +4353,22 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         checkout_bound = False
     if not repo and positional[:1] == ['api']:
         url = next((_account_strip_login(a) for a in positional[1:] if re.match(r'^https?://', a)), '')
-        named = re.match(r'^https?://([^/]+)/(?:api/v3/)?repos/([^/{}@]+/[^/{}@]+)', url) or next(
+        # A full URL names the host gh requests, whatever --hostname says.
+        flag_host = _account_host(url) if url else flag_host
+        named = re.match(r'^https?://[^/]+/(?:api/v3/)?repos/([^/{}@]+/[^/{}@]+)', url) or next(
             (m for m in (re.match(r'^/?repos/([^/{}@]+/[^/{}@]+)', a) for a in positional[1:]) if m), None)
-        if named and named.lastindex == 2:
-            repo = f'{named.group(1)}/{named.group(2)}'
-        elif named:
+        if named:
             repo = named.group(1)
         else:
-            # An api path that names no repo reaches no repo of this checkout; a full URL still names its host.
-            flag_host = flag_host or (re.match(r'^https?://([^/]+)', url).group(1).lower() if url else '')
+            # An api path that names no repo reaches no repo of this checkout.
             checkout_bound = any('{owner}' in a or '{repo}' in a for a in positional)
             cwd = cwd if checkout_bound else None
+    if org:
+        # An organization's secrets, variables and rulesets are not the checkout's.
+        repo, cwd, checkout_bound = org, None, False
     # GH_REPO only stands in for a command that works on a repository.
     repo = repo or ('' if cwd is None and not checkout_bound else _account_env(env, 'GH_REPO'))
-    # A host never carries a login, so anything before an @ is dropped.
-    env_host = _account_env(env, 'GH_HOST').lower().rsplit('@', 1)[-1]
+    env_host = _account_host(_account_env(env, 'GH_HOST'))
     host, owner = '', ''
     if repo:
         repo = _account_strip_login(repo)  # never keep a login or token
@@ -4350,8 +4400,8 @@ def _account_remote_operand(operands: List[str]) -> tuple:
             return None, None
         # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
         match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
-        # A drive letter is local in C:\x form, and in C:/x form too on Windows; elsewhere scp dials host C.
-        if match and not re.match(r'^[A-Za-z]:\\' if os.name != 'nt' else r'^[A-Za-z]:[\\/]', arg):
+        # A drive letter is a local path only on Windows; elsewhere scp dials host C.
+        if match and not (os.name == 'nt' and re.match(r'^[A-Za-z]:[\\/]', arg)):
             return (None, None) if match.group(2) else (match.group(1), None)
     return None, None
 
@@ -4383,7 +4433,7 @@ def _account_rsync_destination(args: List[str], env: Dict) -> tuple:
             operands.append(arg)
     passthrough = []
     if shell:
-        shell_argv = [w for segment, _ in _account_segments(shell) for w in segment]
+        shell_argv = [w for segment, _ in _account_segments(shell) if segment for w in segment]
         # A remote shell other than ssh never reads the ssh config.
         if not shell_argv or os.path.basename(shell_argv[0]) != 'ssh':
             return None, []
@@ -4467,11 +4517,21 @@ def _account_ssh_config_words(line: str) -> Optional[List[str]]:
     return words
 
 
-def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]) -> bool:
-    """Whether ssh -G could run a command while reading its configs: a Match exec anywhere, or a file it can't check."""
+def _account_home() -> str:
+    """The home folder ssh reads its config from: the account's own, which $HOME does not change."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return os.path.expanduser('~')
+
+
+def _account_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> bool:
+    """Whether ssh -G could run a command or a DNS lookup while reading its configs, or reads a file this can't check."""
     import glob
     import stat
-    home_ssh = os.path.expanduser('~/.ssh')
+    home = _account_home()
+    home_ssh = os.path.join(home, '.ssh')
     config = None
     for flag, value in zip(passthrough[::2], passthrough[1::2]):
         if flag == '-F':
@@ -4480,7 +4540,7 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
         return False
     if config is None:
         pending = [(os.path.join(home_ssh, 'config'), home_ssh), ('/etc/ssh/ssh_config', '/etc/ssh')]
-    elif os.path.isabs(config) or cwd:
+    elif os.path.isabs(config) or (cwd and os.path.isdir(cwd)):
         pending = [(os.path.join(cwd or '', config), home_ssh)]
     else:
         return True
@@ -4516,9 +4576,14 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
             words = [w.lstrip('=') for w in ([attached] if attached else []) + words[1:] if w.lstrip('=')]
             if keyword.lower() == 'match' and any(w.lower().lstrip('!').startswith('exec') for w in words):
                 return True
+            if keyword.lower() == 'canonicalizehostname' and words and words[0].lower() in ('yes', 'always'):
+                return True
             for pattern in (words if keyword.lower() == 'include' else []):
+                if '$' in pattern or '%' in pattern:
+                    return True  # ssh may expand a variable or token here
+                pattern = home + pattern[1:] if pattern == '~' or pattern.startswith('~/') else os.path.expanduser(pattern)
                 # ssh globs the path, and glob reads a backslash as escaping the next character.
-                pattern = re.sub(r'\\(.)', r'\1', os.path.expanduser(pattern))
+                pattern = re.sub(r'\\(.)', r'\1', pattern)
                 pending += [(found, base) for found in sorted(glob.glob(os.path.join(base, pattern)))]
     return False
 
@@ -4529,10 +4594,10 @@ def _account_ssh(program: str, args: List[str], env: Dict, cwd: Optional[str], s
     destination, passthrough = _account_ssh_destination(program, args, env)
     if not destination or destination.startswith('-'):
         return None  # a word starting with - would reach ssh -G as an option
-    if other_user and '-F' not in passthrough[::2]:
-        # Under sudo, ssh reads that user's config, which this hook can't.
+    if other_user:
+        # Under sudo, ssh runs as that user, with that user's config and default login.
         return {'platform': 'ssh', 'source': 'unknown'}
-    if _account_ssh_config_runs_commands(passthrough, cwd):
+    if _account_ssh_config_unsafe(passthrough, cwd):
         return {'platform': 'ssh', 'source': 'unknown'}
     out = _account_run(['ssh', '-G'] + passthrough + [destination.replace('[', '').replace(']', '')], cwd, state)
     if not out:
@@ -4582,13 +4647,24 @@ def _destination_account(command: Optional[str], cwd: Optional[str], state: Dict
     try:
         if not isinstance(command, str) or not command.strip():
             return None
-        found, unresolved, exported, status = None, None, {}, None
+        found, unresolved, exported, status, subshells = None, None, {}, None, []
         for argv, operator in _account_segments(command):
+            if argv is None:
+                # A subshell's cd and exports end with it.
+                if operator == '(':
+                    subshells.append((cwd, dict(exported)))
+                elif subshells:
+                    cwd, exported = subshells.pop()
+                continue
+            while argv and argv[0] in _ACCOUNT_SHELL_KEYWORDS:
+                argv = argv[1:]
+            if not argv:
+                continue
             # A literal true or false decides whether && or || runs the next command; any other status is unknown.
             if (operator == '&&' and status == 1) or (operator == '||' and status == 0):
                 continue
             program, args, env, seg_cwd, other_user = _account_program(argv, cwd)
-            env = {**exported, **env}
+            env = env if _ACCOUNT_CLEAN_ENV in env else {**exported, **env}
             status = 0 if program in ('true', ':') else 1 if program == 'false' else None
             if program == 'export':
                 exported.update(a.split('=', 1) for a in args if _account_is_assignment(a))
