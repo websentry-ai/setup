@@ -225,10 +225,12 @@ class DestinationAccountTests(unittest.TestCase):
         marker = os.path.join(self.ssh_dir, 'ran')
         config = os.path.join(self.ssh_dir, 'exec_config')
         Path(config).write_text(f'Match host * exec "touch {marker}"\n  HostName 10.9.9.9\n')
-        for command in (f'ssh -F {config} prod-bastion', f'false && scp -F {config} f prod-bastion:/tmp/'):
-            for hook, account in self._each(command):
-                with self.subTest(hook=hook, command=command):
-                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        for hook, account in self._each(f'ssh -F {config} prod-bastion'):
+            with self.subTest(hook=hook):
+                self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        for hook, account in self._each(f'false && scp -F {config} f prod-bastion:/tmp/'):
+            with self.subTest(hook=hook, command='never ran'):
+                self.assertIsNone(account)
         self.assertFalse(os.path.exists(marker))
 
     def test_what_follows_an_ssh_destination_is_the_remote_command(self):
@@ -395,14 +397,116 @@ class DestinationAccountTests(unittest.TestCase):
             with self.subTest(hook=hook):
                 self.assertEqual((account['host'], account['user']), ('10.0.4.12:2200', 'ops'))
 
-    def test_scp_uris_and_a_login_in_gh_host_are_never_misread(self):
-        for hook, account in self._each('scp dump.sql scp://deploy@prod-bastion:2222/tmp/'):
-            with self.subTest(hook=hook):
-                self.assertIsNone(account)
+    def test_scp_uris_resolve_without_their_password_and_a_login_in_gh_host_is_dropped(self):
+        for command in (f'scp -F {self.ssh_config} dump.sql scp://deploy@prod-bastion:2200/tmp/',
+                        f'sftp -F {self.ssh_config} sftp://deploy:{FAKE_TOKEN}@prod-bastion:2200/tmp'):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['user']), ('10.0.4.12:2200', 'deploy'))
+                    self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
         for hook, account in self._each(f'GH_HOST=jdoe:{FAKE_TOKEN}@ghe.example.com gh pr create -R acme/app'):
             with self.subTest(hook=hook):
                 self.assertEqual(account['host'], 'ghe.example.com')
                 self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
+    def test_wrappers_and_their_option_values_never_hide_the_command(self):
+        repo = _repo({'personal': 'https://github.com/jdoe-dev/app.git'})
+        for command, cwd in ((f'sudo -u deploy ssh -F {self.ssh_config} prod-bastion', None),
+                             ('env -u HOME git push personal main', repo), ('timeout -s KILL 30 git push personal main', repo),
+                             ('nice -n 10 git push personal main', repo), (f'env -C {repo} git push personal main', '/'),
+                             (f'sudo -D {repo} git push personal main', '/'), ("env -S 'git push personal main'", repo)):
+            for hook, account in self._each(command, cwd):
+                with self.subTest(hook=hook, command=command):
+                    self.assertIn(account.get('account') or account.get('user'), ('jdoe-dev', 'deploy'))
+        for hook, account in self._each('command -v ssh'):
+            with self.subTest(hook=hook):
+                self.assertIsNone(account)
+
+    def test_exports_carry_to_later_commands_and_literal_short_circuits_are_followed(self):
+        repo = _repo({'personal': 'https://github.com/jdoe-dev/app.git'})
+        for hook, account in self._each('export GIT_DIR=/elsewhere/.git && git push personal main', repo):
+            with self.subTest(hook=hook):
+                self.assertEqual(account, {'platform': 'git', 'source': 'unknown'})
+        for command, expected in (('false && git push personal main', None), ('true || git push personal main', None),
+                                  ('false || git push personal main', 'jdoe-dev'), ('true && git push personal main', 'jdoe-dev'),
+                                  ('false && echo x || git push personal main', 'jdoe-dev')):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account and account['account'], expected)
+
+    def test_gh_reads_urls_its_default_repo_and_skips_option_values(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git', 'upstream': 'https://github.com/base/app.git'})
+        cases = {'gh pr view https://github.com/other/app/pull/1': 'other',
+                 "gh pr create -R acme/app --title '-Rpersonal/app' --body text": 'acme',
+                 'gh pr list': 'base'}
+        for command, owner in cases.items():
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(account['account'], owner)
+        _git(repo, 'config', 'remote.origin.gh-resolved', 'base')
+        for hook, account in self._each('gh pr list', repo):
+            with self.subTest(hook=hook, default='origin'):
+                self.assertEqual(account['account'], 'acme')
+        for hook, account in self._each(f'gh api repos/x@{FAKE_TOKEN}@github.com/acme/contents'):
+            with self.subTest(hook=hook, command='api'):
+                self.assertNotIn(account.get('account'), ('github.com',))
+                self.assertNotIn(FAKE_TOKEN.lower(), json.dumps(account).lower())
+
+    def test_explicit_push_urls_follow_git_url_rewrites_and_a_url_push_default(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        _git(repo, 'config', 'url.https://github.com/acme/.pushInsteadOf', 'work:')
+        _git(repo, 'config', 'url.https://github.com/personal/.insteadOf', 'https://github.com/elsewhere/')
+        for command, owner in (('git push work:app.git main', 'acme'), ('git push https://github.com/elsewhere/app.git main', 'personal')):
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['account']), ('github.com', owner))
+        other = _repo({'origin': 'https://github.com/acme/app.git'})
+        _git(other, 'config', 'remote.pushDefault', 'https://github.com/jdoe-dev/app.git')
+        for hook, account in self._each('git push', other):
+            with self.subTest(hook=hook, setting='pushDefault url'):
+                self.assertEqual(account['account'], 'jdoe-dev')
+
+    def test_a_remote_named_with_a_slash_is_the_one_pushed_to(self):
+        repo = _repo({'forks/mine': 'https://github.com/jdoe-dev/app.git', 'origin': 'https://github.com/acme/app.git'})
+        _git(repo, 'commit', '-q', '--allow-empty', '-m', 'x')
+        _git(repo, 'update-ref', 'refs/remotes/forks/mine/main', 'HEAD')
+        _git(repo, 'config', 'branch.main.remote', 'forks/mine')
+        _git(repo, 'config', 'branch.main.merge', 'refs/heads/main')
+        for hook, account in self._each('git push', repo):
+            with self.subTest(hook=hook):
+                self.assertEqual((account['account'], account['context']), ('jdoe-dev', 'forks/mine'))
+
+    def test_a_remote_rewritten_later_in_the_turn_leaves_earlier_pushes_unknown(self):
+        repo = _repo({'personal': 'https://github.com/decoy/app.git'})
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(hook._destination_account(
+                    'git push personal main; git remote set-url personal https://github.com/decoy/app.git', repo, {}),
+                    {'platform': 'git', 'source': 'unknown'})
+                state = {}
+                earlier = hook._destination_account('git push personal main', repo, state)
+                hook._destination_account('git config --global url.https://x/.insteadOf https://y/', repo, state)
+                self.assertEqual(earlier, {'platform': 'git', 'source': 'unknown'})
+
+    def test_rsync_reads_rsync_rsh_and_option_clusters_that_take_values(self):
+        for command in (f'RSYNC_RSH="ssh -F {self.ssh_config} -p 2200" rsync -a src prod-bastion:/dest',
+                        f"rsync -af 'foo:bar' -e 'ssh -F {self.ssh_config} -p 2200' src prod-bastion:/dest"):
+            for hook, account in self._each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account['user']), ('10.0.4.12:2200', 'deploy'))
+
+    def test_escapes_inside_quoted_includes_are_read_as_ssh_reads_them(self):
+        folder = os.path.join(self.ssh_dir, 'sub dir')
+        os.makedirs(folder, exist_ok=True)
+        marker = os.path.join(self.ssh_dir, 'ran-escaped')
+        Path(folder, 'inner_config').write_text(f'Match exec "touch {marker}"\n')
+        for body in (f"Include '{folder}/inner\\_config'\n", f"Include '{self.ssh_dir}/sub\\ dir/inner_config'\n"):
+            config = os.path.join(self.ssh_dir, 'escaped')
+            Path(config).write_text(body + 'Host prod-bastion\n  HostName 10.0.4.12\n')
+            for hook, account in self._each(f'ssh -F {config} prod-bastion'):
+                with self.subTest(hook=hook, body=body):
+                    self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
+        self.assertFalse(os.path.exists(marker))
 
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
@@ -456,6 +560,20 @@ class EachHookCarriesTheAccountTests(unittest.TestCase):
                        'output': '', **roots}},
             {'event': {'hook_event_name': 'afterAgentResponse', 'text': 'pushed', **roots}},
         ]
+        self._check(hook.build_llm_exchange(events))
+
+    def test_cursor_uses_the_cwd_noted_before_the_command_ran(self):
+        hook = load_module('cursor/unbound.py')
+        elsewhere = tempfile.mkdtemp()
+        roots = {'workspace_roots': [elsewhere], 'conversation_id': 'c1', 'generation_id': 'g1'}
+        log = os.path.join(tempfile.mkdtemp(), 'agent-audit.log')
+        with patch.object(hook, 'AUDIT_LOG', Path(log)):
+            hook._note_shell_cwd({'hook_event_name': 'preToolUse', 'tool_name': 'Shell', **roots,
+                                  'tool_input': {'command': self.command, 'working_directory': self.repo}})
+        noted = [json.loads(line) for line in Path(log).read_text().splitlines()]
+        events = [{'event': {'hook_event_name': 'beforeSubmitPrompt', 'prompt': 'push it', **roots}}, *noted,
+                  {'event': {'hook_event_name': 'afterShellExecution', 'command': self.command, 'output': '', **roots}},
+                  {'event': {'hook_event_name': 'afterAgentResponse', 'text': 'pushed', **roots}}]
         self._check(hook.build_llm_exchange(events))
 
     def test_copilot(self):

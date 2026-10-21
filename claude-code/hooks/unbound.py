@@ -5194,36 +5194,59 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
 # Only these commands are ever run to resolve an account; everything else is refused.
 _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'remote', 'get-url'),
-    ('git', 'rev-parse', '--abbrev-ref', '--symbolic-full-name'),
+    ('git', 'rev-parse', '--symbolic-full-name'),
     ('git', 'symbolic-ref', '--short', '-q', 'HEAD'),
     ('git', 'config', '--get'),
+    ('git', 'config', '--get-regexp'),
     ('gh', 'config', 'get', '-h'),
     ('ssh', '-G'),
 )
 _ACCOUNT_RUN_TIMEOUT = 5
 # Wall-clock budget for all lookups in one turn, so a slow tool never delays the agent.
 _ACCOUNT_TURN_BUDGET = 10.0
-_ACCOUNT_WRAPPERS = frozenset({'sudo', 'env', 'command', 'exec', 'time', 'nohup'})
+# Wrappers that run the command after them: (short options that take a value, long ones that do, operands before it).
+_ACCOUNT_WRAPPERS = {
+    'sudo': ('ugCDhprtTU', {'--user', '--group', '--close-from', '--chdir', '--host', '--prompt', '--role', '--type',
+                            '--command-timeout', '--other-user'}, 0),
+    'doas': ('uC', set(), 0),
+    'env': ('uCS', {'--unset', '--chdir', '--split-string'}, 0),
+    'nice': ('n', {'--adjustment'}, 0),
+    'timeout': ('ks', {'--kill-after', '--signal'}, 1),
+    'time': ('fo', {'--format', '--output'}, 0),
+    'stdbuf': ('ioe', {'--input', '--output', '--error'}, 0),
+    'ionice': ('cnp', {'--class', '--classdata', '--pid'}, 0),
+    'exec': ('a', set(), 0),
+    'command': ('', set(), 0),
+    'nohup': ('', set(), 0),
+}
 _ACCOUNT_SSH_TOOLS = frozenset({'ssh', 'scp', 'sftp', 'rsync'})
 # Options that take a value, per program; every other option is a switch.
 _ACCOUNT_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': frozenset('cDFiJloPSX'),
-                            'sftp': frozenset('BbcDFiJloPRSsX')}
+                            'sftp': frozenset('BbcDFiJloPRSsX'), 'rsync': frozenset('efTMB@')}
 # Of ssh's -o settings, only these change which host or user ssh -G resolves.
 _ACCOUNT_SSH_IDENTITY_OPTIONS = frozenset({'hostname', 'user', 'port', 'proxyjump'})
 _ACCOUNT_SSH_CONFIG_MAX_BYTES = 256 * 1024
 _ACCOUNT_SSH_CONFIG_MAX_FILES = 32
 _ACCOUNT_RSYNC_VALUE_OPTIONS = frozenset({
-    '--exclude', '--include', '--filter', '-f', '--exclude-from', '--include-from', '--files-from', '--rsync-path',
-    '--log-file', '--partial-dir', '--temp-dir', '-T', '--compare-dest', '--copy-dest', '--link-dest', '--backup-dir',
+    '--exclude', '--include', '--filter', '--exclude-from', '--include-from', '--files-from', '--rsync-path',
+    '--log-file', '--partial-dir', '--temp-dir', '--compare-dest', '--copy-dest', '--link-dest', '--backup-dir',
     '--chmod', '--chown', '--suffix', '--password-file', '--port', '--bwlimit', '--timeout', '--max-size',
-    '--min-size', '--out-format', '--remote-option', '-M'})
+    '--min-size', '--out-format', '--remote-option', '--block-size', '--modify-window'})
 # gh commands that reach no repository.
 _ACCOUNT_GH_NO_REPO = frozenset({'auth', 'help', 'version', 'config', 'alias', 'extension', 'completion',
                                  '--help', '-h', '--version'})
+# gh options whose value is never a repository, skipped so a value such as --title '-Rx/y' is not read as one.
+_ACCOUNT_GH_VALUE_OPTIONS = frozenset({
+    '-t', '--title', '-b', '--body', '-F', '--body-file', '-B', '--base', '-H', '--head', '-l', '--label', '-a',
+    '--assignee', '-r', '--reviewer', '-m', '--milestone', '--project', '-q', '--jq', '-T', '--template', '--json',
+    '-S', '--search', '-s', '--state', '-L', '--limit', '-A', '--author', '-f', '--field', '--raw-field', '--header',
+    '-X', '--method', '--input', '--workflow', '--ref', '-n', '--notes', '--notes-file', '--target', '-j', '--job',
+    '--branch', '--message', '--name', '--description', '--visibility', '--color', '--env', '--org', '--key'})
+# gh picks among unresolved remotes in this order.
+_ACCOUNT_GH_REMOTE_ORDER = ('upstream', 'github', 'origin')
 # Settings that move the repository or rewrite its config, so the remote read here may not be the one pushed to.
 _ACCOUNT_GIT_OVERRIDE_ENV = ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_GLOBAL',
                              'GIT_CONFIG_SYSTEM')
-_ACCOUNT_GH_HOSTS_ENV = ('GH_HOST',)
 _ACCOUNT_GH_TOKEN_ENV = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
 
 
@@ -5250,50 +5273,93 @@ def _account_strip_git_dir(argv: List[str]) -> List[str]:
     return argv
 
 
-def _account_segments(command: str) -> List[List[str]]:
-    """The command split into simple commands on ; && || | and newlines, each as argv; [] when it can't be parsed."""
+def _account_segments(command: str) -> List[tuple]:
+    """The command as (argv, operator before it) per simple command, split on ; && || | and newlines; [] if unparsable."""
     try:
         # A backslash-newline continues the line; a comment swallows its newline, so a doubled one survives it.
         text = command.replace('\\\n', ' ').replace('\n', '\n\n')
         lexer = shlex.shlex(text, posix=True, punctuation_chars=';&|\n')
         lexer.whitespace_split = True
         lexer.whitespace = ' \t\r'
-        segments, current = [], []
+        segments, current, operator = [], [], ''
         for token in lexer:
             if token and set(token) <= set(';&|\n'):
                 if current:
-                    segments.append(current)
+                    segments.append((current, operator))
+                    operator = token.strip('\n') if token.strip('\n') in ('&&', '||') else ';'
                 current = []
             else:
                 current.append(token)
         if current:
-            segments.append(current)
+            segments.append((current, operator))
         return segments
     except Exception:
         return []
 
 
-def _account_program(argv: List[str]) -> tuple:
-    """(program, its args, inline VAR=value settings) after leading assignments and wrappers like sudo or env."""
-    env, i = {}, 0
+def _account_is_assignment(token: str) -> bool:
+    return '=' in token and not token.startswith('-') and token.split('=', 1)[0].replace('_', '').isalnum()
+
+
+def _account_program(argv: List[str], cwd: Optional[str]) -> tuple:
+    """(program, its args, inline VAR=value settings, folder it runs in) after assignments and wrappers like sudo."""
+    env, argv, i, wrapper, operands, options_done = {}, list(argv), 0, None, 0, False
     while i < len(argv):
         token = argv[i]
-        if '=' in token and not token.startswith('-') and token.split('=', 1)[0].replace('_', '').isalnum():
+        i += 1
+        if _account_is_assignment(token) and (wrapper is None or options_done or wrapper in ('env', 'sudo')):
             key, value = token.split('=', 1)
             env[key] = value
-        elif os.path.basename(token) in _ACCOUNT_WRAPPERS:
-            pass
-        elif token.startswith('-') and i > 0 and os.path.basename(argv[i - 1]) in _ACCOUNT_WRAPPERS:
-            pass
-        else:
-            return os.path.basename(token), argv[i + 1:], env
-        i += 1
-    return None, [], env
+            continue
+        if wrapper is not None and not options_done and token == '--':
+            options_done = True
+            continue
+        if wrapper is not None and not options_done and token.startswith('-') and token != '-':
+            short_flags, long_flags, _ = _ACCOUNT_WRAPPERS[wrapper]
+            if wrapper == 'command' and token in ('-v', '-V'):
+                return None, [], env, cwd  # only looks the command up
+            name, value = token, None
+            if token.startswith('--'):
+                name, eq, attached = token.partition('=')
+                if eq:
+                    value = attached
+                elif name in long_flags and i < len(argv):
+                    value, i = argv[i], i + 1
+            else:
+                for j, flag in enumerate(token[1:], start=2):
+                    if flag in short_flags:
+                        name, value = '-' + flag, token[j:]
+                        if not value and i < len(argv):
+                            value, i = argv[i], i + 1
+                        break
+            if value is not None and name in {'env': ('-C', '--chdir'), 'sudo': ('-D', '--chdir')}.get(wrapper, ()):
+                path = os.path.expanduser(value)
+                cwd = path if os.path.isabs(path) else os.path.normpath(os.path.join(cwd or '', path))
+            elif value is not None and name in ('-S', '--split-string') and wrapper == 'env':
+                try:
+                    argv[i:i] = shlex.split(value)
+                except ValueError:
+                    return None, [], env, cwd
+            continue
+        if wrapper is not None and operands > 0:
+            operands -= 1
+            continue
+        if os.path.basename(token) in _ACCOUNT_WRAPPERS:
+            wrapper, options_done = os.path.basename(token), False
+            operands = _ACCOUNT_WRAPPERS[wrapper][2]
+            continue
+        return os.path.basename(token), argv[i:], env, cwd
+    return None, [], env, cwd
 
 
 def _account_strip_login(url: str) -> str:
     """A remote URL with any login removed: everything up to the last @ before the path, with or without a scheme."""
     return re.sub(r'^([a-zA-Z][a-zA-Z0-9+.-]*://)?[^/]*@', r'\1', url.strip())
+
+
+def _account_looks_like_url(value: str) -> bool:
+    """Whether a git remote or target names a URL rather than a remote."""
+    return bool(re.search(r'://|^[^/:]+@[^/:]+:|^[^/:]+:[^/]', value))
 
 
 def _account_remote_parts(url: str) -> tuple:
@@ -5334,8 +5400,47 @@ def _account_gh_user(host: str, env: Dict, cwd: Optional[str], state: Dict) -> s
     return state[key]
 
 
-def _account_default_remote(base: List[str], git_dir: Optional[str], state: Dict) -> str:
-    """The remote a bare git push uses before its branch tracks one: pushRemote, pushDefault, the branch's remote, origin."""
+def _account_git_remotes(git_dir: str, state: Dict) -> Dict:
+    """The repo's remotes by name, each as its remote.<name>.* settings; read once per folder and turn."""
+    key = ('remotes', git_dir)
+    if key not in state:
+        out = _account_run(['git', '-C', git_dir, 'config', '--get-regexp', r'^remote\.'], git_dir, state) or ''
+        remotes = {}
+        for line in out.splitlines():
+            name, _, value = line.partition(' ')
+            match = re.match(r'^remote\.(.+)\.([a-z-]+)$', name)
+            if match:
+                remotes.setdefault(match.group(1), {})[match.group(2)] = value.strip()
+        state[key] = remotes
+    return state[key]
+
+
+def _account_git_rewrite(url: str, base: List[str], git_dir: Optional[str], state: Dict) -> str:
+    """An explicit push URL after git's url.<base>.pushInsteadOf and insteadOf rules, longest match first."""
+    out = _account_run(base + ['config', '--get-regexp', r'^url\..*\.(pushinsteadof|insteadof)$'], git_dir, state)
+    rules = []
+    for line in (out or '').splitlines():
+        name, _, prefix = line.partition(' ')
+        match = re.match(r'^url\.(.*)\.(pushinsteadof|insteadof)$', name, re.IGNORECASE)
+        if match and prefix:
+            rules.append((match.group(2).lower(), prefix.strip(), match.group(1)))
+    for kind in ('pushinsteadof', 'insteadof'):
+        matches = [(len(prefix), prefix, replacement) for k, prefix, replacement in rules
+                   if k == kind and url.startswith(prefix)]
+        if matches:
+            _, prefix, replacement = max(matches)
+            return replacement + url[len(prefix):]
+    return url
+
+
+def _account_default_remote(base: List[str], git_dir: str, state: Dict) -> str:
+    """The remote a bare git push uses: the one its branch pushes to, else pushRemote, pushDefault, the branch's remote, origin."""
+    out = (_account_run(base + ['rev-parse', '--symbolic-full-name', '@{push}'], git_dir, state) or '').strip()
+    if out.startswith('refs/remotes/'):
+        # Remote names may hold a slash, so the longest configured name that prefixes the ref wins.
+        names = [name for name in _account_git_remotes(git_dir, state) if out.startswith(f'refs/remotes/{name}/')]
+        if names:
+            return max(names, key=len)
     branch = (_account_run(base + ['symbolic-ref', '--short', '-q', 'HEAD'], git_dir, state) or '').strip()
     keys = ([f'branch.{branch}.pushRemote', 'remote.pushDefault', f'branch.{branch}.remote']
             if branch else ['remote.pushDefault'])
@@ -5384,20 +5489,23 @@ def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dic
         i += 1
     target = target or (positional[0] if positional else None)
     base = ['git', '-C', git_dir or '.']
-    if target and re.search(r'://|^[^/:]+@[^/:]+:|^[^/:]+:[^/]', target):
-        url, remote = target, ''
-    elif not git_dir:
+    remote = ''
+    if not (target and _account_looks_like_url(target)) and not git_dir:
         # Without the folder the push ran in, its remotes can't be read.
         return {'platform': 'git', 'source': 'unknown'}
+    if target and _account_looks_like_url(target):
+        url = _account_git_rewrite(target, base, git_dir, state)
     else:
-        remote = target
-        if not remote:
-            out = _account_run(base + ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{push}'], git_dir, state)
-            remote = out.strip().split('/', 1)[0] if out and '/' in out else _account_default_remote(base, git_dir, state)
-        url = _account_run(base + ['remote', 'get-url', '--push', remote], git_dir, state)
+        remote = target or _account_default_remote(base, git_dir, state)
+        # pushDefault and a branch's remote may name a URL instead of a remote.
+        url = _account_git_rewrite(remote, base, git_dir, state) if _account_looks_like_url(remote) else \
+            _account_run(base + ['remote', 'get-url', '--push', remote], git_dir, state)
+        remote = '' if _account_looks_like_url(remote) else remote
     host, owner, _repo = _account_remote_parts(url.strip().splitlines()[0]) if url else ('', '', '')
     if not host:
         return {'platform': 'git', 'source': 'unknown'}
+    if git_dir:
+        state['_push_dir'] = os.path.realpath(git_dir)
     user = ''
     if re.match(r'^https?://', url.strip()):
         helper = _account_run(base + ['config', '--get', f'credential.https://{host}.helper'], git_dir, state) or \
@@ -5408,30 +5516,54 @@ def _account_git_push(args: List[str], env: Dict, cwd: Optional[str], state: Dic
             'context': remote or '', 'source': 'command'}
 
 
+def _account_gh_repo_remote(cwd: str, state: Dict) -> str:
+    """The URL of the remote gh queries: the one `gh repo set-default` chose, else upstream, github, origin, the first."""
+    remotes = _account_git_remotes(cwd, state)
+    for name, settings in remotes.items():
+        resolved = settings.get('gh-resolved', '')
+        if resolved and resolved != 'base' and '/' in resolved:
+            host = _account_remote_parts(settings.get('url', ''))[0] or 'github.com'
+            return f'https://{host}/{resolved}'
+        if resolved == 'base':
+            return settings.get('url', '')
+    for name in _ACCOUNT_GH_REMOTE_ORDER + tuple(sorted(remotes)):
+        if remotes.get(name, {}).get('url'):
+            return remotes[name]['url']
+    return ''
+
+
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The account a gh command reaches: host and owner from -R, a repo argument, GH_REPO or the repo's remote, plus the gh login."""
     if not args or args[0] in _ACCOUNT_GH_NO_REPO:
         return None
-    repo, flag_host = '', ''
-    for i, arg in enumerate(args):
-        if arg in ('-R', '--repo') and i + 1 < len(args):
-            repo = args[i + 1]
+    repo, flag_host, positional, i = '', '', [], 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg in ('-R', '--repo') and i < len(args):
+            repo, i = args[i], i + 1
         elif arg.startswith('--repo='):
             repo = arg.split('=', 1)[1]
         elif arg.startswith('-R') and not arg.startswith('--'):
             repo = arg[2:].lstrip('=')
-        elif arg == '--hostname' and i + 1 < len(args):
-            flag_host = args[i + 1].lower().rsplit('@', 1)[-1]
+        elif arg == '--hostname' and i < len(args):
+            flag_host, i = args[i].lower().rsplit('@', 1)[-1], i + 1
         elif arg.startswith('--hostname='):
             flag_host = arg.split('=', 1)[1].lower().rsplit('@', 1)[-1]
-    # `gh repo view|clone|fork|… OWNER/REPO` and `gh api repos/OWNER/REPO/…` name the repository themselves.
-    if not repo and len(args) > 2 and args[0] == 'repo' and not args[2].startswith('-') and '/' in args[2]:
-        repo = args[2]
-    if not repo and args[:1] == ['api']:
-        named = next((m for m in (re.match(r'^/?repos/([^/{}]+/[^/{}]+)', a) for a in args[1:]) if m), None)
+        elif arg in _ACCOUNT_GH_VALUE_OPTIONS:
+            i += 1
+        elif not arg.startswith('-'):
+            positional.append(arg)
+    # `gh repo view|clone|fork|… OWNER/REPO`, a pr or issue URL, and `gh api repos/OWNER/REPO/…` name the repository.
+    if not repo and len(positional) > 2 and positional[0] == 'repo' and '/' in positional[2]:
+        repo = positional[2]
+    if not repo and positional[:1] != ['api']:
+        repo = next((m.group(1) for m in (re.match(r'^https?://([^/@]+/[^/@]+/[^/@]+)', a) for a in positional[1:]) if m), '')
+    if not repo and positional[:1] == ['api']:
+        named = next((m for m in (re.match(r'^/?repos/([^/{}@]+/[^/{}@]+)', a) for a in positional[1:]) if m), None)
         if named:
             repo = named.group(1)
-        elif not any('{owner}' in a or '{repo}' in a for a in args):
+        elif not any('{owner}' in a or '{repo}' in a for a in positional):
             cwd = None  # an api path that names no repo reaches no repo of this checkout
     repo = repo or env.get('GH_REPO') or os.environ.get('GH_REPO') or ''
     # A host never carries a login, so anything before an @ is dropped.
@@ -5447,51 +5579,58 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         if '@' in host or '@' in owner:
             host, owner = '', ''
     elif cwd:
-        # gh queries the repo origin fetches from, not the one it pushes to.
-        url = _account_run(['git', '-C', cwd, 'remote', 'get-url', 'origin'], cwd, state)
+        url = _account_gh_repo_remote(cwd, state)
         if url:
             host, owner, _repo = _account_remote_parts(url.strip().splitlines()[0])
+            state['_push_dir'] = os.path.realpath(cwd)
     host = flag_host or host or env_host or 'github.com'
     return {'platform': 'github', 'host': host, 'account': owner, 'user': _account_gh_user(host, env, cwd, state),
             'context': '', 'source': 'command'}
 
 
-def _account_remote_operand(operands: List[str]) -> Optional[str]:
-    """The last [user@]host: operand, which is where a copy goes; None for an rsync daemon or only local paths."""
+def _account_remote_operand(operands: List[str]) -> tuple:
+    """(the last remote [user@]host operand, its port) for a copy; (None, None) for an rsync daemon or local paths."""
     for arg in reversed(operands):
-        # A scp://, sftp:// or rsync:// URI is left unresolved rather than read as a host named after its scheme.
+        uri = re.match(r'^(scp|sftp)://(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:\[\]@]+)(?::(\d+))?', arg)
+        if uri:
+            # A scp:// or sftp:// URI names the login and port itself; anything after the user (a password) is dropped.
+            return (f'{uri.group(2)}@{uri.group(3)}' if uri.group(2) else uri.group(3)), uri.group(4)
         if '://' in arg:
-            return None
+            return None, None
         # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
         match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
         if match and not re.match(r'^[A-Za-z]:\\', arg):
-            return None if match.group(2) else match.group(1)
-    return None
+            return (None, None) if match.group(2) else (match.group(1), None)
+    return None, None
 
 
-def _account_rsync_destination(args: List[str]) -> tuple:
+def _account_rsync_destination(args: List[str], env: Dict) -> tuple:
     """(destination, ssh identity options) for rsync: the last remote operand, reached through its remote shell."""
-    shell, operands, i = None, [], 0
+    shell = env.get('RSYNC_RSH') or os.environ.get('RSYNC_RSH')
+    operands, i = [], 0
     while i < len(args):
         arg = args[i]
-        if arg == '--rsh' and i + 1 < len(args):
-            shell, i = args[i + 1], i + 2
-            continue
-        if arg.startswith('--rsh='):
+        i += 1
+        if arg == '--rsh' and i < len(args):
+            shell, i = args[i], i + 1
+        elif arg.startswith('--rsh='):
             shell = arg.split('=', 1)[1]
-        elif arg.startswith('-') and not arg.startswith('--') and 'e' in arg[1:]:
-            rest = arg[arg.index('e', 1) + 1:]
-            if rest:
-                shell = rest
-            elif i + 1 < len(args):
-                shell, i = args[i + 1], i + 1
         elif arg in _ACCOUNT_RSYNC_VALUE_OPTIONS:
             i += 1
+        elif arg.startswith('-') and not arg.startswith('--'):
+            # Walk a cluster such as -avze: the first option that takes a value takes the rest of it, or the next word.
+            for j, flag in enumerate(arg[1:], start=2):
+                if flag in _ACCOUNT_SSH_VALUE_FLAGS['rsync']:
+                    value = arg[j:]
+                    if not value and i < len(args):
+                        value, i = args[i], i + 1
+                    if flag == 'e':
+                        shell = value
+                    break
         elif not arg.startswith('-'):
             operands.append(arg)
-        i += 1
     passthrough = []
-    if shell is not None:
+    if shell:
         try:
             shell_argv = shlex.split(shell)
         except ValueError:
@@ -5499,15 +5638,17 @@ def _account_rsync_destination(args: List[str]) -> tuple:
         # A remote shell other than ssh never reads the ssh config.
         if not shell_argv or os.path.basename(shell_argv[0]) != 'ssh':
             return None, []
-        passthrough = _account_ssh_destination('ssh', shell_argv[1:] + ['-'])[1]
-    destination = _account_remote_operand(operands)
-    return (destination, passthrough) if destination else (None, [])
+        passthrough = _account_ssh_destination('ssh', shell_argv[1:] + ['-'], env)[1]
+    destination, port = _account_remote_operand(operands)
+    if not destination:
+        return None, []
+    return destination, passthrough + (['-p', port] if port else [])
 
 
-def _account_ssh_destination(program: str, args: List[str]) -> tuple:
+def _account_ssh_destination(program: str, args: List[str], env: Dict) -> tuple:
     """(destination, identity options to pass to ssh -G) for ssh, scp, sftp or rsync; (None, []) when there is none."""
     if program == 'rsync':
-        return _account_rsync_destination(args)
+        return _account_rsync_destination(args, env)
     passthrough, operands, i = [], [], 0
     value_flags = _ACCOUNT_SSH_VALUE_FLAGS.get(program, frozenset())
     # Only the options that change which host or user ssh -G resolves are passed through; scp's -l is a bandwidth limit.
@@ -5536,13 +5677,45 @@ def _account_ssh_destination(program: str, args: List[str]) -> tuple:
             break
     if program == 'ssh':
         return (operands[0], passthrough) if operands else (None, [])
-    destination = _account_remote_operand(operands)
+    destination, port = _account_remote_operand(operands)
     if destination:
-        return destination, passthrough
+        return destination, passthrough + (['-p', port] if port else [])
     # sftp also takes a plain [user@]host with no path.
     if program == 'sftp' and operands and re.match(r'^(?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)$', operands[0]):
         return operands[0], passthrough
     return None, []
+
+
+def _account_ssh_config_words(line: str) -> Optional[List[str]]:
+    """An ssh config line split the way OpenSSH splits it; None for an unbalanced quote, which ssh rejects."""
+    words, word, in_word, quote, i = [], '', False, None, 0
+    while i < len(line):
+        ch = line[i]
+        # A backslash escapes a quote, a backslash, or (outside quotes) a space; any other backslash is kept.
+        if ch == '\\' and i + 1 < len(line) and (line[i + 1] in '\'"\\' or (quote is None and line[i + 1] == ' ')):
+            word, in_word, i = word + line[i + 1], True, i + 2
+            continue
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            else:
+                word += ch
+        elif ch in '\'"':
+            quote, in_word = ch, True
+        elif ch in ' \t':
+            if in_word:
+                words.append(word)
+            word, in_word = '', False
+        elif ch == '#' and not in_word:
+            break
+        else:
+            word, in_word = word + ch, True
+        i += 1
+    if quote is not None:
+        return None
+    if in_word:
+        words.append(word)
+    return words
 
 
 def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]) -> bool:
@@ -5584,10 +5757,8 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
         except OSError:
             return True
         for line in lines:
-            # Split the way ssh does, so a quoted keyword or path is read as ssh reads it.
-            try:
-                words = shlex.split(line, comments=True)
-            except ValueError:
+            words = _account_ssh_config_words(line)
+            if words is None:
                 return True
             if not words:
                 continue
@@ -5597,14 +5768,15 @@ def _account_ssh_config_runs_commands(passthrough: List[str], cwd: Optional[str]
             if keyword.lower() == 'match' and any(w.lower().lstrip('!').startswith('exec') for w in words):
                 return True
             for pattern in (words if keyword.lower() == 'include' else []):
-                pattern = os.path.expanduser(pattern)
+                # ssh globs the path, and glob reads a backslash as escaping the next character.
+                pattern = re.sub(r'\\(.)', r'\1', os.path.expanduser(pattern))
                 pending += [(found, base) for found in sorted(glob.glob(os.path.join(base, pattern)))]
     return False
 
 
-def _account_ssh(program: str, args: List[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
+def _account_ssh(program: str, args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The host and user an ssh-family command reaches, resolved through ssh -G."""
-    destination, passthrough = _account_ssh_destination(program, args)
+    destination, passthrough = _account_ssh_destination(program, args, env)
     if not destination:
         return None
     if _account_ssh_config_runs_commands(passthrough, cwd):
@@ -5626,32 +5798,84 @@ def _account_ssh(program: str, args: List[str], cwd: Optional[str], state: Dict)
             'user': settings.get('user', ''), 'context': alias if alias.lower() != host else '', 'source': 'command'}
 
 
+def _account_rewrites_remotes(args: List[str], cwd: Optional[str]) -> tuple:
+    """(whether a git command changes remote or URL settings, the folder whose remotes it changes or None for all)."""
+    git_dir, rest = cwd, list(args)
+    while rest and rest[0].startswith('-'):
+        flag = rest.pop(0)
+        if flag == '-C' and rest:
+            path = os.path.expanduser(rest.pop(0))
+            git_dir = path if os.path.isabs(path) else (os.path.join(git_dir, path) if git_dir else None)
+        elif flag in ('-c', '--git-dir', '--work-tree', '--namespace') and rest:
+            rest.pop(0)
+    git_dir = os.path.realpath(git_dir) if git_dir else None
+    if rest[:1] == ['remote'] and len(rest) > 1 and rest[1] in ('add', 'set-url', 'rename', 'remove', 'rm'):
+        return True, git_dir
+    if rest[:1] == ['config']:
+        options = [a for a in rest[1:] if a.startswith('-')]
+        keys = [a.lower() for a in rest[1:] if not a.startswith('-')]
+        reads = {'--get', '--get-all', '--get-regexp', '--list', '-l', '--get-urlmatch'} & set(options)
+        if not reads and keys and keys[0].startswith(('remote.', 'url.', 'branch.')):
+            scoped = {'--global', '--system', '--file', '-f'} & set(options)
+            return True, None if scoped else git_dir
+    return False, git_dir
+
+
 def _destination_account(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The account the first resolved command in a shell call reached, else the first unresolved one, or None."""
     try:
         if not isinstance(command, str) or not command.strip():
             return None
-        unresolved = None
-        for argv in _account_segments(command):
-            program, args, env = _account_program(argv)
-            account = None
+        found, unresolved, exported, status = None, None, {}, None
+        for argv, operator in _account_segments(command):
+            # A literal true or false decides whether && or || runs the next command; any other status is unknown.
+            if (operator == '&&' and status == 1) or (operator == '||' and status == 0):
+                continue
+            program, args, env, seg_cwd = _account_program(argv, cwd)
+            env = {**exported, **env}
+            status = 0 if program in ('true', ':') else 1 if program == 'false' else None
+            if program == 'export':
+                exported.update(a.split('=', 1) for a in args if _account_is_assignment(a))
+                continue
+            if program == 'unset':
+                for name in args:
+                    exported.pop(name, None)
+                continue
             if program == 'cd':
                 # Later segments run in the folder this one moves to.
                 target = os.path.expanduser(args[0]) if args else os.path.expanduser('~')
-                cwd = target if os.path.isabs(target) else os.path.normpath(os.path.join(cwd or '', target))
+                cwd = target if os.path.isabs(target) else os.path.normpath(os.path.join(seg_cwd or '', target))
                 continue
             if program == 'git':
-                account = _account_git_push(args, env, cwd, state)
+                rewrites, rewritten_dir = _account_rewrites_remotes(args, seg_cwd)
+                if rewrites:
+                    # A push already resolved against these remotes in this turn can no longer be trusted.
+                    for result_dir, result in state.get('push_results', []):
+                        if rewritten_dir is None or result_dir == rewritten_dir:
+                            result.clear()
+                            result.update({'platform': 'git', 'source': 'unknown'})
+                    continue
+            if found is not None:
+                continue
+            account = None
+            state.pop('_push_dir', None)
+            if program == 'git':
+                account = _account_git_push(args, env, seg_cwd, state)
             elif program == 'gh':
-                account = _account_gh(args, env, cwd, state)
+                account = _account_gh(args, env, seg_cwd, state)
             elif program in _ACCOUNT_SSH_TOOLS:
-                account = _account_ssh(program, args, cwd, state)
+                account = _account_ssh(program, args, env, seg_cwd, state)
+            # The folder whose remotes this answer was read from, if it was read from a remote.
+            push_dir = state.pop('_push_dir', None)
             if account:
                 account = {k: v for k, v in account.items() if v or k in ('platform', 'source')}
                 if account['source'] != 'unknown':
-                    return account
-                unresolved = unresolved or account
-        return unresolved
+                    found = account
+                    if push_dir is not None:
+                        state.setdefault('push_results', []).append((push_dir, account))
+                else:
+                    unresolved = unresolved or account
+        return found or unresolved
     except Exception:
         return None
 # --- end destination account ---
