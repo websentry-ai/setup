@@ -2044,6 +2044,9 @@ function segments(command) {
 function shellWords(text) {
   return segments(text).flatMap((segment) => segment.argv);
 }
+function envValue(env, processEnv, key) {
+  return key in env ? env[key] : processEnv[key] ?? "";
+}
 function isAssignment(token) {
   const eq = token.indexOf("=");
   return eq > 0 && !token.startsWith("-") && /^[A-Za-z0-9_]+$/.test(token.slice(0, eq));
@@ -2150,7 +2153,7 @@ function realDir(path) {
   }
 }
 async function ghUser(host, env, state) {
-  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k]) || env.GH_CONFIG_DIR) return "";
+  if (GH_TOKEN_ENV.some((k) => envValue(env, state.env, k)) || env.GH_CONFIG_DIR) return "";
   const cached = state.ghUser.get(host);
   if (cached !== void 0) return cached;
   const user = firstLine(await run(["gh", "config", "get", "-h", host, "user"], state));
@@ -2258,7 +2261,7 @@ async function gitPush(args, env, cwd, state) {
   const { host, owner } = url === void 0 ? { host: "", owner: "" } : remoteParts(url);
   if (host === "" || url === void 0) return { account: { platform: "git", source: "unknown" } };
   let user = "";
-  if (/^https?:\/\//.test(url.trim())) {
+  if (/^https?:\/\//.test(url.trim()) && !/^[a-z]+:\/\/[^/@]*:[^/@]*@/i.test(url.trim())) {
     const helper = await run([...base, "config", "--get", `credential.https://${host}.helper`], state) ?? await run([...base, "config", "--get", "credential.helper"], state) ?? "";
     if (helper.includes("auth git-credential")) user = await ghUser(host, env, state);
   }
@@ -2304,15 +2307,26 @@ async function gh(args, env, cwd, state) {
     if (url) repo = url[1];
   }
   let lookupDir = cwd;
+  let checkoutBound = true;
   const listOrCreate = positional[0] === "repo" && (positional[1] === "list" || positional[1] === "create");
-  if (GH_NO_CHECKOUT.has(positional[0] ?? "") || listOrCreate && repo === "") lookupDir = void 0;
-  if (repo === "" && positional[0] === "api") {
-    const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
-    if (named) repo = named[1];
-    else if (!positional.some((a) => a.includes("{owner}") || a.includes("{repo}"))) lookupDir = void 0;
+  if (GH_NO_CHECKOUT.has(positional[0] ?? "") || listOrCreate && repo === "") {
+    lookupDir = void 0;
+    checkoutBound = false;
   }
-  repo = repo || env.GH_REPO || state.env.GH_REPO || "";
-  const envHost = withoutLogin((env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase());
+  if (repo === "" && positional[0] === "api") {
+    const url = stripLogin(positional.slice(1).find((a) => /^https?:\/\//.test(a)) ?? "");
+    const full = /^https?:\/\/([^/]+)\/(?:api\/v3\/)?repos\/([^/{}@]+\/[^/{}@]+)/.exec(url);
+    const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
+    if (full) repo = `${full[1]}/${full[2]}`;
+    else if (named) repo = named[1];
+    else {
+      flagHost ||= (/^https?:\/\/([^/]+)/.exec(url)?.[1] ?? "").toLowerCase();
+      checkoutBound = positional.some((a) => a.includes("{owner}") || a.includes("{repo}"));
+      if (!checkoutBound) lookupDir = void 0;
+    }
+  }
+  repo = repo || (lookupDir === void 0 && !checkoutBound ? "" : envValue(env, state.env, "GH_REPO"));
+  const envHost = withoutLogin(envValue(env, state.env, "GH_HOST").toLowerCase());
   let host = "";
   let owner = "";
   let dir;
@@ -2355,12 +2369,13 @@ function remoteOperand(operands) {
     }
     if (arg.includes("://")) return {};
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-    if (match !== null && !/^[A-Za-z]:[\\/]/.test(arg)) return match[2] === void 0 ? { destination: match[1] } : {};
+    const drive = process.platform === "win32" ? /^[A-Za-z]:[\\/]/ : /^[A-Za-z]:\\/;
+    if (match !== null && !drive.test(arg)) return match[2] === void 0 ? { destination: match[1] } : {};
   }
   return {};
 }
 function rsyncDestination(args, env, processEnv) {
-  let shell = env.RSYNC_RSH || processEnv.RSYNC_RSH || void 0;
+  let shell = envValue(env, processEnv, "RSYNC_RSH") || void 0;
   const operands = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
@@ -2537,7 +2552,7 @@ function configRunsCommands(passthrough) {
 }
 async function ssh(name, args, env, dir, state, otherUser = false) {
   const { destination, passthrough } = sshDestination(name, args, env, state.env);
-  if (destination === void 0) return void 0;
+  if (destination === void 0 || destination.startsWith("-")) return void 0;
   if (otherUser && !passthrough.some((flag, i) => i % 2 === 0 && flag === "-F")) return { platform: "ssh", source: "unknown" };
   for (let i = 0; i + 1 < passthrough.length; i += 2) {
     const value = expandHome(passthrough[i + 1]);
@@ -2618,7 +2633,7 @@ async function resolveOne(command, cwd, state) {
       continue;
     }
     if (name === "unset") {
-      for (const arg of args) delete exported[arg];
+      for (const arg of args) if (!arg.startsWith("-")) exported[arg] = "";
       continue;
     }
     if (name === "cd") {

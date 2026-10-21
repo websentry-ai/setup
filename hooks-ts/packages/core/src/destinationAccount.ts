@@ -244,6 +244,11 @@ function shellWords(text: string): string[] {
   return segments(text).flatMap((segment) => segment.argv);
 }
 
+/** A variable as the command sees it: set or unset in the command, else inherited from the hook's environment. */
+function envValue(env: Record<string, string>, processEnv: Record<string, string | undefined>, key: string): string {
+  return key in env ? (env[key] as string) : (processEnv[key] ?? "");
+}
+
 function isAssignment(token: string): boolean {
   const eq = token.indexOf("=");
   return eq > 0 && !token.startsWith("-") && /^[A-Za-z0-9_]+$/.test(token.slice(0, eq));
@@ -366,7 +371,7 @@ function realDir(path: string): string {
 }
 
 async function ghUser(host: string, env: Record<string, string>, state: State): Promise<string> {
-  if (GH_TOKEN_ENV.some((k) => env[k] || state.env[k]) || env.GH_CONFIG_DIR) return "";
+  if (GH_TOKEN_ENV.some((k) => envValue(env, state.env, k)) || env.GH_CONFIG_DIR) return "";
   const cached = state.ghUser.get(host);
   if (cached !== undefined) return cached;
   const user = firstLine(await run(["gh", "config", "get", "-h", host, "user"], state));
@@ -489,7 +494,8 @@ async function gitPush(
   const { host, owner } = url === undefined ? { host: "", owner: "" } : remoteParts(url);
   if (host === "" || url === undefined) return { account: { platform: "git", source: "unknown" } };
   let user = "";
-  if (/^https?:\/\//.test(url.trim())) {
+  // A remote that carries its own password never asks the credential helper.
+  if (/^https?:\/\//.test(url.trim()) && !/^[a-z]+:\/\/[^/@]*:[^/@]*@/i.test(url.trim())) {
     const helper =
       (await run([...base, "config", "--get", `credential.https://${host}.helper`], state)) ??
       (await run([...base, "config", "--get", "credential.helper"], state)) ??
@@ -544,16 +550,29 @@ async function gh(
     if (url) repo = url[1] as string;
   }
   let lookupDir = cwd;
+  let checkoutBound = true;
   const listOrCreate = positional[0] === "repo" && (positional[1] === "list" || positional[1] === "create");
-  if (GH_NO_CHECKOUT.has(positional[0] ?? "") || (listOrCreate && repo === "")) lookupDir = undefined;
-  if (repo === "" && positional[0] === "api") {
-    const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
-    if (named) repo = named[1] as string;
-    else if (!positional.some((a) => a.includes("{owner}") || a.includes("{repo}"))) lookupDir = undefined;
+  if (GH_NO_CHECKOUT.has(positional[0] ?? "") || (listOrCreate && repo === "")) {
+    lookupDir = undefined;
+    checkoutBound = false;
   }
-  repo = repo || env.GH_REPO || state.env.GH_REPO || "";
+  if (repo === "" && positional[0] === "api") {
+    const url = stripLogin(positional.slice(1).find((a) => /^https?:\/\//.test(a)) ?? "");
+    const full = /^https?:\/\/([^/]+)\/(?:api\/v3\/)?repos\/([^/{}@]+\/[^/{}@]+)/.exec(url);
+    const named = positional.slice(1).map((a) => /^\/?repos\/([^/{}@]+\/[^/{}@]+)/.exec(a)).find((m) => m !== null);
+    if (full) repo = `${full[1] as string}/${full[2] as string}`;
+    else if (named) repo = named[1] as string;
+    else {
+      // An api path that names no repo reaches no repo of this checkout; a full URL still names its host.
+      flagHost ||= (/^https?:\/\/([^/]+)/.exec(url)?.[1] ?? "").toLowerCase();
+      checkoutBound = positional.some((a) => a.includes("{owner}") || a.includes("{repo}"));
+      if (!checkoutBound) lookupDir = undefined;
+    }
+  }
+  // GH_REPO only stands in for a command that works on a repository.
+  repo = repo || (lookupDir === undefined && !checkoutBound ? "" : envValue(env, state.env, "GH_REPO"));
   // A host never carries a login, so anything before an @ is dropped.
-  const envHost = withoutLogin((env.GH_HOST ?? state.env.GH_HOST ?? "").toLowerCase());
+  const envHost = withoutLogin(envValue(env, state.env, "GH_HOST").toLowerCase());
   let host = "";
   let owner = "";
   let dir: string | undefined;
@@ -600,8 +619,9 @@ function remoteOperand(operands: readonly string[]): { destination?: string; por
     if (arg.includes("://")) return {};
     // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
     const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-    // A drive letter (C:\x or C:/x) is a local path, not a host.
-    if (match !== null && !/^[A-Za-z]:[\\/]/.test(arg)) return match[2] === undefined ? { destination: match[1] as string } : {};
+    // A drive letter is local in C:\x form, and in C:/x form too on Windows; elsewhere scp dials host C.
+    const drive = process.platform === "win32" ? /^[A-Za-z]:[\\/]/ : /^[A-Za-z]:\\/;
+    if (match !== null && !drive.test(arg)) return match[2] === undefined ? { destination: match[1] as string } : {};
   }
   return {};
 }
@@ -610,7 +630,7 @@ function remoteOperand(operands: readonly string[]): { destination?: string; por
 function rsyncDestination(
   args: string[], env: Record<string, string>, processEnv: Record<string, string | undefined>,
 ): { destination?: string; passthrough: string[] } {
-  let shell = env.RSYNC_RSH || processEnv.RSYNC_RSH || undefined;
+  let shell = envValue(env, processEnv, "RSYNC_RSH") || undefined;
   const operands: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
@@ -814,7 +834,7 @@ async function ssh(
   name: string, args: string[], env: Record<string, string>, dir: string | undefined, state: State, otherUser = false,
 ): Promise<DestinationAccount | undefined> {
   const { destination, passthrough } = sshDestination(name, args, env, state.env);
-  if (destination === undefined) return undefined;
+  if (destination === undefined || destination.startsWith("-")) return undefined; // a - word would be an ssh -G option
   // Under sudo, ssh reads that user's config, which this hook can't.
   if (otherUser && !passthrough.some((flag, i) => i % 2 === 0 && flag === "-F")) return { platform: "ssh", source: "unknown" };
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
@@ -906,7 +926,8 @@ async function resolveOne(command: string, cwd: string | undefined, state: State
       continue;
     }
     if (name === "unset") {
-      for (const arg of args) delete exported[arg];
+      // Unset hides the inherited value too, so it is kept as empty rather than dropped.
+      for (const arg of args) if (!arg.startsWith("-")) exported[arg] = "";
       continue;
     }
     if (name === "cd") {

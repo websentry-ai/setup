@@ -542,8 +542,11 @@ test("gh commands outside the checkout and urls with a login", async () => {
 
 test("scp uris, drive letters and sudo are never misread", async () => {
   assert.equal(await resolve(`scp -F ${sshConfig} dump.sql scp://deploy:p@ss@prod-bastion:2200/tmp/`), undefined);
-  const drive = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file C:/Users/me/out`);
-  assert.deepEqual([drive?.host, drive?.user], ["10.0.4.12:2222", "deploy"]);
+  // scp reads C:\x as a local path everywhere, and C:/x as host C except on Windows.
+  const backslash = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file C:\\\\Users\\\\me`);
+  assert.deepEqual([backslash?.host, backslash?.user], ["10.0.4.12:2222", "deploy"]);
+  const slash = await resolve(`scp -F ${sshConfig} prod-bastion:/tmp/file C:/Users/me/out`);
+  assert.equal(slash?.host, process.platform === "win32" ? "10.0.4.12:2222" : "c");
   assert.deepEqual(await resolve("sudo -u nobody ssh prod-bastion"), { platform: "ssh", source: "unknown" });
 });
 
@@ -553,4 +556,26 @@ test("git config set rewrites count as rewrites", async () => {
     await resolve("git push personal main; git config set remote.personal.url https://github.com/decoy/app.git", dir),
     { platform: "git", source: "unknown" },
   );
+});
+
+test("gh repo, unset variables and api urls follow the command", async () => {
+  const dir = repo({ origin: "https://github.com/acme/app.git" });
+  assert.equal((await resolve("GH_REPO=other/app gh search repos unbound", dir))?.account, undefined);
+  const unset = await resolveDestinationAccounts(
+    [{ tool_name: "bash", tool_use_id: "c1", tool_input: { command: "unset GH_HOST; gh repo view acme/app" } }],
+    undefined, { env: { GH_HOST: "ghe.example.com" } },
+  );
+  assert.equal(unset.get("c1")?.host, "github.com");
+  const full = await resolve("gh api https://ghe.example.com/api/v3/repos/acme/app", dir);
+  assert.deepEqual([full?.host, full?.account], ["ghe.example.com", "acme"]);
+  const user = await resolve("gh api https://ghe.example.com/api/v3/user", dir);
+  assert.deepEqual([user?.host, user?.account], ["ghe.example.com", undefined]);
+});
+
+test("a destination starting with a dash never reaches ssh as an option", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "ssh-dash-"));
+  const marker = join(dir, "ran");
+  writeFileSync(join(dir, "evil"), `Match exec "touch ${marker}"\n`);
+  assert.equal(await resolve(`ssh -- -F${join(dir, "evil")} prod-bastion`), undefined);
+  assert.equal(existsSync(marker), false);
 });
