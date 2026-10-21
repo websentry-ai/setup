@@ -1047,19 +1047,54 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
         return None
 
 
+def _is_unbound_hook_command(cmd, script_path) -> bool:
+    """Our cursor hook: the relative path the template ships, the absolute path the
+    Windows rewrite writes, or the /opt/unbound binary. The relative form is matched
+    whole, so a foreign command that merely contains that path is not ours."""
+    if not cmd or not isinstance(cmd, str):
+        return False
+    if str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd):
+        return True
+    return cmd.replace("\\", "/").strip().strip('"') in (
+        "./hooks/unbound.py", "hooks/unbound.py")
+
+
+def _unbound_hooks_registered(hooks_path, script_path) -> Optional[bool]:
+    """True when hooks.json registers OUR hook, False when it does not, None when it
+    exists but could not be read."""
+    if not hooks_path.exists():
+        return False
+    try:
+        with open(hooks_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        debug_print(f"Could not read {hooks_path}: {e}")
+        return None
+    events = data.get("hooks") if isinstance(data, dict) else None
+    for entries in events.values() if isinstance(events, dict) else ():
+        for item in entries if isinstance(entries, list) else []:
+            if isinstance(item, dict) and _is_unbound_hook_command(
+                    item.get("command", ""), script_path):
+                return True
+    return False
+
+
 def detect_install_state() -> Optional[str]:
     """Inspect the enterprise hooks.json target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error."""
+    'fresh' (neither our hook entries nor the script), 'persisted' (both),
+    'tampered' (one without the other), None when hooks.json was unreadable."""
     try:
         enterprise_dir = get_enterprise_hooks_dir()
-        hooks_json = enterprise_dir / "hooks.json"
         script_path = enterprise_dir / "hooks" / "unbound.py"
-        if not hooks_json.exists():
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        # An enterprise hooks.json can be the org's own, so the file existing is
+        # not our install; only our own hook entries are.
+        registered = _unbound_hooks_registered(
+            enterprise_dir / "hooks.json", script_path)
+        if registered is None:
+            return None
+        if registered == script_path.exists():
+            return 'persisted' if registered else 'fresh'
+        return 'tampered'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None

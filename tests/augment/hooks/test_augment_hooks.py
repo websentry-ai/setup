@@ -1117,17 +1117,38 @@ class TestMdmManagedSettings(unittest.TestCase):
         self.assertEqual(len(data["hooks"]["PreToolUse"]), 1)
         self.assertEqual(len(data["toolPermissions"]), 2)
 
+    def _write_settings(self, settings):
+        (self.managed / "hooks").mkdir(parents=True, exist_ok=True)
+        (self.managed / "settings.json").write_text(json.dumps(settings))
+
+    def _our_hooks(self):
+        script = self.managed / "hooks" / "unbound.py"
+        return {"hooks": {"PreToolUse": [{"hooks": [{"command": f'"{script}"'}]}]}}
+
     def test_detect_install_state(self):
         # fresh: no settings.json
         self.assertEqual(self.mdm.detect_install_state(), "fresh")
-        # persisted: settings + hook script
-        (self.managed / "hooks").mkdir(parents=True, exist_ok=True)
-        (self.managed / "settings.json").write_text("{}")
+        # persisted: our hook entries + hook script
+        self._write_settings(self._our_hooks())
         (self.managed / "hooks" / "unbound.py").write_text("x")
         self.assertEqual(self.mdm.detect_install_state(), "persisted")
-        # tampered: settings present, hook script missing
+        # tampered: our entries remain, hook script removed
         (self.managed / "hooks" / "unbound.py").unlink()
         self.assertEqual(self.mdm.detect_install_state(), "tampered")
+
+    def test_detect_install_state_ignores_foreign_config(self):
+        # An org settings.json we never touched is not our install.
+        self._write_settings({"hooks": {"PreToolUse": [{"hooks": [
+            {"command": "/usr/local/bin/their-hook.sh"}]}]}, "other": 1})
+        self.assertEqual(self.mdm.detect_install_state(), "fresh")
+        # Our script beside it, but our entries stripped: that is a real tamper.
+        (self.managed / "hooks" / "unbound.py").write_text("x")
+        self.assertEqual(self.mdm.detect_install_state(), "tampered")
+
+    def test_detect_install_state_unreadable_is_unknown(self):
+        (self.managed / "hooks").mkdir(parents=True, exist_ok=True)
+        (self.managed / "settings.json").write_text("{ not json")
+        self.assertIsNone(self.mdm.detect_install_state())
 
     def test_clear_managed_removes_hooks_and_permissions(self):
         with patch.object(self.mdm, "download_file", return_value=True):

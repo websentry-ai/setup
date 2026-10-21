@@ -1347,6 +1347,33 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
 
+def _unbound_hooks_registered(settings_candidates, script_path) -> Optional[bool]:
+    """True when one of these configs registers OUR hook, False when none does, None
+    only when nothing matched and a candidate could not be read. Same rule the
+    uninstall strips by. managed-settings.json is often the org's, so an unreadable
+    one must not mask our own drop-in answering definitively."""
+    unreadable = False
+    for settings_path in settings_candidates:
+        if not settings_path.exists():
+            continue
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception as e:
+            debug_print(f"Could not read {settings_path}: {e}")
+            unreadable = True
+            continue
+        events = settings.get("hooks") if isinstance(settings, dict) else None
+        for entries in events.values() if isinstance(events, dict) else ():
+            for item in entries if isinstance(entries, list) else []:
+                hooks = item.get("hooks") if isinstance(item, dict) else None
+                for hook in hooks if isinstance(hooks, list) else []:
+                    if isinstance(hook, dict) and _is_unbound_hook_command(
+                            hook.get("command", ""), script_path):
+                        return True
+    return None if unreadable else False
+
+
 def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path,
                                        delete_when_empty: bool = True) -> Tuple[bool, bool]:
     """Remove ONLY our hook entries from the managed Claude config, preserving
@@ -2427,25 +2454,24 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error.
+    'fresh' (neither our hook entries nor the script), 'persisted' (both),
+    'tampered' (one without the other), None when the config was unreadable.
     With skip_settings no config is written, so the hook script is the marker."""
     try:
         managed_dir = get_managed_settings_dir()
         script_path = managed_dir / "hooks" / "unbound.py"
         if skip_settings:
             return 'persisted' if script_path.exists() else 'fresh'
-        # The install prefers the drop-in and only falls back to the flat file,
-        # so checking one of them reports every drop-in install as 'fresh'.
-        config_present = (
-            (managed_dir / "managed-settings.d" / "unbound.json").exists()
-            or (managed_dir / "managed-settings.json").exists()
-        )
-        if not config_present:
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        # managed-settings.json is shared with org/Enterprise policy, so the file
+        # existing is not our install; only our own hook entries are.
+        registered = _unbound_hooks_registered(
+            [managed_dir / "managed-settings.d" / "unbound.json",
+             managed_dir / "managed-settings.json"], script_path)
+        if registered is None:
+            return None
+        if registered == script_path.exists():
+            return 'persisted' if registered else 'fresh'
+        return 'tampered'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None

@@ -1850,13 +1850,15 @@ def test_a_child_paused_after_answering_cannot_hold_setup(monkeypatch):
     assert time.monotonic() - started < 5
 
 
-def test_a_copilot_check_its_user_stops_is_tampered(env, monkeypatch):
+def test_a_copilot_check_its_user_stops_is_unknown(env, monkeypatch):
+    """Its user can kill or pause the check, so an unanswered one reports nothing and
+    leaves the stored state alone."""
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     real = env["modules"]["copilot"]._run_as_user
     monkeypatch.setattr(env["modules"]["copilot"], "_run_as_user",
                         lambda u, fn, *a, **k: None if fn is setup_cmd._copilot_registered else real(u, fn, *a, **k))
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
-    assert _states(env, "copilot")[-1] == "tampered"
+    assert _states(env, "copilot")[-1] is None
 
 
 @pytest.mark.parametrize("tool", ["codex", "copilot"])
@@ -1869,3 +1871,21 @@ def test_setup_bounds_the_module_s_own_user_calls_until_the_report(env, monkeypa
     monkeypatch.setattr(m, "run_backfill", lambda *a, **k: seen.append(m._RUN_AS_USER_TIMEOUT))
     assert setup_cmd.run(["--api-key", "admin-key", "--backfill"]) == 0
     assert seen == [setup_cmd._USER_CHECK_TIMEOUT, None]
+
+
+def test_a_copilot_tamper_outranks_another_profile_s_unanswered_check(env, monkeypatch):
+    """An unanswered check reports nothing, but it must not mask a real removal on a
+    profile that did answer, whatever order the profiles come in."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    other = env["tmp"] / "other-home"
+    (other / ".copilot" / "hooks").mkdir(parents=True)
+    (other / ".copilot" / "hooks" / "unbound.json").write_text("{}")
+    real = env["modules"]["copilot"]._run_as_user
+    monkeypatch.setattr(
+        env["modules"]["copilot"], "_run_as_user",
+        lambda u, fn, *a, **k: None if u == "alice" else real(u, fn, *a, **k))
+    m = env["modules"]["copilot"]
+    unanswered, answering = ("alice", env["home"]), ("other", other)
+    # Unanswered first is the ordering that regresses if the loop returns early.
+    assert setup_cmd._copilot_detect_state(m, [unanswered, answering]) == "tampered"
+    assert setup_cmd._copilot_detect_state(m, [answering, unanswered]) == "tampered"
