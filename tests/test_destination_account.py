@@ -468,7 +468,7 @@ class DestinationAccountTests(unittest.TestCase):
 
     def test_a_remote_named_with_a_slash_is_the_one_pushed_to(self):
         repo = _repo({'forks/mine': 'https://github.com/jdoe-dev/app.git', 'origin': 'https://github.com/acme/app.git'})
-        _git(repo, 'commit', '-q', '--allow-empty', '-m', 'x')
+        _git(repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'x')
         _git(repo, 'update-ref', 'refs/remotes/forks/mine/main', 'HEAD')
         _git(repo, 'config', 'branch.main.remote', 'forks/mine')
         _git(repo, 'config', 'branch.main.merge', 'refs/heads/main')
@@ -536,9 +536,14 @@ class DestinationAccountTests(unittest.TestCase):
             for hook, account in self._each(command):
                 with self.subTest(hook=hook, command=command):
                     self.assertIsNone(account)
-        for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file C:/Users/me/out'):
-            with self.subTest(hook=hook, command='drive letter'):
+        # scp reads C:\\x as a local path everywhere, and C:/x as host C except on Windows.
+        for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file C:\\\\Users\\\\me'):
+            with self.subTest(hook=hook, command='backslash drive letter'):
                 self.assertEqual((account['host'], account['user']), ('10.0.4.12:2222', 'deploy'))
+        for hook, account in self._each(f'scp -F {self.ssh_config} prod-bastion:/tmp/file C:/Users/me/out'):
+            with self.subTest(hook=hook, command='slash drive letter'):
+                self.assertEqual(account.get('context') or account.get('host'),
+                                 '10.0.4.12:2222' if os.name == 'nt' else 'c')
         for hook, account in self._each('sudo -u nobody ssh prod-bastion'):
             with self.subTest(hook=hook, command='sudo without -F'):
                 self.assertEqual(account, {'platform': 'ssh', 'source': 'unknown'})
@@ -550,6 +555,43 @@ class DestinationAccountTests(unittest.TestCase):
                 self.assertEqual(hook._destination_account(
                     'git push personal main; git config set remote.personal.url https://github.com/decoy/app.git', repo, {}),
                     {'platform': 'git', 'source': 'unknown'})
+
+    def test_gh_repo_unset_variables_and_api_urls_follow_the_command(self):
+        repo = _repo({'origin': 'https://github.com/acme/app.git'})
+        for hook, account in self._each('GH_REPO=other/app gh search repos unbound', repo):
+            with self.subTest(hook=hook, command='GH_REPO on search'):
+                self.assertNotIn('account', account)
+        with patch.dict(os.environ, {'GH_HOST': 'ghe.example.com'}):
+            for hook, account in self._each('unset GH_HOST; gh repo view acme/app'):
+                with self.subTest(hook=hook, command='unset GH_HOST'):
+                    self.assertEqual(account['host'], 'github.com')
+        cases = {'gh api https://ghe.example.com/api/v3/repos/acme/app': ('ghe.example.com', 'acme'),
+                 'gh api https://ghe.example.com/api/v3/user': ('ghe.example.com', None)}
+        for command, (host, owner) in cases.items():
+            for hook, account in self._each(command, repo):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual((account['host'], account.get('account')), (host, owner))
+
+    def test_a_destination_starting_with_a_dash_never_reaches_ssh_as_an_option(self):
+        marker = os.path.join(self.ssh_dir, 'ran-dash')
+        evil = os.path.join(self.ssh_dir, 'evil_config')
+        Path(evil).write_text(f'Match exec "touch {marker}"\n')
+        for hook, account in self._each(f'ssh -- -F{evil} prod-bastion'):
+            with self.subTest(hook=hook):
+                self.assertIsNone(account)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_a_remote_with_its_own_password_never_reports_the_gh_login(self):
+        if not shutil.which('gh'):
+            self.skipTest('needs gh')
+        Path(os.environ['GH_CONFIG_DIR'], 'hosts.yml').write_text(
+            'github.com:\n    users:\n        bob: {}\n    user: bob\n    git_protocol: https\n')
+        repo = _repo({'personal': f'https://alice:{FAKE_TOKEN}@github.com/jdoe-dev/app.git'})
+        _git(repo, 'config', 'credential.https://github.com.helper', '!/usr/bin/gh auth git-credential')
+        for hook, account in self._each('git push personal main', repo):
+            with self.subTest(hook=hook):
+                self.assertEqual(account['account'], 'jdoe-dev')
+                self.assertNotIn('user', account)
 
     def test_only_allowlisted_lookups_ever_run(self):
         for hook in HOOKS:
