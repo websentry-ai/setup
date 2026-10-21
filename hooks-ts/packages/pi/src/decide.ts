@@ -57,6 +57,8 @@ export interface DecideCtx extends UiCtx {
 
 export interface DecideDeps {
   checker: PolicyChecker;
+  /** Told when the person declines a confirm, so the recorded call is known never to have run. */
+  onDeclined?: (toolUseId: string) => void;
   apiKey: string;
   entrypoint: string;
   /** Injectable clock, so a 300 s cache-TTL test runs in milliseconds. Defaults to `Date.now`. */
@@ -285,7 +287,10 @@ export async function decideToolCall(
       tool_input: auditInput,
     });
 
-    return await applyOutcome(outcome, ctx);
+    const result = await applyOutcome(outcome, ctx);
+    // A blocked confirm was declined: the decision recorded above can't say so, and the call never ran.
+    if (outcome.kind === "confirm" && result !== undefined) noteSafe(() => deps.onDeclined?.(event.toolCallId));
+    return result;
   } catch {
     // Belt and braces: `index.ts` catches too, but an internal fault must allow, never block.
     return undefined;

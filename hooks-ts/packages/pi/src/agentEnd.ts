@@ -253,6 +253,8 @@ export function postStandaloneTurn(
     if (input !== null && typeof input === "object" && !Array.isArray(input)) {
       call.tool_input = { ...input };
     }
+    // Posted before its confirm is answered, so a `confirm` here is not known to have run.
+    if (call.decision === "confirm") call.ran = false;
     const record: TurnRecord = { tool_calls: [call], results: [], started_at: now };
     if (typeof sessionId === "string" && sessionId !== "") {
       record.session_id = sessionId;

@@ -27,7 +27,7 @@ import { createTurnStore } from "../../core/src/turn.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
-import { assistantTextFrom, handleAgentEnd } from "../src/agentEnd.ts";
+import { assistantTextFrom, handleAgentEnd, postStandaloneTurn } from "../src/agentEnd.ts";
 import { recordToolResult } from "../src/toolResult.ts";
 import { decideToolCall } from "../src/decide.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
@@ -683,6 +683,37 @@ test("a shell call's destination account rides on its tool_use entry", async () 
       | undefined;
     const account = body?.messages?.[1]?.tool_use?.[0]?.destination_account;
     assert.deepEqual(account, { platform: "github", source: "command", host: "github.com", account: "jdoe-dev", context: "personal" });
+  } finally {
+    await api.close();
+  }
+});
+
+test("a declined call and a !cmd still awaiting its confirm carry no account", async () => {
+  const { execFileSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  process.env.GH_CONFIG_DIR = mkdtempSync(join(tmpdir(), "gh-"));
+  const repo = mkdtempSync(join(tmpdir(), "repo-"));
+  execFileSync("git", ["-C", repo, "init", "-q", "-b", "main"]);
+  execFileSync("git", ["-C", repo, "remote", "add", "personal", "https://github.com/jdoe-dev/app.git"]);
+  const push = { tool_name: "bash", decision: "confirm", tool_input: { command: "git push personal main" } };
+
+  const api = await startMockApi();
+  try {
+    const store = createTurnStore();
+    store.recordPrompt("push it", "sess-declined", 1_000);
+    store.recordToolCall({ ...push, tool_use_id: "call_declined" }, "sess-declined", 1_001);
+    store.markNotRun("call_declined");
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx({ cwd: repo }), { client: client(api), store, now: () => 5_000 });
+    postStandaloneTurn({ ...push, tool_use_id: "bang_unanswered" }, { cwd: repo }, "sess-declined", { client: client(api), now: () => 5_000 });
+    await sleep(500);
+
+    const entries = turnLogs(api).flatMap((log) =>
+      ((log.body as { messages?: { tool_use?: Record<string, unknown>[] }[] }).messages ?? []).flatMap((m) => m.tool_use ?? []));
+    assert.equal(entries.length, 2);
+    assert.ok(entries.every((entry) => entry.destination_account === undefined), JSON.stringify(entries));
+    assert.ok(entries.every((entry) => !("ran" in entry)), "the never-ran flag is never sent");
   } finally {
     await api.close();
   }
