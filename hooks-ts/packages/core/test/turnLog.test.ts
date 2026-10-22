@@ -594,3 +594,19 @@ test("a __proto__ key in recorded MCP args reaches the audit row, redacted, as p
   assert.ok(wire.includes('"__proto__":{"secret":"Bearer [REDACTED]"}'));
   assert.equal(wire.includes("hiddenproto"), false);
 });
+
+test("each entry carries its call time to the second, and a shell call its transfer", () => {
+  const transfer = { tool: "scp", endpoints: [{ direction: "out" as const, host: "prod", resolved_host: "10.0.4.12", address: "private" as const }] };
+  const body = buildTurnLogBody(
+    record({ tool_calls: [{ tool_name: "bash", tool_use_id: "call_1", decision: "allow", ts: Date.UTC(2026, 9, 22, 16, 40, 0, 999) }] }),
+    { cwd: CWD, completedAtMs: COMPLETED_AT, transfers: new Map([["call_1", transfer]]) },
+  );
+  const [entry] = body.messages[1]?.tool_use ?? [];
+  assert.equal(entry?.ts, "2026-10-22T16:40:00Z");
+  assert.deepEqual(entry?.transfer, transfer);
+  const [plain] = build(record({ tool_calls: [{ tool_name: "read", tool_use_id: "call_2", decision: "allow", ts: Number.NaN }] }))
+    .messages[1]?.tool_use ?? [];
+  assert.equal(plain?.ts, undefined);
+  assert.equal(plain?.transfer, undefined);
+});
+

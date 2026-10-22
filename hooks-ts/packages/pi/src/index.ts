@@ -664,6 +664,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           onDecision: (entry) => {
             if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
           },
+          onDeclined: (toolUseId) => turnStore.markNotRun(toolUseId),
         });
       } catch {
         // The fail-open net of last resort: allow, rather than let pi read an exception as a block.

@@ -27,7 +27,7 @@ import { createTurnStore } from "../../core/src/turn.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
-import { assistantTextFrom, handleAgentEnd } from "../src/agentEnd.ts";
+import { assistantTextFrom, handleAgentEnd, postStandaloneTurn } from "../src/agentEnd.ts";
 import { recordToolResult } from "../src/toolResult.ts";
 import { decideToolCall } from "../src/decide.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
@@ -651,6 +651,53 @@ test("the handler survives a ctx that raises and a store that raises", async () 
         now: () => 5_000,
       });
     });
+  } finally {
+    await api.close();
+  }
+});
+
+test("a shell call's transfer and call time ride on its tool_use entry", async () => {
+  const api = await startMockApi();
+  try {
+    const store = createTurnStore();
+    store.recordPrompt("ship it", "sess-transfer", 1_000);
+    store.recordToolCall(
+      { tool_name: "bash", tool_use_id: "call_up", decision: "allow", tool_input: { command: "curl -T build.zip http://10.1.2.3/up" } },
+      "sess-transfer",
+      Date.UTC(2026, 9, 22, 16, 40, 0, 250),
+    );
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx({ cwd: "/" }), { client: client(api), store, now: () => 5_000 });
+    await sleep(300);
+
+    const entry = (turnLogs(api)[0]?.body as { messages?: { tool_use?: Record<string, unknown>[] }[] } | undefined)
+      ?.messages?.[1]?.tool_use?.[0];
+    assert.equal(entry?.ts, "2026-10-22T16:40:00Z");
+    assert.deepEqual(entry?.transfer, {
+      tool: "curl",
+      endpoints: [{ direction: "out", host: "10.1.2.3", resolved_host: "10.1.2.3", address: "private" }],
+    });
+  } finally {
+    await api.close();
+  }
+});
+
+test("a declined call and a !cmd still awaiting its confirm carry no transfer", async () => {
+  const upload = { tool_name: "bash", decision: "confirm", tool_input: { command: "curl -T build.zip http://10.1.2.3/up" } };
+  const api = await startMockApi();
+  try {
+    const store = createTurnStore();
+    store.recordPrompt("ship it", "sess-declined", 1_000);
+    store.recordToolCall({ ...upload, tool_use_id: "call_declined" }, "sess-declined", 1_001);
+    store.markNotRun("call_declined");
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx({ cwd: "/" }), { client: client(api), store, now: () => 5_000 });
+    postStandaloneTurn({ ...upload, tool_use_id: "bang_unanswered" }, { cwd: "/" }, "sess-declined", { client: client(api), now: () => 5_000 });
+    await sleep(300);
+
+    const entries = turnLogs(api).flatMap((log) =>
+      ((log.body as { messages?: { tool_use?: Record<string, unknown>[] }[] }).messages ?? []).flatMap((m) => m.tool_use ?? []));
+    assert.equal(entries.length, 2);
+    assert.ok(entries.every((entry) => entry.transfer === undefined), JSON.stringify(entries));
+    assert.ok(entries.every((entry) => !("ran" in entry)), "the never-ran flag is never sent");
   } finally {
     await api.close();
   }
