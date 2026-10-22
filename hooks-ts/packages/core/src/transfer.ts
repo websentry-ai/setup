@@ -375,6 +375,7 @@ class Lexer {
     if (inner !== undefined) {
       const items = new Lexer(inner, this.depth + 1).read();
       if (items === undefined) return false;
+      this.flushLeading();
       this.marker("$(", this.before);
       this.items.push(...items);
       this.marker(")");
@@ -501,6 +502,18 @@ class Lexer {
     this.flush();
     this.cases.pop();
     this.marker("esac");
+  }
+
+  /** Emit the reserved words that lead the current command, so a substitution in it runs only when they let it. */
+  private flushLeading(): void {
+    let n = 0;
+    while (n < this.argv.length && (LEADING_WORDS.has(this.argv[n] as string) || this.argv[n] === "function")) {
+      n += this.argv[n] === "function" ? 2 : 1;
+    }
+    if (n === 0) return;
+    this.items.push({ kind: "cmd", argv: this.argv.slice(0, n), before: this.before, after: "", io: new Set() });
+    this.argv = this.argv.slice(n);
+    this.before = "";
   }
 
   /** Emit the reserved words read so far ahead of the compound command they lead. */
@@ -824,9 +837,10 @@ function simple(argv: string[], item: Item, shell: Shell, depth: number): Call[]
   }
   const inner = name === undefined ? undefined : shellString(name, args);
   if (inner !== undefined) {
-    // The string's commands read the wrapper's stdin and write its stdout, so they share its pipes and redirections.
+    // The string's commands run as the wrapper's user and read its stdin and write its stdout.
     return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1).map((call) => ({
       ...call,
+      otherUser: call.otherUser || parsed.otherUser,
       io: new Set([...call.io, ...item.io]),
       pipedIn: call.pipedIn || item.before === "|",
       pipedOut: call.pipedOut || item.after === "|",

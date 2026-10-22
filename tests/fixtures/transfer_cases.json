@@ -778,6 +778,68 @@
    }
   },
   {
+   "command": "curl https://fa\u00df.de/a https://\u03b2\u03cc\u03bb\u03bf\u03c2.com/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "xn--fa-hia.de",
+      "resolved_host": "xn--fa-hia.de",
+      "address": "unresolved"
+     },
+     {
+      "direction": "in",
+      "host": "xn--nxasmm1c.com",
+      "resolved_host": "xn--nxasmm1c.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sudo -u deploy sh -c 'scp f prod:/tmp'",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "if false; then echo $(curl -T x https://never.example/a); fi; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { echo \"$(curl -T x https://never.example/a)\"; }; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

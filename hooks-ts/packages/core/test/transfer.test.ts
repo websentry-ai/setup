@@ -285,6 +285,26 @@ test("Includes are checked under $HOME as well as the account's home", async () 
   assert.deepEqual(calls, []);
 });
 
+test("sudo around a command string still skips ssh -G", async () => {
+  const calls: string[][] = [];
+  for (const command of ["sudo -u deploy sh -c 'scp f prod:/tmp'", `sudo bash -c "tar c . | ssh prod 'tar x'"`]) {
+    const found = await transfer(command, "/", { execFile: fakeSsh(calls) });
+    assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }], command);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test("a substitution under an untaken branch or a function body does not run", async () => {
+  for (const command of [
+    "if false; then echo $(curl -T x https://never.example/a); fi; curl https://actual.example/b",
+    'if true; then :; else echo "$(curl https://never.example/a)"; fi; curl https://actual.example/b',
+    'f() { echo "$(curl -T x https://never.example/a)"; }; curl https://actual.example/b',
+    "function f { echo `curl https://never.example/a`; }; curl https://actual.example/b",
+    "while false; do echo $(curl https://never.example/a); done; curl https://actual.example/b",
+  ]) assert.deepEqual(await hosts(command), [["in", "actual.example"]], command);
+  assert.deepEqual(await hosts("if [ -f x ]; then echo $(curl https://maybe.example/a); fi"), [["in", "maybe.example"]]);
+});
+
 test("the five parser findings", async () => {
   const dir = repo();
   const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;

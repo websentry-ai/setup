@@ -2162,6 +2162,7 @@ var Lexer = class _Lexer {
     if (inner !== void 0) {
       const items = new _Lexer(inner, this.depth + 1).read();
       if (items === void 0) return false;
+      this.flushLeading();
       this.marker("$(", this.before);
       this.items.push(...items);
       this.marker(")");
@@ -2276,6 +2277,17 @@ var Lexer = class _Lexer {
     this.flush();
     this.cases.pop();
     this.marker("esac");
+  }
+  /** Emit the reserved words that lead the current command, so a substitution in it runs only when they let it. */
+  flushLeading() {
+    let n = 0;
+    while (n < this.argv.length && (LEADING_WORDS.has(this.argv[n]) || this.argv[n] === "function")) {
+      n += this.argv[n] === "function" ? 2 : 1;
+    }
+    if (n === 0) return;
+    this.items.push({ kind: "cmd", argv: this.argv.slice(0, n), before: this.before, after: "", io: /* @__PURE__ */ new Set() });
+    this.argv = this.argv.slice(n);
+    this.before = "";
   }
   /** Emit the reserved words read so far ahead of the compound command they lead. */
   flush() {
@@ -2515,6 +2527,7 @@ function simple(argv, item, shell, depth) {
   if (inner !== void 0) {
     return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1).map((call) => ({
       ...call,
+      otherUser: call.otherUser || parsed.otherUser,
       io: /* @__PURE__ */ new Set([...call.io, ...item.io]),
       pipedIn: call.pipedIn || item.before === "|",
       pipedOut: call.pipedOut || item.after === "|"

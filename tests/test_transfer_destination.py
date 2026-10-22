@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '915f54b5ffb052a4356d4651e8942ce385a13d8be1b9ce4dcde70ef139643bce'
+BLOCK_SHA256 = '4bddd0eaac208f9e441e300217367f66307410c82f35ceaaef79a6f282fbcb33'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -236,8 +236,10 @@ class CurlTests(TransferTestCase):
                           [('in', 'example.com')])
 
     def test_a_non_ascii_host_is_sent_in_the_punycode_form_curl_dials(self):
-        self.assert_hosts('curl https://exämple.com/a', [('in', 'xn--exmple-cua.com')])
-        self.assert_hosts('curl https://xn--exmple-cua.com/a', [('in', 'xn--exmple-cua.com')])
+        # curl (libidn2) and the URL standard keep ß and a final sigma; the older IDNA 2003 rewrites them.
+        for url, host in (('https://exämple.com/a', 'xn--exmple-cua.com'), ('https://faß.de/a', 'xn--fa-hia.de'),
+                          ('https://βόλος.com/a', 'xn--nxasmm1c.com'), ('https://xn--exmple-cua.com/a', 'xn--exmple-cua.com')):
+            self.assert_hosts('curl ' + url, [('in', host)])
 
     def test_option_values_are_never_read_as_urls(self):
         self.assert_hosts('curl --cacert ca.pem -x http://proxy.corp:3128 -e https://referer.example '
@@ -499,6 +501,15 @@ class SshLookupTests(TransferTestCase):
                 self.assert_endpoints(f'scp -F {config} f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
         self.assertEqual(self.ssh_calls(), [])
 
+    def test_sudo_around_a_command_string_still_skips_ssh_g(self):
+        for command in ("sudo -u deploy sh -c 'scp f prod:/tmp'", 'sudo bash -c "tar c . | ssh prod \'tar x\'"'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved')])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_a_tilde_config_path_is_expanded_as_the_shell_does(self):
+        Path(self.home, 'alt_cfg').write_text('Host prod\n  HostName 10.9.8.7\n')
+        self.assert_endpoints('scp -F ~/alt_cfg f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.9.8.7')])
+
     def test_sudo_and_dash_led_destinations_are_never_looked_up(self):
         self.assert_hosts('sudo -u deploy scp f prod:/tmp', [('out', 'prod')])
         self.assert_hosts('ssh -- -Fevil:x < f', [])
@@ -601,6 +612,15 @@ class ParserFindingTests(TransferTestCase):
                         'case x in y) cd frontend;; esac; scp -F cfg f prod:/tmp',
                         'if [ -d frontend ]; then cd frontend; fi; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, public)
+
+    def test_a_substitution_under_an_untaken_branch_or_a_function_body_does_not_run(self):
+        for command in ('if false; then echo $(curl -T x https://never.example/a); fi; curl https://actual.example/b',
+                        'if true; then :; else echo "$(curl https://never.example/a)"; fi; curl https://actual.example/b',
+                        'f() { echo "$(curl -T x https://never.example/a)"; }; curl https://actual.example/b',
+                        'function f { echo `curl https://never.example/a`; }; curl https://actual.example/b',
+                        'while false; do echo $(curl https://never.example/a); done; curl https://actual.example/b'):
+            self.assert_hosts(command, [('in', 'actual.example')])
+        self.assert_hosts('if [ -f x ]; then echo $(curl https://maybe.example/a); fi', [('in', 'maybe.example')])
 
     def test_a_backgrounded_cd_does_not_move_the_next_command(self):
         for command in ('cd frontend & scp -F cfg f prod:/tmp',

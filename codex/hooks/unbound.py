@@ -4136,6 +4136,7 @@ class _TransferLexer:
             items = _TransferLexer(inner, self.depth + 1).read()
             if items is None:
                 return False
+            self._flush_leading()
             self.items += [('$(', None, self.before, '', None)] + items + [(')', None, '', '', None)]
         self.word, self.in_word, self.i = self.word + _TRANSFER_SUBSTITUTED, True, end
         return True
@@ -4239,6 +4240,15 @@ class _TransferLexer:
         self._flush()
         self.case.pop()
         self.items.append(('esac', None, '', '', None))
+
+    def _flush_leading(self) -> None:
+        """Emit the reserved words that lead the current command, so a substitution in it runs only when they let it."""
+        n = 0
+        while n < len(self.argv) and (self.argv[n] in _TRANSFER_LEADING_WORDS or self.argv[n] == 'function'):
+            n += 2 if self.argv[n] == 'function' else 1
+        if n:
+            self.items.append(('cmd', self.argv[:n], self.before, '', set()))
+            self.argv, self.before = self.argv[n:], ''
 
     def _flush(self) -> None:
         """Emit the reserved words read so far ahead of the compound command they lead."""
@@ -4496,9 +4506,10 @@ def _transfer_simple(words: List[str], before: str, after: str, io: set, shell: 
         return []
     inner = _transfer_shell_string(program, args) if program else None
     if inner is not None:
-        # The string's commands read the wrapper's stdin and write its stdout, so they share its pipes and redirections.
+        # The string's commands run as the wrapper's user and read its stdin and write its stdout.
         calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1)
-        return [call[:5] + (call[5] | io, call[6] or before == '|', call[7] or after == '|') for call in calls]
+        return [call[:4] + (call[4] or other_user, call[5] | io, call[6] or before == '|', call[7] or after == '|')
+                for call in calls]
     return [(program, args, env, cwd, other_user, io, before == '|', after == '|')] if program else []
 
 
@@ -4553,8 +4564,12 @@ def _transfer_url_host(url: str) -> str:
     try:
         text = url.strip()
         host = urlsplit(text if '://' in text else 'http://' + text).hostname or ''
-        # A non-ASCII name is dialled in its punycode form, as curl and the URL standard write it.
-        return host if host.isascii() else host.encode('idna').decode('ascii')
+        if host.isascii():
+            return host
+        import unicodedata
+        # curl (libidn2) and the URL standard dial each non-ASCII label in punycode, keeping ß and a final sigma.
+        return '.'.join(label if label.isascii() else 'xn--' + label.encode('punycode').decode('ascii')
+                        for label in unicodedata.normalize('NFC', host).split('.'))
     except ValueError:
         return ''
 
@@ -4945,6 +4960,8 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
 
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> str:
     """The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely."""
+    # The shell expands a leading ~ in an -F path before ssh sees it.
+    options = [os.path.expanduser(v) if i and options[i - 1] == '-F' else v for i, v in enumerate(options)]
     key = ('ssh', destination, tuple(options), cwd)
     if key not in state:
         state[key] = ''
