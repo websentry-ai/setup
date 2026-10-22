@@ -1364,16 +1364,16 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
     # user_notice when the gateway sends one (a skill instruction's admin
     # message), else the same text.
     additional_context = api_response.get('additionalContext', '')
+    system_message = api_response.get('user_notice') or additional_context
+    response = {}
     if additional_context:
-        return {
-            'hookSpecificOutput': {
-                'hookEventName': 'UserPromptSubmit',
-                'additionalContext': additional_context,
-            },
-            'systemMessage': api_response.get('user_notice') or additional_context,
+        response['hookSpecificOutput'] = {
+            'hookEventName': 'UserPromptSubmit',
+            'additionalContext': additional_context,
         }
-
-    return {}
+    if system_message:
+        response['systemMessage'] = system_message
+    return response
 
 
 _HOOK_SCRIPT_RUNTIMES = {
@@ -3045,6 +3045,9 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     cwd = event.get('cwd')
     if isinstance(cwd, str) and cwd:
         metadata['cwd'] = cwd
+    session_context = _rollout_session_context(event.get('transcript_path'))
+    if session_context:
+        metadata['session_context'] = session_context
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'codex',
@@ -4097,6 +4100,58 @@ def _codex_same_totals(left: Dict, right: Dict) -> bool:
     if not left or not right:
         return False
     return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
+
+
+def _rollout_last_two_totals(lines: List[bytes], whole_file: bool) -> Optional[Tuple[Dict, Dict]]:
+    """(newest token_count totals, prior distinct totals or {}); None if compacted after it."""
+    latest, latest_total = None, None
+    for raw in reversed(lines):
+        try:
+            entry = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get('payload') if isinstance(entry.get('payload'), dict) else {}
+        if entry.get('type') == 'compacted' or payload.get('type') == 'context_compacted':
+            if latest is None:
+                return None
+            continue  # totals are cumulative, so the delta across a compaction still holds
+        if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+            continue
+        total = (payload.get('info') or {}).get('total_token_usage')
+        if not isinstance(total, dict):
+            continue
+        if latest is None:
+            latest, latest_total = entry, total
+        elif not _codex_same_totals(total, latest_total):  # sticky re-emits repeat the same totals
+            return latest_total, total
+    if latest is None:
+        return None
+    if whole_file:  # one snapshot in the whole rollout is the first request
+        return latest_total, {}
+    last = latest['payload']['info'].get('last_token_usage')  # prior totals fell outside the tail
+    return (last, {}) if isinstance(last, dict) else None
+
+
+def _rollout_session_context(transcript_path) -> Optional[Dict]:
+    """Context size at the newest token_count; totals delta, not last_token_usage (openai/codex#14489)."""
+    if not isinstance(transcript_path, str) or not transcript_path or transcript_path == 'undefined':
+        return None
+    try:
+        lines = _skill_policy_transcript_tail(transcript_path)
+        whole_file = os.path.getsize(transcript_path) <= SKILL_TRANSCRIPT_TAIL_BYTES  # sized after the read, so growth only errs False
+        found = _rollout_last_two_totals(lines, whole_file)
+        if found is None:
+            return None
+        latest_total, previous_total = found
+        context_tokens = sum(
+            max(_codex_token(latest_total, field) - _codex_token(previous_total, field), 0)
+            for field in ('input_tokens', 'output_tokens')
+        )
+        return {'context_tokens': context_tokens}
+    except Exception:
+        return None
 
 
 def _codex_all_totals(transcript_path: str, until: Optional[str] = None) -> List[Dict]:
