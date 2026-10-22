@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '4bddd0eaac208f9e441e300217367f66307410c82f35ceaaef79a6f282fbcb33'
+BLOCK_SHA256 = '796cbba7e0ba30e543edd039b55727391e76346742589b662fc76d9e80197831'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -240,6 +240,12 @@ class CurlTests(TransferTestCase):
         for url, host in (('https://exämple.com/a', 'xn--exmple-cua.com'), ('https://faß.de/a', 'xn--fa-hia.de'),
                           ('https://βόλος.com/a', 'xn--nxasmm1c.com'), ('https://xn--exmple-cua.com/a', 'xn--exmple-cua.com')):
             self.assert_hosts('curl ' + url, [('in', host)])
+
+    def test_each_next_starts_a_request_with_its_own_options(self):
+        self.assert_hosts('curl -T build.zip https://files.acme-infra.net/up --next https://example.com/file',
+                          [('out', 'files.acme-infra.net'), ('in', 'example.com')])
+        self.assert_hosts('curl https://example.com/a -: -d x https://files.acme-infra.net/up',
+                          [('in', 'example.com'), ('out', 'files.acme-infra.net')])
 
     def test_option_values_are_never_read_as_urls(self):
         self.assert_hosts('curl --cacert ca.pem -x http://proxy.corp:3128 -e https://referer.example '
@@ -606,6 +612,9 @@ class ParserFindingTests(TransferTestCase):
                           [('in', 'actual.example')])
         self.assert_hosts('function f { curl -T x https://never.example/a; }; curl https://actual.example/b',
                           [('in', 'actual.example')])
+        for command in ('f () { curl -T x https://never.example/a; }; curl https://actual.example/b',
+                        'function f () { curl -T x https://never.example/a; }; curl https://actual.example/b'):
+            self.assert_hosts(command, [('in', 'actual.example')])
         public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
         for command in ('if false; then cd frontend; fi; scp -F cfg f prod:/tmp',
                         'f() { cd frontend; }; scp -F cfg f prod:/tmp',

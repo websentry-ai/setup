@@ -258,6 +258,20 @@ test("curl reads an attached or expanded value as curl does", async () => {
   assert.deepEqual(await hosts("curl --output=page.html --proxy=http://proxy.corp:3128 https://example.com/x"), [["in", "example.com"]]);
 });
 
+test("each curl --next starts a request with its own options", async () => {
+  assert.deepEqual(await hosts("curl -T build.zip https://files.acme-infra.net/up --next https://example.com/file"),
+    [["out", "files.acme-infra.net"], ["in", "example.com"]]);
+  assert.deepEqual(await hosts("curl https://example.com/a -: -d x https://files.acme-infra.net/up"),
+    [["in", "example.com"], ["out", "files.acme-infra.net"]]);
+});
+
+test("a function written name () is only defined, not run", async () => {
+  for (const command of [
+    "f () { curl -T x https://never.example/a; }; curl https://actual.example/b",
+    "function f () { curl -T x https://never.example/a; }; curl https://actual.example/b",
+  ]) assert.deepEqual(await hosts(command), [["in", "actual.example"]], command);
+});
+
 test("a followed command string shares its wrapper's pipes and redirections", async () => {
   const cases: [string, [string, string][]][] = [
     [`tar c . | sh -c "ssh prod 'tar x -C /srv'"`, [["out", "prod"]]],

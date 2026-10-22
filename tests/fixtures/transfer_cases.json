@@ -840,6 +840,40 @@
    }
   },
   {
+   "command": "f () { curl -T x https://never.example/a; }; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -T build.zip https://files.acme-infra.net/up --next https://example.com/file",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

@@ -4077,9 +4077,10 @@ class _TransferLexer:
         if self.case and self.case[-1] == 'pattern':
             return  # the optional ( before a case pattern
         rest = self.text[self.i + 1:].lstrip(' \t')
-        if self.in_word and self.argv in ([], ['function']) and rest.startswith(')') and \
-                re.match(r'^[\w.:-]+$', self.word):
-            # `name()` defines a function; the body that follows runs only when it's called.
+        name = self.word if self.in_word else (self.argv[-1] if self.argv else '')
+        head = self.argv if self.in_word else self.argv[:-1]
+        if rest.startswith(')') and head in ([], ['function']) and re.match(r'^[\w.:-]+$', name):
+            # `name()` or `name ()` defines a function; the body that follows runs only when it's called.
             self.items.append(('func', None, self.before, '', None))
             self.argv, self.word, self.in_word = [], '', False
             self.i = self.text.index(')', self.i)
@@ -4507,7 +4508,21 @@ def _transfer_url_host(url: str) -> str:
 
 
 def _transfer_curl(args: List[str]) -> List[tuple]:
-    """curl's URLs: sent to when it uploads a file, a form or a body, or uses a sending method; else fetched from."""
+    """curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
+    from. Each --next starts a request with options of its own."""
+    endpoints, request = [], []
+    for arg in args + ['--next']:
+        if arg not in ('-:', '--next'):
+            request.append(arg)
+            continue
+        urls, sends = _transfer_curl_request(request)
+        endpoints += [('out' if sends else 'in', _transfer_url_host(url), None) for url in urls]
+        request = []
+    return endpoints
+
+
+def _transfer_curl_request(args: List[str]) -> tuple:
+    """(the URLs of one curl request, whether it sends data)."""
     urls, flags, method, i = [], set(), '', 0
     while i < len(args):
         arg, value, i = args[i], None, i + 1
@@ -4531,7 +4546,7 @@ def _transfer_curl(args: List[str]) -> List[tuple]:
             method = value.upper()
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
-    return [('out' if sends else 'in', _transfer_url_host(url), None) for url in urls]
+    return urls, bool(sends)
 
 
 def _transfer_wget(args: List[str]) -> List[tuple]:

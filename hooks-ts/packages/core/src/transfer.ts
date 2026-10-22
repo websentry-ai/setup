@@ -389,9 +389,11 @@ class Lexer {
   private open(): void {
     if (this.cases.at(-1) === "pattern") return; // the optional ( before a case pattern
     const rest = this.text.slice(this.i + 1).trimStart();
-    const bare = this.argv.length === 0 || (this.argv.length === 1 && this.argv[0] === "function");
-    if (this.inWord && bare && rest.startsWith(")") && /^[\w.:-]+$/.test(this.word)) {
-      // `name()` defines a function; the body that follows runs only when it's called.
+    const name = this.inWord ? this.word : (this.argv.at(-1) ?? "");
+    const head = this.inWord ? this.argv : this.argv.slice(0, -1);
+    const bare = head.length === 0 || (head.length === 1 && head[0] === "function");
+    if (bare && rest.startsWith(")") && /^[\w.:-]+$/.test(name)) {
+      // `name()` or `name ()` defines a function; the body that follows runs only when it's called.
       this.marker("func", this.before);
       this.argv = [];
       this.word = "";
@@ -910,7 +912,25 @@ function urlHost(url: string): string {
   }
 }
 
+/** curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
+ *  from. Each --next starts a request with options of its own. */
 function curl(args: string[]): Raw[] {
+  const out: Raw[] = [];
+  let request: string[] = [];
+  for (const arg of [...args, "--next"]) {
+    if (arg !== "-:" && arg !== "--next") {
+      request.push(arg);
+      continue;
+    }
+    const [urls, sends] = curlRequest(request);
+    out.push(...urls.map((url): Raw => [sends ? "out" : "in", urlHost(url), undefined]));
+    request = [];
+  }
+  return out;
+}
+
+/** The URLs of one curl request, and whether it sends data. */
+function curlRequest(args: string[]): [string[], boolean] {
   const urls: string[] = [];
   const flags = new Set<string>();
   let method = "";
@@ -936,7 +956,7 @@ function curl(args: string[]): Raw[] {
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
-  return urls.map((url): Raw => [sends ? "out" : "in", urlHost(url), undefined]);
+  return [urls, Boolean(sends)];
 }
 
 function wget(args: string[]): Raw[] {

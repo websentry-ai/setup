@@ -2175,8 +2175,10 @@ var Lexer = class _Lexer {
   open() {
     if (this.cases.at(-1) === "pattern") return;
     const rest = this.text.slice(this.i + 1).trimStart();
-    const bare = this.argv.length === 0 || this.argv.length === 1 && this.argv[0] === "function";
-    if (this.inWord && bare && rest.startsWith(")") && /^[\w.:-]+$/.test(this.word)) {
+    const name = this.inWord ? this.word : this.argv.at(-1) ?? "";
+    const head = this.inWord ? this.argv : this.argv.slice(0, -1);
+    const bare = head.length === 0 || head.length === 1 && head[0] === "function";
+    if (bare && rest.startsWith(")") && /^[\w.:-]+$/.test(name)) {
       this.marker("func", this.before);
       this.argv = [];
       this.word = "";
@@ -2594,6 +2596,20 @@ function urlHost(url) {
   }
 }
 function curl(args) {
+  const out = [];
+  let request = [];
+  for (const arg of [...args, "--next"]) {
+    if (arg !== "-:" && arg !== "--next") {
+      request.push(arg);
+      continue;
+    }
+    const [urls, sends] = curlRequest(request);
+    out.push(...urls.map((url) => [sends ? "out" : "in", urlHost(url), void 0]));
+    request = [];
+  }
+  return out;
+}
+function curlRequest(args) {
   const urls = [];
   const flags = /* @__PURE__ */ new Set();
   let method = "";
@@ -2618,7 +2634,7 @@ function curl(args) {
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return urls.map((url) => [sends ? "out" : "in", urlHost(url), void 0]);
+  return [urls, Boolean(sends)];
 }
 function wget(args) {
   const urls = [];
