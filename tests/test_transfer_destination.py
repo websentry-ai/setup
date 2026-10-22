@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '5295a3e35bb3ce6d3efa980c9e4c1cf795b84746944039bc8c627f47b194219c'
+BLOCK_SHA256 = '7e721b4ef91e0b7be0fc063945e231df4800c4fa7d1d684e6975187f170aee5a'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -223,6 +223,18 @@ class CurlTests(TransferTestCase):
                         '/usr/bin/curl -H "Accept: text/plain" example.com/plain'):
             self.assert_endpoints(command, [_endpoint('in', 'example.com', 'public')], tool='curl')
 
+    def test_an_attached_or_expanded_value_is_read_as_curl_reads_it(self):
+        for command in ('curl --data=hello https://files.acme-infra.net/up',
+                        'curl --upload-file=build.zip https://files.acme-infra.net/up',
+                        'curl --json=@payload.json https://files.acme-infra.net/up',
+                        'curl --form=file=@a.zip https://files.acme-infra.net/up',
+                        'curl --request=PUT https://files.acme-infra.net/up',
+                        'curl --url=https://files.acme-infra.net/up --data-binary=@build.zip',
+                        "curl --expand-data '{{body}}' https://files.acme-infra.net/up"):
+            self.assert_endpoints(command, [_endpoint('out', 'files.acme-infra.net', 'private')], tool='curl')
+        self.assert_hosts('curl --output=page.html --proxy=http://proxy.corp:3128 https://example.com/x',
+                          [('in', 'example.com')])
+
     def test_option_values_are_never_read_as_urls(self):
         self.assert_hosts('curl --cacert ca.pem -x http://proxy.corp:3128 -e https://referer.example '
                           '--resolve api.example.com:443:1.2.3.4 https://api.example.com/v1', [('in', 'api.example.com')])
@@ -371,6 +383,16 @@ class PowerShellTests(TransferTestCase):
         for command, direction in cases.items():
             self.assert_endpoints(command, [_endpoint(direction, 'example.com', 'public')], tool='powershell')
 
+    def test_a_followed_command_string_shares_its_wrappers_pipes_and_redirections(self):
+        cases = {
+            'tar c . | sh -c "ssh prod \'tar x -C /srv\'"': [('out', 'prod')],
+            'sh -c "ssh prod \'tar c /srv\'" > backup.tar': [('in', 'prod')],
+            'bash -c "nc example.com 80" < request.txt': [('out', 'example.com')],
+            'Get-Content a.json | powershell -Command "Invoke-RestMethod https://example.com/api"': [('out', 'example.com')],
+        }
+        for command, expected in cases.items():
+            self.assert_hosts(command, expected)
+
     def test_a_powershell_or_sh_command_string_is_followed(self):
         self.assert_endpoints('powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri https://example.com/up '
                               '-InFile b.zip -Method Put"', [_endpoint('out', 'example.com', 'public')], 'powershell')
@@ -414,7 +436,7 @@ class AddressTests(TransferTestCase):
 class LoginsNeverLeaveTests(TransferTestCase):
     def test_no_login_password_or_token_reaches_the_field(self):
         for command in (f'curl https://jdoe:{FAKE_TOKEN}@example.com/x',
-                        f'curl -u jdoe:{FAKE_TOKEN} https://example.com/x',
+                        f'curl -u jdoe:{FAKE_TOKEN} https://example.com/x',  # gitleaks:allow
                         f'wget https://jdoe:{FAKE_TOKEN}@example.com/x',
                         'scp f jdoe@example.com:/tmp',
                         f'scp f scp://jdoe:{FAKE_TOKEN}@example.com/tmp',
@@ -458,6 +480,19 @@ class SshLookupTests(TransferTestCase):
         Path(program_data, 'ssh', 'ssh_config').write_text('Match exec "touch /tmp/never"\n')
         with patch.dict(os.environ, {'PROGRAMDATA': program_data}):
             self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_includes_are_checked_under_home_as_well_as_the_account_home(self):
+        # ssh reads ~/.ssh/config from the account's home but expands an Include with $HOME.
+        elsewhere = tempfile.mkdtemp()
+        os.makedirs(os.path.join(elsewhere, '.ssh', 'config.d'))
+        Path(elsewhere, '.ssh', 'config.d', 'x.conf').write_text('Match exec "touch /tmp/never"\n')
+        Path(elsewhere, '.ssh', 'other.conf').write_text('Match exec "touch /tmp/never"\n')
+        Path(self.repo, 'relative_cfg').write_text('Include config.d/*.conf\nHost prod\n  HostName 10.0.4.12\n')
+        Path(self.repo, 'tilde_cfg').write_text('Include ~/.ssh/other.conf\nHost prod\n  HostName 10.0.4.12\n')
+        with patch.dict(os.environ, {'HOME': elsewhere}):
+            for config in ('relative_cfg', 'tilde_cfg'):
+                self.assert_endpoints(f'scp -F {config} f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
         self.assertEqual(self.ssh_calls(), [])
 
     def test_sudo_and_dash_led_destinations_are_never_looked_up(self):

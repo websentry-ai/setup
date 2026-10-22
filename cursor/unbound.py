@@ -4451,7 +4451,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: set, shell: 
         return []
     inner = _transfer_shell_string(program, args) if program else None
     if inner is not None:
-        return _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1)
+        # The string's commands read the wrapper's stdin and write its stdout, so they share its pipes and redirections.
+        calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1)
+        return [call[:5] + (call[5] | io, call[6] or before == '|', call[7] or after == '|') for call in calls]
     return [(program, args, env, cwd, other_user, io, before == '|', after == '|')] if program else []
 
 
@@ -4515,11 +4517,17 @@ def _transfer_curl(args: List[str]) -> List[tuple]:
     urls, flags, method, i = [], set(), '', 0
     while i < len(args):
         arg, value, i = args[i], None, i + 1
-        if arg.startswith('--') and arg in _TRANSFER_CURL_LONG_VALUES and i < len(args):
-            value, i = args[i], i + 1
-        elif arg.startswith('-') and not arg.startswith('--') and len(arg) > 1:
+        if arg.startswith('--'):
+            # curl reads --name=value as --name value, and --expand-name as --name with variables expanded.
+            arg, eq, attached = arg.partition('=')
+            arg = '--' + arg[len('--expand-'):] if arg.startswith('--expand-') else arg
+            if eq:
+                value = attached
+            elif arg in _TRANSFER_CURL_LONG_VALUES and i < len(args):
+                value, i = args[i], i + 1
+        elif arg.startswith('-') and len(arg) > 1:
             arg, value, i = _transfer_short_option(arg, args, i, _TRANSFER_CURL_SHORT_VALUES, flags)
-        elif not arg.startswith('-'):
+        else:
             urls.append(arg)
             continue
         flags.add(arg)
@@ -4808,8 +4816,9 @@ def _transfer_ssh_config_words(line: str) -> Optional[List[str]]:
     return words
 
 
-def _transfer_ssh_config_runs(lines: List[str], home: str, base: str, pending: List[tuple]) -> bool:
-    """Whether config lines could run a command or a DNS lookup in ssh -G; their Includes are queued on pending."""
+def _transfer_ssh_config_runs(lines: List[str], homes: List[str], bases: tuple, pending: List[tuple]) -> bool:
+    """Whether config lines could run a command or a DNS lookup in ssh -G; their Includes are queued on pending,
+    resolved against every home and folder ssh may use."""
     import glob
     for line in lines:
         words = _transfer_ssh_config_words(line)
@@ -4827,10 +4836,14 @@ def _transfer_ssh_config_runs(lines: List[str], home: str, base: str, pending: L
         for pattern in (words if keyword.lower() == 'include' else []):
             if '$' in pattern or '%' in pattern:
                 return True  # ssh may expand a variable or token here
-            pattern = home + pattern[1:] if pattern == '~' or pattern.startswith('~/') else os.path.expanduser(pattern)
             # ssh globs the path, and glob reads a backslash as escaping the next character.
             pattern = re.sub(r'\\(.)', r'\1', pattern)
-            pending += [(found, base) for found in sorted(glob.glob(os.path.join(base, pattern)))]
+            if pattern == '~' or pattern.startswith('~/'):
+                paths = [home + pattern[1:] for home in homes]
+            else:
+                paths = [os.path.join(base, os.path.expanduser(pattern)) for base in bases]
+            for path in paths:
+                pending += [(found, bases) for found in sorted(glob.glob(path))]
     return False
 
 
@@ -4838,7 +4851,9 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
     """Whether ssh -G could run a command or a DNS lookup while reading its configs, or reads a file this can't check."""
     import stat
     home = _transfer_home()
-    home_ssh = os.path.join(home, '.ssh')
+    # ssh reads ~/.ssh/config from the account's home but expands an Include's ~ and relative path with $HOME.
+    homes = list(dict.fromkeys([home, os.path.expanduser('~')]))
+    user_bases = tuple(os.path.join(h, '.ssh') for h in homes)
     config = None
     for flag, value in zip(passthrough[::2], passthrough[1::2]):
         if flag == '-F':
@@ -4849,14 +4864,15 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
         # Whichever ssh is on PATH reads its own system config, so every one that exists is checked.
         system = ['/etc/ssh', '/opt/homebrew/etc/ssh', '/usr/local/etc/ssh',
                   os.path.join(os.environ.get('PROGRAMDATA') or '/nonexistent', 'ssh')]
-        pending = [(os.path.join(home_ssh, 'config'), home_ssh)] + [(os.path.join(d, 'ssh_config'), d) for d in system]
+        pending = [(os.path.join(home, '.ssh', 'config'), user_bases)] + \
+            [(os.path.join(d, 'ssh_config'), (d,)) for d in system]
     elif os.path.isabs(config) or (cwd and os.path.isdir(cwd)):
-        pending = [(os.path.join(cwd or '', config), home_ssh)]
+        pending = [(os.path.join(cwd or '', config), user_bases)]
     else:
         return True
     seen = set()
     while pending:
-        path, base = pending.pop()
+        path, bases = pending.pop()
         if path in seen:
             continue
         seen.add(path)
@@ -4875,7 +4891,7 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
                 lines = handle.read().splitlines()
         except OSError:
             return True
-        if _transfer_ssh_config_runs(lines, home, base, pending):
+        if _transfer_ssh_config_runs(lines, homes, bases, pending):
             return True
     return False
 

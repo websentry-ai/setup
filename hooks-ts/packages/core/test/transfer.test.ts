@@ -146,7 +146,7 @@ test("every tool's out and in", async () => {
 test("no login, password, token, path or URL reaches the field", async () => {
   for (const command of [
     `curl https://jdoe:${FAKE_TOKEN}@example.com/x`,
-    `curl -u jdoe:${FAKE_TOKEN} https://example.com/x`,
+    `curl -u jdoe:${FAKE_TOKEN} https://example.com/x`, // gitleaks:allow
     `wget https://jdoe:${FAKE_TOKEN}@example.com/x`,
     `scp f scp://jdoe:${FAKE_TOKEN}@example.com/tmp`,
     "rsync -a f jdoe@example.com:/tmp",
@@ -243,6 +243,46 @@ test("only ssh -G is ever run, a call that never ran is not resolved, and errors
   const throwing = await resolveTransfers([{ tool_name: "bash", tool_use_id: "x", tool_input: { command: "curl https://example.com" } }], "/",
     options({ lookup: () => { throw new Error("boom"); } }));
   assert.equal(throwing.get("x")?.endpoints[0]?.address, "unresolved");
+});
+
+test("curl reads an attached or expanded value as curl does", async () => {
+  for (const command of [
+    "curl --data=hello https://example.com/up",
+    "curl --upload-file=build.zip https://example.com/up",
+    "curl --json=@payload.json https://example.com/up",
+    "curl --form=file=@a.zip https://example.com/up",
+    "curl --request=PUT https://example.com/up",
+    "curl --url=https://example.com/up --data-binary=@build.zip",
+    "curl --expand-data '{{body}}' https://example.com/up",
+  ]) assert.deepEqual(await hosts(command), [["out", "example.com"]], command);
+  assert.deepEqual(await hosts("curl --output=page.html --proxy=http://proxy.corp:3128 https://example.com/x"), [["in", "example.com"]]);
+});
+
+test("a followed command string shares its wrapper's pipes and redirections", async () => {
+  const cases: [string, [string, string][]][] = [
+    [`tar c . | sh -c "ssh prod 'tar x -C /srv'"`, [["out", "prod"]]],
+    [`sh -c "ssh prod 'tar c /srv'" > backup.tar`, [["in", "prod"]]],
+    [`bash -c "nc example.com 80" < request.txt`, [["out", "example.com"]]],
+    [`Get-Content a.json | powershell -Command "Invoke-RestMethod https://example.com/api"`, [["out", "example.com"]]],
+  ];
+  for (const [command, expected] of cases) assert.deepEqual(await hosts(command), expected, command);
+});
+
+test("Includes are checked under $HOME as well as the account's home", async () => {
+  // ssh reads ~/.ssh/config from the account's home but expands an Include with $HOME.
+  const elsewhere = mkdtempSync(join(tmpdir(), "transfer-env-home-"));
+  mkdirSync(join(elsewhere, ".ssh", "config.d"), { recursive: true });
+  writeFileSync(join(elsewhere, ".ssh", "config.d", "x.conf"), 'Match exec "touch /tmp/never"\n');
+  writeFileSync(join(elsewhere, ".ssh", "other.conf"), 'Match exec "touch /tmp/never"\n');
+  const dir = repo();
+  writeFileSync(join(dir, "relative_cfg"), "Include config.d/*.conf\nHost prod\n  HostName 10.0.4.12\n");
+  writeFileSync(join(dir, "tilde_cfg"), "Include ~/.ssh/other.conf\nHost prod\n  HostName 10.0.4.12\n");
+  const calls: string[][] = [];
+  for (const config of ["relative_cfg", "tilde_cfg"]) {
+    const found = await transfer(`scp -F ${config} f prod:/tmp`, dir, { execFile: fakeSsh(calls), env: { HOME: elsewhere } });
+    assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }], config);
+  }
+  assert.deepEqual(calls, []);
 });
 
 test("the five parser findings", async () => {

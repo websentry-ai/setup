@@ -666,6 +666,104 @@
    }
   },
   {
+   "command": "curl --upload-file=build.zip https://files.acme-infra.net/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --url=https://example.com/api --data=hello",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --expand-data '{{body}}' https://example.com/api",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --output=page.html https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "tar c . | sh -c \"ssh prod 'tar x -C /srv'\"",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sh -c \"ssh prod 'tar c /srv'\" > backup.tar",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "Get-Content a.json | powershell -Command \"Invoke-RestMethod https://example.com/api\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

@@ -823,7 +823,15 @@ function simple(argv: string[], item: Item, shell: Shell, depth: number): Call[]
     return [];
   }
   const inner = name === undefined ? undefined : shellString(name, args);
-  if (inner !== undefined) return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1);
+  if (inner !== undefined) {
+    // The string's commands read the wrapper's stdin and write its stdout, so they share its pipes and redirections.
+    return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1).map((call) => ({
+      ...call,
+      io: new Set([...call.io, ...item.io]),
+      pipedIn: call.pipedIn || item.before === "|",
+      pipedOut: call.pipedOut || item.after === "|",
+    }));
+  }
   if (name === undefined) return [];
   return [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, io: item.io, pipedIn: item.before === "|", pipedOut: item.after === "|" }];
 }
@@ -895,11 +903,16 @@ function curl(args: string[]): Raw[] {
   for (let i = 0; i < args.length; ) {
     let arg = args[i++] as string;
     let value: string | undefined;
-    if (arg.startsWith("--") && CURL_LONG_VALUES.has(arg) && i < args.length) {
-      value = args[i++];
-    } else if (arg.startsWith("-") && !arg.startsWith("--") && arg.length > 1) {
+    if (arg.startsWith("--")) {
+      // curl reads --name=value as --name value, and --expand-name as --name with variables expanded.
+      const eq = arg.indexOf("=");
+      if (eq >= 0) value = arg.slice(eq + 1);
+      arg = eq >= 0 ? arg.slice(0, eq) : arg;
+      if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
+      if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
+    } else if (arg.startsWith("-") && arg.length > 1) {
       [arg, value, i] = shortOption(arg, args, i, CURL_SHORT_VALUES, flags);
-    } else if (!arg.startsWith("-")) {
+    } else {
       urls.push(arg);
       continue;
     }
@@ -1195,13 +1208,27 @@ function globMatch(pattern: string, name: string): boolean {
   return p === pattern.length;
 }
 
-/** The files an ssh Include pattern names; undefined when it can't be expanded, so the caller refuses. */
-function includeTargets(pattern: string, base: string, home: string): string[] | undefined {
+/** The files an ssh Include pattern names, resolved against every home and folder ssh may use; undefined when it
+ *  can't be expanded, so the caller refuses. */
+function includeTargets(pattern: string, bases: readonly string[], homes: readonly string[]): string[] | undefined {
   // `~user` names another account's home, and ssh may expand a variable or token, so only ssh can resolve those.
   if ((pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/")) || /[$%]/.test(pattern)) return undefined;
   // ssh globs the path, and glob reads a backslash as escaping the next character.
-  const path = expandHome(pattern, home).replace(/\\(.)/g, "$1");
-  const full = isAbsolute(path) ? path : join(base, path);
+  const unescaped = pattern.replace(/\\(.)/g, "$1");
+  const fulls = unescaped === "~" || unescaped.startsWith("~/")
+    ? homes.map((home) => expandHome(unescaped, home))
+    : bases.map((base) => (isAbsolute(unescaped) ? unescaped : join(base, unescaped)));
+  const out: string[] = [];
+  for (const full of new Set(fulls)) {
+    const found = globTargets(full);
+    if (found === undefined) return undefined;
+    out.push(...found);
+  }
+  return out;
+}
+
+/** The files a path with `*` or `?` in its last part names; undefined for a glob this can't expand. */
+function globTargets(full: string): string[] | undefined {
   if (!/[*?[]/.test(full)) return [full];
   if (/[*?[]/.test(dirname(full)) || basename(full).includes("[")) return undefined;
   try {
@@ -1248,7 +1275,7 @@ function configWords(line: string): string[] | undefined {
 }
 
 /** Whether config lines could run a command or a DNS lookup in ssh -G; their Includes are queued on `pending`. */
-function configRuns(text: string, base: string, home: string, pending: [string, string][]): boolean {
+function configRuns(text: string, bases: readonly string[], homes: readonly string[], pending: [string, readonly string[]][]): boolean {
   for (const line of text.split(/\r?\n/)) {
     const lineWords = configWords(line);
     if (lineWords === undefined) return true;
@@ -1259,9 +1286,9 @@ function configRuns(text: string, base: string, home: string, pending: [string, 
     if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) return true;
     if (keyword.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return true;
     for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
-      const targets = includeTargets(pattern, base, home);
+      const targets = includeTargets(pattern, bases, homes);
       if (targets === undefined) return true;
-      pending.push(...targets.map((target): [string, string] => [target, base]));
+      pending.push(...targets.map((target): [string, readonly string[]] => [target, bases]));
     }
   }
   return false;
@@ -1269,18 +1296,22 @@ function configRuns(text: string, base: string, home: string, pending: [string, 
 
 /** Whether ssh -G could run a command or a DNS lookup while reading its configs, or reads a file this can't check. */
 function configUnsafe(passthrough: readonly string[], home: string, processEnv: Record<string, string | undefined>): boolean {
-  const homeSsh = join(home, ".ssh");
+  // ssh reads ~/.ssh/config from the account's home but expands an Include's ~ and relative path with $HOME.
+  const homes = [...new Set([home, processEnv.HOME || home])];
+  const userBases = homes.map((h) => join(h, ".ssh"));
   let config: string | undefined;
   for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
   if (config === "none") return false;
   if (config !== undefined && !isAbsolute(config)) return true;
   // Whichever ssh is on PATH reads its own system config, so every one that exists is checked.
   const system = ["/etc/ssh", "/opt/homebrew/etc/ssh", "/usr/local/etc/ssh", join(processEnv.PROGRAMDATA || "/nonexistent", "ssh")];
-  const pending: [string, string][] =
-    config === undefined ? [[join(homeSsh, "config"), homeSsh], ...system.map((d): [string, string] => [join(d, "ssh_config"), d])] : [[config, homeSsh]];
+  const pending: [string, readonly string[]][] =
+    config === undefined
+      ? [[join(home, ".ssh", "config"), userBases], ...system.map((d): [string, readonly string[]] => [join(d, "ssh_config"), [d]])]
+      : [[config, userBases]];
   const seen = new Set<string>();
   while (pending.length > 0) {
-    const [path, base] = pending.pop() as [string, string];
+    const [path, bases] = pending.pop() as [string, readonly string[]];
     if (seen.has(path)) continue;
     seen.add(path);
     let text: string;
@@ -1293,7 +1324,7 @@ function configUnsafe(passthrough: readonly string[], home: string, processEnv: 
     } catch {
       return true;
     }
-    if (configRuns(text, base, home, pending)) return true;
+    if (configRuns(text, bases, homes, pending)) return true;
   }
   return false;
 }
@@ -1361,7 +1392,6 @@ async function resolveAddresses(host: string, timeoutMs: number, state: State): 
       }
       done([]);
     }, timeoutMs);
-    timer.unref?.();
   });
   try {
     return await Promise.race([pending, timeout]);

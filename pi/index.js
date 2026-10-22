@@ -2512,7 +2512,14 @@ function simple(argv, item, shell, depth) {
     return [];
   }
   const inner = name === void 0 ? void 0 : shellString(name, args);
-  if (inner !== void 0) return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1);
+  if (inner !== void 0) {
+    return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1).map((call) => ({
+      ...call,
+      io: /* @__PURE__ */ new Set([...call.io, ...item.io]),
+      pipedIn: call.pipedIn || item.before === "|",
+      pipedOut: call.pipedOut || item.after === "|"
+    }));
+  }
   if (name === void 0) return [];
   return [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, io: item.io, pipedIn: item.before === "|", pipedOut: item.after === "|" }];
 }
@@ -2580,11 +2587,15 @@ function curl(args) {
   for (let i = 0; i < args.length; ) {
     let arg = args[i++];
     let value;
-    if (arg.startsWith("--") && CURL_LONG_VALUES.has(arg) && i < args.length) {
-      value = args[i++];
-    } else if (arg.startsWith("-") && !arg.startsWith("--") && arg.length > 1) {
+    if (arg.startsWith("--")) {
+      const eq = arg.indexOf("=");
+      if (eq >= 0) value = arg.slice(eq + 1);
+      arg = eq >= 0 ? arg.slice(0, eq) : arg;
+      if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
+      if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
+    } else if (arg.startsWith("-") && arg.length > 1) {
       [arg, value, i] = shortOption(arg, args, i, CURL_SHORT_VALUES, flags);
-    } else if (!arg.startsWith("-")) {
+    } else {
       urls.push(arg);
       continue;
     }
@@ -2845,10 +2856,19 @@ function globMatch(pattern, name) {
   while (pattern[p] === "*") p++;
   return p === pattern.length;
 }
-function includeTargets(pattern, base, home) {
+function includeTargets(pattern, bases, homes) {
   if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/") || /[$%]/.test(pattern)) return void 0;
-  const path = expandHome(pattern, home).replace(/\\(.)/g, "$1");
-  const full = isAbsolute3(path) ? path : join5(base, path);
+  const unescaped = pattern.replace(/\\(.)/g, "$1");
+  const fulls = unescaped === "~" || unescaped.startsWith("~/") ? homes.map((home) => expandHome(unescaped, home)) : bases.map((base) => isAbsolute3(unescaped) ? unescaped : join5(base, unescaped));
+  const out = [];
+  for (const full of new Set(fulls)) {
+    const found = globTargets(full);
+    if (found === void 0) return void 0;
+    out.push(...found);
+  }
+  return out;
+}
+function globTargets(full) {
   if (!/[*?[]/.test(full)) return [full];
   if (/[*?[]/.test(dirname3(full)) || basename(full).includes("[")) return void 0;
   try {
@@ -2890,7 +2910,7 @@ function configWords(line) {
   if (inWord) out.push(word);
   return out;
 }
-function configRuns(text, base, home, pending) {
+function configRuns(text, bases, homes, pending) {
   for (const line of text.split(/\r?\n/)) {
     const lineWords = configWords(line);
     if (lineWords === void 0) return true;
@@ -2900,24 +2920,25 @@ function configRuns(text, base, home, pending) {
     if (keyword2.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) return true;
     if (keyword2.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return true;
     for (const pattern of keyword2.toLowerCase() === "include" ? args : []) {
-      const targets = includeTargets(pattern, base, home);
+      const targets = includeTargets(pattern, bases, homes);
       if (targets === void 0) return true;
-      pending.push(...targets.map((target) => [target, base]));
+      pending.push(...targets.map((target) => [target, bases]));
     }
   }
   return false;
 }
 function configUnsafe(passthrough, home, processEnv) {
-  const homeSsh = join5(home, ".ssh");
+  const homes = [.../* @__PURE__ */ new Set([home, processEnv.HOME || home])];
+  const userBases = homes.map((h) => join5(h, ".ssh"));
   let config;
   for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
   if (config === "none") return false;
   if (config !== void 0 && !isAbsolute3(config)) return true;
   const system = ["/etc/ssh", "/opt/homebrew/etc/ssh", "/usr/local/etc/ssh", join5(processEnv.PROGRAMDATA || "/nonexistent", "ssh")];
-  const pending = config === void 0 ? [[join5(homeSsh, "config"), homeSsh], ...system.map((d) => [join5(d, "ssh_config"), d])] : [[config, homeSsh]];
+  const pending = config === void 0 ? [[join5(home, ".ssh", "config"), userBases], ...system.map((d) => [join5(d, "ssh_config"), [d]])] : [[config, userBases]];
   const seen = /* @__PURE__ */ new Set();
   while (pending.length > 0) {
-    const [path, base] = pending.pop();
+    const [path, bases] = pending.pop();
     if (seen.has(path)) continue;
     seen.add(path);
     let text;
@@ -2929,7 +2950,7 @@ function configUnsafe(passthrough, home, processEnv) {
     } catch {
       return true;
     }
-    if (configRuns(text, base, home, pending)) return true;
+    if (configRuns(text, bases, homes, pending)) return true;
   }
   return false;
 }
@@ -2983,7 +3004,6 @@ async function resolveAddresses(host, timeoutMs, state) {
       }
       done([]);
     }, timeoutMs);
-    timer.unref?.();
   });
   try {
     return await Promise.race([pending, timeout]);
