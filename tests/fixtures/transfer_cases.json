@@ -888,6 +888,62 @@
    }
   },
   {
+   "command": "tar c . | (ssh prod 'tar x -C /srv')",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "{ ssh bastion 'tar c /srv'; } > backup.tar",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "bastion",
+      "resolved_host": "203.0.113.7",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "false && ! true; false && curl https://never.example/a; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "if true; then f () { curl https://never.example/a; }; fi; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

@@ -2177,12 +2177,13 @@ var Lexer = class _Lexer {
     const rest = this.text.slice(this.i + 1).trimStart();
     const name = this.inWord ? this.word : this.argv.at(-1) ?? "";
     const head = this.inWord ? this.argv : this.argv.slice(0, -1);
-    const bare = head.length === 0 || head.length === 1 && head[0] === "function";
-    if (bare && rest.startsWith(")") && /^[\w.:-]+$/.test(name)) {
-      this.marker("func", this.before);
-      this.argv = [];
+    const leading = head.at(-1) === "function" ? head.slice(0, -1) : head;
+    if (rest.startsWith(")") && leading.every((w) => LEADING_WORDS.has(w)) && /^[\w.:-]+$/.test(name)) {
+      this.argv = leading;
       this.word = "";
       this.inWord = false;
+      this.flush();
+      this.marker("func", this.before);
       this.i = this.text.indexOf(")", this.i);
       return;
     }
@@ -2304,8 +2305,13 @@ var Lexer = class _Lexer {
     if (this.argv.length > 0) {
       this.items.push({ kind: "cmd", argv: this.argv, before: this.before, after, io: this.io });
       this.before = after;
-    } else if (after !== ";" && after !== "") {
-      this.before = after;
+    } else {
+      const last = this.items.at(-1);
+      if (last !== void 0 && (last.kind === ")" || last.kind === "esac") && (after !== "" || this.io.size > 0)) {
+        last.after = after;
+        last.io = this.io;
+      }
+      if (after !== ";" && after !== "") this.before = after;
     }
     this.argv = [];
     this.io = /* @__PURE__ */ new Set();
@@ -2421,7 +2427,29 @@ function openFrame(kind, runsHere, shell) {
     value = false;
     shell.function = false;
   }
-  shell.frames.push({ kind, base: value, runs: value, decided: false, state: snapshot(shell), status: shell.status });
+  shell.frames.push({
+    kind,
+    base: value,
+    runs: value,
+    decided: false,
+    state: snapshot(shell),
+    status: shell.status,
+    calls: shell.calls.length,
+    pipedIn: shell.openingPipe
+  });
+  shell.openingPipe = false;
+}
+function closeFrame(frame, after, io, shell) {
+  for (let i = frame.calls; i < shell.calls.length; i++) {
+    const call = shell.calls[i];
+    shell.calls[i] = {
+      ...call,
+      io: /* @__PURE__ */ new Set([...call.io, ...io]),
+      pipedIn: call.pipedIn || frame.pipedIn,
+      pipedOut: call.pipedOut || after === "|"
+    };
+  }
+  if (after === "&") shell.start = frame.state;
 }
 function branch(keyword2, frame, shell) {
   let holds = shell.status === 0 ? true : shell.status === 1 ? false : void 0;
@@ -2453,13 +2481,11 @@ function keyword(argv, followsHere, shell) {
     shell.function = true;
     return rest.slice(1);
   }
-  if (word === "!") {
-    shell.negate = true;
-    return rest;
-  }
+  if (word === "!") return rest;
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(shell.frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
     restore(shell, frame?.saved);
+    shell.closed = frame;
     if (word !== "}") shell.status = void 0;
     return rest;
   }
@@ -2471,6 +2497,7 @@ function marker(item, shell) {
   const { frames } = shell;
   const runsHere = both(runs(shell), follows(item.before, shell.status));
   if (item.kind === "(" || item.kind === "$(" || item.kind === "case") {
+    shell.openingPipe = item.before === "|" && item.kind !== "$(";
     openFrame(item.kind, runsHere, shell);
     if (item.kind === "case") frames.at(-1).runs = false;
   } else if (item.kind === "func") {
@@ -2486,6 +2513,7 @@ function marker(item, shell) {
     restore(shell, item.kind === ")" ? frame.state : frame.saved);
     if (frame.kind === "$(" || frame.runs === false) shell.status = frame.status;
     else if (item.kind === "esac") shell.status = void 0;
+    if (frame.kind !== "$(") closeFrame(frame, item.after, item.io, shell);
   }
 }
 function builtin(name, args, cwd, shell) {
@@ -2542,32 +2570,39 @@ function command(item, shell, depth) {
   let argv = item.argv;
   let followsHere = follows(item.before, shell.status);
   if (!["&&", "||", "|"].includes(item.before)) shell.start = snapshot(shell);
+  let negated = false;
+  shell.openingPipe = item.before === "|";
   while (argv.length > 0 && KEYWORDS.has(argv[0])) {
     const negation = argv[0] === "!";
+    negated ||= negation;
     argv = keyword(argv, followsHere, shell);
     if (!negation) followsHere = true;
   }
+  shell.openingPipe = false;
+  const closed = shell.closed;
+  shell.closed = void 0;
+  if (closed !== void 0) closeFrame(closed, item.after, item.io, shell);
   let calls = [];
   if (argv.length > 0 && both(runs(shell), followsHere) !== false) {
     calls = simple(argv, item, shell, depth);
-    if (shell.negate) shell.status = shell.status === 0 ? 1 : shell.status === 1 ? 0 : void 0;
-    shell.negate = false;
+    if (negated) shell.status = shell.status === 0 ? 1 : shell.status === 1 ? 0 : void 0;
   }
   if (item.after === "&") restore(shell, shell.start);
   return calls;
 }
 function walk(items, cwd, exported, processEnv, depth) {
+  const calls = [];
   const shell = {
     cwd,
     exported: { ...exported },
     status: void 0,
     frames: [],
     function: false,
-    negate: false,
     start: [cwd, { ...exported }],
-    processEnv
+    processEnv,
+    calls,
+    openingPipe: false
   };
-  const calls = [];
   for (const item of items) {
     if (item.kind === "cmd") calls.push(...command(item, shell, depth));
     else marker(item, shell);

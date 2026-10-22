@@ -4102,10 +4102,13 @@ class _TransferLexer:
         rest = self.text[self.i + 1:].lstrip(' \t')
         name = self.word if self.in_word else (self.argv[-1] if self.argv else '')
         head = self.argv if self.in_word else self.argv[:-1]
-        if rest.startswith(')') and head in ([], ['function']) and re.match(r'^[\w.:-]+$', name):
+        leading = head[:-1] if head[-1:] == ['function'] else head
+        if rest.startswith(')') and all(w in _TRANSFER_LEADING_WORDS for w in leading) and \
+                re.match(r'^[\w.:-]+$', name):
             # `name()` or `name ()` defines a function; the body that follows runs only when it's called.
+            self.argv, self.word, self.in_word = leading, '', False
+            self._flush()  # a then, do or { before it still opens its compound
             self.items.append(('func', None, self.before, '', None))
-            self.argv, self.word, self.in_word = [], '', False
             self.i = self.text.index(')', self.i)
             return
         self._end_word()
@@ -4219,8 +4222,13 @@ class _TransferLexer:
         if self.argv:
             self.items.append(('cmd', self.argv, self.before, after, self.io))
             self.before = after
-        elif after not in (';', ''):
-            self.before = after
+        else:
+            if self.items and self.items[-1][0] in (')', 'esac') and (after or self.io):
+                # A pipe, redirection or & after a subshell or case applies to the whole compound.
+                kind, _, before, _, _ = self.items[-1]
+                self.items[-1] = (kind, None, before, after, self.io)
+            if after not in (';', ''):
+                self.before = after
         self.argv, self.io = [], set()
 
 
@@ -4349,7 +4357,19 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict) -> None:
     if shell['function'] and kind != '$(':
         runs, shell['function'] = False, False
     shell['frames'].append({'kind': kind, 'base': runs, 'runs': runs, 'decided': False, 'saved': None,
-                            'state': _transfer_snapshot(shell), 'status': shell['status']})
+                            'state': _transfer_snapshot(shell), 'status': shell['status'],
+                            'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False)})
+
+
+def _transfer_close(frame: Dict, after: str, io: Optional[set], shell: Dict) -> None:
+    """Give the commands inside a closed compound the pipes and redirections around it, as they share its stdin and
+    stdout; a backgrounded compound keeps its cd and exports to itself."""
+    calls = shell['calls']
+    for i in range(frame['calls'], len(calls)):
+        call = calls[i]
+        calls[i] = call[:5] + (call[5] | (io or set()), call[6] or frame['piped_in'], call[7] or after == '|')
+    if after == '&':
+        shell['start'] = frame['state']
 
 
 def _transfer_branch(keyword: str, frame: Dict, shell: Dict) -> None:
@@ -4383,11 +4403,11 @@ def _transfer_keyword(words: List[str], follows: bool, shell: Dict) -> List[str]
         shell['function'] = True
         return rest[1:]
     if keyword == '!':
-        shell['negate'] = True
-        return rest
+        return rest  # the caller negates the command it leads
     if keyword in ('}', 'fi', 'done'):
         frame = _transfer_pop(frames, {'}': ('{',), 'fi': ('if',), 'done': _TRANSFER_LOOPS}[keyword])
         _transfer_restore(shell, frame and frame['saved'])
+        shell['closed'] = frame
         if keyword != '}':
             shell['status'] = None  # an if or loop that ran no body still succeeds
         return rest
@@ -4396,10 +4416,13 @@ def _transfer_keyword(words: List[str], follows: bool, shell: Dict) -> List[str]
     return rest
 
 
-def _transfer_marker(kind: str, before: str, shell: Dict) -> None:
+def _transfer_marker(item: tuple, shell: Dict) -> None:
     """Apply a subshell, substitution, function or case marker to the open compound commands."""
+    kind, _, before, after, io = item
     frames, follows = shell['frames'], _transfer_follows(before, shell['status'])
     if kind in ('(', '$(', 'case'):
+        # A substitution's output is captured, so only a subshell or case shares the pipe around it.
+        shell['opening_pipe'] = before == '|' and kind != '$('
         _transfer_open(kind, _transfer_both(_transfer_runs(shell), follows), shell)
         if kind == 'case':
             frames[-1]['runs'] = False  # nothing runs until an arm opens
@@ -4418,6 +4441,8 @@ def _transfer_marker(kind: str, before: str, shell: Dict) -> None:
                 shell['status'] = frame['status']
             elif kind == 'esac':
                 shell['status'] = None
+            if frame['kind'] != '$(':
+                _transfer_close(frame, after, io, shell)
 
 
 def _transfer_builtin(program: str, args: List[str], cwd: Optional[str], shell: Dict) -> None:
@@ -4477,15 +4502,21 @@ def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
     follows = _transfer_follows(before, shell['status'])
     if before not in ('&&', '||', '|'):
         shell['start'] = _transfer_snapshot(shell)
+    negated, shell['opening_pipe'] = False, before == '|'
     while words and words[0] in _TRANSFER_KEYWORDS:
         negation = words[0] == '!'
+        negated = negated or negation
         words = _transfer_keyword(words, follows, shell)
         # A frame or branch keyword takes the && or || itself; `!` leaves it to the command it negates.
         follows = follows if negation else True
+    shell.pop('opening_pipe', None)
+    closed = shell.pop('closed', None)
+    if closed:
+        _transfer_close(closed, after, io, shell)
     calls = []
     if words and _transfer_both(_transfer_runs(shell), follows) is not False:
         calls = _transfer_simple(words, before, after, io, shell, depth)
-        if shell.pop('negate', False):
+        if negated:
             shell['status'] = {0: 1, 1: 0}.get(shell['status'])
     if after == '&':
         _transfer_restore(shell, shell['start'])  # a backgrounded list runs in a subshell
@@ -4495,14 +4526,14 @@ def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
 def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth: int) -> List[tuple]:
     """Each simple command that runs or may run, as (program, args, env, folder, as another user, redirections,
     piped in, piped out); commands a literal true or false skips, untaken branches and function bodies are left out."""
-    shell = {'cwd': cwd, 'exported': dict(exported), 'status': None, 'frames': [], 'function': False,
-             'start': (cwd, dict(exported))}
     calls = []
+    shell = {'cwd': cwd, 'exported': dict(exported), 'status': None, 'frames': [], 'function': False,
+             'start': (cwd, dict(exported)), 'calls': calls}
     for item in items:
         if item[0] == 'cmd':
             calls += _transfer_command(item, shell, depth)
         else:
-            _transfer_marker(item[0], item[2], shell)
+            _transfer_marker(item, shell)
     return calls
 
 

@@ -272,13 +272,41 @@ test("a negated command still obeys the && or || before it", async () => {
     "true || ! echo $(curl https://never.example/a); curl https://actual.example/b",
   ]) assert.deepEqual(await hosts(command), [["in", "actual.example"]], command);
   assert.deepEqual(await hosts("true && ! curl https://ran.example/a"), [["in", "ran.example"]]);
+  // A skipped `!` must not flip the status of the next command.
+  const cases: [string, [string, string][]][] = [
+    ["false && ! true; false && curl https://never.example/a", []],
+    ["false && ! true; true && curl https://ran.example/a", [["in", "ran.example"]]],
+    ["true || ! false; true && curl https://ran.example/a", [["in", "ran.example"]]],
+    ["if false; then ! true; fi; false && curl https://never.example/a", []],
+  ];
+  for (const [command, expected] of cases) assert.deepEqual(await hosts(command), expected, command);
 });
 
 test("a function written name () is only defined, not run", async () => {
   for (const command of [
     "f () { curl -T x https://never.example/a; }; curl https://actual.example/b",
     "function f () { curl -T x https://never.example/a; }; curl https://actual.example/b",
+    "if true; then f () { curl https://never.example/a; }; fi; curl https://actual.example/b",
+    "{ f() { curl https://never.example/a; }; }; curl https://actual.example/b",
+    "while true; do g () { curl https://never.example/a; }; break; done; curl https://actual.example/b",
   ]) assert.deepEqual(await hosts(command), [["in", "actual.example"]], command);
+});
+
+test("a compound's pipes and redirections reach the commands inside it", async () => {
+  const cases: [string, [string, string][]][] = [
+    ["tar c . | (ssh prod 'tar x -C /srv')", [["out", "prod"]]],
+    ["(ssh prod 'tar c /srv') > backup.tar", [["in", "prod"]]],
+    ["{ ssh prod 'tar c /srv'; } > backup.tar", [["in", "prod"]]],
+    ["tar c . | { cd /tmp && ssh prod 'tar x'; }", [["out", "prod"]]],
+    ["if true; then nc example.com 80; fi < request.txt", [["out", "example.com"]]],
+    ["case x in *) ssh prod 'tar c /srv';; esac | tar x", [["in", "prod"]]],
+    ["echo $(ssh prod 'cat f') > out.txt", []],
+  ];
+  for (const [command, expected] of cases) assert.deepEqual(await hosts(command), expected, command);
+  const dir = repo();
+  for (const command of ["{ cd frontend; } & scp -F cfg f prod:/tmp", "if true; then cd frontend; fi & scp -F cfg f prod:/tmp"]) {
+    assert.equal((await transfer(command, dir))?.endpoints[0]?.resolved_host, "203.0.113.9", command);
+  }
 });
 
 test("a followed command string shares its wrapper's pipes and redirections", async () => {

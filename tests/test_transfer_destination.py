@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '52a96102496501b4cac9df373593cee98bae601960eecf31ef8d41cd27ca8556'
+BLOCK_SHA256 = '351768a461759f360cd4a5c49c49ea3063a718c815224c3078f16f191d99f31d'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -405,6 +405,19 @@ class PowerShellTests(TransferTestCase):
         for command, expected in cases.items():
             self.assert_hosts(command, expected)
 
+    def test_a_compounds_pipes_and_redirections_reach_the_commands_inside(self):
+        cases = {
+            "tar c . | (ssh prod 'tar x -C /srv')": [('out', 'prod')],
+            "(ssh prod 'tar c /srv') > backup.tar": [('in', 'prod')],
+            "{ ssh prod 'tar c /srv'; } > backup.tar": [('in', 'prod')],
+            "tar c . | { cd /tmp && ssh prod 'tar x'; }": [('out', 'prod')],
+            'if true; then nc example.com 80; fi < request.txt': [('out', 'example.com')],
+            "case x in *) ssh prod 'tar c /srv';; esac | tar x": [('in', 'prod')],
+            "echo $(ssh prod 'cat f') > out.txt": [],
+        }
+        for command, expected in cases.items():
+            self.assert_hosts(command, expected)
+
     def test_a_powershell_or_sh_command_string_is_followed(self):
         self.assert_endpoints('powershell.exe -NoProfile -Command "Invoke-WebRequest -Uri https://example.com/up '
                               '-InFile b.zip -Method Put"', [_endpoint('out', 'example.com', 'public')], 'powershell')
@@ -613,7 +626,10 @@ class ParserFindingTests(TransferTestCase):
         self.assert_hosts('function f { curl -T x https://never.example/a; }; curl https://actual.example/b',
                           [('in', 'actual.example')])
         for command in ('f () { curl -T x https://never.example/a; }; curl https://actual.example/b',
-                        'function f () { curl -T x https://never.example/a; }; curl https://actual.example/b'):
+                        'function f () { curl -T x https://never.example/a; }; curl https://actual.example/b',
+                        'if true; then f () { curl https://never.example/a; }; fi; curl https://actual.example/b',
+                        '{ f() { curl https://never.example/a; }; }; curl https://actual.example/b',
+                        'while true; do g () { curl https://never.example/a; }; break; done; curl https://actual.example/b'):
             self.assert_hosts(command, [('in', 'actual.example')])
         public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
         for command in ('if false; then cd frontend; fi; scp -F cfg f prod:/tmp',
@@ -637,9 +653,16 @@ class ParserFindingTests(TransferTestCase):
                         'true || ! echo $(curl https://never.example/a); curl https://actual.example/b'):
             self.assert_hosts(command, [('in', 'actual.example')])
         self.assert_hosts('true && ! curl https://ran.example/a', [('in', 'ran.example')])
+        # A skipped `!` must not flip the status of the next command.
+        for command, expected in (('false && ! true; false && curl https://never.example/a', []),
+                                  ('false && ! true; true && curl https://ran.example/a', [('in', 'ran.example')]),
+                                  ('true || ! false; true && curl https://ran.example/a', [('in', 'ran.example')]),
+                                  ('if false; then ! true; fi; false && curl https://never.example/a', [])):
+            self.assert_hosts(command, expected)
 
     def test_a_backgrounded_cd_does_not_move_the_next_command(self):
-        for command in ('cd frontend & scp -F cfg f prod:/tmp',
+        for command in ('cd frontend & scp -F cfg f prod:/tmp', '{ cd frontend; } & scp -F cfg f prod:/tmp',
+                        'if true; then cd frontend; fi & scp -F cfg f prod:/tmp',
                         'cd frontend && true & scp -F cfg f prod:/tmp',
                         'cd frontend | true; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
