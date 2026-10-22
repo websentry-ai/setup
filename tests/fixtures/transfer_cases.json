@@ -874,6 +874,20 @@
    }
   },
   {
+   "command": "false && ! echo $(curl https://never.example/a); curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

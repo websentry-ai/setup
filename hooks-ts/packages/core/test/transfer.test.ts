@@ -265,6 +265,15 @@ test("each curl --next starts a request with its own options", async () => {
     [["in", "example.com"], ["out", "files.acme-infra.net"]]);
 });
 
+test("a negated command still obeys the && or || before it", async () => {
+  for (const command of [
+    "false && ! curl -T x https://never.example/a; curl https://actual.example/b",
+    "false && ! echo $(curl https://never.example/a); curl https://actual.example/b",
+    "true || ! echo $(curl https://never.example/a); curl https://actual.example/b",
+  ]) assert.deepEqual(await hosts(command), [["in", "actual.example"]], command);
+  assert.deepEqual(await hosts("true && ! curl https://ran.example/a"), [["in", "ran.example"]]);
+});
+
 test("a function written name () is only defined, not run", async () => {
   for (const command of [
     "f () { curl -T x https://never.example/a; }; curl https://actual.example/b",

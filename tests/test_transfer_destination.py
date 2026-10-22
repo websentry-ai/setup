@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '796cbba7e0ba30e543edd039b55727391e76346742589b662fc76d9e80197831'
+BLOCK_SHA256 = '52a96102496501b4cac9df373593cee98bae601960eecf31ef8d41cd27ca8556'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -630,6 +630,13 @@ class ParserFindingTests(TransferTestCase):
                         'while false; do echo $(curl https://never.example/a); done; curl https://actual.example/b'):
             self.assert_hosts(command, [('in', 'actual.example')])
         self.assert_hosts('if [ -f x ]; then echo $(curl https://maybe.example/a); fi', [('in', 'maybe.example')])
+
+    def test_a_negated_command_still_obeys_the_and_or_before_it(self):
+        for command in ('false && ! curl -T x https://never.example/a; curl https://actual.example/b',
+                        'false && ! echo $(curl https://never.example/a); curl https://actual.example/b',
+                        'true || ! echo $(curl https://never.example/a); curl https://actual.example/b'):
+            self.assert_hosts(command, [('in', 'actual.example')])
+        self.assert_hosts('true && ! curl https://ran.example/a', [('in', 'ran.example')])
 
     def test_a_backgrounded_cd_does_not_move_the_next_command(self):
         for command in ('cd frontend & scp -F cfg f prod:/tmp',

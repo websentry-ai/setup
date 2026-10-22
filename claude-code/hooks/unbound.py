@@ -5590,7 +5590,9 @@ class _TransferLexer:
     def _flush_leading(self) -> None:
         """Emit the reserved words that lead the current command, so a substitution in it runs only when they let it."""
         n = 0
-        while n < len(self.argv) and (self.argv[n] in _TRANSFER_LEADING_WORDS or self.argv[n] == 'function'):
+        # `!` stays with its command, which still obeys the && or || before it.
+        while n < len(self.argv) and self.argv[n] != '!' and \
+                (self.argv[n] in _TRANSFER_LEADING_WORDS or self.argv[n] == 'function'):
             n += 2 if self.argv[n] == 'function' else 1
         if n:
             self.items.append(('cmd', self.argv[:n], self.before, '', set()))
@@ -5866,8 +5868,10 @@ def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
     if before not in ('&&', '||', '|'):
         shell['start'] = _transfer_snapshot(shell)
     while words and words[0] in _TRANSFER_KEYWORDS:
+        negation = words[0] == '!'
         words = _transfer_keyword(words, follows, shell)
-        follows = True
+        # A frame or branch keyword takes the && or || itself; `!` leaves it to the command it negates.
+        follows = follows if negation else True
     calls = []
     if words and _transfer_both(_transfer_runs(shell), follows) is not False:
         calls = _transfer_simple(words, before, after, io, shell, depth)

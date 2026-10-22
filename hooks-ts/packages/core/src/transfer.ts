@@ -509,7 +509,11 @@ class Lexer {
   /** Emit the reserved words that lead the current command, so a substitution in it runs only when they let it. */
   private flushLeading(): void {
     let n = 0;
-    while (n < this.argv.length && (LEADING_WORDS.has(this.argv[n] as string) || this.argv[n] === "function")) {
+    // `!` stays with its command, which still obeys the && or || before it.
+    while (
+      n < this.argv.length && this.argv[n] !== "!" &&
+      (LEADING_WORDS.has(this.argv[n] as string) || this.argv[n] === "function")
+    ) {
       n += this.argv[n] === "function" ? 2 : 1;
     }
     if (n === 0) return;
@@ -858,8 +862,10 @@ function command(item: Item, shell: Shell, depth: number): Call[] {
   let followsHere = follows(item.before, shell.status);
   if (!["&&", "||", "|"].includes(item.before)) shell.start = snapshot(shell);
   while (argv.length > 0 && KEYWORDS.has(argv[0] as string)) {
+    const negation = argv[0] === "!";
     argv = keyword(argv, followsHere, shell);
-    followsHere = true;
+    // A frame or branch keyword takes the && or || itself; `!` leaves it to the command it negates.
+    if (!negation) followsHere = true;
   }
   let calls: Call[] = [];
   if (argv.length > 0 && both(runs(shell), followsHere) !== false) {
