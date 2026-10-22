@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '7e721b4ef91e0b7be0fc063945e231df4800c4fa7d1d684e6975187f170aee5a'
+BLOCK_SHA256 = '915f54b5ffb052a4356d4651e8942ce385a13d8be1b9ce4dcde70ef139643bce'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -234,6 +234,10 @@ class CurlTests(TransferTestCase):
             self.assert_endpoints(command, [_endpoint('out', 'files.acme-infra.net', 'private')], tool='curl')
         self.assert_hosts('curl --output=page.html --proxy=http://proxy.corp:3128 https://example.com/x',
                           [('in', 'example.com')])
+
+    def test_a_non_ascii_host_is_sent_in_the_punycode_form_curl_dials(self):
+        self.assert_hosts('curl https://exämple.com/a', [('in', 'xn--exmple-cua.com')])
+        self.assert_hosts('curl https://xn--exmple-cua.com/a', [('in', 'xn--exmple-cua.com')])
 
     def test_option_values_are_never_read_as_urls(self):
         self.assert_hosts('curl --cacert ca.pem -x http://proxy.corp:3128 -e https://referer.example '

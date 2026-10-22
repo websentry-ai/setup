@@ -764,6 +764,20 @@
    }
   },
   {
+   "command": "curl https://ex\u00e4mple.com/a",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "xn--exmple-cua.com",
+      "resolved_host": "xn--exmple-cua.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

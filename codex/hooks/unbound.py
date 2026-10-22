@@ -4552,7 +4552,9 @@ def _transfer_url_host(url: str) -> str:
     from urllib.parse import urlsplit
     try:
         text = url.strip()
-        return urlsplit(text if '://' in text else 'http://' + text).hostname or ''
+        host = urlsplit(text if '://' in text else 'http://' + text).hostname or ''
+        # A non-ASCII name is dialled in its punycode form, as curl and the URL standard write it.
+        return host if host.isascii() else host.encode('idna').decode('ascii')
     except ValueError:
         return ''
 
