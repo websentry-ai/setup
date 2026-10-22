@@ -1304,14 +1304,16 @@ def clear_setup() -> bool:
 
 
 def _unbound_hooks_registered(config_path, script_path) -> Optional[bool]:
-    """True when settings.json registers OUR hook, False when it does not, None when
-    it exists but could not be read. Same rule the uninstall strips by."""
+    """True when settings.json registers OUR hook on any event, since the install
+    writes them together. False when it does not, None when it could not be read.
+    Unparseable raises, because augment refuses such a file too. Same rule the
+    uninstall strips by."""
     if not config_path.exists():
         return False
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-    except Exception as e:
+    except OSError as e:
         debug_print(f"Could not read {config_path}: {e}")
         return None
     is_windows = platform.system().lower() == "windows"
@@ -1336,8 +1338,13 @@ def detect_install_state() -> Optional[str]:
         script_path = managed_dir / "hooks" / "unbound.py"
         # settings.json is shared with the org's own Augment config, so the file
         # existing is not our install; only our own hook entries are.
-        registered = _unbound_hooks_registered(
-            managed_dir / "settings.json", script_path)
+        try:
+            registered = _unbound_hooks_registered(
+                managed_dir / "settings.json", script_path)
+        except ValueError:
+            # Augment refuses a settings.json it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return 'tampered'
         if registered is None:
             return None
         if registered == script_path.exists():

@@ -1264,24 +1264,16 @@ def _codex_detect_state(m, user_homes):
                 try:
                     loads = _codex_can_load(_load_codex_json(_read_user_file(system, follow=True)))
                 except (OSError, ValueError, RecursionError):
-                    # The managed file is admin-owned, so no user could have stalled
-                    # this read: codex cannot load it either and enforcement is dead.
                     loads = False
                 if not loads:
                     return "tampered"  # codex refuses the whole file, our entries included
-            unanswered = False
             for username, home_dir in user_homes if state == "persisted" else ():
                 disabled = _as_user(m, username, _codex_hooks_disabled, home_dir / ".codex" / "config.toml")
-                if disabled is None:
-                    unanswered = True
-                elif disabled:
+                if disabled is None or disabled:
                     return "tampered"
-            return None if unanswered else state
+            return state
         # Per profile, on the pair the user-level install wrote (wrapper script and hooks.json entry).
         any_complete = False
-        # A profile whose check didn't answer is evidence of nothing, but it must not
-        # mask a real tamper on another profile, so the scan runs to the end.
-        unanswered = False
         for username, home_dir in user_homes:
             wrapper = home_dir / ".codex" / "hooks" / "unbound.py"
             hooks_path = home_dir / ".codex" / "hooks.json"
@@ -1294,21 +1286,19 @@ def _codex_detect_state(m, user_homes):
             if os.path.lexists(hooks_path):
                 registered = _as_user(m, username, _codex_hook_registered, hooks_path, wrapper)
             if registered is None or script is None:
-                unanswered = True
+                # Only reached for a profile holding our files: its user can kill or stop
+                # the check, so a check that didn't answer doesn't keep the old state.
+                return "tampered"
             elif script and registered:
                 # Both halves in place, yet codex may still run nothing: the hooks feature
                 # turned off, or a config.toml codex can't load.
                 disabled = _as_user(m, username, _codex_hooks_disabled, hooks_path.parent / "config.toml")
-                if disabled is None:
-                    unanswered = True
-                elif disabled:
+                if disabled is None or disabled:
                     return "tampered"
                 else:
                     any_complete = True
             elif script or registered:
                 return "tampered"
-        if unanswered:
-            return None
         return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
@@ -1354,29 +1344,20 @@ def _setup_cursor(opts):
 
 
 def _copilot_detect_state(m, user_homes):
-    """Per profile, as that user: ~/.copilot/hooks/unbound.json must run our command on every event.
-    'tampered' if any doesn't, 'fresh' if none exists, else 'persisted'; None on failure or an
-    unanswered check."""
+    """Per profile, as that user: ~/.copilot/hooks/unbound.json must run our command on every event. 'tampered'
+    if any doesn't or its check didn't answer, 'fresh' if none exists, else 'persisted'; None on failure."""
     try:
         any_complete = False
-        # An unanswered check is evidence of nothing, but it must not mask a real
-        # tamper on another profile, so the scan runs to the end.
-        unanswered = False
         for username, home_dir in user_homes:
             if home_dir is None:
                 continue
             path = home_dir / ".copilot" / "hooks" / "unbound.json"
             if not os.path.lexists(path):
                 continue
-            registered = _as_user(m, username, _copilot_registered, path)
-            if registered is None:
-                unanswered = True
-            elif not registered:
+            # A check its user killed or stopped (None) doesn't keep the old state either.
+            if not _as_user(m, username, _copilot_registered, path):
                 return "tampered"
-            else:
-                any_complete = True
-        if unanswered:
-            return None
+            any_complete = True
         return "persisted" if any_complete else "fresh"
     except Exception as e:
         print(f"[setup] copilot install_state detection failed: {e}", file=sys.stderr)

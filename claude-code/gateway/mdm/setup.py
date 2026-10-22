@@ -1181,7 +1181,7 @@ def _unbound_gateway_registered(managed_dir) -> Optional[bool]:
         return False
     try:
         settings = json.loads(flat.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as e:
+    except OSError as e:
         debug_print(f"Could not read {flat}: {e}")
         return None
     if _managed_settings_is_exactly_ours(settings, managed_dir):
@@ -1198,7 +1198,12 @@ def detect_install_state() -> Optional[str]:
     env block alone). None on any error."""
     try:
         managed_dir = get_managed_settings_dir()
-        registered = _unbound_gateway_registered(managed_dir)
+        try:
+            registered = _unbound_gateway_registered(managed_dir)
+        except ValueError:
+            # Claude Code refuses a config it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return "tampered"
         if registered is None:
             return None
         if not registered:

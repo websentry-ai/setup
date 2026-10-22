@@ -68,11 +68,17 @@ class TestDetectInstallState(unittest.TestCase):
         self.script.write_text("x", encoding="utf-8")
         self.assertEqual(mdm.detect_install_state(), "tampered")
 
-    def test_unreadable_config_is_unknown(self):
+    def test_an_unparseable_config_is_tampered(self):
+        # Claude Code refuses the whole file, so our hooks are not running.
         (self.managed / "managed-settings.json").write_text("{ not json")
-        self.assertIsNone(mdm.detect_install_state())
+        self.assertEqual(mdm.detect_install_state(), "tampered")
 
-    def test_our_dropin_outranks_an_unreadable_org_policy(self):
+    def test_a_config_that_cannot_be_read_is_unknown(self):
+        with mock.patch.object(mdm, "open", side_effect=OSError("EIO")):
+            self._write("managed-settings.d/unbound.json", self._ours())
+            self.assertIsNone(mdm.detect_install_state())
+
+    def test_our_dropin_outranks_an_unparseable_org_policy(self):
         # managed-settings.json is often the org's. One we cannot parse must not
         # mask our own drop-in answering definitively, or deleting our hooks while
         # that file is corrupt would leave the device reading healthy forever.

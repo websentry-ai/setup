@@ -1048,26 +1048,27 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
 
 
 def _is_unbound_hook_command(cmd, script_path) -> bool:
-    """Our cursor hook: the relative path the template ships, the absolute path the
-    Windows rewrite writes, or the /opt/unbound binary. The relative form is matched
-    whole, so a foreign command that merely contains that path is not ours."""
+    """Our cursor hook: the relative path hooks.json ships (matched whole), or the
+    absolute path and the /opt/unbound binary, matched as substrings because the
+    Windows rewrite wraps them in a launcher. Under-matching would report 'fresh',
+    which counts as a removal."""
     if not cmd or not isinstance(cmd, str):
         return False
     if str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd):
         return True
-    return cmd.replace("\\", "/").strip().strip('"') in (
-        "./hooks/unbound.py", "hooks/unbound.py")
+    return cmd.strip() == "./hooks/unbound.py"
 
 
 def _unbound_hooks_registered(hooks_path, script_path) -> Optional[bool]:
-    """True when hooks.json registers OUR hook, False when it does not, None when it
-    exists but could not be read."""
+    """True when hooks.json registers OUR hook on any event, since the install writes
+    them together. False when it does not, None when it could not be read. Unparseable
+    raises, because cursor refuses such a file too."""
     if not hooks_path.exists():
         return False
     try:
         with open(hooks_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception as e:
+    except OSError as e:
         debug_print(f"Could not read {hooks_path}: {e}")
         return None
     events = data.get("hooks") if isinstance(data, dict) else None
@@ -1088,8 +1089,13 @@ def detect_install_state() -> Optional[str]:
         script_path = enterprise_dir / "hooks" / "unbound.py"
         # An enterprise hooks.json can be the org's own, so the file existing is
         # not our install; only our own hook entries are.
-        registered = _unbound_hooks_registered(
-            enterprise_dir / "hooks.json", script_path)
+        try:
+            registered = _unbound_hooks_registered(
+                enterprise_dir / "hooks.json", script_path)
+        except ValueError:
+            # Cursor refuses a hooks.json it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return 'tampered'
         if registered is None:
             return None
         if registered == script_path.exists():

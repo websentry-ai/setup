@@ -1348,21 +1348,19 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
 
 
 def _unbound_hooks_registered(settings_candidates, script_path) -> Optional[bool]:
-    """True when one of these configs registers OUR hook, False when none does, None
-    only when nothing matched and a candidate could not be read. Same rule the
-    uninstall strips by. managed-settings.json is often the org's, so an unreadable
-    one must not mask our own drop-in answering definitively."""
-    unreadable = False
+    """True when one of these configs registers OUR hook on any event, since the
+    install writes them together. False when none does, None when one could not be
+    read. Unparseable raises, because the tool refuses such a file too. Same rule the
+    uninstall strips by."""
     for settings_path in settings_candidates:
         if not settings_path.exists():
             continue
         try:
             with open(settings_path, "r", encoding="utf-8") as f:
                 settings = json.load(f)
-        except Exception as e:
+        except OSError as e:
             debug_print(f"Could not read {settings_path}: {e}")
-            unreadable = True
-            continue
+            return None
         events = settings.get("hooks") if isinstance(settings, dict) else None
         for entries in events.values() if isinstance(events, dict) else ():
             for item in entries if isinstance(entries, list) else []:
@@ -1371,7 +1369,7 @@ def _unbound_hooks_registered(settings_candidates, script_path) -> Optional[bool
                     if isinstance(hook, dict) and _is_unbound_hook_command(
                             hook.get("command", ""), script_path):
                         return True
-    return None if unreadable else False
+    return False
 
 
 def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path,
@@ -2464,9 +2462,14 @@ def detect_install_state(skip_settings: bool = False) -> Optional[str]:
             return 'persisted' if script_path.exists() else 'fresh'
         # managed-settings.json is shared with org/Enterprise policy, so the file
         # existing is not our install; only our own hook entries are.
-        registered = _unbound_hooks_registered(
-            [managed_dir / "managed-settings.d" / "unbound.json",
-             managed_dir / "managed-settings.json"], script_path)
+        try:
+            registered = _unbound_hooks_registered(
+                [managed_dir / "managed-settings.d" / "unbound.json",
+                 managed_dir / "managed-settings.json"], script_path)
+        except ValueError:
+            # Claude Code refuses a config it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return 'tampered'
         if registered is None:
             return None
         if registered == script_path.exists():

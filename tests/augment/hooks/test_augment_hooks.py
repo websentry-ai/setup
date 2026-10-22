@@ -1145,10 +1145,11 @@ class TestMdmManagedSettings(unittest.TestCase):
         (self.managed / "hooks" / "unbound.py").write_text("x")
         self.assertEqual(self.mdm.detect_install_state(), "tampered")
 
-    def test_detect_install_state_unreadable_is_unknown(self):
+    def test_detect_install_state_unparseable_is_tampered(self):
+        # Augment refuses the whole file, so our hooks are not running.
         (self.managed / "hooks").mkdir(parents=True, exist_ok=True)
         (self.managed / "settings.json").write_text("{ not json")
-        self.assertIsNone(self.mdm.detect_install_state())
+        self.assertEqual(self.mdm.detect_install_state(), "tampered")
 
     def test_clear_managed_removes_hooks_and_permissions(self):
         with patch.object(self.mdm, "download_file", return_value=True):

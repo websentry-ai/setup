@@ -90,9 +90,15 @@ class TestDetectInstallState(unittest.TestCase):
         self._write({"version": 1, "hooks": {"preToolUse": [{"command": {"a": 1}}, 7]}})
         self.assertEqual(mdm.detect_install_state(), "fresh")
 
-    def test_unreadable_config_is_unknown(self):
+    def test_an_unparseable_config_is_tampered(self):
+        # Cursor refuses the whole file, so our hooks are not running.
         self.hooks_json.write_text("{ not json", encoding="utf-8")
-        self.assertIsNone(mdm.detect_install_state())
+        self.assertEqual(mdm.detect_install_state(), "tampered")
+
+    def test_a_config_that_cannot_be_read_is_unknown(self):
+        self.hooks_json.write_text("{}", encoding="utf-8")
+        with mock.patch.object(mdm, "open", side_effect=OSError("EIO")):
+            self.assertIsNone(mdm.detect_install_state())
 
 
 if __name__ == "__main__":
