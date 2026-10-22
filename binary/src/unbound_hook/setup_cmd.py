@@ -1264,7 +1264,9 @@ def _codex_detect_state(m, user_homes):
                 try:
                     loads = _codex_can_load(_load_codex_json(_read_user_file(system, follow=True)))
                 except (OSError, ValueError, RecursionError):
-                    return None
+                    # The managed file is admin-owned, so no user could have stalled
+                    # this read: codex cannot load it either and enforcement is dead.
+                    loads = False
                 if not loads:
                     return "tampered"  # codex refuses the whole file, our entries included
             unanswered = False
