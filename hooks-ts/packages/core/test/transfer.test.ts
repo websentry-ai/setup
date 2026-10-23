@@ -494,9 +494,8 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
   mkdirSync(join(dir, "frontend", "inner"));
   symlinkSync(join(dir, "frontend", "inner"), join(dir, "link"));
   const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
-  // -P resolves links, so a later `..` leaves the real folder: bash takes the last of -L and -P, zsh any -P. A cd
-  // every shell rejects stays put; bash 5 rejects a second folder that bash 3 takes the first of, and -e and -q are
-  // not in every shell, so where those land is not guessed.
+  // -P resolves links (bash takes the last of -L and -P, zsh any -P); a cd every shell rejects stays put, and one the
+  // shells land differently on (a second folder, -e, -q) is not guessed.
   for (const [command, expected] of [
     ["cd link; cd ..; scp -F cfg f prod:/tmp", "203.0.113.9"],
     ["cd -P link; cd ..; scp -F cfg f prod:/tmp", "10.0.4.12"],

@@ -1,10 +1,5 @@
-"""Every hook records where each shell transfer went: the tool, and for each place it sent to or fetched from, the host
-as written (no login), the host ssh resolves it to, and the kind of address that host has.
-
-The same checks run on all five Python hook copies. ssh -G is answered by a fake `ssh` on PATH that reads `-F` (or
-~/.ssh/config under a throwaway home) and logs every call; DNS is answered by a patched `socket.getaddrinfo`. Each
-hook's own exchange builder is then driven once to prove the field and the call time ride on its tool entry.
-"""
+"""Every hook records where each shell transfer went (tool, host as written, host ssh resolves it to, address kind),
+checked on all five Python hooks with a fake `ssh` on PATH, a patched resolver and each hook's exchange builder."""
 import hashlib
 import json
 import os
@@ -32,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'ab629760362814fb5a0022dfc00fa822b096206af250c774ad6da477d17c8ab8'
+BLOCK_SHA256 = 'c94978b963d0c29a422571b65587568f44ab60bcef351f58a964db6bc03e1b49'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -667,9 +662,8 @@ class TimeLimitTests(TransferTestCase):
 
 
 class ParserFindingTests(TransferTestCase):
-    """Each of these was read wrong before: a command bash never runs was resolved, or one it runs was missed, or a
-    command ran in a folder bash never moved to. `cfg` in the repo maps prod to a public address, `frontend/cfg` to a
-    private one, so the address shows which folder the lookup ran in."""
+    """Commands the shell reads in ways easy to get wrong. `cfg` in the repo maps prod to a public address and
+    `frontend/cfg` to a private one, so the address shows which folder the lookup ran in."""
 
     def test_a_short_circuited_subshell_is_skipped_whole(self):
         for command in ('false && (echo skipped; curl -T f https://never.example/x); curl https://actual.example/y',
@@ -808,9 +802,8 @@ class ParserFindingTests(TransferTestCase):
             self.assert_endpoints(command, [expected])
 
     def test_a_cd_lands_where_bash_and_zsh_both_do_or_leaves_the_folder_unknown(self):
-        # -P resolves links, so a later `..` leaves the real folder: bash takes the last of -L and -P, zsh any -P.
-        # A cd every shell rejects stays put; bash 5 rejects a second folder that bash 3 takes the first of, and -e
-        # and -q are not in every shell, so where those land is not guessed.
+        # -P resolves links (bash takes the last of -L and -P, zsh any -P); a cd every shell rejects stays put, and one
+        # the shells land differently on (a second folder, -e, -q) is not guessed.
         os.makedirs(os.path.join(self.repo, 'frontend', 'inner'))
         os.symlink(os.path.join(self.repo, 'frontend', 'inner'), os.path.join(self.repo, 'link'))
         private, public, unknown = (_endpoint('out', 'prod', 'private', '10.0.4.12'),

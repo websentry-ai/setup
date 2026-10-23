@@ -770,9 +770,8 @@ function isAssignment(token: string): boolean {
   return eq > 0 && !token.startsWith("-") && /^[A-Za-z0-9_]+\+?$/.test(token.slice(0, eq));
 }
 
-/** The words with each leading NAME+=value made NAME=value. In a command of only assignments the value is appended
- *  to the one an earlier word or else the shell gives the name; before a command it is unknown, since bash 3 appends
- *  it to nothing there while bash 5 and zsh append it to that value. */
+/** The words with each leading NAME+=value made NAME=value: appended to the earlier or shell value in a command of
+ *  only assignments, and unknown before a command, where bash 3 appends to nothing and bash 5 and zsh to that value. */
 function appends(argv: string[], shell: Shell): string[] {
   const given = new Map<string, string>();
   const out = [...argv];
@@ -828,9 +827,8 @@ function cdTarget(args: string[], cwd: string | undefined): string | undefined {
   return landed.size === 1 ? [...landed][0] : undefined;
 }
 
-/** The folder a cd to `path` lands in from `cwd`, with its links resolved when `physical`; undefined when that hangs
- *  on a folder not known or on `cd -`, or the folder is not there now, so the cd may have failed and left the shell
- *  where it was. */
+/** The folder a cd to `path` lands in from `cwd`, links resolved when `physical`; undefined when `cwd` is not known,
+ *  for `cd -`, or when the folder is not there now, so the cd may have failed. */
 function moveTo(cwd: string | undefined, path: string, physical: boolean): string | undefined {
   const target = expandHome(path);
   // Joined as written, as chdir reads it: a link before a `..` is followed, and a missing folder there fails.
@@ -1172,9 +1170,8 @@ function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): voi
   pipeline("", value, shell);
 }
 
-/** The status a closed compound leaves, given its last command's: a function definition succeeds, a compound that
- *  never ran keeps the one before it, an if or loop that ran no body succeeds, a body that may have run leaves it
- *  unknown, and one a return, exit, break or continue ended leaves that one's. */
+/** The status a closed compound leaves: a jump's that ended it, 0 for a definition or an if or loop that ran no body,
+ *  the one before it when it never ran, unknown when a body may have run, else its last command's. */
 function frameStatus(frame: Frame, status: number | undefined): number | undefined {
   const { kind, rel } = frame;
   if (frame.left !== undefined) return frame.left[0];
@@ -1209,9 +1206,8 @@ function leave(frame: Frame, shell: Shell): void {
   frame.saved = undefined;
 }
 
-/** At a compound's end, make unknown what may not have happened: a body that may not have run, what followed a
- *  return, exit, break or continue that may have run, and all of it when the compound was reached only through an
- *  && or || after an unknown status, or is a loop that may run its body again. */
+/** At a compound's end, make unknown what may not have happened: a body that may not have run, what followed a jump
+ *  that may have run, and all of it when an unknown status guarded the compound or it is a loop that may repeat. */
 function doubtful(frame: Frame, shell: Shell): void {
   for (const since of [frame.jumped, frame.doubt || frame.repeats ? frame.state : undefined]) {
     if (since !== undefined) for (const name of changes(shell, since)) frame.unsure.add(name);
@@ -1241,9 +1237,8 @@ function revive(outside: Liveness, shell: Shell): void {
 
 /** Wrap the commands inside a closed compound in the pipes and redirections around it; a piped or backgrounded
  *  compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it. */
-/** Wrap the commands inside a closed compound in the pipes and redirections around it; a piped or backgrounded
- *  compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it. The last command of
- *  a pipeline runs in a subshell in bash but in this shell in zsh, so what it changed is unknown after it. */
+/** Wrap a closed compound's commands in the pipes and redirections around it. Piped or backgrounded, its changes end
+ *  with it; as a pipeline's last command, zsh keeps them and bash does not, so they are unknown. */
 function closeFrame(frame: Frame, layer: Layer, shell: Shell, background = false): void {
   wrap(shell, frame.calls, layer);
   if (layer[0] && !(layer[1] || background || frame.kind === "(" || frame.kind === "$(")) {
@@ -1380,17 +1375,10 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
   return rest;
 }
 
-/** [whether a loop runs its body once at least: true, false, or undefined when not known; whether it may run it
- *  again]. A literal word runs a for body at least once, and a list with no words never runs a for or select body;
- *  without `in` the list is the positional parameters. Any loop but a for over one plain word may run its body
- *  again. */
 type LoopRead = [iterates: Maybe, repeats: boolean, forever: boolean, counter: string | undefined];
 
-/** [whether a loop runs its body once at least: true, false, or undefined when not known; whether it may run it
- *  again; whether its test never fails; an arithmetic for's counter]. A literal word runs a for body at least once,
- *  and a list with no words never runs a for or select body; without `in` the list is the positional parameters. Any
- *  loop but a for over one plain word, or an arithmetic for that surely stops after one pass, may run its body
- *  again. */
+/** [whether a loop runs its body at least once: true, false or undefined; whether it may run it again; whether its
+ *  test never fails; an arithmetic for's counter], from its header, or the positional parameters with no `in`. */
 function loop(word: string, rest: string[], shell: Shell): LoopRead {
   if (word === "for" && rest[0]?.startsWith("((")) return counted(rest[0]);
   if (word !== "for" && word !== "select") return [undefined, true, false, undefined];
@@ -1577,9 +1565,8 @@ function assign(name: string, args: string[], shell: Shell): void {
   }
 }
 
-/** unset -f removes functions, and -v or a bare name variables; a variable gone takes its export, so the hook's own
- *  value is gone too. A bare name with no variable set removes the function in bash but not in zsh, so the function
- *  then may or may not be there, as is one removed by an unset -f that may not run. */
+/** unset -f removes functions, and -v or a bare name variables with their export. A bare name with no variable set
+ *  removes the function in bash but not zsh, so it may or may not remain, as after an unset -f that may not run. */
 function unset(args: string[], shell: Shell): void {
   const sure = shell.pipe.runs === true && !doubt(shell.pipe);
   for (const name of args.filter((a) => !a.startsWith("-"))) {
@@ -1594,9 +1581,8 @@ function unset(args: string[], shell: Shell): void {
   }
 }
 
-/** declare or typeset outside a function sets each NAME=value, exports it with -x and stops that with +x, as export
- *  does. Any other option, a +=, local, readonly, and a declaration inside a function, which bash keeps to the
- *  function and zsh may not, leave the names unknown. */
+/** declare or typeset outside a function set NAME=value, exporting with -x and not with +x. Other options, +=, local,
+ *  readonly, and declarations in a function (bash scopes them, zsh may not) leave the names unknown. */
 function declare(name: string, args: string[], shell: Shell): void {
   let on = "";
   let off = "";
@@ -1645,10 +1631,8 @@ function shellString(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
-/** Run a defined function's body, from `known` (body, whether it may not have been defined), where it is called: in
- *  this shell with the call's stdin and stdout, or in a subshell when the call is piped or backgrounded. A call reached
- *  only through an && or || after an unknown status, to a function that may not exist, or as the last command of a
- *  pipeline (`subshell` undefined), which zsh runs in this shell and bash does not, leaves what it changed unknown. */
+/** Run a function's body (`known`: body, whether it may not exist) where called, in a subshell when piped or
+ *  backgrounded; one that may not run, or a pipeline's last command (`subshell` undefined), leaves its changes unknown. */
 function callFunction(known: [Item[], boolean], layer: Layer, subshell: Maybe, shell: Shell, depth: number): void {
   const [body, maybe] = known;
   if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
@@ -1818,8 +1802,8 @@ function walkItems(list: Item[], shell: Shell, depth: number): void {
   [shell.items, shell.at, shell.ends] = outer;
 }
 
-/** What follows the end of each compound in `list`, by where it opens ("item,word"): one piped or backgrounded at its
- *  end runs in a subshell, which a return, exit, break or continue inside it does not leave. */
+/** Where each compound in `list` ends, [operator after it, item], by where it opens ("item,word"): one piped or
+ *  backgrounded at its end is a subshell, which no jump inside it leaves. */
 function compoundEnds(list: Item[]): Map<string, [string, number]> {
   const ends = new Map<string, [string, number]>();
   const opened: string[] = [];
@@ -1893,10 +1877,8 @@ function urlHost(url: string): string {
   }
 }
 
-/** curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
- *  from. Each --next starts a request with options of its own, though the addresses --resolve pins carry on to the
- *  requests after it. A URL's {a,b} and [1-3] globs reach every host they name unless --globoff is given, and curl
- *  stops at a URL whose glob it rejects. */
+/** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
+ *  --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. */
 function curl(args: string[]): Raw[] {
   const out: Raw[] = [];
   const pins: string[] = [];
@@ -1929,9 +1911,8 @@ function curlGlob(url: string): string[] | undefined {
   return urls;
 }
 
-/** A curl URL as [literal text, the values of the glob after it] pieces, read as curl reads {a,b} sets, [1-3] or
- *  [a-c] ranges with an optional :step, a bracketed IPv6 address and backslash escapes; undefined for a glob it
- *  rejects. */
+/** A curl URL as [literal text, the values of the glob after it] pieces, as curl reads {a,b}, [1-3] or [a-c] with a
+ *  :step, a bracketed IPv6 address and backslash escapes; undefined for a glob it rejects. */
 function globPieces(url: string): [string, string[]][] | undefined {
   const pieces: [string, string[]][] = [];
   let text = "";
@@ -1994,9 +1975,8 @@ function ipOf(text: string): string {
   return family === 6 ? normalizeV6(bare) : family === 4 ? bare : "";
 }
 
-/** Where a URL's request connects when --connect-to or --resolve change it, as curl applies them: the first
- *  --connect-to rule that matches, then the last pin for that host and port, a named host before *; undefined when
- *  neither applies. */
+/** Where a URL's request connects, as curl applies the first matching --connect-to and then the last --resolve pin
+ *  for that host and port, a named host before *; undefined when neither applies. */
 function curlDial(url: string, connects: readonly string[], pins: readonly string[]): Dial | undefined {
   const host = urlHost(url);
   let port: string;
@@ -2033,9 +2013,8 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
   return [addresses[0] ?? target[0], addresses];
 }
 
-/** The URLs of the curl request starting at args[start], whether it sends data, its --resolve and --connect-to values in
- *  order, whether it turns globbing off, and where the next request starts; a --next that is another option's value
- *  does not end it. */
+/** The URLs of the curl request at args[start], whether it sends data, its --resolve and --connect-to values, whether
+ *  it turns globbing off, and where the next request starts; a --next that is an option's value does not end it. */
 function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], boolean, number] {
   const urls: string[] = [];
   const flags = new Set<string>();

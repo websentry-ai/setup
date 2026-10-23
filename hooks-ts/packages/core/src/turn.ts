@@ -112,9 +112,8 @@ export interface TurnToolCall {
    */
   session_id?: string;
   /**
-   * Only ever `false`: the call is known not to have run — a confirm the person declined, or a `!cmd`
-   * posted before its confirm was answered. Never sent; it keeps local transfer lookups off calls that
-   * never ran.
+   * Only ever `false`: the call is known not to have run (a declined confirm, or a `!cmd` posted before its
+   * confirm was answered). Never sent; it keeps transfer lookups off calls that never ran.
    */
   ran?: false;
 }

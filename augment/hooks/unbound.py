@@ -4035,11 +4035,8 @@ def _transfer_backtick_end(text: str, i: int) -> int:
 
 
 class _TransferLexer:
-    """Reads a command the way the shell does into items, in the order they run: ('cmd', argv, operator before,
-    operator after, redirections) for each simple command, and ('(' | '$(' | ')' | 'func' | 'case' | 'arm' | 'esac',
-    None or [function name], operator before, '', None) around subshells, substitutions, function bodies and case
-    arms. Redirections are kept in the order written, each as (fd, 'file' | 'null' | the fd it copies): a file or
-    heredoc is read or written, /dev/null or a closed fd moves no data."""
+    """Reads a command into items in the order they run: ('cmd', argv, operator before, operator after, redirections as
+    (fd, 'file' | 'null' | fd copied)), or a '(', '$(', ')', 'func', 'case', 'arm' or 'esac' marker around them."""
 
     def __init__(self, text: str, depth: int = 0):
         self.text, self.depth, self.i, self.quote = text, depth, 0, None
@@ -4405,9 +4402,8 @@ def _transfer_is_assignment(token: str) -> bool:
 
 
 def _transfer_appends(words: List[str], shell: Dict) -> List[str]:
-    """The words with each leading NAME+=value made NAME=value. In a command of only assignments the value is appended
-    to the one an earlier word or else the shell gives the name; before a command it is unknown, since bash 3 appends
-    it to nothing there while bash 5 and zsh append it to that value."""
+    """The words with each leading NAME+=value made NAME=value: appended to the earlier or shell value in a command of
+    only assignments, and unknown before a command, where bash 3 appends to nothing and bash 5 and zsh to that value."""
     given, words, bare = {}, list(words), all(_transfer_is_assignment(w) for w in words)
     for i, word in enumerate(words):
         if not _transfer_is_assignment(word):
@@ -4494,9 +4490,8 @@ def _transfer_cd(args: List[str], cwd: Optional[str]) -> Optional[str]:
 
 
 def _transfer_move(cwd: Optional[str], path: str, physical: bool) -> Optional[str]:
-    """The folder a cd to path lands in from cwd, with its links resolved when physical; None when that hangs on a
-    folder not known or on `cd -`, or the folder is not there now, so the cd may have failed and left the shell where
-    it was."""
+    """The folder a cd to path lands in from cwd, links resolved when physical; None when cwd is not known, for `cd -`,
+    or when the folder is not there now, so the cd may have failed."""
     path = os.path.expanduser(path)
     if not os.path.isabs(path):
         if cwd is None or path == '-':
@@ -4673,9 +4668,8 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) ->
 
 
 def _transfer_status(frame: Dict, status: Optional[int]) -> Optional[int]:
-    """The status a closed compound leaves, given its last command's: a function definition succeeds, a compound that
-    never ran keeps the one before it, an if or loop that ran no body succeeds, a body that may have run leaves it
-    unknown, and one a return, exit, break or continue ended leaves that one's."""
+    """The status a closed compound leaves: a jump's that ended it, 0 for a definition or an if or loop that ran no
+    body, the one before it when it never ran, unknown when a body may have run, else its last command's."""
     kind, rel = frame['kind'], frame['rel']
     if frame['left']:
         return frame['left'][0]
@@ -4714,9 +4708,8 @@ def _transfer_leave(frame: Dict, shell: Dict) -> None:
 
 
 def _transfer_doubtful(frame: Dict, shell: Dict) -> None:
-    """At a compound's end, make unknown what may not have happened: a body that may not have run, what followed a
-    return, exit, break or continue that may have run, and all of it when the compound was reached only through an
-    && or || after an unknown status, or is a loop that may run its body again."""
+    """At a compound's end, make unknown what may not have happened: a body that may not have run, what followed a jump
+    that may have run, and all of it when an unknown status guarded the compound or it is a loop that may repeat."""
     for since in (frame['jumped'], frame['state'] if frame['doubt'] or frame['repeats'] else None):
         if since:
             frame['unsure'] |= _transfer_changes(shell, since)
@@ -4761,9 +4754,8 @@ def _transfer_soften(outside: tuple, shell: Dict) -> None:
 
 
 def _transfer_close(frame: Dict, layer: tuple, shell: Dict, background: bool = False) -> None:
-    """Wrap the commands inside a closed compound in the pipes and redirections around it; a piped or backgrounded
-    compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it. The last command
-    of a pipeline runs in a subshell in bash but in this shell in zsh, so what it changed is unknown after it."""
+    """Wrap a closed compound's commands in the pipes and redirections around it. Piped or backgrounded, its changes end
+    with it; as a pipeline's last command, zsh keeps them and bash does not, so they are unknown."""
     _transfer_wrap(shell, frame['calls'], layer)
     if layer[0] and not (layer[1] or background or frame['kind'] in ('(', '$(')):
         _transfer_unsure(shell, frame['state'])
@@ -4893,10 +4885,8 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
 
 
 def _transfer_loop(keyword: str, rest: List[str], shell: Dict) -> tuple:
-    """(whether a loop runs its body once at least: True, False, or None when not known; whether it may run it again;
-    whether its test never fails; an arithmetic for's counter). A literal word runs a for body at least once, and a
-    list with no words never runs a for or select body; without `in` the list is the positional parameters. Any loop
-    but a for over one plain word, or an arithmetic for that surely stops after one pass, may run its body again."""
+    """(whether a loop runs its body at least once: True, False or None; whether it may run it again; whether its test
+    never fails; an arithmetic for's counter), from its header, or the positional parameters when it has no `in`."""
     if keyword == 'for' and rest[:1] and rest[0].startswith('(('):
         return _transfer_counted(rest[0])
     if keyword not in ('for', 'select'):
@@ -5085,9 +5075,8 @@ def _transfer_assign(program: str, args: List[str], shell: Dict) -> None:
 
 
 def _transfer_unset(args: List[str], shell: Dict) -> None:
-    """unset -f removes functions, and -v or a bare name variables; a variable gone takes its export, so the hook's own
-    value is gone too. A bare name with no variable set removes the function in bash but not in zsh, so the function
-    then may or may not be there, as is one removed by an unset -f that may not run."""
+    """unset -f removes functions, and -v or a bare name variables with their export. A bare name with no variable set
+    removes the function in bash but not zsh, so it may or may not remain, as after an unset -f that may not run."""
     sure = shell['pipe']['runs'] is True and not _transfer_doubt(shell['pipe'])
     for name in (a for a in args if not a.startswith('-')):
         value = _transfer_variable(shell, name)[0]
@@ -5102,9 +5091,8 @@ def _transfer_unset(args: List[str], shell: Dict) -> None:
 
 
 def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
-    """declare or typeset outside a function sets each NAME=value, exports it with -x and stops that with +x, as export
-    does. Any other option, a +=, local, readonly, and a declaration inside a function, which bash keeps to the function
-    and zsh may not, leave the names unknown."""
+    """declare or typeset outside a function set NAME=value, exporting with -x and not with +x. Other options, +=,
+    local, readonly, and declarations in a function (bash scopes them, zsh may not) leave the names unknown."""
     on = off = ''
     while args and args[0][:1] in '-+' and len(args[0]) > 1:
         option, args = args[0], args[1:]
@@ -5141,10 +5129,8 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
 
 
 def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: Dict, depth: int) -> None:
-    """Run a defined function's body, from known (body, whether it may not have been defined), where it is called: in
-    this shell with the call's stdin and stdout, or in a subshell when the call is piped or backgrounded. A call reached
-    only through an && or || after an unknown status, to a function that may not exist, or as the last command of a
-    pipeline (subshell None), which zsh runs in this shell and bash does not, leaves what it changed unknown."""
+    """Run a function's body (known: body, whether it may not exist) where called, in a subshell when piped or
+    backgrounded; one that may not run, or a pipeline's last command (subshell None), leaves its changes unknown."""
     body, maybe = known
     if depth >= _TRANSFER_MAX_DEPTH or shell['calls_left'] <= 0:
         shell['status'] = None
@@ -5176,7 +5162,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     known = shell['functions'].get(name)
     if known:
         outer, shell['args'] = shell['args'], words[words.index(name) + 1:]
-        _transfer_call(known, layer, subshell, shell, depth)  # the body may remove the function, as it runs on
+        _transfer_call(known, layer, subshell, shell, depth)  # looked up first: the body may remove the function
         shell['args'] = outer
         if not known[1]:
             return []
@@ -5285,8 +5271,8 @@ def _transfer_items(items: List[tuple], shell: Dict, depth: int) -> None:
 
 
 def _transfer_ends(items: List[tuple]) -> Dict:
-    """What follows the end of each compound in items, by where it opens (item, word): one piped or backgrounded at
-    its end runs in a subshell, which a return, exit, break or continue inside it does not leave."""
+    """Where each compound in items ends, (operator after it, item), by where it opens (item, word): one piped or
+    backgrounded at its end is a subshell, which no jump inside it leaves."""
     ends, opened = {}, []
     for at, (kind, words, _, after, _) in enumerate(items):
         if kind in ('(', '$(', 'case'):
@@ -5314,9 +5300,8 @@ def _transfer_ends_piped(head: tuple, shell: Dict) -> bool:
 
 def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth: int,
                    positional: List[str] = ()) -> List[tuple]:
-    """Each simple command that runs or may run, as (program, args, env, folder, as another user, the (piped in,
-    piped out, redirections) around it from its own outward); commands a literal true or false skips, untaken
-    branches and function bodies are left out, and a function's body runs where it is called."""
+    """Each simple command that runs or may run, as (program, args, env, folder, as another user, its (piped in, piped
+    out, redirections) layers from its own outward); skipped branches and uncalled function bodies are left out."""
     return _transfer_shell(items, cwd, exported, depth, positional)['calls']
 
 
@@ -5377,10 +5362,8 @@ def _transfer_url_host(url: str) -> str:
 
 
 def _transfer_curl(args: List[str]) -> List[tuple]:
-    """curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
-    from. Each --next starts a request with options of its own, though the addresses --resolve pins carry on to the
-    requests after it. A URL's {a,b} and [1-3] globs reach every host they name unless --globoff is given, and curl
-    stops at a URL whose glob it rejects."""
+    """curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
+    --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl."""
     endpoints, pins, i = [], [], 0
     while True:
         urls, sends, overrides, globoff, i = _transfer_curl_request(args, i)
@@ -5472,9 +5455,8 @@ def _transfer_ip(text: str):
 
 
 def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optional[tuple]:
-    """(the host a URL's request connects to, the addresses pinned for it) when --connect-to or --resolve change where
-    it connects, as curl applies them: the first --connect-to rule that matches, then the last pin for that host and
-    port, a named host before *; None when neither applies."""
+    """(the host a URL's request connects to, the addresses pinned for it), as curl applies the first matching
+    --connect-to and then the last --resolve pin for that host and port, a named host before *; None when neither."""
     from urllib.parse import urlsplit
     host = _transfer_url_host(url)
     try:
@@ -5502,9 +5484,8 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """(the URLs of the curl request starting at args[i], whether it sends data, its --resolve and --connect-to values in
-    order, whether it turns globbing off, where the next request starts); a --next that is another option's value does
-    not end it."""
+    """(the URLs of the curl request at args[i], whether it sends data, its --resolve and --connect-to values, whether
+    it turns globbing off, where the next request starts); a --next that is an option's value does not end it."""
     urls, flags, method, overrides = [], set(), '', []
     while i < len(args):
         arg, value, i = args[i], None, i + 1
@@ -5986,9 +5967,8 @@ def _transfer_address_kind(addresses: list) -> str:
 
 
 def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict) -> Optional[Dict]:
-    """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial]): its host as
-    written without any login, the host it connects to, as ssh -G resolves it or curl's --connect-to and --resolve set
-    it, and the kind of address that host has."""
+    """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial]): the host as
+    written without a login, the host it connects to (ssh -G or curl's dial), and that host's address kind."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     destination = destination.strip()
