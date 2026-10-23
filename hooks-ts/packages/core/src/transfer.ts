@@ -418,6 +418,14 @@ class Lexer {
 
   private open(): void {
     if (this.cases.at(-1) === "pattern") return; // the optional ( before a case pattern
+    const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
+    const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
+    if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
+      // An arithmetic command, or a for loop's (( )) header, is one word that runs nothing.
+      this.argv.push(this.text.slice(this.i, close + 1));
+      this.i = close;
+      return;
+    }
     const rest = this.text.slice(this.i + 1).trimStart();
     const name = this.inWord ? this.word : (this.argv.at(-1) ?? "");
     const head = this.inWord ? this.argv : this.argv.slice(0, -1);
@@ -659,11 +667,16 @@ function programName(token: string): string {
   return name.endsWith(".exe") ? name.slice(0, -4) : name;
 }
 
-/** The folder a cd to `path` lands in from `cwd`; undefined when that hangs on a folder not known, or on `cd -`. */
+/** The folder a cd to `path` lands in from `cwd`; undefined when that hangs on a folder not known or on `cd -`, or the
+ *  folder is not there now, so the cd may have failed and left the shell where it was. */
 function moveTo(cwd: string | undefined, path: string): string | undefined {
   const target = expandHome(path);
-  if (isAbsolute(target)) return target;
-  return cwd === undefined || target === "-" ? undefined : normalize(join(cwd, target));
+  const folder = isAbsolute(target) ? target : cwd === undefined || target === "-" ? undefined : normalize(join(cwd, target));
+  try {
+    return folder !== undefined && statSync(folder).isDirectory() ? folder : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 interface Program {
@@ -751,8 +764,11 @@ function follows(before: string, status: number | undefined): boolean {
   return !((before === "&&" && status === 1) || (before === "||" && status === 0));
 }
 
-/** The folder, exports and defined functions at one point, to return to. */
-type Snapshot = [cwd: string | undefined, exported: Env, functions: Map<string, Item[]>];
+/** A shell variable: its value, undefined once unset, and whether it is exported. */
+type Variable = [value: string | undefined, exported: boolean];
+
+/** The folder, variables and defined functions at one point, to return to. */
+type Snapshot = [cwd: string | undefined, vars: Record<string, Variable>, functions: Map<string, [Item[], boolean]>];
 
 /** A pipeline being read: whether it runs, and the operator and status before it, which settle the status it leaves. */
 interface Pipeline {
@@ -764,8 +780,11 @@ interface Pipeline {
   leading: boolean;
 }
 
-/** Whether frames from the shell's base up ran, and whether the shell itself does, to put back after a subshell. */
-type Liveness = [frames: [Maybe, Maybe][], live: Maybe];
+/** What a return, exit, break or continue may change in a frame, to put back after a subshell. */
+type JumpMarks = Pick<Frame, "runs" | "alive" | "left" | "jumped" | "repeats">;
+
+/** The jump marks of the open frames, and whether the shell itself still runs. */
+type Liveness = [frames: JumpMarks[], live: Maybe];
 
 interface Frame {
   kind: string;
@@ -792,6 +811,8 @@ interface Frame {
   head: [number, Item];
   /** Whether a for loop's word list runs the body: at least once, never, or not known. */
   iterates: Maybe;
+  /** A loop that may run its body again. */
+  repeats: boolean;
   /** The status a return, exit, break or continue left the compound with; undefined inside when not known. */
   left?: [number | undefined];
   /** Reached only through an && or || after a status that is not known. */
@@ -805,7 +826,7 @@ interface Frame {
 
 interface Shell {
   cwd: string | undefined;
-  exported: Env;
+  vars: Record<string, Variable>;
   status: number | undefined;
   frames: Frame[];
   /** The function the definition being read names. */
@@ -818,7 +839,8 @@ interface Shell {
   /** The compound the current command's closing keyword closed. */
   closed?: Frame;
   pipe: Pipeline;
-  functions: Map<string, Item[]>;
+  /** Each defined function's body, and whether its definition may not have run. */
+  functions: Map<string, [Item[], boolean]>;
   callsLeft: number;
   /** The items being walked, and the one being read. */
   items: Item[];
@@ -849,23 +871,24 @@ function runs(shell: Shell): Maybe {
 }
 
 function snapshot(shell: Shell): Snapshot {
-  return [shell.cwd, { ...shell.exported }, new Map(shell.functions)];
+  return [shell.cwd, { ...shell.vars }, new Map(shell.functions)];
 }
 
-/** Undo the cd and exports since `saved`. A subshell also undoes its function definitions; one defined in a body
+/** Undo the cd and variables since `saved`. A subshell also undoes its function definitions; one defined in a body
  *  that may not have run is kept, so its calls are still followed. */
 function restore(shell: Shell, saved: Snapshot | undefined, subshell = false): void {
   if (saved === undefined) return;
   shell.cwd = saved[0];
-  shell.exported = { ...saved[1] };
+  shell.vars = { ...saved[1] };
   if (subshell) shell.functions = new Map(saved[2]);
 }
 
-/** What a cd, export or unset changed since `saved`: "" for the folder, else each variable. */
+/** What a cd, assignment, export or unset changed since `saved`: "" for the folder, else each variable. */
 function changes(shell: Shell, saved: Snapshot): Set<string> {
   const names = new Set<string>();
-  for (const key of new Set([...Object.keys(saved[1]), ...Object.keys(shell.exported)])) {
-    if (saved[1][key] !== shell.exported[key]) names.add(key);
+  for (const key of new Set([...Object.keys(saved[1]), ...Object.keys(shell.vars)])) {
+    const [before, now] = [saved[1][key], shell.vars[key]];
+    if (before?.[0] !== now?.[0] || before?.[1] !== now?.[1]) names.add(key);
   }
   if (shell.cwd !== saved[0]) names.add("");
   return names;
@@ -876,8 +899,23 @@ function changes(shell: Shell, saved: Snapshot): Set<string> {
 function forget(shell: Shell, names: Set<string>): void {
   for (const name of names) {
     if (name === "") shell.cwd = undefined;
-    else shell.exported[name] = SUBSTITUTED;
+    else shell.vars[name] = [SUBSTITUTED, true];
   }
+}
+
+/** A shell variable; one the shell never set is the hook's own environment's, which is exported. */
+function variable(shell: Shell, name: string): Variable {
+  const set = shell.vars[name];
+  if (set !== undefined) return set;
+  const inherited = !(CLEAN_ENV in shell.vars) && shell.processEnv[name] !== undefined;
+  return [inherited ? shell.processEnv[name] : undefined, inherited];
+}
+
+/** The variables a command gets from the shell; one unset or not exported hides the hook's own value. */
+function exportedEnv(shell: Shell): Env {
+  const env: Env = {};
+  for (const [name, [value, exported]] of Object.entries(shell.vars)) env[name] = exported && value !== undefined ? value : "";
+  return env;
 }
 
 /** Whether a pipeline runs only through an && or || after a status that is not known. */
@@ -902,7 +940,8 @@ function pipeline(before: string, runsHere: Maybe, shell: Shell): void {
 /** Start the pipeline a command or compound begins, unless it continues one after a | or a leading `!`; && and ||
  *  decide whether the whole pipeline runs, and any other operator also starts a list. */
 function begin(before: string, shell: Shell): void {
-  if (before === "|") shell.status = shell.pipe.prior; // each command of a pipeline sees the status from before it
+  // A later command of a pipeline sees the status from before it in bash 5 but 0 in bash 3, so only 0 is known.
+  if (before === "|") shell.status = shell.pipe.prior === 0 ? 0 : undefined;
   if (before === "|" || shell.pipe.leading) return;
   if (before !== "&&" && before !== "||") shell.start = snapshot(shell);
   pipeline(before, both(runs(shell), follows(before, shell.status)), shell);
@@ -945,8 +984,8 @@ function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): voi
   shell.frames.push({
     kind, base: value, runs: value, rel: true, alive: true, decided: false, state: snapshot(shell),
     status: shell.status, calls: shell.calls.length, pipedIn: shell.openingPipe, outer: [shell.pipe, shell.start],
-    defines: name, head: [shell.at, head], iterates: undefined, doubt: doubt(shell.pipe), unsure: new Set(),
-    outside: [shell.frames.map((f): [Maybe, Maybe] => [f.runs, f.alive]), shell.live],
+    defines: name, head: [shell.at, head], iterates: undefined, repeats: false, doubt: doubt(shell.pipe), unsure: new Set(),
+    outside: liveness(shell),
   });
   shell.openingPipe = false;
   shell.start = snapshot(shell); // the body starts a list of its own
@@ -977,7 +1016,8 @@ function settle(frame: Frame, tail: Item, shell: Shell): void {
   [shell.pipe, shell.start] = frame.outer;
   if (frame.defines !== undefined && shell.pipe.runs !== false) {
     const [at, head] = frame.head;
-    shell.functions.set(frame.defines, [head, ...shell.items.slice(at + 1, shell.at), tail]);
+    const maybe = shell.pipe.runs === undefined || doubt(shell.pipe); // the definition may not have run
+    shell.functions.set(frame.defines, [[head, ...shell.items.slice(at + 1, shell.at), tail], maybe]);
   }
 }
 
@@ -991,9 +1031,9 @@ function leave(frame: Frame, shell: Shell): void {
 
 /** At a compound's end, make unknown what may not have happened: a body that may not have run, what followed a
  *  return, exit, break or continue that may have run, and all of it when the compound was reached only through an
- *  && or || after an unknown status. */
+ *  && or || after an unknown status, or is a loop that may run its body again. */
 function doubtful(frame: Frame, shell: Shell): void {
-  for (const since of [frame.jumped, frame.doubt ? frame.state : undefined]) {
+  for (const since of [frame.jumped, frame.doubt || frame.repeats ? frame.state : undefined]) {
     if (since !== undefined) for (const name of changes(shell, since)) frame.unsure.add(name);
   }
   leave(frame, shell);
@@ -1008,13 +1048,14 @@ function wrap(shell: Shell, first: number, layer: Layer): void {
   }
 }
 
+/** What a return, exit, break or continue may change in the open compounds and the shell, to put back. */
+function liveness(shell: Shell): Liveness {
+  return [shell.frames.map(({ runs: r, alive, left, jumped, repeats }) => ({ runs: r, alive, left, jumped, repeats })), shell.live];
+}
+
 /** Undo what a return, exit, break or continue did beyond a compound that turned out to run in a subshell. */
 function revive(outside: Liveness, shell: Shell): void {
-  outside[0].forEach(([runsHere, alive], i) => {
-    const frame = shell.frames[i] as Frame;
-    frame.runs = runsHere;
-    frame.alive = alive;
-  });
+  outside[0].forEach((marks, i) => Object.assign(shell.frames[i] as Frame, marks));
   shell.live = outside[1];
 }
 
@@ -1069,7 +1110,8 @@ function jump(name: string, args: string[], shell: Shell): void {
   });
   let target: number;
   if (name === "break" || name === "continue") {
-    const loops = frames.flatMap((f, i) => (LOOPS.includes(f.kind) && i > bound && i >= (floor ?? 0) ? [i] : []));
+    // A loop that is itself piped is its own subshell, so a break inside still reaches it.
+    const loops = frames.flatMap((f, i) => (LOOPS.includes(f.kind) && i >= Math.max(bound, floor ?? 0) ? [i] : []));
     if (loops.length === 0) return;
     const count = /^\d+$/.test(args[0] ?? "") && Number(args[0]) > 0 ? Number(args[0]) : 1;
     target = loops[loops.length - Math.min(count, loops.length)] as number;
@@ -1079,12 +1121,20 @@ function jump(name: string, args: string[], shell: Shell): void {
   } else {
     target = Math.max(bound, 0);
   }
-  const sure = shell.pipe.runs === true && !doubt(shell.pipe);
-  for (const frame of frames.slice(target)) {
+  // Sure once the compound it ends is running: nothing between here and there can skip it. It ends the whole shell
+  // only when the outermost compound it is in surely runs as well.
+  const sure = !doubt(shell.pipe) && frames.slice(target + 1).every((f) => f.rel === true && f.alive === true && !f.doubt);
+  const outermost = frames[0];
+  const whole = outermost === undefined
+    ? sure && shell.pipe.runs === true
+    : sure && outermost.base === true && outermost.rel === true && !outermost.doubt;
+  frames.slice(target).forEach((frame, i) => {
     frame.alive = both(frame.alive, sure ? false : undefined);
     frame.runs = both(frame.runs, frame.alive);
-  }
-  if (name === "exit" && bound < 0) shell.live = both(shell.live, sure ? false : undefined);
+    // A sure break, return or exit ends the loops it leaves for good, while a continue runs its own loop again.
+    frame.repeats &&= !(sure && (name !== "continue" || i > 0));
+  });
+  if (name === "exit" && bound < 0) shell.live = both(shell.live, whole ? false : undefined);
   const frame = frames[target];
   if (frame === undefined) return;
   // The compound ends with the jump's status, unknown when it may not have jumped, or may have earlier. A `!` still
@@ -1100,11 +1150,15 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
   const { frames } = shell;
   if (word === "{" || word === "if" || LOOPS.includes(word)) {
     openFrame(word, shell.pipe.runs, shell, { kind: "cmd", argv, before: "", after: item.after, io: item.io });
-    if (word === "for") {
-      // A literal word runs the body at least once, and a list with no words never runs it.
-      const listed = rest[1] === "in" ? rest.slice(2) : undefined;
-      const literal = (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
-      (frames.at(-1) as Frame).iterates = literal ? true : listed?.length === 0 ? false : undefined;
+    if (LOOPS.includes(word)) {
+      // A literal word runs a for body at least once, and a list with no words never runs a for or select body. Any
+      // loop but a for over one plain word may run its body again.
+      const listed = (word === "for" || word === "select") && rest[1] === "in" ? rest.slice(2) : undefined;
+      const literal = word === "for" && (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
+      const frame = frames.at(-1) as Frame;
+      frame.iterates = literal ? true : listed?.length === 0 ? false : undefined;
+      frame.repeats = word !== "for" ||
+        !(listed?.length === 1 && ![..."$*?[", SUBSTITUTED].some((c) => (listed[0] as string).includes(c)));
     }
     return word === "for" || word === "select" ? [] : rest; // a for loop's header runs nothing
   }
@@ -1172,15 +1226,23 @@ function marker(item: Item, shell: Shell): void {
   }
 }
 
-/** Apply a cd, export or unset to the commands after it. */
+/** Apply a cd, export or unset, or a command made only of assignments (name ""), to the commands after it. */
 function builtin(name: string, args: string[], cwd: string | undefined, shell: Shell): void {
-  if (name === "export") {
-    for (const arg of args) if (isAssignment(arg)) shell.exported[arg.slice(0, arg.indexOf("="))] = arg.slice(arg.indexOf("=") + 1);
-  } else if (name === "unset") {
-    // Unset hides the inherited value too, so it is kept as empty rather than dropped.
-    for (const arg of args) if (!arg.startsWith("-")) shell.exported[arg] = "";
-  } else {
-    shell.cwd = moveTo(cwd, args[0] ?? "~");
+  if (name === "cd") {
+    // Options such as -P come before the folder, and -- ends them; a lone - is the previous folder.
+    const folders = [...args];
+    while (folders[0]?.startsWith("-") && folders[0] !== "-") if (folders.shift() === "--") break;
+    shell.cwd = moveTo(cwd, folders[0] ?? "~");
+    return;
+  }
+  for (const arg of args.filter((a) => !a.startsWith("-"))) {
+    const eq = arg.indexOf("=");
+    const key = eq < 0 ? arg : arg.slice(0, eq);
+    const value = eq < 0 ? undefined : arg.slice(eq + 1);
+    if (name === "unset" && args.includes("-f")) shell.functions.delete(key);
+    else if (name === "unset") shell.vars[key] = [undefined, false]; // gone, with its export, so the hook's own value is gone too
+    else if (name === "export") shell.vars[key] = [value ?? variable(shell, key)[0], !args.includes("-n")];
+    else shell.vars[key] = [value, variable(shell, key)[1]]; // an exported one stays exported
   }
 }
 
@@ -1205,10 +1267,12 @@ function shellString(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
-/** Run a defined function's body where it is called: in this shell with the call's stdin and stdout, or in a
- *  subshell when the call is piped or backgrounded. A call reached only through an && or || after an unknown status
- *  leaves what it changed unknown. */
-function callFunction(body: Item[], layer: Layer, subshell: boolean, shell: Shell, depth: number): void {
+/** Run a defined function's body, from `known` (body, whether it may not have been defined), where it is called: in
+ *  this shell with the call's stdin and stdout, or in a subshell when the call is piped or backgrounded. A call reached
+ *  only through an && or || after an unknown status, or to a function that may not exist, leaves what it changed
+ *  unknown. */
+function callFunction(known: [Item[], boolean], layer: Layer, subshell: boolean, shell: Shell, depth: number): void {
+  const [body, maybe] = known;
   if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
     shell.status = undefined;
     return;
@@ -1217,7 +1281,7 @@ function callFunction(body: Item[], layer: Layer, subshell: boolean, shell: Shel
   const first = shell.calls.length;
   const state = snapshot(shell);
   const outer: [Pipeline, Snapshot, number | undefined] = [shell.pipe, shell.start, shell.floor];
-  const outside: Liveness = [shell.frames.map((f): [Maybe, Maybe] => [f.runs, f.alive]), shell.live];
+  const outside = liveness(shell);
   shell.floor = shell.frames.length;
   walkItems(body, shell, depth + 1);
   [shell.pipe, shell.start, shell.floor] = outer;
@@ -1225,9 +1289,26 @@ function callFunction(body: Item[], layer: Layer, subshell: boolean, shell: Shel
   if (subshell) {
     restore(shell, state, true);
     revive(outside, shell);
-  } else if (doubt(shell.pipe)) {
+  } else if (maybe || doubt(shell.pipe)) {
     forget(shell, changes(shell, state));
+    soften(outside, shell);
   }
+}
+
+/** Make what a return, exit, break or continue did beyond a call that may not run a maybe: what follows may run, and
+ *  the compound it would have ended leaves an unknown status. */
+function soften(outside: Liveness, shell: Shell): void {
+  outside[0].forEach((marks, i) => {
+    const frame = shell.frames[i] as Frame;
+    if (frame.alive === false && marks.alive !== false) {
+      frame.alive = undefined;
+      frame.runs = both(marks.runs, undefined);
+      frame.jumped ??= snapshot(shell);
+    }
+    if (frame.left !== marks.left) frame.left = [undefined];
+    frame.repeats = marks.repeats;
+  });
+  if (shell.live === false && outside[1] !== false) shell.live = undefined;
 }
 
 /** The calls one simple command makes, after applying its cd, export or unset; a defined function runs its body. */
@@ -1236,16 +1317,20 @@ function simple(argv: string[], item: Item, before: string, shell: Shell, depth:
   // A piped or backgrounded command runs in a subshell.
   const subshell = before === "|" || item.after === "|" || item.after === "&";
   const called = argv.find((word) => !isAssignment(word));
-  const body = called === undefined ? undefined : shell.functions.get(called);
-  if (body !== undefined) {
-    callFunction(body, layer, subshell, shell, depth);
-    return [];
+  const known = called === undefined ? undefined : shell.functions.get(called);
+  if (known !== undefined) {
+    callFunction(known, layer, subshell, shell, depth);
+    if (!known[1]) return [];
+    // A function that may not have been defined may leave the name to the program.
   }
   const parsed = program(argv, shell.cwd);
   const { name, args } = parsed;
-  const env = CLEAN_ENV in parsed.env ? parsed.env : { ...shell.exported, ...parsed.env };
+  const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
+  // A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
+  const assigns = name === undefined && argv.every(isAssignment);
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : undefined;
+  if (assigns && !argv.some((word) => word.includes(SUBSTITUTED))) shell.status = 0;
   if (name === "return" || name === "exit") {
     // Either leaves the status it is given, or else the one before it; a return outside a function fails.
     const given = args[0];
@@ -1253,11 +1338,11 @@ function simple(argv: string[], item: Item, before: string, shell: Shell, depth:
     if (name === "return" && shell.floor === undefined) shell.status = 1;
   }
   if ((name === "return" || name === "exit" || name === "break" || name === "continue") && !subshell) jump(name, args, shell);
-  if (name === "cd" || name === "export" || name === "unset") {
-    // A pipeline's commands run in subshells, so their cd and exports end with them.
+  if (name === "cd" || name === "export" || name === "unset" || assigns) {
+    // A pipeline's commands run in subshells, so their cd and variables end with them.
     if (before !== "|" && item.after !== "|") {
       const saved = snapshot(shell);
-      builtin(name, args, parsed.cwd, shell);
+      builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
       if (doubt(shell.pipe)) forget(shell, changes(shell, saved)); // it may not have run
     }
     return [];
@@ -1315,9 +1400,10 @@ function walkItems(list: Item[], shell: Shell, depth: number): void {
 /** Each simple command that runs or may run; commands a literal true or false skips, untaken branches and function
  *  bodies are left out, and a function's body runs where it is called. */
 function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv: Record<string, string | undefined>, depth: number): Call[] {
+  const vars = Object.fromEntries(Object.entries(exported).map(([key, value]): [string, Variable] => [key, [value, true]]));
   const shell: Shell = {
-    cwd, exported: { ...exported }, status: undefined, frames: [], function: undefined,
-    start: [cwd, { ...exported }, new Map()], processEnv, calls: [], openingPipe: false,
+    cwd, vars, status: undefined, frames: [], function: undefined,
+    start: [cwd, { ...vars }, new Map()], processEnv, calls: [], openingPipe: false,
     pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false },
     functions: new Map(), callsLeft: MAX_CALLS, items, at: 0, live: true, floor: undefined,
   };
@@ -1894,6 +1980,18 @@ function configWords(line: string): string[] | undefined {
 }
 
 /** Whether config lines could run a command or a DNS lookup in ssh -G; their Includes are queued on `pending`. */
+/** Whether a Match line's criteria include exec, read as ssh reads them: each a keyword, negated with !, taking an
+ *  argument after a space or = unless it is all, canonical or final. */
+function matchExecs(words: readonly string[]): boolean {
+  for (let i = 0; i < words.length; ) {
+    const word = words[i] as string;
+    const criterion = word.split("=")[0]?.toLowerCase().replace(/^!/, "") ?? "";
+    if (criterion === "exec") return true;
+    i += word.includes("=") || ["all", "canonical", "final"].includes(criterion) ? 1 : 2;
+  }
+  return false;
+}
+
 function configRuns(text: string, bases: readonly string[], homes: readonly string[], pending: [string, readonly string[]][]): boolean {
   for (const line of text.split(/\r?\n/)) {
     const lineWords = configWords(line);
@@ -1902,7 +2000,7 @@ function configRuns(text: string, bases: readonly string[], homes: readonly stri
     const [keyword = "", attached = ""] = first.split(/=(.*)/s);
     // ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
     const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
-    if (keyword.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) return true;
+    if (keyword.toLowerCase() === "match" && matchExecs(args)) return true;
     if (keyword.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return true;
     for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
       const targets = includeTargets(pattern, bases, homes);

@@ -196,6 +196,20 @@ test("an ssh config that could run commands is never handed to ssh, and sudo or 
   assert.deepEqual(calls, []);
 });
 
+test("Match criteria are read as ssh reads them", async () => {
+  // Only an exec criterion runs a command; a host pattern that starts with exec does not.
+  const dir = repo();
+  const calls: string[][] = [];
+  writeFileSync(join(dir, "host"), "Match host exec-prod\n  HostName 10.1.1.1\n");
+  await transfer("scp -F host f prod:/tmp", dir, { execFile: fakeSsh(calls) });
+  assert.equal(calls.length, 1);
+  for (const config of ["Match exec=true\n", 'Match !exec "true"\n', 'Match canonical exec "true"\n']) {
+    writeFileSync(join(dir, "run"), config);
+    await transfer("scp -F run f prod:/tmp", dir, { execFile: fakeSsh(calls) });
+  }
+  assert.equal(calls.length, 1);
+});
+
 test("a hanging lookup is cut off, the turn ends on time, and a spent budget runs nothing", async () => {
   let release: () => void = () => {};
   const hung = new Promise<void>((done) => (release = done));
@@ -441,6 +455,30 @@ test("a cd that may not have run leaves the folder unknown, and one that surely 
     "for x in a; do break; cd frontend; done; scp -F cfg f prod:/tmp",
     "for x in; do cd frontend; done; scp -F cfg f prod:/tmp",
     "(cd frontend; exit; cd ..); scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "203.0.113.9", command);
+});
+
+test("a loop that may repeat, or a cd into a missing folder, leaves the folder unknown", async () => {
+  const dir = repo();
+  const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
+  // A body that runs again repeats its cd, so where it ends is not known; a cd into a folder that is not there may
+  // have failed. Neither is guessed.
+  for (const command of [
+    "cd frontend; for x in a b; do cd ..; done; scp -F cfg f prod:/tmp",
+    "cd frontend; for x in a b; do cd ..; continue; done; scp -F cfg f prod:/tmp",
+    "cd frontend; while [ -f y ]; do cd ..; done; scp -F cfg f prod:/tmp",
+    "cd frontend; for x in *.txt; do cd ..; done; scp -F cfg f prod:/tmp",
+    "cd nowhere; cd frontend; scp -F cfg f prod:/tmp",
+    "if [ -f y ]; then f() { cd frontend; }; fi; f; scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "prod", command);
+  for (const command of ["cd -P frontend; scp -F cfg f prod:/tmp", "cd -- frontend; scp -F cfg f prod:/tmp", "cd -L frontend; scp -F cfg f prod:/tmp"]) {
+    assert.equal(await at(command), "10.0.4.12", command);
+  }
+  for (const command of [
+    "cd frontend; for x in a; do cd ..; done; scp -F cfg f prod:/tmp",
+    "cd frontend; for x in a b; do cd ..; break; done; scp -F cfg f prod:/tmp",
+    "cd frontend; while true; do cd ..; break; done; scp -F cfg f prod:/tmp",
+    "for x in a b; do scp -F cfg f prod:/tmp; done",
   ]) assert.equal(await at(command), "203.0.113.9", command);
 });
 

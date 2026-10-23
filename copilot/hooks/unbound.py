@@ -5912,6 +5912,13 @@ class _TransferLexer:
     def _open(self) -> None:
         if self.case and self.case[-1] == 'pattern':
             return  # the optional ( before a case pattern
+        head = self.argv[:-1] if self.argv[-1:] == ['for'] else self.argv
+        end = _transfer_paren_end(self.text, self.i + 1) if self.text.startswith('((', self.i) else -1
+        if end > 0 and not self.in_word and all(w in _TRANSFER_LEADING_WORDS for w in head):
+            # An arithmetic command, or a for loop's (( )) header, is one word that runs nothing.
+            self.argv.append(self.text[self.i:end + 1])
+            self.i = end
+            return
         rest = self.text[self.i + 1:].lstrip(' \t')
         name = self.word if self.in_word else (self.argv[-1] if self.argv else '')
         head = self.argv if self.in_word else self.argv[:-1]
@@ -6152,11 +6159,14 @@ def _transfer_program(argv: List[str], cwd: Optional[str]) -> tuple:
 
 
 def _transfer_move(cwd: Optional[str], path: str) -> Optional[str]:
-    """The folder a cd to path lands in from cwd; None when that hangs on a folder not known, or on `cd -`."""
+    """The folder a cd to path lands in from cwd; None when that hangs on a folder not known or on `cd -`, or the folder
+    is not there now, so the cd may have failed and left the shell where it was."""
     path = os.path.expanduser(path)
-    if os.path.isabs(path):
-        return path
-    return None if cwd is None or path == '-' else os.path.normpath(os.path.join(cwd, path))
+    if not os.path.isabs(path):
+        if cwd is None or path == '-':
+            return None
+        path = os.path.normpath(os.path.join(cwd, path))
+    return path if os.path.isdir(path) else None
 
 
 def _transfer_wrapper_option(wrapper: str, token: str, argv: List[str], i: int, env: Dict, cwd: Optional[str]) -> tuple:
@@ -6205,22 +6215,22 @@ def _transfer_runs(shell: Dict) -> Optional[bool]:
 
 
 def _transfer_snapshot(shell: Dict) -> tuple:
-    return shell['cwd'], dict(shell['exported']), dict(shell['functions'])
+    return shell['cwd'], dict(shell['vars']), dict(shell['functions'])
 
 
 def _transfer_restore(shell: Dict, saved: Optional[tuple], subshell: bool = False) -> None:
-    """Undo the cd and exports since saved. A subshell also undoes its function definitions; one defined in a body
+    """Undo the cd and variables since saved. A subshell also undoes its function definitions; one defined in a body
     that may not have run is kept, so its calls are still followed."""
     if saved:
-        shell['cwd'], shell['exported'] = saved[0], dict(saved[1])
+        shell['cwd'], shell['vars'] = saved[0], dict(saved[1])
         if subshell:
             shell['functions'] = dict(saved[2])
 
 
 def _transfer_changes(shell: Dict, saved: tuple) -> set:
-    """What a cd, export or unset changed since saved: '' for the folder, else each variable."""
-    exported = shell['exported']
-    names = {key for key in set(saved[1]) | set(exported) if saved[1].get(key) != exported.get(key)}
+    """What a cd, assignment, export or unset changed since saved: '' for the folder, else each variable."""
+    now = shell['vars']
+    names = {key for key in set(saved[1]) | set(now) if saved[1].get(key) != now.get(key)}
     return names | ({''} if shell['cwd'] != saved[0] else set())
 
 
@@ -6229,7 +6239,21 @@ def _transfer_forget(shell: Dict, names: set) -> None:
     variable, which then reads like a substitution's output."""
     if '' in names:
         shell['cwd'] = None
-    shell['exported'].update((name, _TRANSFER_SUBSTITUTED) for name in names if name)
+    shell['vars'].update((name, (_TRANSFER_SUBSTITUTED, True)) for name in names if name)
+
+
+def _transfer_variable(shell: Dict, name: str) -> tuple:
+    """A shell variable as (its value or None when unset, whether it is exported); one the shell never set is the hook's
+    own environment's, which is exported."""
+    if name in shell['vars']:
+        return shell['vars'][name]
+    inherited = _TRANSFER_CLEAN_ENV not in shell['vars'] and name in os.environ
+    return (os.environ[name] if inherited else None), inherited
+
+
+def _transfer_exported(shell: Dict) -> Dict:
+    """The variables a command gets from the shell; one unset or not exported hides the hook's own value."""
+    return {name: value if exported and value is not None else '' for name, (value, exported) in shell['vars'].items()}
 
 
 def _transfer_doubt(pipe: Dict) -> bool:
@@ -6255,7 +6279,8 @@ def _transfer_begin(before: str, shell: Dict) -> None:
     """Start the pipeline a command or compound begins, unless it continues one after a | or a leading `!`; && and ||
     decide whether the whole pipeline runs, and any other operator also starts a list."""
     if before == '|':
-        shell['status'] = shell['pipe']['prior']  # each command of a pipeline sees the status from before it
+        # A later command of a pipeline sees the status from before it in bash 5 but 0 in bash 3, so only 0 is known.
+        shell['status'] = 0 if shell['pipe']['prior'] == 0 else None
     if before == '|' or shell['pipe']['leading']:
         return
     if before not in ('&&', '||'):
@@ -6299,8 +6324,9 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) ->
                    'saved': None, 'state': _transfer_snapshot(shell), 'status': shell['status'],
                    'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False),
                    'outer': (shell['pipe'], shell['start']), 'defines': name, 'head': (shell['at'], head),
-                   'iterates': None, 'left': None, 'doubt': _transfer_doubt(shell['pipe']), 'jumped': None,
-                   'unsure': set(), 'outside': ([(f['runs'], f['alive']) for f in frames], shell['live'])})
+                   'iterates': None, 'repeats': False, 'left': None, 'doubt': _transfer_doubt(shell['pipe']),
+                   'jumped': None,
+                   'unsure': set(), 'outside': _transfer_liveness(shell)})
     shell['start'] = _transfer_snapshot(shell)  # the body starts a list of its own
     _transfer_pipeline('', runs, shell)
 
@@ -6334,7 +6360,8 @@ def _transfer_settle(frame: Dict, tail: tuple, shell: Dict) -> None:
     shell['pipe'], shell['start'] = frame['outer']
     if frame['defines'] is not None and shell['pipe']['runs'] is not False:
         at, head = frame['head']
-        shell['functions'][frame['defines']] = [head] + shell['items'][at + 1:shell['at']] + [tail]
+        maybe = shell['pipe']['runs'] is None or _transfer_doubt(shell['pipe'])  # the definition may not have run
+        shell['functions'][frame['defines']] = [head] + shell['items'][at + 1:shell['at']] + [tail], maybe
 
 
 def _transfer_leave(frame: Dict, shell: Dict) -> None:
@@ -6348,8 +6375,8 @@ def _transfer_leave(frame: Dict, shell: Dict) -> None:
 def _transfer_doubtful(frame: Dict, shell: Dict) -> None:
     """At a compound's end, make unknown what may not have happened: a body that may not have run, what followed a
     return, exit, break or continue that may have run, and all of it when the compound was reached only through an
-    && or || after an unknown status."""
-    for since in (frame['jumped'], frame['state'] if frame['doubt'] else None):
+    && or || after an unknown status, or is a loop that may run its body again."""
+    for since in (frame['jumped'], frame['state'] if frame['doubt'] or frame['repeats'] else None):
         if since:
             frame['unsure'] |= _transfer_changes(shell, since)
     _transfer_leave(frame, shell)
@@ -6363,11 +6390,33 @@ def _transfer_wrap(shell: Dict, first: int, layer: tuple) -> None:
         calls[i] = calls[i][:5] + (calls[i][5] + (layer,),)
 
 
+_TRANSFER_JUMP_MARKS = ('runs', 'alive', 'left', 'jumped', 'repeats')
+
+
+def _transfer_liveness(shell: Dict) -> tuple:
+    """What a return, exit, break or continue may change in the open compounds and the shell, to put back."""
+    return [tuple(f[key] for key in _TRANSFER_JUMP_MARKS) for f in shell['frames']], shell['live']
+
+
 def _transfer_revive(outside: tuple, shell: Dict) -> None:
     """Undo what a return, exit, break or continue did beyond a compound that turned out to run in a subshell."""
-    for frame, (runs, alive) in zip(shell['frames'], outside[0]):
-        frame['runs'], frame['alive'] = runs, alive
+    for frame, marks in zip(shell['frames'], outside[0]):
+        frame.update(zip(_TRANSFER_JUMP_MARKS, marks))
     shell['live'] = outside[1]
+
+
+def _transfer_soften(outside: tuple, shell: Dict) -> None:
+    """Make what a return, exit, break or continue did beyond a call that may not run a maybe: what follows may run,
+    and the compound it would have ended leaves an unknown status."""
+    for frame, marks in zip(shell['frames'], outside[0]):
+        if frame['alive'] is False and marks[1] is not False:
+            frame['alive'], frame['runs'] = None, _transfer_both(marks[0], None)
+            frame['jumped'] = frame['jumped'] or _transfer_snapshot(shell)
+        if frame['left'] != marks[2]:
+            frame['left'] = (None,)
+        frame['repeats'] = marks[4]
+    if shell['live'] is False and outside[1] is not False:
+        shell['live'] = None
 
 
 def _transfer_close(frame: Dict, layer: tuple, shell: Dict, background: bool = False) -> None:
@@ -6415,7 +6464,8 @@ def _transfer_jump(program: str, args: List[str], shell: Dict) -> None:
     # None of them reaches past a subshell, and a break or continue does not leave the function it is in.
     bound = max([i for i, f in enumerate(frames) if f['kind'] in ('(', '$(') or f['piped_in']], default=-1)
     if program in ('break', 'continue'):
-        loops = [i for i, f in enumerate(frames) if f['kind'] in _TRANSFER_LOOPS and i > bound and i >= (floor or 0)]
+        # A loop that is itself piped is its own subshell, so a break inside still reaches it.
+        loops = [i for i, f in enumerate(frames) if f['kind'] in _TRANSFER_LOOPS and i >= max(bound, floor or 0)]
         if not loops:
             return
         target = loops[-min(int(args[0]) if args and args[0].isdigit() and int(args[0]) else 1, len(loops))]
@@ -6425,12 +6475,19 @@ def _transfer_jump(program: str, args: List[str], shell: Dict) -> None:
         target = max(floor, bound)
     else:
         target = max(bound, 0)
-    sure = shell['pipe']['runs'] is True and not _transfer_doubt(shell['pipe'])
+    # Sure once the compound it ends is running: nothing between here and there can skip it. It ends the whole shell
+    # only when the outermost compound it is in surely runs as well.
+    sure = not _transfer_doubt(shell['pipe']) and \
+        all(f['rel'] is True and f['alive'] is True and not f['doubt'] for f in frames[target + 1:])
+    whole = sure and shell['pipe']['runs'] is True if not frames else \
+        sure and frames[0]['base'] is True and frames[0]['rel'] is True and not frames[0]['doubt']
     for frame in frames[target:]:
         frame['alive'] = _transfer_both(frame['alive'], False if sure else None)
         frame['runs'] = _transfer_both(frame['runs'], frame['alive'])
+        # A sure break, return or exit ends the loops it leaves for good, while a continue runs its own loop again.
+        frame['repeats'] = frame['repeats'] and not (sure and (program != 'continue' or frame is not frames[target]))
     if program == 'exit' and bound < 0:
-        shell['live'] = _transfer_both(shell['live'], False if sure else None)
+        shell['live'] = _transfer_both(shell['live'], False if whole else None)
     if target < len(frames):
         # The compound ends with the jump's status, unknown when it may not have jumped, or may have earlier. A `!`
         # still flips a break or continue, while a return or exit leaves at once.
@@ -6445,11 +6502,14 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
     keyword, rest, frames = words[0], words[1:], shell['frames']
     if keyword in ('{', 'if') + _TRANSFER_LOOPS:
         _transfer_open(keyword, shell['pipe']['runs'], shell, ('cmd', words, '', item[3], item[4]))
-        if keyword == 'for':
-            # A literal word runs the body at least once, and a list with no words never runs it.
-            listed = rest[2:] if rest[1:2] == ['in'] else None
-            literal = any('$' not in w and _TRANSFER_SUBSTITUTED not in w for w in listed or [])
+        if keyword in _TRANSFER_LOOPS:
+            # A literal word runs a for body at least once, and a list with no words never runs a for or select body.
+            # Any loop but a for over one plain word may run its body again.
+            listed = rest[2:] if keyword in ('for', 'select') and rest[1:2] == ['in'] else None
+            literal = keyword == 'for' and any('$' not in w and _TRANSFER_SUBSTITUTED not in w for w in listed or [])
             frames[-1]['iterates'] = True if literal else False if listed == [] else None
+            plain = listed is not None and len(listed) == 1 and not any(c in listed[0] for c in '$*?[\0')
+            frames[-1]['repeats'] = keyword != 'for' or not plain
         return [] if keyword in ('for', 'select') else rest  # a for loop's header runs nothing
     if keyword in ('!', 'function'):
         # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
@@ -6511,14 +6571,25 @@ def _transfer_marker(item: tuple, shell: Dict) -> None:
 
 
 def _transfer_builtin(program: str, args: List[str], cwd: Optional[str], shell: Dict) -> None:
-    """Apply a cd, export or unset to the commands after it."""
-    if program == 'export':
-        shell['exported'].update(a.split('=', 1) for a in args if _transfer_is_assignment(a))
-    elif program == 'unset':
-        # Unset hides the inherited value too, so it is kept as empty rather than dropped.
-        shell['exported'].update((name, '') for name in args if not name.startswith('-'))
-    else:
-        shell['cwd'] = _transfer_move(cwd, args[0] if args else '~')
+    """Apply a cd, export or unset, or a command made only of assignments (program ''), to the commands after it."""
+    if program == 'cd':
+        # Options such as -P come before the folder, and -- ends them; a lone - is the previous folder.
+        folders = list(args)
+        while folders and folders[0].startswith('-') and folders[0] != '-':
+            if folders.pop(0) == '--':
+                break
+        shell['cwd'] = _transfer_move(cwd, folders[0] if folders else '~')
+        return
+    for arg in (a for a in args if not a.startswith('-')):
+        name, eq, value = arg.partition('=')
+        if program == 'unset' and '-f' in args:
+            shell['functions'].pop(name, None)
+        elif program == 'unset':
+            shell['vars'][name] = (None, False)  # gone, with its export, so the hook's own value is gone too
+        elif program == 'export':
+            shell['vars'][name] = (value if eq else _transfer_variable(shell, name)[0], '-n' not in args)
+        else:
+            shell['vars'][name] = (value, _transfer_variable(shell, name)[1])  # an exported one stays exported
 
 
 def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
@@ -6541,17 +6612,18 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
     return None
 
 
-def _transfer_call(body: List[tuple], layer: tuple, subshell: bool, shell: Dict, depth: int) -> None:
-    """Run a defined function's body where it is called: in this shell with the call's stdin and stdout, or in a
-    subshell when the call is piped or backgrounded. A call reached only through an && or || after an unknown status
-    leaves what it changed unknown."""
+def _transfer_call(known: tuple, layer: tuple, subshell: bool, shell: Dict, depth: int) -> None:
+    """Run a defined function's body, from known (body, whether it may not have been defined), where it is called: in
+    this shell with the call's stdin and stdout, or in a subshell when the call is piped or backgrounded. A call reached
+    only through an && or || after an unknown status, or to a function that may not exist, leaves what it changed
+    unknown."""
+    body, maybe = known
     if depth >= _TRANSFER_MAX_DEPTH or shell['calls_left'] <= 0:
         shell['status'] = None
         return
     shell['calls_left'] -= 1
     first, state = len(shell['calls']), _transfer_snapshot(shell)
-    outer, outside = (shell['pipe'], shell['start'], shell['floor']), \
-        ([(f['runs'], f['alive']) for f in shell['frames']], shell['live'])
+    outer, outside = (shell['pipe'], shell['start'], shell['floor']), _transfer_liveness(shell)
     shell['floor'] = len(shell['frames'])
     _transfer_items(body, shell, depth + 1)
     shell['pipe'], shell['start'], shell['floor'] = outer
@@ -6559,8 +6631,9 @@ def _transfer_call(body: List[tuple], layer: tuple, subshell: bool, shell: Dict,
     if subshell:
         _transfer_restore(shell, state, True)
         _transfer_revive(outside, shell)
-    elif _transfer_doubt(shell['pipe']):
+    elif maybe or _transfer_doubt(shell['pipe']):
         _transfer_forget(shell, _transfer_changes(shell, state))
+        _transfer_soften(outside, shell)
 
 
 def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
@@ -6571,11 +6644,17 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     subshell = before == '|' or after in ('|', '&')
     if name in shell['functions']:
         _transfer_call(shell['functions'][name], layer, subshell, shell, depth)
-        return []
+        if not shell['functions'][name][1]:
+            return []
+        # A function that may not have been defined may leave the name to the program.
     program, args, env, cwd, other_user = _transfer_program(words, shell['cwd'])
-    env = env if _TRANSFER_CLEAN_ENV in env else {**shell['exported'], **env}
+    env = env if _TRANSFER_CLEAN_ENV in env else {**_transfer_exported(shell), **env}
+    # A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
+    assigns = program is None and all(_transfer_is_assignment(w) for w in words)
     status = shell['status']
     shell['status'] = 0 if program in ('true', ':', 'break', 'continue') else 1 if program == 'false' else None
+    if assigns and not any(_TRANSFER_SUBSTITUTED in w for w in words):
+        shell['status'] = 0
     if program in ('return', 'exit'):
         # Either leaves the status it is given, or else the one before it; a return outside a function fails.
         shell['status'] = status if not args else int(int(args[0]) % 256 > 0) if args[0].isdigit() else None
@@ -6583,11 +6662,11 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
             shell['status'] = 1
     if program in ('return', 'exit', 'break', 'continue') and not subshell:
         _transfer_jump(program, args, shell)
-    if program in ('cd', 'export', 'unset'):
-        # A pipeline's commands run in subshells, so their cd and exports end with them.
+    if program in ('cd', 'export', 'unset') or assigns:
+        # A pipeline's commands run in subshells, so their cd and variables end with them.
         if before != '|' and after != '|':
             saved = _transfer_snapshot(shell)
-            _transfer_builtin(program, args, cwd, shell)
+            _transfer_builtin(program or '', words if assigns else args, cwd, shell)
             if _transfer_doubt(shell['pipe']):
                 _transfer_forget(shell, _transfer_changes(shell, saved))  # it may not have run
         return []
@@ -6640,8 +6719,9 @@ def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth
     """Each simple command that runs or may run, as (program, args, env, folder, as another user, the (piped in,
     piped out, redirections) around it from its own outward); commands a literal true or false skips, untaken
     branches and function bodies are left out, and a function's body runs where it is called."""
-    shell = {'cwd': cwd, 'exported': dict(exported), 'status': None, 'frames': [], 'function': None,
-             'start': (cwd, dict(exported), {}), 'calls': [], 'functions': {}, 'calls_left': _TRANSFER_MAX_CALLS,
+    variables = {name: (value, True) for name, value in exported.items()}
+    shell = {'cwd': cwd, 'vars': variables, 'status': None, 'frames': [], 'function': None,
+             'start': (cwd, dict(variables), {}), 'calls': [], 'functions': {}, 'calls_left': _TRANSFER_MAX_CALLS,
              'items': items, 'at': 0, 'live': True, 'floor': None}
     _transfer_pipeline('', True, shell)
     _transfer_items(items, shell, depth)
@@ -7128,6 +7208,19 @@ def _transfer_ssh_config_words(line: str) -> Optional[List[str]]:
     return words
 
 
+def _transfer_match_execs(words: List[str]) -> bool:
+    """Whether a Match line's criteria include exec, read as ssh reads them: each a keyword, negated with !, taking an
+    argument after a space or = unless it is all, canonical or final."""
+    i = 0
+    while i < len(words):
+        criterion, eq, _ = words[i].partition('=')
+        criterion = criterion.lower().lstrip('!')
+        if criterion == 'exec':
+            return True
+        i += 1 if eq or criterion in ('all', 'canonical', 'final') else 2
+    return False
+
+
 def _transfer_ssh_config_runs(lines: List[str], homes: List[str], bases: tuple, pending: List[tuple]) -> bool:
     """Whether config lines could run a command or a DNS lookup in ssh -G; their Includes are queued on pending,
     resolved against every home and folder ssh may use."""
@@ -7141,7 +7234,7 @@ def _transfer_ssh_config_runs(lines: List[str], homes: List[str], bases: tuple, 
         keyword, _, attached = words[0].partition('=')
         # ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
         words = [w.lstrip('=') for w in ([attached] if attached else []) + words[1:] if w.lstrip('=')]
-        if keyword.lower() == 'match' and any(w.lower().lstrip('!').startswith('exec') for w in words):
+        if keyword.lower() == 'match' and _transfer_match_execs(words):
             return True
         if keyword.lower() == 'canonicalizehostname' and words and words[0].lower() in ('yes', 'always'):
             return True

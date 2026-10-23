@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '52f01280736b273d3ee79590411b881ccbc3bdd2e94945d6cb2290f8caf96d90'
+BLOCK_SHA256 = '143f66e0d246e3ca4b3dfa936f79ea6e3180726417641ee2766b68eee1200f3f'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -557,6 +557,16 @@ class SshLookupTests(TransferTestCase):
         self.assert_endpoints('scp -F canon f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
         self.assertEqual(self.ssh_calls(), [])
 
+    def test_match_criteria_are_read_as_ssh_reads_them(self):
+        # Only an exec criterion runs a command; a host pattern that starts with exec does not.
+        Path(self.repo, 'host').write_text('Match host exec-prod\n  HostName 10.1.1.1\n')
+        self.assert_hosts('scp -F host f prod:/tmp', [('out', 'prod')])
+        self.assertEqual(len(self.ssh_calls()), len(HOOKS))
+        for config in ('Match exec=true\n', 'Match !exec "true"\n', 'Match canonical exec "true"\n'):
+            Path(self.repo, 'run').write_text(config)
+            self.assert_endpoints('scp -F run f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+        self.assertEqual(len(self.ssh_calls()), len(HOOKS))
+
     def test_a_system_config_that_could_run_commands_is_never_handed_to_ssh(self):
         program_data = tempfile.mkdtemp()
         os.makedirs(os.path.join(program_data, 'ssh'))
@@ -757,6 +767,27 @@ class ParserFindingTests(TransferTestCase):
                         '[ -d x ] && { cd frontend; scp -F cfg f prod:/tmp; }',
                         f'[ -d x ] && cd /tmp; cd {self.repo}/frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, private)
+
+    def test_a_loop_that_may_repeat_or_a_cd_into_a_missing_folder_leaves_the_folder_unknown(self):
+        # A body that runs again repeats its cd, so where it ends is not known; a cd into a folder that is not there
+        # may have failed. Neither is guessed.
+        unknown = [_endpoint('out', 'prod', 'unresolved', 'prod')]
+        for command in ('cd frontend; for x in a b; do cd ..; done; scp -F cfg f prod:/tmp',
+                        'cd frontend; for x in a b; do cd ..; continue; done; scp -F cfg f prod:/tmp',
+                        'cd frontend; while [ -f y ]; do cd ..; done; scp -F cfg f prod:/tmp',
+                        'cd frontend; for x in *.txt; do cd ..; done; scp -F cfg f prod:/tmp',
+                        'cd nowhere; cd frontend; scp -F cfg f prod:/tmp',
+                        'if [ -f y ]; then f() { cd frontend; }; fi; f; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, unknown)
+        for command in ('cd -P frontend; scp -F cfg f prod:/tmp', 'cd -- frontend; scp -F cfg f prod:/tmp',
+                        'cd -L frontend; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+        public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
+        for command in ('cd frontend; for x in a; do cd ..; done; scp -F cfg f prod:/tmp',
+                        'cd frontend; for x in a b; do cd ..; break; done; scp -F cfg f prod:/tmp',
+                        'cd frontend; while true; do cd ..; break; done; scp -F cfg f prod:/tmp',
+                        'for x in a b; do scp -F cfg f prod:/tmp; done'):
+            self.assert_endpoints(command, public)
 
     def test_return_exit_and_break_leave_the_folder_where_bash_does(self):
         private, public = (_endpoint('out', 'prod', 'private', '10.0.4.12'),

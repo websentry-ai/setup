@@ -2193,6 +2193,13 @@ var Lexer = class _Lexer {
   }
   open() {
     if (this.cases.at(-1) === "pattern") return;
+    const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
+    const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
+    if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
+      this.argv.push(this.text.slice(this.i, close + 1));
+      this.i = close;
+      return;
+    }
     const rest = this.text.slice(this.i + 1).trimStart();
     const name = this.inWord ? this.word : this.argv.at(-1) ?? "";
     const head = this.inWord ? this.argv : this.argv.slice(0, -1);
@@ -2407,8 +2414,12 @@ function programName(token) {
 }
 function moveTo(cwd, path) {
   const target = expandHome(path);
-  if (isAbsolute3(target)) return target;
-  return cwd === void 0 || target === "-" ? void 0 : normalize(join5(cwd, target));
+  const folder = isAbsolute3(target) ? target : cwd === void 0 || target === "-" ? void 0 : normalize(join5(cwd, target));
+  try {
+    return folder !== void 0 && statSync(folder).isDirectory() ? folder : void 0;
+  } catch {
+    return void 0;
+  }
 }
 function program(input, start) {
   const argv = [...input];
@@ -2482,18 +2493,19 @@ function runs(shell) {
   return top === void 0 ? shell.live : top.runs;
 }
 function snapshot(shell) {
-  return [shell.cwd, { ...shell.exported }, new Map(shell.functions)];
+  return [shell.cwd, { ...shell.vars }, new Map(shell.functions)];
 }
 function restore(shell, saved, subshell = false) {
   if (saved === void 0) return;
   shell.cwd = saved[0];
-  shell.exported = { ...saved[1] };
+  shell.vars = { ...saved[1] };
   if (subshell) shell.functions = new Map(saved[2]);
 }
 function changes(shell, saved) {
   const names = /* @__PURE__ */ new Set();
-  for (const key of /* @__PURE__ */ new Set([...Object.keys(saved[1]), ...Object.keys(shell.exported)])) {
-    if (saved[1][key] !== shell.exported[key]) names.add(key);
+  for (const key of /* @__PURE__ */ new Set([...Object.keys(saved[1]), ...Object.keys(shell.vars)])) {
+    const [before, now] = [saved[1][key], shell.vars[key]];
+    if (before?.[0] !== now?.[0] || before?.[1] !== now?.[1]) names.add(key);
   }
   if (shell.cwd !== saved[0]) names.add("");
   return names;
@@ -2501,8 +2513,19 @@ function changes(shell, saved) {
 function forget(shell, names) {
   for (const name of names) {
     if (name === "") shell.cwd = void 0;
-    else shell.exported[name] = SUBSTITUTED;
+    else shell.vars[name] = [SUBSTITUTED, true];
   }
+}
+function variable(shell, name) {
+  const set = shell.vars[name];
+  if (set !== void 0) return set;
+  const inherited = !(CLEAN_ENV in shell.vars) && shell.processEnv[name] !== void 0;
+  return [inherited ? shell.processEnv[name] : void 0, inherited];
+}
+function exportedEnv(shell) {
+  const env = {};
+  for (const [name, [value, exported]] of Object.entries(shell.vars)) env[name] = exported && value !== void 0 ? value : "";
+  return env;
 }
 function doubt(pipe) {
   return pipe.prior === void 0 && (pipe.before === "&&" || pipe.before === "||");
@@ -2518,7 +2541,7 @@ function pipeline(before, runsHere, shell) {
   shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false };
 }
 function begin(before, shell) {
-  if (before === "|") shell.status = shell.pipe.prior;
+  if (before === "|") shell.status = shell.pipe.prior === 0 ? 0 : void 0;
   if (before === "|" || shell.pipe.leading) return;
   if (before !== "&&" && before !== "||") shell.start = snapshot(shell);
   pipeline(before, both(runs(shell), follows(before, shell.status)), shell);
@@ -2565,9 +2588,10 @@ function openFrame(kind, runsHere, shell, head) {
     defines: name,
     head: [shell.at, head],
     iterates: void 0,
+    repeats: false,
     doubt: doubt(shell.pipe),
     unsure: /* @__PURE__ */ new Set(),
-    outside: [shell.frames.map((f) => [f.runs, f.alive]), shell.live]
+    outside: liveness(shell)
   });
   shell.openingPipe = false;
   shell.start = snapshot(shell);
@@ -2591,7 +2615,8 @@ function settle(frame, tail, shell) {
   [shell.pipe, shell.start] = frame.outer;
   if (frame.defines !== void 0 && shell.pipe.runs !== false) {
     const [at, head] = frame.head;
-    shell.functions.set(frame.defines, [head, ...shell.items.slice(at + 1, shell.at), tail]);
+    const maybe = shell.pipe.runs === void 0 || doubt(shell.pipe);
+    shell.functions.set(frame.defines, [[head, ...shell.items.slice(at + 1, shell.at), tail], maybe]);
   }
 }
 function leave(frame, shell) {
@@ -2601,7 +2626,7 @@ function leave(frame, shell) {
   frame.saved = void 0;
 }
 function doubtful(frame, shell) {
-  for (const since of [frame.jumped, frame.doubt ? frame.state : void 0]) {
+  for (const since of [frame.jumped, frame.doubt || frame.repeats ? frame.state : void 0]) {
     if (since !== void 0) for (const name of changes(shell, since)) frame.unsure.add(name);
   }
   leave(frame, shell);
@@ -2613,12 +2638,11 @@ function wrap(shell, first, layer) {
     shell.calls[i] = { ...call, layers: [...call.layers, layer] };
   }
 }
+function liveness(shell) {
+  return [shell.frames.map(({ runs: r, alive, left, jumped, repeats }) => ({ runs: r, alive, left, jumped, repeats })), shell.live];
+}
 function revive(outside, shell) {
-  outside[0].forEach(([runsHere, alive], i) => {
-    const frame = shell.frames[i];
-    frame.runs = runsHere;
-    frame.alive = alive;
-  });
+  outside[0].forEach((marks, i) => Object.assign(shell.frames[i], marks));
   shell.live = outside[1];
 }
 function closeFrame(frame, layer, shell, background = false) {
@@ -2661,7 +2685,7 @@ function jump(name, args, shell) {
   });
   let target;
   if (name === "break" || name === "continue") {
-    const loops = frames.flatMap((f, i) => LOOPS.includes(f.kind) && i > bound && i >= (floor ?? 0) ? [i] : []);
+    const loops = frames.flatMap((f, i) => LOOPS.includes(f.kind) && i >= Math.max(bound, floor ?? 0) ? [i] : []);
     if (loops.length === 0) return;
     const count = /^\d+$/.test(args[0] ?? "") && Number(args[0]) > 0 ? Number(args[0]) : 1;
     target = loops[loops.length - Math.min(count, loops.length)];
@@ -2671,12 +2695,15 @@ function jump(name, args, shell) {
   } else {
     target = Math.max(bound, 0);
   }
-  const sure = shell.pipe.runs === true && !doubt(shell.pipe);
-  for (const frame2 of frames.slice(target)) {
+  const sure = !doubt(shell.pipe) && frames.slice(target + 1).every((f) => f.rel === true && f.alive === true && !f.doubt);
+  const outermost = frames[0];
+  const whole = outermost === void 0 ? sure && shell.pipe.runs === true : sure && outermost.base === true && outermost.rel === true && !outermost.doubt;
+  frames.slice(target).forEach((frame2, i) => {
     frame2.alive = both(frame2.alive, sure ? false : void 0);
     frame2.runs = both(frame2.runs, frame2.alive);
-  }
-  if (name === "exit" && bound < 0) shell.live = both(shell.live, sure ? false : void 0);
+    frame2.repeats &&= !(sure && (name !== "continue" || i > 0));
+  });
+  if (name === "exit" && bound < 0) shell.live = both(shell.live, whole ? false : void 0);
   const frame = frames[target];
   if (frame === void 0) return;
   const status = name === "break" || name === "continue" ? Number(shell.pipe.negate) : shell.status;
@@ -2688,10 +2715,12 @@ function keyword(argv, item, shell) {
   const { frames } = shell;
   if (word === "{" || word === "if" || LOOPS.includes(word)) {
     openFrame(word, shell.pipe.runs, shell, { kind: "cmd", argv, before: "", after: item.after, io: item.io });
-    if (word === "for") {
-      const listed = rest[1] === "in" ? rest.slice(2) : void 0;
-      const literal = (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
-      frames.at(-1).iterates = literal ? true : listed?.length === 0 ? false : void 0;
+    if (LOOPS.includes(word)) {
+      const listed = (word === "for" || word === "select") && rest[1] === "in" ? rest.slice(2) : void 0;
+      const literal = word === "for" && (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
+      const frame = frames.at(-1);
+      frame.iterates = literal ? true : listed?.length === 0 ? false : void 0;
+      frame.repeats = word !== "for" || !(listed?.length === 1 && ![..."$*?[", SUBSTITUTED].some((c) => listed[0].includes(c)));
     }
     return word === "for" || word === "select" ? [] : rest;
   }
@@ -2753,12 +2782,20 @@ function marker(item, shell) {
   }
 }
 function builtin(name, args, cwd, shell) {
-  if (name === "export") {
-    for (const arg of args) if (isAssignment(arg)) shell.exported[arg.slice(0, arg.indexOf("="))] = arg.slice(arg.indexOf("=") + 1);
-  } else if (name === "unset") {
-    for (const arg of args) if (!arg.startsWith("-")) shell.exported[arg] = "";
-  } else {
-    shell.cwd = moveTo(cwd, args[0] ?? "~");
+  if (name === "cd") {
+    const folders = [...args];
+    while (folders[0]?.startsWith("-") && folders[0] !== "-") if (folders.shift() === "--") break;
+    shell.cwd = moveTo(cwd, folders[0] ?? "~");
+    return;
+  }
+  for (const arg of args.filter((a) => !a.startsWith("-"))) {
+    const eq = arg.indexOf("=");
+    const key = eq < 0 ? arg : arg.slice(0, eq);
+    const value = eq < 0 ? void 0 : arg.slice(eq + 1);
+    if (name === "unset" && args.includes("-f")) shell.functions.delete(key);
+    else if (name === "unset") shell.vars[key] = [void 0, false];
+    else if (name === "export") shell.vars[key] = [value ?? variable(shell, key)[0], !args.includes("-n")];
+    else shell.vars[key] = [value, variable(shell, key)[1]];
   }
 }
 function shellString(name, args) {
@@ -2780,7 +2817,8 @@ function shellString(name, args) {
   }
   return void 0;
 }
-function callFunction(body, layer, subshell, shell, depth) {
+function callFunction(known, layer, subshell, shell, depth) {
+  const [body, maybe] = known;
   if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
     shell.status = void 0;
     return;
@@ -2789,7 +2827,7 @@ function callFunction(body, layer, subshell, shell, depth) {
   const first = shell.calls.length;
   const state = snapshot(shell);
   const outer = [shell.pipe, shell.start, shell.floor];
-  const outside = [shell.frames.map((f) => [f.runs, f.alive]), shell.live];
+  const outside = liveness(shell);
   shell.floor = shell.frames.length;
   walkItems(body, shell, depth + 1);
   [shell.pipe, shell.start, shell.floor] = outer;
@@ -2797,34 +2835,50 @@ function callFunction(body, layer, subshell, shell, depth) {
   if (subshell) {
     restore(shell, state, true);
     revive(outside, shell);
-  } else if (doubt(shell.pipe)) {
+  } else if (maybe || doubt(shell.pipe)) {
     forget(shell, changes(shell, state));
+    soften(outside, shell);
   }
+}
+function soften(outside, shell) {
+  outside[0].forEach((marks, i) => {
+    const frame = shell.frames[i];
+    if (frame.alive === false && marks.alive !== false) {
+      frame.alive = void 0;
+      frame.runs = both(marks.runs, void 0);
+      frame.jumped ??= snapshot(shell);
+    }
+    if (frame.left !== marks.left) frame.left = [void 0];
+    frame.repeats = marks.repeats;
+  });
+  if (shell.live === false && outside[1] !== false) shell.live = void 0;
 }
 function simple(argv, item, before, shell, depth) {
   const layer = [before === "|", item.after === "|", item.io];
   const subshell = before === "|" || item.after === "|" || item.after === "&";
   const called = argv.find((word) => !isAssignment(word));
-  const body = called === void 0 ? void 0 : shell.functions.get(called);
-  if (body !== void 0) {
-    callFunction(body, layer, subshell, shell, depth);
-    return [];
+  const known = called === void 0 ? void 0 : shell.functions.get(called);
+  if (known !== void 0) {
+    callFunction(known, layer, subshell, shell, depth);
+    if (!known[1]) return [];
   }
   const parsed = program(argv, shell.cwd);
   const { name, args } = parsed;
-  const env = CLEAN_ENV in parsed.env ? parsed.env : { ...shell.exported, ...parsed.env };
+  const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
+  const assigns = name === void 0 && argv.every(isAssignment);
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : void 0;
+  if (assigns && !argv.some((word) => word.includes(SUBSTITUTED))) shell.status = 0;
   if (name === "return" || name === "exit") {
     const given = args[0];
     shell.status = given === void 0 ? status : /^\d+$/.test(given) ? Number(BigInt(given) % 256n > 0n) : void 0;
     if (name === "return" && shell.floor === void 0) shell.status = 1;
   }
   if ((name === "return" || name === "exit" || name === "break" || name === "continue") && !subshell) jump(name, args, shell);
-  if (name === "cd" || name === "export" || name === "unset") {
+  if (name === "cd" || name === "export" || name === "unset" || assigns) {
     if (before !== "|" && item.after !== "|") {
       const saved = snapshot(shell);
-      builtin(name, args, parsed.cwd, shell);
+      builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
       if (doubt(shell.pipe)) forget(shell, changes(shell, saved));
     }
     return [];
@@ -2873,13 +2927,14 @@ function walkItems(list, shell, depth) {
   [shell.items, shell.at] = outer;
 }
 function walk(items, cwd, exported, processEnv, depth) {
+  const vars = Object.fromEntries(Object.entries(exported).map(([key, value]) => [key, [value, true]]));
   const shell = {
     cwd,
-    exported: { ...exported },
+    vars,
     status: void 0,
     frames: [],
     function: void 0,
-    start: [cwd, { ...exported }, /* @__PURE__ */ new Map()],
+    start: [cwd, { ...vars }, /* @__PURE__ */ new Map()],
     processEnv,
     calls: [],
     openingPipe: false,
@@ -3380,6 +3435,15 @@ function configWords(line) {
   if (inWord) out.push(word);
   return out;
 }
+function matchExecs(words2) {
+  for (let i = 0; i < words2.length; ) {
+    const word = words2[i];
+    const criterion = word.split("=")[0]?.toLowerCase().replace(/^!/, "") ?? "";
+    if (criterion === "exec") return true;
+    i += word.includes("=") || ["all", "canonical", "final"].includes(criterion) ? 1 : 2;
+  }
+  return false;
+}
 function configRuns(text, bases, homes, pending) {
   for (const line of text.split(/\r?\n/)) {
     const lineWords = configWords(line);
@@ -3387,7 +3451,7 @@ function configRuns(text, bases, homes, pending) {
     const [first = "", ...rest] = lineWords;
     const [keyword2 = "", attached = ""] = first.split(/=(.*)/s);
     const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
-    if (keyword2.toLowerCase() === "match" && args.some((w) => w.toLowerCase().replace(/^!/, "").startsWith("exec"))) return true;
+    if (keyword2.toLowerCase() === "match" && matchExecs(args)) return true;
     if (keyword2.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return true;
     for (const pattern of keyword2.toLowerCase() === "include" ? args : []) {
       const targets = includeTargets(pattern, bases, homes);
