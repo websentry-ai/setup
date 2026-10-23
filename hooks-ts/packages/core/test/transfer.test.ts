@@ -3,7 +3,7 @@
 // sends the same `transfer` field from every hook.
 
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
@@ -480,6 +480,31 @@ test("a loop that may repeat, or a cd into a missing folder, leaves the folder u
     "cd frontend; while true; do cd ..; break; done; scp -F cfg f prod:/tmp",
     "for x in a b; do scp -F cfg f prod:/tmp; done",
   ]) assert.equal(await at(command), "203.0.113.9", command);
+});
+
+test("a cd lands where bash and zsh both do, or leaves the folder unknown", async () => {
+  const dir = repo();
+  mkdirSync(join(dir, "frontend", "inner"));
+  symlinkSync(join(dir, "frontend", "inner"), join(dir, "link"));
+  const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
+  // -P resolves links, so a later `..` leaves the real folder: bash takes the last of -L and -P, zsh any -P. A cd
+  // every shell rejects stays put; bash 5 rejects a second folder that bash 3 takes the first of, and -e and -q are
+  // not in every shell, so where those land is not guessed.
+  for (const [command, expected] of [
+    ["cd link; cd ..; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    ["cd -P link; cd ..; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["cd link; cd -P ..; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["cd -L -P link; cd ..; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["cd -P -L link; cd ..; scp -F cfg f prod:/tmp", "prod"],
+    ["env -C link/.. scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["cd -Z frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    ["cd --physical frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    ["cd frontend extra; scp -F cfg f prod:/tmp", "prod"],
+    ["cd frontend -P; scp -F cfg f prod:/tmp", "prod"],
+    ["cd -Pe frontend; scp -F cfg f prod:/tmp", "prod"],
+    ["cd -q frontend; scp -F cfg f prod:/tmp", "prod"],
+    ["cd missing/../frontend; scp -F cfg f prod:/tmp", "prod"],
+  ] as const) assert.equal(await at(command), expected, command);
 });
 
 test("URL globs reach every host they name", async () => {

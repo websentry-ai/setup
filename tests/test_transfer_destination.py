@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '143f66e0d246e3ca4b3dfa936f79ea6e3180726417641ee2766b68eee1200f3f'
+BLOCK_SHA256 = '8a32173c9f83ffb464dcd97eb629002830cd348a5da583dc52203b5d8d5eee4c'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -801,6 +801,30 @@ class ParserFindingTests(TransferTestCase):
                                    _endpoint('out', 'prod', 'unresolved', 'prod'))):
             self.assert_endpoints(command, [expected])
 
+    def test_a_cd_lands_where_bash_and_zsh_both_do_or_leaves_the_folder_unknown(self):
+        # -P resolves links, so a later `..` leaves the real folder: bash takes the last of -L and -P, zsh any -P.
+        # A cd every shell rejects stays put; bash 5 rejects a second folder that bash 3 takes the first of, and -e
+        # and -q are not in every shell, so where those land is not guessed.
+        os.makedirs(os.path.join(self.repo, 'frontend', 'inner'))
+        os.symlink(os.path.join(self.repo, 'frontend', 'inner'), os.path.join(self.repo, 'link'))
+        private, public, unknown = (_endpoint('out', 'prod', 'private', '10.0.4.12'),
+                                    _endpoint('out', 'prod', 'public', '203.0.113.9'),
+                                    _endpoint('out', 'prod', 'unresolved', 'prod'))
+        for command, expected in (('cd link; cd ..; scp -F cfg f prod:/tmp', public),
+                                  ('cd -P link; cd ..; scp -F cfg f prod:/tmp', private),
+                                  ('cd link; cd -P ..; scp -F cfg f prod:/tmp', private),
+                                  ('cd -L -P link; cd ..; scp -F cfg f prod:/tmp', private),
+                                  ('cd -P -L link; cd ..; scp -F cfg f prod:/tmp', unknown),
+                                  ('env -C link/.. scp -F cfg f prod:/tmp', private),
+                                  ('cd -Z frontend; scp -F cfg f prod:/tmp', public),
+                                  ('cd --physical frontend; scp -F cfg f prod:/tmp', public),
+                                  ('cd frontend extra; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd frontend -P; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd -Pe frontend; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd -q frontend; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', unknown)):
+            self.assert_endpoints(command, [expected])
+
     def test_a_called_function_runs_its_body_in_the_callers_shell(self):
         private = _endpoint('out', 'prod', 'private', '10.0.4.12')
         public = _endpoint('out', 'prod', 'public', '203.0.113.9')
@@ -949,6 +973,64 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         ]
         Path(transcript).write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
         self._check(hook.parse_codex_transcript_for_tools(transcript, None, self.repo))
+
+    def _transfers(self, path, commands):
+        """Each Bash command, in order, through one hook's own exchange builder; the transfer of each."""
+        hook, lines = load_module(path), []
+        if path.startswith('codex/'):
+            for n, command in enumerate(commands):
+                lines += [{'type': 'response_item', 'timestamp': f'2026-10-22T16:40:0{n}Z',
+                           'payload': {'type': 'function_call', 'call_id': f'c{n}', 'name': 'exec_command',
+                                       'arguments': json.dumps({'cmd': command})}},
+                          {'type': 'response_item', 'timestamp': f'2026-10-22T16:40:0{n}Z',
+                           'payload': {'type': 'function_call_output', 'call_id': f'c{n}', 'output': ''}}]
+            transcript = os.path.join(tempfile.mkdtemp(), 'rollout.jsonl')
+            Path(transcript).write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+            output = hook.parse_codex_transcript_for_tools(transcript, None, self.repo)
+        elif path.startswith('copilot/'):
+            lines.append({'type': 'user.message', 'id': 'u1', 'timestamp': '2026-10-22T16:39:59.000Z',
+                          'data': {'content': 'ship'}})
+            for n, command in enumerate(commands):
+                lines += [{'type': 'tool.execution_start', 'timestamp': f'2026-10-22T16:40:0{n}.000Z',
+                           'data': {'toolCallId': f'call-{n}', 'toolName': 'bash', 'arguments': {'command': command}}},
+                          {'type': 'tool.execution_complete', 'timestamp': f'2026-10-22T16:40:0{n}.500Z',
+                           'data': {'toolCallId': f'call-{n}', 'success': True, 'result': {'content': ''}}}]
+            lines.append({'type': 'assistant.message', 'timestamp': '2026-10-22T16:40:09.000Z',
+                          'data': {'content': 'shipped'}})
+            events = Path(tempfile.mkdtemp(), 'events.jsonl')
+            events.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+            output = hook.build_exchange_from_transcript(str(events), 's1', cwd=self.repo)[0]
+        elif path.startswith('augment/'):
+            post = [{'timestamp': f'2026-10-22T16:40:0{n}.9Z',
+                     'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'launch-process',
+                               'tool_input': {'command': command}, 'tool_output': ''}}
+                    for n, command in enumerate(commands)]
+            stop = {'hook_event_name': 'Stop', 'cwd': self.repo, 'conversation_id': 'c1',
+                    'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}}
+            output = hook.build_llm_exchange(stop, post)
+        else:
+            events = [{'timestamp': '2026-10-22T16:39:58.000001Z',
+                       'event': {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'session_id': 's1'}}]
+            events += [{'timestamp': f'2026-10-22T16:40:0{n}.250000Z',
+                        'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash',
+                                  'tool_input': {'command': command}, 'tool_response': {}}}
+                       for n, command in enumerate(commands)]
+            output = hook.build_llm_exchange(events, cwd=self.repo)
+        return [e.get('transfer') for e in _tool_entries(output)]
+
+    def test_a_later_call_starts_where_the_shell_really_is(self):
+        # A persistent shell keeps a cd between calls, so only a cd that surely ran moves the next call's -F lookup.
+        public = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'public', '203.0.113.9')]}
+        private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+        unknown = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]}
+        cases = (('false && cd frontend', public), ('cd frontend', private), ('cd frontend &', public),
+                 ('(cd frontend)', public), ('test -f marker && cd frontend', unknown))
+        for path in ('claude-code/hooks/unbound.py', 'codex/hooks/unbound.py', 'copilot/hooks/unbound.py',
+                     'augment/hooks/unbound.py'):
+            for first, expected in cases:
+                with self.subTest(hook=path, first=first):
+                    transfers = self._transfers(path, [first, 'scp -F cfg build.zip prod:/srv'])
+                    self.assertEqual(transfers[-1], expected)
 
     def test_a_failing_resolver_never_breaks_the_exchange(self):
         hook = load_module('claude-code/hooks/unbound.py')
