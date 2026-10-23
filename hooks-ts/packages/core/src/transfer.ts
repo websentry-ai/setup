@@ -1129,19 +1129,14 @@ function urlHost(url: string): string {
 function curl(args: string[]): Raw[] {
   const out: Raw[] = [];
   const pins: string[] = [];
-  let request: string[] = [];
-  for (const arg of [...args, "--next"]) {
-    if (arg !== "-:" && arg !== "--next") {
-      request.push(arg);
-      continue;
-    }
-    const [urls, sends, overrides] = curlRequest(request);
+  for (let i = 0; ; ) {
+    const [urls, sends, overrides, next] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     out.push(...urls.map((url): Raw => [sends ? "out" : "in", urlHost(url), undefined, curlDial(url, connects, pins)]));
-    request = [];
+    if (next >= args.length) return out;
+    i = next;
   }
-  return out;
 }
 
 /** The IP address a string holds, brackets allowed, in the form the Python hooks print; empty when it holds none. */
@@ -1190,15 +1185,18 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
   return [addresses[0] ?? target[0], addresses];
 }
 
-/** The URLs of one curl request, whether it sends data, and its --resolve and --connect-to values in order. */
-function curlRequest(args: string[]): [string[], boolean, [string, string][]] {
+/** The URLs of the curl request starting at args[start], whether it sends data, its --resolve and --connect-to values in
+ *  order, and where the next request starts; a --next that is another option's value does not end it. */
+function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], number] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
   let method = "";
-  for (let i = 0; i < args.length; ) {
+  let i = start;
+  while (i < args.length) {
     let arg = args[i++] as string;
     let value: string | undefined;
+    if (arg === "-:" || arg === "--next") break;
     if (arg.startsWith("--")) {
       // curl reads --name=value as --name value, and --expand-name as --name with variables expanded.
       const eq = arg.indexOf("=");
@@ -1219,7 +1217,7 @@ function curlRequest(args: string[]): [string[], boolean, [string, string][]] {
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
-  return [urls, Boolean(sends), overrides];
+  return [urls, Boolean(sends), overrides, i];
 }
 
 function wget(args: string[]): Raw[] {

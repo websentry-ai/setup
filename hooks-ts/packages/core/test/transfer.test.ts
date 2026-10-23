@@ -263,6 +263,9 @@ test("each curl --next starts a request with its own options", async () => {
     [["out", "files.acme-infra.net"], ["in", "example.com"]]);
   assert.deepEqual(await hosts("curl https://example.com/a -: -d x https://files.acme-infra.net/up"),
     [["in", "example.com"], ["out", "files.acme-infra.net"]]);
+  // A --next or -: that is another option's value is that value, not a new request.
+  assert.deepEqual(await hosts("curl --data --next https://example.com/a"), [["out", "example.com"]]);
+  assert.deepEqual(await hosts("curl -d -: https://example.com/a"), [["out", "example.com"]]);
 });
 
 test("a negated command still obeys the && or || before it", async () => {

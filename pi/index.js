@@ -2742,19 +2742,14 @@ function urlHost(url) {
 function curl(args) {
   const out = [];
   const pins = [];
-  let request = [];
-  for (const arg of [...args, "--next"]) {
-    if (arg !== "-:" && arg !== "--next") {
-      request.push(arg);
-      continue;
-    }
-    const [urls, sends, overrides] = curlRequest(request);
+  for (let i = 0; ; ) {
+    const [urls, sends, overrides, next] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     out.push(...urls.map((url) => [sends ? "out" : "in", urlHost(url), void 0, curlDial(url, connects, pins)]));
-    request = [];
+    if (next >= args.length) return out;
+    i = next;
   }
-  return out;
 }
 function ipOf(text) {
   const bare = text.trim().replace(/^\[+|\]+$/g, "");
@@ -2795,14 +2790,16 @@ function curlDial(url, connects, pins) {
   if (target[0] === host && addresses.length === 0) return void 0;
   return [addresses[0] ?? target[0], addresses];
 }
-function curlRequest(args) {
+function curlRequest(args, start) {
   const urls = [];
   const flags = /* @__PURE__ */ new Set();
   const overrides = [];
   let method = "";
-  for (let i = 0; i < args.length; ) {
+  let i = start;
+  while (i < args.length) {
     let arg = args[i++];
     let value;
+    if (arg === "-:" || arg === "--next") break;
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       if (eq >= 0) value = arg.slice(eq + 1);
@@ -2822,7 +2819,7 @@ function curlRequest(args) {
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, Boolean(sends), overrides];
+  return [urls, Boolean(sends), overrides, i];
 }
 function wget(args) {
   const urls = [];

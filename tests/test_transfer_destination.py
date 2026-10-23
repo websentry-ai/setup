@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '04e079d7013077bd8795b5a16a9d41adf94bde37c33e7cc53f7da252b643e9a0'
+BLOCK_SHA256 = 'b17f61f3e2398916f47212721e7f5bee5196e7fa17d3d6d0e2ee4a485afef546'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -246,6 +246,9 @@ class CurlTests(TransferTestCase):
                           [('out', 'files.acme-infra.net'), ('in', 'example.com')])
         self.assert_hosts('curl https://example.com/a -: -d x https://files.acme-infra.net/up',
                           [('in', 'example.com'), ('out', 'files.acme-infra.net')])
+        # A --next or -: that is another option's value is that value, not a new request.
+        self.assert_hosts('curl --data --next https://example.com/a', [('out', 'example.com')])
+        self.assert_hosts('curl -d -: https://example.com/a', [('out', 'example.com')])
 
     def test_connect_to_and_resolve_set_where_a_url_connects(self):
         # As curl applies them: the first matching --connect-to, then the last pin for that host and port, a named

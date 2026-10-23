@@ -4754,18 +4754,15 @@ def _transfer_curl(args: List[str]) -> List[tuple]:
     """curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
     from. Each --next starts a request with options of its own, though the addresses --resolve pins carry on to the
     requests after it."""
-    endpoints, request, pins = [], [], []
-    for arg in args + ['--next']:
-        if arg not in ('-:', '--next'):
-            request.append(arg)
-            continue
-        urls, sends, overrides = _transfer_curl_request(request)
+    endpoints, pins, i = [], [], 0
+    while True:
+        urls, sends, overrides, i = _transfer_curl_request(args, i)
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
         endpoints += [('out' if sends else 'in', _transfer_url_host(url), None,
                        _transfer_curl_dial(url, connects, pins)) for url in urls]
-        request = []
-    return endpoints
+        if i >= len(args):
+            return endpoints
 
 
 def _transfer_ip(text: str):
@@ -4807,11 +4804,14 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     return (str(addresses[0]) if addresses else target[0]), addresses
 
 
-def _transfer_curl_request(args: List[str]) -> tuple:
-    """(the URLs of one curl request, whether it sends data, its --resolve and --connect-to values in order)."""
-    urls, flags, method, overrides, i = [], set(), '', [], 0
+def _transfer_curl_request(args: List[str], i: int) -> tuple:
+    """(the URLs of the curl request starting at args[i], whether it sends data, its --resolve and --connect-to values in
+    order, where the next request starts); a --next that is another option's value does not end it."""
+    urls, flags, method, overrides = [], set(), '', []
     while i < len(args):
         arg, value, i = args[i], None, i + 1
+        if arg in ('-:', '--next'):
+            break
         if arg.startswith('--'):
             # curl reads --name=value as --name value, and --expand-name as --name with variables expanded.
             arg, eq, attached = arg.partition('=')
@@ -4834,7 +4834,7 @@ def _transfer_curl_request(args: List[str]) -> tuple:
             overrides.append((arg, value))
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
-    return urls, bool(sends), overrides
+    return urls, bool(sends), overrides, i
 
 
 def _transfer_wget(args: List[str]) -> List[tuple]:
