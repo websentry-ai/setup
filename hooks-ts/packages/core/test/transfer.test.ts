@@ -410,8 +410,8 @@ test("a piped compound keeps its cd to itself, and a called function runs its bo
   const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
   for (const command of [
     "{ cd frontend; } | cat; scp -F cfg f prod:/tmp",
-    "cat x | { true; cd frontend; }; scp -F cfg f prod:/tmp",
     "if true; then cd frontend; fi | cat; scp -F cfg f prod:/tmp",
+    "cat x | ( cd frontend ); scp -F cfg f prod:/tmp",
     "cd frontend && { true; } & scp -F cfg f prod:/tmp",
     "f() { cd frontend; }; f | cat; scp -F cfg f prod:/tmp",
     "f() ( cd frontend ); f; scp -F cfg f prod:/tmp",
@@ -422,6 +422,13 @@ test("a piped compound keeps its cd to itself, and a called function runs its bo
     "f() { cd frontend; }; f; scp -F cfg f prod:/tmp",
     "f() { scp -F cfg f prod:/tmp; }; cd frontend; f",
   ]) assert.equal(await at(command), "10.0.4.12", command);
+  // zsh runs a pipeline's last command in this shell and bash in a subshell, so what it changes is unknown.
+  for (const command of [
+    "cat x | { true; cd frontend; }; scp -F cfg f prod:/tmp",
+    "cat x | cd frontend; scp -F cfg f prod:/tmp",
+    "f() { cd frontend; }; cat x | f; scp -F cfg f prod:/tmp",
+    "cat x | if true; then cd frontend; fi; scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "prod", command);
   // A recursive function is followed a bounded number of times, and the command after it is still read.
   const started = Date.now();
   assert.deepEqual(await hosts("f() { f; f; f; f; }; f; curl https://actual.example/b"), [["in", "actual.example"]]);
@@ -504,6 +511,11 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["cd -Pe frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd -q frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd missing/../frontend; scp -F cfg f prod:/tmp", "prod"],
+    // Every shell fails that cd, so the || after it surely runs.
+    ["cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    // An arithmetic for that stops after one pass keeps its cd, unless its body touches the counter.
+    ["for ((i=0;i<1;i++)); do cd frontend; done; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp", "prod"],
   ] as const) assert.equal(await at(command), expected, command);
 });
 

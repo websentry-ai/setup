@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '8a32173c9f83ffb464dcd97eb629002830cd348a5da583dc52203b5d8d5eee4c'
+BLOCK_SHA256 = '20dc7cc3da83035386dfc0a28cae605e02814afcc06d1d2c022ecdfc425bbc63'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -740,10 +740,16 @@ class ParserFindingTests(TransferTestCase):
 
     def test_a_piped_compound_keeps_its_cd_to_itself(self):
         for command in ('{ cd frontend; } | cat; scp -F cfg f prod:/tmp',
-                        'cat x | { true; cd frontend; }; scp -F cfg f prod:/tmp',
                         'if true; then cd frontend; fi | cat; scp -F cfg f prod:/tmp',
+                        'cat x | ( cd frontend ); scp -F cfg f prod:/tmp',
                         'cd frontend && { true; } & scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
+        # zsh runs a pipeline's last command in this shell and bash in a subshell, so what it changes is unknown.
+        for command in ('cat x | { true; cd frontend; }; scp -F cfg f prod:/tmp',
+                        'cat x | cd frontend; scp -F cfg f prod:/tmp',
+                        'f() { cd frontend; }; cat x | f; scp -F cfg f prod:/tmp',
+                        'cat x | if true; then cd frontend; fi; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved', 'prod')])
         self.assert_endpoints('cat x | { cd frontend; scp -F cfg f prod:/tmp; }',
                               [_endpoint('out', 'prod', 'private', '10.0.4.12')])
 
@@ -822,7 +828,14 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd frontend -P; scp -F cfg f prod:/tmp', unknown),
                                   ('cd -Pe frontend; scp -F cfg f prod:/tmp', unknown),
                                   ('cd -q frontend; scp -F cfg f prod:/tmp', unknown),
-                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', unknown)):
+                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', unknown),
+                                  # Every shell fails that cd, so the || after it surely runs.
+                                  ('cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp', private),
+                                  # An arithmetic for that stops after one pass keeps its cd, unless its body
+                                  # touches the counter.
+                                  ('for ((i=0;i<1;i++)); do cd frontend; done; scp -F cfg f prod:/tmp', private),
+                                  ('for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp',
+                                   unknown)):
             self.assert_endpoints(command, [expected])
 
     def test_a_called_function_runs_its_body_in_the_callers_shell(self):

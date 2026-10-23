@@ -2440,7 +2440,7 @@ function programName(token) {
   const name = (token.split(/[\\/]/).pop() ?? "").toLowerCase();
   return name.endsWith(".exe") ? name.slice(0, -4) : name;
 }
-function cdTarget(args, cwd) {
+function cdWords(args) {
   const folders = [...args];
   let letters = "";
   while (folders[0]?.startsWith("-") && folders[0] !== "-") {
@@ -2448,7 +2448,14 @@ function cdTarget(args, cwd) {
     if (option === "--") break;
     letters += option.slice(1);
   }
-  if (/[^LPeqs@0-9]/.test(letters)) return cwd;
+  return [letters, folders];
+}
+function cdRejected(args) {
+  return /[^LPeqs@0-9]/.test(cdWords(args)[0]);
+}
+function cdTarget(args, cwd) {
+  const [letters, folders] = cdWords(args);
+  if (cdRejected(args)) return cwd;
   if (folders.length > 1 || /[^LP]/.test(letters)) return void 0;
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
   const path = folders[0] ?? "~";
@@ -2637,6 +2644,7 @@ function openFrame(kind, runsHere, shell, head) {
     head: [shell.at, head],
     iterates: void 0,
     repeats: false,
+    forever: false,
     doubt: doubt(shell.pipe),
     unsure: /* @__PURE__ */ new Set(),
     outside: liveness(shell)
@@ -2695,9 +2703,19 @@ function revive(outside, shell) {
 }
 function closeFrame(frame, layer, shell, background = false) {
   wrap(shell, frame.calls, layer);
-  if (layer[0] || layer[1] || background) {
+  if (layer[0] && !(layer[1] || background || frame.kind === "(" || frame.kind === "$(")) {
+    unsure(shell, frame.state);
+    revive(frame.outside, shell);
+  } else if (layer[0] || layer[1] || background) {
     restore(shell, frame.state, true);
     revive(frame.outside, shell);
+  }
+}
+function unsure(shell, saved) {
+  forget(shell, changes(shell, saved));
+  for (const [name, known] of saved[2]) if (!shell.functions.has(name)) shell.functions.set(name, [known[0], true]);
+  for (const [name, known] of [...shell.functions]) {
+    if (saved[2].get(name) !== known) shell.functions.set(name, [known[0], true]);
   }
 }
 function branch(keyword2, frame, shell) {
@@ -2713,6 +2731,7 @@ function branch(keyword2, frame, shell) {
   } else if (keyword2 === "do" && LOOPS.includes(frame.kind)) {
     if (frame.kind === "for" || frame.kind === "select") holds = frame.iterates;
     else if (frame.kind === "until" && holds !== void 0) holds = !holds;
+    if (frame.kind === "while" || frame.kind === "until") frame.forever = holds === true;
     taken = both(frame.rel, holds);
   } else {
     return;
@@ -2765,7 +2784,7 @@ function keyword(argv, item, shell) {
     openFrame(word, shell.pipe.runs, shell, { kind: "cmd", argv, before: "", after: item.after, io: item.io });
     if (LOOPS.includes(word)) {
       const frame = frames.at(-1);
-      [frame.iterates, frame.repeats] = loop(word, rest, shell);
+      [frame.iterates, frame.repeats, frame.forever, frame.counter] = loop(word, rest, shell);
     }
     return word === "for" || word === "select" ? [] : rest;
   }
@@ -2778,8 +2797,10 @@ function keyword(argv, item, shell) {
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
     if (frame !== void 0) {
+      const ends = endless(frame, shell);
       doubtful(frame, shell);
       settle(frame, { kind: "cmd", argv: [word], before: item.before, after: "", io: item.io }, shell);
+      if (ends) jump("exit", [], shell);
     }
     shell.closed = frame;
     return rest;
@@ -2790,24 +2811,61 @@ function keyword(argv, item, shell) {
   return rest;
 }
 function loop(word, rest, shell) {
-  if (word === "for" && rest[0]?.startsWith("((")) return [counted(rest[0]), true];
-  if (word !== "for" && word !== "select") return [void 0, true];
+  if (word === "for" && rest[0]?.startsWith("((")) return counted(rest[0]);
+  if (word !== "for" && word !== "select") return [void 0, true, false, void 0];
   const listed = rest[1] === "in" ? rest.slice(2) : shell.args;
   const literal = word === "for" && (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
   const plain = listed?.length === 1 && ![..."$*?[", SUBSTITUTED].some((c) => listed[0].includes(c));
-  return [literal ? true : listed?.length === 0 ? false : void 0, word !== "for" || !plain];
+  return [literal ? true : listed?.length === 0 ? false : void 0, word !== "for" || !plain, false, void 0];
 }
+var NAME = "([A-Za-z_][A-Za-z0-9_]*)";
+var NUMBER = "(0|[1-9][0-9]*)";
+var TESTS = {
+  "<": (a, b) => a < b,
+  "<=": (a, b) => a <= b,
+  ">": (a, b) => a > b,
+  ">=": (a, b) => a >= b,
+  "==": (a, b) => a === b,
+  "!=": (a, b) => a !== b
+};
 function counted(word) {
-  const parts = word.endsWith("))") ? word.slice(2, -2).split(";") : [];
-  if (parts.length !== 3) return void 0;
-  const [init, check] = parts;
-  const start = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0|[1-9][0-9]*)\s*$/.exec(init);
-  const test = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|==|!=|<|>)\s*(0|[1-9][0-9]*)\s*$/.exec(check);
-  if (init.trim() !== "" && start === null) return void 0;
-  if (check.trim() === "") return true;
-  if (start === null || test === null || start[1] !== test[1]) return void 0;
-  const [a, op, b] = [Number(start[2]), test[2], Number(test[3])];
-  return { "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a === b, "!=": a !== b }[op];
+  const unknown = [void 0, true, false, void 0];
+  const parts = word.endsWith("))") ? word.slice(2, -2).split(";").map((p) => p.trim()) : [];
+  if (parts.length !== 3) return unknown;
+  const [init, check, step] = parts;
+  const start = new RegExp(`^${NAME}\\s*=\\s*${NUMBER}$`).exec(init);
+  if (init !== "" && start === null) return unknown;
+  if (check === "") return [true, true, true, void 0];
+  const test = new RegExp(`^${NAME}\\s*(<=|>=|==|!=|<|>)\\s*${NUMBER}$`).exec(check);
+  const by = start === null ? void 0 : stepOf(step, start[1]);
+  if (start === null || test === null || by === void 0 || start[1] !== test[1]) return unknown;
+  const [a, op, b] = [BigInt(start[2]), test[2], BigInt(test[3])];
+  const holds = TESTS[op];
+  if (!holds(a, b)) return [false, false, false, start[1]];
+  const forever = op === "!=" ? by === 0n || (b - a) % by !== 0n || (b - a) / by < 0n : op === "==" ? by === 0n : by === 0n || by > 0n === (op === ">" || op === ">=");
+  return [true, holds(a + by, b), forever, start[1]];
+}
+function stepOf(step, name) {
+  if (step === "") return 0n;
+  let match = new RegExp(`^(\\+\\+|--)?\\s*${NAME}\\s*(\\+\\+|--)?$`).exec(step);
+  if (match !== null && match[2] === name && match[1] === void 0 !== (match[3] === void 0)) {
+    return (match[1] ?? match[3]) === "++" ? 1n : -1n;
+  }
+  match = new RegExp(`^${NAME}\\s*([+-])=\\s*${NUMBER}$`).exec(step) ?? new RegExp(`^${NAME}\\s*=\\s*${name}\\s*([+-])\\s*${NUMBER}$`).exec(step);
+  if (match !== null && match[1] === name) return BigInt(match[3]) * (match[2] === "+" ? 1n : -1n);
+  return void 0;
+}
+var ESCAPES = /* @__PURE__ */ new Set(["break", "continue", "return", "eval", "source", "."]);
+function endless(frame, shell) {
+  if (!LOOPS.includes(frame.kind)) return false;
+  const [at, head] = frame.head;
+  const words2 = [
+    ...head.argv.slice(head.argv[0] === "for" || head.argv[0] === "select" ? 2 : 1),
+    ...shell.items.slice(at + 1, shell.at).flatMap((item) => item.kind === "cmd" ? item.argv : [])
+  ];
+  const counter = frame.counter === void 0 ? void 0 : new RegExp(`(?<![A-Za-z0-9_])${frame.counter}(?![A-Za-z0-9_])`);
+  if (counter !== void 0 && words2.some((w) => counter.test(w))) [frame.repeats, frame.forever] = [true, false];
+  return frame.forever && frame.base !== false && !words2.some((w) => ESCAPES.has(w) || shell.functions.has(w));
 }
 function arithmetic(word) {
   const inner = word.startsWith("((") && word.endsWith("))") ? word.slice(2, -2).trim() : "";
@@ -2940,10 +2998,9 @@ function callFunction(known, layer, subshell, shell, depth) {
   if (subshell) {
     restore(shell, state, true);
     revive(outside, shell);
-  } else if (maybe || doubt(shell.pipe)) {
-    forget(shell, changes(shell, state));
+  } else if (subshell === void 0 || maybe || doubt(shell.pipe)) {
+    unsure(shell, state);
     soften(outside, shell);
-    for (const [name, known2] of state[2]) if (!shell.functions.has(name)) shell.functions.set(name, [known2[0], true]);
   }
 }
 function soften(outside, shell) {
@@ -2963,7 +3020,7 @@ function simple(words2, item, before, shell, depth) {
   const layer = [before === "|", item.after === "|", item.io];
   const substituted = words2.some((word) => word.includes(SUBSTITUTED));
   const argv = appends(words2, shell);
-  const subshell = before === "|" || item.after === "|" || item.after === "&";
+  const subshell = item.after === "|" || item.after === "&" ? true : before === "|" ? void 0 : false;
   const called = argv.find((word) => !isAssignment(word));
   const known = called === void 0 ? void 0 : shell.functions.get(called);
   if (known !== void 0) {
@@ -2980,32 +3037,45 @@ function simple(words2, item, before, shell, depth) {
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
   if (assigns && !substituted) shell.status = 0;
+  if (name === "cd" && cdRejected(args)) shell.status = 1;
   if (name === "set" || name === "shift") shell.args = void 0;
   if (name === "return" || name === "exit") {
     const given = args[0];
     shell.status = given === void 0 ? status : /^\d+$/.test(given) ? Number(BigInt(given) % 256n > 0n) : void 0;
     if (name === "return" && shell.floor === void 0) shell.status = 1;
   }
-  if ((name === "return" || name === "exit" || name === "break" || name === "continue") && !subshell) jump(name, args, shell);
+  if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
-    if (before !== "|" && item.after !== "|") {
+    if (before !== "|" && item.after !== "|" || subshell === void 0) {
       const saved = snapshot(shell);
       builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
-      if (doubt(shell.pipe)) forget(shell, changes(shell, saved));
+      if (subshell === void 0) unsure(shell, saved);
+      else if (doubt(shell.pipe)) forget(shell, changes(shell, saved));
     }
     return [];
   }
   const inner = name === void 0 ? void 0 : shellString(name, args);
   if (inner !== void 0) {
     const positional = SHELLS.has(name) ? args.slice(args.indexOf(inner) + 2) : [];
-    return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional).map((call) => ({
+    const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
+    return replaced(called, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
       layers: [...call.layers, layer]
-    }));
+    })));
   }
   if (name === void 0) return [];
-  return [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }];
+  return replaced(called, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
+}
+function replaced(word, subshell, shell, calls) {
+  if (word !== void 0 && programName(word) === "exec") jumpFrom("exit", [], subshell, shell);
+  return calls;
+}
+function jumpFrom(name, args, subshell, shell) {
+  if (subshell === true) return;
+  const outside = liveness(shell);
+  jump(name, args, shell);
+  if (subshell === void 0) soften(outside, shell);
 }
 function command(item, shell, depth) {
   let argv = item.argv;

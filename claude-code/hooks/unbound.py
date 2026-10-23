@@ -5792,17 +5792,28 @@ def _transfer_program(argv: List[str], cwd: Optional[str]) -> tuple:
     return None, [], env, cwd, other_user
 
 
-def _transfer_cd(args: List[str], cwd: Optional[str]) -> Optional[str]:
-    """The folder a cd with args lands in from cwd: cwd when no shell takes one of its options, and None when bash 3,
-    bash 5 and zsh land in different places or the folder is not known."""
+def _transfer_cd_words(args: List[str]) -> tuple:
+    """A cd's option letters and its folders: options come first, -- ends them, and a lone - is a folder."""
     folders, letters = list(args), ''
     while folders and folders[0].startswith('-') and folders[0] != '-':
         option = folders.pop(0)
         if option == '--':
             break
         letters += option[1:]
-    if any(c not in 'LPeqs@0123456789' for c in letters):
-        return cwd  # every shell rejects the cd and stays
+    return letters, folders
+
+
+def _transfer_cd_rejected(args: List[str]) -> bool:
+    """Whether a cd has an option that bash 3, bash 5 and zsh all reject, so it fails and stays."""
+    return any(c not in 'LPeqs@0123456789' for c in _transfer_cd_words(args)[0])
+
+
+def _transfer_cd(args: List[str], cwd: Optional[str]) -> Optional[str]:
+    """The folder a cd with args lands in from cwd: cwd when no shell takes one of its options, and None when bash 3,
+    bash 5 and zsh land in different places or the folder is not known."""
+    letters, folders = _transfer_cd_words(args)
+    if _transfer_cd_rejected(args):
+        return cwd
     if len(folders) > 1 or any(c not in 'LP' for c in letters):
         return None  # bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s, -@ vary
     # Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
@@ -5983,7 +5994,8 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) ->
                    'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False),
                    'piped_out': _transfer_ends_piped(head, shell),
                    'outer': (shell['pipe'], shell['start']), 'defines': name, 'head': (shell['at'], head),
-                   'iterates': None, 'repeats': False, 'left': None, 'doubt': _transfer_doubt(shell['pipe']),
+                   'iterates': None, 'repeats': False, 'forever': False, 'counter': None,
+                   'left': None, 'doubt': _transfer_doubt(shell['pipe']),
                    'jumped': None,
                    'unsure': set(), 'outside': _transfer_liveness(shell)})
     shell['start'] = _transfer_snapshot(shell)  # the body starts a list of its own
@@ -6080,11 +6092,26 @@ def _transfer_soften(outside: tuple, shell: Dict) -> None:
 
 def _transfer_close(frame: Dict, layer: tuple, shell: Dict, background: bool = False) -> None:
     """Wrap the commands inside a closed compound in the pipes and redirections around it; a piped or backgrounded
-    compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it."""
+    compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it. The last command
+    of a pipeline runs in a subshell in bash but in this shell in zsh, so what it changed is unknown after it."""
     _transfer_wrap(shell, frame['calls'], layer)
-    if layer[0] or layer[1] or background:
+    if layer[0] and not (layer[1] or background or frame['kind'] in ('(', '$(')):
+        _transfer_unsure(shell, frame['state'])
+        _transfer_revive(frame['outside'], shell)
+    elif layer[0] or layer[1] or background:
         _transfer_restore(shell, frame['state'], True)
         _transfer_revive(frame['outside'], shell)
+
+
+def _transfer_unsure(shell: Dict, saved: tuple) -> None:
+    """Make what changed since saved unknown, for what may or may not have happened: the folder and variables, and
+    each function defined or removed, which then may or may not be there."""
+    _transfer_forget(shell, _transfer_changes(shell, saved))
+    for name, known in saved[2].items():
+        shell['functions'].setdefault(name, (known[0], True))
+    for name, known in list(shell['functions'].items()):
+        if saved[2].get(name) is not known:
+            shell['functions'][name] = known[0], True
 
 
 def _transfer_branch(keyword: str, frame: Dict, shell: Dict) -> None:
@@ -6102,6 +6129,8 @@ def _transfer_branch(keyword: str, frame: Dict, shell: Dict) -> None:
             holds = frame['iterates']
         elif frame['kind'] == 'until' and holds is not None:
             holds = not holds
+        if frame['kind'] in ('while', 'until'):
+            frame['forever'] = holds is True  # a test that is a literal holds every time
         taken = _transfer_both(frame['rel'], holds)
     else:
         return
@@ -6164,7 +6193,8 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
     if keyword in ('{', 'if') + _TRANSFER_LOOPS:
         _transfer_open(keyword, shell['pipe']['runs'], shell, ('cmd', words, '', item[3], item[4]))
         if keyword in _TRANSFER_LOOPS:
-            frames[-1]['iterates'], frames[-1]['repeats'] = _transfer_loop(keyword, rest, shell)
+            loop = frames[-1]
+            loop['iterates'], loop['repeats'], loop['forever'], loop['counter'] = _transfer_loop(keyword, rest, shell)
         return [] if keyword in ('for', 'select') else rest  # a for loop's header runs nothing
     if keyword in ('!', 'function'):
         # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
@@ -6177,8 +6207,11 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
     if keyword in ('}', 'fi', 'done'):
         frame = _transfer_pop(frames, {'}': ('{',), 'fi': ('if',), 'done': _TRANSFER_LOOPS}[keyword])
         if frame:
+            endless = _transfer_endless(frame, shell)
             _transfer_doubtful(frame, shell)
             _transfer_settle(frame, ('cmd', [keyword], item[2], '', item[4]), shell)
+            if endless:
+                _transfer_jump('exit', [], shell)  # nothing after a loop that never ends runs
         shell['closed'] = frame
         return rest
     if frames:
@@ -6188,35 +6221,87 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
 
 
 def _transfer_loop(keyword: str, rest: List[str], shell: Dict) -> tuple:
-    """(whether a loop runs its body once at least: True, False, or None when not known; whether it may run it again).
-    A literal word runs a for body at least once, and a list with no words never runs a for or select body; without
-    `in` the list is the positional parameters. Any loop but a for over one plain word may run its body again."""
+    """(whether a loop runs its body once at least: True, False, or None when not known; whether it may run it again;
+    whether its test never fails; an arithmetic for's counter). A literal word runs a for body at least once, and a
+    list with no words never runs a for or select body; without `in` the list is the positional parameters. Any loop
+    but a for over one plain word, or an arithmetic for that surely stops after one pass, may run its body again."""
     if keyword == 'for' and rest[:1] and rest[0].startswith('(('):
-        return _transfer_counted(rest[0]), True
+        return _transfer_counted(rest[0])
     if keyword not in ('for', 'select'):
-        return None, True
+        return None, True, False, None
     listed = rest[2:] if rest[1:2] == ['in'] else shell['args']
     literal = keyword == 'for' and any('$' not in w and _TRANSFER_SUBSTITUTED not in w for w in listed or [])
     plain = listed is not None and len(listed) == 1 and not any(c in listed[0] for c in '$*?[\0')
-    return True if literal else False if listed == [] else None, keyword != 'for' or not plain
+    return True if literal else False if listed == [] else None, keyword != 'for' or not plain, False, None
 
 
-def _transfer_counted(word: str) -> Optional[bool]:
-    """Whether an arithmetic for runs its body once at least, from its first test: known when there is none, or when
-    it compares the counter the loop starts at a number with another number; None for anything else."""
-    parts = word[2:-2].split(';') if word.endswith('))') else []
+_TRANSFER_NAME = r'([A-Za-z_][A-Za-z0-9_]*)'
+_TRANSFER_NUMBER = r'(0|[1-9][0-9]*)'
+_TRANSFER_TESTS = {'<': int.__lt__, '<=': int.__le__, '>': int.__gt__, '>=': int.__ge__, '==': int.__eq__,
+                   '!=': int.__ne__}
+
+
+def _transfer_counted(word: str) -> tuple:
+    """_transfer_loop's answer for an arithmetic for: read when it starts its counter at a number, tests it against a
+    number and steps it by a number; with no test it runs until something leaves it."""
+    parts = [p.strip() for p in word[2:-2].split(';')] if word.endswith('))') else []
     if len(parts) != 3:
-        return None
-    start = re.fullmatch(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0|[1-9][0-9]*)\s*', parts[0])
-    test = re.fullmatch(r'\s*([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|==|!=|<|>)\s*(0|[1-9][0-9]*)\s*', parts[1])
-    if parts[0].strip() and not start:
-        return None
-    if not parts[1].strip():
-        return True  # no test runs it until a break
-    if not (start and test and start.group(1) == test.group(1)):
-        return None
-    a, op, b = int(start.group(2)), test.group(2), int(test.group(3))
-    return {'<': a < b, '<=': a <= b, '>': a > b, '>=': a >= b, '==': a == b, '!=': a != b}[op]
+        return None, True, False, None
+    start = re.fullmatch(_TRANSFER_NAME + r'\s*=\s*' + _TRANSFER_NUMBER, parts[0])
+    if parts[0] and not start:
+        return None, True, False, None
+    if not parts[1]:
+        return True, True, True, None
+    test = re.fullmatch(_TRANSFER_NAME + r'\s*(<=|>=|==|!=|<|>)\s*' + _TRANSFER_NUMBER, parts[1])
+    by = _transfer_step(parts[2], start.group(1)) if start else None
+    if not (test and by is not None and start.group(1) == test.group(1)):
+        return None, True, False, None
+    a, holds, b = int(start.group(2)), _TRANSFER_TESTS[test.group(2)], int(test.group(3))
+    if not holds(a, b):
+        return False, False, False, start.group(1)
+    # The counter runs a, a + by, a + 2 by, ...: a != test fails only if it lands on the number, any other only if
+    # the counter moves toward failing it.
+    if test.group(2) == '!=':
+        forever = by == 0 or (b - a) % by != 0 or (b - a) // by < 0
+    elif test.group(2) == '==':
+        forever = by == 0
+    else:
+        forever = by == 0 or (by > 0) == (test.group(2) in ('>', '>='))
+    return True, holds(a + by, b), forever, start.group(1)
+
+
+def _transfer_step(step: str, name: str) -> Optional[int]:
+    """How much an arithmetic for's step adds to its counter: nothing, ++ or --, += or -= a number, or the counter
+    plus or minus a number; None for anything else."""
+    if not step:
+        return 0
+    match = re.fullmatch(r'(\+\+|--)?\s*' + _TRANSFER_NAME + r'\s*(\+\+|--)?', step)
+    if match and match.group(2) == name and bool(match.group(1)) != bool(match.group(3)):
+        return 1 if (match.group(1) or match.group(3)) == '++' else -1
+    match = re.fullmatch(_TRANSFER_NAME + r'\s*([+-])=\s*' + _TRANSFER_NUMBER, step) or \
+        re.fullmatch(_TRANSFER_NAME + r'\s*=\s*' + re.escape(name) + r'\s*([+-])\s*' + _TRANSFER_NUMBER, step)
+    if match and match.group(1) == name:
+        return int(match.group(3)) * (1 if match.group(2) == '+' else -1)
+    return None
+
+
+_TRANSFER_ESCAPES = frozenset({'break', 'continue', 'return', 'eval', 'source', '.'})
+
+
+def _transfer_endless(frame: Dict, shell: Dict) -> bool:
+    """Whether a loop now closing never ends: its test never fails, and no word in it could leave it (a break,
+    continue, return, eval, source or function call). A loop whose words touch an arithmetic for's counter may also
+    run its body again."""
+    if frame['kind'] not in _TRANSFER_LOOPS:
+        return False
+    at, head = frame['head']
+    words = head[1][2 if head[1][0] in ('for', 'select') else 1:] + \
+        [w for item in shell['items'][at + 1:shell['at']] if item[0] == 'cmd' for w in item[1]]
+    counter = frame['counter'] and re.compile(r'(?<![A-Za-z0-9_])' + frame['counter'] + r'(?![A-Za-z0-9_])')
+    if counter and any(counter.search(w) for w in words):
+        frame['repeats'], frame['forever'] = True, False
+    return frame['forever'] and frame['base'] is not False and \
+        not any(w in _TRANSFER_ESCAPES or w in shell['functions'] for w in words)
 
 
 def _transfer_arithmetic(word: str) -> Optional[int]:
@@ -6345,11 +6430,11 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
     return None
 
 
-def _transfer_call(known: tuple, layer: tuple, subshell: bool, shell: Dict, depth: int) -> None:
+def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: Dict, depth: int) -> None:
     """Run a defined function's body, from known (body, whether it may not have been defined), where it is called: in
     this shell with the call's stdin and stdout, or in a subshell when the call is piped or backgrounded. A call reached
-    only through an && or || after an unknown status, or to a function that may not exist, leaves what it changed
-    unknown."""
+    only through an && or || after an unknown status, to a function that may not exist, or as the last command of a
+    pipeline (subshell None), which zsh runs in this shell and bash does not, leaves what it changed unknown."""
     body, maybe = known
     if depth >= _TRANSFER_MAX_DEPTH or shell['calls_left'] <= 0:
         shell['status'] = None
@@ -6364,12 +6449,9 @@ def _transfer_call(known: tuple, layer: tuple, subshell: bool, shell: Dict, dept
     if subshell:
         _transfer_restore(shell, state, True)
         _transfer_revive(outside, shell)
-    elif maybe or _transfer_doubt(shell['pipe']):
-        _transfer_forget(shell, _transfer_changes(shell, state))
+    elif subshell is None or maybe or _transfer_doubt(shell['pipe']):
+        _transfer_unsure(shell, state)
         _transfer_soften(outside, shell)
-        # A function the body removed may still be there.
-        shell['functions'].update((name, (known[0], True)) for name, known in state[2].items()
-                                  if name not in shell['functions'])
 
 
 def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
@@ -6378,13 +6460,15 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     layer = (before == '|', after == '|', tuple(io))
     substituted, words = any(_TRANSFER_SUBSTITUTED in w for w in words), _transfer_appends(words, shell)
     name = next((w for w in words if not _transfer_is_assignment(w)), None)
-    # A piped or backgrounded command runs in a subshell.
-    subshell = before == '|' or after in ('|', '&')
-    if name in shell['functions']:
+    # A piped or backgrounded command runs in a subshell; the last command of a pipeline (None) does in bash, but runs
+    # in this shell in zsh.
+    subshell = True if after in ('|', '&') else None if before == '|' else False
+    known = shell['functions'].get(name)
+    if known:
         outer, shell['args'] = shell['args'], words[words.index(name) + 1:]
-        _transfer_call(shell['functions'][name], layer, subshell, shell, depth)
+        _transfer_call(known, layer, subshell, shell, depth)  # the body may remove the function, as it runs on
         shell['args'] = outer
-        if not shell['functions'][name][1]:
+        if not known[1]:
             return []
         # A function that may not have been defined may leave the name to the program.
     program, args, env, cwd, other_user = _transfer_program(words, shell['cwd'])
@@ -6396,6 +6480,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_arithmetic(words[0]) if len(words) == 1 else None
     if assigns and not substituted:
         shell['status'] = 0
+    if program == 'cd' and _transfer_cd_rejected(args):
+        shell['status'] = 1
     if program in ('set', 'shift'):
         shell['args'] = None  # the positional parameters may have changed
     if program in ('return', 'exit'):
@@ -6403,14 +6489,16 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         shell['status'] = status if not args else int(int(args[0]) % 256 > 0) if args[0].isdigit() else None
         if program == 'return' and shell['floor'] is None:
             shell['status'] = 1
-    if program in ('return', 'exit', 'break', 'continue') and not subshell:
-        _transfer_jump(program, args, shell)
+    if program in ('return', 'exit', 'break', 'continue'):
+        _transfer_jump_from(program, args, subshell, shell)
     if program in ('cd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
-        # A pipeline's commands run in subshells, so their cd and variables end with them.
-        if before != '|' and after != '|':
+        # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
+        if (before != '|' and after != '|') or subshell is None:
             saved = _transfer_snapshot(shell)
             _transfer_builtin(program or '', words if assigns else args, cwd, shell)
-            if _transfer_doubt(shell['pipe']):
+            if subshell is None:
+                _transfer_unsure(shell, saved)
+            elif _transfer_doubt(shell['pipe']):
                 _transfer_forget(shell, _transfer_changes(shell, saved))  # it may not have run
         return []
     inner = _transfer_shell_string(program, args) if program else None
@@ -6419,8 +6507,23 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         # Its words after the string are $0 and then the positional parameters.
         positional = args[args.index(inner) + 2:] if program in _TRANSFER_SHELLS else []
         calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1, positional)
-        return [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
-    return [(program, args, env, cwd, other_user, (layer,))] if program else []
+        calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
+    else:
+        calls = [(program, args, env, cwd, other_user, (layer,))] if program else []
+    if program and _transfer_program_name(name) == 'exec':
+        _transfer_jump_from('exit', [], subshell, shell)  # the command replaces the shell, so nothing after it runs
+    return calls
+
+
+def _transfer_jump_from(program: str, args: List[str], subshell: Optional[bool], shell: Dict) -> None:
+    """A return, exit, break or continue where it runs: nothing beyond a subshell, and only maybe from the last
+    command of a pipeline (subshell None), which ends its subshell in bash but runs in this shell in zsh."""
+    if subshell is True:
+        return
+    outside = _transfer_liveness(shell)
+    _transfer_jump(program, args, shell)
+    if subshell is None:
+        _transfer_soften(outside, shell)
 
 
 def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:

@@ -701,9 +701,8 @@ function programName(token: string): string {
   return name.endsWith(".exe") ? name.slice(0, -4) : name;
 }
 
-/** The folder a cd with `args` lands in from `cwd`: `cwd` when no shell takes one of its options, and undefined when
- *  bash 3, bash 5 and zsh land in different places or the folder is not known. */
-function cdTarget(args: string[], cwd: string | undefined): string | undefined {
+/** A cd's option letters and its folders: options come first, -- ends them, and a lone - is a folder. */
+function cdWords(args: string[]): [string, string[]] {
   const folders = [...args];
   let letters = "";
   while (folders[0]?.startsWith("-") && folders[0] !== "-") {
@@ -711,7 +710,19 @@ function cdTarget(args: string[], cwd: string | undefined): string | undefined {
     if (option === "--") break;
     letters += option.slice(1);
   }
-  if (/[^LPeqs@0-9]/.test(letters)) return cwd; // every shell rejects the cd and stays
+  return [letters, folders];
+}
+
+/** Whether a cd has an option that bash 3, bash 5 and zsh all reject, so it fails and stays. */
+function cdRejected(args: string[]): boolean {
+  return /[^LPeqs@0-9]/.test(cdWords(args)[0]);
+}
+
+/** The folder a cd with `args` lands in from `cwd`: `cwd` when no shell takes one of its options, and undefined when
+ *  bash 3, bash 5 and zsh land in different places or the folder is not known. */
+function cdTarget(args: string[], cwd: string | undefined): string | undefined {
+  const [letters, folders] = cdWords(args);
+  if (cdRejected(args)) return cwd;
   // Bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s, -@ vary.
   if (folders.length > 1 || /[^LP]/.test(letters)) return undefined;
   // Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
@@ -875,6 +886,9 @@ interface Frame {
   iterates: Maybe;
   /** A loop that may run its body again. */
   repeats: boolean;
+  /** A loop whose test never fails, and an arithmetic for's counter. */
+  forever: boolean;
+  counter?: string;
   /** The status a return, exit, break or continue left the compound with; undefined inside when not known. */
   left?: [number | undefined];
   /** Reached only through an && or || after a status that is not known. */
@@ -1054,7 +1068,7 @@ function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): voi
     kind, base: value, runs: value, rel: true, alive: true, decided: false, state: snapshot(shell),
     status: shell.status, calls: shell.calls.length, pipedIn: shell.openingPipe, pipedOut: endsPiped(head, shell),
     outer: [shell.pipe, shell.start],
-    defines: name, head: [shell.at, head], iterates: undefined, repeats: false, doubt: doubt(shell.pipe), unsure: new Set(),
+    defines: name, head: [shell.at, head], iterates: undefined, repeats: false, forever: false, doubt: doubt(shell.pipe), unsure: new Set(),
     outside: liveness(shell),
   });
   shell.openingPipe = false;
@@ -1131,11 +1145,27 @@ function revive(outside: Liveness, shell: Shell): void {
 
 /** Wrap the commands inside a closed compound in the pipes and redirections around it; a piped or backgrounded
  *  compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it. */
+/** Wrap the commands inside a closed compound in the pipes and redirections around it; a piped or backgrounded
+ *  compound runs in a subshell, so its cd, exports, functions and any exit inside it end with it. The last command of
+ *  a pipeline runs in a subshell in bash but in this shell in zsh, so what it changed is unknown after it. */
 function closeFrame(frame: Frame, layer: Layer, shell: Shell, background = false): void {
   wrap(shell, frame.calls, layer);
-  if (layer[0] || layer[1] || background) {
+  if (layer[0] && !(layer[1] || background || frame.kind === "(" || frame.kind === "$(")) {
+    unsure(shell, frame.state);
+    revive(frame.outside, shell);
+  } else if (layer[0] || layer[1] || background) {
     restore(shell, frame.state, true);
     revive(frame.outside, shell);
+  }
+}
+
+/** Make what changed since `saved` unknown, for what may or may not have happened: the folder and variables, and each
+ *  function defined or removed, which then may or may not be there. */
+function unsure(shell: Shell, saved: Snapshot): void {
+  forget(shell, changes(shell, saved));
+  for (const [name, known] of saved[2]) if (!shell.functions.has(name)) shell.functions.set(name, [known[0], true]);
+  for (const [name, known] of [...shell.functions]) {
+    if (saved[2].get(name) !== known) shell.functions.set(name, [known[0], true]);
   }
 }
 
@@ -1154,6 +1184,7 @@ function branch(keyword: string, frame: Frame, shell: Shell): void {
   } else if (keyword === "do" && LOOPS.includes(frame.kind)) {
     if (frame.kind === "for" || frame.kind === "select") holds = frame.iterates;
     else if (frame.kind === "until" && holds !== undefined) holds = !holds;
+    if (frame.kind === "while" || frame.kind === "until") frame.forever = holds === true; // a literal test holds every time
     taken = both(frame.rel, holds);
   } else {
     return;
@@ -1224,7 +1255,7 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
     openFrame(word, shell.pipe.runs, shell, { kind: "cmd", argv, before: "", after: item.after, io: item.io });
     if (LOOPS.includes(word)) {
       const frame = frames.at(-1) as Frame;
-      [frame.iterates, frame.repeats] = loop(word, rest, shell);
+      [frame.iterates, frame.repeats, frame.forever, frame.counter] = loop(word, rest, shell);
     }
     return word === "for" || word === "select" ? [] : rest; // a for loop's header runs nothing
   }
@@ -1238,8 +1269,10 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
     if (frame !== undefined) {
+      const ends = endless(frame, shell);
       doubtful(frame, shell);
       settle(frame, { kind: "cmd", argv: [word], before: item.before, after: "", io: item.io }, shell);
+      if (ends) jump("exit", [], shell); // nothing after a loop that never ends runs
     }
     shell.closed = frame;
     return rest;
@@ -1254,28 +1287,82 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
  *  again]. A literal word runs a for body at least once, and a list with no words never runs a for or select body;
  *  without `in` the list is the positional parameters. Any loop but a for over one plain word may run its body
  *  again. */
-function loop(word: string, rest: string[], shell: Shell): [Maybe, boolean] {
-  if (word === "for" && rest[0]?.startsWith("((")) return [counted(rest[0]), true];
-  if (word !== "for" && word !== "select") return [undefined, true];
+type LoopRead = [iterates: Maybe, repeats: boolean, forever: boolean, counter: string | undefined];
+
+/** [whether a loop runs its body once at least: true, false, or undefined when not known; whether it may run it
+ *  again; whether its test never fails; an arithmetic for's counter]. A literal word runs a for body at least once,
+ *  and a list with no words never runs a for or select body; without `in` the list is the positional parameters. Any
+ *  loop but a for over one plain word, or an arithmetic for that surely stops after one pass, may run its body
+ *  again. */
+function loop(word: string, rest: string[], shell: Shell): LoopRead {
+  if (word === "for" && rest[0]?.startsWith("((")) return counted(rest[0]);
+  if (word !== "for" && word !== "select") return [undefined, true, false, undefined];
   const listed = rest[1] === "in" ? rest.slice(2) : shell.args;
   const literal = word === "for" && (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
   const plain = listed?.length === 1 && ![..."$*?[", SUBSTITUTED].some((c) => (listed[0] as string).includes(c));
-  return [literal ? true : listed?.length === 0 ? false : undefined, word !== "for" || !plain];
+  return [literal ? true : listed?.length === 0 ? false : undefined, word !== "for" || !plain, false, undefined];
 }
 
-/** Whether an arithmetic for runs its body once at least, from its first test: known when there is none, or when it
- *  compares the counter the loop starts at a number with another number; undefined for anything else. */
-function counted(word: string): Maybe {
-  const parts = word.endsWith("))") ? word.slice(2, -2).split(";") : [];
-  if (parts.length !== 3) return undefined;
-  const [init, check] = parts as [string, string, string];
-  const start = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0|[1-9][0-9]*)\s*$/.exec(init);
-  const test = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|==|!=|<|>)\s*(0|[1-9][0-9]*)\s*$/.exec(check);
-  if (init.trim() !== "" && start === null) return undefined;
-  if (check.trim() === "") return true; // no test runs it until a break
-  if (start === null || test === null || start[1] !== test[1]) return undefined;
-  const [a, op, b] = [Number(start[2]), test[2], Number(test[3])];
-  return { "<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b, "==": a === b, "!=": a !== b }[op as string];
+const NAME = "([A-Za-z_][A-Za-z0-9_]*)";
+const NUMBER = "(0|[1-9][0-9]*)";
+const TESTS: Record<string, (a: bigint, b: bigint) => boolean> = {
+  "<": (a, b) => a < b, "<=": (a, b) => a <= b, ">": (a, b) => a > b, ">=": (a, b) => a >= b,
+  "==": (a, b) => a === b, "!=": (a, b) => a !== b,
+};
+
+/** `loop`'s answer for an arithmetic for: read when it starts its counter at a number, tests it against a number and
+ *  steps it by a number; with no test it runs until something leaves it. */
+function counted(word: string): LoopRead {
+  const unknown: LoopRead = [undefined, true, false, undefined];
+  const parts = word.endsWith("))") ? word.slice(2, -2).split(";").map((p) => p.trim()) : [];
+  if (parts.length !== 3) return unknown;
+  const [init, check, step] = parts as [string, string, string];
+  const start = new RegExp(`^${NAME}\\s*=\\s*${NUMBER}$`).exec(init);
+  if (init !== "" && start === null) return unknown;
+  if (check === "") return [true, true, true, undefined];
+  const test = new RegExp(`^${NAME}\\s*(<=|>=|==|!=|<|>)\\s*${NUMBER}$`).exec(check);
+  const by = start === null ? undefined : stepOf(step, start[1] as string);
+  if (start === null || test === null || by === undefined || start[1] !== test[1]) return unknown;
+  const [a, op, b] = [BigInt(start[2] as string), test[2] as string, BigInt(test[3] as string)];
+  const holds = TESTS[op] as (a: bigint, b: bigint) => boolean;
+  if (!holds(a, b)) return [false, false, false, start[1]];
+  // The counter runs a, a + by, a + 2 by, ...: a != test fails only if it lands on the number, any other only if the
+  // counter moves toward failing it.
+  const forever = op === "!=" ? by === 0n || (b - a) % by !== 0n || (b - a) / by < 0n
+    : op === "==" ? by === 0n
+    : by === 0n || (by > 0n) === (op === ">" || op === ">=");
+  return [true, holds(a + by, b), forever, start[1]];
+}
+
+/** How much an arithmetic for's step adds to its counter: nothing, ++ or --, += or -= a number, or the counter plus
+ *  or minus a number; undefined for anything else. */
+function stepOf(step: string, name: string): bigint | undefined {
+  if (step === "") return 0n;
+  let match = new RegExp(`^(\\+\\+|--)?\\s*${NAME}\\s*(\\+\\+|--)?$`).exec(step);
+  if (match !== null && match[2] === name && (match[1] === undefined) !== (match[3] === undefined)) {
+    return (match[1] ?? match[3]) === "++" ? 1n : -1n;
+  }
+  match = new RegExp(`^${NAME}\\s*([+-])=\\s*${NUMBER}$`).exec(step) ??
+    new RegExp(`^${NAME}\\s*=\\s*${name}\\s*([+-])\\s*${NUMBER}$`).exec(step);
+  if (match !== null && match[1] === name) return BigInt(match[3] as string) * (match[2] === "+" ? 1n : -1n);
+  return undefined;
+}
+
+const ESCAPES: ReadonlySet<string> = new Set(["break", "continue", "return", "eval", "source", "."]);
+
+/** Whether a loop now closing never ends: its test never fails, and no word in it could leave it (a break, continue,
+ *  return, eval, source or function call). A loop whose words touch an arithmetic for's counter may also run its
+ *  body again. */
+function endless(frame: Frame, shell: Shell): boolean {
+  if (!LOOPS.includes(frame.kind)) return false;
+  const [at, head] = frame.head;
+  const words = [
+    ...head.argv.slice(head.argv[0] === "for" || head.argv[0] === "select" ? 2 : 1),
+    ...shell.items.slice(at + 1, shell.at).flatMap((item) => (item.kind === "cmd" ? item.argv : [])),
+  ];
+  const counter = frame.counter === undefined ? undefined : new RegExp(`(?<![A-Za-z0-9_])${frame.counter}(?![A-Za-z0-9_])`);
+  if (counter !== undefined && words.some((w) => counter.test(w))) [frame.repeats, frame.forever] = [true, false];
+  return frame.forever && frame.base !== false && !words.some((w) => ESCAPES.has(w) || shell.functions.has(w));
 }
 
 /** The status a (( N )) with a decimal number leaves: 0 for one that is not zero, 1 for zero; undefined otherwise. A
@@ -1419,9 +1506,9 @@ function shellString(name: string, args: string[]): string | undefined {
 
 /** Run a defined function's body, from `known` (body, whether it may not have been defined), where it is called: in
  *  this shell with the call's stdin and stdout, or in a subshell when the call is piped or backgrounded. A call reached
- *  only through an && or || after an unknown status, or to a function that may not exist, leaves what it changed
- *  unknown. */
-function callFunction(known: [Item[], boolean], layer: Layer, subshell: boolean, shell: Shell, depth: number): void {
+ *  only through an && or || after an unknown status, to a function that may not exist, or as the last command of a
+ *  pipeline (`subshell` undefined), which zsh runs in this shell and bash does not, leaves what it changed unknown. */
+function callFunction(known: [Item[], boolean], layer: Layer, subshell: Maybe, shell: Shell, depth: number): void {
   const [body, maybe] = known;
   if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
     shell.status = undefined;
@@ -1439,11 +1526,9 @@ function callFunction(known: [Item[], boolean], layer: Layer, subshell: boolean,
   if (subshell) {
     restore(shell, state, true);
     revive(outside, shell);
-  } else if (maybe || doubt(shell.pipe)) {
-    forget(shell, changes(shell, state));
+  } else if (subshell === undefined || maybe || doubt(shell.pipe)) {
+    unsure(shell, state);
     soften(outside, shell);
-    // A function the body removed may still be there.
-    for (const [name, known] of state[2]) if (!shell.functions.has(name)) shell.functions.set(name, [known[0], true]);
   }
 }
 
@@ -1469,8 +1554,9 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   const layer: Layer = [before === "|", item.after === "|", item.io];
   const substituted = words.some((word) => word.includes(SUBSTITUTED));
   const argv = appends(words, shell);
-  // A piped or backgrounded command runs in a subshell.
-  const subshell = before === "|" || item.after === "|" || item.after === "&";
+  // A piped or backgrounded command runs in a subshell; the last command of a pipeline (undefined) does in bash, but
+  // runs in this shell in zsh.
+  const subshell: Maybe = item.after === "|" || item.after === "&" ? true : before === "|" ? undefined : false;
   const called = argv.find((word) => !isAssignment(word));
   const known = called === undefined ? undefined : shell.functions.get(called);
   if (known !== undefined) {
@@ -1490,6 +1576,7 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
   if (assigns && !substituted) shell.status = 0;
+  if (name === "cd" && cdRejected(args)) shell.status = 1;
   if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
   if (name === "return" || name === "exit") {
     // Either leaves the status it is given, or else the one before it; a return outside a function fails.
@@ -1497,13 +1584,14 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     shell.status = given === undefined ? status : /^\d+$/.test(given) ? Number(BigInt(given) % 256n > 0n) : undefined;
     if (name === "return" && shell.floor === undefined) shell.status = 1;
   }
-  if ((name === "return" || name === "exit" || name === "break" || name === "continue") && !subshell) jump(name, args, shell);
+  if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name as string) || assigns) {
-    // A pipeline's commands run in subshells, so their cd and variables end with them.
-    if (before !== "|" && item.after !== "|") {
+    // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
+    if ((before !== "|" && item.after !== "|") || subshell === undefined) {
       const saved = snapshot(shell);
       builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
-      if (doubt(shell.pipe)) forget(shell, changes(shell, saved)); // it may not have run
+      if (subshell === undefined) unsure(shell, saved);
+      else if (doubt(shell.pipe)) forget(shell, changes(shell, saved)); // it may not have run
     }
     return [];
   }
@@ -1512,14 +1600,30 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // The string's commands run as the wrapper's user and read its stdin and write its stdout.
     // Its words after the string are $0 and then the positional parameters.
     const positional = SHELLS.has(name as string) ? args.slice(args.indexOf(inner) + 2) : [];
-    return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional).map((call) => ({
+    const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
+    return replaced(called, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
       layers: [...call.layers, layer],
-    }));
+    })));
   }
   if (name === undefined) return [];
-  return [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }];
+  return replaced(called, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
+}
+
+/** The calls of a command run through exec, which replaces the shell, so nothing after it runs. */
+function replaced(word: string | undefined, subshell: Maybe, shell: Shell, calls: Call[]): Call[] {
+  if (word !== undefined && programName(word) === "exec") jumpFrom("exit", [], subshell, shell);
+  return calls;
+}
+
+/** A return, exit, break or continue where it runs: nothing beyond a subshell, and only maybe from the last command
+ *  of a pipeline (`subshell` undefined), which ends its subshell in bash but runs in this shell in zsh. */
+function jumpFrom(name: string, args: string[], subshell: Maybe, shell: Shell): void {
+  if (subshell === true) return;
+  const outside = liveness(shell);
+  jump(name, args, shell);
+  if (subshell === undefined) soften(outside, shell);
 }
 
 /** The calls one simple command makes, if it runs or may run, after the reserved words that lead it. */
