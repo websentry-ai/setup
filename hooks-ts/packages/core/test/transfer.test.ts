@@ -515,7 +515,11 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // An arithmetic for that stops after one pass keeps its cd, unless its body touches the counter.
     ["for ((i=0;i<1;i++)); do cd frontend; done; scp -F cfg f prod:/tmp", "10.0.4.12"],
-    ["for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp", "prod"],
+    ["for ((i=0;i<1;i++)); do cd frontend; [ -f m ] && i=-1; done; scp -F cfg f prod:/tmp", "prod"],
+    ["for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["for ((i=0;i<1;i++)); do echo $i; cd frontend; done; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    // exec replaces the shell even when what it runs is a builtin, so the scp never runs.
+    ["exec cd frontend; scp -F cfg f prod:/tmp", undefined],
   ] as const) assert.equal(await at(command), expected, command);
 });
 

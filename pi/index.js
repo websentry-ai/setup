@@ -1892,6 +1892,7 @@ var WRAPPERS = {
   ionice: { short: "cnp", long: ["--class", "--classdata", "--pid"], operands: 0 },
   exec: { short: "a", long: [], operands: 0 },
   command: { short: "", long: [], operands: 0 },
+  builtin: { short: "", long: [], operands: 0 },
   nohup: { short: "", long: [], operands: 0 }
 };
 var WRAPPER_CHDIR = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
@@ -2019,6 +2020,46 @@ async function run(argv, state) {
     return void 0;
   }
 }
+function wordEnd(text, start) {
+  let i = start;
+  while (i < text.length && (text[i] === " " || text[i] === "	")) i++;
+  const bodies = [];
+  let quote;
+  for (; i < text.length; i++) {
+    const ch = text[i];
+    const at = i;
+    if (quote === "'") {
+      if (ch === "'") quote = void 0;
+    } else if (ch === "\\") {
+      i++;
+    } else if (text.startsWith("$(", i) || ch === "`") {
+      i = ch === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
+      if (i < 0) return [-1, bodies];
+      if (!text.startsWith("$((", at)) bodies.push(ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i));
+    } else if (quote === '"') {
+      if (ch === '"') quote = void 0;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (" 	\r\n;&|<>()".includes(ch)) {
+      break;
+    }
+  }
+  return [i, bodies];
+}
+function heredocBodies(body) {
+  const bodies = [];
+  for (let i = 0; i < body.length; i++) {
+    const at = i;
+    if (body[i] === "\\") {
+      i++;
+    } else if (body.startsWith("$(", i) || body[i] === "`") {
+      i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
+      if (i < 0) return void 0;
+      if (!body.startsWith("$((", at)) bodies.push(body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i));
+    }
+  }
+  return bodies;
+}
 function readWord(text, start) {
   let i = start;
   while (i < text.length && (text[i] === " " || text[i] === "	")) i++;
@@ -2079,7 +2120,10 @@ var Lexer = class _Lexer {
   inWord = false;
   before = "";
   io = [];
+  /** Each heredoc still to read: its delimiter, whether tabs are stripped, and where an unquoted one's substitutions
+   *  go. */
   heredocs = [];
+  failed = false;
   cases = [];
   text;
   depth;
@@ -2094,11 +2138,11 @@ var Lexer = class _Lexer {
   read() {
     if (this.depth > MAX_DEPTH) return void 0;
     for (; this.i < this.text.length; this.i++) {
-      if (!(this.quote !== void 0 ? this.quoted() : this.unquoted())) return void 0;
+      if (!(this.quote !== void 0 ? this.quoted() : this.unquoted()) || this.failed) return void 0;
     }
     if (this.quote !== void 0) return void 0;
     this.endCommand("");
-    return this.items;
+    return this.failed ? void 0 : this.items;
   }
   marker(kind, before = "", argv = []) {
     this.items.push({ kind, argv, before, after: "", io: [] });
@@ -2240,8 +2284,19 @@ var Lexer = class _Lexer {
     this.word = "";
     this.inWord = false;
     const op = /^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(text.slice(this.i))[0];
-    const [target, end2] = readWord(text, this.i + op.length);
-    if (op === "<<" || op === "<<-") this.heredocs.push([target, op === "<<-"]);
+    let [target, end2] = readWord(text, this.i + op.length);
+    if (op === "<<" || op === "<<-") {
+      const quoted = /['"\\]/.test(text.slice(this.i + op.length, end2));
+      this.heredocs.push([target, op === "<<-", quoted ? void 0 : this.substitutionsAt()]);
+    } else {
+      const [wordStop, bodies] = wordEnd(text, this.i + op.length);
+      if (wordStop < 0) {
+        this.failed = true;
+        return;
+      }
+      end2 = wordStop;
+      this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : void 0);
+    }
     const to = fd ?? (op.startsWith("<") ? 0 : 1);
     if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
       this.io.push([to, target === "-" ? "null" : Number(target)]);
@@ -2272,17 +2327,48 @@ var Lexer = class _Lexer {
     if (ch === "\n") this.skipHeredocs();
   }
   /** A heredoc's body starts on the next line and is input, not commands. */
+  /** A heredoc's body starts on the next line and is input, not commands, but for the substitutions in one whose
+   *  delimiter is unquoted, which run with its command. */
   skipHeredocs() {
     const { text } = this;
+    let shift = 0;
     while (this.heredocs.length > 0) {
-      const [delimiter, stripTabs] = this.heredocs.shift();
+      const [delimiter, stripTabs, at] = this.heredocs.shift();
+      const lines = [];
       while (this.i + 1 < text.length) {
         const end2 = text.indexOf("\n", this.i + 1);
         const line = end2 < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end2);
         this.i = end2 < 0 ? text.length - 1 : end2;
         if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        lines.push(line);
       }
+      const bodies = at === void 0 ? [] : heredocBodies(lines.join("\n"));
+      if (bodies === void 0) {
+        this.failed = true;
+        return;
+      }
+      shift += this.substitute(bodies, at === void 0 ? void 0 : [at[0] + shift, at[1]]);
     }
+  }
+  /** Where substitutions that run with the current command go: after the reserved words that lead it, so they run
+   *  only when it does; [index in items, operator before]. */
+  substitutionsAt() {
+    this.flushLeading();
+    return [this.items.length, this.before];
+  }
+  /** Insert each body as a substitution at `at` [index in items, operator before]; how many items that added. */
+  substitute(bodies, at) {
+    const added = [];
+    for (const body of bodies) {
+      const items = new _Lexer(body, this.depth + 1).read();
+      if (items === void 0) {
+        this.failed = true;
+        return 0;
+      }
+      added.push({ kind: "$(", argv: [], before: at?.[1] ?? "", after: "", io: [] }, ...items, { kind: ")", argv: [], before: "", after: "", io: [] });
+    }
+    if (at !== void 0 && added.length > 0) this.items.splice(at[0], 0, ...added);
+    return added.length;
   }
   endWord() {
     if (!this.inWord) return;
@@ -2785,6 +2871,7 @@ function keyword(argv, item, shell) {
     if (LOOPS.includes(word)) {
       const frame = frames.at(-1);
       [frame.iterates, frame.repeats, frame.forever, frame.counter] = loop(word, rest, shell);
+      touched(frame, loopCommands(frame, shell, shell.ends.get(`${shell.at},${item.argv.length - argv.length}`)?.[1]));
     }
     return word === "for" || word === "select" ? [] : rest;
   }
@@ -2855,17 +2942,52 @@ function stepOf(step, name) {
   if (match !== null && match[1] === name) return BigInt(match[3]) * (match[2] === "+" ? 1n : -1n);
   return void 0;
 }
-var ESCAPES = /* @__PURE__ */ new Set(["break", "continue", "return", "eval", "source", "."]);
-function endless(frame, shell) {
-  if (!LOOPS.includes(frame.kind)) return false;
+function loopCommands(frame, shell, end2) {
   const [at, head] = frame.head;
-  const words2 = [
-    ...head.argv.slice(head.argv[0] === "for" || head.argv[0] === "select" ? 2 : 1),
-    ...shell.items.slice(at + 1, shell.at).flatMap((item) => item.kind === "cmd" ? item.argv : [])
-  ];
-  const counter = frame.counter === void 0 ? void 0 : new RegExp(`(?<![A-Za-z0-9_])${frame.counter}(?![A-Za-z0-9_])`);
-  if (counter !== void 0 && words2.some((w) => counter.test(w))) [frame.repeats, frame.forever] = [true, false];
-  return frame.forever && frame.base !== false && !words2.some((w) => ESCAPES.has(w) || shell.functions.has(w));
+  if (end2 === void 0) return void 0;
+  return [head.argv.slice(head.argv[0] === "for" || head.argv[0] === "select" ? 2 : 1), ...ownCommands(shell.items.slice(at + 1, end2))];
+}
+function ownCommands(list) {
+  let depth = 0;
+  const commands = [];
+  for (const item of list) {
+    depth += item.kind === "(" || item.kind === "$(" ? 1 : item.kind === ")" ? -1 : 0;
+    if (item.kind === "cmd" && depth === 0) commands.push(item.argv);
+  }
+  return commands;
+}
+function touched(frame, commands) {
+  const name = frame.counter;
+  if (name === void 0) return;
+  const pattern = new RegExp(`(?<![A-Za-z0-9_])${name}(?![A-Za-z0-9_])`, "g");
+  for (const word of (commands ?? [[name]]).flat()) {
+    for (const match of word.matchAll(pattern)) {
+      const [before, after] = [word.slice(0, match.index), word.slice(match.index + name.length)];
+      if (!(before.endsWith("$") || before.endsWith("${") && after.startsWith("}"))) {
+        [frame.repeats, frame.forever] = [true, false];
+        return;
+      }
+    }
+  }
+}
+function leaves(commands, shell, called, seen) {
+  for (const words2 of commands) {
+    for (let k = 0; k < words2.length; k++) {
+      const word = words2[k];
+      const count = words2[k + 1] ?? "1";
+      if (["break", "eval", "source", "."].includes(word) || word === "return" && !called || word === "continue" && !(/^\d+$/.test(count) && Number(count) <= 1)) return true;
+      const known = shell.functions.get(word);
+      if (known !== void 0 && !seen.has(word)) {
+        seen.add(word);
+        if (leaves(ownCommands(known[0]), shell, true, seen)) return true;
+      }
+    }
+  }
+  return false;
+}
+function endless(frame, shell) {
+  const commands = LOOPS.includes(frame.kind) ? loopCommands(frame, shell, shell.at) : void 0;
+  return commands !== void 0 && frame.forever && frame.base !== false && !leaves(commands, shell, false, /* @__PURE__ */ new Set());
 }
 function arithmetic(word) {
   const inner = word.startsWith("((") && word.endsWith("))") ? word.slice(2, -2).trim() : "";
@@ -3052,24 +3174,34 @@ function simple(words2, item, before, shell, depth) {
       if (subshell === void 0) unsure(shell, saved);
       else if (doubt(shell.pipe)) forget(shell, changes(shell, saved));
     }
+    replaceShell(argv, subshell, shell);
     return [];
   }
   const inner = name === void 0 ? void 0 : shellString(name, args);
   if (inner !== void 0) {
     const positional = SHELLS.has(name) ? args.slice(args.indexOf(inner) + 2) : [];
     const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
-    return replaced(called, subshell, shell, calls.map((call) => ({
+    return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
       layers: [...call.layers, layer]
     })));
   }
   if (name === void 0) return [];
-  return replaced(called, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
+  return replaced(argv, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
 }
-function replaced(word, subshell, shell, calls) {
-  if (word !== void 0 && programName(word) === "exec") jumpFrom("exit", [], subshell, shell);
+function replaced(argv, subshell, shell, calls) {
+  replaceShell(argv, subshell, shell);
   return calls;
+}
+function replaceShell(argv, subshell, shell) {
+  let rest = argv.filter((word) => !isAssignment(word));
+  let behindCommand = false;
+  while (rest.length > 0 && ["command", "builtin", "time", "-p", "--"].includes(rest[0])) {
+    behindCommand ||= rest[0] === "command";
+    rest = rest.slice(1);
+  }
+  if (rest.length > 1 && rest[0] === "exec") jumpFrom("exit", [], !behindCommand || subshell === true ? subshell : void 0, shell);
 }
 function jumpFrom(name, args, subshell, shell) {
   if (subshell === true) return;
@@ -3115,11 +3247,11 @@ function compoundEnds(list) {
   const opened = [];
   list.forEach(({ kind, argv, after }, at) => {
     if (kind === "(" || kind === "$(" || kind === "case") opened.push(`${at},0`);
-    else if ((kind === ")" || kind === "esac") && opened.length > 0) ends.set(opened.pop(), after);
+    else if ((kind === ")" || kind === "esac") && opened.length > 0) ends.set(opened.pop(), [after, at]);
     for (let k = 0; kind === "cmd" && k < argv.length && KEYWORDS.has(argv[k]); ) {
       const word = argv[k];
       if ((word === "}" || word === "fi" || word === "done") && opened.length > 0) {
-        ends.set(opened.pop(), k === argv.length - 1 ? after : "");
+        ends.set(opened.pop(), [k === argv.length - 1 ? after : "", at]);
       } else if (word === "{" || word === "if" || LOOPS.includes(word)) {
         opened.push(`${at},${k}`);
         if (word === "for" || word === "select") break;
@@ -3132,7 +3264,7 @@ function compoundEnds(list) {
 function endsPiped(head, shell) {
   const item = shell.items[shell.at] ?? head;
   const k = head.kind === "cmd" && item.kind === "cmd" ? item.argv.length - head.argv.length : 0;
-  const after = shell.ends.get(`${shell.at},${k}`);
+  const after = shell.ends.get(`${shell.at},${k}`)?.[0];
   return after === "|" || after === "&";
 }
 function walk(items, cwd, exported, processEnv, depth, positional = []) {

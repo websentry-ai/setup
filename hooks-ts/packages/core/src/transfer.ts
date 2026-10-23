@@ -59,6 +59,7 @@ const WRAPPERS: Record<string, { short: string; long: readonly string[]; operand
   ionice: { short: "cnp", long: ["--class", "--classdata", "--pid"], operands: 0 },
   exec: { short: "a", long: [], operands: 0 },
   command: { short: "", long: [], operands: 0 },
+  builtin: { short: "", long: [], operands: 0 },
   nohup: { short: "", long: [], operands: 0 },
 };
 /** Where `-C`/`--chdir` or `-D` moves a wrapped command. */
@@ -214,6 +215,52 @@ async function run(argv: string[], state: State): Promise<string | undefined> {
   }
 }
 
+/** The index after the shell word starting at `start` after blanks, and the $( ) and backtick bodies in it, which run;
+ *  the index is -1 when one of them is not closed. */
+function wordEnd(text: string, start: number): [number, string[]] {
+  let i = start;
+  while (i < text.length && (text[i] === " " || text[i] === "\t")) i++;
+  const bodies: string[] = [];
+  let quote: string | undefined;
+  for (; i < text.length; i++) {
+    const ch = text[i] as string;
+    const at = i;
+    if (quote === "'") {
+      if (ch === "'") quote = undefined;
+    } else if (ch === "\\") {
+      i++;
+    } else if (text.startsWith("$(", i) || ch === "`") {
+      i = ch === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
+      if (i < 0) return [-1, bodies];
+      if (!text.startsWith("$((", at)) bodies.push(ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)); // arithmetic runs no commands
+    } else if (quote === '"') {
+      if (ch === '"') quote = undefined;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (" \t\r\n;&|<>()".includes(ch)) {
+      break;
+    }
+  }
+  return [i, bodies];
+}
+
+/** The $( ) and backtick bodies a heredoc with an unquoted delimiter runs; quotes are plain text there, and a
+ *  backslash escapes the next character. Undefined when one is not closed. */
+function heredocBodies(body: string): string[] | undefined {
+  const bodies: string[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const at = i;
+    if (body[i] === "\\") {
+      i++;
+    } else if (body.startsWith("$(", i) || body[i] === "`") {
+      i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
+      if (i < 0) return undefined;
+      if (!body.startsWith("$((", at)) bodies.push(body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i));
+    }
+  }
+  return bodies;
+}
+
 /** The shell word starting at `start` after blanks, and the index after it; quotes and backslashes are undone. */
 function readWord(text: string, start: number): [string, number] {
   let i = start;
@@ -296,7 +343,10 @@ class Lexer {
   private inWord = false;
   private before = "";
   private io: Redirection[] = [];
-  private readonly heredocs: [string, boolean][] = [];
+  /** Each heredoc still to read: its delimiter, whether tabs are stripped, and where an unquoted one's substitutions
+   *  go. */
+  private readonly heredocs: [string, boolean, [number, string] | undefined][] = [];
+  private failed = false;
   private readonly cases: string[] = [];
   private readonly text: string;
   private readonly depth: number;
@@ -313,11 +363,11 @@ class Lexer {
   read(): Item[] | undefined {
     if (this.depth > MAX_DEPTH) return undefined;
     for (; this.i < this.text.length; this.i++) {
-      if (!(this.quote !== undefined ? this.quoted() : this.unquoted())) return undefined;
+      if (!(this.quote !== undefined ? this.quoted() : this.unquoted()) || this.failed) return undefined;
     }
     if (this.quote !== undefined) return undefined;
     this.endCommand("");
-    return this.items;
+    return this.failed ? undefined : this.items;
   }
 
   private marker(kind: Item["kind"], before = "", argv: string[] = []): void {
@@ -470,8 +520,21 @@ class Lexer {
     this.word = "";
     this.inWord = false;
     const op = (/^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(text.slice(this.i)) as RegExpExecArray)[0];
-    const [target, end] = readWord(text, this.i + op.length);
-    if (op === "<<" || op === "<<-") this.heredocs.push([target, op === "<<-"]);
+    let [target, end] = readWord(text, this.i + op.length);
+    if (op === "<<" || op === "<<-") {
+      // An unquoted delimiter leaves the body's substitutions to run, with the command, before it does.
+      const quoted = /['"\\]/.test(text.slice(this.i + op.length, end));
+      this.heredocs.push([target, op === "<<-", quoted ? undefined : this.substitutionsAt()]);
+    } else {
+      // A target's substitutions run with the command too, such as a here-string's "$(curl …)".
+      const [wordStop, bodies] = wordEnd(text, this.i + op.length);
+      if (wordStop < 0) {
+        this.failed = true;
+        return;
+      }
+      end = wordStop;
+      this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : undefined);
+    }
     const to = fd ?? (op.startsWith("<") ? 0 : 1);
     if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
       this.io.push([to, target === "-" ? "null" : Number(target)]);
@@ -505,17 +568,50 @@ class Lexer {
   }
 
   /** A heredoc's body starts on the next line and is input, not commands. */
+  /** A heredoc's body starts on the next line and is input, not commands, but for the substitutions in one whose
+   *  delimiter is unquoted, which run with its command. */
   private skipHeredocs(): void {
     const { text } = this;
+    let shift = 0;
     while (this.heredocs.length > 0) {
-      const [delimiter, stripTabs] = this.heredocs.shift() as [string, boolean];
+      const [delimiter, stripTabs, at] = this.heredocs.shift() as [string, boolean, [number, string] | undefined];
+      const lines: string[] = [];
       while (this.i + 1 < text.length) {
         const end = text.indexOf("\n", this.i + 1);
         const line = end < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end);
         this.i = end < 0 ? text.length - 1 : end;
         if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        lines.push(line);
       }
+      const bodies = at === undefined ? [] : heredocBodies(lines.join("\n"));
+      if (bodies === undefined) {
+        this.failed = true;
+        return;
+      }
+      shift += this.substitute(bodies, at === undefined ? undefined : [at[0] + shift, at[1]]);
     }
+  }
+
+  /** Where substitutions that run with the current command go: after the reserved words that lead it, so they run
+   *  only when it does; [index in items, operator before]. */
+  private substitutionsAt(): [number, string] {
+    this.flushLeading();
+    return [this.items.length, this.before];
+  }
+
+  /** Insert each body as a substitution at `at` [index in items, operator before]; how many items that added. */
+  private substitute(bodies: string[], at: [number, string] | undefined): number {
+    const added: Item[] = [];
+    for (const body of bodies) {
+      const items = new Lexer(body, this.depth + 1).read();
+      if (items === undefined) {
+        this.failed = true;
+        return 0;
+      }
+      added.push({ kind: "$(", argv: [], before: at?.[1] ?? "", after: "", io: [] }, ...items, { kind: ")", argv: [], before: "", after: "", io: [] });
+    }
+    if (at !== undefined && added.length > 0) this.items.splice(at[0], 0, ...added);
+    return added.length;
   }
 
   private endWord(): void {
@@ -928,7 +1024,7 @@ interface Shell {
   /** The positional parameters, undefined when not known. */
   args: string[] | undefined;
   /** What follows the end of each compound in `items`, by where it opens. */
-  ends: Map<string, string>;
+  ends: Map<string, [string, number]>;
 }
 
 /** The pipes and redirections around a call at one level: piped in, piped out, and its redirections. */
@@ -1256,6 +1352,7 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
     if (LOOPS.includes(word)) {
       const frame = frames.at(-1) as Frame;
       [frame.iterates, frame.repeats, frame.forever, frame.counter] = loop(word, rest, shell);
+      touched(frame, loopCommands(frame, shell, shell.ends.get(`${shell.at},${item.argv.length - argv.length}`)?.[1]));
     }
     return word === "for" || word === "select" ? [] : rest; // a for loop's header runs nothing
   }
@@ -1348,21 +1445,65 @@ function stepOf(step: string, name: string): bigint | undefined {
   return undefined;
 }
 
-const ESCAPES: ReadonlySet<string> = new Set(["break", "continue", "return", "eval", "source", "."]);
-
-/** Whether a loop now closing never ends: its test never fails, and no word in it could leave it (a break, continue,
- *  return, eval, source or function call). A loop whose words touch an arithmetic for's counter may also run its
- *  body again. */
-function endless(frame: Frame, shell: Shell): boolean {
-  if (!LOOPS.includes(frame.kind)) return false;
+/** The words of each command a loop runs in this shell, from its condition up to the item `end`, leaving out those in
+ *  a subshell or substitution; undefined when its end is not known. */
+function loopCommands(frame: Frame, shell: Shell, end: number | undefined): string[][] | undefined {
   const [at, head] = frame.head;
-  const words = [
-    ...head.argv.slice(head.argv[0] === "for" || head.argv[0] === "select" ? 2 : 1),
-    ...shell.items.slice(at + 1, shell.at).flatMap((item) => (item.kind === "cmd" ? item.argv : [])),
-  ];
-  const counter = frame.counter === undefined ? undefined : new RegExp(`(?<![A-Za-z0-9_])${frame.counter}(?![A-Za-z0-9_])`);
-  if (counter !== undefined && words.some((w) => counter.test(w))) [frame.repeats, frame.forever] = [true, false];
-  return frame.forever && frame.base !== false && !words.some((w) => ESCAPES.has(w) || shell.functions.has(w));
+  if (end === undefined) return undefined;
+  return [head.argv.slice(head.argv[0] === "for" || head.argv[0] === "select" ? 2 : 1), ...ownCommands(shell.items.slice(at + 1, end))];
+}
+
+/** The words of each command in `list` that runs in this shell, not in a subshell or substitution. */
+function ownCommands(list: Item[]): string[][] {
+  let depth = 0;
+  const commands: string[][] = [];
+  for (const item of list) {
+    depth += item.kind === "(" || item.kind === "$(" ? 1 : item.kind === ")" ? -1 : 0;
+    if (item.kind === "cmd" && depth === 0) commands.push(item.argv);
+  }
+  return commands;
+}
+
+/** An arithmetic for that may change its counter may run its body again, and its test may fail after all; a plain
+ *  $name or ${name} only reads it. */
+function touched(frame: Frame, commands: string[][] | undefined): void {
+  const name = frame.counter;
+  if (name === undefined) return;
+  const pattern = new RegExp(`(?<![A-Za-z0-9_])${name}(?![A-Za-z0-9_])`, "g");
+  for (const word of (commands ?? [[name]]).flat()) {
+    for (const match of word.matchAll(pattern)) {
+      const [before, after] = [word.slice(0, match.index), word.slice((match.index as number) + name.length)];
+      if (!(before.endsWith("$") || (before.endsWith("${") && after.startsWith("}")))) {
+        [frame.repeats, frame.forever] = [true, false];
+        return;
+      }
+    }
+  }
+}
+
+/** Whether `commands` could leave the loop they run in: a break, a continue past it, a return (but in a called
+ *  function, where it only ends the call), eval or source, or a call to a function that could. */
+function leaves(commands: string[][], shell: Shell, called: boolean, seen: Set<string>): boolean {
+  for (const words of commands) {
+    for (let k = 0; k < words.length; k++) {
+      const word = words[k] as string;
+      const count = words[k + 1] ?? "1";
+      if (["break", "eval", "source", "."].includes(word) || (word === "return" && !called) ||
+          (word === "continue" && !(/^\d+$/.test(count) && Number(count) <= 1))) return true;
+      const known = shell.functions.get(word);
+      if (known !== undefined && !seen.has(word)) {
+        seen.add(word);
+        if (leaves(ownCommands(known[0]), shell, true, seen)) return true;
+      }
+    }
+  }
+  return false;
+}
+
+/** Whether a loop now closing never ends: its test never fails, and nothing it runs in this shell could leave it. */
+function endless(frame: Frame, shell: Shell): boolean {
+  const commands = LOOPS.includes(frame.kind) ? loopCommands(frame, shell, shell.at) : undefined;
+  return commands !== undefined && frame.forever && frame.base !== false && !leaves(commands, shell, false, new Set());
 }
 
 /** The status a (( N )) with a decimal number leaves: 0 for one that is not zero, 1 for zero; undefined otherwise. A
@@ -1593,6 +1734,7 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
       if (subshell === undefined) unsure(shell, saved);
       else if (doubt(shell.pipe)) forget(shell, changes(shell, saved)); // it may not have run
     }
+    replaceShell(argv, subshell, shell);
     return [];
   }
   const inner = name === undefined ? undefined : shellString(name, args);
@@ -1601,20 +1743,32 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // Its words after the string are $0 and then the positional parameters.
     const positional = SHELLS.has(name as string) ? args.slice(args.indexOf(inner) + 2) : [];
     const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
-    return replaced(called, subshell, shell, calls.map((call) => ({
+    return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
       layers: [...call.layers, layer],
     })));
   }
   if (name === undefined) return [];
-  return replaced(called, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
+  return replaced(argv, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
 }
 
-/** The calls of a command run through exec, which replaces the shell, so nothing after it runs. */
-function replaced(word: string | undefined, subshell: Maybe, shell: Shell, calls: Call[]): Call[] {
-  if (word !== undefined && programName(word) === "exec") jumpFrom("exit", [], subshell, shell);
+/** The calls of a command, after which nothing runs when it ran through exec. */
+function replaced(argv: string[], subshell: Maybe, shell: Shell, calls: Call[]): Call[] {
+  replaceShell(argv, subshell, shell);
   return calls;
+}
+
+/** After a command run through exec, which replaces the shell, nothing runs: exec itself, or behind time or builtin,
+ *  and only maybe behind command, which bash runs as the builtin and zsh looks up as a program. */
+function replaceShell(argv: string[], subshell: Maybe, shell: Shell): void {
+  let rest = argv.filter((word) => !isAssignment(word));
+  let behindCommand = false;
+  while (rest.length > 0 && ["command", "builtin", "time", "-p", "--"].includes(rest[0] as string)) {
+    behindCommand ||= rest[0] === "command";
+    rest = rest.slice(1);
+  }
+  if (rest.length > 1 && rest[0] === "exec") jumpFrom("exit", [], !behindCommand || subshell === true ? subshell : undefined, shell);
 }
 
 /** A return, exit, break or continue where it runs: nothing beyond a subshell, and only maybe from the last command
@@ -1652,7 +1806,7 @@ function command(item: Item, shell: Shell, depth: number): Call[] {
 
 /** Walk items in this shell, adding each call that runs or may run to its calls. */
 function walkItems(list: Item[], shell: Shell, depth: number): void {
-  const outer: [Item[], number, Map<string, string>] = [shell.items, shell.at, shell.ends];
+  const outer: [Item[], number, Map<string, [string, number]>] = [shell.items, shell.at, shell.ends];
   shell.items = list;
   shell.ends = compoundEnds(list);
   for (let at = 0; at < list.length; at++) {
@@ -1666,16 +1820,16 @@ function walkItems(list: Item[], shell: Shell, depth: number): void {
 
 /** What follows the end of each compound in `list`, by where it opens ("item,word"): one piped or backgrounded at its
  *  end runs in a subshell, which a return, exit, break or continue inside it does not leave. */
-function compoundEnds(list: Item[]): Map<string, string> {
-  const ends = new Map<string, string>();
+function compoundEnds(list: Item[]): Map<string, [string, number]> {
+  const ends = new Map<string, [string, number]>();
   const opened: string[] = [];
   list.forEach(({ kind, argv, after }, at) => {
     if (kind === "(" || kind === "$(" || kind === "case") opened.push(`${at},0`);
-    else if ((kind === ")" || kind === "esac") && opened.length > 0) ends.set(opened.pop() as string, after);
+    else if ((kind === ")" || kind === "esac") && opened.length > 0) ends.set(opened.pop() as string, [after, at]);
     for (let k = 0; kind === "cmd" && k < argv.length && KEYWORDS.has(argv[k] as string); ) {
       const word = argv[k] as string;
       if ((word === "}" || word === "fi" || word === "done") && opened.length > 0) {
-        ends.set(opened.pop() as string, k === argv.length - 1 ? after : "");
+        ends.set(opened.pop() as string, [k === argv.length - 1 ? after : "", at]);
       } else if (word === "{" || word === "if" || LOOPS.includes(word)) {
         opened.push(`${at},${k}`);
         if (word === "for" || word === "select") break; // the rest is its header
@@ -1690,7 +1844,7 @@ function compoundEnds(list: Item[]): Map<string, string> {
 function endsPiped(head: Item, shell: Shell): boolean {
   const item = shell.items[shell.at] ?? head;
   const k = head.kind === "cmd" && item.kind === "cmd" ? item.argv.length - head.argv.length : 0;
-  const after = shell.ends.get(`${shell.at},${k}`);
+  const after = shell.ends.get(`${shell.at},${k}`)?.[0];
   return after === "|" || after === "&";
 }
 

@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '20dc7cc3da83035386dfc0a28cae605e02814afcc06d1d2c022ecdfc425bbc63'
+BLOCK_SHA256 = 'ab629760362814fb5a0022dfc00fa822b096206af250c774ad6da477d17c8ab8'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -834,9 +834,14 @@ class ParserFindingTests(TransferTestCase):
                                   # An arithmetic for that stops after one pass keeps its cd, unless its body
                                   # touches the counter.
                                   ('for ((i=0;i<1;i++)); do cd frontend; done; scp -F cfg f prod:/tmp', private),
+                                  ('for ((i=0;i<1;i++)); do cd frontend; [ -f m ] && i=-1; done; scp -F cfg f prod:/tmp',
+                                   unknown),
                                   ('for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp',
-                                   unknown)):
+                                   private),
+                                  ('for ((i=0;i<1;i++)); do echo $i; cd frontend; done; scp -F cfg f prod:/tmp', private)):
             self.assert_endpoints(command, [expected])
+        # exec replaces the shell even when what it runs is a builtin, so the scp never runs.
+        self.assert_hosts('exec cd frontend; scp -F cfg f prod:/tmp', [])
 
     def test_a_called_function_runs_its_body_in_the_callers_shell(self):
         private = _endpoint('out', 'prod', 'private', '10.0.4.12')

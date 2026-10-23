@@ -3872,6 +3872,7 @@ _TRANSFER_WRAPPERS = {
     'ionice': ('cnp', {'--class', '--classdata', '--pid'}, 0),
     'exec': ('a', set(), 0),
     'command': ('', set(), 0),
+    'builtin': ('', set(), 0),
     'nohup': ('', set(), 0),
 }
 # Reserved words that open, divide or close a compound command.
@@ -4020,6 +4021,52 @@ def _transfer_read_word(text: str, i: int) -> tuple:
     return word, i
 
 
+def _transfer_word_end(text: str, i: int) -> tuple:
+    """(the index after the shell word starting at i after blanks, the $( ) and backtick bodies in it, which run);
+    the index is -1 when one of them is not closed."""
+    while i < len(text) and text[i] in ' \t':
+        i += 1
+    bodies, quote = [], None
+    while i < len(text):
+        ch, start = text[i], i
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif ch == '\\':
+            i += 1
+        elif text.startswith('$(', i) or ch == '`':
+            i = _transfer_paren_end(text, i + 2) if ch == '$' else _transfer_backtick_end(text, i + 1)
+            if i < 0:
+                return -1, bodies
+            if not text.startswith('$((', start):  # arithmetic runs no commands
+                bodies.append(text[start + 2:i] if ch == '$' else text[start + 1:i])
+        elif quote == '"':
+            quote = None if ch == '"' else quote
+        elif ch in '\'"':
+            quote = ch
+        elif ch in ' \t\r\n;&|<>()':
+            break
+        i += 1
+    return i, bodies
+
+
+def _transfer_heredoc_bodies(body: str) -> Optional[List[str]]:
+    """The $( ) and backtick bodies a heredoc with an unquoted delimiter runs; quotes are plain text there, and a
+    backslash escapes the next character. None when one is not closed."""
+    bodies, i = [], 0
+    while i < len(body):
+        start = i
+        if body[i] == '\\':
+            i += 1
+        elif body.startswith('$(', i) or body[i] == '`':
+            i = _transfer_paren_end(body, i + 2) if body[i] == '$' else _transfer_backtick_end(body, i + 1)
+            if i < 0:
+                return None
+            if not body.startswith('$((', start):
+                bodies.append(body[start + 2:i] if body[start] == '$' else body[start + 1:i])
+        i += 1
+    return bodies
+
+
 def _transfer_paren_end(text: str, i: int) -> int:
     """The index of the ) that closes a ( just before i, past quotes and nested parentheses; -1 when none does."""
     depth, quote = 1, None
@@ -4066,20 +4113,20 @@ class _TransferLexer:
         self.text, self.depth, self.i, self.quote = text, depth, 0, None
         self.items, self.argv, self.word, self.in_word = [], [], '', False
         self.before, self.io, self.heredocs, self.case = '', [], [], []
-        self.param, self.dollar = 0, -1
+        self.param, self.dollar, self.failed = 0, -1, False
 
     def read(self) -> Optional[List[tuple]]:
         """The items, or None when the command can't be read the way the shell reads it."""
         if self.depth > _TRANSFER_MAX_DEPTH:
             return None
         while self.i < len(self.text):
-            if not (self._quoted() if self.quote else self._unquoted()):
+            if not (self._quoted() if self.quote else self._unquoted()) or self.failed:
                 return None
             self.i += 1
         if self.quote:
             return None
         self._end_command('')
-        return self.items
+        return None if self.failed else self.items
 
     def _quoted(self) -> bool:
         ch = self.text[self.i]
@@ -4215,7 +4262,16 @@ class _TransferLexer:
         op = re.match(r'&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>', text[self.i:]).group(0)
         target, end = _transfer_read_word(text, self.i + len(op))
         if op in ('<<', '<<-'):
-            self.heredocs.append((target, op == '<<-'))
+            # An unquoted delimiter leaves the body's substitutions to run, with the command, before it does.
+            quoted = any(c in text[self.i + len(op):end] for c in '\'"\\')
+            self.heredocs.append((target, op == '<<-', None if quoted else self._substitutions_at()))
+        else:
+            # A target's substitutions run with the command too, such as a here-string's "$(curl …)".
+            end, bodies = _transfer_word_end(text, self.i + len(op))
+            if end < 0:
+                self.failed = True
+                return
+            self._substitute(bodies, self._substitutions_at() if bodies else None)
         to = fd if fd is not None else 0 if op[0] == '<' else 1
         if op in ('<&', '>&') and (target.isdigit() or target == '-'):
             self.io.append((to, int(target) if target.isdigit() else 'null'))
@@ -4247,16 +4303,43 @@ class _TransferLexer:
             self._skip_heredocs()
 
     def _skip_heredocs(self) -> None:
-        """A heredoc's body starts on the next line and is input, not commands."""
-        text = self.text
+        """A heredoc's body starts on the next line and is input, not commands, but for the substitutions in one whose
+        delimiter is unquoted, which run with its command."""
+        text, shift = self.text, 0
         while self.heredocs:
-            delimiter, strip_tabs = self.heredocs.pop(0)
+            delimiter, strip_tabs, at = self.heredocs.pop(0)
+            lines = []
             while self.i + 1 < len(text):
                 end = text.find('\n', self.i + 1)
                 line = text[self.i + 1:] if end < 0 else text[self.i + 1:end]
                 self.i = len(text) - 1 if end < 0 else end
                 if (line.lstrip('\t') if strip_tabs else line) == delimiter:
                     break
+                lines.append(line)
+            bodies = _transfer_heredoc_bodies('\n'.join(lines)) if at else []
+            if bodies is None:
+                self.failed = True
+                return
+            shift += self._substitute(bodies, (at[0] + shift, at[1]) if at else None)
+
+    def _substitutions_at(self) -> tuple:
+        """Where substitutions that run with the current command go: after the reserved words that lead it, so they
+        run only when it does; (index in items, operator before)."""
+        self._flush_leading()
+        return len(self.items), self.before
+
+    def _substitute(self, bodies: List[str], at: Optional[tuple]) -> int:
+        """Insert each body as a substitution at (index in items, operator before); how many items that added."""
+        added = []
+        for body in bodies:
+            items = _TransferLexer(body, self.depth + 1).read()
+            if items is None:
+                self.failed = True
+                return 0
+            added += [('$(', None, at[1], '', None)] + items + [(')', None, '', '', None)]
+        if added:
+            self.items[at[0]:at[0]] = added
+        return len(added)
 
     def _end_word(self) -> None:
         if not self.in_word:
@@ -4850,6 +4933,8 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
         if keyword in _TRANSFER_LOOPS:
             loop = frames[-1]
             loop['iterates'], loop['repeats'], loop['forever'], loop['counter'] = _transfer_loop(keyword, rest, shell)
+            end = shell['ends'].get((shell['at'], len(item[1]) - len(words)), ('', None))[1]
+            _transfer_touched(loop, _transfer_loop_commands(loop, shell, end))
         return [] if keyword in ('for', 'select') else rest  # a for loop's header runs nothing
     if keyword in ('!', 'function'):
         # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
@@ -4940,23 +5025,61 @@ def _transfer_step(step: str, name: str) -> Optional[int]:
     return None
 
 
-_TRANSFER_ESCAPES = frozenset({'break', 'continue', 'return', 'eval', 'source', '.'})
+def _transfer_loop_commands(frame: Dict, shell: Dict, end: Optional[int]) -> Optional[List[List[str]]]:
+    """The words of each command a loop runs in this shell, from its condition up to the item end, leaving out those in
+    a subshell or substitution; None when its end is not known."""
+    at, head = frame['head']
+    if end is None:
+        return None
+    return [head[1][2 if head[1][0] in ('for', 'select') else 1:]] + _transfer_own_commands(shell['items'][at + 1:end])
+
+
+def _transfer_own_commands(items: List[tuple]) -> List[List[str]]:
+    """The words of each command in items that runs in this shell, not in a subshell or substitution."""
+    depth, commands = 0, []
+    for item in items:
+        depth += 1 if item[0] in ('(', '$(') else -1 if item[0] == ')' else 0
+        if item[0] == 'cmd' and not depth:
+            commands.append(item[1])
+    return commands
+
+
+def _transfer_touched(frame: Dict, commands: Optional[List[List[str]]]) -> None:
+    """An arithmetic for that may change its counter may run its body again, and its test may fail after all; a
+    plain $name or ${name} only reads it."""
+    name = frame['counter']
+    if not name:
+        return
+    for word in (w for words in commands or [[name]] for w in words):
+        for match in re.finditer(r'(?<![A-Za-z0-9_])' + name + r'(?![A-Za-z0-9_])', word):
+            before, after = word[:match.start()], word[match.end():]
+            if not (before.endswith('$') or (before.endswith('${') and after.startswith('}'))):
+                frame['repeats'], frame['forever'] = True, False
+                return
+
+
+def _transfer_leaves(commands: List[List[str]], shell: Dict, called: bool, seen: set) -> bool:
+    """Whether commands could leave the loop they run in: a break, a continue past it, a return (but in a called
+    function, where it only ends the call), eval or source, or a call to a function that could."""
+    for words in commands:
+        for k, word in enumerate(words):
+            count = words[k + 1] if k + 1 < len(words) else '1'
+            if word in ('break', 'eval', 'source', '.') or (word == 'return' and not called) or \
+                    (word == 'continue' and not (re.fullmatch(r'[0-9]+', count) and int(count) <= 1)):
+                return True
+            if word in shell['functions'] and word not in seen:
+                seen.add(word)
+                if _transfer_leaves(_transfer_own_commands(shell['functions'][word][0]), shell, True, seen):
+                    return True
+    return False
 
 
 def _transfer_endless(frame: Dict, shell: Dict) -> bool:
-    """Whether a loop now closing never ends: its test never fails, and no word in it could leave it (a break,
-    continue, return, eval, source or function call). A loop whose words touch an arithmetic for's counter may also
-    run its body again."""
-    if frame['kind'] not in _TRANSFER_LOOPS:
-        return False
-    at, head = frame['head']
-    words = head[1][2 if head[1][0] in ('for', 'select') else 1:] + \
-        [w for item in shell['items'][at + 1:shell['at']] if item[0] == 'cmd' for w in item[1]]
-    counter = frame['counter'] and re.compile(r'(?<![A-Za-z0-9_])' + frame['counter'] + r'(?![A-Za-z0-9_])')
-    if counter and any(counter.search(w) for w in words):
-        frame['repeats'], frame['forever'] = True, False
-    return frame['forever'] and frame['base'] is not False and \
-        not any(w in _TRANSFER_ESCAPES or w in shell['functions'] for w in words)
+    """Whether a loop now closing never ends: its test never fails, and nothing it runs in this shell could leave
+    it."""
+    commands = _transfer_loop_commands(frame, shell, shell['at']) if frame['kind'] in _TRANSFER_LOOPS else None
+    return bool(commands is not None and frame['forever'] and frame['base'] is not False and
+                not _transfer_leaves(commands, shell, False, set()))
 
 
 def _transfer_arithmetic(word: str) -> Optional[int]:
@@ -5155,6 +5278,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
                 _transfer_unsure(shell, saved)
             elif _transfer_doubt(shell['pipe']):
                 _transfer_forget(shell, _transfer_changes(shell, saved))  # it may not have run
+        _transfer_replace(words, subshell, shell)
         return []
     inner = _transfer_shell_string(program, args) if program else None
     if inner is not None:
@@ -5165,9 +5289,19 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
     else:
         calls = [(program, args, env, cwd, other_user, (layer,))] if program else []
-    if program and _transfer_program_name(name) == 'exec':
-        _transfer_jump_from('exit', [], subshell, shell)  # the command replaces the shell, so nothing after it runs
+    if program:
+        _transfer_replace(words, subshell, shell)
     return calls
+
+
+def _transfer_replace(words: List[str], subshell: Optional[bool], shell: Dict) -> None:
+    """After a command run through exec, which replaces the shell, nothing runs: exec itself, or behind time or
+    builtin, and only maybe behind command, which bash runs as the builtin and zsh looks up as a program."""
+    rest, behind_command = [w for w in words if not _transfer_is_assignment(w)], False
+    while rest and rest[0] in ('command', 'builtin', 'time', '-p', '--'):
+        behind_command, rest = behind_command or rest[0] == 'command', rest[1:]
+    if len(rest) > 1 and rest[0] == 'exec':
+        _transfer_jump_from('exit', [], subshell if not behind_command or subshell is True else None, shell)
 
 
 def _transfer_jump_from(program: str, args: List[str], subshell: Optional[bool], shell: Dict) -> None:
@@ -5226,11 +5360,11 @@ def _transfer_ends(items: List[tuple]) -> Dict:
         if kind in ('(', '$(', 'case'):
             opened.append((at, 0))
         elif kind in (')', 'esac') and opened:
-            ends[opened.pop()] = after
+            ends[opened.pop()] = after, at
         k = 0
         while kind == 'cmd' and k < len(words) and words[k] in _TRANSFER_KEYWORDS:
             if words[k] in ('}', 'fi', 'done') and opened:
-                ends[opened.pop()] = after if k == len(words) - 1 else ''
+                ends[opened.pop()] = (after if k == len(words) - 1 else ''), at
             elif words[k] in ('{', 'if') + _TRANSFER_LOOPS:
                 opened.append((at, k))
                 if words[k] in ('for', 'select'):
@@ -5243,7 +5377,7 @@ def _transfer_ends_piped(head: tuple, shell: Dict) -> bool:
     """Whether the compound opening at head, in the item being read, is piped or backgrounded at its end."""
     item = shell['items'][shell['at']] if shell['at'] < len(shell['items']) else head
     k = len(item[1]) - len(head[1]) if head[0] == 'cmd' and item[0] == 'cmd' else 0
-    return shell['ends'].get((shell['at'], k)) in ('|', '&')
+    return shell['ends'].get((shell['at'], k), ('', None))[0] in ('|', '&')
 
 
 def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth: int,
