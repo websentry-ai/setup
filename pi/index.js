@@ -143,6 +143,7 @@ var MCP_BROKER_ID_PREFIX = "mcpb_";
 var MAX_INFLIGHT_MCP_CALLS = 64;
 var MAX_MCP_ARGS_BYTES = 524288;
 var MAX_PRETOOL_BODY_BYTES = 921600;
+var MAX_MCP_SERVER_CONFIG_BYTES = 32768;
 var MCP_INFLIGHT_MAX_AGE_MS = 3e5;
 var ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
 var MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
@@ -813,7 +814,9 @@ function buildPretoolPayload(input) {
     metadata.mcp_server = mcp.server;
     metadata.mcp_tool = mcp.tool;
     applyWireArgs(metadata, mcpArgsForWire(mcp.args));
-    if (mcp.serverConfig !== void 0) metadata.mcp_server_config = mcp.serverConfig;
+    if (mcp.serverConfig !== void 0 && serialisedBytes(mcp.serverConfig) <= MAX_MCP_SERVER_CONFIG_BYTES) {
+      metadata.mcp_server_config = mcp.serverConfig;
+    }
     if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
   } else {
     metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));
@@ -1461,6 +1464,14 @@ function notify(hooks, message, level) {
   } catch {
   }
 }
+function bodyBytes(payload) {
+  try {
+    const text = JSON.stringify(payload);
+    return typeof text === "string" ? Buffer.byteLength(text) : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
 function createPolicyChecker(opts) {
   const breaker = opts.breaker ?? createBreaker({ now: opts.now });
   const keyState2 = opts.keyState ?? createKeyState();
@@ -1469,6 +1480,11 @@ function createPolicyChecker(opts) {
       if (keyState2.isInactive()) return { kind: "allow" };
       const breakerApplies = opts.state.getFailureAction() !== "block";
       if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
+      if (bodyBytes(payload) >= MAX_PRETOOL_BODY_BYTES) {
+        const blocked2 = opts.state.getFailureAction() === "block";
+        opts.telemetry.reportBypass({ errorClass: "PayloadTooLarge", toolName, elapsedMs: 0, blocked: blocked2 });
+        return blocked2 ? { kind: "unavailable" } : { kind: "allow" };
+      }
       const res = await opts.client.postPretool(payload);
       if (res.ok) {
         keyState2.recordSuccess();
@@ -2046,9 +2062,7 @@ async function confirmBrokered(ui, reason, signal) {
       return "deny";
     }
     notifySafe(ui, reason, "warning");
-    const signals = [ui.signal, signal].filter((s) => s instanceof AbortSignal);
-    const combined = signals.length === 0 ? void 0 : signals.length === 1 ? signals[0] : AbortSignal.any(signals);
-    const dialogCtx = { hasUI: true, ui: ui.ui, signal: combined };
+    const dialogCtx = { hasUI: true, ui: ui.ui, signal: signal instanceof AbortSignal ? signal : void 0 };
     const accepted = await confirmWithTimeout(dialogCtx, CONFIRM_TITLE, CONFIRM_QUESTION);
     return accepted ? "allow_once" : "deny";
   } catch {
@@ -2130,7 +2144,7 @@ async function applyOutcome(outcome, ctx) {
 }
 
 // packages/pi/src/mcpBroker.ts
-import { randomBytes as randomBytes2 } from "node:crypto";
+import { createHash as createHash3, randomBytes as randomBytes2 } from "node:crypto";
 var ANSWERS = /* @__PURE__ */ new Set(["allow_once", "deny", "abstain"]);
 function isRecord2(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -2232,6 +2246,30 @@ function wrapperArgsKey(input) {
 function directArgsKey(input) {
   return stableKey(isRecord2(input) ? input : {});
 }
+var ENCODED_SERVER_NAMESPACE_MARKER = "_mcpns_";
+var MAX_SERVER_NAMESPACE_LENGTH = 59;
+function encodeServerNamespace(name) {
+  return Array.from(name, (character) => {
+    if (character === "_") return "__";
+    return /^[A-Za-z0-9]$/.test(character) ? character : `_${character.codePointAt(0).toString(16)}_`;
+  }).join("");
+}
+function formatServerNamespace(serverName) {
+  const normalized = serverName.replace(/-/g, "_");
+  const safe = /^[A-Za-z0-9_]*$/.test(normalized) && !normalized.startsWith(ENCODED_SERVER_NAMESPACE_MARKER);
+  const body = safe ? normalized : encodeServerNamespace(normalized);
+  const namespace = safe ? body : `${ENCODED_SERVER_NAMESPACE_MARKER}${body}`;
+  if (namespace.length <= MAX_SERVER_NAMESPACE_LENGTH) return namespace;
+  const digest = createHash3("sha256").update(namespace, "utf8").digest("hex").slice(0, 16);
+  const hashPrefix = `${ENCODED_SERVER_NAMESPACE_MARKER}_h_`;
+  const head = body.slice(0, MAX_SERVER_NAMESPACE_LENGTH - hashPrefix.length - digest.length - 1);
+  return `${hashPrefix}${head}_${digest}`;
+}
+function wrapperServerMatches(entry, serverName) {
+  if (entry.toolName === MCP_PROXY_TOOL_NAME) return entry.server === void 0 || entry.server === serverName;
+  const ns = entry.toolName.slice(MCP_NAMESPACE_TOOL_PREFIX.length);
+  return ns !== "" && ns === formatServerNamespace(serverName);
+}
 function createInflightCalls(max, maxAgeMs, now = Date.now) {
   let entries = [];
   const cap = Number.isFinite(max) && max > 0 ? Math.floor(max) : 1;
@@ -2246,11 +2284,16 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
         if (typeof entry.toolName !== "string" || entry.toolName === "") return;
         let tool;
         if (isRecord2(entry.input) && typeof entry.input.tool === "string") tool = entry.input.tool;
+        let server;
+        if (isRecord2(entry.input) && typeof entry.input.server === "string" && entry.input.server !== "") {
+          server = entry.input.server;
+        }
         expire();
         entries.push({
           toolCallId: entry.toolCallId,
           toolName: entry.toolName,
           tool,
+          server,
           directKey: directArgsKey(entry.input),
           wrapperKey: mayBeWrapper(entry.toolName) ? wrapperArgsKey(entry.input) : void 0,
           sessionId: typeof sessionId === "string" ? sessionId : "",
@@ -2274,7 +2317,7 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
       } catch {
       }
     },
-    claim(prefixedToolName, originalToolName, args) {
+    claim(serverName, prefixedToolName, originalToolName, args) {
       try {
         expire();
         const argsKey = stableKey(isRecord2(args) ? args : {});
@@ -2283,7 +2326,7 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
           if (prefixedToolName !== "" && entry.toolName === prefixedToolName && entry.directKey === argsKey) {
             return true;
           }
-          return mayBeWrapper(entry.toolName) && entry.wrapperKey === argsKey && entry.tool !== void 0 && (entry.tool === originalToolName || prefixedToolName !== "" && entry.tool === prefixedToolName);
+          return mayBeWrapper(entry.toolName) && entry.wrapperKey === argsKey && wrapperServerMatches(entry, serverName) && entry.tool !== void 0 && (entry.tool === originalToolName || prefixedToolName !== "" && entry.tool === prefixedToolName);
         });
         if (index === -1) return void 0;
         const [found] = entries.splice(index, 1);
@@ -2846,7 +2889,7 @@ function createExtension(overrides = {}) {
     const ctx = lastCtx;
     const sessionId = ctx === void 0 ? "" : sessionIdOf(ctx);
     const cwd = ctx === void 0 ? "" : safeCwd(ctx);
-    const matchedId = inflight.claim(call.prefixedToolName, call.originalToolName, call.args);
+    const matchedId = inflight.claim(call.serverName, call.prefixedToolName, call.originalToolName, call.args);
     const toolUseId = matchedId ?? mintBrokerId();
     const serverConfig = mcpConfigReader.serverConfig(call.serverName, cwd);
     return decideMcpApproval(

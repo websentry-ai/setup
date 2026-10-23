@@ -159,13 +159,14 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
     cut arguments (`tool_input_truncated_keys`). **The middle of oversized values is not inspected;
     other fields are sent whole**, so a policy on a specific argument still sees it exactly. The whole
     request is kept under 900 KB so the gateway's 1 MB request limit can never turn a check into an
-    unchecked allow.
+    unchecked allow; a request that would still be too large is never sent, and the org's
+    "policy check failed" setting decides the call, as for any check that could not be made.
   - **Server config** (`url`, or `command` + `args`) is sent only when the adapter's config files are
     unambiguous: every one of them is plain JSON (no comments, no trailing commas), uses only the
     settings and server fields the extension understands (no `imports`, plugins, ancestor roots, host
     discovery or `socket` servers), pi was not started with `--mcp-config`, and none of the files has
-    changed since the session started (the adapter reads them once, at startup). Otherwise the config
-    is **left out** rather than guessed. `env`, `headers`, bearer tokens and OAuth settings are never
+    changed since the session started (the adapter reads them once, at startup), and the server's
+    config is at most 32 KB. Otherwise the config is **left out** rather than guessed or cut. `env`, `headers`, bearer tokens and OAuth settings are never
     read. A `url` query string or an `args` entry is sent as written, as the Claude Code hook sends
     it, so a credential placed there leaves with it.
   - **What an omitted config means.** Without a config the gateway cannot fingerprint the server. In
@@ -173,7 +174,8 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
     unrecognised server. Elsewhere, policy still applies by server and tool name. To get the config
     sent, keep the MCP config files as plain JSON in the standard locations.
   - **On a deny**, the model sees the adapter's own generic denial; the developer sees the policy's
-    reason as a notice. A "warn" policy asks the developer to confirm; without a UI it denies.
+    reason as a notice. A "warn" policy asks the developer to confirm (also for MCP calls made between
+    turns); without a UI it denies.
   - **Unbound decides first.** The extension claims the adapter's approval request, which pre-empts
     any other permission extension and a host-managed approval broker. On a policy allow it hands the
     decision back to the adapter, so the adapter's own `approveTools` prompt still applies. If another

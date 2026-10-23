@@ -817,3 +817,41 @@ test("RES-03 policy.ts stays free of filesystem and of throw", () => {
   assert.equal(source.includes("node:fs"), false, "the persister is injected, never imported");
   assert.equal(/^\s*throw /m.test(source), false, "an exception out of this module would be a block");
 });
+
+// --- PR #371 round 2: an oversized body is never posted --------------------------------------------
+
+test("an oversized body is not posted: fail-open allows, fail-closed is unavailable, reported once, breaker untouched", async () => {
+  const big = { pre_tool_use_data: { tool_name: "x", command: "", metadata: { blob: "b".repeat(1_000_000) } } } as never;
+  for (const failureAction of ["allow", "block"] as const) {
+    let posts = 0;
+    const reports: { errorClass: string; blocked: boolean }[] = [];
+    const state = createPolicyState();
+    state.recordSuccess({ decision: "allow", policy_check_failure_action: failureAction }, Date.now());
+    const checker = createPolicyChecker({
+      client: {
+        async postPretool() {
+          posts += 1;
+          return { ok: true, body: { decision: "allow" } } as never;
+        },
+        async postHookErrors() {
+          return true;
+        },
+        async postTurnLog() {
+          return true;
+        },
+      } as never,
+      state,
+      telemetry: {
+        reportBypass: (ctx: { errorClass: string; blocked: boolean }) => reports.push(ctx),
+        reportTurnLogFailure: () => {},
+      } as never,
+    });
+    const outcome = await checker.checkTool(big, "mcp__s__t");
+    assert.equal(posts, 0, "never posted — the ingress would answer 413");
+    assert.deepStrictEqual(outcome, failureAction === "block" ? { kind: "unavailable" } : { kind: "allow" });
+    assert.deepStrictEqual(reports.map((r) => [r.errorClass, r.blocked]), [["PayloadTooLarge", failureAction === "block"]]);
+    // The breaker was not fed a failure: a normal-size call still posts.
+    await checker.checkTool({ pre_tool_use_data: { tool_name: "bash", command: "ls", metadata: {} } } as never, "bash");
+    assert.equal(posts, 1);
+  }
+});

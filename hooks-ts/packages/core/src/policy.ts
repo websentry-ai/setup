@@ -48,6 +48,7 @@ import {
   BREAKER_OPEN_NOTICE,
   KEY_REJECTED_BLOCK_REASON,
   KEY_REJECTED_NOTICE,
+  MAX_PRETOOL_BODY_BYTES,
 } from "./constants.ts";
 import { createKeyState } from "./keyState.ts";
 import type { KeyState } from "./keyState.ts";
@@ -130,6 +131,16 @@ function notify(hooks: CheckHooks | undefined, message: string, level: "info" | 
   }
 }
 
+/** Serialised byte size of a request body; `Infinity` when it cannot be serialised. Total. */
+function bodyBytes(payload: unknown): number {
+  try {
+    const text = JSON.stringify(payload);
+    return typeof text === "string" ? Buffer.byteLength(text) : Number.POSITIVE_INFINITY;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
 export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
   // One breaker and one latch per checker, built once — per-call instances would never accumulate a
   // failure run, which is the only thing either of them measures.
@@ -155,6 +166,17 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
       // 2. Before any fetch: an open breaker means no HTTP and no telemetry — the bypass was already
       //    reported, and notified, when it opened.
       if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
+
+      // 2b. A body the ingress would refuse with a 413 is never posted (PR #371). The builders keep
+      //     every body under `MAX_PRETOOL_BODY_BYTES` by construction; this is the guard for the
+      //     case they somehow did not. It is a client-side sizing fault, so it is NOT a breaker
+      //     failure (that would switch off checks for every tool) — the org's failure action decides,
+      //     exactly as for any call that could not be evaluated, and the bypass is reported.
+      if (bodyBytes(payload) >= MAX_PRETOOL_BODY_BYTES) {
+        const blocked = opts.state.getFailureAction() === "block";
+        opts.telemetry.reportBypass({ errorClass: "PayloadTooLarge", toolName, elapsedMs: 0, blocked });
+        return blocked ? { kind: "unavailable" } : { kind: "allow" };
+      }
 
       const res = await opts.client.postPretool(payload);
 

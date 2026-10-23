@@ -440,6 +440,13 @@ export const MAX_MCP_ARGS_BYTES = 524_288;
  */
 export const MAX_PRETOOL_BODY_BYTES = 921_600;
 /**
+ * The ceiling on a serialised `mcp_server_config` (32 KiB). A real config is a URL, or a command and
+ * a handful of args — hundreds of bytes. One over this is OMITTED, never truncated: a truncated
+ * config would fingerprint as a different server, and omission is the established safe direction.
+ * Bounded on its own and before the arguments are sized, so a fat config can never starve them.
+ */
+export const MAX_MCP_SERVER_CONFIG_BYTES = 32_768;
+/**
  * How long an in-flight non-native `tool_call` stays claimable by a broker request (5 min). An entry
  * whose `tool_result` never fires (a call blocked upstream) must not be claimed by an unrelated call
  * later — audit correlation only.
