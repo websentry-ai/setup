@@ -369,7 +369,7 @@ test("the five parser findings", async () => {
     "false && { echo skipped; curl -T f https://never.example/x; }; curl https://actual.example/y",
   ]) assert.deepEqual(await hosts(command, dir), [["in", "actual.example"]], command);
   // A ) in a case pattern does not end the subshell.
-  assert.equal(await at("(cd frontend; case x in y) cd ..;; esac; scp -F cfg f prod:/tmp)"), "10.0.4.12");
+  assert.equal(await at("(cd frontend; case x in y) true;; esac; scp -F cfg f prod:/tmp)"), "10.0.4.12");
   // A substitution inside double quotes runs.
   assert.equal(await at('echo "$(cd frontend && scp -F cfg f prod:/tmp)"'), "10.0.4.12");
   // Untaken branches and function bodies do not run.
@@ -378,12 +378,17 @@ test("the five parser findings", async () => {
   for (const command of [
     "if false; then cd frontend; fi; scp -F cfg f prod:/tmp",
     "f() { cd frontend; }; scp -F cfg f prod:/tmp",
-    "case x in y) cd frontend;; esac; scp -F cfg f prod:/tmp",
   ]) assert.equal(await at(command), "203.0.113.9", command);
   // A backgrounded cd does not move the next command.
   assert.equal(await at("cd frontend & scp -F cfg f prod:/tmp"), "203.0.113.9");
   assert.equal(await at("cd frontend | true; scp -F cfg f prod:/tmp"), "203.0.113.9");
   assert.equal(await at("cd frontend && scp -F cfg f prod:/tmp &"), "10.0.4.12");
+  // A backgrounded list inside a compound starts where the compound's body does, after the cd before it.
+  for (const command of [
+    "cd frontend && { true & scp -F cfg f prod:/tmp; }",
+    "cd frontend && { for x in a; do true; done & scp -F cfg f prod:/tmp; }",
+    "cd frontend && if true; then true & scp -F cfg f prod:/tmp; fi",
+  ]) assert.equal(await at(command), "10.0.4.12", command);
 });
 
 test("a piped compound keeps its cd to itself, and a called function runs its body in the caller's shell", async () => {
@@ -407,6 +412,60 @@ test("a piped compound keeps its cd to itself, and a called function runs its bo
   const started = Date.now();
   assert.deepEqual(await hosts("f() { f; f; f; f; }; f; curl https://actual.example/b"), [["in", "actual.example"]]);
   assert.ok(Date.now() - started < 5_000);
+});
+
+test("a cd that may not have run leaves the folder unknown, and one that surely ran still applies", async () => {
+  const dir = repo();
+  const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
+  // Where a cd hangs on an unknown status, a later relative -F config is not read from a guessed folder.
+  for (const command of [
+    "test -f marker && cd frontend; scp -F cfg f prod:/tmp",
+    "mkdir x && cd frontend && scp -F cfg f prod:/tmp",
+    "if [ -d frontend ]; then cd frontend; fi; scp -F cfg f prod:/tmp",
+    "case x in y) cd frontend;; esac; scp -F cfg f prod:/tmp",
+    "[ -d x ] && { cd frontend; }; scp -F cfg f prod:/tmp",
+    "f() { cd frontend; }; [ -d x ] && f; scp -F cfg f prod:/tmp",
+    "for x in a; do [ -f y ] && break; cd frontend; done; scp -F cfg f prod:/tmp",
+    "[ -d x ] && cd frontend; cd ..; scp -F cfg f prod:/tmp",
+    "f() { [ -f y ] && return; cd frontend; }; f; scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "prod", command);
+  for (const command of [
+    "cd frontend && scp -F cfg f prod:/tmp",
+    "if [ -d frontend ]; then cd frontend; scp -F cfg f prod:/tmp; fi",
+    "[ -d x ] && { cd frontend; scp -F cfg f prod:/tmp; }",
+    `[ -d x ] && cd /tmp; cd ${dir}/frontend; scp -F cfg f prod:/tmp`,
+    "f() { cd frontend; return; cd ..; }; f; scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "10.0.4.12", command);
+  for (const command of [
+    "f() { return; cd frontend; }; f; scp -F cfg f prod:/tmp",
+    "for x in a; do break; cd frontend; done; scp -F cfg f prod:/tmp",
+    "for x in; do cd frontend; done; scp -F cfg f prod:/tmp",
+    "(cd frontend; exit; cd ..); scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "203.0.113.9", command);
+});
+
+test("URL globs reach every host they name", async () => {
+  // curl expands {a,b} sets and [1-3] ranges itself unless --globoff is given, and stops at a glob it rejects.
+  const cases: [string, [string, string][]][] = [
+    ["curl -T x 'https://{files.acme-infra.net,example.com}/up'", [["out", "files.acme-infra.net"], ["out", "example.com"]]],
+    ["curl 'https://h[1-3].example/x'", [["in", "h1.example"], ["in", "h2.example"], ["in", "h3.example"]]],
+    ["curl 'https://h[01-10:9].example/x'", [["in", "h01.example"], ["in", "h10.example"]]],
+    ["curl 'https://{a,b\\,c}.example/x'", [["in", "a.example"]]],
+    ["curl 'https://[::1]:8080/x'", [["in", "::1"]]],
+    ["curl --url 'https://{a,b}.example/x'", [["in", "a.example"], ["in", "b.example"]]],
+    ["curl -g 'https://{a,b}.example/x'", []],
+    ["curl 'https://a.example/x' 'https://{{b}}.example/y' https://c.example/z", [["in", "a.example"]]],
+    ["curl 'https://h[3-1].example/x'", []],
+    ["curl 'https://a.example/x}'", []],
+    // With globbing off, brackets or a backslash in the host are a name curl rejects.
+    ["curl -g 'https://h[1-2].example/x'", []],
+    ["curl -g 'https://a.example\\b/x'", []],
+    // Unquoted, bash expands the braces before curl runs; quoted, curl reads {1..2} as one name.
+    ["curl -g https://{a,b}.example/x", [["in", "a.example"], ["in", "b.example"]]],
+    ["curl https://h{1..2}.example/x", [["in", "h1.example"], ["in", "h2.example"]]],
+    ["curl 'https://h{1..2}.example/x'", [["in", "h1..2.example"]]],
+  ];
+  for (const [command, expected] of cases) assert.deepEqual(await hosts(command), expected, command);
 });
 
 test("--connect-to and --resolve set where a URL connects", async () => {

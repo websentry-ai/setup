@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b17f61f3e2398916f47212721e7f5bee5196e7fa17d3d6d0e2ee4a485afef546'
+BLOCK_SHA256 = '52f01280736b273d3ee79590411b881ccbc3bdd2e94945d6cb2290f8caf96d90'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -249,6 +249,31 @@ class CurlTests(TransferTestCase):
         # A --next or -: that is another option's value is that value, not a new request.
         self.assert_hosts('curl --data --next https://example.com/a', [('out', 'example.com')])
         self.assert_hosts('curl -d -: https://example.com/a', [('out', 'example.com')])
+
+    def test_url_globs_reach_every_host_they_name(self):
+        # curl expands {a,b} sets and [1-3] ranges itself unless --globoff is given, and stops at a glob it rejects.
+        cases = {
+            "curl -T x 'https://{files.acme-infra.net,example.com}/up'":
+                [('out', 'files.acme-infra.net'), ('out', 'example.com')],
+            "curl 'https://h[1-3].example/x'": [('in', 'h1.example'), ('in', 'h2.example'), ('in', 'h3.example')],
+            "curl 'https://h[01-10:9].example/x'": [('in', 'h01.example'), ('in', 'h10.example')],
+            "curl 'https://{a,b\\,c}.example/x'": [('in', 'a.example')],
+            "curl 'https://[::1]:8080/x'": [('in', '::1')],
+            "curl --url 'https://{a,b}.example/x'": [('in', 'a.example'), ('in', 'b.example')],
+            "curl -g 'https://{a,b}.example/x'": [],
+            "curl 'https://a.example/x' 'https://{{b}}.example/y' https://c.example/z": [('in', 'a.example')],
+            "curl 'https://h[3-1].example/x'": [],
+            "curl 'https://a.example/x}'": [],
+            # With globbing off, brackets or a backslash in the host are a name curl rejects.
+            "curl -g 'https://h[1-2].example/x'": [],
+            "curl -g 'https://a.example\\b/x'": [],
+            "curl -g https://{a,b}.example/x": [('in', 'a.example'), ('in', 'b.example')],
+            # Unquoted, bash expands the braces before curl runs; quoted, curl reads {1..2} as one name.
+            'curl https://h{1..2}.example/x': [('in', 'h1.example'), ('in', 'h2.example')],
+            "curl 'https://h{1..2}.example/x'": [('in', 'h1..2.example')],
+        }
+        for command, expected in cases.items():
+            self.assert_hosts(command, expected)
 
     def test_connect_to_and_resolve_set_where_a_url_connects(self):
         # As curl applies them: the first matching --connect-to, then the last pin for that host and port, a named
@@ -643,7 +668,7 @@ class ParserFindingTests(TransferTestCase):
             self.assert_hosts(command, [('in', 'actual.example')])
 
     def test_a_paren_in_a_case_pattern_does_not_end_the_subshell(self):
-        self.assert_endpoints('(cd frontend; case x in y) cd ..;; esac; scp -F cfg f prod:/tmp)',
+        self.assert_endpoints('(cd frontend; case x in y) true;; esac; scp -F cfg f prod:/tmp)',
                               [_endpoint('out', 'prod', 'private', '10.0.4.12')])
 
     def test_a_substitution_inside_double_quotes_runs(self):
@@ -664,12 +689,9 @@ class ParserFindingTests(TransferTestCase):
                         '{ f() { curl https://never.example/a; }; }; curl https://actual.example/b',
                         'while true; do g () { curl https://never.example/a; }; break; done; curl https://actual.example/b'):
             self.assert_hosts(command, [('in', 'actual.example')])
-        public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
         for command in ('if false; then cd frontend; fi; scp -F cfg f prod:/tmp',
-                        'f() { cd frontend; }; scp -F cfg f prod:/tmp',
-                        'case x in y) cd frontend;; esac; scp -F cfg f prod:/tmp',
-                        'if [ -d frontend ]; then cd frontend; fi; scp -F cfg f prod:/tmp'):
-            self.assert_endpoints(command, public)
+                        'f() { cd frontend; }; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
 
     def test_a_substitution_under_an_untaken_branch_or_a_function_body_does_not_run(self):
         for command in ('if false; then echo $(curl -T x https://never.example/a); fi; curl https://actual.example/b',
@@ -700,6 +722,11 @@ class ParserFindingTests(TransferTestCase):
                         'cd frontend | true; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
         self.assert_endpoints('cd frontend && scp -F cfg f prod:/tmp &', [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+        # A backgrounded list inside a compound starts where the compound's body does, after the cd before it.
+        for command in ('cd frontend && { true & scp -F cfg f prod:/tmp; }',
+                        'cd frontend && { for x in a; do true; done & scp -F cfg f prod:/tmp; }',
+                        'cd frontend && if true; then true & scp -F cfg f prod:/tmp; fi'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.0.4.12')])
 
     def test_a_piped_compound_keeps_its_cd_to_itself(self):
         for command in ('{ cd frontend; } | cat; scp -F cfg f prod:/tmp',
@@ -709,6 +736,39 @@ class ParserFindingTests(TransferTestCase):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
         self.assert_endpoints('cat x | { cd frontend; scp -F cfg f prod:/tmp; }',
                               [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+
+    def test_a_cd_that_may_not_have_run_leaves_the_folder_unknown(self):
+        # Where a cd hangs on an unknown status, a later relative -F config is not read from a guessed folder.
+        unknown = [_endpoint('out', 'prod', 'unresolved', 'prod')]
+        for command in ('test -f marker && cd frontend; scp -F cfg f prod:/tmp',
+                        'mkdir x && cd frontend && scp -F cfg f prod:/tmp',
+                        'if [ -d frontend ]; then cd frontend; fi; scp -F cfg f prod:/tmp',
+                        'case x in y) cd frontend;; esac; scp -F cfg f prod:/tmp',
+                        '[ -d x ] && { cd frontend; }; scp -F cfg f prod:/tmp',
+                        'f() { cd frontend; }; [ -d x ] && f; scp -F cfg f prod:/tmp',
+                        'for x in a; do [ -f y ] && break; cd frontend; done; scp -F cfg f prod:/tmp',
+                        '[ -d x ] && cd frontend; cd ..; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, unknown)
+        # A cd that certainly ran, given the command after it runs, still applies; an absolute one is known again.
+        private = [_endpoint('out', 'prod', 'private', '10.0.4.12')]
+        for command in ('cd frontend && scp -F cfg f prod:/tmp',
+                        'cd frontend; scp -F cfg f prod:/tmp',
+                        'if [ -d frontend ]; then cd frontend; scp -F cfg f prod:/tmp; fi',
+                        '[ -d x ] && { cd frontend; scp -F cfg f prod:/tmp; }',
+                        f'[ -d x ] && cd /tmp; cd {self.repo}/frontend; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, private)
+
+    def test_return_exit_and_break_leave_the_folder_where_bash_does(self):
+        private, public = (_endpoint('out', 'prod', 'private', '10.0.4.12'),
+                           _endpoint('out', 'prod', 'public', '203.0.113.9'))
+        for command, expected in (('f() { return; cd frontend; }; f; scp -F cfg f prod:/tmp', public),
+                                  ('f() { cd frontend; return; cd ..; }; f; scp -F cfg f prod:/tmp', private),
+                                  ('for x in a; do break; cd frontend; done; scp -F cfg f prod:/tmp', public),
+                                  ('for x in; do cd frontend; done; scp -F cfg f prod:/tmp', public),
+                                  ('(cd frontend; exit; cd ..); scp -F cfg f prod:/tmp', public),
+                                  ('f() { [ -f y ] && return; cd frontend; }; f; scp -F cfg f prod:/tmp',
+                                   _endpoint('out', 'prod', 'unresolved', 'prod'))):
+            self.assert_endpoints(command, [expected])
 
     def test_a_called_function_runs_its_body_in_the_callers_shell(self):
         private = _endpoint('out', 'prod', 'private', '10.0.4.12')

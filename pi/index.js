@@ -1876,6 +1876,7 @@ var MAX_OUTPUT_BYTES = 64 * 1024;
 var MAX_ENDPOINTS = 10;
 var MAX_DEPTH = 8;
 var MAX_CALLS = 32;
+var MAX_WORDS = 64;
 var WRAPPERS = {
   sudo: {
     short: "ugCDhprtTU",
@@ -1903,6 +1904,10 @@ var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]
 var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
 var SUBSTITUTED = "\0";
+var BRACE_MARKS = { "{": "", ",": "", "}": "" };
+function unmark(word) {
+  return word.replace(/[\x01-\x03]/g, (mark) => "{,}"[mark.charCodeAt(0) - 1]);
+}
 var TOOLS = {
   curl: "curl",
   wget: "wget",
@@ -2077,6 +2082,9 @@ var Lexer = class _Lexer {
   cases = [];
   text;
   depth;
+  /** How deep the reader is inside a ${…} parameter, and where the word's last unquoted $ is. */
+  param = 0;
+  dollar = -1;
   constructor(text, depth = 0) {
     this.text = text;
     this.depth = depth;
@@ -2138,10 +2146,19 @@ var Lexer = class _Lexer {
     } else if (ch === " " || ch === "	" || ch === "\r") {
       this.endWord();
     } else {
-      this.word += ch;
+      this.word += this.mark(ch);
       this.inWord = true;
     }
     return true;
+  }
+  /** An unquoted character as it goes into the word: a { , or } bash may brace-expand is marked, unless it is part
+   *  of a ${…} parameter. */
+  mark(ch) {
+    if (ch === "{" && (this.param > 0 || this.dollar >= 0 && this.dollar === this.word.length - 1)) this.param++;
+    else if (ch === "}" && this.param > 0) this.param--;
+    else if (ch === "$") this.dollar = this.word.length;
+    else if (this.param === 0) return BRACE_MARKS[ch] ?? ch;
+    return ch;
   }
   /** Read a $( ), $(( )), backtick or <( ) substitution starting here; undefined when none starts here. */
   substitution() {
@@ -2261,10 +2278,13 @@ var Lexer = class _Lexer {
   }
   endWord() {
     if (!this.inWord) return;
-    const word = this.word;
+    const marked = this.word;
+    const word = unmark(marked);
     const state = this.cases.at(-1);
     this.word = "";
     this.inWord = false;
+    this.param = 0;
+    this.dollar = -1;
     const atStart = this.argv.every((w) => LEADING_WORDS.has(w));
     if (state === "head") {
       if (word === "in") this.cases[this.cases.length - 1] = "pattern";
@@ -2276,8 +2296,11 @@ var Lexer = class _Lexer {
       this.cases.push("head");
     } else if (word === "esac" && atStart && state === "body") {
       this.esac();
-    } else {
+    } else if (isAssignment(word) && this.argv.every((w) => isAssignment(w) || LEADING_WORDS.has(w))) {
       this.argv.push(word);
+    } else {
+      const expanded = braces(marked).map(unmark);
+      this.argv.push(...expanded.length === 1 ? expanded : expanded.filter((w) => w !== ""));
     }
   }
   esac() {
@@ -2321,6 +2344,52 @@ var Lexer = class _Lexer {
     this.io = [];
   }
 };
+function braces(word) {
+  for (let start = word.indexOf(""); start >= 0; start = word.indexOf("", start + 1)) {
+    let depth = 0;
+    let end2 = -1;
+    const commas = [];
+    for (let j = start; j < word.length && end2 < 0; j++) {
+      if (word[j] === "") depth++;
+      else if (word[j] === "") depth--;
+      if (word[j] === "" && depth === 1) commas.push(j);
+      if (depth === 0) end2 = j;
+    }
+    if (end2 < 0) continue;
+    const bounds = [start, ...commas, end2];
+    const parts = commas.length > 0 ? bounds.slice(1).map((bound, k) => word.slice(bounds[k] + 1, bound)) : sequence(word.slice(start + 1, end2));
+    if (parts === void 0) continue;
+    const tails = braces(word.slice(end2 + 1));
+    const out = [];
+    for (const whole of parts) {
+      for (const part of braces(whole)) {
+        for (const tail of tails) {
+          if (out.length >= MAX_WORDS) return out;
+          out.push(word.slice(0, start) + part + tail);
+        }
+      }
+    }
+    return out;
+  }
+  return [word];
+}
+function sequence(body) {
+  const match = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?$/.exec(body);
+  if (match === null) return void 0;
+  const [, first = "", last = "", by] = match;
+  const letters = /^[A-Za-z]$/.test(first);
+  if (letters !== /^[A-Za-z]$/.test(last)) return void 0;
+  const step = Math.abs(Number(by ?? 1)) || 1;
+  const a = letters ? first.charCodeAt(0) : Number(first);
+  const b = letters ? last.charCodeAt(0) : Number(last);
+  const width = !letters && (/^-?0\d/.test(first) || /^-?0\d/.test(last)) ? Math.max(first.length, last.length) : 0;
+  const out = [];
+  for (let n = a; (b >= a ? n <= b : n >= b) && out.length < MAX_WORDS; n += b >= a ? step : -step) {
+    const digits = String(Math.abs(n)).padStart(width - (n < 0 ? 1 : 0), "0");
+    out.push(letters ? String.fromCharCode(n) : n < 0 ? `-${digits}` : digits);
+  }
+  return out;
+}
 function words(text) {
   return (new Lexer(text).read() ?? []).filter((item) => item.kind === "cmd").flatMap((item) => item.argv);
 }
@@ -2338,7 +2407,8 @@ function programName(token) {
 }
 function moveTo(cwd, path) {
   const target = expandHome(path);
-  return isAbsolute3(target) ? target : normalize(join5(cwd ?? "", target));
+  if (isAbsolute3(target)) return target;
+  return cwd === void 0 || target === "-" ? void 0 : normalize(join5(cwd, target));
 }
 function program(input, start) {
   const argv = [...input];
@@ -2408,7 +2478,8 @@ function follows(before, status) {
   return !(before === "&&" && status === 1 || before === "||" && status === 0);
 }
 function runs(shell) {
-  return shell.frames.at(-1)?.runs ?? true;
+  const top = shell.frames.at(-1);
+  return top === void 0 ? shell.live : top.runs;
 }
 function snapshot(shell) {
   return [shell.cwd, { ...shell.exported }, new Map(shell.functions)];
@@ -2418,6 +2489,23 @@ function restore(shell, saved, subshell = false) {
   shell.cwd = saved[0];
   shell.exported = { ...saved[1] };
   if (subshell) shell.functions = new Map(saved[2]);
+}
+function changes(shell, saved) {
+  const names = /* @__PURE__ */ new Set();
+  for (const key of /* @__PURE__ */ new Set([...Object.keys(saved[1]), ...Object.keys(shell.exported)])) {
+    if (saved[1][key] !== shell.exported[key]) names.add(key);
+  }
+  if (shell.cwd !== saved[0]) names.add("");
+  return names;
+}
+function forget(shell, names) {
+  for (const name of names) {
+    if (name === "") shell.cwd = void 0;
+    else shell.exported[name] = SUBSTITUTED;
+  }
+}
+function doubt(pipe) {
+  return pipe.prior === void 0 && (pipe.before === "&&" || pipe.before === "||");
 }
 function pop(frames, kinds) {
   while (frames.length > 0) {
@@ -2430,6 +2518,7 @@ function pipeline(before, runsHere, shell) {
   shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false };
 }
 function begin(before, shell) {
+  if (before === "|") shell.status = shell.pipe.prior;
   if (before === "|" || shell.pipe.leading) return;
   if (before !== "&&" && before !== "||") shell.start = snapshot(shell);
   pipeline(before, both(runs(shell), follows(before, shell.status)), shell);
@@ -2465,6 +2554,8 @@ function openFrame(kind, runsHere, shell, head) {
     kind,
     base: value,
     runs: value,
+    rel: true,
+    alive: true,
     decided: false,
     state: snapshot(shell),
     status: shell.status,
@@ -2473,22 +2564,26 @@ function openFrame(kind, runsHere, shell, head) {
     outer: [shell.pipe, shell.start],
     defines: name,
     head: [shell.at, head],
-    iterates: false,
-    jumps: false
+    iterates: void 0,
+    doubt: doubt(shell.pipe),
+    unsure: /* @__PURE__ */ new Set(),
+    outside: [shell.frames.map((f) => [f.runs, f.alive]), shell.live]
   });
   shell.openingPipe = false;
+  shell.start = snapshot(shell);
   pipeline("", value, shell);
 }
 function frameStatus(frame, status) {
-  const { kind, runs: ran } = frame;
+  const { kind, rel } = frame;
+  if (frame.left !== void 0) return frame.left[0];
   if (frame.defines !== void 0) return 0;
   if (frame.base === false || kind === "$(") return frame.status;
-  if (kind === "if" && ran !== true && frame.decided !== true) return ran === false && frame.decided === false ? 0 : void 0;
+  if (kind === "if" && rel !== true && frame.decided !== true) return rel === false && frame.decided === false ? 0 : void 0;
   if (LOOPS.includes(kind)) {
-    if (ran === false) return 0;
-    return kind === "for" && ran === true && !frame.jumps ? status : void 0;
+    if (rel === false) return 0;
+    return kind === "for" && rel === true ? status : void 0;
   }
-  if (kind === "case") return ran === false ? 0 : void 0;
+  if (kind === "case") return rel === false ? 0 : void 0;
   return status;
 }
 function settle(frame, tail, shell) {
@@ -2499,36 +2594,94 @@ function settle(frame, tail, shell) {
     shell.functions.set(frame.defines, [head, ...shell.items.slice(at + 1, shell.at), tail]);
   }
 }
+function leave(frame, shell) {
+  if (frame.saved === void 0) return;
+  for (const name of changes(shell, frame.saved)) frame.unsure.add(name);
+  restore(shell, frame.saved);
+  frame.saved = void 0;
+}
+function doubtful(frame, shell) {
+  for (const since of [frame.jumped, frame.doubt ? frame.state : void 0]) {
+    if (since !== void 0) for (const name of changes(shell, since)) frame.unsure.add(name);
+  }
+  leave(frame, shell);
+  forget(shell, frame.unsure);
+}
 function wrap(shell, first, layer) {
   for (let i = first; i < shell.calls.length; i++) {
     const call = shell.calls[i];
     shell.calls[i] = { ...call, layers: [...call.layers, layer] };
   }
 }
-function closeFrame(frame, layer, shell) {
+function revive(outside, shell) {
+  outside[0].forEach(([runsHere, alive], i) => {
+    const frame = shell.frames[i];
+    frame.runs = runsHere;
+    frame.alive = alive;
+  });
+  shell.live = outside[1];
+}
+function closeFrame(frame, layer, shell, background = false) {
   wrap(shell, frame.calls, layer);
-  if (layer[0] || layer[1]) restore(shell, frame.state, true);
+  if (layer[0] || layer[1] || background) {
+    restore(shell, frame.state, true);
+    revive(frame.outside, shell);
+  }
 }
 function branch(keyword2, frame, shell) {
   let holds = shell.status === 0 ? true : shell.status === 1 ? false : void 0;
   let taken;
   if (keyword2 === "then" && frame.kind === "if") {
-    taken = both(frame.runs, holds);
+    taken = both(frame.rel, holds);
     if (taken === true) frame.decided = true;
     else if (taken === void 0 && frame.decided === false) frame.decided = void 0;
   } else if ((keyword2 === "elif" || keyword2 === "else") && frame.kind === "if") {
-    restore(shell, frame.saved);
-    frame.saved = void 0;
-    taken = both(frame.base, frame.decided === void 0 ? void 0 : !frame.decided);
+    leave(frame, shell);
+    taken = frame.decided === void 0 ? void 0 : !frame.decided;
   } else if (keyword2 === "do" && LOOPS.includes(frame.kind)) {
-    if (frame.kind === "for" || frame.kind === "select") holds = frame.iterates ? true : void 0;
+    if (frame.kind === "for" || frame.kind === "select") holds = frame.iterates;
     else if (frame.kind === "until" && holds !== void 0) holds = !holds;
-    taken = both(frame.runs, holds);
+    taken = both(frame.rel, holds);
   } else {
     return;
   }
-  frame.runs = taken;
+  take(frame, taken, shell);
+}
+function take(frame, taken, shell) {
+  frame.rel = taken;
+  frame.runs = both(both(frame.base, taken), frame.alive);
   if (taken === void 0 && frame.saved === void 0) frame.saved = snapshot(shell);
+  shell.start = snapshot(shell);
+}
+function jump(name, args, shell) {
+  const { frames, floor } = shell;
+  let bound = -1;
+  frames.forEach((f, i) => {
+    if (f.kind === "(" || f.kind === "$(" || f.pipedIn) bound = i;
+  });
+  let target;
+  if (name === "break" || name === "continue") {
+    const loops = frames.flatMap((f, i) => LOOPS.includes(f.kind) && i > bound && i >= (floor ?? 0) ? [i] : []);
+    if (loops.length === 0) return;
+    const count = /^\d+$/.test(args[0] ?? "") && Number(args[0]) > 0 ? Number(args[0]) : 1;
+    target = loops[loops.length - Math.min(count, loops.length)];
+  } else if (name === "return") {
+    if (floor === void 0) return;
+    target = Math.max(floor, bound);
+  } else {
+    target = Math.max(bound, 0);
+  }
+  const sure = shell.pipe.runs === true && !doubt(shell.pipe);
+  for (const frame2 of frames.slice(target)) {
+    frame2.alive = both(frame2.alive, sure ? false : void 0);
+    frame2.runs = both(frame2.runs, frame2.alive);
+  }
+  if (name === "exit" && bound < 0) shell.live = both(shell.live, sure ? false : void 0);
+  const frame = frames[target];
+  if (frame === void 0) return;
+  const status = name === "break" || name === "continue" ? Number(shell.pipe.negate) : shell.status;
+  frame.left = [sure && frame.left === void 0 ? status : void 0];
+  if (!sure && frame.jumped === void 0) frame.jumped = snapshot(shell);
 }
 function keyword(argv, item, shell) {
   const [word = "", ...rest] = argv;
@@ -2536,7 +2689,9 @@ function keyword(argv, item, shell) {
   if (word === "{" || word === "if" || LOOPS.includes(word)) {
     openFrame(word, shell.pipe.runs, shell, { kind: "cmd", argv, before: "", after: item.after, io: item.io });
     if (word === "for") {
-      frames.at(-1).iterates = rest[1] === "in" && rest.slice(2).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
+      const listed = rest[1] === "in" ? rest.slice(2) : void 0;
+      const literal = (listed ?? []).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
+      frames.at(-1).iterates = literal ? true : listed?.length === 0 ? false : void 0;
     }
     return word === "for" || word === "select" ? [] : rest;
   }
@@ -2549,7 +2704,7 @@ function keyword(argv, item, shell) {
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
     if (frame !== void 0) {
-      restore(shell, frame.saved);
+      doubtful(frame, shell);
       settle(frame, { kind: "cmd", argv: [word], before: item.before, after: "", io: item.io }, shell);
     }
     shell.closed = frame;
@@ -2566,7 +2721,11 @@ function marker(item, shell) {
     begin(item.before, shell);
     shell.openingPipe = item.before === "|";
     openFrame(item.kind, shell.pipe.runs, shell, { kind: item.kind, argv: [], before: "", after: "", io: [] });
-    if (item.kind === "case") frames.at(-1).runs = false;
+    if (item.kind === "case") {
+      const frame = frames.at(-1);
+      frame.rel = false;
+      frame.runs = false;
+    }
   } else if (item.kind === "$(") {
     const runsHere = item.before === "|" || pipe.leading ? pipe.runs : both(runs(shell), follows(item.before, shell.status));
     shell.openingPipe = item.before === "|";
@@ -2577,18 +2736,18 @@ function marker(item, shell) {
     shell.pipe.leading = true;
   } else if (item.kind === "arm" && frames.at(-1)?.kind === "case") {
     const frame = frames.at(-1);
-    restore(shell, frame.saved);
-    frame.runs = both(frame.base, void 0);
-    frame.saved = snapshot(shell);
+    leave(frame, shell);
+    take(frame, void 0, shell);
   } else if (item.kind === ")" || item.kind === "esac") {
     const frame = pop(frames, item.kind === ")" ? ["(", "$("] : ["case"]);
     if (frame === void 0) return;
-    restore(shell, item.kind === ")" ? frame.state : frame.saved, item.kind === ")");
+    if (item.kind === ")") restore(shell, frame.state, true);
+    else doubtful(frame, shell);
     settle(frame, { ...item, after: "" }, shell);
     if (frame.kind === "$(") {
       closeFrame(frame, [frame.pipedIn, false, [[1, "null"]]], shell);
     } else {
-      closeFrame(frame, [frame.pipedIn, item.after === "|", item.io], shell);
+      closeFrame(frame, [frame.pipedIn, item.after === "|", item.io], shell, item.after === "&");
       finish(item.after, shell);
     }
   }
@@ -2621,7 +2780,7 @@ function shellString(name, args) {
   }
   return void 0;
 }
-function callFunction(body, layer, shell, depth) {
+function callFunction(body, layer, subshell, shell, depth) {
   if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
     shell.status = void 0;
     return;
@@ -2629,29 +2788,45 @@ function callFunction(body, layer, shell, depth) {
   shell.callsLeft--;
   const first = shell.calls.length;
   const state = snapshot(shell);
-  const outer = [shell.pipe, shell.start];
+  const outer = [shell.pipe, shell.start, shell.floor];
+  const outside = [shell.frames.map((f) => [f.runs, f.alive]), shell.live];
+  shell.floor = shell.frames.length;
   walkItems(body, shell, depth + 1);
-  [shell.pipe, shell.start] = outer;
+  [shell.pipe, shell.start, shell.floor] = outer;
   wrap(shell, first, layer);
-  if (layer[0] || layer[1]) restore(shell, state, true);
+  if (subshell) {
+    restore(shell, state, true);
+    revive(outside, shell);
+  } else if (doubt(shell.pipe)) {
+    forget(shell, changes(shell, state));
+  }
 }
 function simple(argv, item, before, shell, depth) {
   const layer = [before === "|", item.after === "|", item.io];
+  const subshell = before === "|" || item.after === "|" || item.after === "&";
   const called = argv.find((word) => !isAssignment(word));
   const body = called === void 0 ? void 0 : shell.functions.get(called);
   if (body !== void 0) {
-    callFunction(body, layer, shell, depth);
+    callFunction(body, layer, subshell, shell, depth);
     return [];
   }
   const parsed = program(argv, shell.cwd);
   const { name, args } = parsed;
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...shell.exported, ...parsed.env };
-  shell.status = name === "true" || name === ":" ? 0 : name === "false" ? 1 : void 0;
-  if (name === "break" || name === "continue") {
-    for (const frame of shell.frames) frame.jumps = true;
+  const status = shell.status;
+  shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : void 0;
+  if (name === "return" || name === "exit") {
+    const given = args[0];
+    shell.status = given === void 0 ? status : /^\d+$/.test(given) ? Number(BigInt(given) % 256n > 0n) : void 0;
+    if (name === "return" && shell.floor === void 0) shell.status = 1;
   }
+  if ((name === "return" || name === "exit" || name === "break" || name === "continue") && !subshell) jump(name, args, shell);
   if (name === "cd" || name === "export" || name === "unset") {
-    if (before !== "|" && item.after !== "|") builtin(name, args, parsed.cwd, shell);
+    if (before !== "|" && item.after !== "|") {
+      const saved = snapshot(shell);
+      builtin(name, args, parsed.cwd, shell);
+      if (doubt(shell.pipe)) forget(shell, changes(shell, saved));
+    }
     return [];
   }
   const inner = name === void 0 ? void 0 : shellString(name, args);
@@ -2677,7 +2852,7 @@ function command(item, shell, depth) {
   shell.openingPipe = false;
   const closed = shell.closed;
   shell.closed = void 0;
-  if (closed !== void 0) closeFrame(closed, [closed.pipedIn, item.after === "|", item.io], shell);
+  if (closed !== void 0) closeFrame(closed, [closed.pipedIn, item.after === "|", item.io], shell, item.after === "&");
   let calls = [];
   if (argv.length > 0) {
     shell.pipe.leading = false;
@@ -2712,7 +2887,9 @@ function walk(items, cwd, exported, processEnv, depth) {
     functions: /* @__PURE__ */ new Map(),
     callsLeft: MAX_CALLS,
     items,
-    at: 0
+    at: 0,
+    live: true,
+    floor: void 0
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -2733,7 +2910,9 @@ function shortOption(arg, args, start, valueFlags, seen) {
 function urlHost(url) {
   try {
     const text = url.trim();
-    const host = new URL(text.includes("://") ? text : `http://${text}`).hostname.toLowerCase();
+    const full = text.includes("://") ? text : `http://${text}`;
+    if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
+    const host = new URL(full).hostname.toLowerCase();
     return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
   } catch {
     return "";
@@ -2743,13 +2922,80 @@ function curl(args) {
   const out = [];
   const pins = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, next] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    out.push(...urls.map((url) => [sends ? "out" : "in", urlHost(url), void 0, curlDial(url, connects, pins)]));
+    for (const url of urls) {
+      const expanded = globoff ? [url] : curlGlob(url);
+      if (expanded === void 0) return out;
+      out.push(...expanded.map((one) => [sends ? "out" : "in", urlHost(one), void 0, curlDial(one, connects, pins)]));
+    }
     if (next >= args.length) return out;
     i = next;
   }
+}
+function curlGlob(url) {
+  const pieces = globPieces(url);
+  if (pieces === void 0) return void 0;
+  let urls = [""];
+  for (const [text, values] of pieces) {
+    urls = urls.map((u) => u + text);
+    const inHost = !urls.every((u) => /[/?#]/.test(u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
+    urls = urls.flatMap((u) => (inHost ? values : values.slice(0, 1)).map((v) => u + v)).slice(0, MAX_WORDS);
+  }
+  return urls;
+}
+function globPieces(url) {
+  const pieces = [];
+  let text = "";
+  for (let i = 0; i < url.length; ) {
+    const ch = url[i];
+    if (ch === "\\" && "{}[],".includes(url[i + 1] ?? "x")) {
+      text += url[i + 1];
+      i += 2;
+      continue;
+    }
+    if (ch === "}" || ch === "]") return void 0;
+    if (ch !== "{" && ch !== "[") {
+      text += ch;
+      i++;
+      continue;
+    }
+    const close = ch === "{" ? "}" : "]";
+    let end2 = i + 1;
+    while (end2 < url.length && url[end2] !== close) {
+      if (url[end2] === ch) return void 0;
+      end2 += url[end2] === "\\" ? 2 : 1;
+    }
+    if (end2 >= url.length) return void 0;
+    const body = url.slice(i + 1, end2);
+    if (ch === "[" && body.includes(":") && ipOf(body) !== "") {
+      text += url.slice(i, end2 + 1);
+    } else {
+      const values = ch === "{" ? body.split(/(?<!\\),/).map((v) => v.replace(/\\(.)/g, "$1")) : globRange(body);
+      if (values === void 0) return void 0;
+      pieces.push([text, values]);
+      text = "";
+    }
+    i = end2 + 1;
+  }
+  return [...pieces, [text, [""]]];
+}
+function globRange(body) {
+  const match = /^(?:(\d+)-(\d+)|([a-z])-([a-z])|([A-Z])-([A-Z]))(?::(\d+))?$/.exec(body);
+  const step = match === null ? 0 : Number(match[7] ?? 1);
+  if (match === null || step === 0) return void 0;
+  const values = [];
+  if (match[1] !== void 0) {
+    const first = match[1];
+    const width = first.startsWith("0") ? first.length : 0;
+    for (let n = Number(first); n <= Number(match[2]) && values.length < MAX_WORDS; n += step) values.push(String(n).padStart(width, "0"));
+  } else {
+    const first = match[3] ?? match[5];
+    const last = match[4] ?? match[6];
+    for (let c = first.charCodeAt(0); c <= last.charCodeAt(0); c += step) values.push(String.fromCharCode(c));
+  }
+  return values.length > 0 ? values : void 0;
 }
 function ipOf(text) {
   const bare = text.trim().replace(/^\[+|\]+$/g, "");
@@ -2819,7 +3065,7 @@ function curlRequest(args, start) {
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, Boolean(sends), overrides, i];
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i];
 }
 function wget(args) {
   const urls = [];
@@ -4014,7 +4260,7 @@ function signatureOf(paths) {
 function createMcpConfigReader(options) {
   let snap;
   let invalidated = false;
-  function take(cwd) {
+  function take2(cwd) {
     const safeCwd2 = typeof cwd === "string" ? cwd : "";
     const sources = mcpConfigSources(options, safeCwd2);
     if (sources === void 0) return false;
@@ -4027,13 +4273,13 @@ function createMcpConfigReader(options) {
   return {
     snapshot(cwd) {
       try {
-        if (snap === void 0) take(cwd);
+        if (snap === void 0) take2(cwd);
       } catch {
       }
     },
     serverConfig(serverName, cwd) {
       try {
-        if (snap === void 0 && !take(cwd)) return void 0;
+        if (snap === void 0 && !take2(cwd)) return void 0;
         if (invalidated || snap === void 0 || snap.view === void 0) return void 0;
         if (signatureOf(snap.sources) !== snap.signature) {
           invalidated = true;
