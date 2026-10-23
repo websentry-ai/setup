@@ -39,6 +39,8 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_ENDPOINTS = 10;
 /** How deep substitutions and `sh -c` strings are followed. */
 const MAX_DEPTH = 8;
+/** How many function calls are followed in one command, so a recursive function stays cheap. */
+const MAX_CALLS = 32;
 /** Wrappers that run the command after them: short options that take a value, long ones that do, operands before it. */
 const WRAPPERS: Record<string, { short: string; long: readonly string[]; operands: number }> = {
   sudo: {
@@ -78,6 +80,8 @@ const TOOLS: Record<string, string> = {
   "invoke-webrequest": "powershell", "invoke-restmethod": "powershell", iwr: "powershell", irm: "powershell",
 };
 const SENDING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "PATCH"]);
+/** The port a URL connects to when it names none, by scheme. */
+const DEFAULT_PORTS: Record<string, number> = { http: 80, https: 443, ftp: 21, ftps: 990, ws: 80, wss: 443 };
 /** Options that take a value, per program; every other option is a switch. */
 const SSH_VALUE_FLAGS: Record<string, string> = {
   ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX", rsync: "efTMB@",
@@ -185,7 +189,9 @@ interface State {
 }
 
 type Env = Record<string, string>;
-type Raw = [direction: string, destination: string, sshOptions: string[] | undefined];
+/** Where curl connects for a URL when --connect-to or --resolve change it: the host, and the addresses pinned for it. */
+type Dial = [resolvedHost: string, addresses: string[]];
+type Raw = [direction: string, destination: string, sshOptions: string[] | undefined, dial?: Dial];
 
 async function run(argv: string[], state: State): Promise<string | undefined> {
   try {
@@ -257,15 +263,19 @@ function backtickEnd(text: string, start: number): number {
   return -1;
 }
 
+/** One redirection, in the order written: the fd it sets and what that fd then holds, a file or heredoc, nothing
+ *  (/dev/null or a closed fd), or the fd it copies. */
+type Redirection = [fd: number, value: "file" | "null" | number];
+
 /** One simple command, or a marker around a subshell, substitution, function body or case arm. */
 interface Item {
   kind: "cmd" | "(" | "$(" | ")" | "func" | "case" | "arm" | "esac";
+  /** A command's words, or the name a function marker defines. */
   argv: string[];
   /** The operator before: "" first, "&&", "||", "|", "&", or ";" for any other separator. */
   before: string;
   after: string;
-  /** "in" when stdin comes from a file or heredoc, "out" when stdout goes to a file. */
-  io: Set<string>;
+  io: Redirection[];
 }
 
 /** Reads a command the way the shell does into items, in the order they run. */
@@ -277,7 +287,7 @@ class Lexer {
   private word = "";
   private inWord = false;
   private before = "";
-  private io = new Set<string>();
+  private io: Redirection[] = [];
   private readonly heredocs: [string, boolean][] = [];
   private readonly cases: string[] = [];
   private readonly text: string;
@@ -299,8 +309,8 @@ class Lexer {
     return this.items;
   }
 
-  private marker(kind: Item["kind"], before = ""): void {
-    this.items.push({ kind, argv: [], before, after: "", io: new Set() });
+  private marker(kind: Item["kind"], before = "", argv: string[] = []): void {
+    this.items.push({ kind, argv, before, after: "", io: [] });
   }
 
   private quoted(): boolean {
@@ -398,7 +408,7 @@ class Lexer {
       this.word = "";
       this.inWord = false;
       this.flush(); // a then, do or { before it still opens its compound
-      this.marker("func", this.before);
+      this.marker("func", this.before, [name]);
       this.i = this.text.indexOf(")", this.i);
       return;
     }
@@ -422,7 +432,8 @@ class Lexer {
     this.before = ";";
   }
 
-  /** A redirection's operator, an fd number written against it, and its target are not arguments. */
+  /** A redirection's operator, an fd number written against it, and its target are not arguments; it is kept as the fd
+   *  it sets and what that fd then holds. */
   private redirect(): void {
     const { text } = this;
     const fd = this.inWord && /^\d+$/.test(this.word) && text[this.i] !== "&" ? Number(this.word) : undefined;
@@ -432,15 +443,13 @@ class Lexer {
     const op = (/^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(text.slice(this.i)) as RegExpExecArray)[0];
     const [target, end] = readWord(text, this.i + op.length);
     if (op === "<<" || op === "<<-") this.heredocs.push([target, op === "<<-"]);
-    const toStdio = fd === undefined;
-    const reads = ["<", "<<", "<<-", "<<<", "<>"].includes(op) && (toStdio || fd === 0);
-    const writes =
-      ([">", ">>", ">|"].includes(op) && (toStdio || fd === 1)) ||
-      op === "&>" || op === "&>>" ||
-      (op === ">&" && (toStdio || fd === 1) && !/^\d+$/.test(target) && target !== "-");
-    if (target !== "/dev/null" || op.startsWith("<<")) {
-      if (reads) this.io.add("in");
-      if (writes) this.io.add("out");
+    const to = fd ?? (op.startsWith("<") ? 0 : 1);
+    if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
+      this.io.push([to, target === "-" ? "null" : Number(target)]);
+    } else {
+      // A heredoc or here-string feeds its text.
+      this.io.push([to, target === "/dev/null" && !op.startsWith("<<") ? "null" : "file"]);
+      if (op.startsWith("&") || (op === ">&" && fd === undefined)) this.io.push([2, 1]); // &> and >&file send stderr there too
     }
     this.i = end - 1;
   }
@@ -456,6 +465,7 @@ class Lexer {
       this.i += text.startsWith(";;&", i) ? 2 : 1;
       return;
     }
+    if (pair === "|&") this.io.push([2, 1]); // |& also pipes stderr, after the command's own redirections
     if (pair === "&&" || pair === "||" || pair === "|&") {
       this.endCommand(pair === "|&" ? "|" : pair);
       this.i++;
@@ -510,15 +520,11 @@ class Lexer {
   /** Emit the reserved words that lead the current command, so a substitution in it runs only when they let it. */
   private flushLeading(): void {
     let n = 0;
-    // `!` stays with its command, which still obeys the && or || before it.
-    while (
-      n < this.argv.length && this.argv[n] !== "!" &&
-      (LEADING_WORDS.has(this.argv[n] as string) || this.argv[n] === "function")
-    ) {
+    while (n < this.argv.length && (LEADING_WORDS.has(this.argv[n] as string) || this.argv[n] === "function")) {
       n += this.argv[n] === "function" ? 2 : 1;
     }
     if (n === 0) return;
-    this.items.push({ kind: "cmd", argv: this.argv.slice(0, n), before: this.before, after: "", io: new Set() });
+    this.items.push({ kind: "cmd", argv: this.argv.slice(0, n), before: this.before, after: "", io: [] });
     this.argv = this.argv.slice(n);
     this.before = "";
   }
@@ -528,7 +534,7 @@ class Lexer {
     if (this.argv.length === 0) return;
     this.items.push({ kind: "cmd", argv: this.argv, before: this.before, after: "", io: this.io });
     this.argv = [];
-    this.io = new Set();
+    this.io = [];
     this.before = "";
   }
 
@@ -539,7 +545,7 @@ class Lexer {
       this.before = after;
     } else {
       const last = this.items.at(-1);
-      if (last !== undefined && (last.kind === ")" || last.kind === "esac") && (after !== "" || this.io.size > 0)) {
+      if (last !== undefined && (last.kind === ")" || last.kind === "esac") && (after !== "" || this.io.length > 0)) {
         // A pipe, redirection or & after a subshell or case applies to the whole compound.
         last.after = after;
         last.io = this.io;
@@ -547,7 +553,7 @@ class Lexer {
       if (after !== ";" && after !== "") this.before = after;
     }
     this.argv = [];
-    this.io = new Set();
+    this.io = [];
   }
 }
 
@@ -658,9 +664,22 @@ function both(a: Maybe, b: Maybe): Maybe {
   return a === undefined || b === undefined ? undefined : true;
 }
 
-/** Whether a command runs after its && or ||, given the last literal true (0) or false (1). */
+/** Whether a pipeline runs after its && or ||, given the last literal true (0) or false (1). */
 function follows(before: string, status: number | undefined): boolean {
   return !((before === "&&" && status === 1) || (before === "||" && status === 0));
+}
+
+/** The folder, exports and defined functions at one point, to return to. */
+type Snapshot = [cwd: string | undefined, exported: Env, functions: Map<string, Item[]>];
+
+/** A pipeline being read: whether it runs, and the operator and status before it, which settle the status it leaves. */
+interface Pipeline {
+  before: string;
+  prior: number | undefined;
+  runs: Maybe;
+  negate: boolean;
+  /** A `!` or a function name was read, and the command it leads is still to come. */
+  leading: boolean;
 }
 
 interface Frame {
@@ -669,13 +688,23 @@ interface Frame {
   runs: Maybe;
   decided: Maybe;
   /** The state before a body that only maybe runs, restored when it ends. */
-  saved?: [string | undefined, Env];
+  saved?: Snapshot;
   /** The state when the frame opened, restored when a subshell closes. */
-  state: [string | undefined, Env];
+  state: Snapshot;
   status: number | undefined;
   /** Where the frame's calls start in the walk's list, so a pipe or redirection around it can reach them. */
   calls: number;
   pipedIn: boolean;
+  /** The pipeline and list around the compound, resumed when it closes. */
+  outer: [Pipeline, Snapshot];
+  /** The function this compound is the body of. */
+  defines?: string;
+  /** Where the compound starts in the walk's items, and the item that starts it, kept for a function's calls. */
+  head: [number, Item];
+  /** A for loop whose word list runs the body at least once. */
+  iterates: boolean;
+  /** A break or continue may end the loop. */
+  jumps: boolean;
 }
 
 interface Shell {
@@ -683,15 +712,25 @@ interface Shell {
   exported: Env;
   status: number | undefined;
   frames: Frame[];
-  function: boolean;
-  start: [string | undefined, Env];
+  /** The function the definition being read names. */
+  function: string | undefined;
+  start: Snapshot;
   processEnv: Record<string, string | undefined>;
   calls: Call[];
   /** Whether the compound the current command opens is piped into. */
   openingPipe: boolean;
   /** The compound the current command's closing keyword closed. */
   closed?: Frame;
+  pipe: Pipeline;
+  functions: Map<string, Item[]>;
+  callsLeft: number;
+  /** The items being walked, and the one being read. */
+  items: Item[];
+  at: number;
 }
+
+/** The pipes and redirections around a call at one level: piped in, piped out, and its redirections. */
+type Layer = [pipedIn: boolean, pipedOut: boolean, redirections: readonly Redirection[]];
 
 /** One simple command that runs or may run. */
 interface Call {
@@ -700,23 +739,25 @@ interface Call {
   env: Env;
   cwd: string | undefined;
   otherUser: boolean;
-  io: Set<string>;
-  pipedIn: boolean;
-  pipedOut: boolean;
+  /** The pipes and redirections around the call, from its own outward. */
+  layers: Layer[];
 }
 
 function runs(shell: Shell): Maybe {
   return shell.frames.at(-1)?.runs ?? true;
 }
 
-function snapshot(shell: Shell): [string | undefined, Env] {
-  return [shell.cwd, { ...shell.exported }];
+function snapshot(shell: Shell): Snapshot {
+  return [shell.cwd, { ...shell.exported }, new Map(shell.functions)];
 }
 
-function restore(shell: Shell, saved: [string | undefined, Env] | undefined): void {
+/** Undo the cd and exports since `saved`. A subshell also undoes its function definitions; one defined in a body
+ *  that may not have run is kept, so its calls are still followed. */
+function restore(shell: Shell, saved: Snapshot | undefined, subshell = false): void {
   if (saved === undefined) return;
   shell.cwd = saved[0];
   shell.exported = { ...saved[1] };
+  if (subshell) shell.functions = new Map(saved[2]);
 }
 
 /** Close the innermost compound command of one of these kinds. */
@@ -728,33 +769,102 @@ function pop(frames: Frame[], kinds: readonly string[]): Frame | undefined {
   return undefined;
 }
 
-/** Open a compound command; a function's body is only defined, so it never runs here. */
-function openFrame(kind: string, runsHere: Maybe, shell: Shell): void {
-  let value = runsHere;
-  if (shell.function && kind !== "$(") {
-    value = false;
-    shell.function = false;
-  }
-  shell.frames.push({
-    kind, base: value, runs: value, decided: false, state: snapshot(shell), status: shell.status,
-    calls: shell.calls.length, pipedIn: shell.openingPipe,
-  });
-  shell.openingPipe = false;
+/** Start a pipeline: whether it runs, and the operator and status before it, which settle the status it leaves. */
+function pipeline(before: string, runsHere: Maybe, shell: Shell): void {
+  shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false };
 }
 
-/** Give the commands inside a closed compound the pipes and redirections around it, as they share its stdin and
- *  stdout; a backgrounded compound keeps its cd and exports to itself. */
-function closeFrame(frame: Frame, after: string, io: Set<string>, shell: Shell): void {
-  for (let i = frame.calls; i < shell.calls.length; i++) {
-    const call = shell.calls[i] as Call;
-    shell.calls[i] = {
-      ...call,
-      io: new Set([...call.io, ...io]),
-      pipedIn: call.pipedIn || frame.pipedIn,
-      pipedOut: call.pipedOut || after === "|",
-    };
+/** Start the pipeline a command or compound begins, unless it continues one after a | or a leading `!`; && and ||
+ *  decide whether the whole pipeline runs, and any other operator also starts a list. */
+function begin(before: string, shell: Shell): void {
+  if (before === "|" || shell.pipe.leading) return;
+  if (before !== "&&" && before !== "||") shell.start = snapshot(shell);
+  pipeline(before, both(runs(shell), follows(before, shell.status)), shell);
+}
+
+/** Set the status a finished pipeline leaves: the one before it when it never ran, else its last command's, flipped
+ *  by `!`, and unknown when an unknown status let it run and skipping it would have left another. */
+function end(shell: Shell): void {
+  const { pipe } = shell;
+  let status = shell.status;
+  if (pipe.runs === false) {
+    status = pipe.prior;
+  } else {
+    if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : undefined;
+    const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : undefined;
+    if (pipe.prior === undefined && skipped !== undefined && status !== skipped) status = undefined;
   }
-  if (after === "&") shell.start = frame.state;
+  shell.status = status;
+}
+
+/** End a pipeline element: the pipeline ends unless a | follows, and a backgrounded list runs in a subshell. */
+function finish(after: string, shell: Shell): void {
+  if (after !== "|") end(shell);
+  if (after === "&") {
+    restore(shell, shell.start, true);
+    shell.status = 0; // starting a background job succeeds
+  }
+}
+
+/** Open a compound command, setting the pipeline and list around it aside until it closes; a function's body is only
+ *  defined, so it never runs here. `head` is the item that starts it, kept for a function's calls. */
+function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): void {
+  const name = kind === "$(" ? undefined : shell.function;
+  let value = runsHere;
+  if (name !== undefined) {
+    value = false;
+    shell.function = undefined;
+  }
+  if (kind !== "$(") shell.pipe.leading = false; // a substitution runs inside the command that a leading `!` still awaits
+  shell.frames.push({
+    kind, base: value, runs: value, decided: false, state: snapshot(shell), status: shell.status,
+    calls: shell.calls.length, pipedIn: shell.openingPipe, outer: [shell.pipe, shell.start], defines: name,
+    head: [shell.at, head], iterates: false, jumps: false,
+  });
+  shell.openingPipe = false;
+  pipeline("", value, shell);
+}
+
+/** The status a closed compound leaves, given its last command's: a function definition succeeds, a compound that
+ *  never ran keeps the one before it, an if or loop that ran no body succeeds, and a body that may have run, or a
+ *  loop that may have ended at a break, leaves it unknown. */
+function frameStatus(frame: Frame, status: number | undefined): number | undefined {
+  const { kind, runs: ran } = frame;
+  if (frame.defines !== undefined) return 0;
+  if (frame.base === false || kind === "$(") return frame.status;
+  if (kind === "if" && ran !== true && frame.decided !== true) return ran === false && frame.decided === false ? 0 : undefined;
+  if (LOOPS.includes(kind)) {
+    if (ran === false) return 0;
+    return kind === "for" && ran === true && !frame.jumps ? status : undefined;
+  }
+  if (kind === "case") return ran === false ? 0 : undefined;
+  return status;
+}
+
+/** Close a compound: set the status it leaves, resume the pipeline and list around it, and keep a defined function's
+ *  body, from its head item to `tail`, for the calls that run it. */
+function settle(frame: Frame, tail: Item, shell: Shell): void {
+  shell.status = frameStatus(frame, shell.status);
+  [shell.pipe, shell.start] = frame.outer;
+  if (frame.defines !== undefined && shell.pipe.runs !== false) {
+    const [at, head] = frame.head;
+    shell.functions.set(frame.defines, [head, ...shell.items.slice(at + 1, shell.at), tail]);
+  }
+}
+
+/** Wrap each call from `first` on in one more level of pipes and redirections. */
+function wrap(shell: Shell, first: number, layer: Layer): void {
+  for (let i = first; i < shell.calls.length; i++) {
+    const call = shell.calls[i] as Call;
+    shell.calls[i] = { ...call, layers: [...call.layers, layer] };
+  }
+}
+
+/** Wrap the commands inside a closed compound in the pipes and redirections around it; a piped compound runs in a
+ *  subshell, so its cd, exports and functions end with it. */
+function closeFrame(frame: Frame, layer: Layer, shell: Shell): void {
+  wrap(shell, frame.calls, layer);
+  if (layer[0] || layer[1]) restore(shell, frame.state, true);
 }
 
 /** Start the body a then, elif, else or do opens: run, skipped or maybe run, by the literal status before it.
@@ -771,8 +881,9 @@ function branch(keyword: string, frame: Frame, shell: Shell): void {
     frame.saved = undefined;
     taken = both(frame.base, frame.decided === undefined ? undefined : !frame.decided);
   } else if (keyword === "do" && LOOPS.includes(frame.kind)) {
-    if (frame.kind === "for" || frame.kind === "select") holds = undefined;
-    taken = both(frame.runs, holds === undefined || frame.kind === "while" ? holds : !holds);
+    if (frame.kind === "for" || frame.kind === "select") holds = frame.iterates ? true : undefined;
+    else if (frame.kind === "until" && holds !== undefined) holds = !holds;
+    taken = both(frame.runs, holds);
   } else {
     return;
   }
@@ -780,41 +891,58 @@ function branch(keyword: string, frame: Frame, shell: Shell): void {
   if (taken === undefined && frame.saved === undefined) frame.saved = snapshot(shell);
 }
 
-/** Apply a command's leading reserved word to the open compound commands; the words after it. */
-function keyword(argv: string[], followsHere: boolean, shell: Shell): string[] {
+/** Apply a command's leading reserved word to the open compound commands and its pipeline; the words after it. */
+function keyword(argv: string[], item: Item, shell: Shell): string[] {
   const [word = "", ...rest] = argv;
+  const { frames } = shell;
   if (word === "{" || word === "if" || LOOPS.includes(word)) {
-    openFrame(word, both(runs(shell), followsHere), shell);
+    openFrame(word, shell.pipe.runs, shell, { kind: "cmd", argv, before: "", after: item.after, io: item.io });
+    if (word === "for") {
+      // A word list with a word that expands to itself runs the body at least once.
+      (frames.at(-1) as Frame).iterates =
+        rest[1] === "in" && rest.slice(2).some((w) => !w.includes("$") && !w.includes(SUBSTITUTED));
+    }
     return word === "for" || word === "select" ? [] : rest; // a for loop's header runs nothing
   }
-  if (word === "function") {
-    shell.function = true;
-    return rest.slice(1);
+  if (word === "!" || word === "function") {
+    // `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
+    if (word === "!") shell.pipe.negate = !shell.pipe.negate;
+    else shell.function = rest[0] ?? "";
+    shell.pipe.leading = true;
+    return word === "!" ? rest : rest.slice(1);
   }
-  if (word === "!") return rest; // the caller negates the command it leads
   if (word === "}" || word === "fi" || word === "done") {
-    const frame = pop(shell.frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
-    restore(shell, frame?.saved);
+    const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
+    if (frame !== undefined) {
+      restore(shell, frame.saved);
+      settle(frame, { kind: "cmd", argv: [word], before: item.before, after: "", io: item.io }, shell);
+    }
     shell.closed = frame;
-    if (word !== "}") shell.status = undefined; // an if or loop that ran no body still succeeds
     return rest;
   }
-  const top = shell.frames.at(-1);
+  const top = frames.at(-1);
   if (top !== undefined) branch(word, top, shell);
+  pipeline("", runs(shell), shell);
   return rest;
 }
 
 /** Apply a subshell, substitution, function or case marker to the open compound commands. */
 function marker(item: Item, shell: Shell): void {
-  const { frames } = shell;
-  const runsHere = both(runs(shell), follows(item.before, shell.status));
-  if (item.kind === "(" || item.kind === "$(" || item.kind === "case") {
-    // A substitution's output is captured, so only a subshell or case shares the pipe around it.
-    shell.openingPipe = item.before === "|" && item.kind !== "$(";
-    openFrame(item.kind, runsHere, shell);
+  const { frames, pipe } = shell;
+  if (item.kind === "(" || item.kind === "case") {
+    begin(item.before, shell);
+    shell.openingPipe = item.before === "|";
+    openFrame(item.kind, shell.pipe.runs, shell, { kind: item.kind, argv: [], before: "", after: "", io: [] });
     if (item.kind === "case") (frames.at(-1) as Frame).runs = false; // nothing runs until an arm opens
+  } else if (item.kind === "$(") {
+    // A substitution runs when its command does, and reads the stdin piped into that command.
+    const runsHere = item.before === "|" || pipe.leading ? pipe.runs : both(runs(shell), follows(item.before, shell.status));
+    shell.openingPipe = item.before === "|";
+    openFrame(item.kind, runsHere, shell, item);
   } else if (item.kind === "func") {
-    shell.function = true;
+    begin(item.before, shell);
+    shell.function = item.argv[0] ?? "";
+    shell.pipe.leading = true;
   } else if (item.kind === "arm" && frames.at(-1)?.kind === "case") {
     const frame = frames.at(-1) as Frame;
     restore(shell, frame.saved);
@@ -824,10 +952,14 @@ function marker(item: Item, shell: Shell): void {
     const frame = pop(frames, item.kind === ")" ? ["(", "$("] : ["case"]);
     if (frame === undefined) return;
     // A subshell's cd and exports end with it, as do a case arm's, which may not have run.
-    restore(shell, item.kind === ")" ? frame.state : frame.saved);
-    if (frame.kind === "$(" || frame.runs === false) shell.status = frame.status;
-    else if (item.kind === "esac") shell.status = undefined;
-    if (frame.kind !== "$(") closeFrame(frame, item.after, item.io, shell);
+    restore(shell, item.kind === ")" ? frame.state : frame.saved, item.kind === ")");
+    settle(frame, { ...item, after: "" }, shell);
+    if (frame.kind === "$(") {
+      closeFrame(frame, [frame.pipedIn, false, [[1, "null"]]], shell); // its output is captured
+    } else {
+      closeFrame(frame, [frame.pipedIn, item.after === "|", item.io], shell);
+      finish(item.after, shell);
+    }
   }
 }
 
@@ -864,15 +996,42 @@ function shellString(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
-/** The calls one simple command makes, after applying its cd, export or unset. */
-function simple(argv: string[], item: Item, shell: Shell, depth: number): Call[] {
+/** Run a defined function's body where it is called: in this shell, with the call's stdin and stdout, or in a
+ *  subshell when the call is piped. */
+function callFunction(body: Item[], layer: Layer, shell: Shell, depth: number): void {
+  if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
+    shell.status = undefined;
+    return;
+  }
+  shell.callsLeft--;
+  const first = shell.calls.length;
+  const state = snapshot(shell);
+  const outer: [Pipeline, Snapshot] = [shell.pipe, shell.start];
+  walkItems(body, shell, depth + 1);
+  [shell.pipe, shell.start] = outer;
+  wrap(shell, first, layer);
+  if (layer[0] || layer[1]) restore(shell, state, true);
+}
+
+/** The calls one simple command makes, after applying its cd, export or unset; a defined function runs its body. */
+function simple(argv: string[], item: Item, before: string, shell: Shell, depth: number): Call[] {
+  const layer: Layer = [before === "|", item.after === "|", item.io];
+  const called = argv.find((word) => !isAssignment(word));
+  const body = called === undefined ? undefined : shell.functions.get(called);
+  if (body !== undefined) {
+    callFunction(body, layer, shell, depth);
+    return [];
+  }
   const parsed = program(argv, shell.cwd);
   const { name, args } = parsed;
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...shell.exported, ...parsed.env };
   shell.status = name === "true" || name === ":" ? 0 : name === "false" ? 1 : undefined;
+  if (name === "break" || name === "continue") {
+    for (const frame of shell.frames) frame.jumps = true; // the loop may end here, with this status
+  }
   if (name === "cd" || name === "export" || name === "unset") {
     // A pipeline's commands run in subshells, so their cd and exports end with them.
-    if (item.before !== "|" && item.after !== "|") builtin(name, args, parsed.cwd, shell);
+    if (before !== "|" && item.after !== "|") builtin(name, args, parsed.cwd, shell);
     return [];
   }
   const inner = name === undefined ? undefined : shellString(name, args);
@@ -881,55 +1040,61 @@ function simple(argv: string[], item: Item, shell: Shell, depth: number): Call[]
     return walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1).map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
-      io: new Set([...call.io, ...item.io]),
-      pipedIn: call.pipedIn || item.before === "|",
-      pipedOut: call.pipedOut || item.after === "|",
+      layers: [...call.layers, layer],
     }));
   }
   if (name === undefined) return [];
-  return [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, io: item.io, pipedIn: item.before === "|", pipedOut: item.after === "|" }];
+  return [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }];
 }
 
-/** The calls one simple command makes, if it runs or may run. */
+/** The calls one simple command makes, if it runs or may run, after the reserved words that lead it. */
 function command(item: Item, shell: Shell, depth: number): Call[] {
   let argv = item.argv;
-  let followsHere = follows(item.before, shell.status);
-  if (!["&&", "||", "|"].includes(item.before)) shell.start = snapshot(shell);
-  let negated = false;
-  shell.openingPipe = item.before === "|";
+  let before = item.before;
+  if (!["}", "fi", "done"].includes(argv[0] as string)) begin(before, shell);
+  shell.openingPipe = before === "|";
   while (argv.length > 0 && KEYWORDS.has(argv[0] as string)) {
-    const negation = argv[0] === "!";
-    negated ||= negation;
-    argv = keyword(argv, followsHere, shell);
-    // A frame or branch keyword takes the && or || itself; `!` leaves it to the command it negates.
-    if (!negation) followsHere = true;
+    // A body's first command is reached by its compound's pipe, which its own redirections then override.
+    if (argv[0] !== "!" && argv[0] !== "function") before = "";
+    argv = keyword(argv, item, shell);
   }
   shell.openingPipe = false;
   const closed = shell.closed;
   shell.closed = undefined;
-  if (closed !== undefined) closeFrame(closed, item.after, item.io, shell);
+  if (closed !== undefined) closeFrame(closed, [closed.pipedIn, item.after === "|", item.io], shell);
   let calls: Call[] = [];
-  if (argv.length > 0 && both(runs(shell), followsHere) !== false) {
-    calls = simple(argv, item, shell, depth);
-    if (negated) shell.status = shell.status === 0 ? 1 : shell.status === 1 ? 0 : undefined;
+  if (argv.length > 0) {
+    shell.pipe.leading = false;
+    if (shell.pipe.runs !== false) calls = simple(argv, item, before, shell, depth);
   }
-  if (item.after === "&") restore(shell, shell.start); // a backgrounded list runs in a subshell
+  if (argv.length > 0 || closed !== undefined) finish(item.after, shell);
   return calls;
 }
 
-/** Each simple command that runs or may run; commands a literal true or false skips, untaken branches and
- *  function bodies are left out. */
-function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv: Record<string, string | undefined>, depth: number): Call[] {
-  const calls: Call[] = [];
-  const shell: Shell = {
-    cwd, exported: { ...exported }, status: undefined, frames: [], function: false,
-    start: [cwd, { ...exported }], processEnv, calls, openingPipe: false,
-  };
-  for (const item of items) {
-    if (item.kind === "cmd") calls.push(...command(item, shell, depth));
+/** Walk items in this shell, adding each call that runs or may run to its calls. */
+function walkItems(list: Item[], shell: Shell, depth: number): void {
+  const outer: [Item[], number] = [shell.items, shell.at];
+  shell.items = list;
+  for (let at = 0; at < list.length; at++) {
+    shell.at = at;
+    const item = list[at] as Item;
+    if (item.kind === "cmd") shell.calls.push(...command(item, shell, depth));
     else marker(item, shell);
   }
-  return calls;
+  [shell.items, shell.at] = outer;
+}
+
+/** Each simple command that runs or may run; commands a literal true or false skips, untaken branches and function
+ *  bodies are left out, and a function's body runs where it is called. */
+function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv: Record<string, string | undefined>, depth: number): Call[] {
+  const shell: Shell = {
+    cwd, exported: { ...exported }, status: undefined, frames: [], function: undefined,
+    start: [cwd, { ...exported }, new Map()], processEnv, calls: [], openingPipe: false,
+    pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false },
+    functions: new Map(), callsLeft: MAX_CALLS, items, at: 0,
+  };
+  walkItems(items, shell, depth);
+  return shell.calls;
 }
 
 /** The option in a cluster such as -sSLo that takes a value, its value and the next index; switches go to `seen`. */
@@ -959,26 +1124,77 @@ function urlHost(url: string): string {
 }
 
 /** curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
- *  from. Each --next starts a request with options of its own. */
+ *  from. Each --next starts a request with options of its own, though the addresses --resolve pins carry on to the
+ *  requests after it. */
 function curl(args: string[]): Raw[] {
   const out: Raw[] = [];
+  const pins: string[] = [];
   let request: string[] = [];
   for (const arg of [...args, "--next"]) {
     if (arg !== "-:" && arg !== "--next") {
       request.push(arg);
       continue;
     }
-    const [urls, sends] = curlRequest(request);
-    out.push(...urls.map((url): Raw => [sends ? "out" : "in", urlHost(url), undefined]));
+    const [urls, sends, overrides] = curlRequest(request);
+    pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
+    const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
+    out.push(...urls.map((url): Raw => [sends ? "out" : "in", urlHost(url), undefined, curlDial(url, connects, pins)]));
     request = [];
   }
   return out;
 }
 
-/** The URLs of one curl request, and whether it sends data. */
-function curlRequest(args: string[]): [string[], boolean] {
+/** The IP address a string holds, brackets allowed, in the form the Python hooks print; empty when it holds none. */
+function ipOf(text: string): string {
+  const bare = text.trim().replace(/^\[+|\]+$/g, "");
+  const family = isIP(bare);
+  return family === 6 ? normalizeV6(bare) : family === 4 ? bare : "";
+}
+
+/** Where a URL's request connects when --connect-to or --resolve change it, as curl applies them: the first
+ *  --connect-to rule that matches, then the last pin for that host and port, a named host before *; undefined when
+ *  neither applies. */
+function curlDial(url: string, connects: readonly string[], pins: readonly string[]): Dial | undefined {
+  const host = urlHost(url);
+  let port: string;
+  try {
+    const text = url.trim();
+    const parsed = new URL(text.includes("://") ? text : `http://${text}`);
+    port = parsed.port || String(DEFAULT_PORTS[parsed.protocol.slice(0, -1).toLowerCase()] ?? "");
+  } catch {
+    return undefined;
+  }
+  // Colons inside [ ] belong to an IPv6 address.
+  const fields = (rule: string): string[] => rule.split(/:(?![^[]*\])/);
+  let target: [string, string] = [host, port];
+  for (const rule of connects) {
+    const parts = fields(rule);
+    const [from = "", fromPort = "", to = "", toPort = ""] = parts;
+    if (parts.length === 4 && ["", host].includes(cleanHost(from)) && ["", port].includes(fromPort)) {
+      target = [cleanHost(to) || host, toPort || port];
+      break;
+    }
+  }
+  const pinned = new Map<string, string[]>();
+  for (const pin of pins) {
+    const parts = fields(pin.replace(/^[+-]+/, ""));
+    const key = `${parts[0] === "*" ? "*" : cleanHost(parts[0] ?? "")} ${parts[1] ?? ""}`;
+    pinned.delete(key);
+    if (!pin.startsWith("-") && parts.length > 2) {
+      pinned.set(key, parts.slice(2).join(":").split(",").map(ipOf).filter((ip) => ip !== ""));
+    }
+  }
+  const named = pinned.get(`${target[0]} ${target[1]}`) ?? [];
+  const addresses = named.length > 0 ? named : (pinned.get(`* ${target[1]}`) ?? []);
+  if (target[0] === host && addresses.length === 0) return undefined;
+  return [addresses[0] ?? target[0], addresses];
+}
+
+/** The URLs of one curl request, whether it sends data, and its --resolve and --connect-to values in order. */
+function curlRequest(args: string[]): [string[], boolean, [string, string][]] {
   const urls: string[] = [];
   const flags = new Set<string>();
+  const overrides: [string, string][] = [];
   let method = "";
   for (let i = 0; i < args.length; ) {
     let arg = args[i++] as string;
@@ -999,10 +1215,11 @@ function curlRequest(args: string[]): [string[], boolean] {
     flags.add(arg);
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
+    else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
-  return [urls, Boolean(sends)];
+  return [urls, Boolean(sends), overrides];
 }
 
 function wget(args: string[]): Raw[] {
@@ -1215,13 +1432,27 @@ function webCmdlet(args: string[], sends: boolean): Raw[] {
   return uri ? [[out ? "out" : "in", urlHost(uri), undefined]] : [];
 }
 
+/** Whether a call's stdin is fed from a file or pipe, and whether its stdout goes to one, from the pipes and
+ *  redirections around it applied as the shell does: the outermost first, each one's pipes before its redirections. */
+function stdio(layers: readonly Layer[]): [boolean, boolean] {
+  // The agent's own stdin and stdout carry no transfer.
+  const fds = new Map<number, string>([[0, "null"], [1, "null"], [2, "null"]]);
+  for (const [pipedIn, pipedOut, redirections] of [...layers].reverse()) {
+    if (pipedIn) fds.set(0, "pipe");
+    if (pipedOut) fds.set(1, "pipe");
+    for (const [fd, value] of redirections) fds.set(fd, typeof value === "number" ? (fds.get(value) ?? "null") : value);
+  }
+  const fed = (fd: number): boolean => fds.get(fd) === "file" || fds.get(fd) === "pipe";
+  return [fed(0), fed(1)];
+}
+
 /** The tool and its raw endpoints for a transfer command; undefined for any other. */
 function parse(call: Call, processEnv: Record<string, string | undefined>): [string, Raw[]] | undefined {
   const tool = TOOLS[call.name];
-  const sends = call.io.has("in") || call.pipedIn;
+  const [sends, keeps] = stdio(call.layers);
   let raw: Raw[];
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
-  else if (tool === "ssh") raw = sshPipe(call.args, sends, call.io.has("out") || call.pipedOut);
+  else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
   else if (tool === "curl") raw = curl(call.args);
   else if (tool === "wget") raw = wget(call.args);
   else if (tool === "nc") raw = netcat(call.args, sends);
@@ -1230,7 +1461,7 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return undefined;
   // Under sudo, ssh runs as that user, with that user's config, which this can't read.
-  return [tool, raw.map(([d, dest, options]): Raw => [d, dest, call.otherUser ? undefined : options])];
+  return [tool, raw.map(([d, dest, options, dial]): Raw => [d, dest, call.otherUser ? undefined : options, dial])];
 }
 
 /** A host name or address in lower case without brackets; empty when it isn't one. */
@@ -1492,21 +1723,34 @@ async function address(host: string, state: State): Promise<AddressKind> {
     const remaining = state.deadline - state.now();
     found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
   }
-  const kinds = found.map(kindOf);
-  const kind: AddressKind = kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : (kinds[0] as AddressKind);
+  const kind = addressKind(found);
   state.addresses.set(host, kind);
   return kind;
 }
 
-/** One place a transfer reached: its host as written without any login, the host ssh resolves it to, and the kind
- *  of address that host has. */
+/** public when any address is public, else the first address's kind; unresolved when there is none. */
+function addressKind(found: readonly string[]): AddressKind {
+  const kinds = found.map(kindOf);
+  return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : (kinds[0] as AddressKind);
+}
+
+/** One place a transfer reached: its host as written without any login, the host it connects to, as ssh -G resolves
+ *  it or curl's --connect-to and --resolve set it, and the kind of address that host has. */
 async function endpoint(raw: Raw, cwd: string | undefined, state: State): Promise<TransferEndpoint | undefined> {
-  const [direction, rawDestination, sshOptions] = raw;
+  const [direction, rawDestination, sshOptions, dial] = raw;
   const destination = rawDestination.trim();
   const host = cleanHost(destination.includes("://") ? urlHost(destination) : (destination.split("@").pop() ?? ""));
   if (host === "") return undefined;
-  const resolved = (sshOptions === undefined ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
-  const out: TransferEndpoint = { host, resolved_host: resolved, address: await address(resolved, state) };
+  let resolved: string;
+  let kind: AddressKind;
+  if (dial !== undefined) {
+    resolved = dial[0];
+    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state);
+  } else {
+    resolved = (sshOptions === undefined ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
+    kind = await address(resolved, state);
+  }
+  const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
 }
 

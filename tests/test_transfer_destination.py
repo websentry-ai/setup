@@ -32,7 +32,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '351768a461759f360cd4a5c49c49ea3063a718c815224c3078f16f191d99f31d'
+BLOCK_SHA256 = '04e079d7013077bd8795b5a16a9d41adf94bde37c33e7cc53f7da252b643e9a0'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -246,6 +246,36 @@ class CurlTests(TransferTestCase):
                           [('out', 'files.acme-infra.net'), ('in', 'example.com')])
         self.assert_hosts('curl https://example.com/a -: -d x https://files.acme-infra.net/up',
                           [('in', 'example.com'), ('out', 'files.acme-infra.net')])
+
+    def test_connect_to_and_resolve_set_where_a_url_connects(self):
+        # As curl applies them: the first matching --connect-to, then the last pin for that host and port, a named
+        # host before *; pins carry on past --next and a --connect-to does not.
+        cases = {
+            'curl --resolve example.com:443:10.0.0.5 https://example.com/x': [('example.com', '10.0.0.5', 'private')],
+            'curl --resolve example.com:80:10.0.0.5 https://example.com/x': [('example.com', 'example.com', 'public')],
+            "curl --resolve '*:443:10.0.0.5' https://example.com/x": [('example.com', '10.0.0.5', 'private')],
+            "curl --resolve example.com:443:8.8.8.8 --resolve '*:443:10.0.0.5' https://example.com/x":
+                [('example.com', '8.8.8.8', 'public')],
+            'curl --resolve example.com:443:10.0.0.5 --resolve -example.com:443 https://example.com/x':
+                [('example.com', 'example.com', 'public')],
+            "curl --resolve 'example.com:443:10.0.0.5,8.8.8.8' https://example.com/x":
+                [('example.com', '10.0.0.5', 'public')],
+            'curl --connect-to example.com:443:cgnat.example:8443 --resolve cgnat.example:8443:[fd00::1] '
+            'https://example.com/x': [('example.com', 'fd00::1', 'private')],
+            'curl --connect-to example.com:443:cgnat.example: --resolve example.com:443:8.8.8.8 https://example.com/x':
+                [('example.com', 'cgnat.example', 'cgnat')],
+            'curl --connect-to ::10.1.2.3: --connect-to ::8.8.8.8: https://example.com/x':
+                [('example.com', '10.1.2.3', 'private')],
+            'curl https://example.com/a --next --resolve example.com:443:10.0.0.5 https://example.com/b':
+                [('example.com', 'example.com', 'public'), ('example.com', '10.0.0.5', 'private')],
+            'curl --connect-to ::10.1.2.3: https://example.com/a --next https://example.com/b':
+                [('example.com', '10.1.2.3', 'private'), ('example.com', 'example.com', 'public')],
+        }
+        for command, expected in cases.items():
+            for hook, transfer in self.each(command):
+                with self.subTest(hook=hook, command=command):
+                    got = [(e['host'], e['resolved_host'], e['address']) for e in transfer['endpoints']]
+                    self.assertEqual(got, expected)
 
     def test_option_values_are_never_read_as_urls(self):
         self.assert_hosts('curl --cacert ca.pem -x http://proxy.corp:3128 -e https://referer.example '
@@ -667,6 +697,29 @@ class ParserFindingTests(TransferTestCase):
                         'cd frontend | true; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
         self.assert_endpoints('cd frontend && scp -F cfg f prod:/tmp &', [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+
+    def test_a_piped_compound_keeps_its_cd_to_itself(self):
+        for command in ('{ cd frontend; } | cat; scp -F cfg f prod:/tmp',
+                        'cat x | { true; cd frontend; }; scp -F cfg f prod:/tmp',
+                        'if true; then cd frontend; fi | cat; scp -F cfg f prod:/tmp',
+                        'cd frontend && { true; } & scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'public', '203.0.113.9')])
+        self.assert_endpoints('cat x | { cd frontend; scp -F cfg f prod:/tmp; }',
+                              [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+
+    def test_a_called_function_runs_its_body_in_the_callers_shell(self):
+        private = _endpoint('out', 'prod', 'private', '10.0.4.12')
+        public = _endpoint('out', 'prod', 'public', '203.0.113.9')
+        for command, expected in (('f() { cd frontend; }; f; scp -F cfg f prod:/tmp', private),
+                                  ('f() { scp -F cfg f prod:/tmp; }; cd frontend; f', private),
+                                  ('f() { cd frontend; }; f | cat; scp -F cfg f prod:/tmp', public),
+                                  ('f() ( cd frontend ); f; scp -F cfg f prod:/tmp', public),
+                                  (': $(f() { cd frontend; }); f; scp -F cfg f prod:/tmp', public)):
+            self.assert_endpoints(command, [expected])
+        # A recursive function is followed a bounded number of times, and the command after it is still read.
+        started = time.monotonic()
+        self.assert_hosts('f() { f; f; f; f; }; f; curl https://actual.example/b', [('in', 'actual.example')])
+        self.assertLess(time.monotonic() - started, 5)
 
 
 class ShellReadingTests(TransferTestCase):

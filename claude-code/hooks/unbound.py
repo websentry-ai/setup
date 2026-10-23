@@ -5200,6 +5200,8 @@ _TRANSFER_TURN_BUDGET = 10.0
 _TRANSFER_MAX_ENDPOINTS = 10
 # How deep substitutions and `sh -c` strings are followed.
 _TRANSFER_MAX_DEPTH = 8
+# How many function calls are followed in one command, so a recursive function stays cheap.
+_TRANSFER_MAX_CALLS = 32
 # Wrappers that run the command after them: (short options that take a value, long ones that do, operands before it).
 _TRANSFER_WRAPPERS = {
     'sudo': ('ugCDhprtTU', {'--user', '--group', '--close-from', '--chdir', '--host', '--prompt', '--role', '--type',
@@ -5233,6 +5235,8 @@ _TRANSFER_TOOLS = {
     'invoke-webrequest': 'powershell', 'invoke-restmethod': 'powershell', 'iwr': 'powershell', 'irm': 'powershell',
 }
 _TRANSFER_SENDING_METHODS = frozenset({'POST', 'PUT', 'PATCH'})
+# The port a URL connects to when it names none, by scheme.
+_TRANSFER_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ftp': 21, 'ftps': 990, 'ws': 80, 'wss': 443}
 # Options that take a value, per program; every other option is a switch.
 _TRANSFER_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': frozenset('cDFiJloPSX'),
                              'sftp': frozenset('BbcDFiJloPRSsX'), 'rsync': frozenset('efTMB@')}
@@ -5393,13 +5397,14 @@ def _transfer_backtick_end(text: str, i: int) -> int:
 class _TransferLexer:
     """Reads a command the way the shell does into items, in the order they run: ('cmd', argv, operator before,
     operator after, redirections) for each simple command, and ('(' | '$(' | ')' | 'func' | 'case' | 'arm' | 'esac',
-    None, operator before, '', None) around subshells, substitutions, function bodies and case arms. Redirections
-    hold 'in' when stdin comes from a file or heredoc and 'out' when stdout goes to a file."""
+    None or [function name], operator before, '', None) around subshells, substitutions, function bodies and case
+    arms. Redirections are kept in the order written, each as (fd, 'file' | 'null' | the fd it copies): a file or
+    heredoc is read or written, /dev/null or a closed fd moves no data."""
 
     def __init__(self, text: str, depth: int = 0):
         self.text, self.depth, self.i, self.quote = text, depth, 0, None
         self.items, self.argv, self.word, self.in_word = [], [], '', False
-        self.before, self.io, self.heredocs, self.case = '', set(), [], []
+        self.before, self.io, self.heredocs, self.case = '', [], [], []
 
     def read(self) -> Optional[List[tuple]]:
         """The items, or None when the command can't be read the way the shell reads it."""
@@ -5498,7 +5503,7 @@ class _TransferLexer:
             # `name()` or `name ()` defines a function; the body that follows runs only when it's called.
             self.argv, self.word, self.in_word = leading, '', False
             self._flush()  # a then, do or { before it still opens its compound
-            self.items.append(('func', None, self.before, '', None))
+            self.items.append(('func', [name], self.before, '', None))
             self.i = self.text.index(')', self.i)
             return
         self._end_word()
@@ -5518,7 +5523,8 @@ class _TransferLexer:
         self.before = ';'
 
     def _redirect(self) -> None:
-        """A redirection's operator, an fd number written against it, and its target are not arguments."""
+        """A redirection's operator, an fd number written against it, and its target are not arguments; it is kept as
+        the fd it sets and what that fd then holds."""
         text, word = self.text, self.word
         fd = int(word) if self.in_word and word.isdigit() and text[self.i] != '&' else None
         if fd is None:
@@ -5528,11 +5534,14 @@ class _TransferLexer:
         target, end = _transfer_read_word(text, self.i + len(op))
         if op in ('<<', '<<-'):
             self.heredocs.append((target, op == '<<-'))
-        reads = op in ('<', '<<', '<<-', '<<<', '<>') and fd in (None, 0)
-        writes = (op in ('>', '>>', '>|') and fd in (None, 1)) or op in ('&>', '&>>') or \
-            (op == '>&' and fd in (None, 1) and not target.isdigit() and target != '-')
-        if target != '/dev/null' or op in ('<<', '<<-', '<<<'):
-            self.io |= ({'in'} if reads else set()) | ({'out'} if writes else set())
+        to = fd if fd is not None else 0 if op[0] == '<' else 1
+        if op in ('<&', '>&') and (target.isdigit() or target == '-'):
+            self.io.append((to, int(target) if target.isdigit() else 'null'))
+        else:
+            # A heredoc or here-string feeds its text.
+            self.io.append((to, 'null' if target == '/dev/null' and op not in ('<<', '<<-', '<<<') else 'file'))
+            if op[0] == '&' or (op == '>&' and fd is None):
+                self.io.append((2, 1))  # &> and >&file send stderr there too
         self.i = end - 1
 
     def _separator(self, ch: str) -> None:
@@ -5545,6 +5554,8 @@ class _TransferLexer:
             self.case[-1] = 'pattern'
             self.i += 2 if text.startswith(';;&', i) else 1
             return
+        if pair == '|&':
+            self.io.append((2, 1))  # |& also pipes stderr, after the command's own redirections
         if pair in ('&&', '||', '|&'):
             self._end_command('|' if pair == '|&' else pair)
             self.i += 1
@@ -5593,19 +5604,17 @@ class _TransferLexer:
     def _flush_leading(self) -> None:
         """Emit the reserved words that lead the current command, so a substitution in it runs only when they let it."""
         n = 0
-        # `!` stays with its command, which still obeys the && or || before it.
-        while n < len(self.argv) and self.argv[n] != '!' and \
-                (self.argv[n] in _TRANSFER_LEADING_WORDS or self.argv[n] == 'function'):
+        while n < len(self.argv) and (self.argv[n] in _TRANSFER_LEADING_WORDS or self.argv[n] == 'function'):
             n += 2 if self.argv[n] == 'function' else 1
         if n:
-            self.items.append(('cmd', self.argv[:n], self.before, '', set()))
+            self.items.append(('cmd', self.argv[:n], self.before, '', []))
             self.argv, self.before = self.argv[n:], ''
 
     def _flush(self) -> None:
         """Emit the reserved words read so far ahead of the compound command they lead."""
         if self.argv:
             self.items.append(('cmd', self.argv, self.before, '', self.io))
-            self.argv, self.io, self.before = [], set(), ''
+            self.argv, self.io, self.before = [], [], ''
 
     def _end_command(self, after: str) -> None:
         self._end_word()
@@ -5619,7 +5628,7 @@ class _TransferLexer:
                 self.items[-1] = (kind, None, before, after, self.io)
             if after not in (';', ''):
                 self.before = after
-        self.argv, self.io = [], set()
+        self.argv, self.io = [], []
 
 
 def _transfer_words(text: str) -> List[str]:
@@ -5716,7 +5725,7 @@ def _transfer_both(a: Optional[bool], b: Optional[bool]) -> Optional[bool]:
 
 
 def _transfer_follows(before: str, status: Optional[int]) -> bool:
-    """Whether a command runs after its && or ||, given the last literal true (0) or false (1)."""
+    """Whether a pipeline runs after its && or ||, given the last literal true (0) or false (1)."""
     return not ((before == '&&' and status == 1) or (before == '||' and status == 0))
 
 
@@ -5725,12 +5734,16 @@ def _transfer_runs(shell: Dict) -> Optional[bool]:
 
 
 def _transfer_snapshot(shell: Dict) -> tuple:
-    return shell['cwd'], dict(shell['exported'])
+    return shell['cwd'], dict(shell['exported']), dict(shell['functions'])
 
 
-def _transfer_restore(shell: Dict, saved: Optional[tuple]) -> None:
+def _transfer_restore(shell: Dict, saved: Optional[tuple], subshell: bool = False) -> None:
+    """Undo the cd and exports since saved. A subshell also undoes its function definitions; one defined in a body
+    that may not have run is kept, so its calls are still followed."""
     if saved:
         shell['cwd'], shell['exported'] = saved[0], dict(saved[1])
+        if subshell:
+            shell['functions'] = dict(saved[2])
 
 
 def _transfer_pop(frames: List[Dict], kinds: tuple) -> Optional[Dict]:
@@ -5742,24 +5755,103 @@ def _transfer_pop(frames: List[Dict], kinds: tuple) -> Optional[Dict]:
     return None
 
 
-def _transfer_open(kind: str, runs: Optional[bool], shell: Dict) -> None:
-    """Open a compound command; a function's body is only defined, so it never runs here."""
-    if shell['function'] and kind != '$(':
-        runs, shell['function'] = False, False
+def _transfer_pipeline(before: str, runs: Optional[bool], shell: Dict) -> None:
+    """Start a pipeline: whether it runs, and the operator and status before it, which settle the status it leaves."""
+    shell['pipe'] = {'before': before, 'prior': shell['status'], 'runs': runs, 'negate': False, 'leading': False}
+
+
+def _transfer_begin(before: str, shell: Dict) -> None:
+    """Start the pipeline a command or compound begins, unless it continues one after a | or a leading `!`; && and ||
+    decide whether the whole pipeline runs, and any other operator also starts a list."""
+    if before == '|' or shell['pipe']['leading']:
+        return
+    if before not in ('&&', '||'):
+        shell['start'] = _transfer_snapshot(shell)
+    _transfer_pipeline(before, _transfer_both(_transfer_runs(shell), _transfer_follows(before, shell['status'])), shell)
+
+
+def _transfer_end(shell: Dict) -> None:
+    """Set the status a finished pipeline leaves: the one before it when it never ran, else its last command's, flipped
+    by `!`, and unknown when an unknown status let it run and skipping it would have left another."""
+    pipe, status = shell['pipe'], shell['status']
+    if pipe['runs'] is False:
+        status = pipe['prior']
+    else:
+        status = {0: 1, 1: 0}.get(status) if pipe['negate'] else status
+        skipped = {'&&': 1, '||': 0}.get(pipe['before'])
+        if pipe['prior'] is None and skipped is not None and status != skipped:
+            status = None
+    shell['status'] = status
+
+
+def _transfer_finish(after: str, shell: Dict) -> None:
+    """End a pipeline element: the pipeline ends unless a | follows, and a backgrounded list runs in a subshell."""
+    if after != '|':
+        _transfer_end(shell)
+    if after == '&':
+        _transfer_restore(shell, shell['start'], True)
+        shell['status'] = 0  # starting a background job succeeds
+
+
+def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) -> None:
+    """Open a compound command, setting the pipeline and list around it aside until it closes; a function's body is
+    only defined, so it never runs here. head is the item that starts it, kept for a function's calls."""
+    name = shell['function'] if kind != '$(' else None
+    if name is not None:
+        runs, shell['function'] = False, None
+    if kind != '$(':
+        shell['pipe']['leading'] = False  # a substitution runs inside the command that a leading `!` still awaits
     shell['frames'].append({'kind': kind, 'base': runs, 'runs': runs, 'decided': False, 'saved': None,
                             'state': _transfer_snapshot(shell), 'status': shell['status'],
-                            'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False)})
+                            'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False),
+                            'outer': (shell['pipe'], shell['start']), 'defines': name, 'head': (shell['at'], head),
+                            'iterates': False, 'jumps': False})
+    _transfer_pipeline('', runs, shell)
 
 
-def _transfer_close(frame: Dict, after: str, io: Optional[set], shell: Dict) -> None:
-    """Give the commands inside a closed compound the pipes and redirections around it, as they share its stdin and
-    stdout; a backgrounded compound keeps its cd and exports to itself."""
+def _transfer_status(frame: Dict, status: Optional[int]) -> Optional[int]:
+    """The status a closed compound leaves, given its last command's: a function definition succeeds, a compound that
+    never ran keeps the one before it, an if or loop that ran no body succeeds, and a body that may have run, or a
+    loop that may have ended at a break, leaves it unknown."""
+    kind, runs = frame['kind'], frame['runs']
+    if frame['defines'] is not None:
+        return 0
+    if frame['base'] is False or kind == '$(':
+        return frame['status']
+    if kind == 'if' and runs is not True and frame['decided'] is not True:
+        return 0 if runs is False and frame['decided'] is False else None
+    if kind in _TRANSFER_LOOPS:
+        if runs is False:
+            return 0
+        return status if kind == 'for' and runs and not frame['jumps'] else None
+    if kind == 'case':
+        return 0 if runs is False else None
+    return status
+
+
+def _transfer_settle(frame: Dict, tail: tuple, shell: Dict) -> None:
+    """Close a compound: set the status it leaves, resume the pipeline and list around it, and keep a defined
+    function's body, from its head item to tail, for the calls that run it."""
+    shell['status'] = _transfer_status(frame, shell['status'])
+    shell['pipe'], shell['start'] = frame['outer']
+    if frame['defines'] is not None and shell['pipe']['runs'] is not False:
+        at, head = frame['head']
+        shell['functions'][frame['defines']] = [head] + shell['items'][at + 1:shell['at']] + [tail]
+
+
+def _transfer_wrap(shell: Dict, first: int, layer: tuple) -> None:
+    """Wrap each call from first on in one more level of (piped in, piped out, redirections)."""
     calls = shell['calls']
-    for i in range(frame['calls'], len(calls)):
-        call = calls[i]
-        calls[i] = call[:5] + (call[5] | (io or set()), call[6] or frame['piped_in'], call[7] or after == '|')
-    if after == '&':
-        shell['start'] = frame['state']
+    for i in range(first, len(calls)):
+        calls[i] = calls[i][:5] + (calls[i][5] + (layer,),)
+
+
+def _transfer_close(frame: Dict, layer: tuple, shell: Dict) -> None:
+    """Wrap the commands inside a closed compound in the pipes and redirections around it; a piped compound runs in a
+    subshell, so its cd, exports and functions end with it."""
+    _transfer_wrap(shell, frame['calls'], layer)
+    if layer[0] or layer[1]:
+        _transfer_restore(shell, frame['state'], True)
 
 
 def _transfer_branch(keyword: str, frame: Dict, shell: Dict) -> None:
@@ -5774,8 +5866,11 @@ def _transfer_branch(keyword: str, frame: Dict, shell: Dict) -> None:
         frame['saved'] = None
         taken = _transfer_both(frame['base'], {True: False, False: True}.get(frame['decided']))
     elif keyword == 'do' and frame['kind'] in _TRANSFER_LOOPS:
-        holds = None if frame['kind'] in ('for', 'select') else holds
-        taken = _transfer_both(frame['runs'], holds if holds is None or frame['kind'] == 'while' else not holds)
+        if frame['kind'] in ('for', 'select'):
+            holds = True if frame['iterates'] else None
+        elif frame['kind'] == 'until' and holds is not None:
+            holds = not holds
+        taken = _transfer_both(frame['runs'], holds)
     else:
         return
     frame['runs'] = taken
@@ -5783,41 +5878,56 @@ def _transfer_branch(keyword: str, frame: Dict, shell: Dict) -> None:
         frame['saved'] = _transfer_snapshot(shell)
 
 
-def _transfer_keyword(words: List[str], follows: bool, shell: Dict) -> List[str]:
-    """Apply a command's leading reserved word to the open compound commands; the words after it."""
+def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
+    """Apply a command's leading reserved word to the open compound commands and its pipeline; the words after it."""
     keyword, rest, frames = words[0], words[1:], shell['frames']
     if keyword in ('{', 'if') + _TRANSFER_LOOPS:
-        _transfer_open(keyword, _transfer_both(_transfer_runs(shell), follows), shell)
+        _transfer_open(keyword, shell['pipe']['runs'], shell, ('cmd', words, '', item[3], item[4]))
+        if keyword == 'for':
+            # A word list with a word that expands to itself runs the body at least once.
+            frames[-1]['iterates'] = rest[1:2] == ['in'] and \
+                any('$' not in w and _TRANSFER_SUBSTITUTED not in w for w in rest[2:])
         return [] if keyword in ('for', 'select') else rest  # a for loop's header runs nothing
-    if keyword == 'function':
-        shell['function'] = True
-        return rest[1:]
-    if keyword == '!':
-        return rest  # the caller negates the command it leads
+    if keyword in ('!', 'function'):
+        # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
+        if keyword == 'function':
+            shell['function'], rest = (rest[0] if rest else ''), rest[1:]
+        else:
+            shell['pipe']['negate'] = not shell['pipe']['negate']
+        shell['pipe']['leading'] = True
+        return rest
     if keyword in ('}', 'fi', 'done'):
         frame = _transfer_pop(frames, {'}': ('{',), 'fi': ('if',), 'done': _TRANSFER_LOOPS}[keyword])
-        _transfer_restore(shell, frame and frame['saved'])
+        if frame:
+            _transfer_restore(shell, frame['saved'])
+            _transfer_settle(frame, ('cmd', [keyword], item[2], '', item[4]), shell)
         shell['closed'] = frame
-        if keyword != '}':
-            shell['status'] = None  # an if or loop that ran no body still succeeds
         return rest
     if frames:
         _transfer_branch(keyword, frames[-1], shell)
+    _transfer_pipeline('', _transfer_runs(shell), shell)
     return rest
 
 
 def _transfer_marker(item: tuple, shell: Dict) -> None:
     """Apply a subshell, substitution, function or case marker to the open compound commands."""
-    kind, _, before, after, io = item
-    frames, follows = shell['frames'], _transfer_follows(before, shell['status'])
-    if kind in ('(', '$(', 'case'):
-        # A substitution's output is captured, so only a subshell or case shares the pipe around it.
-        shell['opening_pipe'] = before == '|' and kind != '$('
-        _transfer_open(kind, _transfer_both(_transfer_runs(shell), follows), shell)
+    kind, words, before, after, io = item
+    frames, pipe = shell['frames'], shell['pipe']
+    if kind in ('(', 'case'):
+        _transfer_begin(before, shell)
+        shell['opening_pipe'] = before == '|'
+        _transfer_open(kind, shell['pipe']['runs'], shell, (kind, None, '', '', None))
         if kind == 'case':
             frames[-1]['runs'] = False  # nothing runs until an arm opens
+    elif kind == '$(':
+        # A substitution runs when its command does, and reads the stdin piped into that command.
+        runs = pipe['runs'] if before == '|' or pipe['leading'] else \
+            _transfer_both(_transfer_runs(shell), _transfer_follows(before, shell['status']))
+        shell['opening_pipe'] = before == '|'
+        _transfer_open(kind, runs, shell, item)
     elif kind == 'func':
-        shell['function'] = True
+        _transfer_begin(before, shell)
+        shell['function'], shell['pipe']['leading'] = words[0], True
     elif kind == 'arm' and frames and frames[-1]['kind'] == 'case':
         _transfer_restore(shell, frames[-1]['saved'])
         frames[-1]['runs'] = _transfer_both(frames[-1]['base'], None)
@@ -5826,13 +5936,13 @@ def _transfer_marker(item: tuple, shell: Dict) -> None:
         frame = _transfer_pop(frames, ('(', '$(') if kind == ')' else ('case',))
         if frame:
             # A subshell's cd and exports end with it, as do a case arm's, which may not have run.
-            _transfer_restore(shell, frame['state'] if kind == ')' else frame['saved'])
-            if frame['kind'] == '$(' or frame['runs'] is False:
-                shell['status'] = frame['status']
-            elif kind == 'esac':
-                shell['status'] = None
-            if frame['kind'] != '$(':
-                _transfer_close(frame, after, io, shell)
+            _transfer_restore(shell, frame['state'] if kind == ')' else frame['saved'], kind == ')')
+            _transfer_settle(frame, (kind, None, before, '', io), shell)
+            if frame['kind'] == '$(':
+                _transfer_close(frame, (frame['piped_in'], False, ((1, 'null'),)), shell)  # its output is captured
+            else:
+                _transfer_close(frame, (frame['piped_in'], after == '|', tuple(io or ())), shell)
+                _transfer_finish(after, shell)
 
 
 def _transfer_builtin(program: str, args: List[str], cwd: Optional[str], shell: Dict) -> None:
@@ -5867,11 +5977,34 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
     return None
 
 
-def _transfer_simple(words: List[str], before: str, after: str, io: set, shell: Dict, depth: int) -> List[tuple]:
-    """The calls one simple command makes, after applying its cd, export or unset."""
+def _transfer_call(body: List[tuple], layer: tuple, shell: Dict, depth: int) -> None:
+    """Run a defined function's body where it is called: in this shell, with the call's stdin and stdout, or in a
+    subshell when the call is piped."""
+    if depth >= _TRANSFER_MAX_DEPTH or shell['calls_left'] <= 0:
+        shell['status'] = None
+        return
+    shell['calls_left'] -= 1
+    first, state, outer = len(shell['calls']), _transfer_snapshot(shell), (shell['pipe'], shell['start'])
+    _transfer_items(body, shell, depth + 1)
+    shell['pipe'], shell['start'] = outer
+    _transfer_wrap(shell, first, layer)
+    if layer[0] or layer[1]:
+        _transfer_restore(shell, state, True)
+
+
+def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
+    """The calls one simple command makes, after applying its cd, export or unset; a defined function runs its body."""
+    layer = (before == '|', after == '|', tuple(io))
+    name = next((w for w in words if not _transfer_is_assignment(w)), None)
+    if name in shell['functions']:
+        _transfer_call(shell['functions'][name], layer, shell, depth)
+        return []
     program, args, env, cwd, other_user = _transfer_program(words, shell['cwd'])
     env = env if _TRANSFER_CLEAN_ENV in env else {**shell['exported'], **env}
     shell['status'] = 0 if program in ('true', ':') else 1 if program == 'false' else None
+    if program in ('break', 'continue'):
+        for frame in shell['frames']:
+            frame['jumps'] = True  # the loop may end here, with this status
     if program in ('cd', 'export', 'unset'):
         # A pipeline's commands run in subshells, so their cd and exports end with them.
         if before != '|' and after != '|':
@@ -5881,50 +6014,57 @@ def _transfer_simple(words: List[str], before: str, after: str, io: set, shell: 
     if inner is not None:
         # The string's commands run as the wrapper's user and read its stdin and write its stdout.
         calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1)
-        return [call[:4] + (call[4] or other_user, call[5] | io, call[6] or before == '|', call[7] or after == '|')
-                for call in calls]
-    return [(program, args, env, cwd, other_user, io, before == '|', after == '|')] if program else []
+        return [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
+    return [(program, args, env, cwd, other_user, (layer,))] if program else []
 
 
 def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
-    """The calls one simple command makes, if it runs or may run."""
+    """The calls one simple command makes, if it runs or may run, after the reserved words that lead it."""
     _, words, before, after, io = item
-    follows = _transfer_follows(before, shell['status'])
-    if before not in ('&&', '||', '|'):
-        shell['start'] = _transfer_snapshot(shell)
-    negated, shell['opening_pipe'] = False, before == '|'
+    if words[0] not in ('}', 'fi', 'done'):
+        _transfer_begin(before, shell)
+    shell['opening_pipe'] = before == '|'
     while words and words[0] in _TRANSFER_KEYWORDS:
-        negation = words[0] == '!'
-        negated = negated or negation
-        words = _transfer_keyword(words, follows, shell)
-        # A frame or branch keyword takes the && or || itself; `!` leaves it to the command it negates.
-        follows = follows if negation else True
+        # A body's first command is reached by its compound's pipe, which its own redirections then override.
+        before = before if words[0] in ('!', 'function') else ''
+        words = _transfer_keyword(words, item, shell)
     shell.pop('opening_pipe', None)
     closed = shell.pop('closed', None)
     if closed:
-        _transfer_close(closed, after, io, shell)
+        _transfer_close(closed, (closed['piped_in'], after == '|', tuple(io)), shell)
     calls = []
-    if words and _transfer_both(_transfer_runs(shell), follows) is not False:
-        calls = _transfer_simple(words, before, after, io, shell, depth)
-        if negated:
-            shell['status'] = {0: 1, 1: 0}.get(shell['status'])
-    if after == '&':
-        _transfer_restore(shell, shell['start'])  # a backgrounded list runs in a subshell
+    if words:
+        shell['pipe']['leading'] = False
+        if shell['pipe']['runs'] is not False:
+            calls = _transfer_simple(words, before, after, io, shell, depth)
+    if words or closed:
+        _transfer_finish(after, shell)
     return calls
+
+
+def _transfer_items(items: List[tuple], shell: Dict, depth: int) -> None:
+    """Walk items in this shell, adding each call that runs or may run to its calls."""
+    outer = shell['items'], shell['at']
+    shell['items'] = items
+    for at, item in enumerate(items):
+        shell['at'] = at
+        if item[0] == 'cmd':
+            shell['calls'] += _transfer_command(item, shell, depth)
+        else:
+            _transfer_marker(item, shell)
+    shell['items'], shell['at'] = outer
 
 
 def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth: int) -> List[tuple]:
-    """Each simple command that runs or may run, as (program, args, env, folder, as another user, redirections,
-    piped in, piped out); commands a literal true or false skips, untaken branches and function bodies are left out."""
-    calls = []
-    shell = {'cwd': cwd, 'exported': dict(exported), 'status': None, 'frames': [], 'function': False,
-             'start': (cwd, dict(exported)), 'calls': calls}
-    for item in items:
-        if item[0] == 'cmd':
-            calls += _transfer_command(item, shell, depth)
-        else:
-            _transfer_marker(item, shell)
-    return calls
+    """Each simple command that runs or may run, as (program, args, env, folder, as another user, the (piped in,
+    piped out, redirections) around it from its own outward); commands a literal true or false skips, untaken
+    branches and function bodies are left out, and a function's body runs where it is called."""
+    shell = {'cwd': cwd, 'exported': dict(exported), 'status': None, 'frames': [], 'function': None,
+             'start': (cwd, dict(exported), {}), 'calls': [], 'functions': {}, 'calls_left': _TRANSFER_MAX_CALLS,
+             'items': items, 'at': 0}
+    _transfer_pipeline('', True, shell)
+    _transfer_items(items, shell, depth)
+    return shell['calls']
 
 
 def _transfer_short_option(arg: str, args: List[str], i: int, value_flags: frozenset, seen: set) -> tuple:
@@ -5957,21 +6097,64 @@ def _transfer_url_host(url: str) -> str:
 
 def _transfer_curl(args: List[str]) -> List[tuple]:
     """curl's URLs: sent to when their request uploads a file, a form or a body, or uses a sending method; else fetched
-    from. Each --next starts a request with options of its own."""
-    endpoints, request = [], []
+    from. Each --next starts a request with options of its own, though the addresses --resolve pins carry on to the
+    requests after it."""
+    endpoints, request, pins = [], [], []
     for arg in args + ['--next']:
         if arg not in ('-:', '--next'):
             request.append(arg)
             continue
-        urls, sends = _transfer_curl_request(request)
-        endpoints += [('out' if sends else 'in', _transfer_url_host(url), None) for url in urls]
+        urls, sends, overrides = _transfer_curl_request(request)
+        pins += [value for option, value in overrides if option == '--resolve']
+        connects = [value for option, value in overrides if option == '--connect-to']
+        endpoints += [('out' if sends else 'in', _transfer_url_host(url), None,
+                       _transfer_curl_dial(url, connects, pins)) for url in urls]
         request = []
     return endpoints
 
 
+def _transfer_ip(text: str):
+    """The IP address a string holds, brackets allowed; None when it holds none."""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(text.strip().strip('[]'))
+    except ValueError:
+        return None
+
+
+def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optional[tuple]:
+    """(the host a URL's request connects to, the addresses pinned for it) when --connect-to or --resolve change where
+    it connects, as curl applies them: the first --connect-to rule that matches, then the last pin for that host and
+    port, a named host before *; None when neither applies."""
+    from urllib.parse import urlsplit
+    host = _transfer_url_host(url)
+    try:
+        parts = urlsplit(url.strip() if '://' in url else 'http://' + url.strip())
+        port = str(parts.port or _TRANSFER_DEFAULT_PORTS.get(parts.scheme.lower(), ''))
+    except ValueError:
+        return None
+    target = (host, port)
+    for rule in connects:
+        fields = re.split(r':(?![^\[]*\])', rule)  # colons inside [ ] belong to an IPv6 address
+        if len(fields) == 4 and _transfer_clean_host(fields[0]) in ('', host) and fields[1] in ('', port):
+            target = (_transfer_clean_host(fields[2]) or host, fields[3] or port)
+            break
+    pinned = {}
+    for pin in pins:
+        fields = re.split(r':(?![^\[]*\])', pin.lstrip('+-'))
+        key = ('*' if fields[0] == '*' else _transfer_clean_host(fields[0]), fields[1] if len(fields) > 1 else '')
+        pinned.pop(key, None)
+        if not pin.startswith('-') and len(fields) > 2:
+            pinned[key] = [ip for ip in map(_transfer_ip, ':'.join(fields[2:]).split(',')) if ip]
+    addresses = pinned.get(target) or pinned.get(('*', target[1])) or []
+    if target[0] == host and not addresses:
+        return None
+    return (str(addresses[0]) if addresses else target[0]), addresses
+
+
 def _transfer_curl_request(args: List[str]) -> tuple:
-    """(the URLs of one curl request, whether it sends data)."""
-    urls, flags, method, i = [], set(), '', 0
+    """(the URLs of one curl request, whether it sends data, its --resolve and --connect-to values in order)."""
+    urls, flags, method, overrides, i = [], set(), '', [], 0
     while i < len(args):
         arg, value, i = args[i], None, i + 1
         if arg.startswith('--'):
@@ -5992,9 +6175,11 @@ def _transfer_curl_request(args: List[str]) -> tuple:
             urls.append(value)
         elif arg in ('-X', '--request') and value:
             method = value.upper()
+        elif arg in ('--resolve', '--connect-to') and value:
+            overrides.append((arg, value))
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
-    return urls, bool(sends)
+    return urls, bool(sends), overrides
 
 
 def _transfer_wget(args: List[str]) -> List[tuple]:
@@ -6199,14 +6384,28 @@ def _transfer_web_cmdlet(args: List[str], sends: bool) -> List[tuple]:
     return [('out' if out else 'in', _transfer_url_host(uri), None)] if uri else []
 
 
-def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, io: set, piped_in: bool,
-                    piped_out: bool) -> Optional[tuple]:
-    """(tool, [(direction, destination, ssh -G options or None)]) for a transfer command; None for any other."""
-    tool, sends = _TRANSFER_TOOLS.get(program), 'in' in io or piped_in
+def _transfer_stdio(layers: tuple) -> tuple:
+    """(whether a call's stdin is fed from a file or pipe, whether its stdout goes to one), from the pipes and
+    redirections around it applied as the shell does: the outermost first, each one's pipes before its redirections."""
+    fds = {0: 'null', 1: 'null', 2: 'null'}  # the agent's own stdin and stdout carry no transfer
+    for piped_in, piped_out, redirections in reversed(layers):
+        if piped_in:
+            fds[0] = 'pipe'
+        if piped_out:
+            fds[1] = 'pipe'
+        for fd, value in redirections:
+            fds[fd] = fds.get(value, 'null') if isinstance(value, int) else value
+    return fds[0] in ('file', 'pipe'), fds[1] in ('file', 'pipe')
+
+
+def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, layers: tuple) -> Optional[tuple]:
+    """(tool, [(direction, destination, ssh -G options or None[, curl's dial])]) for a transfer command; None for any
+    other."""
+    tool, (sends, keeps) = _TRANSFER_TOOLS.get(program), _transfer_stdio(layers)
     if tool in ('scp', 'sftp', 'rsync'):
         raw = _transfer_copy(tool, args, env)
     elif tool == 'ssh':
-        raw = _transfer_ssh_pipe(args, sends, 'out' in io or piped_out)
+        raw = _transfer_ssh_pipe(args, sends, keeps)
     elif tool in ('curl', 'wget'):
         raw = _transfer_curl(args) if tool == 'curl' else _transfer_wget(args)
     elif tool in ('nc', 'socat'):
@@ -6216,7 +6415,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
     else:
         return None
     # Under sudo, ssh runs as that user, with that user's config, which this can't read.
-    return tool, [(d, dest, None if other_user else options) for d, dest, options in raw]
+    return tool, [(e[0], e[1], None if other_user else e[2]) + e[3:] for e in raw]
 
 
 def _transfer_clean_host(host: str) -> str:
@@ -6410,23 +6609,34 @@ def _transfer_address(host: str, state: Dict) -> str:
         except ValueError:
             remaining = _transfer_deadline(state) - time.monotonic()
             addresses = _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else []
-        kinds = [_transfer_kind(a) for a in addresses]
-        state[key] = 'unresolved' if not kinds else 'public' if 'public' in kinds else kinds[0]
+        state[key] = _transfer_address_kind(addresses)
     return state[key]
 
 
-def _transfer_endpoint(direction: str, destination: str, ssh_options: Optional[List[str]], cwd: Optional[str],
-                       state: Dict) -> Optional[Dict]:
-    """One place a transfer reached: its host as written without any login, the host ssh resolves it to, and the
-    kind of address that host has."""
+def _transfer_address_kind(addresses: list) -> str:
+    """public when any address is public, else the first address's kind; unresolved when there is none."""
+    kinds = [_transfer_kind(a) for a in addresses]
+    return 'unresolved' if not kinds else 'public' if 'public' in kinds else kinds[0]
+
+
+def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict) -> Optional[Dict]:
+    """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial]): its host as
+    written without any login, the host it connects to, as ssh -G resolves it or curl's --connect-to and --resolve set
+    it, and the kind of address that host has."""
+    direction, destination, ssh_options = raw[:3]
+    dial = raw[3] if len(raw) > 3 else None
     destination = destination.strip()
     host = _transfer_url_host(destination) if '://' in destination else destination.rsplit('@', 1)[-1]
     host = _transfer_clean_host(host)
     if not host:
         return None
-    resolved = (_transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None else '') or host
-    endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved,
-                'address': _transfer_address(resolved, state)}
+    if dial:
+        resolved, address = dial[0], _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state)
+    else:
+        resolved = (_transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None else '') \
+            or host
+        address = _transfer_address(resolved, state)
+    endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
     return {k: v for k, v in endpoint.items() if v}
 
 
@@ -6437,13 +6647,13 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         if not isinstance(command, str) or not command.strip():
             return None
         tool, endpoints = None, []
-        for program, args, env, call_cwd, other_user, io, piped_in, piped_out in \
+        for program, args, env, call_cwd, other_user, layers in \
                 _transfer_walk(_TransferLexer(command).read() or [], cwd, {}, 0):
-            found = _transfer_parse(program, args, env, other_user, io, piped_in, piped_out)
-            for direction, destination, ssh_options in (found[1] if found else []):
+            found = _transfer_parse(program, args, env, other_user, layers)
+            for raw in (found[1] if found else []):
                 if len(endpoints) >= _TRANSFER_MAX_ENDPOINTS:
                     break
-                endpoint = _transfer_endpoint(direction, destination, ssh_options, call_cwd, state)
+                endpoint = _transfer_endpoint(raw, call_cwd, state)
                 if endpoint and endpoint not in endpoints:
                     endpoints.append(endpoint)
                     tool = tool or found[0]
