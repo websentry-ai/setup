@@ -2706,6 +2706,9 @@ function cdTarget(args, cwd, names) {
   const [letters, folders] = cdWords(args);
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1];
   if (folders.length > 1 || /[^LP]/.test(letters)) return [void 0, void 0];
+  if (folders[0] !== void 0 && [..."$*?[", SUBSTITUTED].some((c) => folders[0].includes(c))) {
+    return [void 0, void 0];
+  }
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
   const path = expandHome(folders[0] ?? "~");
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
@@ -2836,6 +2839,7 @@ function both(a, b) {
 function follows(before, status) {
   return !(before === "&&" && status === 1 || before === "||" && status === 0);
 }
+var LENT = "lent";
 function runs(shell) {
   const top = shell.frames.at(-1);
   return top === void 0 ? shell.live : top.runs;
@@ -3393,21 +3397,21 @@ function shellString(name, args) {
   return void 0;
 }
 function lend(shell, assignments) {
-  const lent = /* @__PURE__ */ new Map();
+  const before = /* @__PURE__ */ new Map();
   for (const word of assignments) {
     const at = word.indexOf("=");
     const name = word.slice(0, at);
-    const entry = [word.slice(at + 1), true];
-    lent.set(name, [lent.has(name) ? lent.get(name)[0] : shell.vars[name], entry]);
-    shell.vars[name] = entry;
+    if (!before.has(name)) before.set(name, shell.vars[name]);
+    shell.vars[name] = [word.slice(at + 1), LENT];
   }
-  return lent;
+  return before;
 }
-function takeBack(shell, lent) {
-  for (const [name, [before, entry]] of lent) {
-    if (shell.vars[name] !== entry) shell.vars[name] = [SUBSTITUTED, void 0];
-    else if (before === void 0) delete shell.vars[name];
-    else shell.vars[name] = before;
+function takeBack(shell, before) {
+  for (const [name, entry] of before) {
+    const [value, exported] = shell.vars[name] ?? [void 0, void 0];
+    if (exported !== LENT && !(value === void 0 && exported === false)) shell.vars[name] = [SUBSTITUTED, void 0];
+    else if (entry === void 0) delete shell.vars[name];
+    else shell.vars[name] = entry;
   }
 }
 function callFunction(known, layer, subshell, shell, depth) {

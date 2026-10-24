@@ -2148,8 +2148,50 @@
      {
       "direction": "out",
       "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { RSYNC_RSH=\"ssh -o HostName=10.9.9.9\"; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { export RSYNC_RSH; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
       "resolved_host": "prod",
       "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { unset RSYNC_RSH; }; export RSYNC_RSH=\"ssh -o HostName=10.9.9.9\"; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.9.9.9",
+      "address": "private"
      }
     ]
    }
@@ -3248,6 +3290,90 @@
       "direction": "out",
       "host": "sub.example",
       "resolved_host": "sub.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd \"$HOME\" && scp f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd $(echo frontend) && scp f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd `echo frontend` && scp f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd fr* && scp f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd \"$D\" || scp f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd \"$HOME\"; scp -F cfg f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
       "address": "unresolved"
      }
     ]

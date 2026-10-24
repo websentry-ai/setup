@@ -1002,6 +1002,10 @@ function cdTarget(args: string[], cwd: string | undefined, names: Set<string>): 
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1]; // every shell rejects the cd and stays
   // Bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary.
   if (folders.length > 1 || /[^LP]/.test(letters)) return [undefined, undefined];
+  // A variable, substitution or glob the shell expands to a folder not known here.
+  if (folders[0] !== undefined && [..."$*?[", SUBSTITUTED].some((c) => (folders[0] as string).includes(c))) {
+    return [undefined, undefined];
+  }
   // Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
   const path = expandHome(folders[0] ?? "~");
@@ -1146,7 +1150,9 @@ function follows(before: string, status: number | undefined): boolean {
 }
 
 /** A shell variable: its value, undefined once unset, and whether it is exported, undefined when that is not known. */
-type Variable = [value: string | undefined, exported: boolean | undefined];
+type Variable = [value: string | undefined, exported: boolean | typeof LENT | undefined];
+/** The export flag of a function call's VAR=value, which an assignment in the body keeps. */
+const LENT = "lent";
 
 /** The folder, variables and defined functions at one point, to return to. */
 type Snapshot = [cwd: string | undefined, vars: Record<string, Variable>, functions: Map<string, [Item[], boolean]>];
@@ -1942,27 +1948,27 @@ function shellString(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
-/** Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; for each name, its entry
- *  before the call and the entry lent. */
-function lend(shell: Shell, assignments: string[]): Map<string, [Variable | undefined, Variable]> {
-  const lent = new Map<string, [Variable | undefined, Variable]>();
+/** Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; each name's entry from
+ *  before the call, undefined when it had none. */
+function lend(shell: Shell, assignments: string[]): Map<string, Variable | undefined> {
+  const before = new Map<string, Variable | undefined>();
   for (const word of assignments) {
     const at = word.indexOf("=");
     const name = word.slice(0, at);
-    const entry: Variable = [word.slice(at + 1), true];
-    lent.set(name, [lent.has(name) ? (lent.get(name) as [Variable | undefined, Variable])[0] : shell.vars[name], entry]);
-    shell.vars[name] = entry;
+    if (!before.has(name)) before.set(name, shell.vars[name]);
+    shell.vars[name] = [word.slice(at + 1), LENT];
   }
-  return lent;
+  return before;
 }
 
-/** Put each lent name back as it was before the call. One the body set again is unknown: bash keeps a value the body
- *  exported and zsh does not. Any write makes a new entry, so an entry that is not the lent one was written. */
-function takeBack(shell: Shell, lent: Map<string, [Variable | undefined, Variable]>): void {
-  for (const [name, [before, entry]] of lent) {
-    if (shell.vars[name] !== entry) shell.vars[name] = [SUBSTITUTED, undefined];
-    else if (before === undefined) delete shell.vars[name];
-    else shell.vars[name] = before;
+/** Put each lent name back as it was before the call, as bash and zsh do after the body assigns or unsets it. One the
+ *  body exported, declared or left unknown is unknown: bash keeps an exported value and zsh does not. */
+function takeBack(shell: Shell, before: Map<string, Variable | undefined>): void {
+  for (const [name, entry] of before) {
+    const [value, exported] = shell.vars[name] ?? [undefined, undefined];
+    if (exported !== LENT && !(value === undefined && exported === false)) shell.vars[name] = [SUBSTITUTED, undefined];
+    else if (entry === undefined) delete shell.vars[name];
+    else shell.vars[name] = entry;
   }
 }
 

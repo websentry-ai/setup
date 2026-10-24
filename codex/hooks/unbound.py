@@ -4714,6 +4714,8 @@ def _transfer_cd(args: List[str], cwd: Optional[str], names: set) -> tuple:
         return cwd, 1  # every shell rejects the cd and stays
     if len(folders) > 1 or any(c not in 'LP' for c in letters):
         return None, None  # bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary
+    if folders and any(c in folders[0] for c in '$*?[' + _TRANSFER_SUBSTITUTED):
+        return None, None  # a variable, substitution or glob the shell expands to a folder not known here
     # Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
     last = letters[max(letters.rfind('L'), letters.rfind('P'))] if letters else 'L'
     path = os.path.expanduser(folders[0] if folders else '~')
@@ -5514,27 +5516,31 @@ def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: 
         _transfer_soften(outside, shell)
 
 
+_TRANSFER_LENT = 'lent'  # the export flag of a function call's VAR=value, which an assignment in the body keeps
+
+
 def _transfer_lend(shell: Dict, assignments: List[str]) -> Dict:
-    """Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; for each name, its
-    entry before the call and the entry lent."""
-    lent = {}
+    """Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; each name's entry
+    from before the call, None when it had none."""
+    before = {}
     for word in assignments:
         name, value = word.split('=', 1)
-        lent[name] = (lent[name][0] if name in lent else shell['vars'].get(name), (value, True))
-        shell['vars'][name] = lent[name][1]
-    return lent
+        before.setdefault(name, shell['vars'].get(name))
+        shell['vars'][name] = (value, _TRANSFER_LENT)
+    return before
 
 
-def _transfer_take_back(shell: Dict, lent: Dict) -> None:
-    """Put each lent name back as it was before the call. One the body set again is unknown: bash keeps a value the
-    body exported and zsh does not. Any write makes a new entry, so an entry that is not the lent one was written."""
-    for name, (before, entry) in lent.items():
-        if shell['vars'].get(name) is not entry:
+def _transfer_take_back(shell: Dict, before: Dict) -> None:
+    """Put each lent name back as it was before the call, as bash and zsh do after the body assigns or unsets it. One
+    the body exported, declared or left unknown is unknown: bash keeps an exported value and zsh does not."""
+    for name, entry in before.items():
+        value, exported = shell['vars'].get(name, (None, None))
+        if exported != _TRANSFER_LENT and (value, exported) != (None, False):
             shell['vars'][name] = (_TRANSFER_SUBSTITUTED, None)
-        elif before is None:
-            del shell['vars'][name]
+        elif entry is None:
+            shell['vars'].pop(name, None)
         else:
-            shell['vars'][name] = before
+            shell['vars'][name] = entry
 
 
 def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
