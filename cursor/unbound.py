@@ -4661,7 +4661,7 @@ def _transfer_cd_words(args: List[str]) -> tuple:
     return letters, folders
 
 
-def _transfer_cd(args: List[str], cwd: Optional[str], names: set) -> tuple:
+def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict) -> tuple:
     """(the folder a cd lands in from cwd, the status it leaves): 0 where it lands, the old folder and 1 when every
     shell rejects it or the folder is not there; None for either when that is not known."""
     letters, folders = _transfer_cd_words(args)
@@ -4671,6 +4671,9 @@ def _transfer_cd(args: List[str], cwd: Optional[str], names: set) -> tuple:
         return None, None  # bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary
     if folders and any(c in folders[0] for c in '$*?[' + _TRANSFER_SUBSTITUTED):
         return None, None  # a variable, substitution or glob the shell expands to a folder not known here
+    if folders and _transfer_variable(shell, 'CDPATH')[0] and folders[0] != '-' and \
+            not folders[0].startswith(('/', '~')) and folders[0].split('/')[0] not in ('.', '..'):
+        return None, None  # CDPATH may find the folder somewhere else first
     # Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
     last = letters[max(letters.rfind('L'), letters.rfind('P'))] if letters else 'L'
     path = os.path.expanduser(folders[0] if folders else '~')
@@ -4679,7 +4682,7 @@ def _transfer_cd(args: List[str], cwd: Optional[str], names: set) -> tuple:
     if target is not None and os.path.exists(target) and not os.path.isdir(target):
         return cwd, 1  # a file is no folder to land in
     # The folder is read after the command ran, so one the command names elsewhere may have been made or removed by it.
-    if target is None or os.path.basename(os.path.normpath(target)) in names or len(landed) > 1:
+    if target is None or os.path.basename(os.path.normpath(target)) in shell['names'] or len(landed) > 1:
         return None, None
     folder = landed.pop()
     return (folder, 0) if folder else (cwd, 1)
@@ -5296,7 +5299,7 @@ def _transfer_builtin(program: str, args: List[str], cwd: Optional[str], shell: 
     """Apply a cd, export, unset or declaration, or a command made only of assignments (program ''), to the commands
     after it."""
     if program == 'cd':
-        shell['cwd'] = _transfer_cd(args, cwd, shell['names'])[0]
+        shell['cwd'] = _transfer_cd(args, cwd, shell)[0]
     elif program == 'unset':
         _transfer_unset(args, shell)
     elif program in _TRANSFER_DECLARES:
@@ -5324,7 +5327,10 @@ def _transfer_unset(args: List[str], shell: Dict) -> None:
     for name in (a for a in args if not a.startswith('-')):
         value = _transfer_variable(shell, name)[0]
         known = shell['functions'].get(name)
-        if '-f' not in args:
+        exported = _transfer_variable(shell, name)[1]
+        if '-f' not in args and exported in _TRANSFER_LENT:
+            shell['vars'][name] = (_TRANSFER_SUBSTITUTED if exported == _TRANSFER_LENT[1] else None, exported)
+        elif '-f' not in args:
             shell['vars'][name] = (None, False)
         if known and ('-f' in args or ('-v' not in args and (value is None or _TRANSFER_SUBSTITUTED in value))):
             if sure and '-f' in args:
@@ -5344,6 +5350,10 @@ def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
         on, off = (on + option[1:], off) if option[0] == '-' else (on, off + option[1:])
     plain = program in ('declare', 'typeset') and shell['floor'] is None and set(on + off) <= {'x'} and not (on and off)
     for name, eq, value in (arg.partition('=') for arg in args):
+        lent = _transfer_variable(shell, name.rstrip('+'))[1]
+        if lent in _TRANSFER_LENT and program != 'readonly' and 'g' not in on + off:
+            shell['vars'][name.rstrip('+')] = (_TRANSFER_SUBSTITUTED, lent)  # local to the call it was lent for
+            continue
         if not plain or name.endswith('+'):
             _transfer_forget(shell, {name.rstrip('+')} - {''})
             continue
@@ -5471,26 +5481,29 @@ def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: 
         _transfer_soften(outside, shell)
 
 
-_TRANSFER_LENT = 'lent'  # the export flag of a function call's VAR=value, which an assignment in the body keeps
+# The export flags of a function call's VAR=value, kept by an assignment, unset or local declaration in the body: the
+# second when the name had a value before the call, which an unset in the body brings back in bash but not in zsh.
+_TRANSFER_LENT = ('lent', 'lent over a value')
 
 
 def _transfer_lend(shell: Dict, assignments: List[str]) -> Dict:
     """Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; each name's entry
     from before the call, None when it had none."""
-    before = {}
+    before, flags = {}, {}
     for word in assignments:
         name, value = word.split('=', 1)
-        before.setdefault(name, shell['vars'].get(name))
-        shell['vars'][name] = (value, _TRANSFER_LENT)
+        if name not in before:
+            before[name] = shell['vars'].get(name)
+            flags[name] = _TRANSFER_LENT[1 if _transfer_variable(shell, name)[0] is not None else 0]
+        shell['vars'][name] = (value, flags[name])
     return before
 
 
 def _transfer_take_back(shell: Dict, before: Dict) -> None:
-    """Put each lent name back as it was before the call, as bash and zsh do after the body assigns or unsets it. One
-    the body exported, declared or left unknown is unknown: bash keeps an exported value and zsh does not."""
+    """Put each lent name back as it was before the call, as bash and zsh do after the body assigns, unsets or
+    declares it locally. One the body exported or left unknown is unknown: bash keeps an exported value, zsh does not."""
     for name, entry in before.items():
-        value, exported = shell['vars'].get(name, (None, None))
-        if exported != _TRANSFER_LENT and (value, exported) != (None, False):
+        if shell['vars'].get(name, (None, None))[1] not in _TRANSFER_LENT:
             shell['vars'][name] = (_TRANSFER_SUBSTITUTED, None)
         elif entry is None:
             shell['vars'].pop(name, None)
@@ -5527,7 +5540,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     if assigns and not substituted:
         shell['status'] = 0
     if program == 'cd':
-        shell['status'] = _transfer_cd(args, cwd, shell['names'])[1]
+        shell['status'] = _transfer_cd(args, cwd, shell)[1]
     if program in ('set', 'shift'):
         shell['args'] = None  # the positional parameters may have changed
     if program in ('return', 'exit'):

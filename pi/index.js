@@ -2702,11 +2702,15 @@ function cdWords(args) {
   }
   return [letters, folders];
 }
-function cdTarget(args, cwd, names) {
+function cdTarget(args, cwd, shell) {
   const [letters, folders] = cdWords(args);
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1];
   if (folders.length > 1 || /[^LP]/.test(letters)) return [void 0, void 0];
   if (folders[0] !== void 0 && [..."$*?[", SUBSTITUTED].some((c) => folders[0].includes(c))) {
+    return [void 0, void 0];
+  }
+  const first = folders[0];
+  if (first !== void 0 && variable(shell, "CDPATH")[0] && first !== "-" && !first.startsWith("/") && !first.startsWith("~") && ![".", ".."].includes(first.split("/")[0])) {
     return [void 0, void 0];
   }
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
@@ -2714,7 +2718,7 @@ function cdTarget(args, cwd, names) {
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
   const target = isAbsolute3(path) ? path : cwd === void 0 || path === "-" ? void 0 : join5(cwd, path);
   if (target !== void 0 && isFile(target)) return [cwd, 1];
-  if (target === void 0 || names.has(basename(normalize(target))) || landed.size > 1) return [void 0, void 0];
+  if (target === void 0 || shell.names.has(basename(normalize(target))) || landed.size > 1) return [void 0, void 0];
   const folder = [...landed][0];
   return folder === void 0 ? [cwd, 1] : [folder, 0];
 }
@@ -2839,7 +2843,10 @@ function both(a, b) {
 function follows(before, status) {
   return !(before === "&&" && status === 1 || before === "||" && status === 0);
 }
-var LENT = "lent";
+var LENT = ["lent", "lent over a value"];
+function isLent(exported) {
+  return exported === LENT[0] || exported === LENT[1];
+}
 function runs(shell) {
   const top = shell.frames.at(-1);
   return top === void 0 ? shell.live : top.runs;
@@ -3270,7 +3277,7 @@ function marker(item, shell) {
   }
 }
 function builtin(name, args, cwd, shell) {
-  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell.names)[0];
+  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell)[0];
   else if (name === "unset") unset(args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
@@ -3290,7 +3297,9 @@ function unset(args, shell) {
   for (const name of args.filter((a) => !a.startsWith("-"))) {
     const value = variable(shell, name)[0];
     const known = shell.functions.get(name);
-    if (!args.includes("-f")) shell.vars[name] = [void 0, false];
+    const exported = variable(shell, name)[1];
+    if (!args.includes("-f") && isLent(exported)) shell.vars[name] = [exported === LENT[1] ? SUBSTITUTED : void 0, exported];
+    else if (!args.includes("-f")) shell.vars[name] = [void 0, false];
     const unsetsFunction = args.includes("-f") || !args.includes("-v") && (value === void 0 || value.includes(SUBSTITUTED));
     if (known === void 0 || !unsetsFunction) continue;
     if (sure && args.includes("-f")) shell.functions.delete(name);
@@ -3314,6 +3323,11 @@ function declare(name, args, shell) {
   for (const arg of args.slice(i)) {
     const eq = arg.indexOf("=");
     const key = eq < 0 ? arg : arg.slice(0, eq);
+    const lent = variable(shell, key.replace(/\+$/, ""))[1];
+    if (isLent(lent) && name !== "readonly" && !(on + off).includes("g")) {
+      shell.vars[key.replace(/\+$/, "")] = [SUBSTITUTED, lent];
+      continue;
+    }
     if (!plain || key.endsWith("+")) {
       forget(shell, new Set([key.replace(/\+$/, "")].filter(Boolean)));
       continue;
@@ -3398,18 +3412,21 @@ function shellString(name, args) {
 }
 function lend(shell, assignments) {
   const before = /* @__PURE__ */ new Map();
+  const flags = /* @__PURE__ */ new Map();
   for (const word of assignments) {
     const at = word.indexOf("=");
     const name = word.slice(0, at);
-    if (!before.has(name)) before.set(name, shell.vars[name]);
-    shell.vars[name] = [word.slice(at + 1), LENT];
+    if (!before.has(name)) {
+      before.set(name, shell.vars[name]);
+      flags.set(name, LENT[variable(shell, name)[0] !== void 0 ? 1 : 0]);
+    }
+    shell.vars[name] = [word.slice(at + 1), flags.get(name)];
   }
   return before;
 }
 function takeBack(shell, before) {
   for (const [name, entry] of before) {
-    const [value, exported] = shell.vars[name] ?? [void 0, void 0];
-    if (exported !== LENT && !(value === void 0 && exported === false)) shell.vars[name] = [SUBSTITUTED, void 0];
+    if (!isLent((shell.vars[name] ?? [void 0, void 0])[1])) shell.vars[name] = [SUBSTITUTED, void 0];
     else if (entry === void 0) delete shell.vars[name];
     else shell.vars[name] = entry;
   }
@@ -3473,7 +3490,7 @@ function simple(words2, item, before, shell, depth) {
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
   if (assigns && !substituted) shell.status = 0;
-  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell.names)[1];
+  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell)[1];
   if (name === "set" || name === "shift") shell.args = void 0;
   if (name === "return" || name === "exit") {
     const given = args[0];

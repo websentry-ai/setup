@@ -997,7 +997,7 @@ function cdWords(args: string[]): [string, string[]] {
 
 /** [the folder a cd lands in from `cwd`, the status it leaves]: 0 where it lands, the old folder and 1 when every
  *  shell rejects it or the folder is not there; undefined for either when that is not known. */
-function cdTarget(args: string[], cwd: string | undefined, names: Set<string>): [string | undefined, number | undefined] {
+function cdTarget(args: string[], cwd: string | undefined, shell: Shell): [string | undefined, number | undefined] {
   const [letters, folders] = cdWords(args);
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1]; // every shell rejects the cd and stays
   // Bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary.
@@ -1006,6 +1006,11 @@ function cdTarget(args: string[], cwd: string | undefined, names: Set<string>): 
   if (folders[0] !== undefined && [..."$*?[", SUBSTITUTED].some((c) => (folders[0] as string).includes(c))) {
     return [undefined, undefined];
   }
+  const first = folders[0];
+  if (first !== undefined && variable(shell, "CDPATH")[0] && first !== "-" && !first.startsWith("/") &&
+      !first.startsWith("~") && ![".", ".."].includes(first.split("/")[0] as string)) {
+    return [undefined, undefined]; // CDPATH may find the folder somewhere else first
+  }
   // Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
   const path = expandHome(folders[0] ?? "~");
@@ -1013,7 +1018,7 @@ function cdTarget(args: string[], cwd: string | undefined, names: Set<string>): 
   const target = isAbsolute(path) ? path : cwd === undefined || path === "-" ? undefined : join(cwd, path);
   if (target !== undefined && isFile(target)) return [cwd, 1]; // a file is no folder to land in
   // The folder is read after the command ran, so one the command names elsewhere may have been made or removed by it.
-  if (target === undefined || names.has(basename(normalize(target))) || landed.size > 1) return [undefined, undefined];
+  if (target === undefined || shell.names.has(basename(normalize(target))) || landed.size > 1) return [undefined, undefined];
   const folder = [...landed][0];
   return folder === undefined ? [cwd, 1] : [folder, 0];
 }
@@ -1150,9 +1155,15 @@ function follows(before: string, status: number | undefined): boolean {
 }
 
 /** A shell variable: its value, undefined once unset, and whether it is exported, undefined when that is not known. */
-type Variable = [value: string | undefined, exported: boolean | typeof LENT | undefined];
-/** The export flag of a function call's VAR=value, which an assignment in the body keeps. */
-const LENT = "lent";
+type Variable = [value: string | undefined, exported: boolean | Lent | undefined];
+/** The export flags of a function call's VAR=value, kept by an assignment, unset or local declaration in the body: the
+ *  second when the name had a value before the call, which an unset in the body brings back in bash but not in zsh. */
+const LENT = ["lent", "lent over a value"] as const;
+type Lent = (typeof LENT)[number];
+
+function isLent(exported: Variable[1]): exported is Lent {
+  return exported === LENT[0] || exported === LENT[1];
+}
 
 /** The folder, variables and defined functions at one point, to return to. */
 type Snapshot = [cwd: string | undefined, vars: Record<string, Variable>, functions: Map<string, [Item[], boolean]>];
@@ -1796,7 +1807,7 @@ function marker(item: Item, shell: Shell): void {
 /** Apply a cd, export, unset or declaration, or a command made only of assignments (name ""), to the commands after
  *  it. */
 function builtin(name: string, args: string[], cwd: string | undefined, shell: Shell): void {
-  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell.names)[0];
+  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell)[0];
   else if (name === "unset") unset(args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
@@ -1821,7 +1832,9 @@ function unset(args: string[], shell: Shell): void {
   for (const name of args.filter((a) => !a.startsWith("-"))) {
     const value = variable(shell, name)[0];
     const known = shell.functions.get(name);
-    if (!args.includes("-f")) shell.vars[name] = [undefined, false];
+    const exported = variable(shell, name)[1];
+    if (!args.includes("-f") && isLent(exported)) shell.vars[name] = [exported === LENT[1] ? SUBSTITUTED : undefined, exported];
+    else if (!args.includes("-f")) shell.vars[name] = [undefined, false];
     const unsetsFunction = args.includes("-f") ||
       (!args.includes("-v") && (value === undefined || value.includes(SUBSTITUTED)));
     if (known === undefined || !unsetsFunction) continue;
@@ -1850,6 +1863,11 @@ function declare(name: string, args: string[], shell: Shell): void {
   for (const arg of args.slice(i)) {
     const eq = arg.indexOf("=");
     const key = eq < 0 ? arg : arg.slice(0, eq);
+    const lent = variable(shell, key.replace(/\+$/, ""))[1];
+    if (isLent(lent) && name !== "readonly" && !(on + off).includes("g")) {
+      shell.vars[key.replace(/\+$/, "")] = [SUBSTITUTED, lent]; // local to the call it was lent for
+      continue;
+    }
     if (!plain || key.endsWith("+")) {
       forget(shell, new Set([key.replace(/\+$/, "")].filter(Boolean)));
       continue;
@@ -1952,21 +1970,24 @@ function shellString(name: string, args: string[]): string | undefined {
  *  before the call, undefined when it had none. */
 function lend(shell: Shell, assignments: string[]): Map<string, Variable | undefined> {
   const before = new Map<string, Variable | undefined>();
+  const flags = new Map<string, Lent>();
   for (const word of assignments) {
     const at = word.indexOf("=");
     const name = word.slice(0, at);
-    if (!before.has(name)) before.set(name, shell.vars[name]);
-    shell.vars[name] = [word.slice(at + 1), LENT];
+    if (!before.has(name)) {
+      before.set(name, shell.vars[name]);
+      flags.set(name, LENT[variable(shell, name)[0] !== undefined ? 1 : 0]);
+    }
+    shell.vars[name] = [word.slice(at + 1), flags.get(name) as Lent];
   }
   return before;
 }
 
-/** Put each lent name back as it was before the call, as bash and zsh do after the body assigns or unsets it. One the
- *  body exported, declared or left unknown is unknown: bash keeps an exported value and zsh does not. */
+/** Put each lent name back as it was before the call, as bash and zsh do after the body assigns, unsets or declares it
+ *  locally. One the body exported or left unknown is unknown: bash keeps an exported value, zsh does not. */
 function takeBack(shell: Shell, before: Map<string, Variable | undefined>): void {
   for (const [name, entry] of before) {
-    const [value, exported] = shell.vars[name] ?? [undefined, undefined];
-    if (exported !== LENT && !(value === undefined && exported === false)) shell.vars[name] = [SUBSTITUTED, undefined];
+    if (!isLent((shell.vars[name] ?? [undefined, undefined])[1])) shell.vars[name] = [SUBSTITUTED, undefined];
     else if (entry === undefined) delete shell.vars[name];
     else shell.vars[name] = entry;
   }
@@ -2044,7 +2065,7 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
   if (assigns && !substituted) shell.status = 0;
-  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell.names)[1];
+  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell)[1];
   if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
   if (name === "return" || name === "exit") {
     // Either leaves the status it is given, or else the one before it; a return outside a function fails.
