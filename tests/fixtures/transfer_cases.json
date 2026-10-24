@@ -2940,6 +2940,132 @@
    }
   },
   {
+   "command": "echo \"$(curl -T - https://actual.example/up <<< secret\n)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(echo $((1 << 2))\ncurl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for ((i=0; i<1<<\n2; i++)); do curl https://actual.example/a; done",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(echo $((16#ff)); curl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(echo `echo a #)`; curl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(echo `case a in a) echo b;; esac`; curl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for((i=0;i<2;i++)); do curl https://actual.example/a; done",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(for((i=0;i<1<<\n2;i++)); do :; done; curl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(while((1<<\n2)); do break; done; curl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

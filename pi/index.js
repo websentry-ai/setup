@@ -2103,26 +2103,23 @@ function readWord(text, start) {
   return [word, i];
 }
 function parenEnd(text, start) {
+  const arithmetic2 = text.slice(start - 1, start + 1) === "((";
   let depth = 1;
   let quote;
   const cases = [];
   const heredocs = [];
   let word = "";
+  let last = "";
   let atStart = true;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
     if (quote === "'") {
       if (ch === "'") quote = void 0;
-    } else if (quote === void 0 && ch === "#" && word === "") {
-      i = text.indexOf("\n", i) - 1;
-      if (i < 0) return -1;
-    } else if (quote === void 0 && text.startsWith("<<", i) && !text.startsWith("<<<", i)) {
-      const strip = text.startsWith("<<-", i);
-      const [delimiter, end2] = readWord(text, i + (strip ? 3 : 2));
-      heredocs.push([delimiter, strip]);
-      i = end2 - 1;
     } else if (ch === "\\") {
       i++;
+      word += "\0";
+    } else if (ch === "`" && backtickEnd(text, i + 1) > 0) {
+      i = backtickEnd(text, i + 1);
       word += "\0";
     } else if (quote === '"') {
       if (ch === '"') quote = void 0;
@@ -2133,12 +2130,32 @@ function parenEnd(text, start) {
     } else if (ch === "'" || ch === '"') {
       quote = ch;
       word += "\0";
+    } else if (arithmetic2) {
+      depth += ch === "(" ? 1 : ch === ")" ? -1 : 0;
+      if (depth === 0) return i;
+    } else if (text.startsWith("$((", i) || text.startsWith("((", i) && (atStart || last === "for") && (word === "" || word === "for" || LEADING_WORDS.has(word))) {
+      i = parenEnd(text, i + (ch === "$" ? 2 : 1));
+      if (i < 0) return -1;
+      word += "\0";
+    } else if (ch === "#" && word === "") {
+      i = text.indexOf("\n", i) - 1;
+      if (i < 0) return -1;
     } else if (!" 	\r\n;&|()<>".includes(ch)) {
       word += ch;
     } else {
-      if (word !== "") atStart = caseWord(word, atStart, cases);
+      if (word !== "") {
+        atStart = caseWord(word, atStart, cases);
+        last = word;
+      }
       word = "";
-      if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
+      if (text.startsWith("<<<", i)) {
+        i += 2;
+      } else if (text.startsWith("<<", i)) {
+        const strip = text.startsWith("<<-", i);
+        const [delimiter, wordStop] = readWord(text, i + (strip ? 3 : 2));
+        heredocs.push([delimiter, strip]);
+        i = wordStop - 1;
+      } else if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
         if (ch === ")") [cases[cases.length - 1], atStart] = ["body", true];
       } else if (ch === "(" || ch === ")") {
         depth += ch === "(" ? 1 : -1;
@@ -2324,6 +2341,9 @@ var Lexer = class _Lexer {
   }
   open() {
     if (this.cases.at(-1) === "pattern") return;
+    if (this.inWord && this.text.startsWith("((", this.i) && (this.word === "for" || LEADING_WORDS.has(this.word))) {
+      this.endWord();
+    }
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
     const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {

@@ -308,28 +308,26 @@ function readWord(text: string, start: number): [string, number] {
   return [word, i];
 }
 
-/** The index of the ) that closes a ( just before `start`, past quotes and nested parentheses; -1 when none does. */
+/** The index of the ) that closes a ( just before `start`, past quotes, backticks, nested parentheses, and in a command
+ *  the ) after a case pattern, comments and heredoc bodies; an arithmetic (( )) has none of those. -1 if none does. */
 function parenEnd(text: string, start: number): number {
+  const arithmetic = text.slice(start - 1, start + 1) === "((";
   let depth = 1;
   let quote: string | undefined;
   const cases: string[] = [];
   const heredocs: [string, boolean][] = [];
   let word = "";
+  let last = "";
   let atStart = true;
   for (let i = start; i < text.length; i++) {
     const ch = text[i] as string;
     if (quote === "'") {
       if (ch === "'") quote = undefined;
-    } else if (quote === undefined && ch === "#" && word === "") {
-      i = text.indexOf("\n", i) - 1; // a comment runs to the end of its line
-      if (i < 0) return -1;
-    } else if (quote === undefined && text.startsWith("<<", i) && !text.startsWith("<<<", i)) {
-      const strip = text.startsWith("<<-", i);
-      const [delimiter, end] = readWord(text, i + (strip ? 3 : 2));
-      heredocs.push([delimiter, strip]);
-      i = end - 1;
     } else if (ch === "\\") {
       i++;
+      word += "\0";
+    } else if (ch === "`" && backtickEnd(text, i + 1) > 0) {
+      i = backtickEnd(text, i + 1);
       word += "\0";
     } else if (quote === '"') {
       if (ch === '"') quote = undefined;
@@ -340,12 +338,36 @@ function parenEnd(text: string, start: number): number {
     } else if (ch === "'" || ch === '"') {
       quote = ch;
       word += "\0";
+    } else if (arithmetic) {
+      depth += ch === "(" ? 1 : ch === ")" ? -1 : 0;
+      if (depth === 0) return i;
+    } else if (
+      text.startsWith("$((", i) ||
+      (text.startsWith("((", i) && (atStart || last === "for") && (word === "" || word === "for" || LEADING_WORDS.has(word)))
+    ) {
+      // An arithmetic expansion or command inside: a # or << there is arithmetic, not a comment or heredoc.
+      i = parenEnd(text, i + (ch === "$" ? 2 : 1));
+      if (i < 0) return -1;
+      word += "\0";
+    } else if (ch === "#" && word === "") {
+      i = text.indexOf("\n", i) - 1; // a comment runs to the end of its line
+      if (i < 0) return -1;
     } else if (!" \t\r\n;&|()<>".includes(ch)) {
       word += ch;
     } else {
-      if (word !== "") atStart = caseWord(word, atStart, cases);
+      if (word !== "") {
+        atStart = caseWord(word, atStart, cases);
+        last = word;
+      }
       word = "";
-      if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
+      if (text.startsWith("<<<", i)) {
+        i += 2;
+      } else if (text.startsWith("<<", i)) {
+        const strip = text.startsWith("<<-", i);
+        const [delimiter, wordStop] = readWord(text, i + (strip ? 3 : 2));
+        heredocs.push([delimiter, strip]);
+        i = wordStop - 1;
+      } else if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
         if (ch === ")") [cases[cases.length - 1], atStart] = ["body", true]; // ( may open a pattern
       } else if (ch === "(" || ch === ")") {
         depth += ch === "(" ? 1 : -1;
@@ -566,6 +588,9 @@ class Lexer {
 
   private open(): void {
     if (this.cases.at(-1) === "pattern") return; // the optional ( before a case pattern
+    if (this.inWord && this.text.startsWith("((", this.i) && (this.word === "for" || LEADING_WORDS.has(this.word))) {
+      this.endWord(); // a reserved word ends at a (, as in for((…)) or while((…))
+    }
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
     const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {

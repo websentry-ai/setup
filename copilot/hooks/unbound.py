@@ -5855,23 +5855,18 @@ def _transfer_arithmetic_parts(text: str) -> Optional[List[str]]:
 
 
 def _transfer_paren_end(text: str, i: int) -> int:
-    """The index of the ) that closes a ( just before i, past quotes, nested parentheses and the ) after a case
-    pattern; -1 when none does."""
-    depth, quote, cases, word, at_start, heredocs = 1, None, [], '', True, []
+    """The index of the ) that closes a ( just before i, past quotes, backticks, nested parentheses, and in a command
+    the ) after a case pattern, comments and heredoc bodies; an arithmetic (( )) has none of those. -1 if none does."""
+    arithmetic = text[i - 1:i + 1] == '(('
+    depth, quote, cases, word, last, at_start, heredocs = 1, None, [], '', '', True, []
     while i < len(text):
         ch = text[i]
         if quote == "'":
             quote = None if ch == "'" else quote
-        elif not quote and ch == '#' and not word:
-            i = text.find('\n', i) - 1  # a comment runs to the end of its line
-            if i < 0:
-                return -1
-        elif not quote and text.startswith('<<', i) and not text.startswith('<<<', i):
-            delimiter, end = _transfer_read_word(text, i + (3 if text.startswith('<<-', i) else 2))
-            heredocs.append((delimiter, text.startswith('<<-', i)))
-            i = end - 1
         elif ch == '\\':
             i, word = i + 1, word + '\0'
+        elif ch == '`' and _transfer_backtick_end(text, i + 1) > 0:
+            i, word = _transfer_backtick_end(text, i + 1), word + '\0'
         elif quote == '"':
             if ch == '"':
                 quote = None
@@ -5881,11 +5876,34 @@ def _transfer_paren_end(text: str, i: int) -> int:
                     return -1
         elif ch in '\'"':
             quote, word = ch, word + '\0'
+        elif arithmetic:
+            depth += 1 if ch == '(' else -1 if ch == ')' else 0
+            if depth == 0:
+                return i
+        elif text.startswith('$((', i) or (text.startswith('((', i) and (at_start or last == 'for') and
+                                            (word in ('', 'for') or word in _TRANSFER_LEADING_WORDS)):
+            # An arithmetic expansion or command inside: a # or << there is arithmetic, not a comment or heredoc.
+            i = _transfer_paren_end(text, i + (2 if ch == '$' else 1))
+            if i < 0:
+                return -1
+            word += '\0'
+        elif ch == '#' and not word:
+            i = text.find('\n', i) - 1  # a comment runs to the end of its line
+            if i < 0:
+                return -1
         elif ch not in ' \t\r\n;&|()<>':
             word += ch
         else:
-            at_start, word = _transfer_case_word(word, at_start, cases) if word else at_start, ''
-            if cases and cases[-1] == 'pattern' and ch in '()':
+            if word:
+                at_start, last = _transfer_case_word(word, at_start, cases), word
+            word = ''
+            if text.startswith('<<<', i):
+                i += 2
+            elif text.startswith('<<', i):
+                delimiter, end = _transfer_read_word(text, i + (3 if text.startswith('<<-', i) else 2))
+                heredocs.append((delimiter, text.startswith('<<-', i)))
+                i = end - 1
+            elif cases and cases[-1] == 'pattern' and ch in '()':
                 cases[-1], at_start = ('body', True) if ch == ')' else ('pattern', at_start)  # ( may open a pattern
             elif ch in '()':
                 depth += 1 if ch == '(' else -1
@@ -6052,6 +6070,9 @@ class _TransferLexer:
     def _open(self) -> None:
         if self.case and self.case[-1] == 'pattern':
             return  # the optional ( before a case pattern
+        if self.in_word and self.text.startswith('((', self.i) and \
+                (self.word == 'for' or self.word in _TRANSFER_LEADING_WORDS):
+            self._end_word()  # a reserved word ends at a (, as in for((…)) or while((…))
         head = self.argv[:-1] if self.argv[-1:] == ['for'] else self.argv
         end = _transfer_paren_end(self.text, self.i + 1) if self.text.startswith('((', self.i) else -1
         if end > 0 and not self.in_word and all(w in _TRANSFER_LEADING_WORDS for w in head):
