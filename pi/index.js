@@ -2034,8 +2034,9 @@ function wordEnd(text, start) {
       i++;
     } else if (text.startsWith("$(", i) || ch === "`") {
       i = ch === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
-      if (i < 0) return [-1, bodies];
-      if (!text.startsWith("$((", at)) bodies.push(ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i));
+      const inner = i > 0 && text.startsWith("$((", at) ? textBodies(text.slice(at + 3, i - 1)) : [];
+      if (i < 0 || inner === void 0) return [-1, bodies];
+      bodies.push(...text.startsWith("$((", at) ? inner : [ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)]);
     } else if (quote === '"') {
       if (ch === '"') quote = void 0;
     } else if (ch === "'" || ch === '"') {
@@ -2046,7 +2047,7 @@ function wordEnd(text, start) {
   }
   return [i, bodies];
 }
-function heredocBodies(body) {
+function textBodies(body) {
   const bodies = [];
   for (let i = 0; i < body.length; i++) {
     const at = i;
@@ -2054,11 +2055,29 @@ function heredocBodies(body) {
       i++;
     } else if (body.startsWith("$(", i) || body[i] === "`") {
       i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
-      if (i < 0) return void 0;
-      if (!body.startsWith("$((", at)) bodies.push(body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i));
+      const inner = i > 0 && body.startsWith("$((", at) ? textBodies(body.slice(at + 3, i - 1)) : [];
+      if (i < 0 || inner === void 0) return void 0;
+      bodies.push(...body.startsWith("$((", at) ? inner : [body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i)]);
     }
   }
   return bodies;
+}
+function expanded(body) {
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    const at = i;
+    if (body[i] === "\\" && ["$", "`", "\\", "\n"].includes(body[i + 1] ?? "")) {
+      out += body[i + 1] === "\n" ? "" : body[i + 1];
+      i++;
+    } else if (body.startsWith("$(", i) || body[i] === "`") {
+      i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
+      if (i < 0) return body.slice(0, at) + SUBSTITUTED;
+      out += SUBSTITUTED;
+    } else {
+      out += body[i];
+    }
+  }
+  return out;
 }
 function readWord(text, start) {
   let i = start;
@@ -2120,8 +2139,8 @@ var Lexer = class _Lexer {
   inWord = false;
   before = "";
   io = [];
-  /** Each heredoc still to read: its delimiter, whether tabs are stripped, and where an unquoted one's substitutions
-   *  go. */
+  /** Each heredoc still to read: its delimiter, whether tabs are stripped, where an unquoted one's substitutions go,
+   *  and where its text goes. */
   heredocs = [];
   failed = false;
   cases = [];
@@ -2212,6 +2231,9 @@ var Lexer = class _Lexer {
     let inner;
     if (text.startsWith("$((", i)) {
       end2 = parenEnd(text, i + 2);
+      const bodies = end2 > 0 ? textBodies(text.slice(i + 3, end2 - 1)) : void 0;
+      if (bodies === void 0) return false;
+      this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : void 0);
     } else if (text.startsWith("$(", i) || this.quote === void 0 && (text.startsWith("<(", i) || text.startsWith(">(", i))) {
       end2 = parenEnd(text, i + 2);
       inner = text.slice(i + 2, end2);
@@ -2241,6 +2263,12 @@ var Lexer = class _Lexer {
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
     const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
+      const bodies = textBodies(this.text.slice(this.i + 2, close - 1));
+      if (bodies === void 0) {
+        this.failed = true;
+        return;
+      }
+      this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : void 0);
       this.argv.push(this.text.slice(this.i, close + 1));
       this.i = close;
       return;
@@ -2285,23 +2313,29 @@ var Lexer = class _Lexer {
     this.inWord = false;
     const op = /^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(text.slice(this.i))[0];
     let [target, end2] = readWord(text, this.i + op.length);
+    const fed = {};
     if (op === "<<" || op === "<<-") {
       const quoted = /['"\\]/.test(text.slice(this.i + op.length, end2));
-      this.heredocs.push([target, op === "<<-", quoted ? void 0 : this.substitutionsAt()]);
+      this.heredocs.push([target, op === "<<-", quoted ? void 0 : this.substitutionsAt(), fed]);
     } else {
-      const [wordStop, bodies] = wordEnd(text, this.i + op.length);
+      const start = this.i + op.length;
+      const [wordStop, bodies] = wordEnd(text, start);
       if (wordStop < 0) {
         this.failed = true;
         return;
       }
       end2 = wordStop;
       this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : void 0);
+      const fedWords = op === "<<<" ? words(text.slice(start, end2)) : [];
+      if (fedWords.length > 0) fed.text = fedWords.join(" ");
     }
     const to = fd ?? (op.startsWith("<") ? 0 : 1);
     if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
       this.io.push([to, target === "-" ? "null" : Number(target)]);
+    } else if (op.startsWith("<<")) {
+      this.io.push([to, "file", fed]);
     } else {
-      this.io.push([to, target === "/dev/null" && !op.startsWith("<<") ? "null" : "file"]);
+      this.io.push([to, target === "/dev/null" ? "null" : "file"]);
       if (op.startsWith("&") || op === ">&" && fd === void 0) this.io.push([2, 1]);
     }
     this.i = end2 - 1;
@@ -2326,23 +2360,25 @@ var Lexer = class _Lexer {
     }
     if (ch === "\n") this.skipHeredocs();
   }
-  /** A heredoc's body starts on the next line and is input, not commands. */
   /** A heredoc's body starts on the next line and is input, not commands, but for the substitutions in one whose
    *  delimiter is unquoted, which run with its command. */
   skipHeredocs() {
     const { text } = this;
     let shift = 0;
     while (this.heredocs.length > 0) {
-      const [delimiter, stripTabs, at] = this.heredocs.shift();
+      const [delimiter, stripTabs, at, fed] = this.heredocs.shift();
       const lines = [];
       while (this.i + 1 < text.length) {
         const end2 = text.indexOf("\n", this.i + 1);
-        const line = end2 < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end2);
+        const raw = end2 < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end2);
+        const line = stripTabs ? raw.replace(/^\t+/, "") : raw;
         this.i = end2 < 0 ? text.length - 1 : end2;
-        if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        if (line === delimiter) break;
         lines.push(line);
       }
-      const bodies = at === void 0 ? [] : heredocBodies(lines.join("\n"));
+      const body = lines.join("\n");
+      fed.text = at === void 0 ? body : expanded(body);
+      const bodies = at === void 0 ? [] : textBodies(body);
       if (bodies === void 0) {
         this.failed = true;
         return;
@@ -2396,8 +2432,8 @@ var Lexer = class _Lexer {
     } else if (isAssignment(word) && this.argv.every((w) => isAssignment(w) || LEADING_WORDS.has(w))) {
       this.argv.push(word);
     } else {
-      const expanded = braces(marked).map(unmark);
-      this.argv.push(...expanded.length === 1 ? expanded : expanded.filter((w) => w !== ""));
+      const expanded2 = braces(marked).map(unmark);
+      this.argv.push(...expanded2.length === 1 ? expanded2 : expanded2.filter((w) => w !== ""));
     }
   }
   /** Whether the words so far end in a for or select header with no `in` list, which a `do` may follow at once. */
@@ -2536,17 +2572,36 @@ function cdWords(args) {
   }
   return [letters, folders];
 }
-function cdRejected(args) {
-  return /[^LPeqs@0-9]/.test(cdWords(args)[0]);
-}
-function cdTarget(args, cwd) {
+function cdTarget(args, cwd, names) {
   const [letters, folders] = cdWords(args);
-  if (cdRejected(args)) return cwd;
-  if (folders.length > 1 || /[^LP]/.test(letters)) return void 0;
+  if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1];
+  if (folders.length > 1 || /[^LP]/.test(letters)) return [void 0, void 0];
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
-  const path = folders[0] ?? "~";
+  const path = expandHome(folders[0] ?? "~");
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
-  return landed.size === 1 ? [...landed][0] : void 0;
+  const target = isAbsolute3(path) ? path : cwd === void 0 || path === "-" ? void 0 : join5(cwd, path);
+  if (target !== void 0 && isFile(target)) return [cwd, 1];
+  if (target === void 0 || names.has(basename(normalize(target))) || landed.size > 1) return [void 0, void 0];
+  const folder = [...landed][0];
+  return folder === void 0 ? [cwd, 1] : [folder, 0];
+}
+function isFile(path) {
+  try {
+    return !statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+var LOOKS = /* @__PURE__ */ new Set(["cd", "[", "[[", "test", "ls", "echo", "printf", "stat", "cat"]);
+function namedSegments(list) {
+  const names = /* @__PURE__ */ new Set();
+  for (const item of list) {
+    const argv = item.kind === "cmd" ? item.argv.filter((w) => !KEYWORDS.has(w)) : [];
+    if (argv.length > 0 && !LOOKS.has(programName(argv[0]))) {
+      for (const word of argv) for (const segment of word.split("/")) if (segment !== "") names.add(segment);
+    }
+  }
+  return names;
 }
 function moveTo(cwd, path, physical) {
   const target = expandHome(path);
@@ -2959,11 +3014,11 @@ function ownCommands(list) {
 function touched(frame, commands) {
   const name = frame.counter;
   if (name === void 0) return;
-  const pattern = new RegExp(`(?<![A-Za-z0-9_])${name}(?![A-Za-z0-9_])`, "g");
   for (const word of (commands ?? [[name]]).flat()) {
-    for (const match of word.matchAll(pattern)) {
-      const [before, after] = [word.slice(0, match.index), word.slice(match.index + name.length)];
-      if (!(before.endsWith("$") || before.endsWith("${") && after.startsWith("}"))) {
+    for (let at = word.indexOf(name); at >= 0; at = word.indexOf(name, at + 1)) {
+      const [before, after] = [word.slice(0, at), word.slice(at + name.length)];
+      const whole = !/[A-Za-z0-9_]/.test(before.slice(-1) + after.slice(0, 1));
+      if (whole && !(before.endsWith("$") || before.endsWith("${") && after.startsWith("}"))) {
         [frame.repeats, frame.forever] = [true, false];
         return;
       }
@@ -3031,7 +3086,7 @@ function marker(item, shell) {
   }
 }
 function builtin(name, args, cwd, shell) {
-  if (name === "cd") shell.cwd = cdTarget(args, cwd);
+  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell.names)[0];
   else if (name === "unset") unset(args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
@@ -3082,6 +3137,53 @@ function declare(name, args, shell) {
     const [current, exported] = variable(shell, key);
     shell.vars[key] = [eq < 0 ? current : arg.slice(eq + 1), on !== "" ? true : off !== "" ? false : exported];
   }
+}
+function stdinScript(name, args) {
+  if (!SHELLS.has(name)) return void 0;
+  for (let i = 0; i < args.length; ) {
+    const arg = args[i++];
+    const option = arg.length > 1 && (arg[0] === "-" || arg[0] === "+");
+    if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++;
+    else if (arg === "-") return args.slice(i);
+    else if (arg === "--") return i < args.length ? void 0 : [];
+    else if (option && arg[1] !== "-" && (arg.includes("c") || arg.includes("s"))) return arg.includes("c") ? void 0 : args.slice(i);
+    else if (!option) return void 0;
+  }
+  return [];
+}
+function stdinText(layers) {
+  let fed;
+  for (const [pipedIn, , redirections] of [...layers].reverse()) {
+    if (pipedIn) fed = void 0;
+    for (const [fd, , text] of redirections) if (fd === 0) fed = text;
+  }
+  return fed?.text;
+}
+function stdinArgs(tool, args, text) {
+  const names = tool === "curl" ? ["-K", "--config"] : ["-i", "--input-file"];
+  const out = [];
+  for (let i = 0; i < args.length; ) {
+    const arg = args[i++];
+    const joined = arg === `${names[0]}-` || arg === `${names[1]}=-`;
+    if (text === void 0 || !(joined || names.includes(arg) && args[i] === "-")) {
+      out.push(arg);
+      continue;
+    }
+    if (!joined) i++;
+    out.push(...tool === "curl" ? curlConfig(text) : text.split("\n").map((line) => line.trim()).filter(Boolean));
+  }
+  return out;
+}
+function curlConfig(text) {
+  const args = [];
+  for (const line of text.split("\n").map((l) => l.trim())) {
+    const match = /^(-{0,2}[A-Za-z0-9][A-Za-z0-9-]*)(?:\s*[=:]\s*|\s+|$)(.*)$/.exec(line);
+    if (match === null || line.startsWith("#")) continue;
+    const [name, value] = [match[1], match[2].trim()];
+    args.push(name.startsWith("-") ? name : `--${name}`);
+    if (value !== "") args.push(value.length > 1 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value);
+  }
+  return args;
 }
 function shellString(name, args) {
   if (SHELLS.has(name)) {
@@ -3159,7 +3261,7 @@ function simple(words2, item, before, shell, depth) {
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
   if (assigns && !substituted) shell.status = 0;
-  if (name === "cd" && cdRejected(args)) shell.status = 1;
+  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell.names)[1];
   if (name === "set" || name === "shift") shell.args = void 0;
   if (name === "return" || name === "exit") {
     const given = args[0];
@@ -3168,7 +3270,7 @@ function simple(words2, item, before, shell, depth) {
   }
   if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
-    if (before !== "|" && item.after !== "|" || subshell === void 0) {
+    if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
       builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
       if (subshell === void 0) unsure(shell, saved);
@@ -3177,9 +3279,11 @@ function simple(words2, item, before, shell, depth) {
     replaceShell(argv, subshell, shell);
     return [];
   }
-  const inner = name === void 0 ? void 0 : shellString(name, args);
+  let inner = name === void 0 ? void 0 : shellString(name, args);
+  let positional = inner !== void 0 && SHELLS.has(name) ? args.slice(args.indexOf(inner) + 2) : [];
+  const script = name !== void 0 && inner === void 0 ? stdinScript(name, args) : void 0;
+  if (script !== void 0) [inner, positional] = [stdinText([layer]), script];
   if (inner !== void 0) {
-    const positional = SHELLS.has(name) ? args.slice(args.indexOf(inner) + 2) : [];
     const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
     return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
@@ -3195,13 +3299,17 @@ function replaced(argv, subshell, shell, calls) {
   return calls;
 }
 function replaceShell(argv, subshell, shell) {
+  const replacing = execsThrough(argv);
+  if (replacing !== false) jumpFrom("exit", [], replacing === true || subshell === true ? subshell : void 0, shell);
+}
+function execsThrough(argv) {
   let rest = argv.filter((word) => !isAssignment(word));
   let behindCommand = false;
   while (rest.length > 0 && ["command", "builtin", "time", "-p", "--"].includes(rest[0])) {
     behindCommand ||= rest[0] === "command";
     rest = rest.slice(1);
   }
-  if (rest.length > 1 && rest[0] === "exec") jumpFrom("exit", [], !behindCommand || subshell === true ? subshell : void 0, shell);
+  return rest.length > 1 && rest[0] === "exec" ? behindCommand ? void 0 : true : false;
 }
 function jumpFrom(name, args, subshell, shell) {
   if (subshell === true) return;
@@ -3287,7 +3395,8 @@ function walk(items, cwd, exported, processEnv, depth, positional = []) {
     live: true,
     floor: void 0,
     args: [...positional],
-    ends: /* @__PURE__ */ new Map()
+    ends: /* @__PURE__ */ new Map(),
+    names: namedSegments(items)
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -3324,9 +3433,9 @@ function curl(args) {
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const url of urls) {
-      const expanded = globoff ? [url] : curlGlob(url);
-      if (expanded === void 0) return out;
-      out.push(...expanded.map((one) => [sends ? "out" : "in", urlHost(one), void 0, curlDial(one, connects, pins)]));
+      const expanded2 = globoff ? [url] : curlGlob(url);
+      if (expanded2 === void 0) return out;
+      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one), void 0, curlDial(one, connects, pins)]));
     }
     if (next >= args.length) return out;
     i = next;
@@ -3669,8 +3778,8 @@ function parse(call, processEnv) {
   let raw;
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(call.args);
-  else if (tool === "wget") raw = wget(call.args);
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)));
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
   else if (tool === "httpie") raw = httpie(call.args, sends);

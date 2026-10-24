@@ -468,17 +468,17 @@ test("a cd that may not have run leaves the folder unknown, and one that surely 
 test("a loop that may repeat, or a cd into a missing folder, leaves the folder unknown", async () => {
   const dir = repo();
   const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
-  // A body that runs again repeats its cd, so where it ends is not known; a cd into a folder that is not there may
-  // have failed. Neither is guessed.
+  // A body that runs again repeats its cd; a folder another command names may have been made or removed by it, since
+  // the folder is read after the command ran. Neither is guessed.
   for (const command of [
     "cd frontend; for x in a b; do cd ..; done; scp -F cfg f prod:/tmp",
     "cd frontend; for x in a b; do cd ..; continue; done; scp -F cfg f prod:/tmp",
     "cd frontend; while [ -f y ]; do cd ..; done; scp -F cfg f prod:/tmp",
     "cd frontend; for x in *.txt; do cd ..; done; scp -F cfg f prod:/tmp",
-    "cd nowhere; cd frontend; scp -F cfg f prod:/tmp",
+    "mkdir nowhere; cd nowhere; cd frontend; scp -F cfg f prod:/tmp",
     "if [ -f y ]; then f() { cd frontend; }; fi; f; scp -F cfg f prod:/tmp",
   ]) assert.equal(await at(command), "prod", command);
-  for (const command of ["cd -P frontend; scp -F cfg f prod:/tmp", "cd -- frontend; scp -F cfg f prod:/tmp", "cd -L frontend; scp -F cfg f prod:/tmp"]) {
+  for (const command of ["cd -P frontend; scp -F cfg f prod:/tmp", "cd -- frontend; scp -F cfg f prod:/tmp", "cd -L frontend; scp -F cfg f prod:/tmp", "cd nowhere; cd frontend; scp -F cfg f prod:/tmp"]) {
     assert.equal(await at(command), "10.0.4.12", command);
   }
   for (const command of [
@@ -493,6 +493,7 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
   const dir = repo();
   mkdirSync(join(dir, "frontend", "inner"));
   symlinkSync(join(dir, "frontend", "inner"), join(dir, "link"));
+  writeFileSync(join(dir, "notes"), "a file, not a folder");
   const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
   // -P resolves links (bash takes the last of -L and -P, zsh any -P); a cd every shell rejects stays put, and one the
   // shells land differently on (a second folder, -e, -q) is not guessed.
@@ -509,7 +510,13 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["cd frontend -P; scp -F cfg f prod:/tmp", "prod"],
     ["cd -Pe frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd -q frontend; scp -F cfg f prod:/tmp", "prod"],
-    ["cd missing/../frontend; scp -F cfg f prod:/tmp", "prod"],
+    ["cd missing/../frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    // A cd into a folder that is there succeeds, and one into a missing path or a file fails and stays.
+    ["cd frontend || cd ..; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["cd nowhere || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["cd nowhere && cd frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    ["cd notes; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    ["cd cfg; scp -F cfg f prod:/tmp", "203.0.113.9"],
     // Every shell fails that cd, so the || after it surely runs.
     ["cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // An arithmetic for that stops after one pass keeps its cd, unless its body touches the counter.

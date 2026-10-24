@@ -231,8 +231,9 @@ function wordEnd(text: string, start: number): [number, string[]] {
       i++;
     } else if (text.startsWith("$(", i) || ch === "`") {
       i = ch === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
-      if (i < 0) return [-1, bodies];
-      if (!text.startsWith("$((", at)) bodies.push(ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)); // arithmetic runs no commands
+      const inner = i > 0 && text.startsWith("$((", at) ? textBodies(text.slice(at + 3, i - 1)) : [];
+      if (i < 0 || inner === undefined) return [-1, bodies];
+      bodies.push(...(text.startsWith("$((", at) ? inner : [ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)]));
     } else if (quote === '"') {
       if (ch === '"') quote = undefined;
     } else if (ch === "'" || ch === '"') {
@@ -244,9 +245,9 @@ function wordEnd(text: string, start: number): [number, string[]] {
   return [i, bodies];
 }
 
-/** The $( ) and backtick bodies a heredoc with an unquoted delimiter runs; quotes are plain text there, and a
- *  backslash escapes the next character. Undefined when one is not closed. */
-function heredocBodies(body: string): string[] | undefined {
+/** The $( ) and backtick bodies that run when an unquoted heredoc or an arithmetic expression is expanded, those
+ *  inside $(( )) too; quotes are plain text there and a backslash escapes. Undefined when one is not closed. */
+function textBodies(body: string): string[] | undefined {
   const bodies: string[] = [];
   for (let i = 0; i < body.length; i++) {
     const at = i;
@@ -254,11 +255,32 @@ function heredocBodies(body: string): string[] | undefined {
       i++;
     } else if (body.startsWith("$(", i) || body[i] === "`") {
       i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
-      if (i < 0) return undefined;
-      if (!body.startsWith("$((", at)) bodies.push(body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i));
+      const inner = i > 0 && body.startsWith("$((", at) ? textBodies(body.slice(at + 3, i - 1)) : [];
+      if (i < 0 || inner === undefined) return undefined;
+      bodies.push(...(body.startsWith("$((", at) ? inner : [body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i)]));
     }
   }
   return bodies;
+}
+
+/** An unquoted heredoc's text as the shell hands it on: each $( ), $(( )) and backtick output unknown, and a
+ *  backslash before $, `, \\ or a newline removed. */
+function expanded(body: string): string {
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    const at = i;
+    if (body[i] === "\\" && ["$", "`", "\\", "\n"].includes(body[i + 1] ?? "")) {
+      out += body[i + 1] === "\n" ? "" : body[i + 1];
+      i++;
+    } else if (body.startsWith("$(", i) || body[i] === "`") {
+      i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
+      if (i < 0) return body.slice(0, at) + SUBSTITUTED;
+      out += SUBSTITUTED;
+    } else {
+      out += body[i];
+    }
+  }
+  return out;
 }
 
 /** The shell word starting at `start` after blanks, and the index after it; quotes and backslashes are undone. */
@@ -320,7 +342,8 @@ function backtickEnd(text: string, start: number): number {
 
 /** One redirection, in the order written: the fd it sets and what that fd then holds, a file or heredoc, nothing
  *  (/dev/null or a closed fd), or the fd it copies. */
-type Redirection = [fd: number, value: "file" | "null" | number];
+/** An fd and what it then holds; a heredoc or here-string also carries its text, for a shell or tool reading stdin. */
+type Redirection = [fd: number, value: "file" | "null" | number, fed?: { text?: string }];
 
 /** One simple command, or a marker around a subshell, substitution, function body or case arm. */
 interface Item {
@@ -343,9 +366,9 @@ class Lexer {
   private inWord = false;
   private before = "";
   private io: Redirection[] = [];
-  /** Each heredoc still to read: its delimiter, whether tabs are stripped, and where an unquoted one's substitutions
-   *  go. */
-  private readonly heredocs: [string, boolean, [number, string] | undefined][] = [];
+  /** Each heredoc still to read: its delimiter, whether tabs are stripped, where an unquoted one's substitutions go,
+   *  and where its text goes. */
+  private readonly heredocs: [string, boolean, [number, string] | undefined, { text?: string }][] = [];
   private failed = false;
   private readonly cases: string[] = [];
   private readonly text: string;
@@ -441,7 +464,10 @@ class Lexer {
     let end: number;
     let inner: string | undefined;
     if (text.startsWith("$((", i)) {
-      end = parenEnd(text, i + 2); // arithmetic runs no commands
+      end = parenEnd(text, i + 2);
+      const bodies = end > 0 ? textBodies(text.slice(i + 3, end - 1)) : undefined; // what its $( ) run
+      if (bodies === undefined) return false;
+      this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : undefined);
     } else if (text.startsWith("$(", i) || (this.quote === undefined && (text.startsWith("<(", i) || text.startsWith(">(", i)))) {
       end = parenEnd(text, i + 2);
       inner = text.slice(i + 2, end);
@@ -472,7 +498,13 @@ class Lexer {
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
     const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
-      // An arithmetic command, or a for loop's (( )) header, is one word that runs nothing.
+      // An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions.
+      const bodies = textBodies(this.text.slice(this.i + 2, close - 1));
+      if (bodies === undefined) {
+        this.failed = true;
+        return;
+      }
+      this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : undefined);
       this.argv.push(this.text.slice(this.i, close + 1));
       this.i = close;
       return;
@@ -521,26 +553,31 @@ class Lexer {
     this.inWord = false;
     const op = (/^(?:&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>)/.exec(text.slice(this.i)) as RegExpExecArray)[0];
     let [target, end] = readWord(text, this.i + op.length);
+    const fed: { text?: string } = {}; // a heredoc or here-string feeds its text
     if (op === "<<" || op === "<<-") {
       // An unquoted delimiter leaves the body's substitutions to run, with the command, before it does.
       const quoted = /['"\\]/.test(text.slice(this.i + op.length, end));
-      this.heredocs.push([target, op === "<<-", quoted ? undefined : this.substitutionsAt()]);
+      this.heredocs.push([target, op === "<<-", quoted ? undefined : this.substitutionsAt(), fed]);
     } else {
       // A target's substitutions run with the command too, such as a here-string's "$(curl …)".
-      const [wordStop, bodies] = wordEnd(text, this.i + op.length);
+      const start = this.i + op.length;
+      const [wordStop, bodies] = wordEnd(text, start);
       if (wordStop < 0) {
         this.failed = true;
         return;
       }
       end = wordStop;
       this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : undefined);
+      const fedWords = op === "<<<" ? words(text.slice(start, end)) : [];
+      if (fedWords.length > 0) fed.text = fedWords.join(" ");
     }
     const to = fd ?? (op.startsWith("<") ? 0 : 1);
     if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
       this.io.push([to, target === "-" ? "null" : Number(target)]);
+    } else if (op.startsWith("<<")) {
+      this.io.push([to, "file", fed]);
     } else {
-      // A heredoc or here-string feeds its text.
-      this.io.push([to, target === "/dev/null" && !op.startsWith("<<") ? "null" : "file"]);
+      this.io.push([to, target === "/dev/null" ? "null" : "file"]);
       if (op.startsWith("&") || (op === ">&" && fd === undefined)) this.io.push([2, 1]); // &> and >&file send stderr there too
     }
     this.i = end - 1;
@@ -567,23 +604,25 @@ class Lexer {
     if (ch === "\n") this.skipHeredocs();
   }
 
-  /** A heredoc's body starts on the next line and is input, not commands. */
   /** A heredoc's body starts on the next line and is input, not commands, but for the substitutions in one whose
    *  delimiter is unquoted, which run with its command. */
   private skipHeredocs(): void {
     const { text } = this;
     let shift = 0;
     while (this.heredocs.length > 0) {
-      const [delimiter, stripTabs, at] = this.heredocs.shift() as [string, boolean, [number, string] | undefined];
+      const [delimiter, stripTabs, at, fed] = this.heredocs.shift() as [string, boolean, [number, string] | undefined, { text?: string }];
       const lines: string[] = [];
       while (this.i + 1 < text.length) {
         const end = text.indexOf("\n", this.i + 1);
-        const line = end < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end);
+        const raw = end < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end);
+        const line = stripTabs ? raw.replace(/^\t+/, "") : raw;
         this.i = end < 0 ? text.length - 1 : end;
-        if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+        if (line === delimiter) break;
         lines.push(line);
       }
-      const bodies = at === undefined ? [] : heredocBodies(lines.join("\n"));
+      const body = lines.join("\n");
+      fed.text = at === undefined ? body : expanded(body);
+      const bodies = at === undefined ? [] : textBodies(body);
       if (bodies === undefined) {
         this.failed = true;
         return;
@@ -808,23 +847,47 @@ function cdWords(args: string[]): [string, string[]] {
   return [letters, folders];
 }
 
-/** Whether a cd has an option that bash 3, bash 5 and zsh all reject, so it fails and stays. */
-function cdRejected(args: string[]): boolean {
-  return /[^LPeqs@0-9]/.test(cdWords(args)[0]);
-}
-
-/** The folder a cd with `args` lands in from `cwd`: `cwd` when no shell takes one of its options, and undefined when
- *  bash 3, bash 5 and zsh land in different places or the folder is not known. */
-function cdTarget(args: string[], cwd: string | undefined): string | undefined {
+/** [the folder a cd lands in from `cwd`, the status it leaves]: 0 where it lands, the old folder and 1 when every
+ *  shell rejects it or the folder is not there; undefined for either when that is not known. */
+function cdTarget(args: string[], cwd: string | undefined, names: Set<string>): [string | undefined, number | undefined] {
   const [letters, folders] = cdWords(args);
-  if (cdRejected(args)) return cwd;
-  // Bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s, -@ vary.
-  if (folders.length > 1 || /[^LP]/.test(letters)) return undefined;
+  if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1]; // every shell rejects the cd and stays
+  // Bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary.
+  if (folders.length > 1 || /[^LP]/.test(letters)) return [undefined, undefined];
   // Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
-  const path = folders[0] ?? "~";
+  const path = expandHome(folders[0] ?? "~");
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
-  return landed.size === 1 ? [...landed][0] : undefined;
+  const target = isAbsolute(path) ? path : cwd === undefined || path === "-" ? undefined : join(cwd, path);
+  if (target !== undefined && isFile(target)) return [cwd, 1]; // a file is no folder to land in
+  // The folder is read after the command ran, so one the command names elsewhere may have been made or removed by it.
+  if (target === undefined || names.has(basename(normalize(target))) || landed.size > 1) return [undefined, undefined];
+  const folder = [...landed][0];
+  return folder === undefined ? [cwd, 1] : [folder, 0];
+}
+
+/** Whether `path` is there and is not a folder. */
+function isFile(path: string): boolean {
+  try {
+    return !statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+const LOOKS: ReadonlySet<string> = new Set(["cd", "[", "[[", "test", "ls", "echo", "printf", "stat", "cat"]);
+
+/** The path segments the commands in `list` name, but for those that only look at a folder, such as cd or test: a
+ *  folder another command names may have been made or removed by it. */
+function namedSegments(list: Item[]): Set<string> {
+  const names = new Set<string>();
+  for (const item of list) {
+    const argv = item.kind === "cmd" ? item.argv.filter((w) => !KEYWORDS.has(w)) : [];
+    if (argv.length > 0 && !LOOKS.has(programName(argv[0] as string))) {
+      for (const word of argv) for (const segment of word.split("/")) if (segment !== "") names.add(segment);
+    }
+  }
+  return names;
 }
 
 /** The folder a cd to `path` lands in from `cwd`, links resolved when `physical`; undefined when `cwd` is not known,
@@ -1021,6 +1084,8 @@ interface Shell {
   floor: number | undefined;
   /** The positional parameters, undefined when not known. */
   args: string[] | undefined;
+  /** The path segments the walk's commands name, other than those that only look at a folder. */
+  names: Set<string>;
   /** What follows the end of each compound in `items`, by where it opens. */
   ends: Map<string, [string, number]>;
 }
@@ -1457,11 +1522,11 @@ function ownCommands(list: Item[]): string[][] {
 function touched(frame: Frame, commands: string[][] | undefined): void {
   const name = frame.counter;
   if (name === undefined) return;
-  const pattern = new RegExp(`(?<![A-Za-z0-9_])${name}(?![A-Za-z0-9_])`, "g");
   for (const word of (commands ?? [[name]]).flat()) {
-    for (const match of word.matchAll(pattern)) {
-      const [before, after] = [word.slice(0, match.index), word.slice((match.index as number) + name.length)];
-      if (!(before.endsWith("$") || (before.endsWith("${") && after.startsWith("}")))) {
+    for (let at = word.indexOf(name); at >= 0; at = word.indexOf(name, at + 1)) {
+      const [before, after] = [word.slice(0, at), word.slice(at + name.length)];
+      const whole = !/[A-Za-z0-9_]/.test(before.slice(-1) + after.slice(0, 1));
+      if (whole && !(before.endsWith("$") || (before.endsWith("${") && after.startsWith("}")))) {
         [frame.repeats, frame.forever] = [true, false];
         return;
       }
@@ -1547,7 +1612,7 @@ function marker(item: Item, shell: Shell): void {
 /** Apply a cd, export, unset or declaration, or a command made only of assignments (name ""), to the commands after
  *  it. */
 function builtin(name: string, args: string[], cwd: string | undefined, shell: Shell): void {
-  if (name === "cd") shell.cwd = cdTarget(args, cwd);
+  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell.names)[0];
   else if (name === "unset") unset(args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
@@ -1608,6 +1673,63 @@ function declare(name: string, args: string[], shell: Shell): void {
     const [current, exported] = variable(shell, key);
     shell.vars[key] = [eq < 0 ? current : arg.slice(eq + 1), on !== "" ? true : off !== "" ? false : exported];
   }
+}
+
+/** The positional parameters of a shell that reads its script from stdin, with no -c string and no script file;
+ *  undefined for any other command. */
+function stdinScript(name: string, args: string[]): string[] | undefined {
+  if (!SHELLS.has(name)) return undefined;
+  for (let i = 0; i < args.length; ) {
+    const arg = args[i++] as string;
+    const option = arg.length > 1 && (arg[0] === "-" || arg[0] === "+");
+    if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++;
+    else if (arg === "-") return args.slice(i);
+    else if (arg === "--") return i < args.length ? undefined : [];
+    else if (option && arg[1] !== "-" && (arg.includes("c") || arg.includes("s"))) return arg.includes("c") ? undefined : args.slice(i);
+    else if (!option) return undefined; // a script file
+  }
+  return [];
+}
+
+/** The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it; undefined otherwise. */
+function stdinText(layers: readonly Layer[]): string | undefined {
+  let fed: { text?: string } | undefined;
+  for (const [pipedIn, , redirections] of [...layers].reverse()) {
+    if (pipedIn) fed = undefined;
+    for (const [fd, , text] of redirections) if (fd === 0) fed = text;
+  }
+  return fed?.text;
+}
+
+/** curl's or wget's arguments, with a config (curl -K -) or a URL list (wget -i -) read from stdin put in place. */
+function stdinArgs(tool: string, args: string[], text: string | undefined): string[] {
+  const names = tool === "curl" ? ["-K", "--config"] : ["-i", "--input-file"];
+  const out: string[] = [];
+  for (let i = 0; i < args.length; ) {
+    const arg = args[i++] as string;
+    const joined = arg === `${names[0]}-` || arg === `${names[1]}=-`;
+    if (text === undefined || !(joined || (names.includes(arg) && args[i] === "-"))) {
+      out.push(arg);
+      continue;
+    }
+    if (!joined) i++;
+    out.push(...(tool === "curl" ? curlConfig(text) : text.split("\n").map((line) => line.trim()).filter(Boolean)));
+  }
+  return out;
+}
+
+/** A curl config's options as arguments: one per line, with or without its dashes, its value after blanks, = or :,
+ *  quoted or not; # starts a comment. */
+function curlConfig(text: string): string[] {
+  const args: string[] = [];
+  for (const line of text.split("\n").map((l) => l.trim())) {
+    const match = /^(-{0,2}[A-Za-z0-9][A-Za-z0-9-]*)(?:\s*[=:]\s*|\s+|$)(.*)$/.exec(line);
+    if (match === null || line.startsWith("#")) continue;
+    const [name, value] = [match[1] as string, (match[2] as string).trim()];
+    args.push(name.startsWith("-") ? name : `--${name}`);
+    if (value !== "") args.push(value.length > 1 && value.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value);
+  }
+  return args;
 }
 
 /** The command string `sh -c` or `powershell -Command` runs; undefined for any other command. */
@@ -1701,7 +1823,7 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
   if (assigns && !substituted) shell.status = 0;
-  if (name === "cd" && cdRejected(args)) shell.status = 1;
+  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell.names)[1];
   if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
   if (name === "return" || name === "exit") {
     // Either leaves the status it is given, or else the one before it; a return outside a function fails.
@@ -1712,20 +1834,22 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
-    if ((before !== "|" && item.after !== "|") || subshell === undefined) {
+    if (((before !== "|" && item.after !== "|") || subshell === undefined) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
       builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
       if (subshell === undefined) unsure(shell, saved);
       else if (doubt(shell.pipe)) forget(shell, changes(shell, saved)); // it may not have run
     }
     replaceShell(argv, subshell, shell);
-    return [];
+    return []; // a builtin run through exec does not run: bash finds no such program, and zsh exits after it
   }
-  const inner = name === undefined ? undefined : shellString(name, args);
+  let inner = name === undefined ? undefined : shellString(name, args);
+  // Its words after the string are $0 and then the positional parameters; a shell may read its script from stdin.
+  let positional = inner !== undefined && SHELLS.has(name as string) ? args.slice(args.indexOf(inner) + 2) : [];
+  const script = name !== undefined && inner === undefined ? stdinScript(name, args) : undefined;
+  if (script !== undefined) [inner, positional] = [stdinText([layer]), script];
   if (inner !== undefined) {
     // The string's commands run as the wrapper's user and read its stdin and write its stdout.
-    // Its words after the string are $0 and then the positional parameters.
-    const positional = SHELLS.has(name as string) ? args.slice(args.indexOf(inner) + 2) : [];
     const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
     return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
@@ -1743,16 +1867,22 @@ function replaced(argv: string[], subshell: Maybe, shell: Shell, calls: Call[]):
   return calls;
 }
 
-/** After a command run through exec, which replaces the shell, nothing runs: exec itself, or behind time or builtin,
- *  and only maybe behind command, which bash runs as the builtin and zsh looks up as a program. */
+/** After a command run through exec, which replaces the shell, nothing runs; only maybe for one behind command. */
 function replaceShell(argv: string[], subshell: Maybe, shell: Shell): void {
+  const replacing = execsThrough(argv);
+  if (replacing !== false) jumpFrom("exit", [], replacing === true || subshell === true ? subshell : undefined, shell);
+}
+
+/** Whether a command runs through exec: true for exec, or exec behind time or builtin; undefined behind command, which
+ *  bash runs as the builtin and zsh looks up as a program; false otherwise. */
+function execsThrough(argv: string[]): Maybe {
   let rest = argv.filter((word) => !isAssignment(word));
   let behindCommand = false;
   while (rest.length > 0 && ["command", "builtin", "time", "-p", "--"].includes(rest[0] as string)) {
     behindCommand ||= rest[0] === "command";
     rest = rest.slice(1);
   }
-  if (rest.length > 1 && rest[0] === "exec") jumpFrom("exit", [], !behindCommand || subshell === true ? subshell : undefined, shell);
+  return rest.length > 1 && rest[0] === "exec" ? (behindCommand ? undefined : true) : false;
 }
 
 /** A return, exit, break or continue where it runs: nothing beyond a subshell, and only maybe from the last command
@@ -1842,7 +1972,7 @@ function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv:
     start: [cwd, { ...vars }, new Map()], processEnv, calls: [], openingPipe: false,
     pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false },
     functions: new Map(), callsLeft: MAX_CALLS, items, at: 0, live: true, floor: undefined, args: [...positional],
-    ends: new Map(),
+    ends: new Map(), names: namedSegments(items),
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -2279,8 +2409,8 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   let raw: Raw[];
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(call.args);
-  else if (tool === "wget") raw = wget(call.args);
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)));
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
   else if (tool === "httpie") raw = httpie(call.args, sends);

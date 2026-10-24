@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'c94978b963d0c29a422571b65587568f44ab60bcef351f58a964db6bc03e1b49'
+BLOCK_SHA256 = 'ca549cb8816721000b4a0e08d22a0bb9a457c77df78059622482468ba78977de'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -768,19 +768,19 @@ class ParserFindingTests(TransferTestCase):
                         f'[ -d x ] && cd /tmp; cd {self.repo}/frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, private)
 
-    def test_a_loop_that_may_repeat_or_a_cd_into_a_missing_folder_leaves_the_folder_unknown(self):
-        # A body that runs again repeats its cd, so where it ends is not known; a cd into a folder that is not there
-        # may have failed. Neither is guessed.
+    def test_a_loop_that_may_repeat_or_a_cd_the_command_may_have_made_leaves_the_folder_unknown(self):
+        # A body that runs again repeats its cd; a folder another command names may have been made or removed by it,
+        # since the folder is read after the command ran. Neither is guessed.
         unknown = [_endpoint('out', 'prod', 'unresolved', 'prod')]
         for command in ('cd frontend; for x in a b; do cd ..; done; scp -F cfg f prod:/tmp',
                         'cd frontend; for x in a b; do cd ..; continue; done; scp -F cfg f prod:/tmp',
                         'cd frontend; while [ -f y ]; do cd ..; done; scp -F cfg f prod:/tmp',
                         'cd frontend; for x in *.txt; do cd ..; done; scp -F cfg f prod:/tmp',
-                        'cd nowhere; cd frontend; scp -F cfg f prod:/tmp',
+                        'mkdir nowhere; cd nowhere; cd frontend; scp -F cfg f prod:/tmp',
                         'if [ -f y ]; then f() { cd frontend; }; fi; f; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, unknown)
         for command in ('cd -P frontend; scp -F cfg f prod:/tmp', 'cd -- frontend; scp -F cfg f prod:/tmp',
-                        'cd -L frontend; scp -F cfg f prod:/tmp'):
+                        'cd -L frontend; scp -F cfg f prod:/tmp', 'cd nowhere; cd frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.0.4.12')])
         public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
         for command in ('cd frontend; for x in a; do cd ..; done; scp -F cfg f prod:/tmp',
@@ -806,6 +806,7 @@ class ParserFindingTests(TransferTestCase):
         # the shells land differently on (a second folder, -e, -q) is not guessed.
         os.makedirs(os.path.join(self.repo, 'frontend', 'inner'))
         os.symlink(os.path.join(self.repo, 'frontend', 'inner'), os.path.join(self.repo, 'link'))
+        Path(self.repo, 'notes').write_text('a file, not a folder')
         private, public, unknown = (_endpoint('out', 'prod', 'private', '10.0.4.12'),
                                     _endpoint('out', 'prod', 'public', '203.0.113.9'),
                                     _endpoint('out', 'prod', 'unresolved', 'prod'))
@@ -821,7 +822,14 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd frontend -P; scp -F cfg f prod:/tmp', unknown),
                                   ('cd -Pe frontend; scp -F cfg f prod:/tmp', unknown),
                                   ('cd -q frontend; scp -F cfg f prod:/tmp', unknown),
-                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', public),
+                                  # A cd into a folder that is there succeeds, and one into a missing path or a file
+                                  # fails and stays, so && and || after it follow.
+                                  ('cd frontend || cd ..; scp -F cfg f prod:/tmp', private),
+                                  ('cd nowhere || cd frontend; scp -F cfg f prod:/tmp', private),
+                                  ('cd nowhere && cd frontend; scp -F cfg f prod:/tmp', public),
+                                  ('cd notes; scp -F cfg f prod:/tmp', public),
+                                  ('cd cfg; scp -F cfg f prod:/tmp', public),
                                   # Every shell fails that cd, so the || after it surely runs.
                                   ('cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp', private),
                                   # An arithmetic for that stops after one pass keeps its cd, unless its body
@@ -1035,7 +1043,7 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
         unknown = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]}
         cases = (('false && cd frontend', public), ('cd frontend', private), ('cd frontend &', public),
-                 ('(cd frontend)', public), ('test -f marker && cd frontend', unknown))
+                 ('(cd frontend)', public), ('test -f marker && cd frontend', unknown), ('exec cd frontend', public))
         for path in ('claude-code/hooks/unbound.py', 'codex/hooks/unbound.py', 'copilot/hooks/unbound.py',
                      'augment/hooks/unbound.py'):
             for first, expected in cases:

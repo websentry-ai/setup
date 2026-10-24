@@ -5779,10 +5779,11 @@ def _transfer_word_end(text: str, i: int) -> tuple:
             i += 1
         elif text.startswith('$(', i) or ch == '`':
             i = _transfer_paren_end(text, i + 2) if ch == '$' else _transfer_backtick_end(text, i + 1)
-            if i < 0:
+            inner = _transfer_text_bodies(text[start + 3:i - 1]) if i > 0 and text.startswith('$((', start) else []
+            if i < 0 or inner is None:
                 return -1, bodies
-            if not text.startswith('$((', start):  # arithmetic runs no commands
-                bodies.append(text[start + 2:i] if ch == '$' else text[start + 1:i])
+            bodies += inner if text.startswith('$((', start) else \
+                [text[start + 2:i] if ch == '$' else text[start + 1:i]]
         elif quote == '"':
             quote = None if ch == '"' else quote
         elif ch in '\'"':
@@ -5793,9 +5794,9 @@ def _transfer_word_end(text: str, i: int) -> tuple:
     return i, bodies
 
 
-def _transfer_heredoc_bodies(body: str) -> Optional[List[str]]:
-    """The $( ) and backtick bodies a heredoc with an unquoted delimiter runs; quotes are plain text there, and a
-    backslash escapes the next character. None when one is not closed."""
+def _transfer_text_bodies(body: str) -> Optional[List[str]]:
+    """The $( ) and backtick bodies that run when an unquoted heredoc or an arithmetic expression is expanded, those
+    inside $(( )) too; quotes are plain text there and a backslash escapes. None when one is not closed."""
     bodies, i = [], 0
     while i < len(body):
         start = i
@@ -5803,12 +5804,40 @@ def _transfer_heredoc_bodies(body: str) -> Optional[List[str]]:
             i += 1
         elif body.startswith('$(', i) or body[i] == '`':
             i = _transfer_paren_end(body, i + 2) if body[i] == '$' else _transfer_backtick_end(body, i + 1)
-            if i < 0:
+            inner = _transfer_text_bodies(body[start + 3:i - 1]) if i > 0 and body.startswith('$((', start) else []
+            if i < 0 or inner is None:
                 return None
-            if not body.startswith('$((', start):
-                bodies.append(body[start + 2:i] if body[start] == '$' else body[start + 1:i])
+            bodies += inner if body.startswith('$((', start) else \
+                [body[start + 2:i] if body[start] == '$' else body[start + 1:i]]
         i += 1
     return bodies
+
+
+def _transfer_expanded(body: str) -> str:
+    """An unquoted heredoc's text as the shell hands it on: each $( ), $(( )) and backtick output unknown, and a
+    backslash before $, `, \\ or a newline removed."""
+    out, i = [], 0
+    while i < len(body):
+        start = i
+        if body[i] == '\\' and body[i + 1:i + 2] in ('$', '`', '\\', '\n'):
+            out.append(body[i + 1] if body[i + 1] != '\n' else '')
+            i += 2
+            continue
+        if body.startswith('$(', i) or body[i] == '`':
+            i = _transfer_paren_end(body, i + 2) if body[i] == '$' else _transfer_backtick_end(body, i + 1)
+            if i < 0:
+                return body[:start] + _TRANSFER_SUBSTITUTED
+            out.append(_TRANSFER_SUBSTITUTED)
+        else:
+            out.append(body[i])
+        i += 1
+    return ''.join(out)
+
+
+class _TransferStdin(str):
+    """A redirection that feeds a heredoc's or here-string's text: 'file' to the fds, with the text as text, for a
+    shell or tool that reads its script or config from stdin."""
+    text = None
 
 
 def _transfer_paren_end(text: str, i: int) -> int:
@@ -5932,7 +5961,11 @@ class _TransferLexer:
         """Read a $( ), $(( )), backtick or <( ) substitution starting here; None when none starts here."""
         text, i, inner = self.text, self.i, None
         if text.startswith('$((', i):
-            end = _transfer_paren_end(text, i + 2)  # arithmetic runs no commands
+            end = _transfer_paren_end(text, i + 2)
+            bodies = _transfer_text_bodies(text[i + 3:end - 1]) if end > 0 else None  # what its $( ) run
+            if bodies is None:
+                return False
+            self._substitute(bodies, self._substitutions_at() if bodies else None)
         elif text.startswith('$(', i) or (not self.quote and text.startswith(('<(', '>('), i)):
             end = _transfer_paren_end(text, i + 2)
             inner = text[i + 2:end]
@@ -5960,7 +5993,12 @@ class _TransferLexer:
         head = self.argv[:-1] if self.argv[-1:] == ['for'] else self.argv
         end = _transfer_paren_end(self.text, self.i + 1) if self.text.startswith('((', self.i) else -1
         if end > 0 and not self.in_word and all(w in _TRANSFER_LEADING_WORDS for w in head):
-            # An arithmetic command, or a for loop's (( )) header, is one word that runs nothing.
+            # An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions.
+            bodies = _transfer_text_bodies(self.text[self.i + 2:end - 1])
+            if bodies is None:
+                self.failed = True
+                return
+            self._substitute(bodies, self._substitutions_at() if bodies else None)
             self.argv.append(self.text[self.i:end + 1])
             self.i = end
             return
@@ -6002,23 +6040,28 @@ class _TransferLexer:
         self.word, self.in_word = '', False
         op = re.match(r'&>>?|<<<|<<-|<<|<>|<&|>>|>&|>\||<|>', text[self.i:]).group(0)
         target, end = _transfer_read_word(text, self.i + len(op))
+        fed = _TransferStdin('file')  # a heredoc or here-string feeds its text
         if op in ('<<', '<<-'):
             # An unquoted delimiter leaves the body's substitutions to run, with the command, before it does.
             quoted = any(c in text[self.i + len(op):end] for c in '\'"\\')
-            self.heredocs.append((target, op == '<<-', None if quoted else self._substitutions_at()))
+            self.heredocs.append((target, op == '<<-', None if quoted else self._substitutions_at(), fed))
         else:
             # A target's substitutions run with the command too, such as a here-string's "$(curl …)".
-            end, bodies = _transfer_word_end(text, self.i + len(op))
+            start = self.i + len(op)
+            end, bodies = _transfer_word_end(text, start)
             if end < 0:
                 self.failed = True
                 return
             self._substitute(bodies, self._substitutions_at() if bodies else None)
+            words = _transfer_words(text[start:end]) if op == '<<<' else []
+            fed.text = ' '.join(words) if words else None
         to = fd if fd is not None else 0 if op[0] == '<' else 1
         if op in ('<&', '>&') and (target.isdigit() or target == '-'):
             self.io.append((to, int(target) if target.isdigit() else 'null'))
+        elif op in ('<<', '<<-', '<<<'):
+            self.io.append((to, fed))
         else:
-            # A heredoc or here-string feeds its text.
-            self.io.append((to, 'null' if target == '/dev/null' and op not in ('<<', '<<-', '<<<') else 'file'))
+            self.io.append((to, 'null' if target == '/dev/null' else 'file'))
             if op[0] == '&' or (op == '>&' and fd is None):
                 self.io.append((2, 1))  # &> and >&file send stderr there too
         self.i = end - 1
@@ -6048,16 +6091,18 @@ class _TransferLexer:
         delimiter is unquoted, which run with its command."""
         text, shift = self.text, 0
         while self.heredocs:
-            delimiter, strip_tabs, at = self.heredocs.pop(0)
+            delimiter, strip_tabs, at, fed = self.heredocs.pop(0)
             lines = []
             while self.i + 1 < len(text):
                 end = text.find('\n', self.i + 1)
                 line = text[self.i + 1:] if end < 0 else text[self.i + 1:end]
                 self.i = len(text) - 1 if end < 0 else end
-                if (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                line = line.lstrip('\t') if strip_tabs else line
+                if line == delimiter:
                     break
                 lines.append(line)
-            bodies = _transfer_heredoc_bodies('\n'.join(lines)) if at else []
+            body = '\n'.join(lines)
+            bodies, fed.text = (_transfer_text_bodies(body), _transfer_expanded(body)) if at else ([], body)
             if bodies is None:
                 self.failed = True
                 return
@@ -6281,24 +6326,40 @@ def _transfer_cd_words(args: List[str]) -> tuple:
     return letters, folders
 
 
-def _transfer_cd_rejected(args: List[str]) -> bool:
-    """Whether a cd has an option that bash 3, bash 5 and zsh all reject, so it fails and stays."""
-    return any(c not in 'LPeqs@0123456789' for c in _transfer_cd_words(args)[0])
-
-
-def _transfer_cd(args: List[str], cwd: Optional[str]) -> Optional[str]:
-    """The folder a cd with args lands in from cwd: cwd when no shell takes one of its options, and None when bash 3,
-    bash 5 and zsh land in different places or the folder is not known."""
+def _transfer_cd(args: List[str], cwd: Optional[str], names: set) -> tuple:
+    """(the folder a cd lands in from cwd, the status it leaves): 0 where it lands, the old folder and 1 when every
+    shell rejects it or the folder is not there; None for either when that is not known."""
     letters, folders = _transfer_cd_words(args)
-    if _transfer_cd_rejected(args):
-        return cwd
+    if any(c not in 'LPeqs@0123456789' for c in letters):
+        return cwd, 1  # every shell rejects the cd and stays
     if len(folders) > 1 or any(c not in 'LP' for c in letters):
-        return None  # bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s, -@ vary
+        return None, None  # bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary
     # Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
     last = letters[max(letters.rfind('L'), letters.rfind('P'))] if letters else 'L'
-    path = folders[0] if folders else '~'
+    path = os.path.expanduser(folders[0] if folders else '~')
     landed = {_transfer_move(cwd, path, physical) for physical in {last == 'P', 'P' in letters}}
-    return landed.pop() if len(landed) == 1 else None
+    target = path if os.path.isabs(path) else None if cwd is None or path == '-' else os.path.join(cwd, path)
+    if target is not None and os.path.exists(target) and not os.path.isdir(target):
+        return cwd, 1  # a file is no folder to land in
+    # The folder is read after the command ran, so one the command names elsewhere may have been made or removed by it.
+    if target is None or os.path.basename(os.path.normpath(target)) in names or len(landed) > 1:
+        return None, None
+    folder = landed.pop()
+    return (folder, 0) if folder else (cwd, 1)
+
+
+_TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat'})
+
+
+def _transfer_names(items: List[tuple]) -> set:
+    """The path segments the commands in items name, but for those that only look at a folder, such as cd or test: a
+    folder another command names may have been made or removed by it."""
+    names = set()
+    for item in items:
+        words = [w for w in item[1] if w not in _TRANSFER_KEYWORDS] if item[0] == 'cmd' else []
+        if words and _transfer_program_name(words[0]) not in _TRANSFER_LOOKS:
+            names.update(segment for word in words for segment in word.split('/') if segment)
+    return names
 
 
 def _transfer_move(cwd: Optional[str], path: str, physical: bool) -> Optional[str]:
@@ -6785,11 +6846,14 @@ def _transfer_touched(frame: Dict, commands: Optional[List[List[str]]]) -> None:
     if not name:
         return
     for word in (w for words in commands or [[name]] for w in words):
-        for match in re.finditer(r'(?<![A-Za-z0-9_])' + name + r'(?![A-Za-z0-9_])', word):
-            before, after = word[:match.start()], word[match.end():]
-            if not (before.endswith('$') or (before.endswith('${') and after.startswith('}'))):
+        at = word.find(name)
+        while at >= 0:
+            before, after = word[:at], word[at + len(name):]
+            whole = not any(c.isascii() and (c.isalnum() or c == '_') for c in before[-1:] + after[:1])
+            if whole and not (before.endswith('$') or (before.endswith('${') and after.startswith('}'))):
                 frame['repeats'], frame['forever'] = True, False
                 return
+            at = word.find(name, at + 1)
 
 
 def _transfer_leaves(commands: List[List[str]], shell: Dict, called: bool, seen: set) -> bool:
@@ -6865,7 +6929,7 @@ def _transfer_builtin(program: str, args: List[str], cwd: Optional[str], shell: 
     """Apply a cd, export, unset or declaration, or a command made only of assignments (program ''), to the commands
     after it."""
     if program == 'cd':
-        shell['cwd'] = _transfer_cd(args, cwd)
+        shell['cwd'] = _transfer_cd(args, cwd, shell['names'])[0]
     elif program == 'unset':
         _transfer_unset(args, shell)
     elif program in _TRANSFER_DECLARES:
@@ -6918,6 +6982,68 @@ def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
             continue
         current, exported = _transfer_variable(shell, name)
         shell['vars'][name] = (value if eq else current, True if on else False if off else exported)
+
+
+def _transfer_stdin_script(program: str, args: List[str]) -> Optional[List[str]]:
+    """The positional parameters of a shell that reads its script from stdin, with no -c string and no script file;
+    None for any other command."""
+    if program not in _TRANSFER_SHELLS:
+        return None
+    i = 0
+    while i < len(args):
+        arg, i = args[i], i + 1
+        if arg in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
+            i += 1
+        elif arg == '-':
+            return args[i:]
+        elif arg == '--':
+            return None if i < len(args) else []
+        elif len(arg) > 1 and arg[0] in '-+' and arg[1] != '-' and ('c' in arg or 's' in arg):
+            return None if 'c' in arg else args[i:]
+        elif not (len(arg) > 1 and arg[0] in '-+'):
+            return None  # a script file
+    return []
+
+
+def _transfer_stdin_text(layers: tuple) -> Optional[str]:
+    """The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it; None otherwise."""
+    fed = None
+    for piped_in, _, redirections in reversed(layers):
+        fed = None if piped_in else fed
+        for fd, value in redirections:
+            fed = (value if isinstance(value, _TransferStdin) else None) if fd == 0 else fed
+    return fed.text if fed is not None else None
+
+
+def _transfer_stdin_args(tool: str, args: List[str], text: Optional[str]) -> List[str]:
+    """curl's or wget's arguments, with a config (curl -K -) or a URL list (wget -i -) read from stdin put in place."""
+    names = ('-K', '--config') if tool == 'curl' else ('-i', '--input-file')
+    out, i = [], 0
+    while i < len(args):
+        arg, i = args[i], i + 1
+        joined = arg in (names[0] + '-', names[1] + '=-')
+        if text is None or not (joined or (arg in names and args[i:i + 1] == ['-'])):
+            out.append(arg)
+            continue
+        i += 0 if joined else 1
+        out += _transfer_curl_config(text) if tool == 'curl' else [line.strip() for line in text.splitlines()
+                                                                    if line.strip()]
+    return out
+
+
+def _transfer_curl_config(text: str) -> List[str]:
+    """A curl config's options as arguments: one per line, with or without its dashes, its value after blanks, = or :,
+    quoted or not; # starts a comment."""
+    args = []
+    for line in (line.strip() for line in text.splitlines()):
+        match = re.match(r'(-{0,2}[A-Za-z0-9][A-Za-z0-9-]*)(?:\s*[=:]\s*|\s+|$)(.*)$', line)
+        if not match or line.startswith('#'):
+            continue
+        name, value = match.group(1), match.group(2).strip()
+        args.append(name if name.startswith('-') else '--' + name)
+        if value:
+            args.append(value[1:-1] if len(value) > 1 and value[0] == value[-1] == '"' else value)
+    return args
 
 
 def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
@@ -6988,8 +7114,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_arithmetic(words[0]) if len(words) == 1 else None
     if assigns and not substituted:
         shell['status'] = 0
-    if program == 'cd' and _transfer_cd_rejected(args):
-        shell['status'] = 1
+    if program == 'cd':
+        shell['status'] = _transfer_cd(args, cwd, shell['names'])[1]
     if program in ('set', 'shift'):
         shell['args'] = None  # the positional parameters may have changed
     if program in ('return', 'exit'):
@@ -7001,7 +7127,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_jump_from(program, args, subshell, shell)
     if program in ('cd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
-        if (before != '|' and after != '|') or subshell is None:
+        if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
             saved = _transfer_snapshot(shell)
             _transfer_builtin(program or '', words if assigns else args, cwd, shell)
             if subshell is None:
@@ -7009,12 +7135,15 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
             elif _transfer_doubt(shell['pipe']):
                 _transfer_forget(shell, _transfer_changes(shell, saved))  # it may not have run
         _transfer_replace(words, subshell, shell)
-        return []
+        return []  # a builtin run through exec does not run: bash finds no such program, and zsh exits after it
     inner = _transfer_shell_string(program, args) if program else None
+    # Its words after the string are $0 and then the positional parameters; a shell may read its script from stdin.
+    positional = args[args.index(inner) + 2:] if inner is not None and program in _TRANSFER_SHELLS else []
+    script = _transfer_stdin_script(program, args) if program and inner is None else None
+    if script is not None:
+        inner, positional = _transfer_stdin_text((layer,)), script
     if inner is not None:
         # The string's commands run as the wrapper's user and read its stdin and write its stdout.
-        # Its words after the string are $0 and then the positional parameters.
-        positional = args[args.index(inner) + 2:] if program in _TRANSFER_SHELLS else []
         calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1, positional)
         calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
     else:
@@ -7025,13 +7154,19 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
 
 
 def _transfer_replace(words: List[str], subshell: Optional[bool], shell: Dict) -> None:
-    """After a command run through exec, which replaces the shell, nothing runs: exec itself, or behind time or
-    builtin, and only maybe behind command, which bash runs as the builtin and zsh looks up as a program."""
+    """After a command run through exec, which replaces the shell, nothing runs; only maybe for one behind command."""
+    replaced = _transfer_execs(words)
+    if replaced is not False:
+        _transfer_jump_from('exit', [], subshell if replaced or subshell is True else None, shell)
+
+
+def _transfer_execs(words: List[str]) -> Optional[bool]:
+    """Whether a command runs through exec: True for exec, or exec behind time or builtin; None behind command, which
+    bash runs as the builtin and zsh looks up as a program; False otherwise."""
     rest, behind_command = [w for w in words if not _transfer_is_assignment(w)], False
     while rest and rest[0] in ('command', 'builtin', 'time', '-p', '--'):
         behind_command, rest = behind_command or rest[0] == 'command', rest[1:]
-    if len(rest) > 1 and rest[0] == 'exec':
-        _transfer_jump_from('exit', [], subshell if not behind_command or subshell is True else None, shell)
+    return (None if behind_command else True) if len(rest) > 1 and rest[0] == 'exec' else False
 
 
 def _transfer_jump_from(program: str, args: List[str], subshell: Optional[bool], shell: Dict) -> None:
@@ -7136,7 +7271,8 @@ def _transfer_shell(items: List[tuple], cwd: Optional[str], exported: Dict, dept
     variables = {name: (value, True) for name, value in exported.items()}
     shell = {'cwd': cwd, 'vars': variables, 'status': None, 'frames': [], 'function': None,
              'start': (cwd, dict(variables), {}), 'calls': [], 'functions': {}, 'calls_left': _TRANSFER_MAX_CALLS,
-             'items': items, 'at': 0, 'live': True, 'floor': None, 'args': list(positional), 'ends': {}}
+             'items': items, 'at': 0, 'live': True, 'floor': None, 'args': list(positional), 'ends': {},
+             'names': _transfer_names(items)}
     _transfer_pipeline('', True, shell)
     _transfer_items(items, shell, depth)
     return shell
@@ -7553,6 +7689,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
     elif tool == 'ssh':
         raw = _transfer_ssh_pipe(args, sends, keeps)
     elif tool in ('curl', 'wget'):
+        args = _transfer_stdin_args(tool, args, _transfer_stdin_text(layers))
         raw = _transfer_curl(args) if tool == 'curl' else _transfer_wget(args)
     elif tool in ('nc', 'socat'):
         raw = _transfer_netcat(args, sends) if tool == 'nc' else _transfer_socat(args, sends)
