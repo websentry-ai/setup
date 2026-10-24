@@ -197,3 +197,21 @@ test("HOOK-03 a confirm implementation that rejects declines instead of propagat
     await api.close();
   }
 });
+
+test("a declined confirm is reported as never run, and an accepted one is not", async () => {
+  for (const [confirmResult, expected] of [[false, 1], [true, 0]] as const) {
+    const api = await startMockApi({ mode: "ask" });
+    const declined: string[] = [];
+    try {
+      const event = createFakeToolCallEvent("bash", { command: "rm -rf /tmp/x" });
+      await decideToolCall(event, createFakeCtx({ confirmResult }), {
+        ...depsFor(api),
+        onDeclined: (toolUseId) => declined.push(toolUseId),
+      });
+      assert.equal(declined.length, expected, `confirm answered ${String(confirmResult)}`);
+      if (expected === 1) assert.equal(declined[0], event.toolCallId);
+    } finally {
+      await api.close();
+    }
+  }
+});

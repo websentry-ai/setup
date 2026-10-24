@@ -664,6 +664,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           onDecision: (entry) => {
             if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
           },
+          onDeclined: (toolUseId) => turnStore.markNotRun(toolUseId),
         });
       } catch {
         // The fail-open net of last resort: allow, rather than let pi read an exception as a block.
@@ -738,7 +739,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // here for the same reason as on `tool_call`: this very call may have latched the key.
           onDecision: (entry) => {
             if (recordingActive(state)) {
-              postStandaloneTurn(entry, ctx, sessionIdOf(ctx), {
+              // A `!cmd` runs in its event's cwd, which can differ from the session's.
+              const ranIn = typeof event.cwd === "string" && event.cwd !== "" ? { cwd: event.cwd } : ctx;
+              postStandaloneTurn(entry, ranIn, sessionIdOf(ctx), {
                 client: state.client,
                 apiKey: state.apiKey,
                 ...(state.telemetry === undefined ? {} : { telemetry: state.telemetry }),
