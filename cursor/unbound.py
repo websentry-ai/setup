@@ -4068,11 +4068,19 @@ def _transfer_arithmetic_parts(text: str) -> Optional[List[str]]:
 def _transfer_paren_end(text: str, i: int) -> int:
     """The index of the ) that closes a ( just before i, past quotes, nested parentheses and the ) after a case
     pattern; -1 when none does."""
-    depth, quote, cases, word, at_start = 1, None, [], '', True
+    depth, quote, cases, word, at_start, heredocs = 1, None, [], '', True, []
     while i < len(text):
         ch = text[i]
         if quote == "'":
             quote = None if ch == "'" else quote
+        elif not quote and ch == '#' and not word:
+            i = text.find('\n', i) - 1  # a comment runs to the end of its line
+            if i < 0:
+                return -1
+        elif not quote and text.startswith('<<', i) and not text.startswith('<<<', i):
+            delimiter, end = _transfer_read_word(text, i + (3 if text.startswith('<<-', i) else 2))
+            heredocs.append((delimiter, text.startswith('<<-', i)))
+            i = end - 1
         elif ch == '\\':
             i, word = i + 1, word + '\0'
         elif quote == '"':
@@ -4098,8 +4106,23 @@ def _transfer_paren_end(text: str, i: int) -> int:
                 at_start = True
             if cases and cases[-1] == 'body' and text.startswith((';;', ';&'), i):
                 cases[-1], i = 'pattern', i + (2 if text.startswith(';;&', i) else 1)
+            if ch == '\n':
+                i = _transfer_heredocs_end(text, i, heredocs)
         i += 1
     return -1
+
+
+def _transfer_heredocs_end(text: str, i: int, heredocs: List[tuple]) -> int:
+    """Past the bodies of the heredocs pending at the newline at i: the index of the last body's delimiter line end."""
+    while heredocs:
+        delimiter, strip_tabs = heredocs.pop(0)
+        while i + 1 < len(text):
+            end = text.find('\n', i + 1)
+            line = text[i + 1:] if end < 0 else text[i + 1:end]
+            i = len(text) - 1 if end < 0 else end
+            if (line.lstrip('\t') if strip_tabs else line) == delimiter:
+                break
+    return i
 
 
 def _transfer_case_word(word: str, at_start: bool, cases: List[str]) -> bool:
@@ -4133,7 +4156,7 @@ class _TransferLexer:
         self.text, self.depth, self.i, self.quote = text, depth, 0, None
         self.items, self.argv, self.word, self.in_word = [], [], '', False
         self.before, self.io, self.heredocs, self.case = '', [], [], []
-        self.param, self.dollar, self.failed = 0, -1, False
+        self.param, self.dollar, self.failed, self.ends = 0, -1, False, {}
 
     def read(self) -> Optional[List[tuple]]:
         """The items, or None when the command can't be read the way the shell reads it."""
@@ -4439,6 +4462,7 @@ class _TransferLexer:
         self._end_word()
         if self.argv:
             self.items.append(('cmd', self.argv, self.before, after, self.io))
+            self.ends[id(self.items[-1])] = self.i
             self.before = after
         else:
             if self.items and self.items[-1][0] in (')', 'esac') and (after or self.io):
@@ -4789,7 +4813,7 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) ->
                    'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False),
                    'piped_out': _transfer_ends_piped(head, shell),
                    'outer': (shell['pipe'], shell['start']), 'defines': name, 'head': (shell['at'], head),
-                   'iterates': None, 'repeats': False, 'forever': False, 'counter': None,
+                   'iterates': None, 'repeats': False, 'forever': False, 'counter': None, 'continued': False,
                    'left': None, 'doubt': _transfer_doubt(shell['pipe']),
                    'jumped': None,
                    'unsure': set(), 'outside': _transfer_liveness(shell)})
@@ -4977,6 +5001,8 @@ def _transfer_jump(program: str, args: List[str], shell: Dict) -> None:
         frames[target]['left'] = (status if sure and not frames[target]['left'] else None,)
         if not sure and frames[target]['jumped'] is None:
             frames[target]['jumped'] = _transfer_snapshot(shell)
+        if program == 'continue':
+            frames[target]['continued'] = frames[target]['continued'] or (True if sure else None)
 
 
 def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
@@ -5083,17 +5109,21 @@ def _transfer_step(step: str, name: str) -> Optional[int]:
 
 
 def _transfer_step_substitutions(frame: Dict, shell: Dict) -> None:
-    """Run the substitutions in an arithmetic for's step where a pass of its body ends, so they run only as far as a
-    pass completes: never after a sure break."""
+    """Run the substitutions in an arithmetic for's step where a pass of its body ends or a continue skips to: never
+    after a sure break."""
     header = frame['head'][1][1][1:2] if frame['kind'] == 'for' else []
     parts = _transfer_arithmetic_parts(header[0][2:-2]) if header and header[0].startswith('((') else None
     items = []
     for body in _transfer_text_bodies(parts[2]) or [] if parts else []:
         items += [('$(', None, '', '', None)] + (_TransferLexer(body).read() or []) + [(')', None, '', '', None)]
     if items:
-        shell['frames'].append(frame)  # inside the loop, as far as its body ran
+        ended = frame['alive'], frame['continued']
+        reached = True if True in ended else False if ended == (False, False) else None
+        runs, frame['runs'] = frame['runs'], _transfer_both(_transfer_both(frame['base'], frame['rel']), reached)
+        shell['frames'].append(frame)  # inside the loop, as far as a pass of its body reached its end
         _transfer_items(items, shell, 0)
         shell['frames'].pop()
+        frame['runs'] = runs
 
 
 def _transfer_loop_commands(frame: Dict, shell: Dict, end: Optional[int]) -> Optional[List[List[str]]]:
@@ -5281,6 +5311,22 @@ def _transfer_stdin_script(program: str, args: List[str]) -> Optional[List[str]]
     return []
 
 
+def _transfer_script_stdin(lexer, items: List[tuple]) -> List[tuple]:
+    """A script read from stdin: each command's stdin is the script's lines after the one it ends on, which a command
+    that reads stdin, such as curl -K - or nc, takes for its input."""
+    out = []
+    for item in items:
+        end = lexer.ends.get(id(item))
+        line_end = lexer.text.find('\n', end) if end is not None else -1
+        rest = lexer.text[line_end + 1:] if line_end >= 0 else ''
+        if rest.strip():
+            fed = _TransferStdin('file')
+            fed.text = rest
+            item = item[:4] + (((0, fed),) + tuple(item[4]),)
+        out.append(item)
+    return out
+
+
 def _transfer_stdin_text(layers: tuple) -> Optional[str]:
     """The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it; None otherwise."""
     fed = None
@@ -5422,7 +5468,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         layer = layer[:2] + (tuple((fd, 'null' if fd == 0 else value) for fd, value in layer[2]),)
     if inner is not None:
         # The string's commands run as the wrapper's user and read its stdin and write its stdout.
-        calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1, positional)
+        lexer = _TransferLexer(inner, depth + 1)
+        items = _transfer_script_stdin(lexer, lexer.read() or []) if script is not None else lexer.read() or []
+        calls = _transfer_walk(items, cwd, env, depth + 1, positional)
         calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
     else:
         calls = [(program, args, env, cwd, other_user, (layer,))] if program else []

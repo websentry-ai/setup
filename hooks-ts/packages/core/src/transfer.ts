@@ -313,12 +313,21 @@ function parenEnd(text: string, start: number): number {
   let depth = 1;
   let quote: string | undefined;
   const cases: string[] = [];
+  const heredocs: [string, boolean][] = [];
   let word = "";
   let atStart = true;
   for (let i = start; i < text.length; i++) {
     const ch = text[i] as string;
     if (quote === "'") {
       if (ch === "'") quote = undefined;
+    } else if (quote === undefined && ch === "#" && word === "") {
+      i = text.indexOf("\n", i) - 1; // a comment runs to the end of its line
+      if (i < 0) return -1;
+    } else if (quote === undefined && text.startsWith("<<", i) && !text.startsWith("<<<", i)) {
+      const strip = text.startsWith("<<-", i);
+      const [delimiter, end] = readWord(text, i + (strip ? 3 : 2));
+      heredocs.push([delimiter, strip]);
+      i = end - 1;
     } else if (ch === "\\") {
       i++;
       word += "\0";
@@ -347,9 +356,25 @@ function parenEnd(text: string, start: number): number {
         cases[cases.length - 1] = "pattern";
         i += text.startsWith(";;&", i) ? 2 : 1;
       }
+      if (ch === "\n") i = heredocsEnd(text, i, heredocs);
     }
   }
   return -1;
+}
+
+/** Past the bodies of the heredocs pending at the newline at `i`: the index of the last body's delimiter line end. */
+function heredocsEnd(text: string, start: number, heredocs: [string, boolean][]): number {
+  let i = start;
+  while (heredocs.length > 0) {
+    const [delimiter, stripTabs] = heredocs.shift() as [string, boolean];
+    while (i + 1 < text.length) {
+      const end = text.indexOf("\n", i + 1);
+      const line = end < 0 ? text.slice(i + 1) : text.slice(i + 1, end);
+      i = end < 0 ? text.length - 1 : end;
+      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+    }
+  }
+  return i;
 }
 
 /** Follow a word through the case commands open in a $( ): case opens one, in starts its patterns, esac ends it;
@@ -414,6 +439,8 @@ class Lexer {
    *  and where its text goes. */
   private readonly heredocs: [string, boolean, [number, string] | undefined, { text?: string }][] = [];
   private failed = false;
+  /** Where in the text each simple command ends. */
+  readonly ends = new Map<Item, number>();
   private readonly cases: string[] = [];
   private readonly text: string;
   private readonly depth: number;
@@ -769,7 +796,9 @@ class Lexer {
   private endCommand(after: string): void {
     this.endWord();
     if (this.argv.length > 0) {
-      this.items.push({ kind: "cmd", argv: this.argv, before: this.before, after, io: this.io });
+      const item: Item = { kind: "cmd", argv: this.argv, before: this.before, after, io: this.io };
+      this.items.push(item);
+      this.ends.set(item, this.i);
       this.before = after;
     } else {
       const last = this.items.at(-1);
@@ -1097,6 +1126,8 @@ interface Frame {
   repeats: boolean;
   /** A loop whose test never fails, and an arithmetic for's counter. */
   forever: boolean;
+  /** A continue reached the loop's next pass: surely, maybe (undefined) or not. */
+  continued: Maybe;
   counter?: string;
   /** The status a return, exit, break or continue left the compound with; undefined inside when not known. */
   left?: [number | undefined];
@@ -1279,7 +1310,7 @@ function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): voi
     kind, base: value, runs: value, rel: true, alive: true, decided: false, state: snapshot(shell),
     status: shell.status, calls: shell.calls.length, pipedIn: shell.openingPipe, pipedOut: endsPiped(head, shell),
     outer: [shell.pipe, shell.start],
-    defines: name, head: [shell.at, head], iterates: undefined, repeats: false, forever: false, doubt: doubt(shell.pipe), unsure: new Set(),
+    defines: name, head: [shell.at, head], iterates: undefined, repeats: false, forever: false, continued: false, doubt: doubt(shell.pipe), unsure: new Set(),
     outside: liveness(shell),
   });
   shell.openingPipe = false;
@@ -1453,6 +1484,7 @@ function jump(name: string, args: string[], shell: Shell): void {
   const status = name === "break" || name === "continue" ? Number(shell.pipe.negate) : shell.status;
   frame.left = [sure && frame.left === undefined ? status : undefined];
   if (!sure && frame.jumped === undefined) frame.jumped = snapshot(shell);
+  if (name === "continue") frame.continued = frame.continued === true || sure ? true : undefined;
 }
 
 /** Apply a command's leading reserved word to the open compound commands and its pipeline; the words after it. */
@@ -1551,8 +1583,8 @@ function stepOf(step: string, name: string): bigint | undefined {
   return undefined;
 }
 
-/** Run the substitutions in an arithmetic for's step where a pass of its body ends, so they run only as far as a pass
- *  completes: never after a sure break. */
+/** Run the substitutions in an arithmetic for's step where a pass of its body ends or a continue skips to: never after
+ *  a sure break. */
 function stepSubstitutions(frame: Frame, shell: Shell): void {
   const header = frame.kind === "for" ? frame.head[1].argv[1] : undefined;
   const parts = header?.startsWith("((") ? arithmeticParts(header.slice(2, -2)) : undefined;
@@ -1562,9 +1594,14 @@ function stepSubstitutions(frame: Frame, shell: Shell): void {
       { kind: ")", argv: [], before: "", after: "", io: [] });
   }
   if (items.length === 0) return;
-  shell.frames.push(frame); // inside the loop, as far as its body ran
+  const ended: Maybe[] = [frame.alive, frame.continued];
+  const reached: Maybe = ended.includes(true) ? true : ended.every((e) => e === false) ? false : undefined;
+  const runsBefore = frame.runs;
+  frame.runs = both(both(frame.base, frame.rel), reached);
+  shell.frames.push(frame); // inside the loop, as far as a pass of its body reached its end
   walkItems(items, shell, 0);
   shell.frames.pop();
+  frame.runs = runsBefore;
 }
 
 /** The words of each command a loop runs in this shell, from its condition up to the item `end`, leaving out those in
@@ -1760,6 +1797,17 @@ function stdinScript(name: string, args: string[]): string[] | undefined {
   return [];
 }
 
+/** A script read from stdin: each command's stdin is the script's lines after the one it ends on, which a command
+ *  that reads stdin, such as curl -K - or nc, takes for its input. */
+function scriptStdin(text: string, lexer: Lexer, list: Item[]): Item[] {
+  return list.map((item) => {
+    const end = lexer.ends.get(item);
+    const lineEnd = end === undefined ? -1 : text.indexOf("\n", end);
+    const rest = lineEnd >= 0 ? text.slice(lineEnd + 1) : "";
+    return rest.trim() === "" ? item : { ...item, io: [[0, "file", { text: rest }] as Redirection, ...item.io] };
+  });
+}
+
 /** The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it; undefined otherwise. */
 function stdinText(layers: readonly Layer[]): string | undefined {
   let fed: { text?: string } | undefined;
@@ -1923,7 +1971,9 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   }
   if (inner !== undefined) {
     // The string's commands run as the wrapper's user and read its stdin and write its stdout.
-    const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
+    const lexer = new Lexer(inner, depth + 1);
+    const read = lexer.read() ?? [];
+    const calls = walk(script === undefined ? read : scriptStdin(inner, lexer, read), parsed.cwd, env, shell.processEnv, depth + 1, positional);
     return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
