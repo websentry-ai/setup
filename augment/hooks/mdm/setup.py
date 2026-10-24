@@ -1303,19 +1303,55 @@ def clear_setup() -> bool:
     return not teardown_failed
 
 
+def _unbound_hooks_registered(config_path, script_path) -> Optional[bool]:
+    """True when settings.json registers OUR hook on any event. Any event, not the
+    enforcing one alone: the install writes them together, and under-matching reports
+    'fresh', which the backend counts as a removal, so demanding one named event would
+    accuse every device whose augment ships a different event set. False when it does
+    not, None when it could not be read. Unparseable raises, because augment refuses
+    such a file too. Same rule the uninstall strips by."""
+    if not config_path.exists():
+        return False
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except OSError as e:
+        debug_print(f"Could not read {config_path}: {e}")
+        return None
+    is_windows = platform.system().lower() == "windows"
+    hook_command = f'"{script_path}"'
+    events = settings.get("hooks") if isinstance(settings, dict) else None
+    for entries in events.values() if isinstance(events, dict) else ():
+        for item in entries if isinstance(entries, list) else []:
+            hooks = item.get("hooks") if isinstance(item, dict) else None
+            for hook in hooks if isinstance(hooks, list) else []:
+                if isinstance(hook, dict) and _hook_command_matches(
+                        hook.get("command", ""), hook_command, script_path, is_windows):
+                    return True
+    return False
+
+
 def detect_install_state() -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error."""
+    'fresh' (neither our hook entries nor the script), 'persisted' (both),
+    'tampered' (one without the other), None when settings.json was unreadable."""
     try:
         managed_dir = get_managed_settings_dir()
-        config_path = managed_dir / "settings.json"
         script_path = managed_dir / "hooks" / "unbound.py"
-        if not config_path.exists():
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        # settings.json is shared with the org's own Augment config, so the file
+        # existing is not our install; only our own hook entries are.
+        try:
+            registered = _unbound_hooks_registered(
+                managed_dir / "settings.json", script_path)
+        except ValueError:
+            # Augment refuses a settings.json it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return 'tampered'
+        if registered is None:
+            return None
+        if registered == script_path.exists():
+            return 'persisted' if registered else 'fresh'
+        return 'tampered'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None
