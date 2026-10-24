@@ -2033,10 +2033,11 @@ function wordEnd(text, start) {
     } else if (ch === "\\") {
       i++;
     } else if (text.startsWith("$(", i) || ch === "`") {
+      const arithmetic2 = text.startsWith("$((", i) && arithmeticEnd(text, i + 2) > 0;
       i = ch === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
-      const inner = i > 0 && text.startsWith("$((", at) ? textBodies(text.slice(at + 3, i - 1)) : [];
+      const inner = arithmetic2 ? textBodies(text.slice(at + 3, i - 1)) : [];
       if (i < 0 || inner === void 0) return [-1, bodies];
-      bodies.push(...text.startsWith("$((", at) ? inner : [ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)]);
+      bodies.push(...arithmetic2 ? inner : [ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)]);
     } else if (quote === '"') {
       if (ch === '"') quote = void 0;
     } else if (ch === "'" || ch === '"') {
@@ -2054,10 +2055,11 @@ function textBodies(body) {
     if (body[i] === "\\") {
       i++;
     } else if (body.startsWith("$(", i) || body[i] === "`") {
+      const arithmetic2 = body.startsWith("$((", i) && arithmeticEnd(body, i + 2) > 0;
       i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
-      const inner = i > 0 && body.startsWith("$((", at) ? textBodies(body.slice(at + 3, i - 1)) : [];
+      const inner = arithmetic2 ? textBodies(body.slice(at + 3, i - 1)) : [];
       if (i < 0 || inner === void 0) return void 0;
-      bodies.push(...body.startsWith("$((", at) ? inner : [body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i)]);
+      bodies.push(...arithmetic2 ? inner : [body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i)]);
     }
   }
   return bodies;
@@ -2102,8 +2104,49 @@ function readWord(text, start) {
   }
   return [word, i];
 }
+var arithmeticEnds = /* @__PURE__ */ new Map();
+function arithmeticEnd(text, start) {
+  let ends = arithmeticEnds.get(text);
+  if (ends === void 0) {
+    arithmeticEnds.clear();
+    ends = /* @__PURE__ */ new Map();
+    arithmeticEnds.set(text, ends);
+  }
+  let end2 = ends.get(start);
+  if (end2 === void 0) {
+    end2 = scanArithmetic(text, start);
+    ends.set(start, end2);
+  }
+  return end2;
+}
+function scanArithmetic(text, start) {
+  let depth = 0;
+  let quote;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (quote === "'") {
+      if (ch === "'") quote = void 0;
+    } else if (ch === "\\") {
+      i++;
+    } else if (ch === "`" && backtickEnd(text, i + 1) > 0) {
+      i = backtickEnd(text, i + 1);
+    } else if (text.startsWith("$(", i)) {
+      i = parenEnd(text, i + 2);
+      if (i < 0) return -1;
+    } else if (quote === '"') {
+      if (ch === '"') quote = void 0;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "(" || ch === ")") {
+      depth += ch === "(" ? 1 : -1;
+      if (depth === 0) return text[i + 1] === ")" ? i + 1 : -1;
+    }
+  }
+  return -1;
+}
 function parenEnd(text, start) {
-  const arithmetic2 = text.slice(start - 1, start + 1) === "((";
+  const arithmetic2 = text.slice(start - 1, start + 1) === "((" ? arithmeticEnd(text, start) : -1;
+  if (arithmetic2 > 0) return arithmetic2;
   let depth = 1;
   let quote;
   const cases = [];
@@ -2130,12 +2173,11 @@ function parenEnd(text, start) {
     } else if (ch === "'" || ch === '"') {
       quote = ch;
       word += "\0";
-    } else if (arithmetic2) {
-      depth += ch === "(" ? 1 : ch === ")" ? -1 : 0;
-      if (depth === 0) return i;
-    } else if (text.startsWith("$((", i) || text.startsWith("((", i) && (atStart || last === "for") && (word === "" || word === "for" || LEADING_WORDS.has(word))) {
-      i = parenEnd(text, i + (ch === "$" ? 2 : 1));
-      if (i < 0) return -1;
+    } else if (text.startsWith("((", i) && (atStart || last === "for") && (word === "" || word === "for" || LEADING_WORDS.has(word)) && arithmeticEnd(text, i + 1) > 0) {
+      i = arithmeticEnd(text, i + 1);
+      word += "\0";
+    } else if (text.startsWith("$((", i) && arithmeticEnd(text, i + 2) > 0) {
+      i = arithmeticEnd(text, i + 2);
       word += "\0";
     } else if (ch === "#" && word === "") {
       i = text.indexOf("\n", i) - 1;
@@ -2310,9 +2352,9 @@ var Lexer = class _Lexer {
     const { text, i } = this;
     let end2;
     let inner;
-    if (text.startsWith("$((", i)) {
-      end2 = parenEnd(text, i + 2);
-      const bodies = end2 > 0 ? textBodies(text.slice(i + 3, end2 - 1)) : void 0;
+    if (text.startsWith("$((", i) && arithmeticEnd(text, i + 2) > 0) {
+      end2 = arithmeticEnd(text, i + 2);
+      const bodies = textBodies(text.slice(i + 3, end2 - 1));
       if (bodies === void 0) return false;
       this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : void 0);
     } else if (text.startsWith("$(", i) || this.quote === void 0 && (text.startsWith("<(", i) || text.startsWith(">(", i))) {
@@ -2345,7 +2387,7 @@ var Lexer = class _Lexer {
       this.endWord();
     }
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
-    const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
+    const close = this.text.startsWith("((", this.i) ? arithmeticEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
       const inner = this.text.slice(this.i + 2, close - 1);
       const parts = this.argv.at(-1) === "for" ? arithmeticParts(inner) : void 0;
@@ -3350,6 +3392,24 @@ function shellString(name, args) {
   }
   return void 0;
 }
+function lend(shell, assignments) {
+  const lent = /* @__PURE__ */ new Map();
+  for (const word of assignments) {
+    const at = word.indexOf("=");
+    const name = word.slice(0, at);
+    const entry = [word.slice(at + 1), true];
+    lent.set(name, [lent.has(name) ? lent.get(name)[0] : shell.vars[name], entry]);
+    shell.vars[name] = entry;
+  }
+  return lent;
+}
+function takeBack(shell, lent) {
+  for (const [name, [before, entry]] of lent) {
+    if (shell.vars[name] !== entry) shell.vars[name] = [SUBSTITUTED, void 0];
+    else if (before === void 0) delete shell.vars[name];
+    else shell.vars[name] = before;
+  }
+}
 function callFunction(known, layer, subshell, shell, depth) {
   const [body, maybe] = known;
   if (depth >= MAX_DEPTH || shell.callsLeft <= 0) {
@@ -3396,7 +3456,9 @@ function simple(words2, item, before, shell, depth) {
   if (known !== void 0) {
     const outer = shell.args;
     shell.args = argv.slice(argv.indexOf(called) + 1);
+    const lent = lend(shell, argv.slice(0, argv.indexOf(called)));
     callFunction(known, layer, subshell, shell, depth);
+    takeBack(shell, lent);
     shell.args = outer;
     if (!known[1]) return [];
   }

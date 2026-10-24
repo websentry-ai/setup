@@ -230,10 +230,11 @@ function wordEnd(text: string, start: number): [number, string[]] {
     } else if (ch === "\\") {
       i++;
     } else if (text.startsWith("$(", i) || ch === "`") {
+      const arithmetic = text.startsWith("$((", i) && arithmeticEnd(text, i + 2) > 0;
       i = ch === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
-      const inner = i > 0 && text.startsWith("$((", at) ? textBodies(text.slice(at + 3, i - 1)) : [];
+      const inner = arithmetic ? textBodies(text.slice(at + 3, i - 1)) : [];
       if (i < 0 || inner === undefined) return [-1, bodies];
-      bodies.push(...(text.startsWith("$((", at) ? inner : [ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)]));
+      bodies.push(...(arithmetic ? inner : [ch === "$" ? text.slice(at + 2, i) : text.slice(at + 1, i)]));
     } else if (quote === '"') {
       if (ch === '"') quote = undefined;
     } else if (ch === "'" || ch === '"') {
@@ -254,10 +255,11 @@ function textBodies(body: string): string[] | undefined {
     if (body[i] === "\\") {
       i++;
     } else if (body.startsWith("$(", i) || body[i] === "`") {
+      const arithmetic = body.startsWith("$((", i) && arithmeticEnd(body, i + 2) > 0;
       i = body[i] === "$" ? parenEnd(body, i + 2) : backtickEnd(body, i + 1);
-      const inner = i > 0 && body.startsWith("$((", at) ? textBodies(body.slice(at + 3, i - 1)) : [];
+      const inner = arithmetic ? textBodies(body.slice(at + 3, i - 1)) : [];
       if (i < 0 || inner === undefined) return undefined;
-      bodies.push(...(body.startsWith("$((", at) ? inner : [body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i)]));
+      bodies.push(...(arithmetic ? inner : [body[at] === "$" ? body.slice(at + 2, i) : body.slice(at + 1, i)]));
     }
   }
   return bodies;
@@ -308,10 +310,56 @@ function readWord(text: string, start: number): [string, number] {
   return [word, i];
 }
 
-/** The index of the ) that closes a ( just before `start`, past quotes, backticks, nested parentheses, and in a command
- *  the ) after a case pattern, comments and heredoc bodies; an arithmetic (( )) has none of those. -1 if none does. */
+const arithmeticEnds = new Map<string, Map<number, number>>();
+
+/** For a (( whose second ( is at `start`, the index of the last ) of the )) that closes it, past quotes, backticks and
+ *  $( ). -1 when the ) matching that ( is not followed by another: bash and zsh then read ( ( … ) … ) as commands. */
+function arithmeticEnd(text: string, start: number): number {
+  let ends = arithmeticEnds.get(text);
+  if (ends === undefined) {
+    arithmeticEnds.clear(); // kept for the last text only: the scans nest, and each would otherwise be repeated
+    ends = new Map<number, number>();
+    arithmeticEnds.set(text, ends);
+  }
+  let end = ends.get(start);
+  if (end === undefined) {
+    end = scanArithmetic(text, start);
+    ends.set(start, end);
+  }
+  return end;
+}
+
+function scanArithmetic(text: string, start: number): number {
+  let depth = 0;
+  let quote: string | undefined;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i] as string;
+    if (quote === "'") {
+      if (ch === "'") quote = undefined;
+    } else if (ch === "\\") {
+      i++;
+    } else if (ch === "`" && backtickEnd(text, i + 1) > 0) {
+      i = backtickEnd(text, i + 1);
+    } else if (text.startsWith("$(", i)) {
+      i = parenEnd(text, i + 2);
+      if (i < 0) return -1;
+    } else if (quote === '"') {
+      if (ch === '"') quote = undefined;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (ch === "(" || ch === ")") {
+      depth += ch === "(" ? 1 : -1;
+      if (depth === 0) return text[i + 1] === ")" ? i + 1 : -1;
+    }
+  }
+  return -1;
+}
+
+/** The index of the ) that closes a ( just before `start`, past quotes, backticks, nested parentheses, the ) after a
+ *  case pattern, comments and heredoc bodies; for a ((, the end of its arithmetic when it is one. -1 if none closes it. */
 function parenEnd(text: string, start: number): number {
-  const arithmetic = text.slice(start - 1, start + 1) === "((";
+  const arithmetic = text.slice(start - 1, start + 1) === "((" ? arithmeticEnd(text, start) : -1;
+  if (arithmetic > 0) return arithmetic;
   let depth = 1;
   let quote: string | undefined;
   const cases: string[] = [];
@@ -338,16 +386,15 @@ function parenEnd(text: string, start: number): number {
     } else if (ch === "'" || ch === '"') {
       quote = ch;
       word += "\0";
-    } else if (arithmetic) {
-      depth += ch === "(" ? 1 : ch === ")" ? -1 : 0;
-      if (depth === 0) return i;
     } else if (
-      text.startsWith("$((", i) ||
-      (text.startsWith("((", i) && (atStart || last === "for") && (word === "" || word === "for" || LEADING_WORDS.has(word)))
+      text.startsWith("((", i) && (atStart || last === "for") &&
+      (word === "" || word === "for" || LEADING_WORDS.has(word)) && arithmeticEnd(text, i + 1) > 0
     ) {
-      // An arithmetic expansion or command inside: a # or << there is arithmetic, not a comment or heredoc.
-      i = parenEnd(text, i + (ch === "$" ? 2 : 1));
-      if (i < 0) return -1;
+      // An arithmetic command inside: a # or << there is arithmetic, not a comment or heredoc.
+      i = arithmeticEnd(text, i + 1);
+      word += "\0";
+    } else if (text.startsWith("$((", i) && arithmeticEnd(text, i + 2) > 0) {
+      i = arithmeticEnd(text, i + 2); // likewise an arithmetic expansion
       word += "\0";
     } else if (ch === "#" && word === "") {
       i = text.indexOf("\n", i) - 1; // a comment runs to the end of its line
@@ -556,9 +603,9 @@ class Lexer {
     const { text, i } = this;
     let end: number;
     let inner: string | undefined;
-    if (text.startsWith("$((", i)) {
-      end = parenEnd(text, i + 2);
-      const bodies = end > 0 ? textBodies(text.slice(i + 3, end - 1)) : undefined; // what its $( ) run
+    if (text.startsWith("$((", i) && arithmeticEnd(text, i + 2) > 0) {
+      end = arithmeticEnd(text, i + 2);
+      const bodies = textBodies(text.slice(i + 3, end - 1)); // what its $( ) run
       if (bodies === undefined) return false;
       this.substitute(bodies, bodies.length > 0 ? this.substitutionsAt() : undefined);
     } else if (text.startsWith("$(", i) || (this.quote === undefined && (text.startsWith("<(", i) || text.startsWith(">(", i)))) {
@@ -592,7 +639,7 @@ class Lexer {
       this.endWord(); // a reserved word ends at a (, as in for((…)) or while((…))
     }
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
-    const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
+    const close = this.text.startsWith("((", this.i) ? arithmeticEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
       // An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions; a header's
       // step runs after each pass of the body, so the walker runs that part there.
@@ -1895,6 +1942,30 @@ function shellString(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
+/** Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; for each name, its entry
+ *  before the call and the entry lent. */
+function lend(shell: Shell, assignments: string[]): Map<string, [Variable | undefined, Variable]> {
+  const lent = new Map<string, [Variable | undefined, Variable]>();
+  for (const word of assignments) {
+    const at = word.indexOf("=");
+    const name = word.slice(0, at);
+    const entry: Variable = [word.slice(at + 1), true];
+    lent.set(name, [lent.has(name) ? (lent.get(name) as [Variable | undefined, Variable])[0] : shell.vars[name], entry]);
+    shell.vars[name] = entry;
+  }
+  return lent;
+}
+
+/** Put each lent name back as it was before the call. One the body set again is unknown: bash keeps a value the body
+ *  exported and zsh does not. Any write makes a new entry, so an entry that is not the lent one was written. */
+function takeBack(shell: Shell, lent: Map<string, [Variable | undefined, Variable]>): void {
+  for (const [name, [before, entry]] of lent) {
+    if (shell.vars[name] !== entry) shell.vars[name] = [SUBSTITUTED, undefined];
+    else if (before === undefined) delete shell.vars[name];
+    else shell.vars[name] = before;
+  }
+}
+
 /** Run a function's body (`known`: body, whether it may not exist) where called, in a subshell when piped or
  *  backgrounded; one that may not run, or a pipeline's last command (`subshell` undefined), leaves its changes unknown. */
 function callFunction(known: [Item[], boolean], layer: Layer, subshell: Maybe, shell: Shell, depth: number): void {
@@ -1951,7 +2022,9 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   if (known !== undefined) {
     const outer = shell.args;
     shell.args = argv.slice(argv.indexOf(called as string) + 1);
+    const lent = lend(shell, argv.slice(0, argv.indexOf(called as string)));
     callFunction(known, layer, subshell, shell, depth);
+    takeBack(shell, lent);
     shell.args = outer;
     if (!known[1]) return [];
     // A function that may not have been defined may leave the name to the program.

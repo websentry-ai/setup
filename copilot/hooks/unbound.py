@@ -5778,12 +5778,12 @@ def _transfer_word_end(text: str, i: int) -> tuple:
         elif ch == '\\':
             i += 1
         elif text.startswith('$(', i) or ch == '`':
+            arithmetic = text.startswith('$((', i) and _transfer_arithmetic_end(text, i + 2) > 0
             i = _transfer_paren_end(text, i + 2) if ch == '$' else _transfer_backtick_end(text, i + 1)
-            inner = _transfer_text_bodies(text[start + 3:i - 1]) if i > 0 and text.startswith('$((', start) else []
+            inner = _transfer_text_bodies(text[start + 3:i - 1]) if arithmetic else []
             if i < 0 or inner is None:
                 return -1, bodies
-            bodies += inner if text.startswith('$((', start) else \
-                [text[start + 2:i] if ch == '$' else text[start + 1:i]]
+            bodies += inner if arithmetic else [text[start + 2:i] if ch == '$' else text[start + 1:i]]
         elif quote == '"':
             quote = None if ch == '"' else quote
         elif ch in '\'"':
@@ -5803,12 +5803,12 @@ def _transfer_text_bodies(body: str) -> Optional[List[str]]:
         if body[i] == '\\':
             i += 1
         elif body.startswith('$(', i) or body[i] == '`':
+            arithmetic = body.startswith('$((', i) and _transfer_arithmetic_end(body, i + 2) > 0
             i = _transfer_paren_end(body, i + 2) if body[i] == '$' else _transfer_backtick_end(body, i + 1)
-            inner = _transfer_text_bodies(body[start + 3:i - 1]) if i > 0 and body.startswith('$((', start) else []
+            inner = _transfer_text_bodies(body[start + 3:i - 1]) if arithmetic else []
             if i < 0 or inner is None:
                 return None
-            bodies += inner if body.startswith('$((', start) else \
-                [body[start + 2:i] if body[start] == '$' else body[start + 1:i]]
+            bodies += inner if arithmetic else [body[start + 2:i] if body[start] == '$' else body[start + 1:i]]
         i += 1
     return bodies
 
@@ -5854,10 +5854,53 @@ def _transfer_arithmetic_parts(text: str) -> Optional[List[str]]:
     return parts + [text[start:]] if len(parts) == 2 else None
 
 
+_TRANSFER_ARITHMETIC_ENDS: Dict[str, Dict[int, int]] = {}
+
+
+def _transfer_arithmetic_end(text: str, i: int) -> int:
+    """For a (( whose second ( is at i, the index of the last ) of the )) that closes it, past quotes, backticks and
+    $( ). -1 when the ) matching that ( is not followed by another: bash and zsh then read ( ( … ) … ) as commands."""
+    ends = _TRANSFER_ARITHMETIC_ENDS.get(text)
+    if ends is None:  # kept for the last text only: the scans nest, and each would otherwise be repeated
+        _TRANSFER_ARITHMETIC_ENDS.clear()
+        ends = _TRANSFER_ARITHMETIC_ENDS[text] = {}
+    if i not in ends:
+        ends[i] = _transfer_arithmetic_scan(text, i)
+    return ends[i]
+
+
+def _transfer_arithmetic_scan(text: str, i: int) -> int:
+    depth, quote = 0, None
+    while i < len(text):
+        ch = text[i]
+        if quote == "'":
+            quote = None if ch == "'" else quote
+        elif ch == '\\':
+            i += 1
+        elif ch == '`' and _transfer_backtick_end(text, i + 1) > 0:
+            i = _transfer_backtick_end(text, i + 1)
+        elif text.startswith('$(', i):
+            i = _transfer_paren_end(text, i + 2)
+            if i < 0:
+                return -1
+        elif quote == '"':
+            quote = None if ch == '"' else quote
+        elif ch in '\'"':
+            quote = ch
+        elif ch in '()':
+            depth += 1 if ch == '(' else -1
+            if depth == 0:
+                return i + 1 if text[i + 1:i + 2] == ')' else -1
+        i += 1
+    return -1
+
+
 def _transfer_paren_end(text: str, i: int) -> int:
-    """The index of the ) that closes a ( just before i, past quotes, backticks, nested parentheses, and in a command
-    the ) after a case pattern, comments and heredoc bodies; an arithmetic (( )) has none of those. -1 if none does."""
-    arithmetic = text[i - 1:i + 1] == '(('
+    """The index of the ) that closes a ( just before i, past quotes, backticks, nested parentheses, the ) after a case
+    pattern, comments and heredoc bodies; for a ((, the end of its arithmetic when it is one. -1 if none closes it."""
+    arithmetic = _transfer_arithmetic_end(text, i) if text[i - 1:i + 1] == '((' else -1
+    if arithmetic > 0:
+        return arithmetic
     depth, quote, cases, word, last, at_start, heredocs = 1, None, [], '', '', True, []
     while i < len(text):
         ch = text[i]
@@ -5876,17 +5919,12 @@ def _transfer_paren_end(text: str, i: int) -> int:
                     return -1
         elif ch in '\'"':
             quote, word = ch, word + '\0'
-        elif arithmetic:
-            depth += 1 if ch == '(' else -1 if ch == ')' else 0
-            if depth == 0:
-                return i
-        elif text.startswith('$((', i) or (text.startswith('((', i) and (at_start or last == 'for') and
-                                            (word in ('', 'for') or word in _TRANSFER_LEADING_WORDS)):
-            # An arithmetic expansion or command inside: a # or << there is arithmetic, not a comment or heredoc.
-            i = _transfer_paren_end(text, i + (2 if ch == '$' else 1))
-            if i < 0:
-                return -1
-            word += '\0'
+        elif text.startswith('((', i) and (at_start or last == 'for') and \
+                (word in ('', 'for') or word in _TRANSFER_LEADING_WORDS) and _transfer_arithmetic_end(text, i + 1) > 0:
+            # An arithmetic command inside: a # or << there is arithmetic, not a comment or heredoc.
+            i, word = _transfer_arithmetic_end(text, i + 1), word + '\0'
+        elif text.startswith('$((', i) and _transfer_arithmetic_end(text, i + 2) > 0:
+            i, word = _transfer_arithmetic_end(text, i + 2), word + '\0'  # likewise an arithmetic expansion
         elif ch == '#' and not word:
             i = text.find('\n', i) - 1  # a comment runs to the end of its line
             if i < 0:
@@ -6040,9 +6078,9 @@ class _TransferLexer:
     def _substitution(self) -> Optional[bool]:
         """Read a $( ), $(( )), backtick or <( ) substitution starting here; None when none starts here."""
         text, i, inner = self.text, self.i, None
-        if text.startswith('$((', i):
-            end = _transfer_paren_end(text, i + 2)
-            bodies = _transfer_text_bodies(text[i + 3:end - 1]) if end > 0 else None  # what its $( ) run
+        if text.startswith('$((', i) and _transfer_arithmetic_end(text, i + 2) > 0:
+            end = _transfer_arithmetic_end(text, i + 2)
+            bodies = _transfer_text_bodies(text[i + 3:end - 1])  # what its $( ) run
             if bodies is None:
                 return False
             self._substitute(bodies, self._substitutions_at() if bodies else None)
@@ -6074,7 +6112,7 @@ class _TransferLexer:
                 (self.word == 'for' or self.word in _TRANSFER_LEADING_WORDS):
             self._end_word()  # a reserved word ends at a (, as in for((…)) or while((…))
         head = self.argv[:-1] if self.argv[-1:] == ['for'] else self.argv
-        end = _transfer_paren_end(self.text, self.i + 1) if self.text.startswith('((', self.i) else -1
+        end = _transfer_arithmetic_end(self.text, self.i + 1) if self.text.startswith('((', self.i) else -1
         if end > 0 and not self.in_word and all(w in _TRANSFER_LEADING_WORDS for w in head):
             # An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions; a
             # header's step runs after each pass of the body, so the walker runs that part there.
@@ -7220,6 +7258,29 @@ def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: 
         _transfer_soften(outside, shell)
 
 
+def _transfer_lend(shell: Dict, assignments: List[str]) -> Dict:
+    """Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; for each name, its
+    entry before the call and the entry lent."""
+    lent = {}
+    for word in assignments:
+        name, value = word.split('=', 1)
+        lent[name] = (lent[name][0] if name in lent else shell['vars'].get(name), (value, True))
+        shell['vars'][name] = lent[name][1]
+    return lent
+
+
+def _transfer_take_back(shell: Dict, lent: Dict) -> None:
+    """Put each lent name back as it was before the call. One the body set again is unknown: bash keeps a value the
+    body exported and zsh does not. Any write makes a new entry, so an entry that is not the lent one was written."""
+    for name, (before, entry) in lent.items():
+        if shell['vars'].get(name) is not entry:
+            shell['vars'][name] = (_TRANSFER_SUBSTITUTED, None)
+        elif before is None:
+            del shell['vars'][name]
+        else:
+            shell['vars'][name] = before
+
+
 def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
     """The calls one simple command makes, after applying its cd, export, unset or declaration; a defined function runs
     its body with the command's words as its positional parameters."""
@@ -7232,7 +7293,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     known = shell['functions'].get(name)
     if known:
         outer, shell['args'] = shell['args'], words[words.index(name) + 1:]
+        lent = _transfer_lend(shell, words[:words.index(name)])
         _transfer_call(known, layer, subshell, shell, depth)  # looked up first: the body may remove the function
+        _transfer_take_back(shell, lent)
         shell['args'] = outer
         if not known[1]:
             return []
