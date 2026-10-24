@@ -312,12 +312,16 @@ function readWord(text: string, start: number): [string, number] {
 function parenEnd(text: string, start: number): number {
   let depth = 1;
   let quote: string | undefined;
+  const cases: string[] = [];
+  let word = "";
+  let atStart = true;
   for (let i = start; i < text.length; i++) {
     const ch = text[i] as string;
     if (quote === "'") {
       if (ch === "'") quote = undefined;
     } else if (ch === "\\") {
       i++;
+      word += "\0";
     } else if (quote === '"') {
       if (ch === '"') quote = undefined;
       else if (text.startsWith("$(", i)) {
@@ -326,12 +330,52 @@ function parenEnd(text: string, start: number): number {
       }
     } else if (ch === "'" || ch === '"') {
       quote = ch;
-    } else if (ch === "(" || ch === ")") {
-      depth += ch === "(" ? 1 : -1;
-      if (depth === 0) return i;
+      word += "\0";
+    } else if (!" \t\r\n;&|()<>".includes(ch)) {
+      word += ch;
+    } else {
+      if (word !== "") atStart = caseWord(word, atStart, cases);
+      word = "";
+      if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
+        if (ch === ")") [cases[cases.length - 1], atStart] = ["body", true]; // ( may open a pattern
+      } else if (ch === "(" || ch === ")") {
+        depth += ch === "(" ? 1 : -1;
+        if (depth === 0) return i;
+      }
+      if (";&|\n(".includes(ch)) atStart = true;
+      if (cases.at(-1) === "body" && (text.startsWith(";;", i) || text.startsWith(";&", i))) {
+        cases[cases.length - 1] = "pattern";
+        i += text.startsWith(";;&", i) ? 2 : 1;
+      }
     }
   }
   return -1;
+}
+
+/** Follow a word through the case commands open in a $( ): case opens one, in starts its patterns, esac ends it;
+ *  whether the next word starts a command. */
+function caseWord(word: string, atStart: boolean, cases: string[]): boolean {
+  if (word === "case" && atStart) cases.push("head");
+  else if (word === "in" && cases.at(-1) === "head") cases[cases.length - 1] = "pattern";
+  else if (word === "esac" && cases.length > 0 && cases.at(-1) !== "head") cases.pop();
+  else return LEADING_WORDS.has(word);
+  return false;
+}
+
+/** An arithmetic for header's start, test and step, split at the ; outside any substitution; undefined if not three. */
+function arithmeticParts(text: string): string[] | undefined {
+  const parts: string[] = [];
+  let begin = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith("$(", i) || text[i] === "`") {
+      i = text[i] === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
+      if (i < 0) return undefined;
+    } else if (text[i] === ";") {
+      parts.push(text.slice(begin, i));
+      begin = i + 1;
+    }
+  }
+  return parts.length === 2 ? [...parts, text.slice(begin)] : undefined;
 }
 
 /** The index of the backtick that closes one just before `start`; -1 when none does. */
@@ -498,9 +542,12 @@ class Lexer {
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
     const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
-      // An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions.
-      const bodies = textBodies(this.text.slice(this.i + 2, close - 1));
-      if (bodies === undefined) {
+      // An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions; a header's
+      // step runs after each pass of the body, so the walker runs that part there.
+      const inner = this.text.slice(this.i + 2, close - 1);
+      const parts = this.argv.at(-1) === "for" ? arithmeticParts(inner) : undefined;
+      const bodies = textBodies(parts === undefined ? inner : parts.slice(0, 2).join(";"));
+      if (bodies === undefined || (parts !== undefined && textBodies(parts[2] as string) === undefined)) {
         this.failed = true;
         return;
       }
@@ -806,7 +853,7 @@ function envValue(env: Env, processEnv: Record<string, string | undefined>, key:
 /** NAME=value, or NAME+=value, which appends to the value. */
 function isAssignment(token: string): boolean {
   const eq = token.indexOf("=");
-  return eq > 0 && !token.startsWith("-") && /^[A-Za-z0-9_]+\+?$/.test(token.slice(0, eq));
+  return eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*\+?$/.test(token.slice(0, eq));
 }
 
 /** The words with each leading NAME+=value made NAME=value: appended to the earlier or shell value in a command of
@@ -875,16 +922,21 @@ function isFile(path: string): boolean {
   }
 }
 
-const LOOKS: ReadonlySet<string> = new Set(["cd", "[", "[[", "test", "ls", "echo", "printf", "stat", "cat"]);
+const LOOKS: ReadonlySet<string> = new Set(["cd", "[", "[[", "test", "ls", "echo", "printf", "stat", "cat", "wc", "head",
+  "tail", "grep", "diff", "file", "du", "readlink", "realpath", "basename", "dirname"]);
+const MAKES_PARENTS: ReadonlySet<string> = new Set(["mkdir", "install", "git", "unzip"]);
 
-/** The path segments the commands in `list` name, but for those that only look at a folder, such as cd or test: a
- *  folder another command names may have been made or removed by it. */
+/** The folders the commands in `list` name, as path segments: each word's last, or every one for a command that may
+ *  make parent folders (mkdir -p); a command that only looks, such as cd, test or wc, names none. */
 function namedSegments(list: Item[]): Set<string> {
   const names = new Set<string>();
   for (const item of list) {
     const argv = item.kind === "cmd" ? item.argv.filter((w) => !KEYWORDS.has(w)) : [];
-    if (argv.length > 0 && !LOOKS.has(programName(argv[0] as string))) {
-      for (const word of argv) for (const segment of word.split("/")) if (segment !== "") names.add(segment);
+    const name = argv.length > 0 ? programName(argv[0] as string) : undefined;
+    if (name === undefined || LOOKS.has(name)) continue;
+    for (const word of argv) {
+      const segments = word.split("/").filter((segment) => segment !== "");
+      for (const segment of MAKES_PARENTS.has(name) ? segments : segments.slice(-1)) names.add(segment);
     }
   }
   return names;
@@ -1426,6 +1478,7 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
     if (frame !== undefined) {
+      stepSubstitutions(frame, shell);
       const ends = endless(frame, shell);
       doubtful(frame, shell);
       settle(frame, { kind: "cmd", argv: [word], before: item.before, after: "", io: item.io }, shell);
@@ -1453,8 +1506,6 @@ function loop(word: string, rest: string[], shell: Shell): LoopRead {
   return [literal ? true : listed?.length === 0 ? false : undefined, word !== "for" || !plain, false, undefined];
 }
 
-const NAME = "([A-Za-z_][A-Za-z0-9_]*)";
-const NUMBER = "(0|[1-9][0-9]*)";
 const TESTS: Record<string, (a: bigint, b: bigint) => boolean> = {
   "<": (a, b) => a < b, "<=": (a, b) => a <= b, ">": (a, b) => a > b, ">=": (a, b) => a >= b,
   "==": (a, b) => a === b, "!=": (a, b) => a !== b,
@@ -1464,18 +1515,19 @@ const TESTS: Record<string, (a: bigint, b: bigint) => boolean> = {
  *  steps it by a number; with no test it runs until something leaves it. */
 function counted(word: string): LoopRead {
   const unknown: LoopRead = [undefined, true, false, undefined];
-  const parts = word.endsWith("))") ? word.slice(2, -2).split(";").map((p) => p.trim()) : [];
+  const parts = word.endsWith("))") ? (arithmeticParts(word.slice(2, -2)) ?? []).map((p) => p.trim()) : [];
   if (parts.length !== 3) return unknown;
   const [init, check, step] = parts as [string, string, string];
-  const start = new RegExp(`^${NAME}\\s*=\\s*${NUMBER}$`).exec(init);
+  const start = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0|[1-9][0-9]*)$/.exec(init);
   if (init !== "" && start === null) return unknown;
   if (check === "") return [true, true, true, undefined];
-  const test = new RegExp(`^${NAME}\\s*(<=|>=|==|!=|<|>)\\s*${NUMBER}$`).exec(check);
-  const by = start === null ? undefined : stepOf(step, start[1] as string);
-  if (start === null || test === null || by === undefined || start[1] !== test[1]) return unknown;
+  const test = /^([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|==|!=|<|>)\s*(0|[1-9][0-9]*)$/.exec(check);
+  if (start === null || test === null || start[1] !== test[1]) return unknown;
   const [a, op, b] = [BigInt(start[2] as string), test[2] as string, BigInt(test[3] as string)];
   const holds = TESTS[op] as (a: bigint, b: bigint) => boolean;
   if (!holds(a, b)) return [false, false, false, start[1]];
+  const by = stepOf(step, start[1] as string);
+  if (by === undefined) return [true, true, false, start[1]]; // a step it can't read may repeat the body
   // The counter runs a, a + by, a + 2 by, ...: a != test fails only if it lands on the number, any other only if the
   // counter moves toward failing it.
   const forever = op === "!=" ? by === 0n || (b - a) % by !== 0n || (b - a) / by < 0n
@@ -1488,14 +1540,31 @@ function counted(word: string): LoopRead {
  *  or minus a number; undefined for anything else. */
 function stepOf(step: string, name: string): bigint | undefined {
   if (step === "") return 0n;
-  let match = new RegExp(`^(\\+\\+|--)?\\s*${NAME}\\s*(\\+\\+|--)?$`).exec(step);
+  let match = /^(\+\+|--)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\+\+|--)?$/.exec(step);
   if (match !== null && match[2] === name && (match[1] === undefined) !== (match[3] === undefined)) {
     return (match[1] ?? match[3]) === "++" ? 1n : -1n;
   }
-  match = new RegExp(`^${NAME}\\s*([+-])=\\s*${NUMBER}$`).exec(step) ??
-    new RegExp(`^${NAME}\\s*=\\s*${name}\\s*([+-])\\s*${NUMBER}$`).exec(step);
+  match = /^([A-Za-z_][A-Za-z0-9_]*)\s*([+-])=\s*(0|[1-9][0-9]*)$/.exec(step);
   if (match !== null && match[1] === name) return BigInt(match[3] as string) * (match[2] === "+" ? 1n : -1n);
+  match = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*([+-])\s*(0|[1-9][0-9]*)$/.exec(step);
+  if (match !== null && match[1] === name && match[2] === name) return BigInt(match[4] as string) * (match[3] === "+" ? 1n : -1n);
   return undefined;
+}
+
+/** Run the substitutions in an arithmetic for's step where a pass of its body ends, so they run only as far as a pass
+ *  completes: never after a sure break. */
+function stepSubstitutions(frame: Frame, shell: Shell): void {
+  const header = frame.kind === "for" ? frame.head[1].argv[1] : undefined;
+  const parts = header?.startsWith("((") ? arithmeticParts(header.slice(2, -2)) : undefined;
+  const items: Item[] = [];
+  for (const body of parts === undefined ? [] : textBodies(parts[2] as string) ?? []) {
+    items.push({ kind: "$(", argv: [], before: "", after: "", io: [] }, ...(new Lexer(body).read() ?? []),
+      { kind: ")", argv: [], before: "", after: "", io: [] });
+  }
+  if (items.length === 0) return;
+  shell.frames.push(frame); // inside the loop, as far as its body ran
+  walkItems(items, shell, 0);
+  shell.frames.pop();
 }
 
 /** The words of each command a loop runs in this shell, from its condition up to the item `end`, leaving out those in
@@ -1847,7 +1916,11 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   // Its words after the string are $0 and then the positional parameters; a shell may read its script from stdin.
   let positional = inner !== undefined && SHELLS.has(name as string) ? args.slice(args.indexOf(inner) + 2) : [];
   const script = name !== undefined && inner === undefined ? stdinScript(name, args) : undefined;
-  if (script !== undefined) [inner, positional] = [stdinText([layer]), script];
+  if (script !== undefined) {
+    // The shell has already read the script from its stdin, so the script's commands find nothing more there.
+    [inner, positional] = [stdinText([layer]), script];
+    layer[2] = layer[2].map(([fd, value]): Redirection => [fd, fd === 0 ? "null" : value]);
+  }
   if (inner !== undefined) {
     // The string's commands run as the wrapper's user and read its stdin and write its stdout.
     const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);

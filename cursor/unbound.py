@@ -4051,15 +4051,30 @@ class _TransferStdin(str):
     text = None
 
 
+def _transfer_arithmetic_parts(text: str) -> Optional[List[str]]:
+    """An arithmetic for header's start, test and step, split at the ; outside any substitution; None if not three."""
+    parts, start, i = [], 0, 0
+    while i < len(text):
+        if text.startswith('$(', i) or text[i] == '`':
+            i = _transfer_paren_end(text, i + 2) if text[i] == '$' else _transfer_backtick_end(text, i + 1)
+            if i < 0:
+                return None
+        elif text[i] == ';':
+            parts, start = parts + [text[start:i]], i + 1
+        i += 1
+    return parts + [text[start:]] if len(parts) == 2 else None
+
+
 def _transfer_paren_end(text: str, i: int) -> int:
-    """The index of the ) that closes a ( just before i, past quotes and nested parentheses; -1 when none does."""
-    depth, quote = 1, None
+    """The index of the ) that closes a ( just before i, past quotes, nested parentheses and the ) after a case
+    pattern; -1 when none does."""
+    depth, quote, cases, word, at_start = 1, None, [], '', True
     while i < len(text):
         ch = text[i]
         if quote == "'":
             quote = None if ch == "'" else quote
         elif ch == '\\':
-            i += 1
+            i, word = i + 1, word + '\0'
         elif quote == '"':
             if ch == '"':
                 quote = None
@@ -4068,13 +4083,37 @@ def _transfer_paren_end(text: str, i: int) -> int:
                 if i < 0:
                     return -1
         elif ch in '\'"':
-            quote = ch
-        elif ch in '()':
-            depth += 1 if ch == '(' else -1
-            if depth == 0:
-                return i
+            quote, word = ch, word + '\0'
+        elif ch not in ' \t\r\n;&|()<>':
+            word += ch
+        else:
+            at_start, word = _transfer_case_word(word, at_start, cases) if word else at_start, ''
+            if cases and cases[-1] == 'pattern' and ch in '()':
+                cases[-1], at_start = ('body', True) if ch == ')' else ('pattern', at_start)  # ( may open a pattern
+            elif ch in '()':
+                depth += 1 if ch == '(' else -1
+                if depth == 0:
+                    return i
+            if ch in ';&|\n(':
+                at_start = True
+            if cases and cases[-1] == 'body' and text.startswith((';;', ';&'), i):
+                cases[-1], i = 'pattern', i + (2 if text.startswith(';;&', i) else 1)
         i += 1
     return -1
+
+
+def _transfer_case_word(word: str, at_start: bool, cases: List[str]) -> bool:
+    """Follow a word through the case commands open in a $( ): case opens one, in starts its patterns, esac ends it;
+    whether the next word starts a command."""
+    if word == 'case' and at_start:
+        cases.append('head')
+    elif word == 'in' and cases and cases[-1] == 'head':
+        cases[-1] = 'pattern'
+    elif word == 'esac' and cases and cases[-1] != 'head':
+        cases.pop()
+    else:
+        return word in _TRANSFER_LEADING_WORDS
+    return False
 
 
 def _transfer_backtick_end(text: str, i: int) -> int:
@@ -4204,9 +4243,11 @@ class _TransferLexer:
         head = self.argv[:-1] if self.argv[-1:] == ['for'] else self.argv
         end = _transfer_paren_end(self.text, self.i + 1) if self.text.startswith('((', self.i) else -1
         if end > 0 and not self.in_word and all(w in _TRANSFER_LEADING_WORDS for w in head):
-            # An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions.
-            bodies = _transfer_text_bodies(self.text[self.i + 2:end - 1])
-            if bodies is None:
+            # An arithmetic command, or a for loop's (( )) header, is one word, and runs only its substitutions; a
+            # header's step runs after each pass of the body, so the walker runs that part there.
+            parts = _transfer_arithmetic_parts(self.text[self.i + 2:end - 1]) if self.argv[-1:] == ['for'] else None
+            bodies = _transfer_text_bodies(';'.join(parts[:2]) if parts else self.text[self.i + 2:end - 1])
+            if bodies is None or (parts and _transfer_text_bodies(parts[2]) is None):
                 self.failed = True
                 return
             self._substitute(bodies, self._substitutions_at() if bodies else None)
@@ -4466,7 +4507,7 @@ def _transfer_is_assignment(token: str) -> bool:
     """NAME=value, or NAME+=value, which appends to the value."""
     name = token.split('=', 1)[0]
     name = name[:-1] if name.endswith('+') else name
-    return '=' in token and not token.startswith('-') and name.replace('_', '').isalnum()
+    return '=' in token and re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name) is not None
 
 
 def _transfer_appends(words: List[str], shell: Dict) -> List[str]:
@@ -4559,17 +4600,22 @@ def _transfer_cd(args: List[str], cwd: Optional[str], names: set) -> tuple:
     return (folder, 0) if folder else (cwd, 1)
 
 
-_TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat'})
+_TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat', 'wc', 'head', 'tail',
+                             'grep', 'diff', 'file', 'du', 'readlink', 'realpath', 'basename', 'dirname'})
+_TRANSFER_MAKES_PARENTS = frozenset({'mkdir', 'install', 'git', 'unzip'})
 
 
 def _transfer_names(items: List[tuple]) -> set:
-    """The path segments the commands in items name, but for those that only look at a folder, such as cd or test: a
-    folder another command names may have been made or removed by it."""
+    """The folders the commands in items name, as path segments: each word's last, or every one for a command that
+    may make parent folders (mkdir -p); a command that only looks, such as cd, test or wc, names none."""
     names = set()
     for item in items:
         words = [w for w in item[1] if w not in _TRANSFER_KEYWORDS] if item[0] == 'cmd' else []
-        if words and _transfer_program_name(words[0]) not in _TRANSFER_LOOKS:
-            names.update(segment for word in words for segment in word.split('/') if segment)
+        program = _transfer_program_name(words[0]) if words else None
+        if program and program not in _TRANSFER_LOOKS:
+            for word in words:
+                segments = [segment for segment in word.split('/') if segment]
+                names.update(segments if program in _TRANSFER_MAKES_PARENTS else segments[-1:])
     return names
 
 
@@ -4955,6 +5001,7 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
     if keyword in ('}', 'fi', 'done'):
         frame = _transfer_pop(frames, {'}': ('{',), 'fi': ('if',), 'done': _TRANSFER_LOOPS}[keyword])
         if frame:
+            _transfer_step_substitutions(frame, shell)
             endless = _transfer_endless(frame, shell)
             _transfer_doubtful(frame, shell)
             _transfer_settle(frame, ('cmd', [keyword], item[2], '', item[4]), shell)
@@ -4990,7 +5037,7 @@ _TRANSFER_TESTS = {'<': int.__lt__, '<=': int.__le__, '>': int.__gt__, '>=': int
 def _transfer_counted(word: str) -> tuple:
     """_transfer_loop's answer for an arithmetic for: read when it starts its counter at a number, tests it against a
     number and steps it by a number; with no test it runs until something leaves it."""
-    parts = [p.strip() for p in word[2:-2].split(';')] if word.endswith('))') else []
+    parts = [p.strip() for p in _transfer_arithmetic_parts(word[2:-2]) or []] if word.endswith('))') else []
     if len(parts) != 3:
         return None, True, False, None
     start = re.fullmatch(_TRANSFER_NAME + r'\s*=\s*' + _TRANSFER_NUMBER, parts[0])
@@ -4999,12 +5046,14 @@ def _transfer_counted(word: str) -> tuple:
     if not parts[1]:
         return True, True, True, None
     test = re.fullmatch(_TRANSFER_NAME + r'\s*(<=|>=|==|!=|<|>)\s*' + _TRANSFER_NUMBER, parts[1])
-    by = _transfer_step(parts[2], start.group(1)) if start else None
-    if not (test and by is not None and start.group(1) == test.group(1)):
+    if not (start and test and start.group(1) == test.group(1)):
         return None, True, False, None
     a, holds, b = int(start.group(2)), _TRANSFER_TESTS[test.group(2)], int(test.group(3))
     if not holds(a, b):
         return False, False, False, start.group(1)
+    by = _transfer_step(parts[2], start.group(1))
+    if by is None:
+        return True, True, False, start.group(1)  # a step it can't read may repeat the body
     # The counter runs a, a + by, a + 2 by, ...: a != test fails only if it lands on the number, any other only if
     # the counter moves toward failing it.
     if test.group(2) == '!=':
@@ -5024,11 +5073,27 @@ def _transfer_step(step: str, name: str) -> Optional[int]:
     match = re.fullmatch(r'(\+\+|--)?\s*' + _TRANSFER_NAME + r'\s*(\+\+|--)?', step)
     if match and match.group(2) == name and bool(match.group(1)) != bool(match.group(3)):
         return 1 if (match.group(1) or match.group(3)) == '++' else -1
-    match = re.fullmatch(_TRANSFER_NAME + r'\s*([+-])=\s*' + _TRANSFER_NUMBER, step) or \
-        re.fullmatch(_TRANSFER_NAME + r'\s*=\s*' + re.escape(name) + r'\s*([+-])\s*' + _TRANSFER_NUMBER, step)
+    match = re.fullmatch(_TRANSFER_NAME + r'\s*([+-])=\s*' + _TRANSFER_NUMBER, step)
     if match and match.group(1) == name:
         return int(match.group(3)) * (1 if match.group(2) == '+' else -1)
+    match = re.fullmatch(_TRANSFER_NAME + r'\s*=\s*' + _TRANSFER_NAME + r'\s*([+-])\s*' + _TRANSFER_NUMBER, step)
+    if match and match.group(1) == match.group(2) == name:
+        return int(match.group(4)) * (1 if match.group(3) == '+' else -1)
     return None
+
+
+def _transfer_step_substitutions(frame: Dict, shell: Dict) -> None:
+    """Run the substitutions in an arithmetic for's step where a pass of its body ends, so they run only as far as a
+    pass completes: never after a sure break."""
+    header = frame['head'][1][1][1:2] if frame['kind'] == 'for' else []
+    parts = _transfer_arithmetic_parts(header[0][2:-2]) if header and header[0].startswith('((') else None
+    items = []
+    for body in _transfer_text_bodies(parts[2]) or [] if parts else []:
+        items += [('$(', None, '', '', None)] + (_TransferLexer(body).read() or []) + [(')', None, '', '', None)]
+    if items:
+        shell['frames'].append(frame)  # inside the loop, as far as its body ran
+        _transfer_items(items, shell, 0)
+        shell['frames'].pop()
 
 
 def _transfer_loop_commands(frame: Dict, shell: Dict, end: Optional[int]) -> Optional[List[List[str]]]:
@@ -5352,7 +5417,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     positional = args[args.index(inner) + 2:] if inner is not None and program in _TRANSFER_SHELLS else []
     script = _transfer_stdin_script(program, args) if program and inner is None else None
     if script is not None:
+        # The shell has already read the script from its stdin, so the script's commands find nothing more there.
         inner, positional = _transfer_stdin_text((layer,)), script
+        layer = layer[:2] + (tuple((fd, 'null' if fd == 0 else value) for fd, value in layer[2]),)
     if inner is not None:
         # The string's commands run as the wrapper's user and read its stdin and write its stdout.
         calls = _transfer_walk(_TransferLexer(inner, depth + 1).read() or [], cwd, env, depth + 1, positional)

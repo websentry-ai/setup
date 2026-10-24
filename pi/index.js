@@ -2105,12 +2105,16 @@ function readWord(text, start) {
 function parenEnd(text, start) {
   let depth = 1;
   let quote;
+  const cases = [];
+  let word = "";
+  let atStart = true;
   for (let i = start; i < text.length; i++) {
     const ch = text[i];
     if (quote === "'") {
       if (ch === "'") quote = void 0;
     } else if (ch === "\\") {
       i++;
+      word += "\0";
     } else if (quote === '"') {
       if (ch === '"') quote = void 0;
       else if (text.startsWith("$(", i)) {
@@ -2119,12 +2123,47 @@ function parenEnd(text, start) {
       }
     } else if (ch === "'" || ch === '"') {
       quote = ch;
-    } else if (ch === "(" || ch === ")") {
-      depth += ch === "(" ? 1 : -1;
-      if (depth === 0) return i;
+      word += "\0";
+    } else if (!" 	\r\n;&|()<>".includes(ch)) {
+      word += ch;
+    } else {
+      if (word !== "") atStart = caseWord(word, atStart, cases);
+      word = "";
+      if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
+        if (ch === ")") [cases[cases.length - 1], atStart] = ["body", true];
+      } else if (ch === "(" || ch === ")") {
+        depth += ch === "(" ? 1 : -1;
+        if (depth === 0) return i;
+      }
+      if (";&|\n(".includes(ch)) atStart = true;
+      if (cases.at(-1) === "body" && (text.startsWith(";;", i) || text.startsWith(";&", i))) {
+        cases[cases.length - 1] = "pattern";
+        i += text.startsWith(";;&", i) ? 2 : 1;
+      }
     }
   }
   return -1;
+}
+function caseWord(word, atStart, cases) {
+  if (word === "case" && atStart) cases.push("head");
+  else if (word === "in" && cases.at(-1) === "head") cases[cases.length - 1] = "pattern";
+  else if (word === "esac" && cases.length > 0 && cases.at(-1) !== "head") cases.pop();
+  else return LEADING_WORDS.has(word);
+  return false;
+}
+function arithmeticParts(text) {
+  const parts = [];
+  let begin2 = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (text.startsWith("$(", i) || text[i] === "`") {
+      i = text[i] === "$" ? parenEnd(text, i + 2) : backtickEnd(text, i + 1);
+      if (i < 0) return void 0;
+    } else if (text[i] === ";") {
+      parts.push(text.slice(begin2, i));
+      begin2 = i + 1;
+    }
+  }
+  return parts.length === 2 ? [...parts, text.slice(begin2)] : void 0;
 }
 function backtickEnd(text, start) {
   for (let i = start; i < text.length; i += text[i] === "\\" ? 2 : 1) if (text[i] === "`") return i;
@@ -2263,8 +2302,10 @@ var Lexer = class _Lexer {
     const lead = this.argv.at(-1) === "for" ? this.argv.slice(0, -1) : this.argv;
     const close = this.text.startsWith("((", this.i) ? parenEnd(this.text, this.i + 1) : -1;
     if (close > 0 && !this.inWord && lead.every((w) => LEADING_WORDS.has(w))) {
-      const bodies = textBodies(this.text.slice(this.i + 2, close - 1));
-      if (bodies === void 0) {
+      const inner = this.text.slice(this.i + 2, close - 1);
+      const parts = this.argv.at(-1) === "for" ? arithmeticParts(inner) : void 0;
+      const bodies = textBodies(parts === void 0 ? inner : parts.slice(0, 2).join(";"));
+      if (bodies === void 0 || parts !== void 0 && textBodies(parts[2]) === void 0) {
         this.failed = true;
         return;
       }
@@ -2539,7 +2580,7 @@ function envValue(env, processEnv, key) {
 }
 function isAssignment(token) {
   const eq = token.indexOf("=");
-  return eq > 0 && !token.startsWith("-") && /^[A-Za-z0-9_]+\+?$/.test(token.slice(0, eq));
+  return eq > 0 && /^[A-Za-z_][A-Za-z0-9_]*\+?$/.test(token.slice(0, eq));
 }
 function appends(argv, shell) {
   const given = /* @__PURE__ */ new Map();
@@ -2592,13 +2633,38 @@ function isFile(path) {
     return false;
   }
 }
-var LOOKS = /* @__PURE__ */ new Set(["cd", "[", "[[", "test", "ls", "echo", "printf", "stat", "cat"]);
+var LOOKS = /* @__PURE__ */ new Set([
+  "cd",
+  "[",
+  "[[",
+  "test",
+  "ls",
+  "echo",
+  "printf",
+  "stat",
+  "cat",
+  "wc",
+  "head",
+  "tail",
+  "grep",
+  "diff",
+  "file",
+  "du",
+  "readlink",
+  "realpath",
+  "basename",
+  "dirname"
+]);
+var MAKES_PARENTS = /* @__PURE__ */ new Set(["mkdir", "install", "git", "unzip"]);
 function namedSegments(list) {
   const names = /* @__PURE__ */ new Set();
   for (const item of list) {
     const argv = item.kind === "cmd" ? item.argv.filter((w) => !KEYWORDS.has(w)) : [];
-    if (argv.length > 0 && !LOOKS.has(programName(argv[0]))) {
-      for (const word of argv) for (const segment of word.split("/")) if (segment !== "") names.add(segment);
+    const name = argv.length > 0 ? programName(argv[0]) : void 0;
+    if (name === void 0 || LOOKS.has(name)) continue;
+    for (const word of argv) {
+      const segments = word.split("/").filter((segment) => segment !== "");
+      for (const segment of MAKES_PARENTS.has(name) ? segments : segments.slice(-1)) names.add(segment);
     }
   }
   return names;
@@ -2939,6 +3005,7 @@ function keyword(argv, item, shell) {
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
     if (frame !== void 0) {
+      stepSubstitutions(frame, shell);
       const ends = endless(frame, shell);
       doubtful(frame, shell);
       settle(frame, { kind: "cmd", argv: [word], before: item.before, after: "", io: item.io }, shell);
@@ -2960,8 +3027,6 @@ function loop(word, rest, shell) {
   const plain = listed?.length === 1 && ![..."$*?[", SUBSTITUTED].some((c) => listed[0].includes(c));
   return [literal ? true : listed?.length === 0 ? false : void 0, word !== "for" || !plain, false, void 0];
 }
-var NAME = "([A-Za-z_][A-Za-z0-9_]*)";
-var NUMBER = "(0|[1-9][0-9]*)";
 var TESTS = {
   "<": (a, b) => a < b,
   "<=": (a, b) => a <= b,
@@ -2972,30 +3037,49 @@ var TESTS = {
 };
 function counted(word) {
   const unknown = [void 0, true, false, void 0];
-  const parts = word.endsWith("))") ? word.slice(2, -2).split(";").map((p) => p.trim()) : [];
+  const parts = word.endsWith("))") ? (arithmeticParts(word.slice(2, -2)) ?? []).map((p) => p.trim()) : [];
   if (parts.length !== 3) return unknown;
   const [init, check, step] = parts;
-  const start = new RegExp(`^${NAME}\\s*=\\s*${NUMBER}$`).exec(init);
+  const start = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(0|[1-9][0-9]*)$/.exec(init);
   if (init !== "" && start === null) return unknown;
   if (check === "") return [true, true, true, void 0];
-  const test = new RegExp(`^${NAME}\\s*(<=|>=|==|!=|<|>)\\s*${NUMBER}$`).exec(check);
-  const by = start === null ? void 0 : stepOf(step, start[1]);
-  if (start === null || test === null || by === void 0 || start[1] !== test[1]) return unknown;
+  const test = /^([A-Za-z_][A-Za-z0-9_]*)\s*(<=|>=|==|!=|<|>)\s*(0|[1-9][0-9]*)$/.exec(check);
+  if (start === null || test === null || start[1] !== test[1]) return unknown;
   const [a, op, b] = [BigInt(start[2]), test[2], BigInt(test[3])];
   const holds = TESTS[op];
   if (!holds(a, b)) return [false, false, false, start[1]];
+  const by = stepOf(step, start[1]);
+  if (by === void 0) return [true, true, false, start[1]];
   const forever = op === "!=" ? by === 0n || (b - a) % by !== 0n || (b - a) / by < 0n : op === "==" ? by === 0n : by === 0n || by > 0n === (op === ">" || op === ">=");
   return [true, holds(a + by, b), forever, start[1]];
 }
 function stepOf(step, name) {
   if (step === "") return 0n;
-  let match = new RegExp(`^(\\+\\+|--)?\\s*${NAME}\\s*(\\+\\+|--)?$`).exec(step);
+  let match = /^(\+\+|--)?\s*([A-Za-z_][A-Za-z0-9_]*)\s*(\+\+|--)?$/.exec(step);
   if (match !== null && match[2] === name && match[1] === void 0 !== (match[3] === void 0)) {
     return (match[1] ?? match[3]) === "++" ? 1n : -1n;
   }
-  match = new RegExp(`^${NAME}\\s*([+-])=\\s*${NUMBER}$`).exec(step) ?? new RegExp(`^${NAME}\\s*=\\s*${name}\\s*([+-])\\s*${NUMBER}$`).exec(step);
+  match = /^([A-Za-z_][A-Za-z0-9_]*)\s*([+-])=\s*(0|[1-9][0-9]*)$/.exec(step);
   if (match !== null && match[1] === name) return BigInt(match[3]) * (match[2] === "+" ? 1n : -1n);
+  match = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([A-Za-z_][A-Za-z0-9_]*)\s*([+-])\s*(0|[1-9][0-9]*)$/.exec(step);
+  if (match !== null && match[1] === name && match[2] === name) return BigInt(match[4]) * (match[3] === "+" ? 1n : -1n);
   return void 0;
+}
+function stepSubstitutions(frame, shell) {
+  const header = frame.kind === "for" ? frame.head[1].argv[1] : void 0;
+  const parts = header?.startsWith("((") ? arithmeticParts(header.slice(2, -2)) : void 0;
+  const items = [];
+  for (const body of parts === void 0 ? [] : textBodies(parts[2]) ?? []) {
+    items.push(
+      { kind: "$(", argv: [], before: "", after: "", io: [] },
+      ...new Lexer(body).read() ?? [],
+      { kind: ")", argv: [], before: "", after: "", io: [] }
+    );
+  }
+  if (items.length === 0) return;
+  shell.frames.push(frame);
+  walkItems(items, shell, 0);
+  shell.frames.pop();
 }
 function loopCommands(frame, shell, end2) {
   const [at, head] = frame.head;
@@ -3282,7 +3366,10 @@ function simple(words2, item, before, shell, depth) {
   let inner = name === void 0 ? void 0 : shellString(name, args);
   let positional = inner !== void 0 && SHELLS.has(name) ? args.slice(args.indexOf(inner) + 2) : [];
   const script = name !== void 0 && inner === void 0 ? stdinScript(name, args) : void 0;
-  if (script !== void 0) [inner, positional] = [stdinText([layer]), script];
+  if (script !== void 0) {
+    [inner, positional] = [stdinText([layer]), script];
+    layer[2] = layer[2].map(([fd, value]) => [fd, fd === 0 ? "null" : value]);
+  }
   if (inner !== void 0) {
     const calls = walk(new Lexer(inner, depth + 1).read() ?? [], parsed.cwd, env, shell.processEnv, depth + 1, positional);
     return replaced(argv, subshell, shell, calls.map((call) => ({

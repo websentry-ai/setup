@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'ca549cb8816721000b4a0e08d22a0bb9a457c77df78059622482468ba78977de'
+BLOCK_SHA256 = '20eeb8a58bd9cc10ea876aa1c9fac7e7a377b010670508bb63abb8c611fdc4f5'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -830,6 +830,8 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd nowhere && cd frontend; scp -F cfg f prod:/tmp', public),
                                   ('cd notes; scp -F cfg f prod:/tmp', public),
                                   ('cd cfg; scp -F cfg f prod:/tmp', public),
+                                  # A command that only reads inside the folder, such as wc, does not name it.
+                                  ('wc -c frontend/cfg; cd frontend; scp -F cfg f prod:/tmp', private),
                                   # Every shell fails that cd, so the || after it surely runs.
                                   ('cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp', private),
                                   # An arithmetic for that stops after one pass keeps its cd, unless its body
@@ -1050,6 +1052,24 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
                 with self.subTest(hook=path, first=first):
                     transfers = self._transfers(path, [first, 'scp -F cfg build.zip prod:/srv'])
                     self.assertEqual(transfers[-1], expected)
+
+    def test_a_codex_workdir_does_not_move_later_calls(self):
+        # A workdir is that call's own; the next call without one still starts in the session folder.
+        hook, lines = load_module('codex/hooks/unbound.py'), []
+        calls = [{'cmd': 'true', 'workdir': os.path.join(self.repo, 'frontend')},
+                 {'cmd': 'scp -F cfg build.zip prod:/srv'}]
+        for n, arguments in enumerate(calls):
+            lines += [{'type': 'response_item', 'timestamp': f'2026-10-22T16:40:0{n}Z',
+                       'payload': {'type': 'function_call', 'call_id': f'c{n}', 'name': 'exec_command',
+                                   'arguments': json.dumps(arguments)}},
+                      {'type': 'response_item', 'timestamp': f'2026-10-22T16:40:0{n}Z',
+                       'payload': {'type': 'function_call_output', 'call_id': f'c{n}', 'output': ''}}]
+        transcript = os.path.join(tempfile.mkdtemp(), 'rollout.jsonl')
+        Path(transcript).write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        output = hook.parse_codex_transcript_for_tools(transcript, None, self.repo)
+        transfers = [entry.get('transfer') for entry in _tool_entries(output)]
+        public = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'public', '203.0.113.9')]}
+        self.assertEqual(transfers[-1], public)
 
     def test_a_failing_resolver_never_breaks_the_exchange(self):
         hook = load_module('claude-code/hooks/unbound.py')

