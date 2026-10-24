@@ -1017,9 +1017,17 @@ function cdTarget(args: string[], cwd: string | undefined, shell: Shell, given: 
   return folder === undefined ? [cwd, 1] : [folder, 0];
 }
 
-/** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a leading ~
- *  from the shell's HOME, read before that. Undefined when not known: a variable, substitution or glob, a HOME not
- *  known, or a relative folder that CDPATH may find somewhere else first. */
+/** A word with a leading ~ or ~/ made the shell's HOME, which the shell reads before a VAR=value in front of the command
+ *  applies; left as it is when that HOME is not known. */
+function tilde(word: string, shell: Shell): string {
+  const home = variable(shell, "HOME")[0];
+  if ((word !== "~" && !word.startsWith("~/")) || !home || home.includes("$") || home.includes(SUBSTITUTED)) return word;
+  return home + word.slice(1);
+}
+
+/** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied. Undefined when not
+ *  known: a variable, substitution or glob, a ~ left for a HOME not known, or a relative folder that CDPATH may find
+ *  somewhere else first. */
 function cdPath(folders: string[], shell: Shell, given: Env): string | undefined {
   const known = (value: string | undefined): value is string => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
   const folder = folders[0];
@@ -1031,9 +1039,7 @@ function cdPath(folders: string[], shell: Shell, given: Env): string | undefined
   const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") &&
     ![".", ".."].includes(folder.split("/")[0] as string);
   if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return undefined;
-  if (folder !== "~" && !folder.startsWith("~/")) return folder;
-  const home = variable(shell, "HOME")[0];
-  return known(home) ? home + folder.slice(1) : undefined;
+  return folder === "~" || folder.startsWith("~/") ? undefined : folder;
 }
 
 /** Whether `path` is there and is not a folder. */
@@ -1879,12 +1885,18 @@ function declare(name: string, args: string[], shell: Shell): void {
     const eq = arg.indexOf("=");
     const key = eq < 0 ? arg : arg.slice(0, eq);
     const lent = variable(shell, key.replace(/\+$/, ""))[1];
+    // Both shells export a local -x NAME=value to the call's commands; other local values they pass on differently.
+    const exportedLocal = name === "local" && on.includes("x") && off === "" && eq >= 0 && !key.endsWith("+");
     if (isLent(lent) && name !== "readonly" && !(on + off).includes("g")) {
-      shell.vars[key.replace(/\+$/, "")] = [SUBSTITUTED, lent]; // local to the call it was lent for
+      shell.vars[key.replace(/\+$/, "")] = [exportedLocal ? arg.slice(eq + 1) : SUBSTITUTED, lent]; // call-local
       continue;
     }
-    if (!plain || key.endsWith("+")) {
+    if (exportedLocal) {
+      shell.vars[key] = [arg.slice(eq + 1), true];
+    } else if (!plain || key.endsWith("+")) {
       forget(shell, new Set([key.replace(/\+$/, "")].filter(Boolean)));
+    }
+    if (!plain || key.endsWith("+")) {
       // Local to the call in both shells, unless zsh makes it global: declare or typeset -x.
       if (shell.scoped.length > 0 && sure && (name === "local" || (name !== "readonly" && !/[gx]/.test(on + off)))) {
         shell.scoped.at(-1)?.add(key.replace(/\+$/, ""));
@@ -1979,10 +1991,47 @@ function shellString(name: string, args: string[]): string | undefined {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i] as string;
       const flag = arg.startsWith("-") || arg.startsWith("/") ? arg.slice(1).toLowerCase() : "";
-      if (flag === "c" || (flag.length >= 3 && "command".startsWith(flag))) return args.slice(i + 1).join(" ");
+      if (flag === "c" || (flag.length >= 3 && "command".startsWith(flag))) return hashtablesEmptied(args.slice(i + 1).join(" "));
     }
   }
   return undefined;
+}
+
+/** A PowerShell command with each @{ } hashtable made empty: a ; in one separates its entries, not commands, and what
+ *  it holds names no host the cmdlet reaches. */
+function hashtablesEmptied(text: string): string {
+  let out = "";
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; ) {
+    if (quote === undefined && text.startsWith("@{", i)) {
+      out += "@{}";
+      i = hashtableEnd(text, i + 2);
+      continue;
+    }
+    const ch = text[i] as string;
+    quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** The index after the } that closes a PowerShell @{ whose contents start at `start`, past quotes and nested braces. */
+function hashtableEnd(text: string, start: number): number {
+  let depth = 1;
+  let quote: string | undefined;
+  let i = start;
+  for (; i < text.length && depth > 0; i++) {
+    const ch = text[i] as string;
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else {
+      depth += ch === "{" ? 1 : ch === "}" ? -1 : 0;
+    }
+  }
+  return i;
 }
 
 /** Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; each name's entry from
@@ -2083,7 +2132,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // A function that may not have been defined may leave the name to the program.
   }
   const parsed = program(argv, shell.cwd);
-  const { name, args } = parsed;
+  const { name } = parsed;
+  const args = parsed.args.map((arg) => tilde(arg, shell));
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
   // A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
   const assigns = name === undefined && argv.every(isAssignment);
@@ -2477,7 +2527,7 @@ function wget(args: string[]): Raw[] {
 }
 
 /** (operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; `switches` collects
- *  the flags such as -n, and -n for an -o that keeps stdin unread. */
+ *  the flags such as -n, and the first -o StdinNull as stdinnull=yes or stdinnull=no. */
 function sshArgs(name: string, args: string[], switches = new Set<string>()): [string[], string[]] {
   const passthrough: string[] = [];
   const operands: string[] = [];
@@ -2500,9 +2550,8 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
     let value: string | undefined;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && (option === "stdinnull" || option === "forkafterauthentication") &&
-        ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase() === "yes") {
-      switches.add("-n");
+    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("stdinnull="))) {
+      switches.add(`stdinnull=${((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase()}`);
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -2571,14 +2620,14 @@ function copy(name: string, args: string[], env: Env, processEnv: Record<string,
   return out;
 }
 
-/** ssh used as a pipe: sent to when its stdin is fed in, fetched from when its stdout is kept. -n, and -f, which
- *  implies it, keep stdin unread. */
+/** ssh used as a pipe: sent to when its stdin is fed in, fetched from when its stdout is kept. -n, -f, which implies
+ *  it, and a first -o StdinNull=yes keep stdin unread; ForkAfterAuthentication=yes still sends it. */
 function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
   const switches = new Set<string>();
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
   if (destination === undefined) return [];
-  const sends = fed && !switches.has("-n") && !switches.has("-f");
+  const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("stdinnull=yes");
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }
 
@@ -2702,23 +2751,7 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return undefined;
   // Under sudo, ssh runs as that user, with that user's config, which this can't read.
-  return [tool, raw.map(([d, dest, options, dial]): Raw => [d, dest, call.otherUser ? undefined : configTilde(options, envValue(call.env, processEnv, "HOME")), dial])];
-}
-
-/** ssh -G options with a leading ~ in an -F path made the shell's HOME, which it expands before ssh runs; undefined
- *  when that HOME is not known. */
-function configTilde(options: string[] | undefined, home: string): string[] | undefined {
-  if (options === undefined) return undefined;
-  const out: string[] = [];
-  for (let i = 0; i < options.length; i++) {
-    let value = options[i] as string;
-    if (i > 0 && options[i - 1] === "-F" && (value === "~" || value.startsWith("~/"))) {
-      if (!home || home.includes(SUBSTITUTED)) return undefined;
-      value = home + value.slice(1);
-    }
-    out.push(value);
-  }
-  return out;
+  return [tool, raw.map(([d, dest, options, dial]): Raw => [d, dest, call.otherUser ? undefined : options, dial])];
 }
 
 /** A host name or address in lower case without brackets; empty when it isn't one. */
@@ -2912,10 +2945,11 @@ function configUnsafe(passthrough: readonly string[], home: string, processEnv: 
 /** The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely. */
 async function sshHostname(destination: string, options: string[], cwd: string | undefined, state: State): Promise<string> {
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
+  // A ~ the shell left, for a HOME not known, or one ssh reads as it is, as in rsync -e, names no file this can read.
+  if (options.some((value, i) => options[i - 1] === "-F" && (value === "~" || value.startsWith("~/")))) return "";
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
-    const path = expandHome(value);
-    return path === "none" || isAbsolute(path) || cwd === undefined ? path : join(cwd, path);
+    return value === "none" || isAbsolute(value) || cwd === undefined ? value : join(cwd, value);
   });
   const key = JSON.stringify([destination, resolved]);
   const cached = state.sshHosts.get(key);

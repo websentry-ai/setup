@@ -3610,6 +3610,112 @@
    }
   },
   {
+   "command": "cat secret | ssh -o ForkAfterAuthentication=yes prod true",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=no -o StdinNull=yes prod true",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=yes -o StdinNull=no prod true",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=no -n prod true",
+   "transfer": null
+  },
+  {
+   "command": "powershell -Command \"Invoke-WebRequest -Method Post -Body @{a=1; b=2} -Uri https://8.8.8.8/up\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { local -x RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a b prod:/srv; }; f",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { local -x RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a b prod:/srv; }; RSYNC_RSH=\"ssh -o HostName=1.1.1.1\" f",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { local RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a b prod:/srv; }; f",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync -e \"ssh -F ~/cfg\" -a b prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

@@ -2717,19 +2717,22 @@ function cdTarget(args, cwd, shell, given) {
   const folder = [...landed][0];
   return folder === void 0 ? [cwd, 1] : [folder, 0];
 }
+function tilde(word, shell) {
+  const home = variable(shell, "HOME")[0];
+  if (word !== "~" && !word.startsWith("~/") || !home || home.includes("$") || home.includes(SUBSTITUTED)) return word;
+  return home + word.slice(1);
+}
 function cdPath(folders, shell, given) {
   const known = (value) => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
   const folder = folders[0];
   if (folder === void 0) {
-    const home2 = "HOME" in given ? given.HOME : variable(shell, "HOME")[0];
-    return known(home2) ? home2 : void 0;
+    const home = "HOME" in given ? given.HOME : variable(shell, "HOME")[0];
+    return known(home) ? home : void 0;
   }
   const cdpath = "CDPATH" in given ? given.CDPATH : variable(shell, "CDPATH")[0];
   const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") && ![".", ".."].includes(folder.split("/")[0]);
   if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return void 0;
-  if (folder !== "~" && !folder.startsWith("~/")) return folder;
-  const home = variable(shell, "HOME")[0];
-  return known(home) ? home + folder.slice(1) : void 0;
+  return folder === "~" || folder.startsWith("~/") ? void 0 : folder;
 }
 function isFile(path) {
   try {
@@ -3334,12 +3337,17 @@ function declare(name, args, shell) {
     const eq = arg.indexOf("=");
     const key = eq < 0 ? arg : arg.slice(0, eq);
     const lent = variable(shell, key.replace(/\+$/, ""))[1];
+    const exportedLocal = name === "local" && on.includes("x") && off === "" && eq >= 0 && !key.endsWith("+");
     if (isLent(lent) && name !== "readonly" && !(on + off).includes("g")) {
-      shell.vars[key.replace(/\+$/, "")] = [SUBSTITUTED, lent];
+      shell.vars[key.replace(/\+$/, "")] = [exportedLocal ? arg.slice(eq + 1) : SUBSTITUTED, lent];
       continue;
     }
-    if (!plain || key.endsWith("+")) {
+    if (exportedLocal) {
+      shell.vars[key] = [arg.slice(eq + 1), true];
+    } else if (!plain || key.endsWith("+")) {
       forget(shell, new Set([key.replace(/\+$/, "")].filter(Boolean)));
+    }
+    if (!plain || key.endsWith("+")) {
       if (shell.scoped.length > 0 && sure && (name === "local" || name !== "readonly" && !/[gx]/.test(on + off))) {
         shell.scoped.at(-1)?.add(key.replace(/\+$/, ""));
       }
@@ -3418,10 +3426,42 @@ function shellString(name, args) {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
       const flag = arg.startsWith("-") || arg.startsWith("/") ? arg.slice(1).toLowerCase() : "";
-      if (flag === "c" || flag.length >= 3 && "command".startsWith(flag)) return args.slice(i + 1).join(" ");
+      if (flag === "c" || flag.length >= 3 && "command".startsWith(flag)) return hashtablesEmptied(args.slice(i + 1).join(" "));
     }
   }
   return void 0;
+}
+function hashtablesEmptied(text) {
+  let out = "";
+  let quote;
+  for (let i = 0; i < text.length; ) {
+    if (quote === void 0 && text.startsWith("@{", i)) {
+      out += "@{}";
+      i = hashtableEnd(text, i + 2);
+      continue;
+    }
+    const ch = text[i];
+    quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+function hashtableEnd(text, start) {
+  let depth = 1;
+  let quote;
+  let i = start;
+  for (; i < text.length && depth > 0; i++) {
+    const ch = text[i];
+    if (quote !== void 0) {
+      if (ch === quote) quote = void 0;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else {
+      depth += ch === "{" ? 1 : ch === "}" ? -1 : 0;
+    }
+  }
+  return i;
 }
 function lend(shell, assignments) {
   const before = /* @__PURE__ */ new Map();
@@ -3503,7 +3543,8 @@ function simple(words2, item, before, shell, depth) {
     if (!known[1]) return [];
   }
   const parsed = program(argv, shell.cwd);
-  const { name, args } = parsed;
+  const { name } = parsed;
+  const args = parsed.args.map((arg) => tilde(arg, shell));
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
   const assigns = name === void 0 && argv.every(isAssignment);
   const status = shell.status;
@@ -3871,8 +3912,8 @@ function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
     let value;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && (option === "stdinnull" || option === "forkafterauthentication") && ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase() === "yes") {
-      switches.add("-n");
+    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("stdinnull="))) {
+      switches.add(`stdinnull=${((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase()}`);
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -3936,7 +3977,7 @@ function sshPipe(args, fed, receives) {
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
   if (destination === void 0) return [];
-  const sends = fed && !switches.has("-n") && !switches.has("-f");
+  const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("stdinnull=yes");
   return [["out", sends], ["in", receives]].filter(([, used]) => used).map(([d]) => [d, destination, options]);
 }
 function netcat(args, sends) {
@@ -4046,20 +4087,7 @@ function parse(call, processEnv) {
   else if (tool === "httpie") raw = httpie(call.args, sends);
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return void 0;
-  return [tool, raw.map(([d, dest, options, dial]) => [d, dest, call.otherUser ? void 0 : configTilde(options, envValue(call.env, processEnv, "HOME")), dial])];
-}
-function configTilde(options, home) {
-  if (options === void 0) return void 0;
-  const out = [];
-  for (let i = 0; i < options.length; i++) {
-    let value = options[i];
-    if (i > 0 && options[i - 1] === "-F" && (value === "~" || value.startsWith("~/"))) {
-      if (!home || home.includes(SUBSTITUTED)) return void 0;
-      value = home + value.slice(1);
-    }
-    out.push(value);
-  }
-  return out;
+  return [tool, raw.map(([d, dest, options, dial]) => [d, dest, call.otherUser ? void 0 : options, dial])];
 }
 function cleanHost(value) {
   let host = value.trim().toLowerCase();
@@ -4215,10 +4243,10 @@ function configUnsafe(passthrough, home, processEnv) {
   return false;
 }
 async function sshHostname(destination, options, cwd, state) {
+  if (options.some((value, i) => options[i - 1] === "-F" && (value === "~" || value.startsWith("~/")))) return "";
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
-    const path = expandHome(value);
-    return path === "none" || isAbsolute3(path) || cwd === void 0 ? path : join5(cwd, path);
+    return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join5(cwd, value);
   });
   const key = JSON.stringify([destination, resolved]);
   const cached = state.sshHosts.get(key);

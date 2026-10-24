@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'a0053f9f6d6bb2115388a2bd39b6db55976779fb78b23d4592a30823cf547911'
+BLOCK_SHA256 = '8368dbd4e7b3f24b3b984a70afe1b6c469df7804d7c3a79359d31af382b91aba'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -849,6 +849,7 @@ class ParserFindingTests(TransferTestCase):
                                   (f'HOME={self.repo}; HOME={self.repo}/frontend cd; scp -F cfg f prod:/tmp', private),
                                   (f'HOME={self.repo}; HOME={self.repo}/frontend cd ~; scp -F cfg f prod:/tmp', public),
                                   (f'HOME={self.repo}/frontend; scp -F ~/cfg f prod:/tmp', private),
+                                  (f'HOME={self.repo}; HOME={self.repo}/frontend scp -F ~/cfg f prod:/tmp', public),
                                   ('FOO=1 cd frontend; scp -F cfg f prod:/tmp', private)):
             self.assert_endpoints(command, [expected])
         # exec replaces the shell even when what it runs is a builtin, so the scp never runs.
