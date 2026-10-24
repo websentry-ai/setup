@@ -2703,25 +2703,33 @@ function cdWords(args) {
   }
   return [letters, folders];
 }
-function cdTarget(args, cwd, shell) {
+function cdTarget(args, cwd, shell, given) {
   const [letters, folders] = cdWords(args);
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1];
   if (folders.length > 1 || /[^LP]/.test(letters)) return [void 0, void 0];
-  if (folders[0] !== void 0 && [..."$*?[", SUBSTITUTED].some((c) => folders[0].includes(c))) {
-    return [void 0, void 0];
-  }
-  const first = folders[0];
-  if (first !== void 0 && variable(shell, "CDPATH")[0] && first !== "-" && !first.startsWith("/") && !first.startsWith("~") && ![".", ".."].includes(first.split("/")[0])) {
-    return [void 0, void 0];
-  }
+  const path = cdPath(folders, shell, given);
+  if (path === void 0) return [void 0, void 0];
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
-  const path = expandHome(folders[0] ?? "~");
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
   const target = isAbsolute3(path) ? path : cwd === void 0 || path === "-" ? void 0 : join5(cwd, path);
   if (target !== void 0 && isFile(target)) return [cwd, 1];
   if (target === void 0 || shell.names.has(basename(normalize(target))) || landed.size > 1) return [void 0, void 0];
   const folder = [...landed][0];
   return folder === void 0 ? [cwd, 1] : [folder, 0];
+}
+function cdPath(folders, shell, given) {
+  const known = (value) => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
+  const folder = folders[0];
+  if (folder === void 0) {
+    const home2 = "HOME" in given ? given.HOME : variable(shell, "HOME")[0];
+    return known(home2) ? home2 : void 0;
+  }
+  const cdpath = "CDPATH" in given ? given.CDPATH : variable(shell, "CDPATH")[0];
+  const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") && ![".", ".."].includes(folder.split("/")[0]);
+  if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return void 0;
+  if (folder !== "~" && !folder.startsWith("~/")) return folder;
+  const home = variable(shell, "HOME")[0];
+  return known(home) ? home + folder.slice(1) : void 0;
 }
 function isFile(path) {
   try {
@@ -2757,7 +2765,8 @@ function namedSegments(list) {
   const names = /* @__PURE__ */ new Set();
   for (const item of list) {
     const argv = item.kind === "cmd" ? item.argv.filter((w) => !KEYWORDS.has(w)) : [];
-    const name = argv.length > 0 ? programName(argv[0]) : void 0;
+    const first = argv.find((w) => !isAssignment(w));
+    const name = first === void 0 ? void 0 : programName(first);
     if (name === void 0 || LOOKS.has(name)) continue;
     for (const word of argv) {
       const segments = word.split("/").filter((segment) => segment !== "");
@@ -3277,9 +3286,8 @@ function marker(item, shell) {
     }
   }
 }
-function builtin(name, args, cwd, shell) {
-  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell)[0];
-  else if (name === "unset") unset(args, shell);
+function builtin(name, args, shell) {
+  if (name === "unset") unset(args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
 }
@@ -3321,6 +3329,7 @@ function declare(name, args, shell) {
     else off += option.slice(1);
   }
   const plain = (name === "declare" || name === "typeset") && shell.floor === void 0 && /^x*$/.test(on + off) && !(on !== "" && off !== "");
+  const sure = shell.pipe.runs === true && !doubt(shell.pipe);
   for (const arg of args.slice(i)) {
     const eq = arg.indexOf("=");
     const key = eq < 0 ? arg : arg.slice(0, eq);
@@ -3331,6 +3340,9 @@ function declare(name, args, shell) {
     }
     if (!plain || key.endsWith("+")) {
       forget(shell, new Set([key.replace(/\+$/, "")].filter(Boolean)));
+      if (shell.scoped.length > 0 && sure && (name === "local" || name !== "readonly" && !/[gx]/.test(on + off))) {
+        shell.scoped.at(-1)?.add(key.replace(/\+$/, ""));
+      }
       continue;
     }
     const [current, exported] = variable(shell, key);
@@ -3444,7 +3456,13 @@ function callFunction(known, layer, subshell, shell, depth) {
   const outer = [shell.pipe, shell.start, shell.floor];
   const outside = liveness(shell);
   shell.floor = shell.frames.length;
+  shell.scoped.push(/* @__PURE__ */ new Set());
   walkItems(body, shell, depth + 1);
+  for (const name of shell.scoped.pop() ?? []) {
+    const before = state[1][name];
+    if (before !== void 0) shell.vars[name] = before;
+    else delete shell.vars[name];
+  }
   [shell.pipe, shell.start, shell.floor] = outer;
   wrap(shell, first, layer);
   if (subshell) {
@@ -3491,7 +3509,8 @@ function simple(words2, item, before, shell, depth) {
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
   if (assigns && !substituted) shell.status = 0;
-  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell)[1];
+  const moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
+  if (moved !== void 0) shell.status = moved[1];
   if (name === "set" || name === "shift") shell.args = void 0;
   if (name === "return" || name === "exit") {
     const given = args[0];
@@ -3502,7 +3521,8 @@ function simple(words2, item, before, shell, depth) {
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
-      builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
+      if (moved !== void 0) shell.cwd = moved[0];
+      else builtin(name ?? "", assigns ? argv : args, shell);
       if (subshell === void 0) unsure(shell, saved);
       else if (doubt(shell.pipe)) forget(shell, changes(shell, saved));
     }
@@ -3631,7 +3651,8 @@ function walk(items, cwd, exported, processEnv, depth, positional = []) {
     floor: void 0,
     args: [...positional],
     ends: /* @__PURE__ */ new Map(),
-    names: namedSegments(items)
+    names: namedSegments(items),
+    scoped: []
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -3830,7 +3851,7 @@ function wget(args) {
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
   return urls.map((url) => [direction, urlHost(url), void 0]);
 }
-function sshArgs(name, args) {
+function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
   const passthrough = [];
   const operands = [];
   const valueFlags = SSH_VALUE_FLAGS[name] ?? "";
@@ -3848,8 +3869,11 @@ function sshArgs(name, args) {
     }
     let flag;
     let value;
-    [flag, value, i] = shortOption(arg, args, i, valueFlags, /* @__PURE__ */ new Set());
+    [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
+    if (flag === "-o" && (option === "stdinnull" || option === "forkafterauthentication") && ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase() === "yes") {
+      switches.add("-n");
+    }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
     }
@@ -3907,10 +3931,12 @@ function copy(name, args, env, processEnv) {
   }
   return out;
 }
-function sshPipe(args, sends, receives) {
-  const [operands, options] = sshArgs("ssh", args);
+function sshPipe(args, fed, receives) {
+  const switches = /* @__PURE__ */ new Set();
+  const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
   if (destination === void 0) return [];
+  const sends = fed && !switches.has("-n") && !switches.has("-f");
   return [["out", sends], ["in", receives]].filter(([, used]) => used).map(([d]) => [d, destination, options]);
 }
 function netcat(args, sends) {
@@ -4020,7 +4046,20 @@ function parse(call, processEnv) {
   else if (tool === "httpie") raw = httpie(call.args, sends);
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return void 0;
-  return [tool, raw.map(([d, dest, options, dial]) => [d, dest, call.otherUser ? void 0 : options, dial])];
+  return [tool, raw.map(([d, dest, options, dial]) => [d, dest, call.otherUser ? void 0 : configTilde(options, envValue(call.env, processEnv, "HOME")), dial])];
+}
+function configTilde(options, home) {
+  if (options === void 0) return void 0;
+  const out = [];
+  for (let i = 0; i < options.length; i++) {
+    let value = options[i];
+    if (i > 0 && options[i - 1] === "-F" && (value === "~" || value.startsWith("~/"))) {
+      if (!home || home.includes(SUBSTITUTED)) return void 0;
+      value = home + value.slice(1);
+    }
+    out.push(value);
+  }
+  return out;
 }
 function cleanHost(value) {
   let host = value.trim().toLowerCase();

@@ -526,9 +526,19 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["for ((i=0;i<1;i++)); do cd frontend; [ -f m ] && i=-1; done; scp -F cfg f prod:/tmp", "prod"],
     ["for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp", "10.0.4.12"],
     ["for ((i=0;i<1;i++)); do echo $i; cd frontend; done; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    // A bare cd and a leading ~ go to the shell's HOME. A HOME= in front of cd applies to a bare cd, but ~ is expanded
+    // before it; a VAR= in front of cd leaves it a cd.
+    [`HOME=${dir}/frontend; cd; scp -F cfg f prod:/tmp`, "10.0.4.12"],
+    [`HOME=${dir}/frontend; cd ~; scp -F cfg f prod:/tmp`, "10.0.4.12"],
+    [`HOME=${dir}; HOME=${dir}/frontend cd; scp -F cfg f prod:/tmp`, "10.0.4.12"],
+    [`HOME=${dir}; HOME=${dir}/frontend cd ~; scp -F cfg f prod:/tmp`, "203.0.113.9"],
+    ["FOO=1 cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // exec replaces the shell even when what it runs is a builtin, so the scp never runs.
     ["exec cd frontend; scp -F cfg f prod:/tmp", undefined],
   ] as const) assert.equal(await at(command), expected, command);
+  // An -F path's ~ is the shell's HOME, which the agent's environment exports.
+  const tilde = await transfer(`HOME=${dir}/frontend; scp -F ~/cfg f prod:/tmp`, dir, { env: { HOME: EMPTY_HOME } });
+  assert.equal(tilde?.endpoints[0]?.resolved_host, "10.0.4.12");
 });
 
 test("URL globs reach every host they name", async () => {

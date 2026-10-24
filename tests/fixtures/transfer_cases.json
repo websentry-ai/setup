@@ -3514,6 +3514,102 @@
    "transfer": null
   },
   {
+   "command": "ssh -n prod true < secret",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -f prod true",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=yes prod true",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=no prod true",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { local RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; }; f; rsync -a b prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { typeset RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a b prod:/srv; }; f",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { declare -g RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; }; f; rsync -a b prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { declare RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; }; f; rsync -a b prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=\"ssh -o HostName=10.0.4.12\"; f() { typeset RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; }; f; rsync -a b prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

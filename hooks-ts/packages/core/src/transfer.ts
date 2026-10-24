@@ -999,23 +999,15 @@ function cdWords(args: string[]): [string, string[]] {
 
 /** [the folder a cd lands in from `cwd`, the status it leaves]: 0 where it lands, the old folder and 1 when every
  *  shell rejects it or the folder is not there; undefined for either when that is not known. */
-function cdTarget(args: string[], cwd: string | undefined, shell: Shell): [string | undefined, number | undefined] {
+function cdTarget(args: string[], cwd: string | undefined, shell: Shell, given: Env): [string | undefined, number | undefined] {
   const [letters, folders] = cdWords(args);
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1]; // every shell rejects the cd and stays
   // Bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary.
   if (folders.length > 1 || /[^LP]/.test(letters)) return [undefined, undefined];
-  // A variable, substitution or glob the shell expands to a folder not known here.
-  if (folders[0] !== undefined && [..."$*?[", SUBSTITUTED].some((c) => (folders[0] as string).includes(c))) {
-    return [undefined, undefined];
-  }
-  const first = folders[0];
-  if (first !== undefined && variable(shell, "CDPATH")[0] && first !== "-" && !first.startsWith("/") &&
-      !first.startsWith("~") && ![".", ".."].includes(first.split("/")[0] as string)) {
-    return [undefined, undefined]; // CDPATH may find the folder somewhere else first
-  }
+  const path = cdPath(folders, shell, given);
+  if (path === undefined) return [undefined, undefined];
   // Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
-  const path = expandHome(folders[0] ?? "~");
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
   const target = isAbsolute(path) ? path : cwd === undefined || path === "-" ? undefined : join(cwd, path);
   if (target !== undefined && isFile(target)) return [cwd, 1]; // a file is no folder to land in
@@ -1023,6 +1015,25 @@ function cdTarget(args: string[], cwd: string | undefined, shell: Shell): [strin
   if (target === undefined || shell.names.has(basename(normalize(target))) || landed.size > 1) return [undefined, undefined];
   const folder = [...landed][0];
   return folder === undefined ? [cwd, 1] : [folder, 0];
+}
+
+/** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a leading ~
+ *  from the shell's HOME, read before that. Undefined when not known: a variable, substitution or glob, a HOME not
+ *  known, or a relative folder that CDPATH may find somewhere else first. */
+function cdPath(folders: string[], shell: Shell, given: Env): string | undefined {
+  const known = (value: string | undefined): value is string => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
+  const folder = folders[0];
+  if (folder === undefined) {
+    const home = "HOME" in given ? given.HOME : variable(shell, "HOME")[0];
+    return known(home) ? home : undefined;
+  }
+  const cdpath = "CDPATH" in given ? given.CDPATH : variable(shell, "CDPATH")[0];
+  const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") &&
+    ![".", ".."].includes(folder.split("/")[0] as string);
+  if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return undefined;
+  if (folder !== "~" && !folder.startsWith("~/")) return folder;
+  const home = variable(shell, "HOME")[0];
+  return known(home) ? home + folder.slice(1) : undefined;
 }
 
 /** Whether `path` is there and is not a folder. */
@@ -1044,7 +1055,8 @@ function namedSegments(list: Item[]): Set<string> {
   const names = new Set<string>();
   for (const item of list) {
     const argv = item.kind === "cmd" ? item.argv.filter((w) => !KEYWORDS.has(w)) : [];
-    const name = argv.length > 0 ? programName(argv[0] as string) : undefined;
+    const first = argv.find((w) => !isAssignment(w));
+    const name = first === undefined ? undefined : programName(first);
     if (name === undefined || LOOKS.has(name)) continue;
     for (const word of argv) {
       const segments = word.split("/").filter((segment) => segment !== "");
@@ -1260,6 +1272,8 @@ interface Shell {
   args: string[] | undefined;
   /** The path segments the walk's commands name, other than those that only look at a folder. */
   names: Set<string>;
+  /** The names declared local in each function call being walked, put back when it returns. */
+  scoped: Set<string>[];
   /** What follows the end of each compound in `items`, by where it opens. */
   ends: Map<string, [string, number]>;
 }
@@ -1806,12 +1820,9 @@ function marker(item: Item, shell: Shell): void {
   }
 }
 
-/** Apply a cd, export or unset, or a command made only of assignments (name ""), to the commands after it. */
-/** Apply a cd, export, unset or declaration, or a command made only of assignments (name ""), to the commands after
- *  it. */
-function builtin(name: string, args: string[], cwd: string | undefined, shell: Shell): void {
-  if (name === "cd") shell.cwd = cdTarget(args, cwd, shell)[0];
-  else if (name === "unset") unset(args, shell);
+/** Apply an export, unset or declaration, or a command made only of assignments (name ""), to the commands after it. */
+function builtin(name: string, args: string[], shell: Shell): void {
+  if (name === "unset") unset(args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
 }
@@ -1847,7 +1858,7 @@ function unset(args: string[], shell: Shell): void {
 }
 
 /** declare or typeset outside a function set NAME=value, exporting with -x and not with +x. Other options, +=, local,
- *  readonly, and declarations in a function (bash scopes them, zsh may not) leave the names unknown. */
+ *  readonly, and declarations in a function leave the names unknown; a local one put back after its call. */
 function declare(name: string, args: string[], shell: Shell): void {
   let on = "";
   let off = "";
@@ -1863,6 +1874,7 @@ function declare(name: string, args: string[], shell: Shell): void {
   }
   const plain = (name === "declare" || name === "typeset") && shell.floor === undefined && /^x*$/.test(on + off) &&
     !(on !== "" && off !== "");
+  const sure = shell.pipe.runs === true && !doubt(shell.pipe);
   for (const arg of args.slice(i)) {
     const eq = arg.indexOf("=");
     const key = eq < 0 ? arg : arg.slice(0, eq);
@@ -1873,6 +1885,10 @@ function declare(name: string, args: string[], shell: Shell): void {
     }
     if (!plain || key.endsWith("+")) {
       forget(shell, new Set([key.replace(/\+$/, "")].filter(Boolean)));
+      // Local to the call in both shells, unless zsh makes it global: declare or typeset -x.
+      if (shell.scoped.length > 0 && sure && (name === "local" || (name !== "readonly" && !/[gx]/.test(on + off)))) {
+        shell.scoped.at(-1)?.add(key.replace(/\+$/, ""));
+      }
       continue;
     }
     const [current, exported] = variable(shell, key);
@@ -2010,7 +2026,14 @@ function callFunction(known: [Item[], boolean], layer: Layer, subshell: Maybe, s
   const outer: [Pipeline, Snapshot, number | undefined] = [shell.pipe, shell.start, shell.floor];
   const outside = liveness(shell);
   shell.floor = shell.frames.length;
+  shell.scoped.push(new Set());
   walkItems(body, shell, depth + 1);
+  for (const name of shell.scoped.pop() ?? []) {
+    // A local ends with the call, and the value from before it is back.
+    const before = state[1][name];
+    if (before !== undefined) shell.vars[name] = before;
+    else delete shell.vars[name];
+  }
   [shell.pipe, shell.start, shell.floor] = outer;
   wrap(shell, first, layer);
   if (subshell) {
@@ -2068,7 +2091,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
   if (assigns && !substituted) shell.status = 0;
-  if (name === "cd") shell.status = cdTarget(args, parsed.cwd, shell)[1];
+  const moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
+  if (moved !== undefined) shell.status = moved[1];
   if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
   if (name === "return" || name === "exit") {
     // Either leaves the status it is given, or else the one before it; a return outside a function fails.
@@ -2081,7 +2105,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
     if (((before !== "|" && item.after !== "|") || subshell === undefined) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
-      builtin(name ?? "", assigns ? argv : args, parsed.cwd, shell);
+      if (moved !== undefined) shell.cwd = moved[0];
+      else builtin(name ?? "", assigns ? argv : args, shell);
       if (subshell === undefined) unsure(shell, saved);
       else if (doubt(shell.pipe)) forget(shell, changes(shell, saved)); // it may not have run
     }
@@ -2223,7 +2248,7 @@ function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv:
     start: [cwd, { ...vars }, new Map()], processEnv, calls: [], openingPipe: false,
     pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false },
     functions: new Map(), callsLeft: MAX_CALLS, items, at: 0, live: true, floor: undefined, args: [...positional],
-    ends: new Map(), names: namedSegments(items),
+    ends: new Map(), names: namedSegments(items), scoped: [],
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -2451,8 +2476,9 @@ function wget(args: string[]): Raw[] {
   return urls.map((url): Raw => [direction, urlHost(url), undefined]);
 }
 
-/** The operands, and the options that change which host or user ssh -G resolves, for ssh, scp or sftp. */
-function sshArgs(name: string, args: string[]): [string[], string[]] {
+/** (operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; `switches` collects
+ *  the flags such as -n, and -n for an -o that keeps stdin unread. */
+function sshArgs(name: string, args: string[], switches = new Set<string>()): [string[], string[]] {
   const passthrough: string[] = [];
   const operands: string[] = [];
   const valueFlags = SSH_VALUE_FLAGS[name] ?? "";
@@ -2472,8 +2498,12 @@ function sshArgs(name: string, args: string[]): [string[], string[]] {
     }
     let flag: string;
     let value: string | undefined;
-    [flag, value, i] = shortOption(arg, args, i, valueFlags, new Set());
+    [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
+    if (flag === "-o" && (option === "stdinnull" || option === "forkafterauthentication") &&
+        ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase() === "yes") {
+      switches.add("-n");
+    }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
     }
@@ -2541,10 +2571,14 @@ function copy(name: string, args: string[], env: Env, processEnv: Record<string,
   return out;
 }
 
-function sshPipe(args: string[], sends: boolean, receives: boolean): Raw[] {
-  const [operands, options] = sshArgs("ssh", args);
+/** ssh used as a pipe: sent to when its stdin is fed in, fetched from when its stdout is kept. -n, and -f, which
+ *  implies it, keep stdin unread. */
+function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
+  const switches = new Set<string>();
+  const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
   if (destination === undefined) return [];
+  const sends = fed && !switches.has("-n") && !switches.has("-f");
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }
 
@@ -2668,7 +2702,23 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return undefined;
   // Under sudo, ssh runs as that user, with that user's config, which this can't read.
-  return [tool, raw.map(([d, dest, options, dial]): Raw => [d, dest, call.otherUser ? undefined : options, dial])];
+  return [tool, raw.map(([d, dest, options, dial]): Raw => [d, dest, call.otherUser ? undefined : configTilde(options, envValue(call.env, processEnv, "HOME")), dial])];
+}
+
+/** ssh -G options with a leading ~ in an -F path made the shell's HOME, which it expands before ssh runs; undefined
+ *  when that HOME is not known. */
+function configTilde(options: string[] | undefined, home: string): string[] | undefined {
+  if (options === undefined) return undefined;
+  const out: string[] = [];
+  for (let i = 0; i < options.length; i++) {
+    let value = options[i] as string;
+    if (i > 0 && options[i - 1] === "-F" && (value === "~" || value.startsWith("~/"))) {
+      if (!home || home.includes(SUBSTITUTED)) return undefined;
+      value = home + value.slice(1);
+    }
+    out.push(value);
+  }
+  return out;
 }
 
 /** A host name or address in lower case without brackets; empty when it isn't one. */

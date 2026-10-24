@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '8d8bda5e677e118263b1ce99a2168ecace07b0f6c3f44c853841cca4c0076a7b'
+BLOCK_SHA256 = 'a0053f9f6d6bb2115388a2bd39b6db55976779fb78b23d4592a30823cf547911'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -841,7 +841,15 @@ class ParserFindingTests(TransferTestCase):
                                    unknown),
                                   ('for ((i=0;i<1;i++)); do cd frontend; i=0; break; done; scp -F cfg f prod:/tmp',
                                    private),
-                                  ('for ((i=0;i<1;i++)); do echo $i; cd frontend; done; scp -F cfg f prod:/tmp', private)):
+                                  ('for ((i=0;i<1;i++)); do echo $i; cd frontend; done; scp -F cfg f prod:/tmp', private),
+                                  # A bare cd and a leading ~ go to the shell's HOME. A HOME= in front of cd applies to
+                                  # a bare cd, but ~ is expanded before it; a VAR= in front of cd leaves it a cd.
+                                  (f'HOME={self.repo}/frontend; cd; scp -F cfg f prod:/tmp', private),
+                                  (f'HOME={self.repo}/frontend; cd ~; scp -F cfg f prod:/tmp', private),
+                                  (f'HOME={self.repo}; HOME={self.repo}/frontend cd; scp -F cfg f prod:/tmp', private),
+                                  (f'HOME={self.repo}; HOME={self.repo}/frontend cd ~; scp -F cfg f prod:/tmp', public),
+                                  (f'HOME={self.repo}/frontend; scp -F ~/cfg f prod:/tmp', private),
+                                  ('FOO=1 cd frontend; scp -F cfg f prod:/tmp', private)):
             self.assert_endpoints(command, [expected])
         # exec replaces the shell even when what it runs is a builtin, so the scp never runs.
         self.assert_hosts('exec cd frontend; scp -F cfg f prod:/tmp', [])

@@ -6452,22 +6452,19 @@ def _transfer_cd_words(args: List[str]) -> tuple:
     return letters, folders
 
 
-def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict) -> tuple:
+def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict, given: Dict) -> tuple:
     """(the folder a cd lands in from cwd, the status it leaves): 0 where it lands, the old folder and 1 when every
-    shell rejects it or the folder is not there; None for either when that is not known."""
+    shell rejects it or the folder is not there; None for either when that is not known. given: its VAR=value words."""
     letters, folders = _transfer_cd_words(args)
     if any(c not in 'LPeqs@0123456789' for c in letters):
         return cwd, 1  # every shell rejects the cd and stays
     if len(folders) > 1 or any(c not in 'LP' for c in letters):
         return None, None  # bash 5 rejects a second folder, bash 3 ignores it and zsh substitutes it; -e, -q, -s vary
-    if folders and any(c in folders[0] for c in '$*?[' + _TRANSFER_SUBSTITUTED):
-        return None, None  # a variable, substitution or glob the shell expands to a folder not known here
-    if folders and _transfer_variable(shell, 'CDPATH')[0] and folders[0] != '-' and \
-            not folders[0].startswith(('/', '~')) and folders[0].split('/')[0] not in ('.', '..'):
-        return None, None  # CDPATH may find the folder somewhere else first
+    path = _transfer_cd_path(folders, shell, given)
+    if path is None:
+        return None, None
     # Bash follows the last of -L and -P, zsh any -P; -P resolves each link, so a later `cd ..` leaves the real folder.
     last = letters[max(letters.rfind('L'), letters.rfind('P'))] if letters else 'L'
-    path = os.path.expanduser(folders[0] if folders else '~')
     landed = {_transfer_move(cwd, path, physical) for physical in {last == 'P', 'P' in letters}}
     target = path if os.path.isabs(path) else None if cwd is None or path == '-' else os.path.join(cwd, path)
     if target is not None and os.path.exists(target) and not os.path.isdir(target):
@@ -6477,6 +6474,25 @@ def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict) -> tuple:
         return None, None
     folder = landed.pop()
     return (folder, 0) if folder else (cwd, 1)
+
+
+def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[str]:
+    """Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a leading ~
+    from the shell's HOME, read before that. None when not known: a variable, substitution or glob, a HOME not known,
+    or a relative folder that CDPATH may find somewhere else first."""
+    unknown = '$' + _TRANSFER_SUBSTITUTED
+    if not folders:
+        home = given['HOME'] if 'HOME' in given else _transfer_variable(shell, 'HOME')[0]
+        return home if home and not any(c in home for c in unknown) else None
+    folder = folders[0]
+    cdpath = given['CDPATH'] if 'CDPATH' in given else _transfer_variable(shell, 'CDPATH')[0]
+    searched = cdpath and folder != '-' and not folder.startswith(('/', '~')) and folder.split('/')[0] not in ('.', '..')
+    if searched or any(c in folder for c in unknown + '*?['):
+        return None
+    if folder != '~' and not folder.startswith('~/'):
+        return os.path.expanduser(folder)  # ~user, or no ~ at all
+    home = _transfer_variable(shell, 'HOME')[0]
+    return home + folder[1:] if home and not any(c in home for c in unknown) else None
 
 
 _TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat', 'wc', 'head', 'tail',
@@ -6490,7 +6506,7 @@ def _transfer_names(items: List[tuple]) -> set:
     names = set()
     for item in items:
         words = [w for w in item[1] if w not in _TRANSFER_KEYWORDS] if item[0] == 'cmd' else []
-        program = _transfer_program_name(words[0]) if words else None
+        program = next((_transfer_program_name(w) for w in words if not _transfer_is_assignment(w)), None)
         if program and program not in _TRANSFER_LOOKS:
             for word in words:
                 segments = [segment for segment in word.split('/') if segment]
@@ -7087,12 +7103,10 @@ def _transfer_marker(item: tuple, shell: Dict) -> None:
                 _transfer_finish(after, shell)
 
 
-def _transfer_builtin(program: str, args: List[str], cwd: Optional[str], shell: Dict) -> None:
-    """Apply a cd, export, unset or declaration, or a command made only of assignments (program ''), to the commands
+def _transfer_builtin(program: str, args: List[str], shell: Dict) -> None:
+    """Apply an export, unset or declaration, or a command made only of assignments (program ''), to the commands
     after it."""
-    if program == 'cd':
-        shell['cwd'] = _transfer_cd(args, cwd, shell)[0]
-    elif program == 'unset':
+    if program == 'unset':
         _transfer_unset(args, shell)
     elif program in _TRANSFER_DECLARES:
         _transfer_declare(program, args, shell)
@@ -7133,7 +7147,7 @@ def _transfer_unset(args: List[str], shell: Dict) -> None:
 
 def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
     """declare or typeset outside a function set NAME=value, exporting with -x and not with +x. Other options, +=,
-    local, readonly, and declarations in a function (bash scopes them, zsh may not) leave the names unknown."""
+    local, readonly, and declarations in a function leave the names unknown; a local one put back after its call."""
     on = off = ''
     while args and args[0][:1] in '-+' and len(args[0]) > 1:
         option, args = args[0], args[1:]
@@ -7141,6 +7155,7 @@ def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
             break
         on, off = (on + option[1:], off) if option[0] == '-' else (on, off + option[1:])
     plain = program in ('declare', 'typeset') and shell['floor'] is None and set(on + off) <= {'x'} and not (on and off)
+    sure = shell['pipe']['runs'] is True and not _transfer_doubt(shell['pipe'])
     for name, eq, value in (arg.partition('=') for arg in args):
         lent = _transfer_variable(shell, name.rstrip('+'))[1]
         if lent in _TRANSFER_LENT and program != 'readonly' and 'g' not in on + off:
@@ -7148,6 +7163,10 @@ def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
             continue
         if not plain or name.endswith('+'):
             _transfer_forget(shell, {name.rstrip('+')} - {''})
+            # Local to the call in both shells, unless zsh makes it global: declare or typeset -x.
+            scoped = program == 'local' or (program != 'readonly' and not {'g', 'x'} & set(on + off))
+            if shell['scoped'] and sure and scoped:
+                shell['scoped'][-1].add(name.rstrip('+'))
             continue
         current, exported = _transfer_variable(shell, name)
         shell['vars'][name] = (value if eq else current, True if on else False if off else exported)
@@ -7262,7 +7281,13 @@ def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: 
     first, state = len(shell['calls']), _transfer_snapshot(shell)
     outer, outside = (shell['pipe'], shell['start'], shell['floor']), _transfer_liveness(shell)
     shell['floor'] = len(shell['frames'])
+    shell['scoped'].append(set())
     _transfer_items(body, shell, depth + 1)
+    for name in shell['scoped'].pop():  # a local ends with the call, and the value from before it is back
+        if name in state[1]:
+            shell['vars'][name] = state[1][name]
+        else:
+            shell['vars'].pop(name, None)
     shell['pipe'], shell['start'], shell['floor'] = outer
     _transfer_wrap(shell, first, layer)
     if subshell:
@@ -7322,8 +7347,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         if not known[1]:
             return []
         # A function that may not have been defined may leave the name to the program.
-    program, args, env, cwd, other_user = _transfer_program(words, shell['cwd'])
-    env = env if _TRANSFER_CLEAN_ENV in env else {**_transfer_exported(shell), **env}
+    program, args, given, cwd, other_user = _transfer_program(words, shell['cwd'])
+    env = given if _TRANSFER_CLEAN_ENV in given else {**_transfer_exported(shell), **given}
     # A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
     assigns = program is None and all(_transfer_is_assignment(w) for w in words)
     status = shell['status']
@@ -7331,8 +7356,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_arithmetic(words[0]) if len(words) == 1 else None
     if assigns and not substituted:
         shell['status'] = 0
-    if program == 'cd':
-        shell['status'] = _transfer_cd(args, cwd, shell)[1]
+    moved = _transfer_cd(args, cwd, shell, given) if program == 'cd' else None
+    if moved:
+        shell['status'] = moved[1]
     if program in ('set', 'shift'):
         shell['args'] = None  # the positional parameters may have changed
     if program in ('return', 'exit'):
@@ -7346,7 +7372,10 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
             saved = _transfer_snapshot(shell)
-            _transfer_builtin(program or '', words if assigns else args, cwd, shell)
+            if moved:
+                shell['cwd'] = moved[0]
+            else:
+                _transfer_builtin(program or '', words if assigns else args, shell)
             if subshell is None:
                 _transfer_unsure(shell, saved)
             elif _transfer_doubt(shell['pipe']):
@@ -7493,7 +7522,7 @@ def _transfer_shell(items: List[tuple], cwd: Optional[str], exported: Dict, dept
     shell = {'cwd': cwd, 'vars': variables, 'status': None, 'frames': [], 'function': None,
              'start': (cwd, dict(variables), {}), 'calls': [], 'functions': {}, 'calls_left': _TRANSFER_MAX_CALLS,
              'items': items, 'at': 0, 'live': True, 'floor': None, 'args': list(positional), 'ends': {},
-             'names': _transfer_names(items)}
+             'names': _transfer_names(items), 'scoped': []}
     _transfer_pipeline('', True, shell)
     _transfer_items(items, shell, depth)
     return shell
@@ -7704,9 +7733,11 @@ def _transfer_wget(args: List[str]) -> List[tuple]:
     return [(direction, _transfer_url_host(url), None) for url in urls]
 
 
-def _transfer_ssh_args(program: str, args: List[str]) -> tuple:
-    """(operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp."""
+def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:
+    """(operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; switches, when
+    given, collects the flags such as -n, and -n for an -o that keeps stdin unread."""
     passthrough, operands, i = [], [], 0
+    switches = set() if switches is None else switches
     value_flags = _TRANSFER_SSH_VALUE_FLAGS[program]
     # scp's -l is a bandwidth limit, not a login.
     identity_flags = ('l', 'o', 'F', 'J', 'p') if program == 'ssh' else ('o', 'F', 'J', 'P')
@@ -7720,8 +7751,11 @@ def _transfer_ssh_args(program: str, args: List[str]) -> tuple:
         if arg == '--':
             operands.extend(args[i:])
             break
-        flag, value, i = _transfer_short_option(arg, args, i, value_flags, set())
+        flag, value, i = _transfer_short_option(arg, args, i, value_flags, switches)
         option = re.split(r'[\s=]', (value or '').strip(), maxsplit=1)[0].lower()
+        if flag == '-o' and option in ('stdinnull', 'forkafterauthentication') and \
+                re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower() == 'yes':
+            switches.add('-n')
         if value and flag[1:] in identity_flags and (flag != '-o' or option in _TRANSFER_SSH_IDENTITY_OPTIONS):
             passthrough += ['-p' if flag == '-P' else flag, value]
     return operands, passthrough
@@ -7790,10 +7824,13 @@ def _transfer_copy(program: str, args: List[str], env: Dict) -> List[tuple]:
 
 
 def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tuple]:
-    """ssh used as a pipe: sent to when its stdin is fed in, fetched from when its stdout is kept."""
-    operands, options = _transfer_ssh_args('ssh', args)
+    """ssh used as a pipe: sent to when its stdin is fed in, fetched from when its stdout is kept. -n, and -f, which
+    implies it, keep stdin unread."""
+    switches = set()
+    operands, options = _transfer_ssh_args('ssh', args, switches)
     if not operands:
         return []
+    sends = sends and not switches & {'-n', '-f'}
     return [(d, operands[0], options) for d, used in (('out', sends), ('in', receives)) if used]
 
 
@@ -7919,7 +7956,22 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
     else:
         return None
     # Under sudo, ssh runs as that user, with that user's config, which this can't read.
-    return tool, [(e[0], e[1], None if other_user else e[2]) + e[3:] for e in raw]
+    return tool, [(e[0], e[1], None if other_user else _transfer_config_tilde(e[2], env)) + e[3:] for e in raw]
+
+
+def _transfer_config_tilde(options: Optional[List[str]], env: Dict) -> Optional[List[str]]:
+    """ssh -G options with a leading ~ in an -F path made the shell's HOME, which it expands before ssh runs; None
+    when that HOME is not known."""
+    if options is None:
+        return None
+    home, out = _transfer_env(env, 'HOME'), []
+    for i, value in enumerate(options):
+        if i and options[i - 1] == '-F' and (value == '~' or value.startswith('~/')):
+            if not home or _TRANSFER_SUBSTITUTED in home:
+                return None
+            value = home + value[1:]
+        out.append(value)
+    return out
 
 
 def _transfer_clean_host(host: str) -> str:
@@ -8071,8 +8123,7 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
 
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> str:
     """The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely."""
-    # The shell expands a leading ~ in an -F path before ssh sees it.
-    options = [os.path.expanduser(v) if i and options[i - 1] == '-F' else v for i, v in enumerate(options)]
+    options = [os.path.expanduser(v) if i and options[i - 1] == '-F' else v for i, v in enumerate(options)]  # ~user
     key = ('ssh', destination, tuple(options), cwd)
     if key not in state:
         state[key] = ''
