@@ -3764,6 +3764,70 @@
    }
   },
   {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; read -r RSYNC_RSH <<< 'ssh -o HostName=8.8.4.4'; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; printf -v RSYNC_RSH '%s' 'ssh -o HostName=8.8.4.4'; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; echo x | read RSYNC_RSH; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; printf '%s' x; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.9.9.9",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=no -o StdinNull=1 prod true",
+   "transfer": null
+  },
+  {
+   "command": "ssh -o StdinNull=yes -o StdinNull=1 prod 'cat f' > out",
+   "transfer": null
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

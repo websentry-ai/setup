@@ -555,10 +555,16 @@ class Lexer {
     return true;
   }
 
-  /** A quoted or escaped character as it goes into the word: a ~ that starts the word is marked, as one the shell does
-   *  not expand. */
+  /** A quoted or escaped character as it goes into the word: a ~ where an unquoted one would be expanded is marked, as
+   *  one the shell leaves. */
   private literal(ch: string): string {
-    return ch === "~" && this.word === "" ? LITERAL_TILDE : ch;
+    return ch === "~" && this.tildePlace() ? LITERAL_TILDE : ch;
+  }
+
+  /** Whether a ~ here starts a tilde prefix: at the start of the word, or of an assignment's value or a part of it after
+   *  a :. */
+  private tildePlace(): boolean {
+    return this.word === "" || ((this.word.endsWith("=") || this.word.endsWith(":")) && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(this.word));
   }
 
   private unquoted(): boolean {
@@ -589,6 +595,8 @@ class Lexer {
       this.separator(ch);
     } else if (ch === " " || ch === "\t" || ch === "\r") {
       this.endWord();
+    } else if (ch === "~" && this.inWord && this.word === "") {
+      this.word += SUBSTITUTED; // after empty quotes: bash leaves the ~, zsh expands it
     } else {
       this.word += this.mark(ch);
       this.inWord = true;
@@ -1026,13 +1034,34 @@ function cdTarget(args: string[], cwd: string | undefined, shell: Shell, given: 
 }
 
 /** A word with a leading ~ or ~/ made the shell's HOME, which the shell reads before a VAR=value in front of the command
- *  applies, or marked unknown when that HOME is not; a quoted one stays ~. */
+ *  applies; marked unknown when that HOME, or the account a ~user names, is not known. A quoted ~ stays. */
 function tilde(word: string, shell: Shell): string {
   if (word.startsWith(LITERAL_TILDE)) return `~${word.slice(1)}`;
-  if (word !== "~" && !word.startsWith("~/")) return word;
-  const home = variable(shell, "HOME")[0];
+  if (!word.startsWith("~")) return word;
+  const head = word.split("/")[0] as string;
+  const home = head === "~" ? variable(shell, "HOME")[0] : undefined;
   const known = !!home && !home.includes("$") && !home.includes(SUBSTITUTED);
-  return (known ? home : SUBSTITUTED) + word.slice(1);
+  return (known ? home : SUBSTITUTED) + word.slice(head.length);
+}
+
+/** A NAME=value with each ~ the shell expands in the value made a folder: the one it starts with, and any after a :,
+ *  as for a word that starts with ~. */
+function assignedTilde(word: string, shell: Shell): string {
+  const at = word.indexOf("=");
+  return `${word.slice(0, at + 1)}${word.slice(at + 1).split(":").map((part) => tilde(part, shell)).join(":")}`;
+}
+
+const READERS: readonly string[] = ["read", "mapfile", "readarray", "getopts", "printf"];
+
+/** The variables a read, mapfile, getopts or printf -v may set, which hold what it read and so are unknown. Every word
+ *  that could name one is taken, which at worst leaves an extra name unknown. */
+function readNames(name: string, args: string[]): Set<string> {
+  if (name === "printf") {
+    return new Set(args.flatMap((a, i) => (a.startsWith("-v") ? [a.slice(2) || (args[i + 1] ?? "")] : [])).filter(Boolean));
+  }
+  if (name === "getopts") return new Set([...args.slice(1, 2), "OPTARG", "OPTIND"]);
+  const names = args.map((a) => a.split("?")[0] as string).filter((n) => isAssignment(`${n}=`));
+  return new Set([...names, name === "read" ? "REPLY" : "MAPFILE"]);
 }
 
 /** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a ~ still
@@ -1049,7 +1078,7 @@ function cdPath(folders: string[], shell: Shell, given: Env): string | undefined
   const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") &&
     ![".", ".."].includes(folder.split("/")[0] as string);
   if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return undefined;
-  return folder === "~" || folder.startsWith("~/") ? `./${folder}` : folder;
+  return folder.startsWith("~") ? `./${folder}` : folder;
 }
 
 /** Whether `path` is there and is not a folder. */
@@ -2124,8 +2153,11 @@ function soften(outside: Liveness, shell: Shell): void {
  *  its body with the command's words as its positional parameters. */
 function simple(words: string[], item: Item, before: string, shell: Shell, depth: number): Call[] {
   const layer: Layer = [before === "|", item.after === "|", item.io];
-  const substituted = words.some((word) => word.includes(SUBSTITUTED));
-  const argv = appends(words, shell);
+  const lead = words.findIndex((word) => !isAssignment(word));
+  const assigned = lead < 0 ? words.length : lead;
+  const expanded = [...words.slice(0, assigned).map((word) => assignedTilde(word, shell)), ...words.slice(assigned)];
+  const substituted = expanded.some((word) => word.includes(SUBSTITUTED));
+  const argv = appends(expanded, shell);
   // A piped or backgrounded command runs in a subshell; the last command of a pipeline (undefined) does in bash, but
   // runs in this shell in zsh.
   const subshell: Maybe = item.after === "|" || item.after === "&" ? true : before === "|" ? undefined : false;
@@ -2143,7 +2175,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   }
   const parsed = program(argv, shell.cwd);
   const { name } = parsed;
-  const args = parsed.args.map((arg) => tilde(arg, shell));
+  const declares = name === "export" || DECLARES.includes(name as string);
+  const args = parsed.args.map((arg) => (declares && isAssignment(arg) ? assignedTilde(arg, shell) : tilde(arg, shell)));
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
   // A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
   const assigns = name === undefined && argv.every(isAssignment);
@@ -2161,6 +2194,9 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     if (name === "return" && shell.floor === undefined) shell.status = 1;
   }
   if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
+  if (READERS.includes(name as string) && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
+    forget(shell, readNames(name as string, args));
+  }
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
     if (((before !== "|" && item.after !== "|") || subshell === undefined) && execsThrough(argv) === false) {
@@ -2560,11 +2596,12 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
     let value: string | undefined;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("StdinNull="))) {
-      // The first counts. ssh takes yes or true and no or false, and runs nothing for any other value.
-      const setting = ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase();
+    if (flag === "-o" && option === "stdinnull") {
+      // The first counts. ssh takes yes or true and no or false, and runs nothing for any other value, wherever.
+      const said = ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase();
       const meaning: Record<string, string> = { yes: "yes", true: "yes", no: "no", false: "no" };
-      switches.add(`StdinNull=${Object.hasOwn(meaning, setting) ? meaning[setting] : "bad"}`);
+      const setting = Object.hasOwn(meaning, said) ? (meaning[said] as string) : "bad";
+      if (setting === "bad" || (!switches.has("StdinNull=yes") && !switches.has("StdinNull=no"))) switches.add(`StdinNull=${setting}`);
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -2959,7 +2996,7 @@ function configUnsafe(passthrough: readonly string[], home: string, processEnv: 
 async function sshHostname(destination: string, options: string[], cwd: string | undefined, state: State): Promise<string> {
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
   // A HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e, names no file this can read.
-  if (options.some((v, i) => options[i - 1] === "-F" && (v === "~" || v.startsWith("~/") || v.startsWith(SUBSTITUTED)))) return "";
+  if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return "";
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute(value) || cwd === undefined ? value : join(cwd, value);

@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'df0cee925d86cabc7bd29eac3aadb9a361df31a59b10a5a67da5ac94b2298a84'
+BLOCK_SHA256 = '76c70ad6f696aa0ff3d2ab91366d296598f1adc7cd56752dacf5f0013c6e963c'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -854,6 +854,11 @@ class ParserFindingTests(TransferTestCase):
                                   (f"HOME={self.repo}; cd '~/frontend'; scp -F cfg f prod:/tmp", public),
                                   (f'HOME={self.repo}; cd \\~/frontend; scp -F cfg f prod:/tmp', public),
                                   (f'HOME={self.repo}; cd ~/frontend; scp -F cfg f prod:/tmp', private),
+                                  (f"HOME={self.repo}; cd '~root'; scp -F cfg f prod:/tmp", public),
+                                  # After empty quotes bash leaves a ~ and zsh expands it.
+                                  (f"HOME={self.repo}; cd ''~/frontend; scp -F cfg f prod:/tmp", unknown),
+                                  # An assignment expands the ~ its value starts with.
+                                  (f'HOME={self.repo}/frontend; cd; HOME=~/..; cd; scp -F cfg f prod:/tmp', public),
                                   ('FOO=1 cd frontend; scp -F cfg f prod:/tmp', private)):
             self.assert_endpoints(command, [expected])
         # exec replaces the shell even when what it runs is a builtin, so the scp never runs.

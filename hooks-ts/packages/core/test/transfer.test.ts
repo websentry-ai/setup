@@ -537,6 +537,11 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     [`HOME=${dir}; cd '~/frontend'; scp -F cfg f prod:/tmp`, "203.0.113.9"],
     [`HOME=${dir}; cd \\~/frontend; scp -F cfg f prod:/tmp`, "203.0.113.9"],
     [`HOME=${dir}; cd ~/frontend; scp -F cfg f prod:/tmp`, "10.0.4.12"],
+    [`HOME=${dir}; cd '~root'; scp -F cfg f prod:/tmp`, "203.0.113.9"],
+    // After empty quotes bash leaves a ~ and zsh expands it.
+    [`HOME=${dir}; cd ''~/frontend; scp -F cfg f prod:/tmp`, "prod"],
+    // An assignment expands the ~ its value starts with.
+    [`HOME=${dir}/frontend; cd; HOME=~/..; cd; scp -F cfg f prod:/tmp`, "203.0.113.9"],
     ["FOO=1 cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // exec replaces the shell even when what it runs is a builtin, so the scp never runs.
     ["exec cd frontend; scp -F cfg f prod:/tmp", undefined],

@@ -2305,10 +2305,15 @@ var Lexer = class _Lexer {
     }
     return true;
   }
-  /** A quoted or escaped character as it goes into the word: a ~ that starts the word is marked, as one the shell does
-   *  not expand. */
+  /** A quoted or escaped character as it goes into the word: a ~ where an unquoted one would be expanded is marked, as
+   *  one the shell leaves. */
   literal(ch) {
-    return ch === "~" && this.word === "" ? LITERAL_TILDE : ch;
+    return ch === "~" && this.tildePlace() ? LITERAL_TILDE : ch;
+  }
+  /** Whether a ~ here starts a tilde prefix: at the start of the word, or of an assignment's value or a part of it after
+   *  a :. */
+  tildePlace() {
+    return this.word === "" || (this.word.endsWith("=") || this.word.endsWith(":")) && /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(this.word);
   }
   unquoted() {
     const { text, i } = this;
@@ -2338,6 +2343,8 @@ var Lexer = class _Lexer {
       this.separator(ch);
     } else if (ch === " " || ch === "	" || ch === "\r") {
       this.endWord();
+    } else if (ch === "~" && this.inWord && this.word === "") {
+      this.word += SUBSTITUTED;
     } else {
       this.word += this.mark(ch);
       this.inWord = true;
@@ -2725,10 +2732,24 @@ function cdTarget(args, cwd, shell, given) {
 }
 function tilde(word, shell) {
   if (word.startsWith(LITERAL_TILDE)) return `~${word.slice(1)}`;
-  if (word !== "~" && !word.startsWith("~/")) return word;
-  const home = variable(shell, "HOME")[0];
+  if (!word.startsWith("~")) return word;
+  const head = word.split("/")[0];
+  const home = head === "~" ? variable(shell, "HOME")[0] : void 0;
   const known = !!home && !home.includes("$") && !home.includes(SUBSTITUTED);
-  return (known ? home : SUBSTITUTED) + word.slice(1);
+  return (known ? home : SUBSTITUTED) + word.slice(head.length);
+}
+function assignedTilde(word, shell) {
+  const at = word.indexOf("=");
+  return `${word.slice(0, at + 1)}${word.slice(at + 1).split(":").map((part) => tilde(part, shell)).join(":")}`;
+}
+var READERS = ["read", "mapfile", "readarray", "getopts", "printf"];
+function readNames(name, args) {
+  if (name === "printf") {
+    return new Set(args.flatMap((a, i) => a.startsWith("-v") ? [a.slice(2) || (args[i + 1] ?? "")] : []).filter(Boolean));
+  }
+  if (name === "getopts") return /* @__PURE__ */ new Set([...args.slice(1, 2), "OPTARG", "OPTIND"]);
+  const names = args.map((a) => a.split("?")[0]).filter((n) => isAssignment(`${n}=`));
+  return /* @__PURE__ */ new Set([...names, name === "read" ? "REPLY" : "MAPFILE"]);
 }
 function cdPath(folders, shell, given) {
   const known = (value) => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
@@ -2740,7 +2761,7 @@ function cdPath(folders, shell, given) {
   const cdpath = "CDPATH" in given ? given.CDPATH : variable(shell, "CDPATH")[0];
   const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") && ![".", ".."].includes(folder.split("/")[0]);
   if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return void 0;
-  return folder === "~" || folder.startsWith("~/") ? `./${folder}` : folder;
+  return folder.startsWith("~") ? `./${folder}` : folder;
 }
 function isFile(path) {
   try {
@@ -3536,8 +3557,11 @@ function soften(outside, shell) {
 }
 function simple(words2, item, before, shell, depth) {
   const layer = [before === "|", item.after === "|", item.io];
-  const substituted = words2.some((word) => word.includes(SUBSTITUTED));
-  const argv = appends(words2, shell);
+  const lead = words2.findIndex((word) => !isAssignment(word));
+  const assigned = lead < 0 ? words2.length : lead;
+  const expanded2 = [...words2.slice(0, assigned).map((word) => assignedTilde(word, shell)), ...words2.slice(assigned)];
+  const substituted = expanded2.some((word) => word.includes(SUBSTITUTED));
+  const argv = appends(expanded2, shell);
   const subshell = item.after === "|" || item.after === "&" ? true : before === "|" ? void 0 : false;
   const called = argv.find((word) => !isAssignment(word));
   const known = called === void 0 ? void 0 : shell.functions.get(called);
@@ -3552,7 +3576,8 @@ function simple(words2, item, before, shell, depth) {
   }
   const parsed = program(argv, shell.cwd);
   const { name } = parsed;
-  const args = parsed.args.map((arg) => tilde(arg, shell));
+  const declares = name === "export" || DECLARES.includes(name);
+  const args = parsed.args.map((arg) => declares && isAssignment(arg) ? assignedTilde(arg, shell) : tilde(arg, shell));
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
   const assigns = name === void 0 && argv.every(isAssignment);
   const status = shell.status;
@@ -3567,6 +3592,9 @@ function simple(words2, item, before, shell, depth) {
     if (name === "return" && shell.floor === void 0) shell.status = 1;
   }
   if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
+  if (READERS.includes(name) && (before !== "|" && item.after !== "|" || subshell === void 0)) {
+    forget(shell, readNames(name, args));
+  }
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
@@ -3920,10 +3948,11 @@ function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
     let value;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("StdinNull="))) {
-      const setting = ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase();
+    if (flag === "-o" && option === "stdinnull") {
+      const said = ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase();
       const meaning = { yes: "yes", true: "yes", no: "no", false: "no" };
-      switches.add(`StdinNull=${Object.hasOwn(meaning, setting) ? meaning[setting] : "bad"}`);
+      const setting = Object.hasOwn(meaning, said) ? meaning[said] : "bad";
+      if (setting === "bad" || !switches.has("StdinNull=yes") && !switches.has("StdinNull=no")) switches.add(`StdinNull=${setting}`);
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -4253,7 +4282,7 @@ function configUnsafe(passthrough, home, processEnv) {
   return false;
 }
 async function sshHostname(destination, options, cwd, state) {
-  if (options.some((v, i) => options[i - 1] === "-F" && (v === "~" || v.startsWith("~/") || v.startsWith(SUBSTITUTED)))) return "";
+  if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return "";
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join5(cwd, value);

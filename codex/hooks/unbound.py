@@ -4291,9 +4291,15 @@ class _TransferLexer:
         return True
 
     def _literal(self, ch: str) -> str:
-        """A quoted or escaped character as it goes into the word: a ~ that starts the word is marked, as one the shell
-        does not expand."""
-        return _TRANSFER_LITERAL_TILDE if ch == '~' and not self.word else ch
+        """A quoted or escaped character as it goes into the word: a ~ where an unquoted one would be expanded is
+        marked, as one the shell leaves."""
+        return _TRANSFER_LITERAL_TILDE if ch == '~' and self._tilde_place() else ch
+
+    def _tilde_place(self) -> bool:
+        """Whether a ~ here starts a tilde prefix: at the start of the word, or of an assignment's value or a part of
+        it after a :."""
+        in_value = re.match(r'[A-Za-z_][A-Za-z0-9_]*\+?=', self.word) is not None
+        return not self.word or (self.word[-1] in '=:' and in_value)
 
     def _unquoted(self) -> bool:
         text, i, ch = self.text, self.i, self.text[self.i]
@@ -4321,6 +4327,8 @@ class _TransferLexer:
             self._separator(ch)
         elif ch in ' \t\r':
             self._end_word()
+        elif ch == '~' and self.in_word and not self.word:
+            self.word += _TRANSFER_SUBSTITUTED  # after empty quotes: bash leaves the ~, zsh expands it
         else:
             self.word, self.in_word = self.word + self._mark(ch), True
         return True
@@ -4741,15 +4749,22 @@ def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict, given: Dict) 
 
 def _transfer_tilde(word: str, shell: Dict) -> str:
     """A word with a leading ~ or ~/ made the shell's HOME, which the shell reads before a VAR=value in front of the
-    command applies, or marked unknown when that HOME is not; a quoted one stays ~. ~user is left to the account
-    database."""
+    command applies; marked unknown when that HOME, or the account a ~user names, is not known. A quoted ~ stays."""
     if word.startswith(_TRANSFER_LITERAL_TILDE):
         return '~' + word[1:]
-    if word != '~' and not word.startswith('~/'):
+    if not word.startswith('~'):
         return word
-    home = _transfer_variable(shell, 'HOME')[0]
+    head = word.split('/', 1)[0]
+    home = _transfer_variable(shell, 'HOME')[0] if head == '~' else None
     known = home and not any(c in home for c in '$' + _TRANSFER_SUBSTITUTED)
-    return (home if known else _TRANSFER_SUBSTITUTED) + word[1:]
+    return (home if known else _TRANSFER_SUBSTITUTED) + word[len(head):]
+
+
+def _transfer_assigned_tilde(word: str, shell: Dict) -> str:
+    """A NAME=value with each ~ the shell expands in the value made a folder: the one it starts with, and any after a
+    :, as for a word that starts with ~."""
+    name, value = word.split('=', 1)
+    return name + '=' + ':'.join(_transfer_tilde(part, shell) for part in value.split(':'))
 
 
 def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[str]:
@@ -4762,10 +4777,11 @@ def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[
         return home if home and not any(c in home for c in unknown) else None
     folder = folders[0]
     cdpath = given['CDPATH'] if 'CDPATH' in given else _transfer_variable(shell, 'CDPATH')[0]
-    searched = cdpath and folder != '-' and not folder.startswith(('/', '~')) and folder.split('/')[0] not in ('.', '..')
+    first = folder.split('/')[0]
+    searched = cdpath and folder != '-' and not folder.startswith(('/', '~')) and first not in ('.', '..')
     if searched or any(c in folder for c in unknown + '*?['):
         return None
-    return './' + folder if folder == '~' or folder.startswith('~/') else os.path.expanduser(folder)  # ~user
+    return './' + folder if folder.startswith('~') else folder
 
 
 _TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat', 'wc', 'head', 'tail',
@@ -5612,6 +5628,21 @@ def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: 
 _TRANSFER_LENT = ('lent', 'lent over a value')
 
 
+_TRANSFER_READERS = ('read', 'mapfile', 'readarray', 'getopts', 'printf')
+
+
+def _transfer_read_names(program: str, args: List[str]) -> set:
+    """The variables a read, mapfile, getopts or printf -v may set, which hold what it read and so are unknown. Every
+    word that could name one is taken, which at worst leaves an extra name unknown."""
+    if program == 'printf':
+        named = {a[2:] or (args[i + 1] if i + 1 < len(args) else '') for i, a in enumerate(args) if a.startswith('-v')}
+        return named - {''}  # an empty name would stand for the folder
+    if program == 'getopts':
+        return set(args[1:2]) | {'OPTARG', 'OPTIND'}
+    names = {a.split('?', 1)[0] for a in args}  # zsh's read NAME?prompt
+    return {n for n in names if _transfer_is_assignment(n + '=')} | {'REPLY' if program == 'read' else 'MAPFILE'}
+
+
 def _transfer_lend(shell: Dict, assignments: List[str]) -> Dict:
     """Set a function call's leading VAR=value words for its body, exported, as bash and zsh do; each name's entry
     from before the call, None when it had none."""
@@ -5627,7 +5658,7 @@ def _transfer_lend(shell: Dict, assignments: List[str]) -> Dict:
 
 def _transfer_take_back(shell: Dict, before: Dict) -> None:
     """Put each lent name back as it was before the call, as bash and zsh do after the body assigns, unsets or
-    declares it locally. One the body exported or left unknown is unknown: bash keeps an exported value, zsh does not."""
+    declares it locally. One the body exported or left unknown is unknown: bash keeps an exported value, zsh doesn't."""
     for name, entry in before.items():
         if shell['vars'].get(name, (None, None))[1] not in _TRANSFER_LENT:
             shell['vars'][name] = (_TRANSFER_SUBSTITUTED, None)
@@ -5641,6 +5672,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     """The calls one simple command makes, after applying its cd, export, unset or declaration; a defined function runs
     its body with the command's words as its positional parameters."""
     layer = (before == '|', after == '|', tuple(io))
+    lead = next((i for i, w in enumerate(words) if not _transfer_is_assignment(w)), len(words))
+    words = [_transfer_assigned_tilde(w, shell) for w in words[:lead]] + words[lead:]
     substituted, words = any(_TRANSFER_SUBSTITUTED in w for w in words), _transfer_appends(words, shell)
     name = next((w for w in words if not _transfer_is_assignment(w)), None)
     # A piped or backgrounded command runs in a subshell; the last command of a pipeline (None) does in bash, but runs
@@ -5657,7 +5690,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
             return []
         # A function that may not have been defined may leave the name to the program.
     program, args, given, cwd, other_user = _transfer_program(words, shell['cwd'])
-    args = [_transfer_tilde(arg, shell) for arg in args]
+    declares = program in ('export',) + _TRANSFER_DECLARES
+    args = [_transfer_assigned_tilde(a, shell) if declares and _transfer_is_assignment(a) else _transfer_tilde(a, shell)
+            for a in args]
     env = given if _TRANSFER_CLEAN_ENV in given else {**_transfer_exported(shell), **given}
     # A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
     assigns = program is None and all(_transfer_is_assignment(w) for w in words)
@@ -5678,6 +5713,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
             shell['status'] = 1
     if program in ('return', 'exit', 'break', 'continue'):
         _transfer_jump_from(program, args, subshell, shell)
+    if program in _TRANSFER_READERS and ((before != '|' and after != '|') or subshell is None):
+        _transfer_forget(shell, _transfer_read_names(program, args))
     if program in ('cd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
@@ -6064,10 +6101,12 @@ def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = 
             break
         flag, value, i = _transfer_short_option(arg, args, i, value_flags, switches)
         option = re.split(r'[\s=]', (value or '').strip(), maxsplit=1)[0].lower()
-        if flag == '-o' and option == 'stdinnull' and not any(s.startswith('StdinNull=') for s in switches):
-            # The first counts. ssh takes yes or true and no or false, and runs nothing for any other value.
-            setting = re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower()
-            switches.add('StdinNull=' + {'yes': 'yes', 'true': 'yes', 'no': 'no', 'false': 'no'}.get(setting, 'bad'))
+        if flag == '-o' and option == 'stdinnull':
+            # The first counts. ssh takes yes or true and no or false, and runs nothing for any other value, wherever.
+            setting = {'yes': 'yes', 'true': 'yes', 'no': 'no', 'false': 'no'}.get(
+                re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower(), 'bad')
+            if setting == 'bad' or not switches & {'StdinNull=yes', 'StdinNull=no'}:
+                switches.add('StdinNull=' + setting)
         if value and flag[1:] in identity_flags and (flag != '-o' or option in _TRANSFER_SSH_IDENTITY_OPTIONS):
             passthrough += ['-p' if flag == '-P' else flag, value]
     return operands, passthrough
@@ -6421,9 +6460,8 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> str:
     """The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely."""
     configs = [v for i, v in enumerate(options) if i and options[i - 1] == '-F']
-    if any(v.startswith(('~/', _TRANSFER_SUBSTITUTED)) or v == '~' for v in configs):
+    if any(v.startswith(('~', _TRANSFER_SUBSTITUTED)) for v in configs):
         return ''  # a HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e
-    options = [os.path.expanduser(v) if i and options[i - 1] == '-F' else v for i, v in enumerate(options)]  # ~user
     key = ('ssh', destination, tuple(options), cwd)
     if key not in state:
         state[key] = ''
