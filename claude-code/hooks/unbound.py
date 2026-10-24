@@ -629,6 +629,45 @@ def _usage_total(usage: Dict) -> int:
     return sum(_usage_value(usage, k) for k in _USAGE_FIELDS)
 
 
+# Tail only: this runs on the synchronous prompt path.
+_SESSION_CONTEXT_TAIL_BYTES = 1024 * 1024
+
+
+def _newest_context_entry(lines: List[bytes]) -> Optional[Dict]:
+    """Newest main-chain usage entry; None if a compaction is newer or none is found."""
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # blank, or a tail cut mid-line
+        if not isinstance(entry, dict) or entry.get('isSidechain'):
+            continue
+        if entry.get('type') == 'system' and entry.get('subtype') == 'compact_boundary':
+            return None
+        message = entry.get('message')
+        usage = message.get('usage') if isinstance(message, dict) else None
+        if isinstance(usage, dict) and _usage_total(usage):  # zero-usage synthetic entries say nothing
+            return entry
+    return None
+
+
+def _transcript_session_context(transcript_path: Optional[str]) -> Optional[Dict]:
+    """Context size at the newest usage entry; None when unmeasurable."""
+    if not transcript_path or transcript_path == 'undefined':
+        return None
+    try:
+        with open(transcript_path, 'rb') as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - _SESSION_CONTEXT_TAIL_BYTES))
+            lines = f.read().split(b'\n')
+        entry = _newest_context_entry(lines)
+        if entry is None:
+            return None
+        return {'context_tokens': _usage_total(entry['message']['usage'])}
+    except Exception:
+        return None
+
+
 def _advisor_usages(message: Dict) -> List[Dict]:
     """Advisor turns ride inside usage.iterations as flattened token blocks under their own
     model. Iterations of type 'message' are already inside the top-level usage."""
@@ -1135,16 +1174,16 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
     # additionalContext feeds the model; the user sees user_notice when the gateway
     # sends one (a skill instruction's admin message), else the same text (spend-limit path).
     additional_context = api_response.get('additionalContext', '')
+    system_message = api_response.get('user_notice') or additional_context
+    response = {}
     if additional_context:
-        return {
-            'hookSpecificOutput': {
-                'hookEventName': 'UserPromptSubmit',
-                'additionalContext': additional_context,
-            },
-            'systemMessage': api_response.get('user_notice') or additional_context,
+        response['hookSpecificOutput'] = {
+            'hookEventName': 'UserPromptSubmit',
+            'additionalContext': additional_context,
         }
-
-    return {}
+    if system_message:
+        response['systemMessage'] = system_message
+    return response
 
 
 def _extract_mcp_server_fields(server: Dict) -> Optional[Dict]:
@@ -4918,6 +4957,10 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     cache = load_policy_cache()
     need_pull_policies = cache is None or is_cache_stale(cache)
 
+    metadata = _prompt_injection_metadata(event)
+    session_context = _transcript_session_context(event.get('transcript_path'))
+    if session_context:
+        metadata['session_context'] = session_context
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': _unbound_app_label(event),
@@ -4928,7 +4971,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'pre_tool_use_data': {
             'tool_name': '',
             'command': '',
-            'metadata': _prompt_injection_metadata(event),
+            'metadata': metadata,
         },
     }
     if need_pull_policies:
