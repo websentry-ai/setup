@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '8368dbd4e7b3f24b3b984a70afe1b6c469df7804d7c3a79359d31af382b91aba'
+BLOCK_SHA256 = '1926e25ae7517b827c1ba88aeb3d62c1daf48ce6ebdd554db8957ccdfcbf029c'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -981,6 +981,15 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         with patch.object(hook, 'RUNNING_CLOUD', True):
             hook.map_copilot_tool('bash', {'command': self.COMMAND}, '', shell_state=shell_state, root_projects={})
         self.assertLessEqual(shell_state['transfers']['deadline'] - time.monotonic(), 3.0)
+
+    def test_a_copilot_powershell_call_keeps_a_hashtable_whole(self):
+        # A ; inside @{ } separates the hashtable's entries, so the cmdlet keeps its -Uri.
+        hook = load_module('copilot/hooks/unbound.py')
+        command = 'Invoke-WebRequest -Method Post -Body @{a=1; b=2} -Uri https://example.com/up'
+        mapped = hook.map_copilot_tool('powershell', {'command': command}, '', shell_state={'dir': self.repo},
+                                       root_projects={})
+        self.assertEqual(mapped['transfer'],
+                         {'tool': 'powershell', 'endpoints': [_endpoint('out', 'example.com', 'public')]})
 
     def test_augment(self):
         hook = load_module('augment/hooks/unbound.py')

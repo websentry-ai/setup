@@ -3716,6 +3716,32 @@
    }
   },
   {
+   "command": "cat secret | ssh -o StdinNull=true prod true",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=true -o StdinNull=no prod true",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=false prod true",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cat secret | ssh -o 'StdinNull True' prod true",
+   "transfer": null
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

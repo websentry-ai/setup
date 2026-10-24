@@ -542,6 +542,16 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
   assert.equal(tilde?.endpoints[0]?.resolved_host, "10.0.4.12");
 });
 
+test("a powershell tool call keeps a hashtable whole", async () => {
+  // A ; inside @{ } separates the hashtable's entries, so the cmdlet keeps its -Uri.
+  const command = "Invoke-WebRequest -Method Post -Body @{a=1; b=2} -Uri https://example.com/up";
+  const found = await resolveTransfers([{ tool_name: "powershell", tool_use_id: "p1", tool_input: { command } }], "/", options());
+  assert.deepEqual(found.get("p1"), {
+    tool: "powershell",
+    endpoints: [{ direction: "out", host: "example.com", resolved_host: "example.com", address: "public" }],
+  });
+});
+
 test("URL globs reach every host they name", async () => {
   // curl expands {a,b} sets and [1-3] ranges itself unless --globoff is given, and stops at a glob it rejects.
   const cases: [string, [string, string][]][] = [

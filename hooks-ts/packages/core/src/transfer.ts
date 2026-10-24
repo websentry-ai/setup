@@ -2527,7 +2527,7 @@ function wget(args: string[]): Raw[] {
 }
 
 /** (operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; `switches` collects
- *  the flags such as -n, and the first -o StdinNull as stdinnull=yes or stdinnull=no. */
+ *  the flags such as -n, and the first -o StdinNull as StdinNull=yes or StdinNull=no. */
 function sshArgs(name: string, args: string[], switches = new Set<string>()): [string[], string[]] {
   const passthrough: string[] = [];
   const operands: string[] = [];
@@ -2550,8 +2550,10 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
     let value: string | undefined;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("stdinnull="))) {
-      switches.add(`stdinnull=${((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase()}`);
+    if (flag === "-o" && option === "stdinnull" && !switches.has("StdinNull=yes") && !switches.has("StdinNull=no")) {
+      // The first counts. ssh takes yes or true and no or false, and runs nothing for any other value.
+      const kept = ["no", "false"].includes(((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase());
+      switches.add(kept ? "StdinNull=no" : "StdinNull=yes");
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -2627,7 +2629,7 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
   if (destination === undefined) return [];
-  const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("stdinnull=yes");
+  const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("StdinNull=yes");
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }
 
@@ -3112,7 +3114,8 @@ export async function resolveTransfers(
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if ((typeof call.decision === "string" && NEVER_RAN.has(call.decision)) || call.ran === false) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
-      const transfer = await transferOf(command, cwd, state);
+      // A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
+      const transfer = await transferOf(call.tool_name === "powershell" ? hashtablesEmptied(command) : command, cwd, state);
       if (transfer !== undefined) transfers.set(call.tool_use_id, transfer);
     }
   } catch {

@@ -7778,7 +7778,7 @@ def _transfer_wget(args: List[str]) -> List[tuple]:
 
 def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:
     """(operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; switches, when
-    given, collects the flags such as -n, and the first -o StdinNull as stdinnull=yes or stdinnull=no."""
+    given, collects the flags such as -n, and the first -o StdinNull as StdinNull=yes or StdinNull=no."""
     passthrough, operands, i = [], [], 0
     switches = set() if switches is None else switches
     value_flags = _TRANSFER_SSH_VALUE_FLAGS[program]
@@ -7796,8 +7796,10 @@ def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = 
             break
         flag, value, i = _transfer_short_option(arg, args, i, value_flags, switches)
         option = re.split(r'[\s=]', (value or '').strip(), maxsplit=1)[0].lower()
-        if flag == '-o' and option == 'stdinnull' and not any(s.startswith('stdinnull=') for s in switches):
-            switches.add('stdinnull=' + re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower())
+        if flag == '-o' and option == 'stdinnull' and not switches & {'StdinNull=yes', 'StdinNull=no'}:
+            # The first counts. ssh takes yes or true and no or false, and runs nothing for any other value.
+            kept = re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower() in ('no', 'false')
+            switches.add('StdinNull=no' if kept else 'StdinNull=yes')
         if value and flag[1:] in identity_flags and (flag != '-o' or option in _TRANSFER_SSH_IDENTITY_OPTIONS):
             passthrough += ['-p' if flag == '-P' else flag, value]
     return operands, passthrough
@@ -7872,7 +7874,7 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
     operands, options = _transfer_ssh_args('ssh', args, switches)
     if not operands:
         return []
-    sends = sends and not switches & {'-n', '-f', 'stdinnull=yes'}
+    sends = sends and not switches & {'-n', '-f', 'StdinNull=yes'}
     return [(d, operands[0], options) for d, used in (('out', sends), ('in', receives)) if used]
 
 
@@ -8326,7 +8328,9 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             candidates.append(shell_state['dir'])
         project = _project_for_paths(candidates, root_projects)
         # The cloud runner's Stop shares a shorter budget with the gateway post, as its git lookups do.
-        transfer = _transfer(command, start_dir,
+        # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
+        script = _transfer_hashtables_emptied(command) if name == 'powershell' and isinstance(command, str) else command
+        transfer = _transfer(script, start_dir,
                              shell_state.setdefault('transfers', {'budget': 3.0} if RUNNING_CLOUD else {}))
         shell_state['transfer_dir'] = _transfer_next_cwd(command, start_dir)
     elif name in READ_TOOLS:
