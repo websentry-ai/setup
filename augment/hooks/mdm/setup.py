@@ -1304,10 +1304,12 @@ def clear_setup() -> bool:
 
 
 def _unbound_hooks_registered(config_path, script_path) -> Optional[bool]:
-    """True when settings.json registers OUR hook on any event, since the install
-    writes them together. False when it does not, None when it could not be read.
-    Unparseable raises, because augment refuses such a file too. Same rule the
-    uninstall strips by."""
+    """True when settings.json registers OUR hook on any event. Any event, not the
+    enforcing one alone: the install writes them together, and under-matching reports
+    'fresh', which the backend counts as a removal, so demanding one named event would
+    accuse every device whose augment ships a different event set. False when it does
+    not, None when it could not be read. Unparseable raises, because augment refuses
+    such a file too. Same rule the uninstall strips by."""
     if not config_path.exists():
         return False
     try:

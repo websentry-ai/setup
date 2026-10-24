@@ -6,6 +6,7 @@ import stat
 import sys
 import platform
 import shutil
+import shlex
 import subprocess
 import hashlib
 import json
@@ -1048,21 +1049,43 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
 
 
 def _is_unbound_hook_command(cmd, script_path) -> bool:
-    """Our cursor hook: the relative path hooks.json ships (matched whole), or the
-    absolute path and the /opt/unbound binary, matched as substrings because the
-    Windows rewrite wraps them in a launcher. Under-matching would report 'fresh',
-    which counts as a removal."""
+    """Ours when the command RUNS our hook or the /opt/unbound binary, not merely
+    mentions one: a decoy like '/bin/true # <our path>' is not ours."""
     if not cmd or not isinstance(cmd, str):
         return False
-    if str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd):
+    if "/opt/unbound/" in cmd and "unbound-hook" in cmd:
         return True
-    return cmd.strip() == "./hooks/unbound.py"
+    try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a path
+        # containing spaces stays one token; only the quotes it leaves are stripped.
+        tokens = shlex.split(cmd, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t for t in (t.strip().strip('"').strip("'") for t in tokens) if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    program = os.path.normcase(os.path.normpath(tokens[0]))
+    # hooks.json ships the relative form; the Windows rewrite makes it absolute.
+    return program in (os.path.normcase(os.path.normpath(str(script_path))),
+                       os.path.normcase(os.path.normpath("./hooks/unbound.py")))
 
 
 def _unbound_hooks_registered(hooks_path, script_path) -> Optional[bool]:
-    """True when hooks.json registers OUR hook on any event, since the install writes
-    them together. False when it does not, None when it could not be read. Unparseable
-    raises, because cursor refuses such a file too."""
+    """True when hooks.json registers OUR hook on any event. Any event, not the
+    enforcing one alone: the install writes them together, and under-matching reports
+    'fresh', which the backend counts as a removal, so demanding one named event would
+    accuse every device whose cursor ships a different event set. False when it does
+    not, None when it could not be read. Unparseable raises, because cursor refuses
+    such a file too."""
     if not hooks_path.exists():
         return False
     try:

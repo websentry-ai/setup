@@ -80,6 +80,12 @@ class TestDetectInstallState(unittest.TestCase):
         self.script.write_text("x", encoding="utf-8")
         self.assertEqual(mdm.detect_install_state(), "tampered")
 
+    def test_a_decoy_that_mentions_our_absolute_path_is_not_ours(self):
+        self._write({"version": 1, "hooks": {
+            "preToolUse": [{"command": f"/bin/true # {self.script}"}]}})
+        self.script.write_text("x", encoding="utf-8")
+        self.assertEqual(mdm.detect_install_state(), "tampered")
+
     def test_binary_install_command_counts_as_ours(self):
         self._write({"version": 1, "hooks": {"preToolUse": [
             {"command": "/opt/unbound/current/unbound-hook/unbound-hook hook"}]}})

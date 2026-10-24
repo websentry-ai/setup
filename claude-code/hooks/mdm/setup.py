@@ -1333,25 +1333,18 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
 
 
 def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
-    """A hook command is ours if it points at OUR managed python hook
-    (script_path) or the /opt/unbound hook binary. Both forms are recognized so a
-    binary-install hook is stripped on clear instead of being orphaned. Matches the
-    specific script path (NOT a bare 'unbound.py' substring) and requires both the
-    install prefix and the binary name, so a foreign hook in a shared/Enterprise
-    config that merely references some other unbound.py / mentions /opt/unbound/
-    isn't stripped."""
-    # A non-string command is never ours; matching one raises and would abandon
-    # every remaining entry in the file.
-    if not cmd or not isinstance(cmd, str):
-        return False
-    return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
+    """Ours when the command RUNS our managed hook or the /opt/unbound binary, not
+    merely mentions one: a decoy like '/bin/true # <our path>' is not ours."""
+    return _command_targets_hook(cmd, script_path)
 
 
 def _unbound_hooks_registered(settings_candidates, script_path) -> Optional[bool]:
-    """True when one of these configs registers OUR hook on any event, since the
-    install writes them together. False when none does, None when one could not be
-    read. Unparseable raises, because the tool refuses such a file too. Same rule the
-    uninstall strips by."""
+    """True when one of these configs registers OUR hook on any event. Any event, not
+    the enforcing one alone: the install writes them together, and under-matching
+    reports 'fresh', which the backend counts as a removal, so demanding one named
+    event would accuse every device whose tool ships a different event set. False when
+    none does, None when one could not be read. Unparseable raises, because the tool
+    refuses such a file too. Same rule the uninstall strips by."""
     for settings_path in settings_candidates:
         if not settings_path.exists():
             continue

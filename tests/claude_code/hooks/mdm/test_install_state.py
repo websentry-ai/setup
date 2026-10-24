@@ -87,6 +87,20 @@ class TestDetectInstallState(unittest.TestCase):
         self.script.write_text("x", encoding="utf-8")
         self.assertEqual(mdm.detect_install_state(), "persisted")
 
+    def test_a_decoy_that_mentions_our_path_is_not_ours(self):
+        self._write("managed-settings.d/unbound.json", {"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": f"/bin/true # {self.script}"}]}]}})
+        self.script.write_text("x", encoding="utf-8")
+        self.assertEqual(mdm.detect_install_state(), "tampered")
+
+    def test_windows_launcher_entries_count_as_ours(self):
+        self._write("managed-settings.d/unbound.json", {"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": f'py -3 "{self.script}"'}]}]}})
+        self.script.write_text("x", encoding="utf-8")
+        self.assertEqual(mdm.detect_install_state(), "persisted")
+
     def test_binary_install_entries_count_as_ours(self):
         self._write("managed-settings.d/unbound.json", {"hooks": {"PreToolUse": [
             {"matcher": "*", "hooks": [{"command": "/opt/unbound/current/unbound-hook/unbound-hook hook"}]}]}})
