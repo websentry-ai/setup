@@ -66,10 +66,10 @@ const WRAPPERS: Record<string, { short: string; long: readonly string[]; operand
 const WRAPPER_CHDIR: Record<string, readonly string[]> = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
 /** Reserved words that open, divide or close a compound command. */
 const KEYWORDS: ReadonlySet<string> = new Set(
-  "{ } if then elif else fi while until for select do done ! function".split(" "),
+  "{ } if then elif else fi while until for select do done ! function time".split(" "),
 );
 /** Reserved words after which the next word still starts a command. */
-const LEADING_WORDS: ReadonlySet<string> = new Set("{ if then elif else while until do !".split(" "));
+const LEADING_WORDS: ReadonlySet<string> = new Set("{ if then elif else while until do ! time".split(" "));
 const LOOPS: readonly string[] = ["while", "until", "for", "select"];
 const DECLARES: readonly string[] = ["declare", "typeset", "local", "readonly"];
 const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
@@ -809,6 +809,8 @@ class Lexer {
     this.param = 0;
     this.dollar = -1;
     const atStart = this.argv.every((w) => LEADING_WORDS.has(w));
+    // bash's time -p sets only how the timing is printed; zsh runs -p as the command.
+    if (word === "-p" && this.argv.at(-1) === "time" && atStart) return;
     if (state === "head") {
       if (word === "in") this.cases[this.cases.length - 1] = "pattern"; // `case WORD in` runs nothing
     } else if (state === "pattern") {
@@ -1589,12 +1591,13 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
     }
     return word === "for" || word === "select" ? [] : rest; // a for loop's header runs nothing
   }
-  if (word === "!" || word === "function") {
-    // `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
+  if (word === "!" || word === "function" || word === "time") {
+    // `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back;
+    // `time` leads a pipeline and leaves its status.
     if (word === "!") shell.pipe.negate = !shell.pipe.negate;
-    else shell.function = rest[0] ?? "";
+    else if (word === "function") shell.function = rest[0] ?? "";
     shell.pipe.leading = true;
-    return word === "!" ? rest : rest.slice(1);
+    return word === "function" ? rest.slice(1) : rest;
   }
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
@@ -2150,7 +2153,7 @@ function command(item: Item, shell: Shell, depth: number): Call[] {
   shell.openingPipe = before === "|";
   while (argv.length > 0 && KEYWORDS.has(argv[0] as string)) {
     // A body's first command is reached by its compound's pipe, which its own redirections then override.
-    if (argv[0] !== "!" && argv[0] !== "function") before = "";
+    if (argv[0] !== "!" && argv[0] !== "function" && argv[0] !== "time") before = "";
     argv = keyword(argv, item, shell);
   }
   shell.openingPipe = false;

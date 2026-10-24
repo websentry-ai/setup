@@ -1897,9 +1897,9 @@ var WRAPPERS = {
 };
 var WRAPPER_CHDIR = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
 var KEYWORDS = new Set(
-  "{ } if then elif else fi while until for select do done ! function".split(" ")
+  "{ } if then elif else fi while until for select do done ! function time".split(" ")
 );
-var LEADING_WORDS = new Set("{ if then elif else while until do !".split(" "));
+var LEADING_WORDS = new Set("{ if then elif else while until do ! time".split(" "));
 var LOOPS = ["while", "until", "for", "select"];
 var DECLARES = ["declare", "typeset", "local", "readonly"];
 var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
@@ -2544,6 +2544,7 @@ var Lexer = class _Lexer {
     this.param = 0;
     this.dollar = -1;
     const atStart = this.argv.every((w) => LEADING_WORDS.has(w));
+    if (word === "-p" && this.argv.at(-1) === "time" && atStart) return;
     if (state === "head") {
       if (word === "in") this.cases[this.cases.length - 1] = "pattern";
     } else if (state === "pattern") {
@@ -3098,11 +3099,11 @@ function keyword(argv, item, shell) {
     }
     return word === "for" || word === "select" ? [] : rest;
   }
-  if (word === "!" || word === "function") {
+  if (word === "!" || word === "function" || word === "time") {
     if (word === "!") shell.pipe.negate = !shell.pipe.negate;
-    else shell.function = rest[0] ?? "";
+    else if (word === "function") shell.function = rest[0] ?? "";
     shell.pipe.leading = true;
-    return word === "!" ? rest : rest.slice(1);
+    return word === "function" ? rest.slice(1) : rest;
   }
   if (word === "}" || word === "fi" || word === "done") {
     const frame = pop(frames, word === "}" ? ["{"] : word === "fi" ? ["if"] : LOOPS);
@@ -3557,7 +3558,7 @@ function command(item, shell, depth) {
   if (!["}", "fi", "done"].includes(argv[0])) begin(before, shell);
   shell.openingPipe = before === "|";
   while (argv.length > 0 && KEYWORDS.has(argv[0])) {
-    if (argv[0] !== "!" && argv[0] !== "function") before = "";
+    if (argv[0] !== "!" && argv[0] !== "function" && argv[0] !== "time") before = "";
     argv = keyword(argv, item, shell);
   }
   shell.openingPipe = false;

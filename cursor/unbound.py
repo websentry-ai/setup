@@ -3832,9 +3832,9 @@ _TRANSFER_WRAPPERS = {
 }
 # Reserved words that open, divide or close a compound command.
 _TRANSFER_KEYWORDS = frozenset({'{', '}', 'if', 'then', 'elif', 'else', 'fi', 'while', 'until', 'for', 'select', 'do',
-                                'done', '!', 'function'})
+                                'done', '!', 'function', 'time'})
 # Reserved words after which the next word still starts a command.
-_TRANSFER_LEADING_WORDS = frozenset({'{', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '!'})
+_TRANSFER_LEADING_WORDS = frozenset({'{', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '!', 'time'})
 _TRANSFER_LOOPS = ('while', 'until', 'for', 'select')
 _TRANSFER_DECLARES = ('declare', 'typeset', 'local', 'readonly')
 _TRANSFER_SHELLS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash'})
@@ -4468,6 +4468,8 @@ class _TransferLexer:
         self.word, self.in_word, self.param, self.dollar = '', False, 0, -1
         word = marked.translate(_TRANSFER_UNMARK)
         at_start = all(w in _TRANSFER_LEADING_WORDS for w in self.argv)
+        if word == '-p' and self.argv[-1:] == ['time'] and at_start:
+            return  # bash's time -p sets only how the timing is printed; zsh runs -p as the command
         if state == 'head':
             self.case[-1] = 'pattern' if word == 'in' else 'head'  # `case WORD in` runs nothing
         elif state == 'pattern':
@@ -5080,11 +5082,12 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
             end = shell['ends'].get((shell['at'], len(item[1]) - len(words)), ('', None))[1]
             _transfer_touched(loop, _transfer_loop_commands(loop, shell, end))
         return [] if keyword in ('for', 'select') else rest  # a for loop's header runs nothing
-    if keyword in ('!', 'function'):
-        # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back.
+    if keyword in ('!', 'function', 'time'):
+        # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back;
+        # `time` leads a pipeline and leaves its status.
         if keyword == 'function':
             shell['function'], rest = (rest[0] if rest else ''), rest[1:]
-        else:
+        elif keyword == '!':
             shell['pipe']['negate'] = not shell['pipe']['negate']
         shell['pipe']['leading'] = True
         return rest
@@ -5617,7 +5620,7 @@ def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
     shell['opening_pipe'] = before == '|'
     while words and words[0] in _TRANSFER_KEYWORDS:
         # A body's first command is reached by its compound's pipe, which its own redirections then override.
-        before = before if words[0] in ('!', 'function') else ''
+        before = before if words[0] in ('!', 'function', 'time') else ''
         words = _transfer_keyword(words, item, shell)
     shell.pop('opening_pipe', None)
     closed = shell.pop('closed', None)

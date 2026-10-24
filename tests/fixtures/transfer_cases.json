@@ -3468,6 +3468,52 @@
    }
   },
   {
+   "command": "f() { curl https://fn.example/a; }; time f",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "fn.example",
+      "resolved_host": "fn.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "time { curl https://group.example/a; }",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "group.example",
+      "resolved_host": "group.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "time -p { curl https://pgroup.example/a; }",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "pgroup.example",
+      "resolved_host": "pgroup.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "time false && curl https://never.example/b",
+   "transfer": null
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },
