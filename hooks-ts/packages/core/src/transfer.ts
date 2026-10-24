@@ -80,6 +80,8 @@ const CLEAN_ENV = "\0clean";
 const SUBSTITUTED = "\0";
 /** Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has. */
 const BRACE_MARKS: Record<string, string> = { "{": "\x01", ",": "\x02", "}": "\x03" };
+/** Marks a quoted or escaped ~ that starts a word, which the shell leaves as it is; `tilde` turns it back. */
+const LITERAL_TILDE = "\x05";
 function unmark(word: string): string {
   return word.replace(/[\x01-\x03]/g, (mark) => "{,}"[mark.charCodeAt(0) - 1] as string);
 }
@@ -546,11 +548,17 @@ class Lexer {
       if (found !== undefined) return found;
       this.word += ch;
     } else if (this.quote === '"' && ch === "\\" && this.i + 1 < this.text.length) {
-      this.word += this.text[++this.i];
+      this.word += this.literal(this.text[++this.i] as string);
     } else {
-      this.word += ch;
+      this.word += this.literal(ch);
     }
     return true;
+  }
+
+  /** A quoted or escaped character as it goes into the word: a ~ that starts the word is marked, as one the shell does
+   *  not expand. */
+  private literal(ch: string): string {
+    return ch === "~" && this.word === "" ? LITERAL_TILDE : ch;
   }
 
   private unquoted(): boolean {
@@ -566,7 +574,7 @@ class Lexer {
     } else if (ch === "\\" && text[i + 1] === "\n") {
       this.i++; // a backslash-newline continues the line
     } else if (ch === "\\" && i + 1 < text.length) {
-      this.word += text[++this.i];
+      this.word += this.literal(text[++this.i] as string);
       this.inWord = true;
     } else if (ch === "#" && !this.inWord) {
       const end = text.indexOf("\n", i);
@@ -1018,16 +1026,18 @@ function cdTarget(args: string[], cwd: string | undefined, shell: Shell, given: 
 }
 
 /** A word with a leading ~ or ~/ made the shell's HOME, which the shell reads before a VAR=value in front of the command
- *  applies; left as it is when that HOME is not known. */
+ *  applies, or marked unknown when that HOME is not; a quoted one stays ~. */
 function tilde(word: string, shell: Shell): string {
+  if (word.startsWith(LITERAL_TILDE)) return `~${word.slice(1)}`;
+  if (word !== "~" && !word.startsWith("~/")) return word;
   const home = variable(shell, "HOME")[0];
-  if ((word !== "~" && !word.startsWith("~/")) || !home || home.includes("$") || home.includes(SUBSTITUTED)) return word;
-  return home + word.slice(1);
+  const known = !!home && !home.includes("$") && !home.includes(SUBSTITUTED);
+  return (known ? home : SUBSTITUTED) + word.slice(1);
 }
 
-/** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied. Undefined when not
- *  known: a variable, substitution or glob, a ~ left for a HOME not known, or a relative folder that CDPATH may find
- *  somewhere else first. */
+/** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a ~ still
+ *  there, which was quoted, a folder named ~. Undefined when not known: a variable, substitution or glob, or a relative
+ *  folder that CDPATH may find somewhere else first. */
 function cdPath(folders: string[], shell: Shell, given: Env): string | undefined {
   const known = (value: string | undefined): value is string => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
   const folder = folders[0];
@@ -1039,7 +1049,7 @@ function cdPath(folders: string[], shell: Shell, given: Env): string | undefined
   const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") &&
     ![".", ".."].includes(folder.split("/")[0] as string);
   if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return undefined;
-  return folder === "~" || folder.startsWith("~/") ? undefined : folder;
+  return folder === "~" || folder.startsWith("~/") ? `./${folder}` : folder;
 }
 
 /** Whether `path` is there and is not a folder. */
@@ -2527,7 +2537,7 @@ function wget(args: string[]): Raw[] {
 }
 
 /** (operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; `switches` collects
- *  the flags such as -n, and the first -o StdinNull as StdinNull=yes or StdinNull=no. */
+ *  the flags such as -n, and the first -o StdinNull as StdinNull=yes, =no, or =bad for a value ssh rejects. */
 function sshArgs(name: string, args: string[], switches = new Set<string>()): [string[], string[]] {
   const passthrough: string[] = [];
   const operands: string[] = [];
@@ -2550,10 +2560,11 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
     let value: string | undefined;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && option === "stdinnull" && !switches.has("StdinNull=yes") && !switches.has("StdinNull=no")) {
+    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("StdinNull="))) {
       // The first counts. ssh takes yes or true and no or false, and runs nothing for any other value.
-      const kept = ["no", "false"].includes(((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase());
-      switches.add(kept ? "StdinNull=no" : "StdinNull=yes");
+      const setting = ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase();
+      const meaning: Record<string, string> = { yes: "yes", true: "yes", no: "no", false: "no" };
+      switches.add(`StdinNull=${Object.hasOwn(meaning, setting) ? meaning[setting] : "bad"}`);
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -2628,7 +2639,7 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
   const switches = new Set<string>();
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
-  if (destination === undefined) return [];
+  if (destination === undefined || switches.has("StdinNull=bad")) return [];
   const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("StdinNull=yes");
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }
@@ -2947,8 +2958,8 @@ function configUnsafe(passthrough: readonly string[], home: string, processEnv: 
 /** The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely. */
 async function sshHostname(destination: string, options: string[], cwd: string | undefined, state: State): Promise<string> {
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
-  // A ~ the shell left, for a HOME not known, or one ssh reads as it is, as in rsync -e, names no file this can read.
-  if (options.some((value, i) => options[i - 1] === "-F" && (value === "~" || value.startsWith("~/")))) return "";
+  // A HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e, names no file this can read.
+  if (options.some((v, i) => options[i - 1] === "-F" && (v === "~" || v.startsWith("~/") || v.startsWith(SUBSTITUTED)))) return "";
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute(value) || cwd === undefined ? value : join(cwd, value);

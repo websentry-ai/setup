@@ -3742,6 +3742,28 @@
    "transfer": null
   },
   {
+   "command": "ssh -o StdinNull=1 prod 'cat f' > out",
+   "transfer": null
+  },
+  {
+   "command": "cat secret | ssh -o StdinNull=1 prod true",
+   "transfer": null
+  },
+  {
+   "command": "ssh -o StdinNull=true prod 'cat f' > out",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
    "command": "git push origin main",
    "transfer": null
   },

@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '1926e25ae7517b827c1ba88aeb3d62c1daf48ce6ebdd554db8957ccdfcbf029c'
+BLOCK_SHA256 = 'df0cee925d86cabc7bd29eac3aadb9a361df31a59b10a5a67da5ac94b2298a84'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -850,6 +850,10 @@ class ParserFindingTests(TransferTestCase):
                                   (f'HOME={self.repo}; HOME={self.repo}/frontend cd ~; scp -F cfg f prod:/tmp', public),
                                   (f'HOME={self.repo}/frontend; scp -F ~/cfg f prod:/tmp', private),
                                   (f'HOME={self.repo}; HOME={self.repo}/frontend scp -F ~/cfg f prod:/tmp', public),
+                                  # A quoted or escaped ~ is a folder named ~, which is not there.
+                                  (f"HOME={self.repo}; cd '~/frontend'; scp -F cfg f prod:/tmp", public),
+                                  (f'HOME={self.repo}; cd \\~/frontend; scp -F cfg f prod:/tmp', public),
+                                  (f'HOME={self.repo}; cd ~/frontend; scp -F cfg f prod:/tmp', private),
                                   ('FOO=1 cd frontend; scp -F cfg f prod:/tmp', private)):
             self.assert_endpoints(command, [expected])
         # exec replaces the shell even when what it runs is a builtin, so the scp never runs.
@@ -990,6 +994,13 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
                                        root_projects={})
         self.assertEqual(mapped['transfer'],
                          {'tool': 'powershell', 'endpoints': [_endpoint('out', 'example.com', 'public')]})
+        # A cd written inside the hashtable is its text, so the next call starts where this one did.
+        shell_state = {'dir': self.repo}
+        command = 'iwr -Body @{a=1; cd frontend; b=2} -Uri https://example.com/up'
+        hook.map_copilot_tool('powershell', {'command': command}, '', shell_state=shell_state, root_projects={})
+        mapped = hook.map_copilot_tool('bash', {'command': 'scp -F cfg f prod:/tmp'}, '', shell_state=shell_state,
+                                       root_projects={})
+        self.assertEqual(mapped['transfer']['endpoints'], [_endpoint('out', 'prod', 'public', '203.0.113.9')])
 
     def test_augment(self):
         hook = load_module('augment/hooks/unbound.py')

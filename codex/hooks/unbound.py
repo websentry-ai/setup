@@ -3891,6 +3891,8 @@ _TRANSFER_SUBSTITUTED = '\0'
 # Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has.
 _TRANSFER_BRACE_MARKS = {'{': '\1', ',': '\2', '}': '\3'}
 _TRANSFER_UNMARK = {1: '{', 2: ',', 3: '}'}
+# Marks a quoted or escaped ~ that starts a word, which the shell leaves as it is; _transfer_tilde turns it back.
+_TRANSFER_LITERAL_TILDE = '\5'
 _TRANSFER_TOOLS = {
     'curl': 'curl', 'wget': 'wget', 'scp': 'scp', 'rsync': 'rsync', 'sftp': 'sftp', 'ssh': 'ssh',
     'nc': 'nc', 'ncat': 'nc', 'netcat': 'nc', 'socat': 'socat', 'http': 'httpie', 'https': 'httpie',
@@ -4283,10 +4285,15 @@ class _TransferLexer:
             self.word += ch
         elif self.quote == '"' and ch == '\\' and self.i + 1 < len(self.text):
             self.i += 1
-            self.word += self.text[self.i]
+            self.word += self._literal(self.text[self.i])
         else:
-            self.word += ch
+            self.word += self._literal(ch)
         return True
+
+    def _literal(self, ch: str) -> str:
+        """A quoted or escaped character as it goes into the word: a ~ that starts the word is marked, as one the shell
+        does not expand."""
+        return _TRANSFER_LITERAL_TILDE if ch == '~' and not self.word else ch
 
     def _unquoted(self) -> bool:
         text, i, ch = self.text, self.i, self.text[self.i]
@@ -4300,7 +4307,7 @@ class _TransferLexer:
             self.i += 1  # a backslash-newline continues the line
         elif ch == '\\' and i + 1 < len(text):
             self.i += 1
-            self.word, self.in_word = self.word + text[self.i], True
+            self.word, self.in_word = self.word + self._literal(text[self.i]), True
         elif ch == '#' and not self.in_word:
             end = text.find('\n', i)
             self.i = (len(text) if end < 0 else end) - 1  # a comment runs to the end of its line
@@ -4734,17 +4741,21 @@ def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict, given: Dict) 
 
 def _transfer_tilde(word: str, shell: Dict) -> str:
     """A word with a leading ~ or ~/ made the shell's HOME, which the shell reads before a VAR=value in front of the
-    command applies; left as it is when that HOME is not known. ~user is left to the account database."""
-    home = _transfer_variable(shell, 'HOME')[0]
-    if (word != '~' and not word.startswith('~/')) or not home or any(c in home for c in '$' + _TRANSFER_SUBSTITUTED):
+    command applies, or marked unknown when that HOME is not; a quoted one stays ~. ~user is left to the account
+    database."""
+    if word.startswith(_TRANSFER_LITERAL_TILDE):
+        return '~' + word[1:]
+    if word != '~' and not word.startswith('~/'):
         return word
-    return home + word[1:]
+    home = _transfer_variable(shell, 'HOME')[0]
+    known = home and not any(c in home for c in '$' + _TRANSFER_SUBSTITUTED)
+    return (home if known else _TRANSFER_SUBSTITUTED) + word[1:]
 
 
 def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[str]:
-    """Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied. None when not
-    known: a variable, substitution or glob, a ~ left for a HOME not known, or a relative folder that CDPATH may find
-    somewhere else first."""
+    """Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a ~ still
+    there, which was quoted, a folder named ~. None when not known: a variable, substitution or glob, or a relative
+    folder that CDPATH may find somewhere else first."""
     unknown = '$' + _TRANSFER_SUBSTITUTED
     if not folders:
         home = given['HOME'] if 'HOME' in given else _transfer_variable(shell, 'HOME')[0]
@@ -4754,7 +4765,7 @@ def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[
     searched = cdpath and folder != '-' and not folder.startswith(('/', '~')) and folder.split('/')[0] not in ('.', '..')
     if searched or any(c in folder for c in unknown + '*?['):
         return None
-    return None if folder == '~' or folder.startswith('~/') else os.path.expanduser(folder)  # ~user
+    return './' + folder if folder == '~' or folder.startswith('~/') else os.path.expanduser(folder)  # ~user
 
 
 _TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat', 'wc', 'head', 'tail',
@@ -6034,7 +6045,8 @@ def _transfer_wget(args: List[str]) -> List[tuple]:
 
 def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:
     """(operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; switches, when
-    given, collects the flags such as -n, and the first -o StdinNull as StdinNull=yes or StdinNull=no."""
+    given, collects the flags such as -n, and the first -o StdinNull as StdinNull=yes, =no, or =bad for a value ssh
+    rejects."""
     passthrough, operands, i = [], [], 0
     switches = set() if switches is None else switches
     value_flags = _TRANSFER_SSH_VALUE_FLAGS[program]
@@ -6052,10 +6064,10 @@ def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = 
             break
         flag, value, i = _transfer_short_option(arg, args, i, value_flags, switches)
         option = re.split(r'[\s=]', (value or '').strip(), maxsplit=1)[0].lower()
-        if flag == '-o' and option == 'stdinnull' and not switches & {'StdinNull=yes', 'StdinNull=no'}:
+        if flag == '-o' and option == 'stdinnull' and not any(s.startswith('StdinNull=') for s in switches):
             # The first counts. ssh takes yes or true and no or false, and runs nothing for any other value.
-            kept = re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower() in ('no', 'false')
-            switches.add('StdinNull=no' if kept else 'StdinNull=yes')
+            setting = re.split(r'[\s=]+', value.strip(), maxsplit=1)[-1].lower()
+            switches.add('StdinNull=' + {'yes': 'yes', 'true': 'yes', 'no': 'no', 'false': 'no'}.get(setting, 'bad'))
         if value and flag[1:] in identity_flags and (flag != '-o' or option in _TRANSFER_SSH_IDENTITY_OPTIONS):
             passthrough += ['-p' if flag == '-P' else flag, value]
     return operands, passthrough
@@ -6128,7 +6140,7 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
     it, and a first -o StdinNull=yes keep stdin unread; ForkAfterAuthentication=yes still sends it."""
     switches = set()
     operands, options = _transfer_ssh_args('ssh', args, switches)
-    if not operands:
+    if not operands or 'StdinNull=bad' in switches:
         return []
     sends = sends and not switches & {'-n', '-f', 'StdinNull=yes'}
     return [(d, operands[0], options) for d, used in (('out', sends), ('in', receives)) if used]
@@ -6409,8 +6421,8 @@ def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> b
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> str:
     """The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely."""
     configs = [v for i, v in enumerate(options) if i and options[i - 1] == '-F']
-    if any(v == '~' or v.startswith('~/') for v in configs):
-        return ''  # a ~ the shell left, for a HOME not known, or one ssh reads as it is, as in rsync -e
+    if any(v.startswith(('~/', _TRANSFER_SUBSTITUTED)) or v == '~' for v in configs):
+        return ''  # a HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e
     options = [os.path.expanduser(v) if i and options[i - 1] == '-F' else v for i, v in enumerate(options)]  # ~user
     key = ('ssh', destination, tuple(options), cwd)
     if key not in state:

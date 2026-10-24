@@ -1907,6 +1907,7 @@ var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
 var SUBSTITUTED = "\0";
 var BRACE_MARKS = { "{": "", ",": "", "}": "" };
+var LITERAL_TILDE = "";
 function unmark(word) {
   return word.replace(/[\x01-\x03]/g, (mark) => "{,}"[mark.charCodeAt(0) - 1]);
 }
@@ -2298,11 +2299,16 @@ var Lexer = class _Lexer {
       if (found !== void 0) return found;
       this.word += ch;
     } else if (this.quote === '"' && ch === "\\" && this.i + 1 < this.text.length) {
-      this.word += this.text[++this.i];
+      this.word += this.literal(this.text[++this.i]);
     } else {
-      this.word += ch;
+      this.word += this.literal(ch);
     }
     return true;
+  }
+  /** A quoted or escaped character as it goes into the word: a ~ that starts the word is marked, as one the shell does
+   *  not expand. */
+  literal(ch) {
+    return ch === "~" && this.word === "" ? LITERAL_TILDE : ch;
   }
   unquoted() {
     const { text, i } = this;
@@ -2317,7 +2323,7 @@ var Lexer = class _Lexer {
     } else if (ch === "\\" && text[i + 1] === "\n") {
       this.i++;
     } else if (ch === "\\" && i + 1 < text.length) {
-      this.word += text[++this.i];
+      this.word += this.literal(text[++this.i]);
       this.inWord = true;
     } else if (ch === "#" && !this.inWord) {
       const end2 = text.indexOf("\n", i);
@@ -2718,9 +2724,11 @@ function cdTarget(args, cwd, shell, given) {
   return folder === void 0 ? [cwd, 1] : [folder, 0];
 }
 function tilde(word, shell) {
+  if (word.startsWith(LITERAL_TILDE)) return `~${word.slice(1)}`;
+  if (word !== "~" && !word.startsWith("~/")) return word;
   const home = variable(shell, "HOME")[0];
-  if (word !== "~" && !word.startsWith("~/") || !home || home.includes("$") || home.includes(SUBSTITUTED)) return word;
-  return home + word.slice(1);
+  const known = !!home && !home.includes("$") && !home.includes(SUBSTITUTED);
+  return (known ? home : SUBSTITUTED) + word.slice(1);
 }
 function cdPath(folders, shell, given) {
   const known = (value) => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
@@ -2732,7 +2740,7 @@ function cdPath(folders, shell, given) {
   const cdpath = "CDPATH" in given ? given.CDPATH : variable(shell, "CDPATH")[0];
   const searched = !!cdpath && folder !== "-" && !folder.startsWith("/") && !folder.startsWith("~") && ![".", ".."].includes(folder.split("/")[0]);
   if (searched || [..."$*?[", SUBSTITUTED].some((c) => folder.includes(c))) return void 0;
-  return folder === "~" || folder.startsWith("~/") ? void 0 : folder;
+  return folder === "~" || folder.startsWith("~/") ? `./${folder}` : folder;
 }
 function isFile(path) {
   try {
@@ -3912,9 +3920,10 @@ function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
     let value;
     [flag, value, i] = shortOption(arg, args, i, valueFlags, switches);
     const option = ((value ?? "").trim().split(/[\s=]/)[0] ?? "").toLowerCase();
-    if (flag === "-o" && option === "stdinnull" && !switches.has("StdinNull=yes") && !switches.has("StdinNull=no")) {
-      const kept = ["no", "false"].includes(((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase());
-      switches.add(kept ? "StdinNull=no" : "StdinNull=yes");
+    if (flag === "-o" && option === "stdinnull" && ![...switches].some((s) => s.startsWith("StdinNull="))) {
+      const setting = ((value ?? "").trim().split(/[\s=]+/).at(-1) ?? "").toLowerCase();
+      const meaning = { yes: "yes", true: "yes", no: "no", false: "no" };
+      switches.add(`StdinNull=${Object.hasOwn(meaning, setting) ? meaning[setting] : "bad"}`);
     }
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
@@ -3977,7 +3986,7 @@ function sshPipe(args, fed, receives) {
   const switches = /* @__PURE__ */ new Set();
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
-  if (destination === void 0) return [];
+  if (destination === void 0 || switches.has("StdinNull=bad")) return [];
   const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("StdinNull=yes");
   return [["out", sends], ["in", receives]].filter(([, used]) => used).map(([d]) => [d, destination, options]);
 }
@@ -4244,7 +4253,7 @@ function configUnsafe(passthrough, home, processEnv) {
   return false;
 }
 async function sshHostname(destination, options, cwd, state) {
-  if (options.some((value, i) => options[i - 1] === "-F" && (value === "~" || value.startsWith("~/")))) return "";
+  if (options.some((v, i) => options[i - 1] === "-F" && (v === "~" || v.startsWith("~/") || v.startsWith(SUBSTITUTED)))) return "";
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join5(cwd, value);
