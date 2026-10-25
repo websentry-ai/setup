@@ -3818,6 +3818,8 @@ _TRANSFER_SHELLS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash'})
 _TRANSFER_POWERSHELLS = frozenset({'powershell', 'pwsh'})
 # Set in a command's env by `env -i`: nothing is inherited from the hook's environment.
 _TRANSFER_CLEAN_ENV = '\0clean'
+# Set after eval or source, whose text may set any variable: one not set since then is unknown.
+_TRANSFER_UNKNOWN_ENV = '\0unknown'
 # Stands in for a substitution's output inside a word, so no host is read from it.
 _TRANSFER_SUBSTITUTED = '\0'
 # Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has.
@@ -4577,6 +4579,8 @@ def _transfer_env(env: Dict, key: str) -> str:
     """A variable as the command sees it: set or unset in the command, else inherited from the hook's environment."""
     if key in env:
         return env[key]
+    if _TRANSFER_UNKNOWN_ENV in env:
+        return _TRANSFER_SUBSTITUTED
     return '' if _TRANSFER_CLEAN_ENV in env else os.environ.get(key, '')
 
 
@@ -4825,6 +4829,8 @@ def _transfer_variable(shell: Dict, name: str) -> tuple:
     own environment's, which is exported."""
     if name in shell['vars']:
         return shell['vars'][name]
+    if _TRANSFER_UNKNOWN_ENV in shell['vars']:
+        return _TRANSFER_SUBSTITUTED, None
     inherited = _TRANSFER_CLEAN_ENV not in shell['vars'] and name in os.environ
     return (os.environ[name] if inherited else None), inherited
 
@@ -5647,6 +5653,10 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_jump_from(program, args, subshell, shell)
     if program in _TRANSFER_READERS and ((before != '|' and after != '|') or subshell is None):
         _transfer_forget(shell, _transfer_read_names(program, args))
+    if program in ('eval', 'source', '.') and ((before != '|' and after != '|') or subshell is None):
+        # Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
+        _transfer_forget(shell, {name for name in shell['vars'] if not name.startswith('\0')} | {''})
+        shell['vars'][_TRANSFER_UNKNOWN_ENV] = (None, None)
     if program in ('cd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:

@@ -76,6 +76,8 @@ const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh",
 const POWERSHELLS: ReadonlySet<string> = new Set(["powershell", "pwsh"]);
 /** Set in a command's env by `env -i`: nothing is inherited from the hook's environment. */
 const CLEAN_ENV = "\0clean";
+/** Set after eval or source, whose text may set any variable: one not set since then is unknown. */
+const UNKNOWN_ENV = "\0unknown";
 /** Stands in for a substitution's output inside a word, so no host is read from it. */
 const SUBSTITUTED = "\0";
 /** Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has. */
@@ -966,6 +968,7 @@ function words(text: string): string[] {
 /** A variable as the command sees it: set or unset in the command, else inherited from the hook's environment. */
 function envValue(env: Env, processEnv: Record<string, string | undefined>, key: string): string {
   if (key in env) return env[key] as string;
+  if (UNKNOWN_ENV in env) return SUBSTITUTED;
   return CLEAN_ENV in env ? "" : (processEnv[key] ?? "");
 }
 
@@ -1379,6 +1382,7 @@ function forget(shell: Shell, names: Set<string>): void {
 function variable(shell: Shell, name: string): Variable {
   const set = shell.vars[name];
   if (set !== undefined) return set;
+  if (UNKNOWN_ENV in shell.vars) return [SUBSTITUTED, undefined];
   const inherited = !(CLEAN_ENV in shell.vars) && shell.processEnv[name] !== undefined;
   return [inherited ? shell.processEnv[name] : undefined, inherited];
 }
@@ -2196,6 +2200,11 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
   if (READERS.includes(name as string) && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
     forget(shell, readNames(name as string, args));
+  }
+  if ((name === "eval" || name === "source" || name === ".") && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
+    // Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
+    forget(shell, new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
+    shell.vars[UNKNOWN_ENV] = [undefined, undefined];
   }
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.

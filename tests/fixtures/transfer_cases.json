@@ -3806,6 +3806,76 @@
    }
   },
   {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; eval \"export RSYNC_RSH='ssh -o HostName=8.8.4.4'\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; source ./env.sh; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; . ./env.sh; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; eval true | cat; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.9.9.9",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.9.9.9",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
    "command": "export RSYNC_RSH='ssh -o HostName=10.9.9.9'; printf '%s' x; rsync -a build.zip prod:/srv",
    "transfer": {
     "tool": "rsync",

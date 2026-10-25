@@ -1905,6 +1905,7 @@ var DECLARES = ["declare", "typeset", "local", "readonly"];
 var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
 var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
+var UNKNOWN_ENV = "\0unknown";
 var SUBSTITUTED = "\0";
 var BRACE_MARKS = { "{": "", ",": "", "}": "" };
 var LITERAL_TILDE = "";
@@ -2679,6 +2680,7 @@ function words(text) {
 }
 function envValue(env, processEnv, key) {
   if (key in env) return env[key];
+  if (UNKNOWN_ENV in env) return SUBSTITUTED;
   return CLEAN_ENV in env ? "" : processEnv[key] ?? "";
 }
 function isAssignment(token) {
@@ -2920,6 +2922,7 @@ function forget(shell, names) {
 function variable(shell, name) {
   const set = shell.vars[name];
   if (set !== void 0) return set;
+  if (UNKNOWN_ENV in shell.vars) return [SUBSTITUTED, void 0];
   const inherited = !(CLEAN_ENV in shell.vars) && shell.processEnv[name] !== void 0;
   return [inherited ? shell.processEnv[name] : void 0, inherited];
 }
@@ -3594,6 +3597,10 @@ function simple(words2, item, before, shell, depth) {
   if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
   if (READERS.includes(name) && (before !== "|" && item.after !== "|" || subshell === void 0)) {
     forget(shell, readNames(name, args));
+  }
+  if ((name === "eval" || name === "source" || name === ".") && (before !== "|" && item.after !== "|" || subshell === void 0)) {
+    forget(shell, /* @__PURE__ */ new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
+    shell.vars[UNKNOWN_ENV] = [void 0, void 0];
   }
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
