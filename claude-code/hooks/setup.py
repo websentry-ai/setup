@@ -18,6 +18,7 @@ import socketserver
 import socket
 import hashlib
 import bisect
+import itertools
 import json
 from datetime import datetime
 import shlex
@@ -29,8 +30,13 @@ DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
 BACKFILL_TOOL_TYPE = "claude-code"
-BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
+# A transcript bigger than one chunk is read line by line and sent a slice at a time, so its
+# size no longer bounds memory; this only stops a runaway file.
+BACKFILL_MAX_FILE_BYTES = 1024 ** 3
+# Lines read from one subagent file: a session's subagent usage is held whole beside every slice.
 BACKFILL_MAX_LINES_PER_FILE = 50000
+# The server keeps only this many entries of one uploaded session or slice.
+BACKFILL_MAX_ENTRIES_PER_SLICE = 10000
 # Usage records of the subagents one session ran; the server reads at most this many.
 BACKFILL_MAX_SUBAGENT_REPLIES = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
@@ -1168,10 +1174,10 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     entries = []
     session_id = None
     try:
+        # Only transcripts up to one chunk are read whole (_backfill_stream_session takes the
+        # rest), so their size bounds this read.
         with open(transcript_path, 'r', encoding='utf-8') as f:
-            for lineno, line in enumerate(f):
-                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
-                    break
+            for line in f:
                 if not line.strip():
                     continue
                 try:
@@ -1281,7 +1287,7 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> bool:
-    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions, 'uploader_stats': _backfill_uploader_stats}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.
@@ -1371,9 +1377,20 @@ def _backfill_write_cutoff(config_dir: Path, ts: float) -> None:
         debug_print(f"failed to persist backfill timestamp: {e}")
 
 
-def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
-    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
-    # their session (_backfill_subagent_usage).
+def _backfill_empty_stats() -> Dict:
+    return {'files_seen': 0, 'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0},
+            'unreadable': 0}
+
+
+# What this run's walk found it cannot send. Every upload carries it so the server can see
+# the history that never reaches it.
+_backfill_uploader_stats = _backfill_empty_stats()
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[Dict] = None):
+    # Skip hidden, symlinked, over the size cap, or files older than cutoff. Subagent files go up with
+    # their session (_backfill_subagent_usage). stats counts the transcripts seen and those over the cap.
+    stats = stats if stats is not None else _backfill_empty_stats()
     for p in root.rglob('*.jsonl'):
         if p.name.startswith('.'):
             continue
@@ -1383,13 +1400,28 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
             continue
         try:
             st = p.stat()
+            stats['files_seen'] += 1
             if st.st_size > BACKFILL_MAX_FILE_BYTES:
+                over = stats['skipped_over_cap']
+                over['count'] += 1
+                over['total_bytes'] += st.st_size
+                over['largest_bytes'] = max(over['largest_bytes'], st.st_size)
                 continue
             if st.st_mtime < cutoff_mtime:
                 continue
         except OSError:
             continue
         yield p
+
+
+def _backfill_walk_stats(root: Path) -> Dict:
+    """uploader_stats for every transcript under root, whatever its age: how many there are, which
+    are over the size cap, and which cannot be read or name no session."""
+    stats = _backfill_empty_stats()
+    for path in _backfill_iter_transcripts(root, 0, stats):
+        if not _backfill_first_session_id(path):
+            stats['unreadable'] += 1
+    return stats
 
 
 def _backfill_is_real_user_prompt(content) -> bool:
@@ -1410,21 +1442,16 @@ def _backfill_is_real_user_prompt(content) -> bool:
     return False
 
 
+def _backfill_is_exchange_start(entry) -> bool:
+    """A real user prompt outside a subagent: where the server starts a new exchange."""
+    if not isinstance(entry, dict) or entry.get('isSidechain') or entry.get('type') != 'user':
+        return False
+    msg = entry.get('message') or {}
+    return msg.get('role') == 'user' and _backfill_is_real_user_prompt(msg.get('content'))
+
+
 def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
-    boundaries = []
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            continue
-        if entry.get('isSidechain'):
-            continue
-        if entry.get('type') != 'user':
-            continue
-        msg = entry.get('message') or {}
-        if msg.get('role') != 'user':
-            continue
-        if _backfill_is_real_user_prompt(msg.get('content')):
-            boundaries.append(i)
-    return boundaries
+    return [i for i, entry in enumerate(entries) if _backfill_is_exchange_start(entry)]
 
 
 def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
@@ -1440,7 +1467,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     # an oversized session silently loses the attribution the whole change is for.
     identity = {k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}
     try:
-        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
+        if (len(entries) <= BACKFILL_MAX_ENTRIES_PER_SLICE
+                and len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes):
             yield session
             return
         # +2 for the `, ` separator json.dumps puts between array elements.
@@ -1456,7 +1484,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     for size, owner in zip(subagent_sizes, owners):
         entry_sizes[owner] += size
     n = len(entries)
-    record_index_base = 0
+    # A slice cut again keeps its place in the session.
+    record_index_base = session.get('record_index_base') or 0
     start_idx = 0
     while start_idx < n:
         ends = [b for b in boundaries if b > start_idx]
@@ -1477,8 +1506,10 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
         for end_idx in ends:
             cum += sum(entry_sizes[cursor:end_idx])
             cursor = end_idx
-            # -2: last entry has no trailing `, ` and `[]` was counted in wrap.
-            if cum - 2 > max_chunk_bytes:
+            # -2: last entry has no trailing `, ` and `[]` was counted in wrap. An exchange
+            # longer than the entry cap still goes alone, where the server keeps its start.
+            if cum - 2 > max_chunk_bytes or (
+                    last_fit_end is not None and end_idx - start_idx > BACKFILL_MAX_ENTRIES_PER_SLICE):
                 break
             last_fit_end = end_idx
             last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)
@@ -1499,6 +1530,157 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
         yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
+
+
+def _backfill_first_session_id(transcript_path: Path):
+    """The session id _backfill_collect_session would file a transcript under, or None. Reads only
+    up to the first line that names one."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = entry.get('sessionId') or entry.get('session_id')
+                if sid:
+                    return sid
+    except Exception:
+        return None
+    return None
+
+
+def _backfill_entry_time(entry):
+    """The time an entry moves its exchange's end to, as _backfill_subagent_owners reads it."""
+    if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant', 'progress'):
+        return _backfill_ts(entry.get('timestamp'))
+    return None
+
+
+def _backfill_claim(exchange: Dict, record_ids: List[int], sizes: List[int]) -> None:
+    exchange['records'].extend(record_ids)
+    exchange['bytes'] += sum(sizes[i] for i in record_ids)
+
+
+def _backfill_read_exchanges(f, records: List[Dict], resume: Optional[Dict], max_bytes: int):
+    """Yield the exchanges of a transcript opened in binary, from resume's offset, each with the
+    subagent records it owns (as _backfill_subagent_owners assigns them) and its payload bytes.
+    Reading stops inside an exchange bigger than max_bytes: it ends the session's upload anyway."""
+    latest = _backfill_ts(resume['latest']) if resume else None
+    offset = resume['offset'] if resume else 0
+    times = [_backfill_ts(r.get('timestamp')) for r in records]
+    # Replies at or before the cut rode with the slices already sent.
+    timed = sorted((at, i) for i, at in enumerate(times) if at is not None and (latest is None or at > latest))
+    untimed = [i for i, at in enumerate(times) if at is None]
+    sizes = [len(json.dumps(r).encode('utf-8')) + 2 for r in records]
+    exchange, k = None, 0
+    f.seek(offset)
+    for raw in f:
+        line_at, offset = offset, offset + len(raw)
+        try:
+            entry = json.loads(raw.decode('utf-8')) if raw.strip() else None
+        except ValueError:  # undecodable or unparseable: skipped like a bad line in a small file
+            continue
+        if entry is None:
+            continue
+        starts = _backfill_is_exchange_start(entry)
+        if exchange is not None and starts:
+            # The replies up to this exchange's end that no earlier exchange claimed.
+            j = bisect.bisect_right(timed, (latest, len(records))) if latest is not None else k
+            _backfill_claim(exchange, [i for _, i in timed[k:j]], sizes)
+            k = j
+            yield exchange
+            exchange = None
+        if exchange is None:
+            exchange = {'offset': line_at, 'entries': [], 'bytes': 0, 'prompts': int(starts),
+                        'records': [], 'latest': None}
+        exchange['entries'].append(entry)
+        exchange['bytes'] += len(json.dumps(entry).encode('utf-8')) + 2
+        at = _backfill_entry_time(entry)
+        if at is not None and (latest is None or at > latest):
+            latest = at
+        exchange['latest'] = latest
+        if exchange['bytes'] > max_bytes:
+            yield exchange
+            return
+    if exchange is not None:
+        # Whatever no exchange claimed rides with the last one.
+        _backfill_claim(exchange, [i for _, i in timed[k:]] + untimed, sizes)
+        yield exchange
+
+
+def _backfill_exchange_slice(session: Dict, record_index_base: int, exchanges: List[Dict]) -> Dict:
+    """The payload of one slice: these exchanges' entries and subagent records, shaped as
+    _backfill_slice_session shapes a slice."""
+    piece = {'session_id': session['session_id'], 'record_index_base': record_index_base,
+             'entries': [e for exchange in exchanges for e in exchange['entries']]}
+    if session.get('subagents'):
+        owned = sorted(i for exchange in exchanges for i in exchange['records'])
+        piece['subagents'] = [session['subagents'][i] for i in owned]
+    piece.update({k: session[k] for k in ('device_serial', 'user_email') if session.get(k)})
+    return piece
+
+
+def _backfill_pack_exchanges(session: Dict, exchanges, resume: Optional[Dict], max_chunk_bytes: int):
+    """Yield (slice, next) cut exactly where _backfill_slice_session cuts: as many whole exchanges
+    as fit the byte and entry caps. next is where the following slice starts, None after the last."""
+    base = resume['record_index_base'] if resume else 0
+    pending, cum, count = [], 0, 0
+    for exchange in exchanges:
+        if pending and (cum + exchange['bytes'] - 2 > max_chunk_bytes
+                        or count + len(exchange['entries']) > BACKFILL_MAX_ENTRIES_PER_SLICE):
+            latest = pending[-1]['latest']
+            nxt = {'offset': exchange['offset'], 'record_index_base': base + sum(p['prompts'] for p in pending),
+                   'latest': latest.isoformat() if latest else None}
+            yield _backfill_exchange_slice(session, base, pending), nxt
+            base, pending = nxt['record_index_base'], []
+        if not pending:
+            cum = len(json.dumps(_backfill_exchange_slice(session, base, [])).encode('utf-8'))
+            count = 0
+            if cum + exchange['bytes'] - 2 > max_chunk_bytes:
+                debug_print(f"stopped session {session['session_id']}: an exchange exceeds {max_chunk_bytes} bytes")
+                return
+        pending.append(exchange)
+        cum += exchange['bytes']
+        count += len(exchange['entries'])
+    if pending:
+        yield _backfill_exchange_slice(session, base, pending), None
+
+
+def _backfill_stream_session(session: Dict, max_chunk_bytes: int, resume: Optional[Dict] = None):
+    """Yield (slice, next) for a session whose transcript is too big to read whole: the slices
+    _backfill_slice_session would cut from it, read line by line so only about one slice is held
+    at a time. With resume, starts at that slice (see _backfill_pack_exchanges for next)."""
+    path = session['transcript_path']
+    head = {k: session[k] for k in ('session_id', 'device_serial', 'user_email') if session.get(k)}
+    records = _backfill_subagent_usage(path)
+    if records:
+        head['subagents'] = records
+    try:
+        with open(path, 'rb') as f:
+            exchanges = _backfill_read_exchanges(f, records, resume, max_chunk_bytes)
+            held, held_bytes, held_entries = [], 0, 0
+            if resume is None:
+                for exchange in exchanges:
+                    held.append(exchange)
+                    held_bytes += exchange['bytes']
+                    held_entries += len(exchange['entries'])
+                    if held_bytes > max_chunk_bytes or held_entries > BACKFILL_MAX_ENTRIES_PER_SLICE:
+                        break
+                else:
+                    # Small enough to hold after all: cut it as a session read whole is cut.
+                    whole = dict(head, entries=[e for exchange in held for e in exchange['entries']])
+                    for piece in _backfill_slice_session(whole, max_chunk_bytes):
+                        yield piece, None
+                    return
+            # Chained through an iterator, which lets go of the held exchanges once they are cut.
+            exchanges, held = itertools.chain(iter(held), exchanges), None
+            yield from _backfill_pack_exchanges(head, exchanges, resume, max_chunk_bytes)
+    except Exception as e:
+        # Same as an unreadable small transcript: what was already sent stays sent.
+        debug_print(f"stopped reading {path}: {e!r}")
 
 
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
@@ -1669,8 +1851,22 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
             session['user_email'] = email
 
 
+def _backfill_read_session(transcript_path: Path) -> Optional[Dict]:
+    """A transcript up to one chunk, read whole; a bigger one as its session id and path, read
+    line by line as it is sent (_backfill_stream_session). None when it names no session."""
+    try:
+        streamed = transcript_path.stat().st_size > BACKFILL_CHUNK_BYTES
+    except OSError:
+        return None
+    if not streamed:
+        return _backfill_collect_session(transcript_path)
+    session_id = _backfill_first_session_id(transcript_path)
+    return {'session_id': session_id, 'transcript_path': transcript_path} if session_id else None
+
+
 def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> None:
     """Walk config_dir/projects and seed historical sessions. Never raises."""
+    global _backfill_uploader_stats
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -1696,7 +1892,10 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
         projects_root = config_dir / 'projects'
         sessions: List[Dict] = []
         capped = False
+        _backfill_uploader_stats = _backfill_empty_stats()
         if projects_root.exists():
+            # Counted before any upload, so each upload carries the same numbers.
+            _backfill_uploader_stats = _backfill_walk_stats(projects_root)
             for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                     # Hit the per-run cap with files still unprocessed — don't advance
@@ -1704,7 +1903,7 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
                     capped = True
                     debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
                     break
-                session = _backfill_collect_session(transcript_path)
+                session = _backfill_read_session(transcript_path)
                 if session:
                     sessions.append(session)
         _backfill_attach_identity(sessions, get_device_identifier(), _backfill_account_email(home))
@@ -1734,7 +1933,11 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
             current_size = 2
 
         for session in sessions:
-            for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
+            if 'transcript_path' in session:
+                pieces = (piece for piece, _ in _backfill_stream_session(session, BACKFILL_CHUNK_BYTES))
+            else:
+                pieces = _backfill_slice_session(session, BACKFILL_CHUNK_BYTES)
+            for slice_session in pieces:
                 try:
                     slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
                 except (TypeError, ValueError):
