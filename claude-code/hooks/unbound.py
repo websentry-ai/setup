@@ -7654,7 +7654,8 @@ def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
 
 
 def _transfer_socat(args: List[str], sends: bool) -> List[tuple]:
-    """The hosts socat's two addresses connect to: sent to when its stdin is fed in."""
+    """The hosts socat's two addresses connect to: sent to when its stdin is fed in. A host a PROXY or SOCKS address
+    names, or one with a proxyport= or socksport= option, is reached through that proxy."""
     addresses, i = [], 0
     while i < len(args):
         arg, i = args[i], i + 1
@@ -7665,9 +7666,11 @@ def _transfer_socat(args: List[str], sends: bool) -> List[tuple]:
     endpoints = []
     for address in addresses[:2]:
         match = re.match(r'^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|'
-                         r'(?:proxy|socks4a?|socks5):[^:,]+):(\[[^\]]+\]|[^:,]+):', address, re.IGNORECASE)
+                         r'(proxy(?:-connect)?|socks4a?|socks5(?:-connect)?):[^:,]+):(\[[^\]]+\]|[^:,]+):', address,
+                         re.IGNORECASE)
         if match:
-            endpoints.append(('out' if sends else '', match.group(1), None))
+            proxied = bool(match.group(1) or re.search(r',\s*(?:proxyport|socksport)=', address, re.IGNORECASE))
+            endpoints.append(('out' if sends else '', match.group(2), None, None, proxied))
     return endpoints
 
 

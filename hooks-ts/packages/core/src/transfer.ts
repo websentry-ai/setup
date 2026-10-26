@@ -2818,8 +2818,10 @@ function socat(args: string[], sends: boolean): Raw[] {
   const out: Raw[] = [];
   for (const address of addresses.slice(0, 2)) {
     const match =
-      /^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|(?:proxy|socks4a?|socks5):[^:,]+):(\[[^\]]+\]|[^:,]+):/i.exec(address);
-    if (match !== null) out.push([sends ? "out" : "", match[1] as string, undefined]);
+      /^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|(proxy(?:-connect)?|socks4a?|socks5(?:-connect)?):[^:,]+):(\[[^\]]+\]|[^:,]+):/i.exec(address);
+    // A PROXY or SOCKS address, or a proxyport= or socksport= option, reaches the host through that proxy.
+    const proxied = match?.[1] !== undefined || /,\s*(?:proxyport|socksport)=/i.test(address);
+    if (match !== null) out.push([sends ? "out" : "", match[2] as string, undefined, undefined, proxied]);
   }
   return out;
 }

@@ -4139,8 +4139,9 @@ function socat(args, sends) {
   }
   const out = [];
   for (const address2 of addresses.slice(0, 2)) {
-    const match = /^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|(?:proxy|socks4a?|socks5):[^:,]+):(\[[^\]]+\]|[^:,]+):/i.exec(address2);
-    if (match !== null) out.push([sends ? "out" : "", match[1], void 0]);
+    const match = /^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|(proxy(?:-connect)?|socks4a?|socks5(?:-connect)?):[^:,]+):(\[[^\]]+\]|[^:,]+):/i.exec(address2);
+    const proxied = match?.[1] !== void 0 || /,\s*(?:proxyport|socksport)=/i.test(address2);
+    if (match !== null) out.push([sends ? "out" : "", match[2], void 0, void 0, proxied]);
   }
   return out;
 }
