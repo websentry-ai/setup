@@ -1343,7 +1343,7 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> bool:
-    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions, 'uploader_stats': _backfill_uploader_stats}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.
@@ -1443,9 +1443,19 @@ def _backfill_jsonl_files(root: Path, skip_dirs=()):
                 yield base / name
 
 
-def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
+def _backfill_empty_stats() -> Dict:
+    return {'files_seen': 0, 'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0},
+            'unreadable': 0}
+
+
+# What this run could not send, carried on every upload so the server can report it per device.
+_backfill_uploader_stats = _backfill_empty_stats()
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[Dict] = None):
     # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
-    # their session (_backfill_subagent_usage).
+    # their session (_backfill_subagent_usage). stats counts the transcripts seen and those over the cap.
+    stats = stats if stats is not None else _backfill_empty_stats()
     for p in _backfill_jsonl_files(root, skip_dirs=('subagents',)):
         if p.name.startswith('.'):
             continue
@@ -1453,13 +1463,47 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
             continue
         try:
             st = p.stat()
+            stats['files_seen'] += 1
             if st.st_size > BACKFILL_MAX_FILE_BYTES:
+                over = stats['skipped_over_cap']
+                over['count'] += 1
+                over['total_bytes'] += st.st_size
+                over['largest_bytes'] = max(over['largest_bytes'], st.st_size)
                 continue
             if st.st_mtime < cutoff_mtime:
                 continue
         except OSError:
             continue
         yield p
+
+
+def _backfill_first_session_id(transcript_path: Path):
+    """The session id _backfill_collect_session would file a transcript under, or None; reads up to the first one."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = entry.get('sessionId') or entry.get('session_id') if isinstance(entry, dict) else None
+                if sid:
+                    return sid
+    except Exception:
+        return None
+    return None
+
+
+def _backfill_walk_stats(root: Path) -> Dict:
+    """uploader_stats for every transcript under root, whatever its age: how many, which are over the cap, and
+    which can't be read."""
+    stats = _backfill_empty_stats()
+    for path in _backfill_iter_transcripts(root, 0, stats):
+        if not _backfill_first_session_id(path):
+            stats['unreadable'] += 1
+    return stats
 
 
 def _backfill_is_real_user_prompt(content) -> bool:
@@ -1757,6 +1801,7 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
 
 def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> None:
     """Walk config_dir/projects and seed historical sessions. Never raises."""
+    global _backfill_uploader_stats
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -1782,7 +1827,9 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
         projects_root = config_dir / 'projects'
         sessions: List[Dict] = []
         capped = False
+        _backfill_uploader_stats = _backfill_empty_stats()
         if projects_root.exists():
+            _backfill_uploader_stats = _backfill_walk_stats(projects_root)
             for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                     # Hit the per-run cap with files still unprocessed — don't advance

@@ -1904,9 +1904,19 @@ def _backfill_root_is_linked(*paths: Path) -> bool:
     return platform.system().lower() == "windows" and any(_is_reparse_point(p) for p in paths)
 
 
-def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
+def _backfill_empty_stats() -> Dict:
+    return {'files_seen': 0, 'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0},
+            'unreadable': 0}
+
+
+# What this run could not send, carried on every upload so the server can report it per device.
+_backfill_uploader_stats = _backfill_empty_stats()
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[Dict] = None):
     # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
-    # their session (_backfill_subagent_usage).
+    # their session (_backfill_subagent_usage). stats counts the transcripts seen and those over the cap.
+    stats = stats if stats is not None else _backfill_empty_stats()
     for p in _backfill_jsonl_files(root, skip_dirs=('subagents',)):
         if p.name.startswith('.'):
             continue
@@ -1914,13 +1924,47 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
             continue
         try:
             st = p.stat()
+            stats['files_seen'] += 1
             if st.st_size > BACKFILL_MAX_FILE_BYTES:
+                over = stats['skipped_over_cap']
+                over['count'] += 1
+                over['total_bytes'] += st.st_size
+                over['largest_bytes'] = max(over['largest_bytes'], st.st_size)
                 continue
             if st.st_mtime < cutoff_mtime:
                 continue
         except OSError:
             continue
         yield p
+
+
+def _backfill_first_session_id(transcript_path: Path):
+    """The session id _backfill_collect_session would file a transcript under, or None; reads up to the first one."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = entry.get('sessionId') or entry.get('session_id') if isinstance(entry, dict) else None
+                if sid:
+                    return sid
+    except Exception:
+        return None
+    return None
+
+
+def _backfill_walk_stats(root: Path) -> Dict:
+    """uploader_stats for every transcript under root, whatever its age: how many, which are over the cap, and
+    which can't be read."""
+    stats = _backfill_empty_stats()
+    for path in _backfill_iter_transcripts(root, 0, stats):
+        if not _backfill_first_session_id(path):
+            stats['unreadable'] += 1
+    return stats
 
 
 def _backfill_oldest_first(paths):
@@ -2374,7 +2418,7 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> bool:
-    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions, 'uploader_stats': _backfill_uploader_stats}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.
@@ -2664,6 +2708,24 @@ def _backfill_report(sessions_sent: int, batches: int, statuses: set) -> None:
     print(line)
 
 
+def _backfill_home_stats(home_dir: Path) -> Dict:
+    projects_root = home_dir / '.claude' / 'projects'
+    if not projects_root.exists() or _backfill_root_is_linked(home_dir / '.claude', projects_root):
+        return _backfill_empty_stats()
+    return _backfill_walk_stats(projects_root)
+
+
+def _backfill_add_stats(total: Dict, part: Optional[Dict]) -> None:
+    if not part:
+        return
+    total['files_seen'] += part['files_seen']
+    total['unreadable'] += part['unreadable']
+    over, more = total['skipped_over_cap'], part['skipped_over_cap']
+    over['count'] += more['count']
+    over['total_bytes'] += more['total_bytes']
+    over['largest_bytes'] = max(over['largest_bytes'], more['largest_bytes'])
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
@@ -2671,6 +2733,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     shared. Each session carries its own home's signed-in email plus the machine
     serial, which is what lets the server attribute a profile's history to the
     person who ran it rather than to the key's owner."""
+    global _backfill_uploader_stats
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -2685,6 +2748,11 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         # Fetched once, before privileges are dropped: one call per device, not per profile.
         run = _BackfillRun(api_key, backend_url, device_serial,
                            _backfill_force_config(api_key, backend_url), completed_watermark)
+        # Counted for every profile before any upload, so each upload carries the same numbers.
+        stats = _backfill_empty_stats()
+        for username, home_dir in user_homes:
+            _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
+        _backfill_uploader_stats = stats
         sessions_sent, batches, statuses = 0, 0, set()
         for user_home in user_homes:
             try:
