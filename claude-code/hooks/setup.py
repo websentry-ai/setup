@@ -1486,6 +1486,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     boundaries = _backfill_exchange_boundaries(entries)
     # Each subagent reply rides with the exchange it is billed to, so a slice carries the replies its turns hold.
     owners = _backfill_subagent_owners(entries, boundaries, subagents)
+    bare_sizes = list(entry_sizes)
     for size, owner in zip(subagent_sizes, owners):
         entry_sizes[owner] += size
     n = len(entries)
@@ -1519,6 +1520,13 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             last_fit_end = end_idx
             last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)
 
+        # An exchange that fits only without its subagent records still goes, without them, so its turns are kept.
+        bare = last_fit_end is None and len(json.dumps({
+            'session_id': session_id, 'record_index_base': record_index_base, 'entries': [], **identity,
+        }).encode('utf-8')) + sum(bare_sizes[start_idx:ends[0]]) - 2 <= max_chunk_bytes
+        if bare:
+            last_fit_end = ends[0]
+            last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < last_fit_end)
         if last_fit_end is None:
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
@@ -1528,7 +1536,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'record_index_base': record_index_base,
             'entries': entries[start_idx:last_fit_end],
         }
-        if subagents:
+        if subagents and not bare:
             slice_payload['subagents'] = [r for r, owner in zip(subagents, owners)
                                           if start_idx <= owner < last_fit_end]
         slice_payload.update(identity)

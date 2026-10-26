@@ -190,6 +190,19 @@ class BackfillSubagentsTestCase(unittest.TestCase):
                 self.assertEqual([len(s["entries"]) for s in slices], [3, 13, 3])
                 self.assertEqual([s["record_index_base"] for s in slices], [0, 1, 2])
 
+    def test_an_exchange_that_fits_only_without_its_subagent_records_still_uploads(self):
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                session = up._backfill_collect_session(self.with_agents)
+                cuts = up._backfill_exchange_boundaries(session["entries"]) + [len(session["entries"])]
+                # Room for every exchange on its own, but not for the first with its subagent records.
+                limit = max(len(json.dumps({"session_id": session["session_id"], "record_index_base": 0,
+                                            "entries": session["entries"][a:b]}).encode("utf-8"))
+                            for a, b in zip(cuts, cuts[1:]))
+                slices = list(up._backfill_slice_session(session, limit))
+                self.assertEqual([e for s in slices for e in s["entries"]], session["entries"])
+                self.assertTrue(all(len(json.dumps(s).encode("utf-8")) <= limit for s in slices))
+
 
 if __name__ == "__main__":
     unittest.main()
