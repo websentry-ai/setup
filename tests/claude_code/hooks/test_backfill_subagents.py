@@ -72,6 +72,86 @@ class BackfillSubagentsTestCase(unittest.TestCase):
                 slices = list(up._backfill_slice_session(session, len(json.dumps(session).encode("utf-8")) - 1))
                 self.assertEqual(slices[-1]["subagents"][-1]["message"]["id"], "msg_late")
 
+    # ------------------------------------------------------------------ hostile and unusual subagent files
+
+    def _agent_file(self, lines, name="agent-extra.jsonl"):
+        subdir = self.with_agents.with_suffix("") / "subagents"
+        subdir.mkdir(parents=True, exist_ok=True)
+        (subdir / name).write_text("".join(json.dumps(line) + "\n" for line in lines))
+
+    @staticmethod
+    def _reply(reply_id, ts, output, advisors=()):
+        usage = {"input_tokens": 1, "output_tokens": output}
+        if advisors:
+            usage["iterations"] = [{"type": "advisor_message", "model": "claude-opus-4-1", "output_tokens": n}
+                                   for n in advisors]
+        line = {"type": "assistant", "isSidechain": True, "message": {"id": reply_id, "usage": usage}}
+        if ts is not None:
+            line["timestamp"] = ts
+        return line
+
+    def test_mixed_timestamp_shapes_never_cost_the_session(self):
+        self._agent_file([self._reply("msg_naive", "2026-09-01T10:20:00.000", 3),
+                          self._reply("msg_naive", "2026-09-01T10:19:00.000Z", 4),
+                          self._reply("msg_epoch", 1788257000000, 5),
+                          self._reply("msg_untimed", None, 6)])
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                session = up._backfill_collect_session(self.with_agents)
+                by_id = {r["message"]["id"]: r for r in session["subagents"]}
+                self.assertEqual(by_id["msg_naive"]["timestamp"], "2026-09-01T10:19:00.000Z")
+                # Epoch milliseconds, which the live hook accepts, reach the server as a time it can read.
+                self.assertEqual(by_id["msg_epoch"]["timestamp"], "2026-09-01T10:03:20Z")
+                self.assertEqual(session["subagents"][-1]["message"]["id"], "msg_untimed")
+                list(up._backfill_slice_session(session, len(json.dumps(session).encode("utf-8")) // 2))
+
+    def test_an_unreadable_subagent_dir_still_uploads_the_session(self):
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                original = up._backfill_subagent_usage
+                up._backfill_subagent_usage = lambda path: 1 / 0
+                try:
+                    session = up._backfill_collect_session(self.with_agents)
+                finally:
+                    up._backfill_subagent_usage = original
+                self.assertTrue(session["entries"])
+                self.assertNotIn("subagents", session)
+
+    def test_a_later_copy_that_adds_advisor_usage_keeps_it(self):
+        # Same top-level usage on both copies; only the later one carries the advisor turn.
+        self._agent_file([self._reply("msg_adv", "2026-09-01T10:21:00.000Z", 7),
+                          self._reply("msg_adv", "2026-09-01T10:21:01.000Z", 7, advisors=(40,))])
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                [record] = [r for r in up._backfill_collect_session(self.with_agents)["subagents"]
+                            if r["message"]["id"] == "msg_adv"]
+                self.assertEqual([it["output_tokens"] for it in record["message"]["usage"]["iterations"]], [40])
+
+    def test_the_reply_cap_holds_while_reading(self):
+        self._agent_file([self._reply(f"msg_cap{i}", "2026-09-01T10:30:00.000Z", 1) for i in range(5)])
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                cap = up.BACKFILL_MAX_SUBAGENT_REPLIES
+                up.BACKFILL_MAX_SUBAGENT_REPLIES = 4
+                try:
+                    records = up._backfill_collect_session(self.with_agents)["subagents"]
+                finally:
+                    up.BACKFILL_MAX_SUBAGENT_REPLIES = cap
+                self.assertEqual(len(records), 4)
+
+    def test_subagent_usage_counts_toward_the_mdm_batch_budget(self):
+        mdm = uploaders[0]
+        self._agent_file([self._reply(f"msg_heavy{i}", "2026-09-01T10:30:00.000Z", 1) for i in range(200)])
+        stamped = [(1.0, 10, self.with_agents), (2.0, 10, self.without)]
+        budget = mdm.BACKFILL_BATCH_BYTES
+        mdm.BACKFILL_BATCH_BYTES = 1000
+        try:
+            sessions, capped = mdm._backfill_read_batch(stamped)
+        finally:
+            mdm.BACKFILL_BATCH_BYTES = budget
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(capped, (1.0, str(self.with_agents)))
+
 
 if __name__ == "__main__":
     unittest.main()

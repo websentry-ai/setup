@@ -13,7 +13,7 @@ import threading
 import hashlib
 import bisect
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import shlex
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -1569,13 +1569,17 @@ def clear_setup() -> bool:
 
 
 def _backfill_ts(value):
-    """A transcript timestamp as an aware datetime, or None when it does not parse."""
-    if not isinstance(value, str):
-        return None
+    """A transcript timestamp as an aware UTC datetime, or None. Never raises: like the live hook, it takes ISO
+    strings with or without an offset and epoch seconds or milliseconds."""
     try:
-        return datetime.fromisoformat(value.replace('Z', '+00:00'))
-    except ValueError:
-        return None
+        if isinstance(value, str):
+            at = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value / 1000.0 if value > 10_000_000_000 else value, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
 
 
 def _backfill_usage_total(usage: Dict) -> int:
@@ -1613,6 +1617,18 @@ def _backfill_usage_record(entry) -> Optional[Dict]:
             'message': {'id': reply_id, 'usage': usage}}
 
 
+def _backfill_keep(kept, usage, sidechain) -> bool:
+    """Whether a copy replaces the one kept: a copy outside a subagent wins, then the largest. The hook's rule."""
+    return (kept is None or (kept[1] and not sidechain)
+            or (kept[1] == sidechain and _backfill_usage_total(usage) > _backfill_usage_total(kept[0])))
+
+
+def _backfill_advisors(usage: Dict) -> List[Dict]:
+    iterations = usage.get('iterations')
+    return [it for it in iterations if isinstance(it, dict) and it.get('type') == 'advisor_message'
+            and it.get('model')] if isinstance(iterations, list) else []
+
+
 def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
     """One usage record per reply of the subagents this session ran, which Claude Code writes under subagents/
     beside the transcript: the reply's first line's time and its largest copy, as the live hook bills it. The
@@ -1624,7 +1640,8 @@ def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
             break
     if subdir is None:
         return []
-    replies, first = {}, {}
+    # reply id -> (usage, sidechain) for the reply and each advisor turn in it, kept apart as the hook keeps them.
+    replies, advisors, first = {}, {}, {}
     for path in sorted(subdir.rglob('*.jsonl')):
         try:
             if path.is_symlink() or not path.is_file() or path.stat().st_size > BACKFILL_MAX_FILE_BYTES:
@@ -1640,24 +1657,33 @@ def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
                     if record is None:
                         continue
                     reply_id, at = record['message']['id'], _backfill_ts(record['timestamp'])
+                    if reply_id not in replies and len(replies) >= BACKFILL_MAX_SUBAGENT_REPLIES:
+                        continue
                     if at is not None and (reply_id not in first or at < first[reply_id][0]):
                         first[reply_id] = (at, record['timestamp'])
-                    kept = replies.get(reply_id)
-                    # A copy outside a subagent wins, then the largest: the hook's rule.
-                    if (kept is None or (kept['isSidechain'] and not record['isSidechain'])
-                            or (kept['isSidechain'] == record['isSidechain']
-                                and _backfill_usage_total(record['message']['usage'])
-                                > _backfill_usage_total(kept['message']['usage']))):
-                        replies[reply_id] = record
+                    usage, sidechain = record['message']['usage'], record['isSidechain']
+                    if _backfill_keep(replies.get(reply_id), usage, sidechain):
+                        replies[reply_id] = (usage, sidechain)
+                    parts = advisors.setdefault(reply_id, {})
+                    for index, advisor in enumerate(_backfill_advisors(usage)):
+                        if _backfill_keep(parts.get(index), advisor, sidechain):
+                            parts[index] = (advisor, sidechain)
         except (OSError, UnicodeDecodeError):
             continue
     records = []
-    for reply_id, record in replies.items():
-        if reply_id in first:
-            record = dict(record, timestamp=first[reply_id][1])
-        records.append(record)
-    records.sort(key=lambda r: (_backfill_ts(r['timestamp']) is None, r['timestamp'] or ''))
-    return records[:BACKFILL_MAX_SUBAGENT_REPLIES]
+    for reply_id, (usage, sidechain) in replies.items():
+        parts = advisors.get(reply_id)
+        if parts:
+            usage = dict(usage, iterations=[parts[i][0] for i in sorted(parts)])
+        at, stamp = first.get(reply_id, (None, None))
+        if at is not None and not isinstance(stamp, str):
+            stamp = at.isoformat().replace('+00:00', 'Z')
+        records.append({'type': 'assistant', 'timestamp': stamp, 'isSidechain': sidechain,
+                        'message': {'id': reply_id, 'usage': usage}})
+    epoch = datetime.fromtimestamp(0, timezone.utc)
+    records.sort(key=lambda r: (first.get(r['message']['id']) is None,
+                                first.get(r['message']['id'], (epoch,))[0]))
+    return records
 
 
 def _backfill_subagent_owners(entries: List[Dict], boundaries: List[int], records: List[Dict]) -> List[int]:
@@ -1714,7 +1740,11 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     if not session_id or not entries:
         return None
     session = {'session_id': session_id, 'entries': entries}
-    subagents = _backfill_subagent_usage(transcript_path)
+    try:
+        subagents = _backfill_subagent_usage(transcript_path)
+    except Exception:
+        # The session still uploads without its subagents rather than not at all.
+        subagents = []
     if subagents:
         session['subagents'] = subagents
     return session
@@ -2137,6 +2167,8 @@ def _backfill_read_batch(stamped) -> Tuple[List[Dict], object]:
         session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
+            # Subagent usage rides with its session, so it is held in the batch too.
+            bytes_read += len(json.dumps(session.get('subagents') or []))
         else:
             skipped += 1
     if skipped:
