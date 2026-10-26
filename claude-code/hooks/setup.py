@@ -33,6 +33,8 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 # Usage records of the subagents one session ran; the server reads at most this many.
 BACKFILL_MAX_SUBAGENT_REPLIES = 50000
+# The server parses at most this many entries of a session or slice, so a slice never holds more.
+BACKFILL_MAX_ENTRIES_PER_SLICE = 10000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
@@ -1470,7 +1472,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     # an oversized session silently loses the attribution the whole change is for.
     identity = {k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}
     try:
-        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
+        if (len(entries) <= BACKFILL_MAX_ENTRIES_PER_SLICE
+                and len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes):
             yield session
             return
         # +2 for the `, ` separator json.dumps puts between array elements.
@@ -1509,6 +1512,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             cursor = end_idx
             # -2: last entry has no trailing `, ` and `[]` was counted in wrap.
             if cum - 2 > max_chunk_bytes:
+                break
+            # An exchange over the entry cap on its own still goes alone rather than ending the session.
+            if last_fit_end is not None and end_idx - start_idx > BACKFILL_MAX_ENTRIES_PER_SLICE:
                 break
             last_fit_end = end_idx
             last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)

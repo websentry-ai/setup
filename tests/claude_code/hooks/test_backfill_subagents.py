@@ -152,6 +152,44 @@ class BackfillSubagentsTestCase(unittest.TestCase):
         self.assertEqual(len(sessions), 1)
         self.assertEqual(capped, (1.0, str(self.with_agents)))
 
+    # ------------------------------------------------------------------ the server's per-slice entry limit
+
+    @staticmethod
+    def _session(lines_per_exchange):
+        entries = []
+        for n, lines in enumerate(lines_per_exchange):
+            entries.append({"type": "user", "timestamp": f"2026-09-01T11:{n:02d}:00.000Z",
+                            "message": {"role": "user", "content": f"ask {n}"}})
+            entries += [{"type": "assistant", "timestamp": f"2026-09-01T11:{n:02d}:01.000Z",
+                         "message": {"id": f"msg_{n}", "role": "assistant", "content": [{"type": "text", "text": "x"}],
+                                     "usage": {"input_tokens": 1, "output_tokens": 1}}}] * lines
+        return {"session_id": "S-many-lines", "entries": entries}
+
+    def _sliced(self, up, session, cap):
+        limit = up.BACKFILL_MAX_ENTRIES_PER_SLICE
+        up.BACKFILL_MAX_ENTRIES_PER_SLICE = cap
+        try:
+            return list(up._backfill_slice_session(session, 14 * 1024 * 1024))
+        finally:
+            up.BACKFILL_MAX_ENTRIES_PER_SLICE = limit
+
+    def test_a_small_session_over_the_entry_limit_is_sliced_within_it(self):
+        session = self._session([3] * 6)  # 24 entries, far under the byte limit
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                slices = self._sliced(up, session, 10)
+                self.assertTrue(all(len(s["entries"]) <= 10 for s in slices))
+                self.assertEqual([e for s in slices for e in s["entries"]], session["entries"])
+                self.assertEqual([s["record_index_base"] for s in slices], [0, 2, 4])
+
+    def test_an_exchange_over_the_entry_limit_goes_alone_and_the_rest_still_goes(self):
+        session = self._session([2, 12, 2])
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                slices = self._sliced(up, session, 10)
+                self.assertEqual([len(s["entries"]) for s in slices], [3, 13, 3])
+                self.assertEqual([s["record_index_base"] for s in slices], [0, 1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()
