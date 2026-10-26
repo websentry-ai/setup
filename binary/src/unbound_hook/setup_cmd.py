@@ -1010,6 +1010,8 @@ def _setup_claude_code(opts):
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         m.remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+
     success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
         return ("deferred", "failed to set UNBOUND_DEVICE_TOKEN")
@@ -1068,6 +1070,8 @@ def _setup_augment(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+
     success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
         return ("deferred", "failed to set UNBOUND_DEVICE_TOKEN")
@@ -1112,6 +1116,8 @@ def _setup_codex(opts):
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
+
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
 
     success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
@@ -1321,6 +1327,8 @@ def _setup_cursor(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+
     success, env_changed, message = m.set_env_var("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
         return ("deferred", f"failed to set UNBOUND_DEVICE_TOKEN: {message}")
@@ -1407,6 +1415,8 @@ def _setup_copilot(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
 
     success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:

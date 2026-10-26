@@ -155,3 +155,17 @@ def test_every_config_writer_also_writes_device_token():
     assert files
     missing = [f for f in files if not re.search(r"config\[['\"]device_token['\"]\] = api_key", (REPO / f).read_text())]
     assert missing == []
+
+
+@pytest.mark.parametrize("tool", sorted(SETUPS))
+def test_relative_hook_dirs_never_count_as_in_use(home, tmp_path, monkeypatch, tool):
+    # On macOS an unexpanded %ProgramData% entry is relative and would resolve against the cwd.
+    setup = _load(SETUPS[tool], f"token_setup_{tool.replace('-', '_')}")
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_{tool.replace('-', '_')}")
+    (tmp_path / "%ProgramData%" / "X" / "hooks").mkdir(parents=True)
+    (tmp_path / "%ProgramData%" / "X" / "hooks" / "unbound.py").write_text("#")
+    monkeypatch.chdir(tmp_path)
+    for m in (setup, mdm):
+        monkeypatch.setattr(m, "OTHER_HOOK_DIRS", ("%ProgramData%/X",))
+    assert setup.device_token_in_use() is False
+    assert mdm.device_token_in_use(home) is False

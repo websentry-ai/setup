@@ -1681,7 +1681,9 @@ def device_token_in_use(home_dir: Optional[Path]) -> bool:
             if home_dir is None:
                 continue
             d = str(home_dir) + d[1:]
-        if (Path(os.path.expandvars(d)) / "hooks" / "unbound.py").exists():
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
             return True
     return False
 
@@ -2446,6 +2448,8 @@ def main():
     # Remove leftover gateway setup env vars
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
+
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
 
     success, _ = set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:

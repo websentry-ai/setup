@@ -714,8 +714,9 @@ OTHER_HOOK_DIRS = (
 
 
 def device_token_in_use() -> bool:
-    return any((Path(os.path.expandvars(os.path.expanduser(d))) / "hooks" / "unbound.py").exists()
-               for d in OTHER_HOOK_DIRS)
+    dirs = (Path(os.path.expandvars(os.path.expanduser(d))) for d in OTHER_HOOK_DIRS)
+    # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+    return any(p.is_absolute() and (p / "hooks" / "unbound.py").exists() for p in dirs)
 
 
 def clear_setup() -> bool:
@@ -1066,6 +1067,7 @@ def main():
     debug_print("API key received from callback")
 
     debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
     success, message = set_env_var("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")

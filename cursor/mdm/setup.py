@@ -932,7 +932,9 @@ def device_token_in_use(home_dir: Optional[Path]) -> bool:
             if home_dir is None:
                 continue
             d = str(home_dir) + d[1:]
-        if (Path(os.path.expandvars(d)) / "hooks" / "unbound.py").exists():
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
             return True
     return False
 
@@ -1312,6 +1314,7 @@ def main():
 
     # Set environment variable
     debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
     success, env_changed, message = set_env_var("UNBOUND_DEVICE_TOKEN", cursor_api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
