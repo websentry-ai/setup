@@ -4220,9 +4220,9 @@ class _TransferLexer:
             if found is not None:
                 return found
             self.word += ch
-        elif self.quote == '"' and ch == '\\' and self.i + 1 < len(self.text):
-            self.i += 1
-            self.word += self._literal(self.text[self.i])
+        elif self.quote == '"' and ch == '\\' and self.text[self.i + 1:self.i + 2] in ('$', '`', '"', '\\', '\n'):
+            self.i += 1  # only these lose the backslash in double quotes; before anything else it stays
+            self.word += '' if self.text[self.i] == '\n' else self._literal(self.text[self.i])
         else:
             self.word += self._literal(ch)
         return True
@@ -5839,14 +5839,14 @@ def _transfer_url_host(url: str) -> str:
     from urllib.parse import urlsplit
     try:
         text = url.strip()
-        parts = urlsplit(text if '://' in text else 'http://' + text)
+        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
         host = parts.hostname or ''
         if '[' in parts.netloc and not _transfer_ip(host):
             return ''  # brackets hold nothing but an IPv6 address, which older Pythons do not check
         if '%' in host and '[' not in parts.netloc:
             from urllib.parse import unquote
-            host = unquote(host, errors='strict').lower()  # curl decodes a host name; one still holding % is none
-            if '%' in host:
+            host = unquote(host, errors='strict').lower()  # curl decodes a host name, then rejects what no name holds
+            if any(c.isspace() or (c.isascii() and not (c.isalnum() or c in '-._')) for c in host):
                 return ''
         if host.isascii():
             return host
@@ -5886,7 +5886,7 @@ def _transfer_curl_glob(url: str) -> Optional[List[str]]:
     for text, values in pieces:
         urls = [u + text for u in urls]
         # Past the host a glob only changes the path, so one of its values stands for all.
-        in_host = not all(re.search(r'[/?#]', u.split('://', 1)[-1]) for u in urls)
+        in_host = not all(re.search(r'[/?#]', u[2:] if u.startswith('//') else u.split('://', 1)[-1]) for u in urls)
         urls = [u + v for u in urls for v in (values if in_host else values[:1])][:_TRANSFER_MAX_WORDS]
     return urls
 
@@ -5957,7 +5957,8 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     from urllib.parse import urlsplit
     host = _transfer_url_host(url)
     try:
-        parts = urlsplit(url.strip() if '://' in url else 'http://' + url.strip())
+        text = url.strip()
+        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
         port = str(parts.port or _TRANSFER_DEFAULT_PORTS.get(parts.scheme.lower(), ''))
     except ValueError:
         return None
@@ -6567,8 +6568,6 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     shell_dir = cwd
     root_projects = {}
     transfer_state = {}
-    # Where the next shell call's transfer lookups start; only a cd that surely ran moves it.
-    transfer_dir = cwd
 
     read_skills = set()
     mcp_servers = read_augment_mcp_servers(event)
@@ -6585,8 +6584,11 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
                 shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
             shaped['project'] = tool_project
             if shaped.get('tool_name') == 'Bash' and isinstance(shaped.get('tool_input'), dict):
-                transfer = _transfer(shaped['tool_input'].get('command'), transfer_dir, transfer_state)
-                transfer_dir = _transfer_next_cwd(shaped['tool_input'].get('command'), transfer_dir)
+                # A launch-process is a new process in its own cwd, relative to the workspace root; no cd carries over.
+                call_cwd = (ev.get('tool_input') or {}).get('cwd') if isinstance(ev.get('tool_input'), dict) else None
+                start = os.path.join(cwd or '', call_cwd) if isinstance(call_cwd, str) and call_cwd else cwd
+                start = start if start and os.path.isabs(start) else None
+                transfer = _transfer(shaped['tool_input'].get('command'), start, transfer_state)
                 if transfer:
                     shaped['transfer'] = transfer
             assistant_tool_uses.append(_with_call_ts(shaped, log_entry.get('timestamp')))

@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '2a8c78ed6adeb41ffa3bc61f242a176e3f6f3872c873c02bbfcd62e188748ad3'
+BLOCK_SHA256 = '6a4947ae6ac55988590d48407fbec6c6993344d35062b1ae567ddfdeb1d80c7d'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -840,6 +840,10 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd nowhere || cd frontend; scp -F cfg f prod:/tmp', unknown),
                                   ('cd nowhere && cd frontend; scp -F cfg f prod:/tmp', unknown),
                                   ('cd notes; scp -F cfg f prod:/tmp', public),
+                                  # In double quotes a backslash stays unless it escapes $ ` " \ or a newline.
+                                  ('cd "\\frontend"; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd "\\~/frontend"; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd "front\\\nend"; scp -F cfg f prod:/tmp', private),
                                   ('cd cfg; scp -F cfg f prod:/tmp', public),
                                   # A command that only reads inside the folder, such as wc, does not name it.
                                   ('wc -c frontend/cfg; cd frontend; scp -F cfg f prod:/tmp', private),
@@ -1092,12 +1096,33 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         unknown = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]}
         cases = (('false && cd frontend', public), ('cd frontend', private), ('cd frontend &', public),
                  ('(cd frontend)', public), ('test -f marker && cd frontend', unknown), ('exec cd frontend', public))
-        for path in ('claude-code/hooks/unbound.py', 'codex/hooks/unbound.py', 'copilot/hooks/unbound.py',
-                     'augment/hooks/unbound.py'):
+        for path in ('claude-code/hooks/unbound.py', 'copilot/hooks/unbound.py'):
             for first, expected in cases:
                 with self.subTest(hook=path, first=first):
                     transfers = self._transfers(path, [first, 'scp -F cfg build.zip prod:/srv'])
                     self.assertEqual(transfers[-1], expected)
+
+    def test_a_codex_or_augment_call_starts_in_a_new_shell(self):
+        # Each Codex exec_command and Augment launch-process is a new shell, so a cd in one call does not move the next.
+        public = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'public', '203.0.113.9')]}
+        for path in ('codex/hooks/unbound.py', 'augment/hooks/unbound.py'):
+            with self.subTest(hook=path):
+                transfers = self._transfers(path, ['cd frontend', 'scp -F cfg build.zip prod:/srv'])
+                self.assertEqual(transfers[-1], public)
+
+    def test_an_augment_call_starts_in_its_own_cwd(self):
+        hook = load_module('augment/hooks/unbound.py')
+        private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+        for cwd in ('frontend', os.path.join(self.repo, 'frontend')):
+            post = [{'timestamp': '2026-10-22T16:40:00.9Z',
+                     'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'launch-process',
+                               'tool_input': {'command': 'scp -F cfg build.zip prod:/srv', 'cwd': cwd},
+                               'tool_output': ''}}]
+            stop = {'hook_event_name': 'Stop', 'cwd': self.repo, 'conversation_id': 'c1',
+                    'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}}
+            with self.subTest(cwd=cwd):
+                entries = _tool_entries(hook.build_llm_exchange(stop, post))
+                self.assertEqual([e.get('transfer') for e in entries], [private])
 
     def test_claude_code_starts_the_walk_where_the_turn_started(self):
         # Claude's Stop carries the folder the turn ended in; replaying the turn's cd from there would miss the folder.

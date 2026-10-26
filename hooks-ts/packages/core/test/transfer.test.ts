@@ -528,6 +528,10 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["cd nowhere || cd frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd nowhere && cd frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd notes; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    // In double quotes a backslash stays unless it escapes $ ` " \ or a newline.
+    ['cd "\\frontend"; scp -F cfg f prod:/tmp', "prod"],
+    ['cd "\\~/frontend"; scp -F cfg f prod:/tmp', "prod"],
+    ['cd "front\\\nend"; scp -F cfg f prod:/tmp', "10.0.4.12"],
     ["cd cfg; scp -F cfg f prod:/tmp", "203.0.113.9"],
     // A command that only reads inside the folder, such as wc, does not name it.
     ["wc -c frontend/cfg; cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],

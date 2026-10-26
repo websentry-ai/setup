@@ -2301,8 +2301,9 @@ var Lexer = class _Lexer {
       const found = this.substitution();
       if (found !== void 0) return found;
       this.word += ch;
-    } else if (this.quote === '"' && ch === "\\" && this.i + 1 < this.text.length) {
-      this.word += this.literal(this.text[++this.i]);
+    } else if (this.quote === '"' && ch === "\\" && ["$", "`", '"', "\\", "\n"].includes(this.text[this.i + 1] ?? "")) {
+      const next = this.text[++this.i];
+      this.word += next === "\n" ? "" : this.literal(next);
     } else {
       this.word += this.literal(ch);
     }
@@ -3760,7 +3761,7 @@ function shortOption(arg, args, start, valueFlags, seen) {
 function urlHost(url) {
   try {
     const text = url.trim();
-    const full = text.includes("://") ? text : `http://${text}`;
+    const full = text.includes("://") ? text : `${text.startsWith("//") ? "http:" : "http://"}${text}`;
     if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
     const host = new URL(full).hostname.toLowerCase();
     return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
@@ -3790,7 +3791,7 @@ function curlGlob(url) {
   let urls = [""];
   for (const [text, values] of pieces) {
     urls = urls.map((u) => u + text);
-    const inHost = !urls.every((u) => /[/?#]/.test(u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
+    const inHost = !urls.every((u) => /[/?#]/.test(u.startsWith("//") ? u.slice(2) : u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
     urls = urls.flatMap((u) => (inHost ? values : values.slice(0, 1)).map((v) => u + v)).slice(0, MAX_WORDS);
   }
   return urls;

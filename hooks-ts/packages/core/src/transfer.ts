@@ -552,8 +552,10 @@ class Lexer {
       const found = this.substitution();
       if (found !== undefined) return found;
       this.word += ch;
-    } else if (this.quote === '"' && ch === "\\" && this.i + 1 < this.text.length) {
-      this.word += this.literal(this.text[++this.i] as string);
+    } else if (this.quote === '"' && ch === "\\" && ["$", "`", '"', "\\", "\n"].includes(this.text[this.i + 1] ?? "")) {
+      // Only these lose the backslash in double quotes; before anything else it stays.
+      const next = this.text[++this.i] as string;
+      this.word += next === "\n" ? "" : this.literal(next);
     } else {
       this.word += this.literal(ch);
     }
@@ -2382,7 +2384,7 @@ function shortOption(arg: string, args: readonly string[], start: number, valueF
 function urlHost(url: string): string {
   try {
     const text = url.trim();
-    const full = text.includes("://") ? text : `http://${text}`;
+    const full = text.includes("://") ? text : `${text.startsWith("//") ? "http:" : "http://"}${text}`;
     // A backslash is no part of a host, though the URL standard reads it as a slash.
     if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
     const host = new URL(full).hostname.toLowerCase();
@@ -2420,7 +2422,7 @@ function curlGlob(url: string): string[] | undefined {
   for (const [text, values] of pieces) {
     urls = urls.map((u) => u + text);
     // Past the host a glob only changes the path, so one of its values stands for all.
-    const inHost = !urls.every((u) => /[/?#]/.test(u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
+    const inHost = !urls.every((u) => /[/?#]/.test(u.startsWith("//") ? u.slice(2) : u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
     urls = urls.flatMap((u) => (inHost ? values : values.slice(0, 1)).map((v) => u + v)).slice(0, MAX_WORDS);
   }
   return urls;
