@@ -56,15 +56,18 @@ function fakeSsh(calls: string[][] = []): ExecFileLike {
       else if (args[i] === "-F") config = args[i + 1];
     }
     const host = destination.split("@").pop() as string;
+    let jump: string | undefined;
     if (config !== undefined && config !== "none") {
       let current: string[] = [];
       for (const line of configLines(config)) {
         const [key, ...values] = line.trim().split(/\s+/);
         if (key?.toLowerCase() === "host") current = values;
         else if (key?.toLowerCase() === "hostname" && current.includes(host)) hostname ??= values[0];
+        else if (key?.toLowerCase() === "proxyjump" && current.includes(host)) jump ??= values.join(" ");
       }
     }
-    return `hostname ${(hostname ?? FIXTURE.ssh_hosts[host] ?? host).toLowerCase()}\nport 22\n`;
+    const proxy = jump === undefined || jump.toLowerCase() === "none" ? "" : `proxyjump ${jump}\n`;
+    return `hostname ${(hostname ?? FIXTURE.ssh_hosts[host] ?? host).toLowerCase()}\nport 22\n${proxy}`;
   };
 }
 
@@ -167,6 +170,56 @@ test("a Match exec never runs however the config reaches ssh", { skip: REAL_SSH 
   assert.ok(!existsSync(sentinel));
 });
 
+test("a Match exec split by a trailing backslash never runs", { skip: REAL_SSH === undefined }, async () => {
+  // ssh joins no lines, so the split line is a bad option to it; the check refuses any line ending in a backslash.
+  const folder = repo();
+  const sentinel = join(mkdtempSync(join(tmpdir(), "transfer-sentinel-")), "ran");
+  const split = `Match host prod \\\n  exec "touch ${sentinel}"\n  HostName 10.6.6.6\n`;
+  writeFileSync(join(folder, "split"), split);
+  writeFileSync(join(folder, "split.conf"), split);
+  writeFileSync(join(folder, "includes"), `Include ${folder}/split.conf\nHost prod\n  HostName 10.0.4.12\n`);
+  writeFileSync(join(folder, "canon"), "CanonicalizeHostname \\\nyes\nHost prod\n  HostName 10.0.4.12\n");
+  for (const name of ["split", "includes", "canon"]) {
+    const ran: string[][] = [];
+    const counting: ExecFileLike = (file, args, opts) => {
+      ran.push([file, ...args]);
+      return defaultExecFile(file, args, opts);
+    };
+    const found = await transfer(`scp -F ${name} f prod:/tmp`, folder, { execFile: counting, env: { PATH: process.env.PATH } });
+    assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }], name);
+    assert.deepEqual(ran, [], name); // refused before ssh -G ever starts
+    assert.ok(!existsSync(sentinel), name);
+  }
+});
+
+test("a host reached through a jump host or proxy command is never looked up", async () => {
+  // The jump host or proxy resolves it, so neither ssh -G nor DNS runs here; an address as written still counts.
+  const dir = repo();
+  const calls: string[][] = [];
+  const seen: string[] = [];
+  const recording: LookupLike = async (host) => {
+    seen.push(host);
+    return lookup(host);
+  };
+  const extra = { execFile: fakeSsh(calls), lookup: recording };
+  for (const command of [
+    "scp -J jump f prod:/tmp", "scp -o ProxyJump=jump f prod:/tmp", "scp -o 'ProxyCommand nc %h %p' f prod:/tmp",
+    "ssh -J jump prod cat < f", 'rsync -a -e "ssh -J jump" f prod:/tmp',
+  ]) {
+    assert.deepEqual((await transfer(command, dir, extra))?.endpoints,
+      [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }], command);
+  }
+  assert.equal((await transfer("scp -J jump f 10.0.4.12:/tmp", dir, extra))?.endpoints[0]?.address, "private");
+  assert.deepEqual([calls, seen], [[], []]);
+  // A jump host the config names, as ssh -G reports it, keeps the config's name but is not looked up.
+  writeFileSync(join(dir, "jump_cfg"), "Host prod\n  HostName files.acme-infra.net\n  ProxyJump bastion\n");
+  assert.deepEqual((await transfer("scp -F jump_cfg f prod:/tmp", dir, extra))?.endpoints,
+    [{ direction: "out", host: "prod", resolved_host: "files.acme-infra.net", address: "unresolved" }]);
+  writeFileSync(join(dir, "jump_cfg"), "Host prod\n  HostName files.acme-infra.net\n");
+  assert.deepEqual((await transfer("scp -F jump_cfg f prod:/tmp", dir, extra))?.endpoints,
+    [{ direction: "out", host: "prod", resolved_host: "files.acme-infra.net", address: "private" }]);
+});
+
 test("ssh reads the copy that was checked, not the file as it is later", { skip: REAL_SSH === undefined }, async () => {
   // The config turns into one that runs a command after the check and before ssh starts; ssh never sees it.
   const folder = repo();
@@ -195,7 +248,7 @@ test("ssh -G runs through a fake ssh on PATH, with the options that change the h
   process.env.PATH = `${bin}${delimiter}${path ?? ""}`;
   try {
     const found = await resolveTransfers(
-      [{ tool_name: "bash", tool_use_id: "c1", tool_input: { command: "scp -P 2222 -o HostName=10.9.9.9 -J jump f prod:/tmp" } }],
+      [{ tool_name: "bash", tool_use_id: "c1", tool_input: { command: "scp -P 2222 -o HostName=10.9.9.9 -o ProxyJump=none f prod:/tmp" } }],
       "/", { lookup, home: EMPTY_HOME, env: {} },
     );
     assert.deepEqual(found.get("c1"), {
@@ -203,7 +256,7 @@ test("ssh -G runs through a fake ssh on PATH, with the options that change the h
       endpoints: [{ direction: "out", host: "prod", resolved_host: "10.9.9.9", address: "private" }],
     });
     const argv = (JSON.parse(readFileSync(log, "utf8").trim()) as string[]).map((arg) => (arg.includes("unbound-ssh-") ? "<vetted>" : arg));
-    assert.deepEqual(argv, ["-G", "-F", "<vetted>", "-p", "2222", "-o", "HostName=10.9.9.9", "-J", "jump", "--", "prod"]);
+    assert.deepEqual(argv, ["-G", "-F", "<vetted>", "-p", "2222", "-o", "HostName=10.9.9.9", "-o", "ProxyJump=none", "--", "prod"]);
   } finally {
     process.env.PATH = path;
   }
@@ -593,7 +646,10 @@ test("a loop that may repeat, or a cd into a missing folder, leaves the folder u
 test("pushd lands as cd does, and any other stack move leaves the folder unknown", async () => {
   const dir = repo();
   const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
-  for (const command of ["pushd frontend; scp -F cfg build.zip prod:/srv", "pushd frontend && scp -F cfg f prod:/tmp"]) {
+  for (const command of [
+    "pushd frontend; scp -F cfg build.zip prod:/srv", "pushd frontend && scp -F cfg f prod:/tmp",
+    "pushd -- frontend; scp -F cfg f prod:/tmp", "cd -- frontend; scp -F cfg f prod:/tmp",
+  ]) {
     assert.equal(await at(command), "10.0.4.12", command);
   }
   for (const command of [

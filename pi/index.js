@@ -1957,7 +1957,17 @@ var SSH_VALUE_FLAGS = {
   sftp: "BbcDFiJloPRSsX",
   rsync: "efTMB@"
 };
-var SSH_IDENTITY_OPTIONS = /* @__PURE__ */ new Set(["hostname", "user", "port", "proxyjump"]);
+var SSH_IDENTITY_OPTIONS = /* @__PURE__ */ new Set(["hostname", "user", "port", "proxyjump", "proxycommand"]);
+var CURL_PROXIES = /* @__PURE__ */ new Set([
+  "-x",
+  "--proxy",
+  "--preproxy",
+  "--socks4",
+  "--socks4a",
+  "--socks5",
+  "--socks5-hostname"
+]);
+var PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ftp_proxy", "FTP_PROXY", "all_proxy", "ALL_PROXY"];
 var SSH_CONFIG_MAX_BYTES = 256 * 1024;
 var SSH_CONFIG_MAX_FILES = 32;
 var RSYNC_VALUE_OPTIONS = new Set(
@@ -3627,8 +3637,9 @@ function simple(words2, item, before, shell, depth) {
   if (assigns && !substituted) shell.status = 0;
   let moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
   if (name === "pushd" || name === "popd") {
-    const sure = name === "pushd" && args.length === 1 && !/^[+-]/.test(args[0]);
-    moved = sure ? cdTarget(args, parsed.cwd, shell, parsed.env) : [void 0, void 0];
+    const folders = args[0] === "--" ? args.slice(1) : args;
+    const sure = name === "pushd" && folders.length === 1 && !/^[+-]/.test(folders[0]);
+    moved = sure ? cdTarget(folders, parsed.cwd, shell, parsed.env) : [void 0, void 0];
   }
   if (moved !== void 0) shell.status = moved[1];
   if (name === "set" || name === "shift") shell.args = void 0;
@@ -3823,17 +3834,20 @@ function urlHost(url, schemes) {
     return "";
   }
 }
-function curl(args) {
+function proxiedEnv(env) {
+  return PROXY_ENV.some((key) => Boolean(env[key]));
+}
+function curl(args, proxied = false) {
   const out = [];
   const pins = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next, proxy] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const url of urls) {
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return out;
-      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, pins)]));
+      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, pins), proxied || proxy]));
     }
     if (next >= args.length) return out;
     i = next;
@@ -3945,6 +3959,7 @@ function curlRequest(args, start) {
   const flags = /* @__PURE__ */ new Set();
   const overrides = [];
   let method = "";
+  let proxy = false;
   let i = start;
   while (i < args.length) {
     let arg = args[i++];
@@ -3967,31 +3982,41 @@ function curlRequest(args, start) {
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
+    else if (CURL_PROXIES.has(arg) && value !== void 0) proxy = value !== "";
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i];
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy];
 }
-function wget(args) {
+function wget(args, proxied = false) {
   const urls = [];
   const flags = /* @__PURE__ */ new Set();
+  const settings = /* @__PURE__ */ new Map();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
+    let name;
+    let value;
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
-      const name = eq < 0 ? arg : arg.slice(0, eq);
-      if (eq < 0 && WGET_LONG_VALUES.has(name)) i++;
+      name = eq < 0 ? arg : arg.slice(0, eq);
+      value = eq < 0 ? void 0 : arg.slice(eq + 1);
+      if (eq < 0 && WGET_LONG_VALUES.has(name)) value = args[i++];
       flags.add(name);
     } else if (arg.startsWith("-") && arg.length > 1) {
-      let flag;
-      [flag, , i] = shortOption(arg, args, i, WGET_SHORT_VALUES, flags);
-      flags.add(flag);
+      [name, value, i] = shortOption(arg, args, i, WGET_SHORT_VALUES, flags);
+      flags.add(name);
     } else {
       urls.push(arg);
     }
+    if ((name === "-e" || name === "--execute") && value) {
+      const [key = "", ...setting] = value.replace(/ /g, "").toLowerCase().split("=");
+      settings.set(key.replace(/_/g, ""), setting.join("="));
+    }
   }
+  const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
+  const proxy = on && (proxied || settings.has("useproxy") || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
-  return urls.map((url) => [direction, urlHost(url, WGET_SCHEMES), void 0]);
+  return urls.map((url) => [direction, urlHost(url, WGET_SCHEMES), void 0, void 0, proxy]);
 }
 function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
   const passthrough = [];
@@ -4184,14 +4209,14 @@ function parse(call, processEnv) {
   let raw;
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)));
-  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)));
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
-  else if (tool === "httpie") raw = httpie(call.args, sends);
+  else if (tool === "httpie") raw = httpie(call.args, sends).map(([d, dest, options]) => [d, dest, options, void 0, proxiedEnv(call.env)]);
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return void 0;
-  return [tool, raw.map(([d, dest, options, dial]) => [d, dest, call.otherUser ? void 0 : options, dial])];
+  return [tool, raw.map(([d, dest, options, dial, proxied]) => [d, dest, call.otherUser ? void 0 : options, dial, proxied])];
 }
 function cleanHost(value) {
   let host = value.trim().toLowerCase();
@@ -4303,7 +4328,8 @@ function matchExecs(words2) {
   return false;
 }
 function configLine(line, bases, homes) {
-  const lineWords = /[\x00-\x08\x0a-\x1f\x7f]/.test(line) ? void 0 : configWords(line);
+  const odd = /[\x00-\x08\x0a-\x1f\x7f]/.test(line) || /\\[ \t]*$/.test(line);
+  const lineWords = odd ? void 0 : configWords(line);
   if (lineWords === void 0) return void 0;
   if (lineWords.length === 0) return [false, []];
   const [first = "", ...rest] = lineWords;
@@ -4397,8 +4423,17 @@ function vetted(options, home, processEnv, folder) {
   }
   return ["-F", top, ...rest];
 }
+function sshJumps(options) {
+  for (let i = 0; i + 1 < options.length; i += 2) {
+    const [flag, value] = [options[i], options[i + 1]];
+    if (flag !== "-J" && flag !== "-o") continue;
+    const [key = "", setting = ""] = flag === "-J" ? ["proxyjump", value] : value.trim().split(/[\s=]+(.*)/s);
+    if (["proxyjump", "proxycommand"].includes(key.toLowerCase()) && !["", "none"].includes(setting.trim().toLowerCase())) return true;
+  }
+  return false;
+}
 async function sshHostname(destination, options, cwd, state) {
-  if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return "";
+  if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return ["", false];
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join5(cwd, value);
@@ -4406,13 +4441,17 @@ async function sshHostname(destination, options, cwd, state) {
   const key = JSON.stringify([destination, resolved]);
   const cached = state.sshHosts.get(key);
   if (cached !== void 0) return cached;
-  state.sshHosts.set(key, "");
-  if (destination.startsWith("-")) return "";
+  state.sshHosts.set(key, ["", false]);
+  if (destination.startsWith("-")) return ["", false];
   const out = await run(["ssh", "-G", ...resolved, "--", destination.replace(/[[\]]/g, "")], state) ?? "";
-  const line = out.split(/\r?\n/).find((l) => l.startsWith("hostname "));
-  const host = line === void 0 ? "" : cleanHost(line.slice("hostname ".length));
-  state.sshHosts.set(key, host);
-  return host;
+  const lines = out.split(/\r?\n/);
+  const line = lines.find((l) => l.startsWith("hostname "));
+  const found = [
+    line === void 0 ? "" : cleanHost(line.slice("hostname ".length)),
+    lines.some((l) => l.startsWith("proxyjump ") || l.startsWith("proxycommand "))
+  ];
+  state.sshHosts.set(key, found);
+  return found;
 }
 var KIND_LISTS = ADDRESS_KINDS.map(([kind, networks]) => {
   const list = new BlockList();
@@ -4474,8 +4513,9 @@ function addressKind(found) {
   const kinds = found.map(kindOf);
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : kinds[0];
 }
-async function endpoint(raw, cwd, state, lookup = true) {
-  const [direction, rawDestination, sshOptions, dial] = raw;
+async function endpoint(raw, cwd, state, sure = true) {
+  const [direction, rawDestination, sshOptions, dial, proxied] = raw;
+  let lookup = sure && proxied !== true;
   const destination = rawDestination.trim();
   const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : destination.split("@").pop() ?? "");
   if (host === "") return void 0;
@@ -4485,8 +4525,10 @@ async function endpoint(raw, cwd, state, lookup = true) {
     resolved = dial[0];
     kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
   } else {
-    resolved = (sshOptions === void 0 || !lookup ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
-    kind = await address(resolved, state, lookup);
+    lookup &&= !(sshOptions !== void 0 && sshJumps(sshOptions));
+    const [name, jumps] = sshOptions === void 0 || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
+    resolved = name || host;
+    kind = await address(resolved, state, lookup && !jumps);
   }
   const out = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;

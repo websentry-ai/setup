@@ -3917,7 +3917,12 @@ _TRANSFER_POWERSHELL_SCHEMES = frozenset({'http', 'https', 'ftp'})
 _TRANSFER_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': frozenset('cDFiJloPSX'),
                              'sftp': frozenset('BbcDFiJloPRSsX'), 'rsync': frozenset('efTMB@')}
 # Of ssh's -o settings, only these change which host or user ssh -G resolves.
-_TRANSFER_SSH_IDENTITY_OPTIONS = frozenset({'hostname', 'user', 'port', 'proxyjump'})
+_TRANSFER_SSH_IDENTITY_OPTIONS = frozenset({'hostname', 'user', 'port', 'proxyjump', 'proxycommand'})
+# A host reached through one of these is resolved by the proxy, so it is never looked up here.
+_TRANSFER_CURL_PROXIES = frozenset({'-x', '--proxy', '--preproxy', '--socks4', '--socks4a', '--socks5',
+                                    '--socks5-hostname'})
+_TRANSFER_PROXY_ENV = ('http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'ftp_proxy', 'FTP_PROXY', 'all_proxy',
+                       'ALL_PROXY')
 _TRANSFER_SSH_CONFIG_MAX_BYTES = 256 * 1024
 _TRANSFER_SSH_CONFIG_MAX_FILES = 32
 _TRANSFER_RSYNC_VALUE_OPTIONS = frozenset({
@@ -5749,8 +5754,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     moved = _transfer_cd(args, cwd, shell, given) if program == 'cd' else None
     if program in ('pushd', 'popd'):
         # pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
-        sure = program == 'pushd' and len(args) == 1 and args[0][:1] not in ('+', '-')
-        moved = _transfer_cd(args, cwd, shell, given) if sure else (None, None)
+        folders = args[1:] if args[:1] == ['--'] else args
+        sure = program == 'pushd' and len(folders) == 1 and folders[0][:1] not in ('+', '-')
+        moved = _transfer_cd(folders, cwd, shell, given) if sure else (None, None)
     if moved:
         shell['status'] = moved[1]
     if program in ('set', 'shift'):
@@ -5982,12 +5988,18 @@ def _transfer_url_host(url: str, schemes: frozenset) -> str:
         return ''
 
 
-def _transfer_curl(args: List[str]) -> List[tuple]:
+def _transfer_proxied(env: Dict) -> bool:
+    """Whether the command itself sets a proxy for curl, wget or HTTPie in their environment."""
+    return any(env.get(key) for key in _TRANSFER_PROXY_ENV)
+
+
+def _transfer_curl(args: List[str], proxied: bool = False) -> List[tuple]:
     """curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
-    --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl."""
+    --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. Each carries
+    whether it goes through a proxy, by option or by a proxy the command set."""
     endpoints, pins, i = [], [], 0
     while True:
-        urls, sends, overrides, globoff, i = _transfer_curl_request(args, i)
+        urls, sends, overrides, globoff, i, proxy = _transfer_curl_request(args, i)
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
         for url in urls:
@@ -5995,7 +6007,7 @@ def _transfer_curl(args: List[str]) -> List[tuple]:
             if expanded is None:
                 return endpoints
             endpoints += [('out' if sends else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
-                           _transfer_curl_dial(one, connects, pins)) for one in expanded]
+                           _transfer_curl_dial(one, connects, pins), proxied or proxy) for one in expanded]
         if i >= len(args):
             return endpoints
 
@@ -6105,8 +6117,9 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
     """(the URLs of the curl request at args[i], whether it sends data, its --resolve and --connect-to values, whether
-    it turns globbing off, where the next request starts); a --next that is an option's value does not end it."""
-    urls, flags, method, overrides = [], set(), '', []
+    it turns globbing off, where the next request starts, whether it names a proxy); a --next that is an option's value
+    does not end it."""
+    urls, flags, method, overrides, proxy = [], set(), '', [], False
     while i < len(args):
         arg, value, i = args[i], None, i + 1
         if arg in ('-:', '--next'):
@@ -6132,28 +6145,37 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             method = value.upper()
         elif arg in ('--resolve', '--connect-to') and value:
             overrides.append((arg, value))
+        elif arg in _TRANSFER_CURL_PROXIES and value is not None:
+            proxy = bool(value)  # an empty one turns the proxy off
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
-    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i
+    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i, proxy
 
 
-def _transfer_wget(args: List[str]) -> List[tuple]:
-    """wget's URLs: sent to when it posts data or a file; else fetched from."""
-    urls, flags, i = [], set(), 0
+def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
+    """wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a
+    proxy: one the command set or an -e proxy setting, unless --no-proxy or -e use_proxy=off turns proxies off."""
+    urls, flags, settings, i = [], set(), {}, 0
     while i < len(args):
-        arg, i = args[i], i + 1
+        arg, name, value, i = args[i], None, None, i + 1
         if arg.startswith('--'):
-            name, eq, _ = arg.partition('=')
+            name, eq, value = arg.partition('=')
             if not eq and name in _TRANSFER_WGET_LONG_VALUES:
-                i += 1
+                value, i = (args[i] if i < len(args) else None), i + 1
             flags.add(name)
         elif arg.startswith('-') and len(arg) > 1:
-            flag, _, i = _transfer_short_option(arg, args, i, _TRANSFER_WGET_SHORT_VALUES, flags)
-            flags.add(flag)
+            name, value, i = _transfer_short_option(arg, args, i, _TRANSFER_WGET_SHORT_VALUES, flags)
+            flags.add(name)
         else:
             urls.append(arg)
+        if name in ('-e', '--execute') and value:
+            key, _, setting = value.replace(' ', '').lower().partition('=')
+            settings[key.replace('_', '')] = setting
+    on = settings.get('useproxy', 'on') in ('on', 'yes', '1') and '--no-proxy' not in flags
+    proxy = on and (proxied or 'useproxy' in settings or any(settings.get(k) for k in ('httpproxy', 'httpsproxy',
+                                                                                       'ftpproxy')))
     direction = 'out' if flags & _TRANSFER_WGET_UPLOADS else 'in'
-    return [(direction, _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None) for url in urls]
+    return [(direction, _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None, None, proxy) for url in urls]
 
 
 def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:
@@ -6376,11 +6398,12 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
         raw = _transfer_ssh_pipe(args, sends, keeps)
     elif tool in ('curl', 'wget'):
         args = _transfer_stdin_args(tool, args, _transfer_stdin_text(layers))
-        raw = _transfer_curl(args) if tool == 'curl' else _transfer_wget(args)
+        raw = (_transfer_curl if tool == 'curl' else _transfer_wget)(args, _transfer_proxied(env))
     elif tool in ('nc', 'socat'):
         raw = _transfer_netcat(args, sends) if tool == 'nc' else _transfer_socat(args, sends)
     elif tool in ('httpie', 'powershell'):
         raw = _transfer_httpie(args, sends) if tool == 'httpie' else _transfer_web_cmdlet(args, sends)
+        raw = [e + (None, _transfer_proxied(env)) for e in raw] if tool == 'httpie' else raw
     else:
         return None
     # Under sudo, ssh runs as that user, with that user's config, which this can't read.
@@ -6458,7 +6481,9 @@ def _transfer_ssh_config_line(line: str, homes: List[str], bases: tuple) -> Opti
     """One ssh config line read as ssh reads it: (whether it is an Include, the files it names, resolved against every
     home and folder ssh may use); None when it could run a command or a DNS lookup, or ssh may read it differently."""
     import glob
-    words = _transfer_ssh_config_words(line) if not re.search(r'[\x00-\x08\x0a-\x1f\x7f]', line) else None
+    # ssh joins no lines, but a line ending in a backslash is refused too, as a reader that joins them would differ.
+    odd = re.search(r'[\x00-\x08\x0a-\x1f\x7f]', line) or line.rstrip(' \t').endswith('\\')
+    words = _transfer_ssh_config_words(line) if not odd else None
     if words is None:
         return None
     if not words:
@@ -6568,20 +6593,33 @@ def _transfer_ssh_vetted(options: List[str], cwd: Optional[str], folder: str) ->
     return ['-F', top] + rest
 
 
-def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> str:
-    """The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely."""
+def _transfer_ssh_jumps(options: List[str]) -> bool:
+    """Whether ssh options send the connection through a jump host or a proxy command, which reach the host from there."""
+    for flag, value in zip(options[::2], options[1::2]):
+        if flag not in ('-J', '-o'):
+            continue
+        key, setting = ('proxyjump', value) if flag == '-J' else (re.split(r'[\s=]+', value.strip(), 1) + [''])[:2]
+        if key.lower() in ('proxyjump', 'proxycommand') and setting.strip().lower() not in ('', 'none'):
+            return True
+    return False
+
+
+def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> tuple:
+    """(the host ssh connects to for a destination, read from ssh -G, empty when it can't be looked up safely, whether
+    ssh -G reports a jump host or proxy command for it)."""
     configs = [v for i, v in enumerate(options) if i and options[i - 1] == '-F']
     if any(v.startswith(('~', _TRANSFER_SUBSTITUTED)) for v in configs):
-        return ''  # a HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e
+        return '', False  # a HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e
     key = ('ssh', destination, tuple(options), cwd)
     if key not in state:
-        state[key] = ''
+        state[key] = '', False
         # A destination starting with - would reach ssh -G as an option.
         if not destination.startswith('-'):
             target = destination.replace('[', '').replace(']', '')
             out = _transfer_run(['ssh', '-G'] + options + ['--', target], cwd, state) or ''
             names = [line.split(None, 1)[1] for line in out.splitlines() if line.startswith('hostname ')]
-            state[key] = _transfer_clean_host(names[0]) if names else ''
+            jumps = any(line.startswith(('proxyjump ', 'proxycommand ')) for line in out.splitlines())
+            state[key] = (_transfer_clean_host(names[0]) if names else ''), jumps
     return state[key]
 
 
@@ -6639,11 +6677,13 @@ def _transfer_address_kind(addresses: list) -> str:
 
 
 def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool = True) -> Optional[Dict]:
-    """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial]): the host as
-    written without a login, the host it connects to (ssh -G or curl's dial), and that host's address kind. Without
-    lookup, neither ssh -G nor DNS runs, and only an address as written is classified."""
+    """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial[, whether a
+    proxy reaches it]]): the host as written without a login, the host it connects to (ssh -G or curl's dial), and that
+    host's address kind. Without lookup, neither ssh -G nor DNS runs, and only an address as written is classified; a
+    host a proxy or jump host reaches is never looked up here either."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
+    lookup = lookup and not (len(raw) > 4 and raw[4])
     destination = destination.strip()
     host = _transfer_url_host(destination, _TRANSFER_CURL_SCHEMES) if '://' in destination else \
         destination.rsplit('@', 1)[-1]
@@ -6654,9 +6694,11 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         resolved = dial[0]
         address = _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state, lookup)
     else:
-        resolved = (_transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and lookup
-                    else '') or host
-        address = _transfer_address(resolved, state, lookup)
+        lookup = lookup and not (ssh_options is not None and _transfer_ssh_jumps(ssh_options))
+        resolved, jumps = _transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and \
+            lookup else ('', False)
+        resolved = resolved or host
+        address = _transfer_address(resolved, state, lookup and not jumps)
     endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
     return {k: v for k, v in endpoint.items() if v}
 

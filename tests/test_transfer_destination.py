@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '6ef7f610349c9a20d198c4cf9cbe6ac6e85f9393d56932222fb259d509cd9e12'
+BLOCK_SHA256 = '3b6f9bb577443eeacb75dc66f18703066a0ea9ebe7b90c0e42d49b6753129b93'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -96,8 +96,13 @@ for line in (lines_of(config) if config != 'none' else []):
         current = words[1:]
     elif words and words[0].lower() == 'hostname' and host in current and hostname == host:
         hostname = words[1]  # the first value wins, as in ssh
+    elif words and words[0].lower() in ('proxyjump', 'proxycommand') and host in current:
+        overrides.setdefault(words[0].lower(), ' '.join(words[1:]))
 print('hostname ' + overrides.get('hostname', hostname).lower())
 print('port ' + overrides.get('port', port))
+for key in ('proxyjump', 'proxycommand'):
+    if overrides.get(key, 'none').lower() != 'none':
+        print(key + ' ' + overrides[key])
 '''
 
 
@@ -370,10 +375,27 @@ class CopyTests(TransferTestCase):
         self.assert_hosts('sftp -b batch.txt sftp://deploy@prod:2222/srv', [('in', 'prod')])
 
     def test_ssh_options_that_change_the_host_are_passed_to_ssh_g(self):
-        command = 'scp -F cfg -P 2222 -o HostName=10.9.9.9 -o Compression=yes -J jump f prod:/tmp'
+        command = 'scp -F cfg -P 2222 -o HostName=10.9.9.9 -o Compression=yes -o ProxyJump=none f prod:/tmp'
         self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.9.9.9')])
         self.assertEqual(self.ssh_calls()[0]['argv'],
-                         ['-G', '-F', '<vetted>', '-p', '2222', '-o', 'HostName=10.9.9.9', '-J', 'jump', '--', 'prod'])
+                         ['-G', '-F', '<vetted>', '-p', '2222', '-o', 'HostName=10.9.9.9', '-o', 'ProxyJump=none', '--',
+                          'prod'])
+
+    def test_a_host_reached_through_a_jump_host_or_proxy_command_is_never_looked_up(self):
+        # The jump host or proxy resolves it, so neither ssh -G nor DNS runs here; an address as written still counts.
+        for command in ('scp -J jump f prod:/tmp', 'scp -o ProxyJump=jump f prod:/tmp',
+                        "scp -o 'ProxyCommand nc %h %p' f prod:/tmp", 'ssh -J jump prod cat < f',
+                        'rsync -a -e "ssh -J jump" f prod:/tmp'):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved')])
+        self.assert_endpoints('scp -J jump f 10.0.4.12:/tmp', [_endpoint('out', '10.0.4.12', 'private')])
+        self.assertEqual(self.ssh_calls(), [])
+        # A jump host the config names, as ssh -G reports it, keeps the config's name but is not looked up.
+        Path(self.repo, 'jump_cfg').write_text('Host prod\n  HostName files.acme-infra.net\n')
+        self.assert_endpoints('scp -F jump_cfg f prod:/tmp',
+                              [_endpoint('out', 'prod', 'private', 'files.acme-infra.net')])
+        Path(self.repo, 'jump_cfg').write_text('Host prod\n  HostName files.acme-infra.net\n  ProxyJump bastion\n')
+        self.assert_endpoints('scp -F jump_cfg f prod:/tmp',
+                              [_endpoint('out', 'prod', 'unresolved', 'files.acme-infra.net')])
 
     def test_rsync_reads_its_remote_shell_and_a_daemon_is_never_looked_up(self):
         for command in ('rsync -a -e "ssh -F frontend/cfg -p 2200" src prod:/dest',
@@ -660,6 +682,23 @@ class SshLookupTests(TransferTestCase):
         with patch.dict(os.environ, env):
             self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
         self.assertFalse(os.path.exists(sentinel))
+
+    @unittest.skipUnless(REAL_SSH, 'needs a real ssh')
+    def test_a_match_exec_split_by_a_trailing_backslash_never_runs(self):
+        # ssh joins no lines, so the split line is a bad option to it; the check refuses any line ending in a backslash.
+        sentinel = os.path.join(tempfile.mkdtemp(), 'ran')
+        split = f'Match host prod \\\n  exec "touch {sentinel}"\n  HostName 10.6.6.6\n'
+        Path(self.repo, 'split').write_text(split)
+        Path(self.repo, 'split.conf').write_text(split)
+        Path(self.repo, 'includes').write_text(f'Include {self.repo}/split.conf\nHost prod\n  HostName 10.0.4.12\n')
+        Path(self.repo, 'canon').write_text('CanonicalizeHostname \\\nyes\nHost prod\n  HostName 10.0.4.12\n')
+        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH']}
+        for name in ('split', 'includes', 'canon'):
+            with self.subTest(config=name), patch.dict(os.environ, env), \
+                    patch('subprocess.run', wraps=subprocess.run) as run:
+                self.assert_endpoints(f'scp -F {name} f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+                self.assertEqual(run.call_args_list, [])  # refused before ssh -G ever starts
+            self.assertFalse(os.path.exists(sentinel), name)
 
     @unittest.skipUnless(REAL_SSH, 'needs a real ssh')
     def test_ssh_reads_the_copy_that_was_checked_not_the_file_as_it_is_later(self):
@@ -1000,7 +1039,8 @@ class ParserFindingTests(TransferTestCase):
 
     def test_pushd_lands_as_cd_does_and_any_other_stack_move_leaves_the_folder_unknown(self):
         private, unknown = (_endpoint('out', 'prod', 'private', '10.0.4.12'), _endpoint('out', 'prod', 'unresolved'))
-        for command in ('pushd frontend; scp -F cfg build.zip prod:/srv', 'pushd frontend && scp -F cfg f prod:/tmp'):
+        for command in ('pushd frontend; scp -F cfg build.zip prod:/srv', 'pushd frontend && scp -F cfg f prod:/tmp',
+                        'pushd -- frontend; scp -F cfg f prod:/tmp', 'cd -- frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [private])
         for command in ('pushd frontend; popd; scp -F cfg f prod:/tmp', 'pushd frontend; pushd; scp -F cfg f prod:/tmp',
                         'pushd frontend; pushd +1; scp -F cfg f prod:/tmp', 'pushd -n frontend; scp -F cfg f prod:/tmp'):

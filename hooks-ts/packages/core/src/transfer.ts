@@ -114,7 +114,11 @@ const SSH_VALUE_FLAGS: Record<string, string> = {
   ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX", rsync: "efTMB@",
 };
 /** Of ssh's -o settings, only these change which host or user ssh -G resolves. */
-const SSH_IDENTITY_OPTIONS: ReadonlySet<string> = new Set(["hostname", "user", "port", "proxyjump"]);
+const SSH_IDENTITY_OPTIONS: ReadonlySet<string> = new Set(["hostname", "user", "port", "proxyjump", "proxycommand"]);
+/** A host reached through one of these is resolved by the proxy, so it is never looked up here. */
+const CURL_PROXIES: ReadonlySet<string> = new Set(["-x", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5",
+  "--socks5-hostname"]);
+const PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ftp_proxy", "FTP_PROXY", "all_proxy", "ALL_PROXY"];
 const SSH_CONFIG_MAX_BYTES = 256 * 1024;
 const SSH_CONFIG_MAX_FILES = 32;
 // Option lists are single literals split on blanks, because the bundle check reads `-from", "` as an import.
@@ -211,14 +215,14 @@ interface State {
   now: () => number;
   deadline: number;
   home: string;
-  sshHosts: Map<string, string>;
+  sshHosts: Map<string, [string, boolean]>;
   addresses: Map<string, AddressKind>;
 }
 
 type Env = Record<string, string>;
 /** Where curl connects for a URL when --connect-to or --resolve change it: the host, and the addresses pinned for it. */
 type Dial = [resolvedHost: string, addresses: string[]];
-type Raw = [direction: string, destination: string, sshOptions: string[] | undefined, dial?: Dial];
+type Raw = [direction: string, destination: string, sshOptions: string[] | undefined, dial?: Dial | undefined, proxied?: boolean];
 
 /** Run one allowlisted lookup within its timeout and the turn's budget; undefined when refused, slow or failing. ssh -G
  *  is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked. */
@@ -2231,8 +2235,9 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   let moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
   if (name === "pushd" || name === "popd") {
     // pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
-    const sure = name === "pushd" && args.length === 1 && !/^[+-]/.test(args[0] as string);
-    moved = sure ? cdTarget(args, parsed.cwd, shell, parsed.env) : [undefined, undefined];
+    const folders = args[0] === "--" ? args.slice(1) : args;
+    const sure = name === "pushd" && folders.length === 1 && !/^[+-]/.test(folders[0] as string);
+    moved = sure ? cdTarget(folders, parsed.cwd, shell, parsed.env) : [undefined, undefined];
   }
   if (moved !== undefined) shell.status = moved[1];
   if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
@@ -2457,17 +2462,24 @@ function urlHost(url: string, schemes: ReadonlySet<string>): string {
 
 /** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
  *  --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. */
-function curl(args: string[]): Raw[] {
+/** Whether the command itself sets a proxy for curl, wget or HTTPie in their environment. */
+function proxiedEnv(env: Env): boolean {
+  return PROXY_ENV.some((key) => Boolean(env[key]));
+}
+
+/** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each carries whether it goes
+ *  through a proxy, by option or by a proxy the command set. */
+function curl(args: string[], proxied = false): Raw[] {
   const out: Raw[] = [];
   const pins: string[] = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next, proxy] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const url of urls) {
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return out;
-      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, pins)]));
+      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, pins), proxied || proxy]));
     }
     if (next >= args.length) return out;
     i = next;
@@ -2592,11 +2604,12 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
 
 /** The URLs of the curl request at args[start], whether it sends data, its --resolve and --connect-to values, whether
  *  it turns globbing off, and where the next request starts; a --next that is an option's value does not end it. */
-function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], boolean, number] {
+function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], boolean, number, boolean] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
   let method = "";
+  let proxy = false;
   let i = start;
   while (i < args.length) {
     let arg = args[i++] as string;
@@ -2620,32 +2633,44 @@ function curlRequest(args: string[], start: number): [string[], boolean, [string
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
+    else if (CURL_PROXIES.has(arg) && value !== undefined) proxy = value !== ""; // an empty one turns the proxy off
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i];
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy];
 }
 
-function wget(args: string[]): Raw[] {
+/** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:
+ *  one the command set or an -e proxy setting, unless --no-proxy or -e use_proxy=off turns proxies off. */
+function wget(args: string[], proxied = false): Raw[] {
   const urls: string[] = [];
   const flags = new Set<string>();
+  const settings = new Map<string, string>();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
+    let name: string | undefined;
+    let value: string | undefined;
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
-      const name = eq < 0 ? arg : arg.slice(0, eq);
-      if (eq < 0 && WGET_LONG_VALUES.has(name)) i++;
+      name = eq < 0 ? arg : arg.slice(0, eq);
+      value = eq < 0 ? undefined : arg.slice(eq + 1);
+      if (eq < 0 && WGET_LONG_VALUES.has(name)) value = args[i++];
       flags.add(name);
     } else if (arg.startsWith("-") && arg.length > 1) {
-      let flag: string;
-      [flag, , i] = shortOption(arg, args, i, WGET_SHORT_VALUES, flags);
-      flags.add(flag);
+      [name, value, i] = shortOption(arg, args, i, WGET_SHORT_VALUES, flags);
+      flags.add(name);
     } else {
       urls.push(arg);
     }
+    if ((name === "-e" || name === "--execute") && value) {
+      const [key = "", ...setting] = value.replace(/ /g, "").toLowerCase().split("=");
+      settings.set(key.replace(/_/g, ""), setting.join("="));
+    }
   }
+  const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
+  const proxy = on && (proxied || settings.has("useproxy") || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
-  return urls.map((url): Raw => [direction, urlHost(url, WGET_SCHEMES), undefined]);
+  return urls.map((url): Raw => [direction, urlHost(url, WGET_SCHEMES), undefined, undefined, proxy]);
 }
 
 /** (operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; `switches` collects
@@ -2869,15 +2894,15 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   let raw: Raw[];
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)));
-  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)));
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
-  else if (tool === "httpie") raw = httpie(call.args, sends);
+  else if (tool === "httpie") raw = httpie(call.args, sends).map(([d, dest, options]): Raw => [d, dest, options, undefined, proxiedEnv(call.env)]);
   else if (tool === "powershell") raw = webCmdlet(call.args, sends);
   else return undefined;
   // Under sudo, ssh runs as that user, with that user's config, which this can't read.
-  return [tool, raw.map(([d, dest, options, dial]): Raw => [d, dest, call.otherUser ? undefined : options, dial])];
+  return [tool, raw.map(([d, dest, options, dial, proxied]): Raw => [d, dest, call.otherUser ? undefined : options, dial, proxied])];
 }
 
 /** A host name or address in lower case without brackets; empty when it isn't one. */
@@ -3017,7 +3042,9 @@ function matchExecs(words: readonly string[]): boolean {
 /** One ssh config line read as ssh reads it: [whether it is an Include, the files it names, resolved against every
  *  home and folder ssh may use]; undefined when it could run a command or a DNS lookup, or ssh may read it differently. */
 function configLine(line: string, bases: readonly string[], homes: readonly string[]): [boolean, string[]] | undefined {
-  const lineWords = /[\x00-\x08\x0a-\x1f\x7f]/.test(line) ? undefined : configWords(line);
+  // ssh joins no lines, but a line ending in a backslash is refused too, as a reader that joins them would differ.
+  const odd = /[\x00-\x08\x0a-\x1f\x7f]/.test(line) || /\\[ \t]*$/.test(line);
+  const lineWords = odd ? undefined : configWords(line);
   if (lineWords === undefined) return undefined;
   if (lineWords.length === 0) return [false, []];
   const [first = "", ...rest] = lineWords;
@@ -3126,10 +3153,23 @@ function vetted(options: readonly string[], home: string, processEnv: Record<str
 }
 
 /** The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely. */
-async function sshHostname(destination: string, options: string[], cwd: string | undefined, state: State): Promise<string> {
+/** Whether ssh options send the connection through a jump host or a proxy command, which reach the host from there. */
+function sshJumps(options: readonly string[]): boolean {
+  for (let i = 0; i + 1 < options.length; i += 2) {
+    const [flag, value] = [options[i] as string, options[i + 1] as string];
+    if (flag !== "-J" && flag !== "-o") continue;
+    const [key = "", setting = ""] = flag === "-J" ? ["proxyjump", value] : value.trim().split(/[\s=]+(.*)/s);
+    if (["proxyjump", "proxycommand"].includes(key.toLowerCase()) && !["", "none"].includes(setting.trim().toLowerCase())) return true;
+  }
+  return false;
+}
+
+/** [the host ssh connects to for a destination, read from ssh -G, empty when it can't be looked up safely, whether
+ *  ssh -G reports a jump host or proxy command for it]. */
+async function sshHostname(destination: string, options: string[], cwd: string | undefined, state: State): Promise<[string, boolean]> {
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
   // A HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e, names no file this can read.
-  if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return "";
+  if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return ["", false];
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute(value) || cwd === undefined ? value : join(cwd, value);
@@ -3137,14 +3177,16 @@ async function sshHostname(destination: string, options: string[], cwd: string |
   const key = JSON.stringify([destination, resolved]);
   const cached = state.sshHosts.get(key);
   if (cached !== undefined) return cached;
-  state.sshHosts.set(key, "");
+  state.sshHosts.set(key, ["", false]);
   // A destination starting with - would reach ssh -G as an option.
-  if (destination.startsWith("-")) return "";
+  if (destination.startsWith("-")) return ["", false];
   const out = (await run(["ssh", "-G", ...resolved, "--", destination.replace(/[[\]]/g, "")], state)) ?? "";
-  const line = out.split(/\r?\n/).find((l) => l.startsWith("hostname "));
-  const host = line === undefined ? "" : cleanHost(line.slice("hostname ".length));
-  state.sshHosts.set(key, host);
-  return host;
+  const lines = out.split(/\r?\n/);
+  const line = lines.find((l) => l.startsWith("hostname "));
+  const found: [string, boolean] = [line === undefined ? "" : cleanHost(line.slice("hostname ".length)),
+    lines.some((l) => l.startsWith("proxyjump ") || l.startsWith("proxycommand "))];
+  state.sshHosts.set(key, found);
+  return found;
 }
 
 const KIND_LISTS: [AddressKind, BlockList][] = ADDRESS_KINDS.map(([kind, networks]) => {
@@ -3223,10 +3265,12 @@ function addressKind(found: readonly string[]): AddressKind {
 }
 
 /** One place a transfer reached: its host as written without any login, the host it connects to, as ssh -G resolves
- *  it or curl's --connect-to and --resolve set it, and the kind of address that host has. Without `lookup`, neither
- *  ssh -G nor DNS runs, and only an address as written is classified. */
-async function endpoint(raw: Raw, cwd: string | undefined, state: State, lookup = true): Promise<TransferEndpoint | undefined> {
-  const [direction, rawDestination, sshOptions, dial] = raw;
+ *  it or curl's --connect-to and --resolve set it, and the kind of address that host has. Unless the call surely ran,
+ *  neither ssh -G nor DNS runs, and only an address as written is classified; a host a proxy or jump host reaches is
+ *  never looked up here either. */
+async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = true): Promise<TransferEndpoint | undefined> {
+  const [direction, rawDestination, sshOptions, dial, proxied] = raw;
+  let lookup = sure && proxied !== true;
   const destination = rawDestination.trim();
   const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : (destination.split("@").pop() ?? ""));
   if (host === "") return undefined;
@@ -3236,8 +3280,10 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, lookup 
     resolved = dial[0];
     kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
   } else {
-    resolved = (sshOptions === undefined || !lookup ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
-    kind = await address(resolved, state, lookup);
+    lookup &&= !(sshOptions !== undefined && sshJumps(sshOptions));
+    const [name, jumps] = sshOptions === undefined || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
+    resolved = name || host;
+    kind = await address(resolved, state, lookup && !jumps);
   }
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
