@@ -83,7 +83,7 @@ cat > /dev/null
 exit 7
 SHIM
 chmod +x "$smoke_tmp/bin/curl"
-out="$(printf '%s' "$sample" | env -u UNBOUND_GATEWAY_URL -u UNBOUND_CLAUDE_API_KEY \
+out="$(printf '%s' "$sample" | env -u UNBOUND_GATEWAY_URL -u UNBOUND_DEVICE_TOKEN -u UNBOUND_CLAUDE_API_KEY \
   HOME="$smoke_tmp/home" PATH="$smoke_tmp/bin:$PATH" \
   SMOKE_CURL_LOG="$smoke_tmp/curl.log" "$hook" hook claude-code PreToolUse)"
 echo "$out"

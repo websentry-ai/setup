@@ -40,6 +40,7 @@ def windows_hook(request, tmp_path, monkeypatch):
     assert hook.RUNNING_FROZEN is False
 
     monkeypatch.delenv(TOOL_API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_DEVICE_TOKEN", raising=False)
     monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
 
     state_dir = tmp_path / "state"
@@ -328,6 +329,7 @@ def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, 
 
     monkeypatch.setattr(Path, "open", deny_config)
     monkeypatch.delenv(TOOL_API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_DEVICE_TOKEN", raising=False)
     monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
 
     hook._dispatch_discovery()
