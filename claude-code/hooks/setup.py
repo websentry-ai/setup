@@ -1443,11 +1443,6 @@ def _backfill_jsonl_files(root: Path, skip_dirs=()):
                 yield base / name
 
 
-def _backfill_root_is_linked(*paths: Path) -> bool:
-    """On Windows a linked .claude or projects folder can point into another profile, so it is not walked."""
-    return platform.system().lower() == "windows" and any(_is_reparse_point(p) for p in paths)
-
-
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
     # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
     # their session (_backfill_subagent_usage).
@@ -1787,7 +1782,7 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
         projects_root = config_dir / 'projects'
         sessions: List[Dict] = []
         capped = False
-        if projects_root.exists() and not _backfill_root_is_linked(config_dir, projects_root):
+        if projects_root.exists():
             for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                     # Hit the per-run cap with files still unprocessed — don't advance

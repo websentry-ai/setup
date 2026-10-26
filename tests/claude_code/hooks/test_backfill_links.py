@@ -95,7 +95,8 @@ class BackfillLinksTestCase(unittest.TestCase):
             with self.subTest(up.__name__), self._as_junction(self.session.with_suffix("")):
                 self.assertNotIn("subagents", up._backfill_collect_session(self.session))
 
-    def test_a_linked_claude_folder_is_not_walked_on_windows(self):
+    def test_a_linked_claude_folder_is_not_walked_by_the_mdm_uploader_on_windows(self):
+        # Only the MDM uploader reads as SYSTEM; the per-user one reads as its own user, so a moved .claude still works.
         home = Path(self.root).parent / "home"
         shutil.copytree(self.root, home / ".claude" / "projects")
         mdm = uploaders[0]
@@ -104,10 +105,9 @@ class BackfillLinksTestCase(unittest.TestCase):
                     mock.patch.object(mdm.platform, "system", return_value=system):
                 found, _, _ = mdm._backfill_collect_sessions(home)
                 self.assertEqual(len(found), sessions)
-        for up in uploaders:
-            with self.subTest(up.__name__), self._as_junction(home / ".claude" / "projects"), \
-                    mock.patch.object(up.platform, "system", return_value="Windows"):
-                self.assertTrue(up._backfill_root_is_linked(home / ".claude", home / ".claude" / "projects"))
+        with self._as_junction(home / ".claude" / "projects"), \
+                mock.patch.object(mdm.platform, "system", return_value="Windows"):
+            self.assertEqual(mdm._backfill_collect_sessions(home)[0], [])
 
 
 if __name__ == "__main__":
