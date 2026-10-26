@@ -35,14 +35,14 @@ class BackfillLinksTestCase(unittest.TestCase):
             "type": "assistant", "timestamp": "2026-09-01T10:10:06.000Z", "isSidechain": True,
             "message": {"id": "msg_OUTSIDE", "usage": {"input_tokens": 1, "output_tokens": 999}}}) + "\n")
 
-    def _as_junction(self, *junctions):
-        """os.lstat reports a junction's reparse tag for these paths, as Windows does."""
+    def _as_junction(self, *junctions, tag=JUNCTION_TAG):
+        """os.lstat reports a reparse tag for these paths, as Windows does."""
         real_lstat, marked = os.lstat, {str(p) for p in junctions}
 
         def lstat(path, *args, **kwargs):
             result = real_lstat(path, *args, **kwargs)
             if str(path) in marked:
-                return mock.Mock(wraps=result, st_reparse_tag=JUNCTION_TAG, st_mode=result.st_mode)
+                return mock.Mock(wraps=result, st_reparse_tag=tag, st_mode=result.st_mode)
             return result
         return mock.patch("os.lstat", side_effect=lstat)
 
@@ -77,6 +77,37 @@ class BackfillLinksTestCase(unittest.TestCase):
             with self.subTest(up.__name__):
                 walked = sorted(p.name for p in up._backfill_iter_transcripts(self.root, 0))
                 self.assertEqual(walked, ["agent-outside.jsonl", "subagent-files.jsonl"])
+
+    def test_a_missing_path_is_not_a_link(self):
+        # A fresh install checks settings files that don't exist yet.
+        for up in uploaders:
+            with self.subTest(up.__name__):
+                self.assertFalse(up._is_reparse_point(self.root / "not-there.json"))
+
+    def test_every_redirecting_reparse_tag_is_a_link_and_a_placeholder_is_not(self):
+        for up in uploaders:
+            for tag, linked in ((0xA000001D, True), (0xA000000C, True), (0x9000701A, False)):
+                with self.subTest(up.__name__, tag=hex(tag)), self._as_junction(self.outside, tag=tag):
+                    self.assertIs(up._is_reparse_point(self.outside), linked)
+
+    def test_a_linked_session_folder_is_not_read_for_subagents(self):
+        for up in uploaders:
+            with self.subTest(up.__name__), self._as_junction(self.session.with_suffix("")):
+                self.assertNotIn("subagents", up._backfill_collect_session(self.session))
+
+    def test_a_linked_claude_folder_is_not_walked_on_windows(self):
+        home = Path(self.root).parent / "home"
+        shutil.copytree(self.root, home / ".claude" / "projects")
+        mdm = uploaders[0]
+        for system, sessions in (("Windows", 0), ("Darwin", 1)):
+            with self.subTest(system), self._as_junction(home / ".claude"), \
+                    mock.patch.object(mdm.platform, "system", return_value=system):
+                found, _, _ = mdm._backfill_collect_sessions(home)
+                self.assertEqual(len(found), sessions)
+        for up in uploaders:
+            with self.subTest(up.__name__), self._as_junction(home / ".claude" / "projects"), \
+                    mock.patch.object(up.platform, "system", return_value="Windows"):
+                self.assertTrue(up._backfill_root_is_linked(home / ".claude", home / ".claude" / "projects"))
 
 
 if __name__ == "__main__":

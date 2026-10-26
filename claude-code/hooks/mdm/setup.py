@@ -1686,7 +1686,7 @@ def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
     server bills each to the turn that ran it. No content leaves the machine."""
     subdir = None
     for candidate in (transcript_path.with_suffix('') / 'subagents', transcript_path.parent / 'subagents'):
-        if candidate.is_dir() and not _is_reparse_point(candidate):
+        if candidate.is_dir() and not _is_reparse_point(candidate) and not _is_reparse_point(candidate.parent):
             subdir = candidate
             break
     if subdir is None:
@@ -1892,6 +1892,11 @@ def _backfill_jsonl_files(root: Path, skip_dirs=()):
                 yield base / name
 
 
+def _backfill_root_is_linked(*paths: Path) -> bool:
+    """On Windows a linked .claude or projects folder can point into another profile, so it is not walked."""
+    return platform.system().lower() == "windows" and any(_is_reparse_point(p) for p in paths)
+
+
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
     # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
     # their session (_backfill_subagent_usage).
@@ -2052,8 +2057,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
 _IS_JUNCTION = getattr(os.path, 'isjunction', None)
-# Windows reparse tags of a directory junction (mount point) and a symlink; stat only names them on Windows.
-_LINK_REPARSE_TAGS = (0xA0000003, 0xA000000C)
+# Reparse tags with this bit redirect to another path (junction, symlink, WSL link); OneDrive placeholders lack it.
+_NAME_SURROGATE_BIT = 0x20000000
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -2063,8 +2068,9 @@ def _is_reparse_point(path: Path) -> bool:
     try:
         if path.is_symlink() or (_IS_JUNCTION and _IS_JUNCTION(path)):
             return True
-        tag = getattr(os.lstat(path), 'st_reparse_tag', 0)
-        return tag in _LINK_REPARSE_TAGS
+        return bool(getattr(os.lstat(path), 'st_reparse_tag', 0) & _NAME_SURROGATE_BIT)
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
 
@@ -2257,7 +2263,7 @@ def _backfill_collect_sessions(home_dir: Path, force_epoch=None, force_days=None
     # to resume strictly after: files are read in (mtime, path) order, so the next
     # batch (start) picks up there instead of re-reading the same slice forever.
     projects_root = home_dir / '.claude' / 'projects'
-    if not projects_root.exists():
+    if not projects_root.exists() or _backfill_root_is_linked(home_dir / '.claude', projects_root):
         # Three values like every other exit: the caller unpacks one shape, and a
         # profile with no history here was not behind the request either.
         return [], False, False

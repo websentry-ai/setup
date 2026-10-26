@@ -1144,7 +1144,7 @@ def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
     server bills each to the turn that ran it. No content leaves the machine."""
     subdir = None
     for candidate in (transcript_path.with_suffix('') / 'subagents', transcript_path.parent / 'subagents'):
-        if candidate.is_dir() and not _is_reparse_point(candidate):
+        if candidate.is_dir() and not _is_reparse_point(candidate) and not _is_reparse_point(candidate.parent):
             subdir = candidate
             break
     if subdir is None:
@@ -1443,6 +1443,11 @@ def _backfill_jsonl_files(root: Path, skip_dirs=()):
                 yield base / name
 
 
+def _backfill_root_is_linked(*paths: Path) -> bool:
+    """On Windows a linked .claude or projects folder can point into another profile, so it is not walked."""
+    return platform.system().lower() == "windows" and any(_is_reparse_point(p) for p in paths)
+
+
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
     # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
     # their session (_backfill_subagent_usage).
@@ -1585,8 +1590,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
 _IS_JUNCTION = getattr(os.path, 'isjunction', None)
-# Windows reparse tags of a directory junction (mount point) and a symlink; stat only names them on Windows.
-_LINK_REPARSE_TAGS = (0xA0000003, 0xA000000C)
+# Reparse tags with this bit redirect to another path (junction, symlink, WSL link); OneDrive placeholders lack it.
+_NAME_SURROGATE_BIT = 0x20000000
 
 
 def _is_reparse_point(path: Path) -> bool:
@@ -1596,8 +1601,9 @@ def _is_reparse_point(path: Path) -> bool:
     try:
         if path.is_symlink() or (_IS_JUNCTION and _IS_JUNCTION(path)):
             return True
-        tag = getattr(os.lstat(path), 'st_reparse_tag', 0)
-        return tag in _LINK_REPARSE_TAGS
+        return bool(getattr(os.lstat(path), 'st_reparse_tag', 0) & _NAME_SURROGATE_BIT)
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
 
@@ -1781,7 +1787,7 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
         projects_root = config_dir / 'projects'
         sessions: List[Dict] = []
         capped = False
-        if projects_root.exists():
+        if projects_root.exists() and not _backfill_root_is_linked(config_dir, projects_root):
             for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                     # Hit the per-run cap with files still unprocessed — don't advance
