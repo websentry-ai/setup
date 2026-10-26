@@ -17,7 +17,9 @@ import http.server
 import socketserver
 import socket
 import hashlib
+import bisect
 import json
+from datetime import datetime, timezone
 import shlex
 
 
@@ -29,6 +31,10 @@ BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
 BACKFILL_TOOL_TYPE = "claude-code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
+# Usage records of the subagents one session ran; the server reads at most this many.
+BACKFILL_MAX_SUBAGENT_REPLIES = 50000
+# The server parses at most this many entries of a session or slice, so a slice never holds more.
+BACKFILL_MAX_ENTRIES_PER_SLICE = 10000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
@@ -1071,6 +1077,147 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+def _backfill_ts(value):
+    """A transcript timestamp as an aware UTC datetime, or None. Never raises: like the live hook, it takes ISO
+    strings with or without an offset and epoch seconds or milliseconds."""
+    try:
+        if isinstance(value, str):
+            at = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value / 1000.0 if value > 10_000_000_000 else value, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def _backfill_usage_total(usage: Dict) -> int:
+    """A reply's tokens summed as the live hook sums them: cache writes from their TTL split when present."""
+    total = 0
+    for key in ('input_tokens', 'output_tokens', 'cache_read_input_tokens'):
+        try:
+            total += int(usage.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
+    split = usage.get('cache_creation')
+    keys, source = ((('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens'), split) if isinstance(split, dict)
+                    else (('cache_creation_input_tokens',), usage))
+    for key in keys:
+        try:
+            total += int(source.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _backfill_usage_record(entry) -> Optional[Dict]:
+    """A subagent line's reply usage without its content, unwrapping a progress line."""
+    if not isinstance(entry, dict):
+        return None
+    data = entry.get('data') if isinstance(entry.get('data'), dict) else {}
+    line = data.get('message') if isinstance(data.get('message'), dict) else entry
+    msg = line.get('message') if isinstance(line.get('message'), dict) else {}
+    reply_id, usage = msg.get('id'), msg.get('usage')
+    if line is entry and entry.get('type') != 'assistant':
+        return None
+    if not isinstance(reply_id, str) or not reply_id or not isinstance(usage, dict):
+        return None
+    return {'type': 'assistant', 'timestamp': line.get('timestamp'), 'isSidechain': line.get('isSidechain') is True,
+            'message': {'id': reply_id, 'usage': usage}}
+
+
+def _backfill_keep(kept, usage, sidechain) -> bool:
+    """Whether a copy replaces the one kept: a copy outside a subagent wins, then the largest. The hook's rule."""
+    return (kept is None or (kept[1] and not sidechain)
+            or (kept[1] == sidechain and _backfill_usage_total(usage) > _backfill_usage_total(kept[0])))
+
+
+def _backfill_advisors(usage: Dict) -> List[Dict]:
+    iterations = usage.get('iterations')
+    return [it for it in iterations if isinstance(it, dict) and it.get('type') == 'advisor_message'
+            and it.get('model')] if isinstance(iterations, list) else []
+
+
+def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
+    """One usage record per reply of the subagents this session ran, which Claude Code writes under subagents/
+    beside the transcript: the reply's first line's time and its largest copy, as the live hook bills it. The
+    server bills each to the turn that ran it. No content leaves the machine."""
+    subdir = None
+    for candidate in (transcript_path.with_suffix('') / 'subagents', transcript_path.parent / 'subagents'):
+        if candidate.is_dir() and not candidate.is_symlink():
+            subdir = candidate
+            break
+    if subdir is None:
+        return []
+    # reply id -> (usage, sidechain) for the reply and each advisor turn in it, kept apart as the hook keeps them.
+    replies, advisors, first = {}, {}, {}
+    for path in sorted(subdir.rglob('*.jsonl')):
+        try:
+            if path.is_symlink() or not path.is_file() or path.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+                continue
+            with open(path, 'r', encoding='utf-8') as f:
+                for lineno, line in enumerate(f):
+                    if lineno >= BACKFILL_MAX_LINES_PER_FILE:
+                        break
+                    try:
+                        record = _backfill_usage_record(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+                    if record is None:
+                        continue
+                    reply_id, at = record['message']['id'], _backfill_ts(record['timestamp'])
+                    if reply_id not in replies and len(replies) >= BACKFILL_MAX_SUBAGENT_REPLIES:
+                        continue
+                    if at is not None and (reply_id not in first or at < first[reply_id][0]):
+                        first[reply_id] = (at, record['timestamp'])
+                    usage, sidechain = record['message']['usage'], record['isSidechain']
+                    if _backfill_keep(replies.get(reply_id), usage, sidechain):
+                        replies[reply_id] = (usage, sidechain)
+                    parts = advisors.setdefault(reply_id, {})
+                    for index, advisor in enumerate(_backfill_advisors(usage)):
+                        if _backfill_keep(parts.get(index), advisor, sidechain):
+                            parts[index] = (advisor, sidechain)
+        except (OSError, UnicodeDecodeError):
+            continue
+    records = []
+    for reply_id, (usage, sidechain) in replies.items():
+        parts = advisors.get(reply_id)
+        if parts:
+            usage = dict(usage, iterations=[parts[i][0] for i in sorted(parts)])
+        at, stamp = first.get(reply_id, (None, None))
+        if at is not None and not isinstance(stamp, str):
+            stamp = at.isoformat().replace('+00:00', 'Z')
+        records.append({'type': 'assistant', 'timestamp': stamp, 'isSidechain': sidechain,
+                        'message': {'id': reply_id, 'usage': usage}})
+    epoch = datetime.fromtimestamp(0, timezone.utc)
+    records.sort(key=lambda r: (first.get(r['message']['id']) is None,
+                                first.get(r['message']['id'], (epoch,))[0]))
+    return records
+
+
+def _backfill_subagent_owners(entries: List[Dict], boundaries: List[int], records: List[Dict]) -> List[int]:
+    """The entry each subagent reply rides with when a session is sliced: the last line of the first exchange that
+    ends at or after the reply's first line, the turn the server bills it to. A later reply rides with the last."""
+    starts = sorted(set([0] + [b for b in boundaries if b > 0]))
+    ends, lasts, latest = [], [], None
+    for k, start in enumerate(starts):
+        stop = starts[k + 1] if k + 1 < len(starts) else len(entries)
+        for entry in entries[start:stop]:
+            if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant', 'progress'):
+                at = _backfill_ts(entry.get('timestamp'))
+                if at is not None and (latest is None or at > latest):
+                    latest = at
+        if latest is not None:
+            ends.append(latest)
+            lasts.append(stop - 1)
+    owners = []
+    for record in records:
+        at = _backfill_ts(record.get('timestamp'))
+        k = bisect.bisect_left(ends, at) if at is not None else len(ends)
+        owners.append(lasts[k] if k < len(lasts) else len(entries) - 1)
+    return owners
+
+
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     """Read a transcript and return {session_id, entries} for server-side parsing.
     The client only JSON-decodes lines and pulls a session id — all semantic
@@ -1101,7 +1248,15 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 
     if not session_id or not entries:
         return None
-    return {'session_id': session_id, 'entries': entries}
+    session = {'session_id': session_id, 'entries': entries}
+    try:
+        subagents = _backfill_subagent_usage(transcript_path)
+    except Exception:
+        # The session still uploads without its subagents rather than not at all.
+        subagents = []
+    if subagents:
+        session['subagents'] = subagents
+    return session
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1279,9 +1434,12 @@ def _backfill_write_cutoff(config_dir: Path, ts: float) -> None:
 
 
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
-    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
+    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
+    # their session (_backfill_subagent_usage).
     for p in root.rglob('*.jsonl'):
         if p.name.startswith('.'):
+            continue
+        if 'subagents' in p.relative_to(root).parts:
             continue
         if not p.is_file() or p.is_symlink():
             continue
@@ -1339,20 +1497,28 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     globally stable per (org, tool, session, record_index)."""
     session_id = session.get('session_id')
     entries = session.get('entries') or []
+    subagents = session.get('subagents') or []
     # A slice is a fresh dict, so the identity has to be carried over explicitly or
     # an oversized session silently loses the attribution the whole change is for.
     identity = {k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}
     try:
-        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
+        if (len(entries) <= BACKFILL_MAX_ENTRIES_PER_SLICE
+                and len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes):
             yield session
             return
         # +2 for the `, ` separator json.dumps puts between array elements.
         entry_sizes = [len(json.dumps(e).encode('utf-8')) + 2 for e in entries]
+        subagent_sizes = [len(json.dumps(r).encode('utf-8')) + 2 for r in subagents]
     except (TypeError, ValueError):
         debug_print(f"skipping unserializable session {session_id}")
         return
 
     boundaries = _backfill_exchange_boundaries(entries)
+    # Each subagent reply rides with the exchange it is billed to, so a slice carries the replies its turns hold.
+    owners = _backfill_subagent_owners(entries, boundaries, subagents)
+    bare_sizes = list(entry_sizes)
+    for size, owner in zip(subagent_sizes, owners):
+        entry_sizes[owner] += size
     n = len(entries)
     record_index_base = 0
     start_idx = 0
@@ -1365,6 +1531,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': [],
+            **({'subagents': []} if subagents else {}),
             **identity,
         }).encode('utf-8'))
         cum = wrap
@@ -1377,9 +1544,19 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             # -2: last entry has no trailing `, ` and `[]` was counted in wrap.
             if cum - 2 > max_chunk_bytes:
                 break
+            # An exchange over the entry cap on its own still goes alone rather than ending the session.
+            if last_fit_end is not None and end_idx - start_idx > BACKFILL_MAX_ENTRIES_PER_SLICE:
+                break
             last_fit_end = end_idx
             last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)
 
+        # An exchange that fits only without its subagent records still goes, without them, so its turns are kept.
+        bare = last_fit_end is None and len(json.dumps({
+            'session_id': session_id, 'record_index_base': record_index_base, 'entries': [], **identity,
+        }).encode('utf-8')) + sum(bare_sizes[start_idx:ends[0]]) - 2 <= max_chunk_bytes
+        if bare:
+            last_fit_end = ends[0]
+            last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < last_fit_end)
         if last_fit_end is None:
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
@@ -1389,6 +1566,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'record_index_base': record_index_base,
             'entries': entries[start_idx:last_fit_end],
         }
+        if subagents and not bare:
+            slice_payload['subagents'] = [r for r, owner in zip(subagents, owners)
+                                          if start_idx <= owner < last_fit_end]
         slice_payload.update(identity)
         yield slice_payload
         record_index_base += last_fit_base_count
