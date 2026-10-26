@@ -30,6 +30,9 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 ).rstrip("/")
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
+# Two attempts plus the inter-attempt sleep stay under the 60s hook timeout the installers write.
+PRETOOL_ATTEMPTS = 2
+
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
@@ -909,7 +912,7 @@ def send_to_hook_api(request_body, api_key):
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    for attempt in range(3):
+    for attempt in range(PRETOOL_ATTEMPTS):
         try:
             result = subprocess.run(
                 ["curl", "-fsSL", "-X", "POST",
@@ -936,7 +939,7 @@ def send_to_hook_api(request_body, api_key):
         except Exception as e:
             log_error(f"Hook API error: {str(e)}", 'api_call')
 
-        if attempt < 2:
+        if attempt < PRETOOL_ATTEMPTS - 1:
             time.sleep(0.5)
 
     return {}

@@ -748,8 +748,13 @@ class TestCloudPreToolBudget(unittest.TestCase):
                 {'decision': 'ask', 'reason': 'needs approval'})
         self.assertEqual(response['permissionDecision'], 'ask')
 
-    def test_the_laptop_budget_is_unchanged(self):
-        self.assertEqual(self._attempts(False), [20, 20, 20])
+    def test_the_laptop_budget_fits_inside_the_user_prompt_timeout(self):
+        """The laptop shares send_to_hook_api with UserPromptSubmit, whose installed
+        timeout is 60s, so the budget has to leave room for the fail-open return."""
+        timeouts = self._attempts(False)
+        self.assertEqual(timeouts, [20, 20])
+        worst_case = sum(timeouts) + 0.5 * (len(timeouts) - 1)
+        self.assertLess(worst_case, 60)
 
 
 class TestCloudCatchAllDenies(unittest.TestCase):

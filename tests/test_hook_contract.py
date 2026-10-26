@@ -9,10 +9,11 @@ editor invokes it, against a gateway address nothing is listening on.
 import json
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 
-from tests.conftest import REPO
+from tests.conftest import REPO, tool_module
 
 # Every tool that ships a hook, and the event names it is invoked with.
 HOOKS = {
@@ -117,3 +118,44 @@ class TestEveryHookFailsOpen:
                            stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=60, env=env)
         assert r.returncode == 0, r.stderr[-400:]
+
+
+# Where each tool's hook module lives, for the in-process budget probe.
+MODULES = {
+    "claude-code": "claude-code/hooks",
+    "cursor": "cursor",
+    "copilot": "copilot/hooks",
+    "codex": "codex/hooks",
+    "augment": "augment/hooks",
+}
+
+# The host kills the hook at these, and a killed hook never reaches its fail-open return.
+HOOK_CAP_SECONDS = {"augment": 15}
+DEFAULT_HOOK_CAP_SECONDS = 60
+
+INTER_ATTEMPT_SLEEP = 0.5
+
+
+def pretool_curl_timeouts(tool):
+    """Every per-attempt curl timeout send_to_hook_api asks for when the gateway never
+    answers, read off the real calls rather than restated from the module's constants."""
+    module = tool_module(MODULES[tool])
+    with mock.patch.object(module.subprocess, "run",
+                           side_effect=module.subprocess.TimeoutExpired("curl", 1)) as run, \
+            mock.patch.object(module.time, "sleep"), \
+            mock.patch.object(module, "RUNNING_CLOUD", False, create=True):
+        module.send_to_hook_api({"a": 1}, "key")
+    return [c.kwargs["timeout"] for c in run.call_args_list]
+
+
+@pytest.mark.parametrize("tool", sorted(MODULES))
+def test_the_pretool_budget_fits_inside_the_hook_timeout(tool):
+    """A gateway that never answers must leave time for the fail-open return. Overshoot
+    and the host kills the hook instead, which the user sees as a timeout warning."""
+    timeouts = pretool_curl_timeouts(tool)
+    assert timeouts, "send_to_hook_api never called curl"
+    worst_case = sum(timeouts) + INTER_ATTEMPT_SLEEP * (len(timeouts) - 1)
+    cap = HOOK_CAP_SECONDS.get(tool, DEFAULT_HOOK_CAP_SECONDS)
+    assert worst_case < cap, (
+        "%s spends %.1fs worst case against a %ds hook timeout; it would be killed "
+        "before it can fail open" % (tool, worst_case, cap))

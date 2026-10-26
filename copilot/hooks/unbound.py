@@ -4406,8 +4406,8 @@ def send_to_hook_api(request_body, api_key):
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    # 3x20s exceeds the cloud timeoutSec, and a preToolUse killed by it fails OPEN.
-    attempts, per_attempt = (2, 8) if RUNNING_CLOUD else (3, 20)
+    # Both budgets must answer inside the host timeout; a preToolUse killed by it fails OPEN.
+    attempts, per_attempt = (2, 8) if RUNNING_CLOUD else (2, 20)
 
     for attempt in range(attempts):
         try:
