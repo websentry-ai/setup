@@ -4127,6 +4127,96 @@
   {
    "command": "scp f $GITHUB_TOKEN:/tmp",
    "transfer": null
+  },
+  {
+   "command": "curl -G --no-get -d x https://example.com/api",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --no-get -G -d x https://example.com/api",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl 'example.com/search?q=http://evil.invalid/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -T f 'files.acme-infra.net/upload?next=https://example.com/done'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -T secret 'example.com://10.0.0.5/up'",
+   "transfer": null
+  },
+  {
+   "command": "wget 'example.com://10.0.0.5/up'",
+   "transfer": null
+  },
+  {
+   "command": "curl 'ssh://10.0.0.5/'",
+   "transfer": null
+  },
+  {
+   "command": "wget 'ssh://10.0.0.5/'",
+   "transfer": null
+  },
+  {
+   "command": "curl dict://10.0.0.5/",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "10.0.0.5",
+      "resolved_host": "10.0.0.5",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget dict://10.0.0.5/",
+   "transfer": null
   }
  ]
 }

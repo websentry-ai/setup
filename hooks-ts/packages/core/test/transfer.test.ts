@@ -3,12 +3,13 @@
 // sends the same `transfer` field from every hook.
 
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
 
-import type { ExecFileLike } from "../src/accountIdentity.ts";
+import { defaultExecFile, type ExecFileLike } from "../src/accountIdentity.ts";
 import { resolveTransfers, type LookupLike, type ResolveOptions, type Transfer } from "../src/transfer.ts";
 
 interface Fixture {
@@ -31,6 +32,16 @@ const lookup: LookupLike = async (host) => {
   return found;
 };
 
+/** A config's lines with each Include read in place, its Host blocks ending with it, as ssh does. */
+function configLines(path: string, depth = 0): string[] {
+  if (depth > 8 || !existsSync(path)) return [];
+  return readFileSync(path, "utf8").split("\n").flatMap((line) => {
+    const [key, ...targets] = line.trim().split(/\s+/);
+    if (key?.toLowerCase() !== "include") return [line];
+    return targets.flatMap((target) => [...configLines(target.replace(/^"|"$/g, ""), depth + 1), "Host \0end"]);
+  });
+}
+
 /** ssh -G answered from the fixture's hosts, -o HostName and a `-F` file's `Host`/`HostName` lines; each call logged. */
 function fakeSsh(calls: string[][] = []): ExecFileLike {
   return async (file, args) => {
@@ -47,7 +58,7 @@ function fakeSsh(calls: string[][] = []): ExecFileLike {
     const host = destination.split("@").pop() as string;
     if (config !== undefined && config !== "none") {
       let current: string[] = [];
-      for (const line of readFileSync(config, "utf8").split("\n")) {
+      for (const line of configLines(config)) {
         const [key, ...values] = line.trim().split(/\s+/);
         if (key?.toLowerCase() === "host") current = values;
         else if (key?.toLowerCase() === "hostname" && current.includes(host)) hostname ??= values[0];
@@ -117,6 +128,59 @@ test("a command nested too deep sends no transfer, and the turn's later calls st
   assert.equal(found.get("c2")?.endpoints[0]?.host, "example.com");
 });
 
+// The ssh on PATH; ssh -G runs a Match exec command, which these lookups never must.
+const REAL_SSH = (process.env.PATH ?? "").split(delimiter).filter(Boolean).map((dir) => join(dir, "ssh")).find(existsSync);
+
+test("a Match exec never runs however the config reaches ssh", { skip: REAL_SSH === undefined }, async () => {
+  // Each config is shown to run its command when handed to ssh -G directly, then never runs through the lookup.
+  const folder = repo();
+  const home = mkdtempSync(join(tmpdir(), "transfer-sentinel-home-"));
+  mkdirSync(join(home, ".ssh"));
+  const sentinel = join(mkdtempSync(join(tmpdir(), "transfer-sentinel-")), "ran");
+  const evil = `Match exec "touch ${sentinel}"\n  HostName 10.6.6.6\n`;
+  const safe = "Host prod\n  HostName 10.0.4.12\n";
+  writeFileSync(join(folder, "evil.conf"), evil);
+  mkdirSync(join(folder, "conf.d"));
+  writeFileSync(join(folder, "conf.d", "b.conf"), evil);
+  writeFileSync(join(home, "evil.conf"), evil);
+  writeFileSync(join(home, ".ssh", "rel.conf"), evil);
+  const forms: Record<string, string> = {
+    direct: evil, include: `Include ${folder}/evil.conf\n${safe}`, glob: `Include ${folder}/conf.d/*.conf\n${safe}`,
+    tilde: `Include ~/evil.conf\n${safe}`, relative: `Include rel.conf\n${safe}`, nested: `Include ${folder}/include\n${safe}`,
+  };
+  const real = { execFile: undefined, home, env: { HOME: home, PATH: process.env.PATH } };
+  const unresolved = [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }];
+  for (const [name, text] of Object.entries(forms)) {
+    writeFileSync(join(folder, name), text);
+    if (name !== "tilde" && name !== "relative") {
+      // ssh puts those two under the account's own home.
+      spawnSync(REAL_SSH as string, ["-G", "-F", join(folder, name), "--", "prod"], { cwd: folder, timeout: 10_000 });
+      assert.ok(existsSync(sentinel), name);
+      rmSync(sentinel);
+    }
+    assert.deepEqual((await transfer(`scp -F ${name} f prod:/tmp`, folder, real))?.endpoints, unresolved, name);
+    assert.ok(!existsSync(sentinel), name);
+  }
+  // The account's own config, read when no -F is given.
+  writeFileSync(join(home, ".ssh", "config"), evil);
+  assert.deepEqual((await transfer("scp f prod:/tmp", folder, real))?.endpoints, unresolved);
+  assert.ok(!existsSync(sentinel));
+});
+
+test("ssh reads the copy that was checked, not the file as it is later", { skip: REAL_SSH === undefined }, async () => {
+  // The config turns into one that runs a command after the check and before ssh starts; ssh never sees it.
+  const folder = repo();
+  const sentinel = join(mkdtempSync(join(tmpdir(), "transfer-sentinel-")), "ran");
+  writeFileSync(join(folder, "swap"), "Host prod\n  HostName 10.0.4.12\n");
+  const swapThenRun: ExecFileLike = (file, args, opts) => {
+    writeFileSync(join(folder, "swap"), `Match exec "touch ${sentinel}"\n  HostName 10.6.6.6\n`);
+    return defaultExecFile(file, args, opts);
+  };
+  const found = await transfer("scp -F swap f prod:/tmp", folder, { execFile: swapThenRun, env: { PATH: process.env.PATH } });
+  assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "10.0.4.12", address: "private" }]);
+  assert.ok(!existsSync(sentinel));
+});
+
 test("ssh -G runs through a fake ssh on PATH, with the options that change the host", async () => {
   const bin = mkdtempSync(join(tmpdir(), "transfer-bin-"));
   const log = join(bin, "calls.log");
@@ -138,8 +202,8 @@ test("ssh -G runs through a fake ssh on PATH, with the options that change the h
       tool: "scp",
       endpoints: [{ direction: "out", host: "prod", resolved_host: "10.9.9.9", address: "private" }],
     });
-    const argv = JSON.parse(readFileSync(log, "utf8").trim()) as string[];
-    assert.deepEqual(argv, ["-G", "-p", "2222", "-o", "HostName=10.9.9.9", "-J", "jump", "--", "prod"]);
+    const argv = (JSON.parse(readFileSync(log, "utf8").trim()) as string[]).map((arg) => (arg.includes("unbound-ssh-") ? "<vetted>" : arg));
+    assert.deepEqual(argv, ["-G", "-F", "<vetted>", "-p", "2222", "-o", "HostName=10.9.9.9", "-J", "jump", "--", "prod"]);
   } finally {
     process.env.PATH = path;
   }
@@ -521,6 +585,16 @@ test("a loop that may repeat, or a cd into a missing folder, leaves the folder u
     "cd frontend; while true; do cd ..; break; done; scp -F cfg f prod:/tmp",
     "for x in a b; do scp -F cfg f prod:/tmp; done",
   ]) assert.equal(await at(command), "203.0.113.9", command);
+});
+
+test("eval and source leave every function unknown", async () => {
+  // Their text may redefine a function, so a call after them may no longer run the body seen before.
+  const dir = repo();
+  const front = join(dir, "frontend");
+  for (const command of [
+    `f() { cd ${front}; }; eval 'f() { cd ${dir}; }'; f; scp -F cfg f prod:/tmp`,
+    `f() { cd ${front}; }; source x.sh; cd ${dir}; f; scp -F cfg f prod:/tmp`,
+  ]) assert.equal((await transfer(command, dir))?.endpoints[0]?.resolved_host, "prod", command);
 });
 
 test("a cd lands where bash and zsh both do, or leaves the folder unknown", async () => {

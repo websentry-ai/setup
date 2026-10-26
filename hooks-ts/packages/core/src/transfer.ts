@@ -6,10 +6,13 @@
 // `unresolved`; every lookup has a deadline and the turn shares one budget, so the turn log is never held up long.
 
 import { lookup as dnsLookup } from "node:dns/promises";
-import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync, constants, fstatSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
+  writeFileSync,
+} from "node:fs";
 import { BlockList, isIP } from "node:net";
-import { homedir, userInfo } from "node:os";
-import { basename, dirname, isAbsolute, join, normalize, sep } from "node:path";
+import { homedir, tmpdir, userInfo } from "node:os";
+import { basename, delimiter, dirname, isAbsolute, join, normalize, sep } from "node:path";
 
 import { defaultExecFile, type ExecFileLike } from "./accountIdentity.ts";
 
@@ -98,6 +101,14 @@ const TOOLS: Record<string, string> = {
 const SENDING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "PATCH"]);
 /** The port a URL connects to when it names none, by scheme. */
 const DEFAULT_PORTS: Record<string, number> = { http: 80, https: 443, ftp: 21, ftps: 990, ws: 80, wss: 443 };
+/** The URL schemes each tool speaks; a URL with any other reaches no host. */
+const CURL_SCHEMES: ReadonlySet<string> = new Set(("dict ftp ftps gopher gophers http https imap imaps ldap ldaps mqtt pop3 " +
+  "pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss").split(" "));
+const WGET_SCHEMES: ReadonlySet<string> = new Set(["http", "https", "ftp", "ftps"]);
+const HTTPIE_SCHEMES: ReadonlySet<string> = new Set(["http", "https"]);
+const POWERSHELL_SCHEMES: ReadonlySet<string> = new Set(["http", "https", "ftp"]);
+/** The switches a --no- option turns back off, so the last of them decides. */
+const CURL_UNDOES: Record<string, readonly string[]> = { "--no-globoff": ["-g", "--globoff"], "--no-get": ["-G", "--get"] };
 /** Options that take a value, per program; every other option is a switch. */
 const SSH_VALUE_FLAGS: Record<string, string> = {
   ssh: "BbcDEeFIiJLlmOoPpQRSWw", scp: "cDFiJloPSX", sftp: "BbcDFiJloPRSsX", rsync: "efTMB@",
@@ -209,16 +220,28 @@ type Env = Record<string, string>;
 type Dial = [resolvedHost: string, addresses: string[]];
 type Raw = [direction: string, destination: string, sshOptions: string[] | undefined, dial?: Dial];
 
+/** Run one allowlisted lookup within its timeout and the turn's budget; undefined when refused, slow or failing. ssh -G
+ *  is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked. */
 async function run(argv: string[], state: State): Promise<string | undefined> {
+  let folder: string | undefined;
   try {
     if (!ALLOWED_RUNS.some((p) => p.every((part, i) => argv[i] === part))) return undefined;
     const remaining = state.deadline - state.now();
     if (remaining <= 0) return undefined;
-    const [file, ...args] = argv;
+    let [file, ...args] = argv;
     if (file === undefined) return undefined;
+    if (file === "ssh" && args[0] === "-G") {
+      folder = mkdtempSync(join(tmpdir(), "unbound-ssh-"));
+      const end = argv.indexOf("--");
+      const options = end < 0 ? undefined : vetted(argv.slice(2, end), state.home, state.env, folder);
+      if (options === undefined) return undefined;
+      args = ["-G", ...options, ...argv.slice(end)];
+    }
     return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
   } catch {
     return undefined;
+  } finally {
+    if (folder !== undefined) rmSync(folder, { recursive: true, force: true });
   }
 }
 
@@ -2214,6 +2237,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
     forget(shell, new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
     shell.vars[UNKNOWN_ENV] = [undefined, undefined];
+    // It may also redefine any function, so each one known may no longer run as written.
+    for (const [fname, known] of shell.functions) shell.functions.set(fname, [known[0], true]);
   }
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
@@ -2383,16 +2408,24 @@ function shortOption(arg: string, args: readonly string[], start: number, valueF
   return [arg, undefined, i];
 }
 
-/** The host a URL names, with any login, port and path dropped; empty when it names none. */
-function urlHost(url: string): string {
+/** A URL as the tools read it: a scheme only at its start, and http when it has none. */
+function urlText(url: string): string {
+  const text = url.trim();
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
+}
+
+/** The host a URL names, with any login, port and path dropped; empty when it names none, or when the tool does not
+ *  speak its scheme. */
+function urlHost(url: string, schemes: ReadonlySet<string>): string {
   try {
-    const text = url.trim();
     // curl and wget reject a //host with no scheme, and a path names no host, though the URL standard reads one.
-    if (text.startsWith("/")) return "";
-    const full = text.includes("://") ? text : `http://${text}`;
+    if (url.trim().startsWith("/")) return "";
+    const full = urlText(url);
     // A backslash is no part of a host, though the URL standard reads it as a slash.
     if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
-    const host = new URL(full).hostname.toLowerCase();
+    const parsed = new URL(full);
+    if (!schemes.has(parsed.protocol.slice(0, -1).toLowerCase())) return "";
+    const host = parsed.hostname.toLowerCase();
     return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
   } catch {
     return "";
@@ -2411,7 +2444,7 @@ function curl(args: string[]): Raw[] {
     for (const url of urls) {
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return out;
-      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one), undefined, curlDial(one, connects, pins)]));
+      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, pins)]));
     }
     if (next >= args.length) return out;
     i = next;
@@ -2500,11 +2533,10 @@ function ipOf(text: string): string {
 /** Where a URL's request connects, as curl applies the first matching --connect-to and then the last --resolve pin
  *  for that host and port, a named host before *; undefined when neither applies. */
 function curlDial(url: string, connects: readonly string[], pins: readonly string[]): Dial | undefined {
-  const host = urlHost(url);
+  const host = urlHost(url, CURL_SCHEMES);
   let port: string;
   try {
-    const text = url.trim();
-    const parsed = new URL(text.includes("://") ? text : `http://${text}`);
+    const parsed = new URL(urlText(url));
     port = parsed.port || String(DEFAULT_PORTS[parsed.protocol.slice(0, -1).toLowerCase()] ?? "");
   } catch {
     return undefined;
@@ -2561,7 +2593,7 @@ function curlRequest(args: string[], start: number): [string[], boolean, [string
       continue;
     }
     flags.add(arg);
-    if (arg === "--no-globoff") ["-g", "--globoff"].forEach((flag) => flags.delete(flag)); // the last of them decides
+    for (const flag of CURL_UNDOES[arg] ?? []) flags.delete(flag);
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
@@ -2590,7 +2622,7 @@ function wget(args: string[]): Raw[] {
     }
   }
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
-  return urls.map((url): Raw => [direction, urlHost(url), undefined]);
+  return urls.map((url): Raw => [direction, urlHost(url, WGET_SCHEMES), undefined]);
 }
 
 /** (operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; `switches` collects
@@ -2768,7 +2800,7 @@ function httpie(args: string[], sends: boolean): Raw[] {
   const items = positional.slice(method ? 2 : 1);
   const readsStdin = sends && !flags.has("-I") && !flags.has("--ignore-stdin");
   const out = SENDING_METHODS.has(method) || flags.has("--raw") || readsStdin || items.some(httpieItem);
-  return [[out ? "out" : "in", url.startsWith(":") ? "localhost" : urlHost(url), undefined]];
+  return [[out ? "out" : "in", url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES), undefined]];
 }
 
 function webCmdlet(args: string[], sends: boolean): Raw[] {
@@ -2790,7 +2822,7 @@ function webCmdlet(args: string[], sends: boolean): Raw[] {
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
   }
   uri ||= positional[0] ?? "";
-  return uri ? [[out ? "out" : "in", urlHost(uri), undefined]] : [];
+  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), undefined]] : [];
 }
 
 /** Whether a call's stdin is fed from a file or pipe, and whether its stdout goes to one, from the pipes and
@@ -2959,58 +2991,115 @@ function matchExecs(words: readonly string[]): boolean {
   return false;
 }
 
-function configRuns(text: string, bases: readonly string[], homes: readonly string[], pending: [string, readonly string[]][]): boolean {
-  for (const line of text.split(/\r?\n/)) {
-    const lineWords = configWords(line);
-    if (lineWords === undefined) return true;
-    const [first = "", ...rest] = lineWords;
-    const [keyword = "", attached = ""] = first.split(/=(.*)/s);
-    // ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
-    const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
-    if (keyword.toLowerCase() === "match" && matchExecs(args)) return true;
-    if (keyword.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return true;
-    for (const pattern of keyword.toLowerCase() === "include" ? args : []) {
-      const targets = includeTargets(pattern, bases, homes);
-      if (targets === undefined) return true;
-      pending.push(...targets.map((target): [string, readonly string[]] => [target, bases]));
-    }
+/** One ssh config line read as ssh reads it: [whether it is an Include, the files it names, resolved against every
+ *  home and folder ssh may use]; undefined when it could run a command or a DNS lookup, or ssh may read it differently. */
+function configLine(line: string, bases: readonly string[], homes: readonly string[]): [boolean, string[]] | undefined {
+  const lineWords = /[\x00-\x08\x0a-\x1f\x7f]/.test(line) ? undefined : configWords(line);
+  if (lineWords === undefined) return undefined;
+  if (lineWords.length === 0) return [false, []];
+  const [first = "", ...rest] = lineWords;
+  const [word = "", attached = ""] = first.split(/=(.*)/s);
+  const keyword = word.toLowerCase();
+  // ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
+  const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
+  if (keyword === "match" && matchExecs(args)) return undefined;
+  if (keyword === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return undefined;
+  if (keyword !== "include") return [false, []];
+  const paths: string[] = [];
+  for (const pattern of args) {
+    const targets = includeTargets(pattern, bases, homes);
+    if (targets === undefined) return undefined;
+    paths.push(...targets);
   }
-  return false;
+  return [true, paths];
 }
 
-/** Whether ssh -G could run a command or a DNS lookup while reading its configs, or reads a file this can't check. */
-function configUnsafe(passthrough: readonly string[], home: string, processEnv: Record<string, string | undefined>): boolean {
+/** The folder of the system config the ssh on PATH reads: its install prefix's etc/ssh, /etc/ssh for one in /usr, and
+ *  PROGRAMDATA's ssh on Windows. */
+function sshSystemDir(processEnv: Record<string, string | undefined>): string {
+  if (process.platform === "win32") return join(processEnv.PROGRAMDATA ?? "", "ssh");
+  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => dir !== "" && isFile(join(dir, "ssh")));
+  const prefix = dirname(bin ?? "/usr/bin");
+  return prefix === "/usr" || prefix === "/" ? "/etc/ssh" : join(prefix, "etc", "ssh");
+}
+
+/** A small regular file's text, read once without blocking on a fifo; undefined when it is not one. Throws when it
+ *  can't be opened. */
+function readOnce(path: string): string | undefined {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size > SSH_CONFIG_MAX_BYTES) return undefined;
+    const buffer = Buffer.alloc(SSH_CONFIG_MAX_BYTES + 1);
+    let size = 0;
+    for (let n = 1; n > 0 && size < buffer.length; size += n) n = readSync(fd, buffer, size, buffer.length - size, null);
+    return size > SSH_CONFIG_MAX_BYTES ? undefined : buffer.subarray(0, size).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** ssh -G's options with -F set to a copy, in `folder`, of exactly the configs this read once and checked, with each
+ *  Include pointed at the copies, so ssh reads nothing else; undefined when one could run a command or can't be checked. */
+function vetted(options: readonly string[], home: string, processEnv: Record<string, string | undefined>, folder: string): string[] | undefined {
   // ssh reads ~/.ssh/config from the account's home but expands an Include's ~ and relative path with $HOME.
   const homes = [...new Set([home, processEnv.HOME || home])];
   const userBases = homes.map((h) => join(h, ".ssh"));
-  let config: string | undefined;
-  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
-  if (config === "none") return false;
-  if (config !== undefined && !isAbsolute(config)) return true;
-  // Whichever ssh is on PATH reads its own system config, so every one that exists is checked.
-  const system = ["/etc/ssh", "/opt/homebrew/etc/ssh", "/usr/local/etc/ssh", join(processEnv.PROGRAMDATA || "/nonexistent", "ssh")];
-  const pending: [string, readonly string[]][] =
-    config === undefined
-      ? [[join(home, ".ssh", "config"), userBases], ...system.map((d): [string, readonly string[]] => [join(d, "ssh_config"), [d]])]
-      : [[config, userBases]];
-  const seen = new Set<string>();
-  while (pending.length > 0) {
-    const [path, bases] = pending.pop() as [string, readonly string[]];
-    if (seen.has(path)) continue;
-    seen.add(path);
-    let text: string;
-    try {
-      const info = statSync(path, { throwIfNoEntry: false });
-      if (info === undefined) continue;
-      // Only small regular files are read, so a fifo or a huge file can't hold up the turn.
-      if (seen.size > SSH_CONFIG_MAX_FILES || !info.isFile() || info.size > SSH_CONFIG_MAX_BYTES) return true;
-      text = readFileSync(path, "utf8");
-    } catch {
-      return true;
-    }
-    if (configRuns(text, bases, homes, pending)) return true;
+  if (options.length % 2 !== 0) return undefined;
+  const configs: string[] = [];
+  const rest: string[] = [];
+  for (let i = 0; i < options.length; i += 2) {
+    if (options[i] === "-F") configs.push(options[i + 1] as string);
+    else rest.push(options[i] as string, options[i + 1] as string);
   }
-  return false;
+  const config = configs.at(-1);
+  if (config === "none") return [...options];
+  if (config !== undefined && !isAbsolute(config)) return undefined;
+  const system = sshSystemDir(processEnv);
+  // ssh reads only a -F file; else the user's config, then the system's.
+  const sources: [string, readonly string[]][] = config !== undefined
+    ? [[config, userBases]]
+    : [[join(home, ".ssh", "config"), userBases], [join(system, "ssh_config"), [system]]];
+  const copies = new Map<string, string>();
+  const queue: [string, readonly string[]][] = [];
+  const copyOf = (path: string, bases: readonly string[]): string => {
+    const key = JSON.stringify([path, bases]);
+    let copy = copies.get(key);
+    if (copy === undefined) {
+      copy = join(folder, String(copies.size));
+      copies.set(key, copy);
+      queue.push([path, bases]);
+    }
+    return copy;
+  };
+  const tops = sources.map(([path, bases]) => copyOf(path, bases));
+  while (queue.length > 0) {
+    const [path, bases] = queue.shift() as [string, readonly string[]];
+    if (copies.size > SSH_CONFIG_MAX_FILES) return undefined;
+    let text: string | undefined;
+    try {
+      text = readOnce(path);
+    } catch (error) {
+      // ssh refuses a -F file that isn't there, and skips any other.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT" || config !== undefined) return undefined;
+      text = "";
+    }
+    if (text === undefined) return undefined;
+    const lines: string[] = [];
+    for (const raw of text.split("\n")) {
+      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+      const read = configLine(line, bases, homes);
+      if (read === undefined) return undefined;
+      lines.push(!read[0] ? line : read[1].length > 0 ? `Include ${read[1].map((found) => `"${copyOf(found, bases)}"`).join(" ")}` : "");
+    }
+    writeFileSync(copies.get(JSON.stringify([path, bases])) as string, `${lines.join("\n")}\n`, { mode: 0o600 });
+  }
+  let top = tops[0] as string;
+  if (config === undefined) {
+    top = join(folder, "config");
+    writeFileSync(top, tops.map((copy) => `Include "${copy}"\n`).join(""), { mode: 0o600 });
+  }
+  return ["-F", top, ...rest];
 }
 
 /** The host ssh connects to for a destination, read from ssh -G; empty when it can't be looked up safely. */
@@ -3027,7 +3116,7 @@ async function sshHostname(destination: string, options: string[], cwd: string |
   if (cached !== undefined) return cached;
   state.sshHosts.set(key, "");
   // A destination starting with - would reach ssh -G as an option.
-  if (destination.startsWith("-") || configUnsafe(resolved, state.home, state.env)) return "";
+  if (destination.startsWith("-")) return "";
   const out = (await run(["ssh", "-G", ...resolved, "--", destination.replace(/[[\]]/g, "")], state)) ?? "";
   const line = out.split(/\r?\n/).find((l) => l.startsWith("hostname "));
   const host = line === undefined ? "" : cleanHost(line.slice("hostname ".length));
@@ -3113,7 +3202,7 @@ function addressKind(found: readonly string[]): AddressKind {
 async function endpoint(raw: Raw, cwd: string | undefined, state: State): Promise<TransferEndpoint | undefined> {
   const [direction, rawDestination, sshOptions, dial] = raw;
   const destination = rawDestination.trim();
-  const host = cleanHost(destination.includes("://") ? urlHost(destination) : (destination.split("@").pop() ?? ""));
+  const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : (destination.split("@").pop() ?? ""));
   if (host === "") return undefined;
   let resolved: string;
   let kind: AddressKind;

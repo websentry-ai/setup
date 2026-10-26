@@ -3,6 +3,7 @@ checked on all five Python hooks with a fake `ssh` on PATH, a patched resolver a
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -23,11 +24,13 @@ HOOK_PATHS = [
 ]
 HOOKS = [load_module(p) for p in HOOK_PATHS]
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# The ssh on PATH before the tests put their stand-in first; ssh -G runs a Match exec command, which they never must.
+REAL_SSH = shutil.which('ssh')
 START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '09be5b8255c3aa671668527f7aa901891621d1b86f7a8b20143a9dc338ed5334'
+BLOCK_SHA256 = 'bd1c3d07559dbe2a8f820729d1fbf4b2838cc271c1b8de85c746b44a5fc24c00'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -72,13 +75,27 @@ while i < len(args):
 host = destination.rsplit('@', 1)[-1]
 hostname, current = host, []
 config = config or os.path.join(os.environ['HOME'], '.ssh', 'config')
-if config != 'none' and os.path.exists(config):
-    for line in open(config):
+
+
+def lines_of(path, depth=0):
+    # Each Include is read in place, and its Host blocks end with it, as ssh does.
+    out = []
+    for line in (open(path) if depth < 8 and os.path.exists(path) else []):
         words = line.split()
-        if words and words[0].lower() == 'host':
-            current = words[1:]
-        elif words and words[0].lower() == 'hostname' and host in current:
-            hostname = words[1]
+        if words and words[0].lower() == 'include':
+            for target in words[1:]:
+                out += lines_of(target.strip('"'), depth + 1) + ['Host \\0end']
+        else:
+            out.append(line)
+    return out
+
+
+for line in (lines_of(config) if config != 'none' else []):
+    words = line.split()
+    if words and words[0].lower() == 'host':
+        current = words[1:]
+    elif words and words[0].lower() == 'hostname' and host in current and hostname == host:
+        hostname = words[1]  # the first value wins, as in ssh
 print('hostname ' + overrides.get('hostname', hostname).lower())
 print('port ' + overrides.get('port', port))
 '''
@@ -133,7 +150,11 @@ class TransferTestCase(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def ssh_calls(self):
-        return [json.loads(line) for line in Path(self.ssh_log).read_text().splitlines()]
+        """Each ssh -G call, with the vetted config copy it was handed shown as <vetted>."""
+        calls = [json.loads(line) for line in Path(self.ssh_log).read_text().splitlines()]
+        for call in calls:
+            call['argv'] = ['<vetted>' if 'unbound-ssh-' in arg else arg for arg in call['argv']]
+        return calls
 
     def each(self, command, cwd=None):
         """(hook file, transfer) for every hook, each with a fresh turn."""
@@ -325,7 +346,7 @@ class WgetTests(TransferTestCase):
 class CopyTests(TransferTestCase):
     def test_scp_to_a_nickname_reports_the_address_ssh_resolves_it_to(self):
         self.assert_endpoints('scp build.zip prod:/srv', [_endpoint('out', 'prod', 'private', '10.0.4.12')], 'scp')
-        self.assertEqual(self.ssh_calls()[0]['argv'], ['-G', '--', 'prod'])
+        self.assertEqual(self.ssh_calls()[0]['argv'], ['-G', '-F', '<vetted>', '--', 'prod'])
 
     def test_scp_and_rsync_copy_directions(self):
         cases = {
@@ -352,14 +373,14 @@ class CopyTests(TransferTestCase):
         command = 'scp -F cfg -P 2222 -o HostName=10.9.9.9 -o Compression=yes -J jump f prod:/tmp'
         self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.9.9.9')])
         self.assertEqual(self.ssh_calls()[0]['argv'],
-                         ['-G', '-F', 'cfg', '-p', '2222', '-o', 'HostName=10.9.9.9', '-J', 'jump', '--', 'prod'])
+                         ['-G', '-F', '<vetted>', '-p', '2222', '-o', 'HostName=10.9.9.9', '-J', 'jump', '--', 'prod'])
 
     def test_rsync_reads_its_remote_shell_and_a_daemon_is_never_looked_up(self):
         for command in ('rsync -a -e "ssh -F frontend/cfg -p 2200" src prod:/dest',
                         'RSYNC_RSH="ssh -F frontend/cfg -p 2200" rsync -a src prod:/dest',
                         "rsync -avze 'ssh -F frontend/cfg -p 2200' src prod:/dest --exclude foo:bar"):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.0.4.12')])
-        self.assertTrue(all(c['argv'][:5] == ['-G', '-F', 'frontend/cfg', '-p', '2200'] for c in self.ssh_calls()))
+        self.assertTrue(all(c['argv'][:5] == ['-G', '-F', '<vetted>', '-p', '2200'] for c in self.ssh_calls()))
         Path(self.ssh_log).write_text('')
         self.assert_hosts('rsync -a src prod::module', [('out', 'prod')])
         self.assert_hosts('rsync -a -e /usr/local/bin/custom-shell src prod:/dest', [('out', 'prod')])
@@ -379,7 +400,7 @@ class CopyTests(TransferTestCase):
                               [_endpoint('out', 'fd12:3456:789a::1', 'private')])
         self.assert_endpoints(f'scp dump.sql scp://deploy:{FAKE_TOKEN}@prod:2200/tmp/',
                               [_endpoint('out', 'prod', 'private', '10.0.4.12')])
-        self.assertIn(['-p', '2200'], [c['argv'][1:3] for c in self.ssh_calls()])
+        self.assertIn(['-p', '2200'], [c['argv'][3:5] for c in self.ssh_calls()])
         self.assertNotIn(FAKE_TOKEN, json.dumps(self.ssh_calls()))
 
 
@@ -578,12 +599,70 @@ class SshLookupTests(TransferTestCase):
         self.assertEqual(len(self.ssh_calls()), len(HOOKS))
 
     def test_a_system_config_that_could_run_commands_is_never_handed_to_ssh(self):
-        program_data = tempfile.mkdtemp()
-        os.makedirs(os.path.join(program_data, 'ssh'))
-        Path(program_data, 'ssh', 'ssh_config').write_text('Match exec "touch /tmp/never"\n')
-        with patch.dict(os.environ, {'PROGRAMDATA': program_data}):
-            self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+        system = tempfile.mkdtemp()
+        Path(system, 'ssh_config').write_text('Match exec "touch /tmp/never"\n')
+        patches = [patch.object(hook, '_transfer_ssh_system_dir', lambda: system) for hook in HOOKS]
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
         self.assertEqual(self.ssh_calls(), [])
+        # A safe one is read after the user's config, whose value comes first.
+        Path(system, 'ssh_config').write_text('Host prod other\n  HostName 10.7.7.7\n')
+        self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+        self.assert_endpoints('scp f other:/tmp', [_endpoint('out', 'other', 'private', '10.7.7.7')])
+
+    @unittest.skipUnless(REAL_SSH, 'needs a real ssh')
+    def test_a_match_exec_never_runs_however_the_config_reaches_ssh(self):
+        # Each config is shown to run its command when handed to ssh -G directly, then never runs through the hook.
+        sentinel = os.path.join(tempfile.mkdtemp(), 'ran')
+        evil = f'Match exec "touch {sentinel}"\n  HostName 10.6.6.6\n'
+        safe = 'Host prod\n  HostName 10.0.4.12\n'
+        Path(self.repo, 'evil.conf').write_text(evil)
+        os.makedirs(os.path.join(self.repo, 'conf.d'))
+        Path(self.repo, 'conf.d', 'b.conf').write_text(evil)
+        Path(self.home, 'evil.conf').write_text(evil)
+        Path(self.home, '.ssh', 'rel.conf').write_text(evil)
+        forms = {'direct': evil, 'include': f'Include {self.repo}/evil.conf\n' + safe,
+                 'glob': f'Include {self.repo}/conf.d/*.conf\n' + safe, 'tilde': 'Include ~/evil.conf\n' + safe,
+                 'relative': 'Include rel.conf\n' + safe, 'nested': f'Include {self.repo}/include\n' + safe}
+        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH']}
+        for name, text in forms.items():
+            Path(self.repo, name).write_text(text)
+            with self.subTest(form=name):
+                if name not in ('tilde', 'relative'):  # ssh puts those under the account's own home
+                    subprocess.run([REAL_SSH, '-G', '-F', os.path.join(self.repo, name), '--', 'prod'],
+                                   cwd=self.repo, capture_output=True, timeout=10)
+                    self.assertTrue(os.path.exists(sentinel), name)
+                    os.remove(sentinel)
+                with patch.dict(os.environ, env):
+                    self.assert_endpoints(f'scp -F {name} f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+                self.assertFalse(os.path.exists(sentinel), name)
+        # The account's own config, read when no -F is given.
+        Path(self.home, '.ssh', 'config').write_text(evil)
+        with patch.dict(os.environ, env):
+            self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+        self.assertFalse(os.path.exists(sentinel))
+
+    @unittest.skipUnless(REAL_SSH, 'needs a real ssh')
+    def test_ssh_reads_the_copy_that_was_checked_not_the_file_as_it_is_later(self):
+        # The config turns into one that runs a command after the check and before ssh starts; ssh never sees it.
+        sentinel = os.path.join(tempfile.mkdtemp(), 'ran')
+        Path(self.repo, 'swap').write_text('Host prod\n  HostName 10.0.4.12\n')
+        real_run = subprocess.run
+
+        def swap_then_run(argv, *args, **kwargs):
+            Path(self.repo, 'swap').write_text(f'Match exec "touch {sentinel}"\n  HostName 10.6.6.6\n')
+            return real_run(argv, *args, **kwargs)
+
+        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH']}
+        for hook in HOOKS:
+            Path(self.repo, 'swap').write_text('Host prod\n  HostName 10.0.4.12\n')
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, env), \
+                    patch.object(hook.subprocess, 'run', swap_then_run):
+                self.assertEqual(hook._transfer('scp -F swap f prod:/tmp', self.repo, {})['endpoints'],
+                                 [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+            self.assertFalse(os.path.exists(sentinel))
 
     def test_includes_are_checked_under_home_as_well_as_the_account_home(self):
         # ssh reads ~/.ssh/config from the account's home but expands an Include with $HOME.
@@ -895,6 +974,13 @@ class ParserFindingTests(TransferTestCase):
         # exec replaces the shell even when what it runs is a builtin, so the scp never runs.
         self.assert_hosts('exec cd frontend; scp -F cfg f prod:/tmp', [])
 
+    def test_eval_and_source_leave_every_function_unknown(self):
+        # Their text may redefine a function, so a call after them may no longer run the body seen before.
+        frontend = os.path.join(self.repo, 'frontend')
+        for command in (f"f() {{ cd {frontend}; }}; eval 'f() {{ cd {self.repo}; }}'; f; scp -F cfg f prod:/tmp",
+                        f"f() {{ cd {frontend}; }}; source x.sh; cd {self.repo}; f; scp -F cfg f prod:/tmp"):
+            self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved', 'prod')])
+
     def test_a_called_function_runs_its_body_in_the_callers_shell(self):
         private = _endpoint('out', 'prod', 'private', '10.0.4.12')
         public = _endpoint('out', 'prod', 'public', '203.0.113.9')
@@ -999,6 +1085,23 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
              'event': {'hook_event_name': 'afterAgentResponse', 'text': 'shipped', **roots}},
         ]
         self._check(hook.build_llm_exchange(events))
+
+    def test_a_cursor_command_on_windows_is_read_as_powershell(self):
+        # Cursor's agent runs commands in PowerShell there, where a ; inside @{ } separates a hashtable's entries.
+        hook = load_module('cursor/unbound.py')
+        roots = {'workspace_roots': [self.repo], 'conversation_id': 'c1', 'generation_id': 'g1'}
+        command = 'Invoke-WebRequest -Method Post -Body @{a=1; b=2} -Uri https://files.acme-infra.net/up'
+        events = [{'timestamp': '2026-10-22T22:09:59+05:30',
+                   'event': {'hook_event_name': 'beforeSubmitPrompt', 'prompt': 'ship it', **roots}},
+                  {'timestamp': '2026-10-22T22:10:00+05:30',
+                   'event': {'hook_event_name': 'afterShellExecution', 'command': command, 'cwd': self.repo,
+                             'output': '', **roots}},
+                  {'timestamp': '2026-10-22T22:10:02+05:30',
+                   'event': {'hook_event_name': 'afterAgentResponse', 'text': 'shipped', **roots}}]
+        with patch.object(hook.os, 'name', 'nt'):
+            transfers = [e.get('transfer') for e in _tool_entries(hook.build_llm_exchange(events))]
+        self.assertEqual(transfers, [{'tool': 'powershell',
+                                      'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]}])
 
     def test_copilot(self):
         hook = load_module('copilot/hooks/unbound.py')
@@ -1156,6 +1259,29 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
             with self.subTest(command=command):
                 entries = _tool_entries(hook.build_llm_exchange(events, cwd=frontend))
                 self.assertEqual([e.get('transfer') for e in entries], [private])
+
+    def test_a_failed_claude_bash_call_leaves_the_folder_unknown(self):
+        # Claude reports a command that exits non-zero as PostToolUseFailure; it ran, so its cd may have too.
+        hook = load_module('claude-code/hooks/unbound.py')
+        events = [{'timestamp': '2026-10-22T16:40:00Z', 'event': {**fields, 'session_id': 's1'}} for fields in (
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'cwd': self.repo},
+            {'hook_event_name': 'PostToolUseFailure', 'tool_name': 'Bash', 'error': 'Exit code 1',
+             'tool_input': {'command': 'cd frontend && npm test'}},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_response': {},
+             'tool_input': {'command': 'scp -F cfg build.zip prod:/srv'}})]
+        transfers = [e.get('transfer') for e in _tool_entries(hook.build_llm_exchange(events, cwd=self.repo))]
+        self.assertEqual(transfers[-1], {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]})
+
+    def test_claude_code_seeds_the_walk_from_a_prompt_that_carries_a_cwd(self):
+        hook = load_module('claude-code/hooks/unbound.py')
+        frontend = os.path.join(self.repo, 'frontend')
+        events = [{'timestamp': '2026-10-22T16:40:00Z', 'event': {**fields, 'session_id': 's1'}} for fields in (
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it'},
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'and the build', 'cwd': self.repo},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_response': {},
+             'tool_input': {'command': 'cd frontend && scp -F cfg build.zip prod:/srv'}})]
+        transfers = [e.get('transfer') for e in _tool_entries(hook.build_llm_exchange(events, cwd=frontend))]
+        self.assertEqual(transfers, [{'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}])
 
     def test_claude_code_seeds_the_walk_from_the_turns_first_prompt_only(self):
         # The shell keeps its folder across the turn, so a later prompt's cwd does not move it back.

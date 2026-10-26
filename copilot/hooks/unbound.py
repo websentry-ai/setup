@@ -5650,6 +5650,13 @@ _TRANSFER_TOOLS = {
 _TRANSFER_SENDING_METHODS = frozenset({'POST', 'PUT', 'PATCH'})
 # The port a URL connects to when it names none, by scheme.
 _TRANSFER_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ftp': 21, 'ftps': 990, 'ws': 80, 'wss': 443}
+# The URL schemes each tool speaks; a URL with any other reaches no host.
+_TRANSFER_CURL_SCHEMES = frozenset({'dict', 'ftp', 'ftps', 'gopher', 'gophers', 'http', 'https', 'imap', 'imaps', 'ldap',
+                                    'ldaps', 'mqtt', 'pop3', 'pop3s', 'rtsp', 'scp', 'sftp', 'smb', 'smbs', 'smtp',
+                                    'smtps', 'telnet', 'tftp', 'ws', 'wss'})
+_TRANSFER_WGET_SCHEMES = frozenset({'http', 'https', 'ftp', 'ftps'})
+_TRANSFER_HTTPIE_SCHEMES = frozenset({'http', 'https'})
+_TRANSFER_POWERSHELL_SCHEMES = frozenset({'http', 'https', 'ftp'})
 # Options that take a value, per program; every other option is a switch.
 _TRANSFER_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': frozenset('cDFiJloPSX'),
                              'sftp': frozenset('BbcDFiJloPRSsX'), 'rsync': frozenset('efTMB@')}
@@ -5684,6 +5691,8 @@ _TRANSFER_CURL_LONG_VALUES = frozenset((
     '--trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out').split())
 _TRANSFER_CURL_UPLOADS = frozenset({'-T', '--upload-file', '-F', '--form', '--form-string', '--json'})
 _TRANSFER_CURL_BODIES = frozenset({'-d', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode'})
+# The switches a --no- option turns back off, so the last of them decides.
+_TRANSFER_CURL_UNDOES = {'--no-globoff': {'-g', '--globoff'}, '--no-get': {'-G', '--get'}}
 _TRANSFER_WGET_SHORT_VALUES = frozenset('aABDeIilnOoPQRtTUwX')
 _TRANSFER_WGET_LONG_VALUES = frozenset((
     '--output-file --append-output --execute --input-file --base --config --rejected-log --tries '
@@ -5730,18 +5739,31 @@ def _transfer_deadline(state: Dict) -> float:
 
 
 def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[str]:
-    """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing."""
+    """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing. ssh -G
+    is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked."""
+    import shutil
+    import tempfile
+    folder = None
     try:
         if not any(tuple(argv[:len(p)]) == p for p in _TRANSFER_ALLOWED_RUNS):
             return None
         remaining = _transfer_deadline(state) - time.monotonic()
         if remaining <= 0:
             return None
+        if argv[:2] == ['ssh', '-G']:
+            folder, end = tempfile.mkdtemp(prefix='unbound-ssh-'), argv.index('--')
+            options = _transfer_ssh_vetted(argv[2:end], cwd, folder)
+            if options is None:
+                return None
+            argv = argv[:2] + options + argv[end:]
         result = subprocess.run(argv, cwd=cwd if cwd and os.path.isdir(cwd) else None, capture_output=True,
                                 text=True, timeout=min(_TRANSFER_RUN_TIMEOUT, remaining), stdin=subprocess.DEVNULL)
         return result.stdout if result.returncode == 0 else None
     except Exception:
         return None
+    finally:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 def _transfer_read_word(text: str, i: int) -> tuple:
@@ -7477,6 +7499,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         # Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
         _transfer_forget(shell, {name for name in shell['vars'] if not name.startswith('\0')} | {''})
         shell['vars'][_TRANSFER_UNKNOWN_ENV] = (None, None)
+        # It may also redefine any function, so each one known may no longer run as written.
+        shell['functions'] = {name: (known[0], True) for name, known in shell['functions'].items()}
     if program in ('cd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
@@ -7649,12 +7673,20 @@ def _transfer_short_option(arg: str, args: List[str], i: int, value_flags: froze
     return arg, None, i
 
 
-def _transfer_url_host(url: str) -> str:
-    """The host a URL names, with any login, port and path dropped; empty when it names none."""
+def _transfer_url_split(url: str):
+    """A URL split as the tools read it: a scheme only at its start, and http when it has none."""
     from urllib.parse import urlsplit
+    text = url.strip()
+    return urlsplit(text if re.match(r'[A-Za-z][A-Za-z0-9+.-]*://', text) else 'http://' + text)
+
+
+def _transfer_url_host(url: str, schemes: frozenset) -> str:
+    """The host a URL names, with any login, port and path dropped; empty when it names none, or when the tool does
+    not speak its scheme."""
     try:
-        text = url.strip()
-        parts = urlsplit(text if '://' in text else 'http://' + text)
+        parts = _transfer_url_split(url)
+        if parts.scheme.lower() not in schemes:
+            return ''
         host = parts.hostname or ''
         if '[' in parts.netloc and not _transfer_ip(host):
             return ''  # brackets hold nothing but an IPv6 address, which older Pythons do not check
@@ -7685,7 +7717,7 @@ def _transfer_curl(args: List[str]) -> List[tuple]:
             expanded = [url] if globoff else _transfer_curl_glob(url)
             if expanded is None:
                 return endpoints
-            endpoints += [('out' if sends else 'in', _transfer_url_host(one), None,
+            endpoints += [('out' if sends else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
                            _transfer_curl_dial(one, connects, pins)) for one in expanded]
         if i >= len(args):
             return endpoints
@@ -7769,10 +7801,9 @@ def _transfer_ip(text: str):
 def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optional[tuple]:
     """(the host a URL's request connects to, the addresses pinned for it), as curl applies the first matching
     --connect-to and then the last --resolve pin for that host and port, a named host before *; None when neither."""
-    from urllib.parse import urlsplit
-    host = _transfer_url_host(url)
+    host = _transfer_url_host(url, _TRANSFER_CURL_SCHEMES)
     try:
-        parts = urlsplit(url.strip() if '://' in url else 'http://' + url.strip())
+        parts = _transfer_url_split(url)
         port = str(parts.port or _TRANSFER_DEFAULT_PORTS.get(parts.scheme.lower(), ''))
     except ValueError:
         return None
@@ -7817,8 +7848,7 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             urls.append(arg)
             continue
         flags.add(arg)
-        if arg == '--no-globoff':
-            flags -= {'-g', '--globoff'}  # the last of them decides
+        flags -= _TRANSFER_CURL_UNDOES.get(arg, set())
         if arg == '--url' and value:
             urls.append(value)
         elif arg in ('-X', '--request') and value:
@@ -7846,7 +7876,7 @@ def _transfer_wget(args: List[str]) -> List[tuple]:
         else:
             urls.append(arg)
     direction = 'out' if flags & _TRANSFER_WGET_UPLOADS else 'in'
-    return [(direction, _transfer_url_host(url), None) for url in urls]
+    return [(direction, _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None) for url in urls]
 
 
 def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:
@@ -8018,7 +8048,8 @@ def _transfer_httpie(args: List[str], sends: bool) -> List[tuple]:
     url, items = (positional[1], positional[2:]) if method else (positional[0], positional[1:])
     reads_stdin = sends and not flags & {'-I', '--ignore-stdin'}
     out = method in _TRANSFER_SENDING_METHODS or '--raw' in flags or reads_stdin or any(map(_transfer_httpie_item, items))
-    return [('out' if out else 'in', 'localhost' if url.startswith(':') else _transfer_url_host(url), None)]
+    host = 'localhost' if url.startswith(':') else _transfer_url_host(url, _TRANSFER_HTTPIE_SCHEMES)
+    return [('out' if out else 'in', host, None)]
 
 
 def _transfer_web_cmdlet(args: List[str], sends: bool) -> List[tuple]:
@@ -8041,7 +8072,7 @@ def _transfer_web_cmdlet(args: List[str], sends: bool) -> List[tuple]:
         elif name in ('method', 'custommethod') and value.upper() in _TRANSFER_SENDING_METHODS:
             out = True
     uri = uri or (positional[0] if positional else '')
-    return [('out' if out else 'in', _transfer_url_host(uri), None)] if uri else []
+    return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None)] if uri else []
 
 
 def _transfer_stdio(layers: tuple) -> tuple:
@@ -8146,84 +8177,118 @@ def _transfer_match_execs(words: List[str]) -> bool:
     return False
 
 
-def _transfer_ssh_config_runs(lines: List[str], homes: List[str], bases: tuple, pending: List[tuple]) -> bool:
-    """Whether config lines could run a command or a DNS lookup in ssh -G; their Includes are queued on pending,
-    resolved against every home and folder ssh may use."""
+def _transfer_ssh_config_line(line: str, homes: List[str], bases: tuple) -> Optional[tuple]:
+    """One ssh config line read as ssh reads it: (whether it is an Include, the files it names, resolved against every
+    home and folder ssh may use); None when it could run a command or a DNS lookup, or ssh may read it differently."""
     import glob
-    for line in lines:
-        words = _transfer_ssh_config_words(line)
-        if words is None:
-            return True
-        if not words:
-            continue
-        keyword, _, attached = words[0].partition('=')
-        # ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
-        words = [w.lstrip('=') for w in ([attached] if attached else []) + words[1:] if w.lstrip('=')]
-        if keyword.lower() == 'match' and _transfer_match_execs(words):
-            return True
-        if keyword.lower() == 'canonicalizehostname' and words and words[0].lower() in ('yes', 'always'):
-            return True
-        for pattern in (words if keyword.lower() == 'include' else []):
-            if '$' in pattern or '%' in pattern:
-                return True  # ssh may expand a variable or token here
-            # ssh globs the path, and glob reads a backslash as escaping the next character.
-            pattern = re.sub(r'\\(.)', r'\1', pattern)
-            if pattern == '~' or pattern.startswith('~/'):
-                paths = [home + pattern[1:] for home in homes]
-            else:
-                paths = [os.path.join(base, os.path.expanduser(pattern)) for base in bases]
-            for path in paths:
-                pending += [(found, bases) for found in sorted(glob.glob(path))]
-    return False
+    words = _transfer_ssh_config_words(line) if not re.search(r'[\x00-\x08\x0a-\x1f\x7f]', line) else None
+    if words is None:
+        return None
+    if not words:
+        return False, []
+    keyword, _, attached = words[0].partition('=')
+    keyword = keyword.lower()
+    # ssh allows `Keyword=value` and `Keyword =value`, so a leading = is only a separator.
+    words = [w.lstrip('=') for w in ([attached] if attached else []) + words[1:] if w.lstrip('=')]
+    if keyword == 'match' and _transfer_match_execs(words):
+        return None
+    if keyword == 'canonicalizehostname' and words and words[0].lower() in ('yes', 'always'):
+        return None
+    if keyword != 'include':
+        return False, []
+    paths = []
+    for pattern in words:
+        if '$' in pattern or '%' in pattern:
+            return None  # ssh may expand a variable or token here
+        # ssh globs the path, and glob reads a backslash as escaping the next character.
+        pattern = re.sub(r'\\(.)', r'\1', pattern)
+        if pattern == '~' or pattern.startswith('~/'):
+            candidates = [home + pattern[1:] for home in homes]
+        else:
+            candidates = [os.path.join(base, os.path.expanduser(pattern)) for base in bases]
+        for candidate in candidates:
+            paths += sorted(glob.glob(candidate))
+    return True, paths
 
 
-def _transfer_ssh_config_unsafe(passthrough: List[str], cwd: Optional[str]) -> bool:
-    """Whether ssh -G could run a command or a DNS lookup while reading its configs, or reads a file this can't check."""
+def _transfer_ssh_system_dir() -> str:
+    """The folder of the system config the ssh on PATH reads: its install prefix's etc/ssh, /etc/ssh for one in /usr,
+    and PROGRAMDATA's ssh on Windows."""
+    import shutil
+    if os.name == 'nt':
+        return os.path.join(os.environ.get('PROGRAMDATA') or '', 'ssh')
+    prefix = os.path.dirname(os.path.dirname(shutil.which('ssh') or '/usr/bin/ssh'))
+    return '/etc/ssh' if prefix in ('/usr', '/') else os.path.join(prefix, 'etc', 'ssh')
+
+
+def _transfer_ssh_vetted(options: List[str], cwd: Optional[str], folder: str) -> Optional[List[str]]:
+    """ssh -G's options with -F set to a copy, in folder, of exactly the configs this read once and checked, with each
+    Include pointed at the copies, so ssh reads nothing else; None when one could run a command or can't be checked."""
     import stat
     home = _transfer_home()
     # ssh reads ~/.ssh/config from the account's home but expands an Include's ~ and relative path with $HOME.
     homes = list(dict.fromkeys([home, os.path.expanduser('~')]))
     user_bases = tuple(os.path.join(h, '.ssh') for h in homes)
-    config = None
-    for flag, value in zip(passthrough[::2], passthrough[1::2]):
-        if flag == '-F':
-            config = os.path.expanduser(value)
-    if config == 'none':
-        return False
-    if config is None:
-        # Whichever ssh is on PATH reads its own system config, so every one that exists is checked.
-        system = ['/etc/ssh', '/opt/homebrew/etc/ssh', '/usr/local/etc/ssh',
-                  os.path.join(os.environ.get('PROGRAMDATA') or '/nonexistent', 'ssh')]
-        pending = [(os.path.join(home, '.ssh', 'config'), user_bases)] + \
-            [(os.path.join(d, 'ssh_config'), (d,)) for d in system]
-    elif os.path.isabs(config) or (cwd and os.path.isdir(cwd)):
-        pending = [(os.path.join(cwd or '', config), user_bases)]
-    else:
-        return True
-    seen = set()
-    while pending:
-        path, bases = pending.pop()
-        if path in seen:
-            continue
-        seen.add(path)
+    if len(options) % 2:
+        return None
+    pairs = list(zip(options[::2], options[1::2]))
+    configs = [os.path.expanduser(value) for flag, value in pairs if flag == '-F']
+    rest = [word for flag, value in pairs if flag != '-F' for word in (flag, value)]
+    if configs and configs[-1] == 'none':
+        return options
+    if configs and not (os.path.isabs(configs[-1]) or (cwd and os.path.isdir(cwd))):
+        return None
+    system = _transfer_ssh_system_dir()
+    # ssh reads only a -F file; else the user's config, then the system's.
+    sources = [(os.path.join(cwd or '', configs[-1]), user_bases)] if configs else \
+        [(os.path.join(home, '.ssh', 'config'), user_bases), (os.path.join(system, 'ssh_config'), (system,))]
+    copies, queue = {}, []
+
+    def copy_of(path: str, bases: tuple) -> str:
+        if (path, bases) not in copies:
+            copies[(path, bases)] = os.path.join(folder, str(len(copies)))
+            queue.append((path, bases))
+        return copies[(path, bases)]
+
+    tops = [copy_of(path, bases) for path, bases in sources]
+    while queue:
+        path, bases = queue.pop(0)
+        if len(copies) > _TRANSFER_SSH_CONFIG_MAX_FILES:
+            return None
         try:
-            info = os.stat(path)
+            # Read once, without blocking on a fifo; only a small regular file is read.
+            handle = os.open(path, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0))
+            try:
+                info = os.fstat(handle)
+                if not stat.S_ISREG(info.st_mode) or info.st_size > _TRANSFER_SSH_CONFIG_MAX_BYTES:
+                    return None
+                data = os.read(handle, _TRANSFER_SSH_CONFIG_MAX_BYTES + 1)
+            finally:
+                os.close(handle)
         except FileNotFoundError:
-            continue
+            if configs:
+                return None  # ssh refuses a -F file that isn't there
+            data = b''
         except OSError:
-            return True
-        # Only small regular files are read, so a fifo or a huge file can't hold up the turn.
-        if len(seen) > _TRANSFER_SSH_CONFIG_MAX_FILES or not stat.S_ISREG(info.st_mode) or \
-                info.st_size > _TRANSFER_SSH_CONFIG_MAX_BYTES:
-            return True
-        try:
-            with open(path, errors='ignore') as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return True
-        if _transfer_ssh_config_runs(lines, homes, bases, pending):
-            return True
-    return False
+            return None
+        if len(data) > _TRANSFER_SSH_CONFIG_MAX_BYTES:
+            return None
+        lines = []
+        for line in data.decode('utf-8', 'surrogateescape').split('\n'):
+            line = line[:-1] if line.endswith('\r') else line
+            read = _transfer_ssh_config_line(line, homes, bases)
+            if read is None:
+                return None
+            lines.append(line if not read[0] else
+                         'Include ' + ' '.join('"%s"' % copy_of(found, bases) for found in read[1]) if read[1] else '')
+        with open(copies[(path, bases)], 'w', encoding='utf-8', errors='surrogateescape') as out:
+            out.write('\n'.join(lines) + '\n')
+    top = tops[0]
+    if not configs:
+        top = os.path.join(folder, 'config')
+        with open(top, 'w', encoding='utf-8') as out:
+            out.write(''.join('Include "%s"\n' % copy for copy in tops))
+    return ['-F', top] + rest
 
 
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> str:
@@ -8235,7 +8300,7 @@ def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[s
     if key not in state:
         state[key] = ''
         # A destination starting with - would reach ssh -G as an option.
-        if not destination.startswith('-') and not _transfer_ssh_config_unsafe(options, cwd):
+        if not destination.startswith('-'):
             target = destination.replace('[', '').replace(']', '')
             out = _transfer_run(['ssh', '-G'] + options + ['--', target], cwd, state) or ''
             names = [line.split(None, 1)[1] for line in out.splitlines() if line.startswith('hostname ')]
@@ -8300,7 +8365,8 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict) -> Optional[
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     destination = destination.strip()
-    host = _transfer_url_host(destination) if '://' in destination else destination.rsplit('@', 1)[-1]
+    host = _transfer_url_host(destination, _TRANSFER_CURL_SCHEMES) if '://' in destination else \
+        destination.rsplit('@', 1)[-1]
     host = _transfer_clean_host(host)
     if not host:
         return None

@@ -1864,10 +1864,22 @@ var turnStore = createTurnStore();
 
 // packages/core/src/transfer.ts
 import { lookup as dnsLookup } from "node:dns/promises";
-import { readdirSync, readFileSync as readFileSync3, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync as writeFileSync2
+} from "node:fs";
 import { BlockList, isIP } from "node:net";
-import { homedir, userInfo } from "node:os";
-import { basename, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, normalize, sep } from "node:path";
+import { homedir, tmpdir as tmpdir2, userInfo } from "node:os";
+import { basename, delimiter, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, normalize, sep } from "node:path";
 var ALLOWED_RUNS = [["ssh", "-G"]];
 var RUN_TIMEOUT_MS = 5e3;
 var DNS_TIMEOUT_MS = 1500;
@@ -1934,6 +1946,11 @@ var TOOLS = {
 };
 var SENDING_METHODS = /* @__PURE__ */ new Set(["POST", "PUT", "PATCH"]);
 var DEFAULT_PORTS = { http: 80, https: 443, ftp: 21, ftps: 990, ws: 80, wss: 443 };
+var CURL_SCHEMES = new Set("dict ftp ftps gopher gophers http https imap imaps ldap ldaps mqtt pop3 pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss".split(" "));
+var WGET_SCHEMES = /* @__PURE__ */ new Set(["http", "https", "ftp", "ftps"]);
+var HTTPIE_SCHEMES = /* @__PURE__ */ new Set(["http", "https"]);
+var POWERSHELL_SCHEMES = /* @__PURE__ */ new Set(["http", "https", "ftp"]);
+var CURL_UNDOES = { "--no-globoff": ["-g", "--globoff"], "--no-get": ["-G", "--get"] };
 var SSH_VALUE_FLAGS = {
   ssh: "BbcDEeFIiJLlmOoPpQRSWw",
   scp: "cDFiJloPSX",
@@ -2013,15 +2030,25 @@ var ADDRESS_KINDS = [
   ["cgnat", ["100.64.0.0/10"]]
 ];
 async function run(argv, state) {
+  let folder;
   try {
     if (!ALLOWED_RUNS.some((p) => p.every((part, i) => argv[i] === part))) return void 0;
     const remaining = state.deadline - state.now();
     if (remaining <= 0) return void 0;
-    const [file, ...args] = argv;
+    let [file, ...args] = argv;
     if (file === void 0) return void 0;
+    if (file === "ssh" && args[0] === "-G") {
+      folder = mkdtempSync(join5(tmpdir2(), "unbound-ssh-"));
+      const end2 = argv.indexOf("--");
+      const options = end2 < 0 ? void 0 : vetted(argv.slice(2, end2), state.home, state.env, folder);
+      if (options === void 0) return void 0;
+      args = ["-G", ...options, ...argv.slice(end2)];
+    }
     return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
   } catch {
     return void 0;
+  } finally {
+    if (folder !== void 0) rmSync(folder, { recursive: true, force: true });
   }
 }
 function wordEnd(text, start) {
@@ -2198,8 +2225,8 @@ function parenEnd(text, start) {
         i += 2;
       } else if (text.startsWith("<<", i)) {
         const strip = text.startsWith("<<-", i);
-        const [delimiter, wordStop] = readWord(text, i + (strip ? 3 : 2));
-        heredocs.push([delimiter, strip]);
+        const [delimiter2, wordStop] = readWord(text, i + (strip ? 3 : 2));
+        heredocs.push([delimiter2, strip]);
         i = wordStop - 1;
       } else if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
         if (ch === ")") [cases[cases.length - 1], atStart] = ["body", true];
@@ -2220,12 +2247,12 @@ function parenEnd(text, start) {
 function heredocsEnd(text, start, heredocs) {
   let i = start;
   while (heredocs.length > 0) {
-    const [delimiter, stripTabs] = heredocs.shift();
+    const [delimiter2, stripTabs] = heredocs.shift();
     while (i + 1 < text.length) {
       const end2 = text.indexOf("\n", i + 1);
       const line = end2 < 0 ? text.slice(i + 1) : text.slice(i + 1, end2);
       i = end2 < 0 ? text.length - 1 : end2;
-      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter) break;
+      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter2) break;
     }
   }
   return i;
@@ -2511,14 +2538,14 @@ var Lexer = class _Lexer {
     const { text } = this;
     let shift = 0;
     while (this.heredocs.length > 0) {
-      const [delimiter, stripTabs, at, fed] = this.heredocs.shift();
+      const [delimiter2, stripTabs, at, fed] = this.heredocs.shift();
       const lines = [];
       while (this.i + 1 < text.length) {
         const end2 = text.indexOf("\n", this.i + 1);
         const raw = end2 < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end2);
         const line = stripTabs ? raw.replace(/^\t+/, "") : raw;
         this.i = end2 < 0 ? text.length - 1 : end2;
-        if (line === delimiter) break;
+        if (line === delimiter2) break;
         lines.push(line);
       }
       const body = lines.join("\n");
@@ -3606,6 +3633,7 @@ function simple(words2, item, before, shell, depth) {
   if ((name === "eval" || name === "source" || name === ".") && (before !== "|" && item.after !== "|" || subshell === void 0)) {
     forget(shell, /* @__PURE__ */ new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
     shell.vars[UNKNOWN_ENV] = [void 0, void 0];
+    for (const [fname, known2] of shell.functions) shell.functions.set(fname, [known2[0], true]);
   }
   if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
@@ -3759,13 +3787,18 @@ function shortOption(arg, args, start, valueFlags, seen) {
   }
   return [arg, void 0, i];
 }
-function urlHost(url) {
+function urlText(url) {
+  const text = url.trim();
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`;
+}
+function urlHost(url, schemes) {
   try {
-    const text = url.trim();
-    if (text.startsWith("/")) return "";
-    const full = text.includes("://") ? text : `http://${text}`;
+    if (url.trim().startsWith("/")) return "";
+    const full = urlText(url);
     if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
-    const host = new URL(full).hostname.toLowerCase();
+    const parsed = new URL(full);
+    if (!schemes.has(parsed.protocol.slice(0, -1).toLowerCase())) return "";
+    const host = parsed.hostname.toLowerCase();
     return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
   } catch {
     return "";
@@ -3781,7 +3814,7 @@ function curl(args) {
     for (const url of urls) {
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return out;
-      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one), void 0, curlDial(one, connects, pins)]));
+      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, pins)]));
     }
     if (next >= args.length) return out;
     i = next;
@@ -3856,11 +3889,10 @@ function ipOf(text) {
   return family === 6 ? normalizeV6(bare) : family === 4 ? bare : "";
 }
 function curlDial(url, connects, pins) {
-  const host = urlHost(url);
+  const host = urlHost(url, CURL_SCHEMES);
   let port;
   try {
-    const text = url.trim();
-    const parsed = new URL(text.includes("://") ? text : `http://${text}`);
+    const parsed = new URL(urlText(url));
     port = parsed.port || String(DEFAULT_PORTS[parsed.protocol.slice(0, -1).toLowerCase()] ?? "");
   } catch {
     return void 0;
@@ -3912,7 +3944,7 @@ function curlRequest(args, start) {
       continue;
     }
     flags.add(arg);
-    if (arg === "--no-globoff") ["-g", "--globoff"].forEach((flag) => flags.delete(flag));
+    for (const flag of CURL_UNDOES[arg] ?? []) flags.delete(flag);
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
@@ -3940,7 +3972,7 @@ function wget(args) {
     }
   }
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
-  return urls.map((url) => [direction, urlHost(url), void 0]);
+  return urls.map((url) => [direction, urlHost(url, WGET_SCHEMES), void 0]);
 }
 function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
   const passthrough = [];
@@ -4094,7 +4126,7 @@ function httpie(args, sends) {
   const items = positional.slice(method ? 2 : 1);
   const readsStdin = sends && !flags.has("-I") && !flags.has("--ignore-stdin");
   const out = SENDING_METHODS.has(method) || flags.has("--raw") || readsStdin || items.some(httpieItem);
-  return [[out ? "out" : "in", url.startsWith(":") ? "localhost" : urlHost(url), void 0]];
+  return [[out ? "out" : "in", url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES), void 0]];
 }
 function webCmdlet(args, sends) {
   let uri = "";
@@ -4115,7 +4147,7 @@ function webCmdlet(args, sends) {
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
   }
   uri ||= positional[0] ?? "";
-  return uri ? [[out ? "out" : "in", urlHost(uri), void 0]] : [];
+  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0]] : [];
 }
 function stdio(layers) {
   const fds = /* @__PURE__ */ new Map([[0, "null"], [1, "null"], [2, "null"]]);
@@ -4251,49 +4283,100 @@ function matchExecs(words2) {
   }
   return false;
 }
-function configRuns(text, bases, homes, pending) {
-  for (const line of text.split(/\r?\n/)) {
-    const lineWords = configWords(line);
-    if (lineWords === void 0) return true;
-    const [first = "", ...rest] = lineWords;
-    const [keyword2 = "", attached = ""] = first.split(/=(.*)/s);
-    const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
-    if (keyword2.toLowerCase() === "match" && matchExecs(args)) return true;
-    if (keyword2.toLowerCase() === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return true;
-    for (const pattern of keyword2.toLowerCase() === "include" ? args : []) {
-      const targets = includeTargets(pattern, bases, homes);
-      if (targets === void 0) return true;
-      pending.push(...targets.map((target) => [target, bases]));
-    }
+function configLine(line, bases, homes) {
+  const lineWords = /[\x00-\x08\x0a-\x1f\x7f]/.test(line) ? void 0 : configWords(line);
+  if (lineWords === void 0) return void 0;
+  if (lineWords.length === 0) return [false, []];
+  const [first = "", ...rest] = lineWords;
+  const [word = "", attached = ""] = first.split(/=(.*)/s);
+  const keyword2 = word.toLowerCase();
+  const args = (attached ? [attached, ...rest] : rest).map((w) => w.replace(/^=+/, "")).filter(Boolean);
+  if (keyword2 === "match" && matchExecs(args)) return void 0;
+  if (keyword2 === "canonicalizehostname" && ["yes", "always"].includes((args[0] ?? "").toLowerCase())) return void 0;
+  if (keyword2 !== "include") return [false, []];
+  const paths = [];
+  for (const pattern of args) {
+    const targets = includeTargets(pattern, bases, homes);
+    if (targets === void 0) return void 0;
+    paths.push(...targets);
   }
-  return false;
+  return [true, paths];
 }
-function configUnsafe(passthrough, home, processEnv) {
+function sshSystemDir(processEnv) {
+  if (process.platform === "win32") return join5(processEnv.PROGRAMDATA ?? "", "ssh");
+  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => dir !== "" && isFile(join5(dir, "ssh")));
+  const prefix = dirname3(bin ?? "/usr/bin");
+  return prefix === "/usr" || prefix === "/" ? "/etc/ssh" : join5(prefix, "etc", "ssh");
+}
+function readOnce(path) {
+  const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size > SSH_CONFIG_MAX_BYTES) return void 0;
+    const buffer = Buffer.alloc(SSH_CONFIG_MAX_BYTES + 1);
+    let size = 0;
+    for (let n = 1; n > 0 && size < buffer.length; size += n) n = readSync(fd, buffer, size, buffer.length - size, null);
+    return size > SSH_CONFIG_MAX_BYTES ? void 0 : buffer.subarray(0, size).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+function vetted(options, home, processEnv, folder) {
   const homes = [.../* @__PURE__ */ new Set([home, processEnv.HOME || home])];
   const userBases = homes.map((h) => join5(h, ".ssh"));
-  let config;
-  for (let i = 0; i + 1 < passthrough.length; i += 2) if (passthrough[i] === "-F") config = passthrough[i + 1];
-  if (config === "none") return false;
-  if (config !== void 0 && !isAbsolute3(config)) return true;
-  const system = ["/etc/ssh", "/opt/homebrew/etc/ssh", "/usr/local/etc/ssh", join5(processEnv.PROGRAMDATA || "/nonexistent", "ssh")];
-  const pending = config === void 0 ? [[join5(home, ".ssh", "config"), userBases], ...system.map((d) => [join5(d, "ssh_config"), [d]])] : [[config, userBases]];
-  const seen = /* @__PURE__ */ new Set();
-  while (pending.length > 0) {
-    const [path, bases] = pending.pop();
-    if (seen.has(path)) continue;
-    seen.add(path);
+  if (options.length % 2 !== 0) return void 0;
+  const configs = [];
+  const rest = [];
+  for (let i = 0; i < options.length; i += 2) {
+    if (options[i] === "-F") configs.push(options[i + 1]);
+    else rest.push(options[i], options[i + 1]);
+  }
+  const config = configs.at(-1);
+  if (config === "none") return [...options];
+  if (config !== void 0 && !isAbsolute3(config)) return void 0;
+  const system = sshSystemDir(processEnv);
+  const sources = config !== void 0 ? [[config, userBases]] : [[join5(home, ".ssh", "config"), userBases], [join5(system, "ssh_config"), [system]]];
+  const copies = /* @__PURE__ */ new Map();
+  const queue = [];
+  const copyOf = (path, bases) => {
+    const key = JSON.stringify([path, bases]);
+    let copy2 = copies.get(key);
+    if (copy2 === void 0) {
+      copy2 = join5(folder, String(copies.size));
+      copies.set(key, copy2);
+      queue.push([path, bases]);
+    }
+    return copy2;
+  };
+  const tops = sources.map(([path, bases]) => copyOf(path, bases));
+  while (queue.length > 0) {
+    const [path, bases] = queue.shift();
+    if (copies.size > SSH_CONFIG_MAX_FILES) return void 0;
     let text;
     try {
-      const info = statSync(path, { throwIfNoEntry: false });
-      if (info === void 0) continue;
-      if (seen.size > SSH_CONFIG_MAX_FILES || !info.isFile() || info.size > SSH_CONFIG_MAX_BYTES) return true;
-      text = readFileSync3(path, "utf8");
-    } catch {
-      return true;
+      text = readOnce(path);
+    } catch (error) {
+      if (error.code !== "ENOENT" || config !== void 0) return void 0;
+      text = "";
     }
-    if (configRuns(text, bases, homes, pending)) return true;
+    if (text === void 0) return void 0;
+    const lines = [];
+    for (const raw of text.split("\n")) {
+      const line = raw.endsWith("\r") ? raw.slice(0, -1) : raw;
+      const read = configLine(line, bases, homes);
+      if (read === void 0) return void 0;
+      lines.push(!read[0] ? line : read[1].length > 0 ? `Include ${read[1].map((found) => `"${copyOf(found, bases)}"`).join(" ")}` : "");
+    }
+    writeFileSync2(copies.get(JSON.stringify([path, bases])), `${lines.join("\n")}
+`, { mode: 384 });
   }
-  return false;
+  let top = tops[0];
+  if (config === void 0) {
+    top = join5(folder, "config");
+    writeFileSync2(top, tops.map((copy2) => `Include "${copy2}"
+`).join(""), { mode: 384 });
+  }
+  return ["-F", top, ...rest];
 }
 async function sshHostname(destination, options, cwd, state) {
   if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return "";
@@ -4305,7 +4388,7 @@ async function sshHostname(destination, options, cwd, state) {
   const cached = state.sshHosts.get(key);
   if (cached !== void 0) return cached;
   state.sshHosts.set(key, "");
-  if (destination.startsWith("-") || configUnsafe(resolved, state.home, state.env)) return "";
+  if (destination.startsWith("-")) return "";
   const out = await run(["ssh", "-G", ...resolved, "--", destination.replace(/[[\]]/g, "")], state) ?? "";
   const line = out.split(/\r?\n/).find((l) => l.startsWith("hostname "));
   const host = line === void 0 ? "" : cleanHost(line.slice("hostname ".length));
@@ -4373,7 +4456,7 @@ function addressKind(found) {
 async function endpoint(raw, cwd, state) {
   const [direction, rawDestination, sshOptions, dial] = raw;
   const destination = rawDestination.trim();
-  const host = cleanHost(destination.includes("://") ? urlHost(destination) : destination.split("@").pop() ?? "");
+  const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : destination.split("@").pop() ?? "");
   if (host === "") return void 0;
   let resolved;
   let kind;
@@ -4903,7 +4986,7 @@ function mintBrokerId() {
 }
 
 // packages/pi/src/mcpConfig.ts
-import { closeSync, constants as fsConstants, fstatSync, lstatSync as lstatSync2, openSync, readSync, statSync as statSync2 } from "node:fs";
+import { closeSync as closeSync2, constants as fsConstants, fstatSync as fstatSync2, lstatSync as lstatSync2, openSync as openSync2, readSync as readSync2, statSync as statSync2 } from "node:fs";
 import { isAbsolute as isAbsolute4, join as join6 } from "node:path";
 var KNOWN_SERVER_KEYS = /* @__PURE__ */ new Set([
   "command",
@@ -5008,17 +5091,17 @@ function readSource(path) {
   let fd;
   try {
     try {
-      fd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
+      fd = openSync2(path, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
     } catch (error) {
       return isMissing(error) ? { kind: "absent" } : { kind: "failed" };
     }
-    const stats = fstatSync(fd);
+    const stats = fstatSync2(fd);
     if (!stats.isFile()) return { kind: "failed" };
     if (!Number.isFinite(stats.size) || stats.size > MAX_MCP_CONFIG_BYTES) return { kind: "failed" };
     const buffer = Buffer.alloc(MAX_MCP_CONFIG_BYTES + 1);
     let total = 0;
     while (total < buffer.length) {
-      const read = readSync(fd, buffer, total, buffer.length - total, null);
+      const read = readSync2(fd, buffer, total, buffer.length - total, null);
       if (read <= 0) break;
       total += read;
     }
@@ -5029,7 +5112,7 @@ function readSource(path) {
   } finally {
     if (fd !== void 0) {
       try {
-        closeSync(fd);
+        closeSync2(fd);
       } catch {
       }
     }
