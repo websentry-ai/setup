@@ -676,7 +676,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
@@ -2427,6 +2428,51 @@ def clear_otel_export_for_user(username: str, home: Path) -> str:
     return _run_as_user(username, _clear) or "failed"
 
 
+def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) -> bool:
+    """Removes var_name for every user except those keep() names; False when any removal failed."""
+    if platform.system().lower() == "windows":
+        # One machine-wide value: it stays if any user still needs it.
+        # A planted hook file only keeps a value every user can already read; unbound-hook clear drops it regardless.
+        if keep(None) or any(keep(home_dir) for _, home_dir in get_all_user_homes()):
+            return True
+        return remove_env_var_on_windows_machine(var_name) in ("cleared", "not_found")
+    ok = True
+    for username, home_dir in get_all_user_homes():
+        if not keep(home_dir) and remove_env_var_from_user(username, home_dir, var_name) not in ("cleared", "not_found"):
+            ok = False
+    return ok
+
+
+# Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
+def remove_legacy_key_env() -> None:
+    try:
+        _remove_env_var_for_all_users("UNBOUND_COPILOT_API_KEY")
+    except Exception:
+        pass
+
+
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.claude", "~/.codex", "~/.cursor", "~/.augment",
+    "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
+    "/etc/codex", "%ProgramData%/OpenAI/Codex", "/Library/Application Support/Cursor", "/etc/cursor",
+    "%ProgramData%/Cursor", "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
+            return True
+    return False
+
+
 def clear_setup() -> bool:
     print("=" * 60)
     print("Copilot Hooks - Clearing MDM Setup")
@@ -2496,6 +2542,10 @@ def clear_setup() -> bool:
     elif managed == "failed":
         teardown_failed = True
         print("Failed to clear Copilot telemetry settings")
+
+    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
+        teardown_failed = True
+        print("Failed to clear UNBOUND_DEVICE_TOKEN")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -2593,11 +2643,13 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
-    env_ok, _ = set_env_var_system_wide("UNBOUND_COPILOT_API_KEY", api_key)
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+    env_ok, _ = set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not env_ok:
-        print("Failed to set UNBOUND_COPILOT_API_KEY")
+        print("Failed to set UNBOUND_DEVICE_TOKEN")
         return False
-    debug_print("UNBOUND_COPILOT_API_KEY set successfully")
+    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
+    remove_legacy_key_env()
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:

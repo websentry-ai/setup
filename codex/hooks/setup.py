@@ -307,7 +307,8 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -695,6 +696,29 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
+# Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
+def remove_legacy_key_env() -> None:
+    try:
+        remove_env_var("UNBOUND_CODEX_API_KEY")
+    except Exception:
+        pass
+
+
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.claude", "~/.cursor", "~/.copilot", "~/.augment",
+    "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
+    "/Library/Application Support/Cursor", "/etc/cursor", "%ProgramData%/Cursor",
+    "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use() -> bool:
+    dirs = (Path(os.path.expandvars(os.path.expanduser(d))) for d in OTHER_HOOK_DIRS)
+    # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+    return any(p.is_absolute() and (p / "hooks" / "unbound.py").exists() for p in dirs)
+
+
 def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
@@ -710,6 +734,13 @@ def clear_setup() -> bool:
     elif status not in ("cleared", "not_found"):
         print("Failed to clear API_KEY")
         any_failed = True
+    if not device_token_in_use():
+        status, _ = remove_env_var("UNBOUND_DEVICE_TOKEN")
+        if status == "cleared":
+            any_cleared = True
+        elif status != "not_found":
+            print("Failed to clear UNBOUND_DEVICE_TOKEN")
+            any_failed = True
 
     _r = _clear_path(Path.home() / ".codex" / "hooks" / "unbound.py", "Codex unbound.py hook")
     if _r == "cleared":
@@ -1749,12 +1780,13 @@ def main():
     # Remove gateway setup env vars and artifacts
     remove_gateway_artifacts()
 
-    debug_print("Setting UNBOUND_CODEX_API_KEY environment variable...")
-    success, message = set_env_var("UNBOUND_CODEX_API_KEY", api_key)
+    debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+    success, message = set_env_var("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
         print(f"Failed to set environment variable: {message}")
         return False
-    debug_print("UNBOUND_CODEX_API_KEY set successfully")
+    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
 
     write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None})
 
@@ -1774,6 +1806,8 @@ def main():
     if not enable_codex_hooks_feature():
         print("Failed to enable hooks feature flag")
         return False
+    # After the new hook is in place: an older codex hook reads only the per-tool var.
+    remove_legacy_key_env()
 
     print("API key verified and added")
     print("Setup complete")
