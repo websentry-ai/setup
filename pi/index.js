@@ -1877,6 +1877,8 @@ var MAX_ENDPOINTS = 10;
 var MAX_DEPTH = 8;
 var MAX_CALLS = 32;
 var MAX_WORDS = 64;
+var MAX_CHARS = 2e4;
+var MAX_NESTING = 100;
 var WRAPPERS = {
   sudo: {
     short: "ugCDhprtTU",
@@ -2280,7 +2282,7 @@ var Lexer = class _Lexer {
   }
   /** The items, or undefined when the command can't be read the way the shell reads it. */
   read() {
-    if (this.depth > MAX_DEPTH) return void 0;
+    if (this.depth > MAX_DEPTH || this.text.length > MAX_CHARS) return void 0;
     for (; this.i < this.text.length; this.i++) {
       if (!(this.quote !== void 0 ? this.quoted() : this.unquoted()) || this.failed) return void 0;
     }
@@ -2730,7 +2732,7 @@ function cdTarget(args, cwd, shell, given) {
   if (target !== void 0 && isFile(target)) return [cwd, 1];
   if (target === void 0 || shell.names.has(basename(normalize(target))) || landed.size > 1) return [void 0, void 0];
   const folder = [...landed][0];
-  return folder === void 0 ? [cwd, 1] : [folder, 0];
+  return folder === void 0 ? [void 0, void 0] : [folder, 0];
 }
 function tilde(word, shell) {
   if (word.startsWith(LITERAL_TILDE)) return `~${word.slice(1)}`;
@@ -2979,6 +2981,7 @@ function openFrame(kind, runsHere, shell, head) {
     shell.function = void 0;
   }
   if (kind !== "$(") shell.pipe.leading = false;
+  if (shell.frames.length >= MAX_NESTING) throw new Error("nested too deep");
   shell.frames.push({
     kind,
     base: value,
@@ -4383,7 +4386,13 @@ async function endpoint(raw, cwd, state) {
 async function transferOf(command2, cwd, state) {
   let tool;
   const endpoints = [];
-  for (const call of walk(new Lexer(command2).read() ?? [], cwd, {}, state.env, 0)) {
+  let calls;
+  try {
+    calls = walk(new Lexer(command2).read() ?? [], cwd, {}, state.env, 0);
+  } catch {
+    return void 0;
+  }
+  for (const call of calls) {
     const found = parse(call, state.env);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;

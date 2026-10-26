@@ -84,6 +84,16 @@ test("every command in the shared corpus sends the same transfer as the Python h
   }
 });
 
+test("a command nested too deep sends no transfer, and the turn's later calls still do", async () => {
+  const deep = "{ ".repeat(101) + "curl https://example.com/a" + "; }".repeat(101);
+  const found = await resolveTransfers([
+    { tool_name: "bash", tool_use_id: "c1", tool_input: { command: deep } },
+    { tool_name: "bash", tool_use_id: "c2", tool_input: { command: "curl https://example.com/b" } },
+  ], "/", options());
+  assert.equal(found.get("c1"), undefined);
+  assert.equal(found.get("c2")?.endpoints[0]?.host, "example.com");
+});
+
 test("ssh -G runs through a fake ssh on PATH, with the options that change the host", async () => {
   const bin = mkdtempSync(join(tmpdir(), "transfer-bin-"));
   const log = join(bin, "calls.log");
@@ -476,9 +486,10 @@ test("a loop that may repeat, or a cd into a missing folder, leaves the folder u
     "cd frontend; while [ -f y ]; do cd ..; done; scp -F cfg f prod:/tmp",
     "cd frontend; for x in *.txt; do cd ..; done; scp -F cfg f prod:/tmp",
     "mkdir nowhere; cd nowhere; cd frontend; scp -F cfg f prod:/tmp",
+    "cd nowhere; cd frontend; scp -F cfg f prod:/tmp",
     "if [ -f y ]; then f() { cd frontend; }; fi; f; scp -F cfg f prod:/tmp",
   ]) assert.equal(await at(command), "prod", command);
-  for (const command of ["cd -P frontend; scp -F cfg f prod:/tmp", "cd -- frontend; scp -F cfg f prod:/tmp", "cd -L frontend; scp -F cfg f prod:/tmp", "cd nowhere; cd frontend; scp -F cfg f prod:/tmp"]) {
+  for (const command of ["cd -P frontend; scp -F cfg f prod:/tmp", "cd -- frontend; scp -F cfg f prod:/tmp", "cd -L frontend; scp -F cfg f prod:/tmp"]) {
     assert.equal(await at(command), "10.0.4.12", command);
   }
   for (const command of [
@@ -510,11 +521,12 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ["cd frontend -P; scp -F cfg f prod:/tmp", "prod"],
     ["cd -Pe frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd -q frontend; scp -F cfg f prod:/tmp", "prod"],
-    ["cd missing/../frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
-    // A cd into a folder that is there succeeds, and one into a missing path or a file fails and stays.
+    ["cd missing/../frontend; scp -F cfg f prod:/tmp", "prod"],
+    // A cd into a folder that is there succeeds, and one into a file fails and stays; a missing folder may have been
+    // there when it ran.
     ["cd frontend || cd ..; scp -F cfg f prod:/tmp", "10.0.4.12"],
-    ["cd nowhere || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
-    ["cd nowhere && cd frontend; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    ["cd nowhere || cd frontend; scp -F cfg f prod:/tmp", "prod"],
+    ["cd nowhere && cd frontend; scp -F cfg f prod:/tmp", "prod"],
     ["cd notes; scp -F cfg f prod:/tmp", "203.0.113.9"],
     ["cd cfg; scp -F cfg f prod:/tmp", "203.0.113.9"],
     // A command that only reads inside the folder, such as wc, does not name it.
@@ -533,11 +545,11 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     [`HOME=${dir}; HOME=${dir}/frontend cd; scp -F cfg f prod:/tmp`, "10.0.4.12"],
     [`HOME=${dir}; HOME=${dir}/frontend cd ~; scp -F cfg f prod:/tmp`, "203.0.113.9"],
     [`HOME=${dir}; HOME=${dir}/frontend scp -F ~/cfg f prod:/tmp`, "203.0.113.9"],
-    // A quoted or escaped ~ is a folder named ~, which is not there.
-    [`HOME=${dir}; cd '~/frontend'; scp -F cfg f prod:/tmp`, "203.0.113.9"],
-    [`HOME=${dir}; cd \\~/frontend; scp -F cfg f prod:/tmp`, "203.0.113.9"],
+    // A quoted or escaped ~ is a folder named ~, which is not there, so where the cd went is not known.
+    [`HOME=${dir}; cd '~/frontend'; scp -F cfg f prod:/tmp`, "prod"],
+    [`HOME=${dir}; cd \\~/frontend; scp -F cfg f prod:/tmp`, "prod"],
     [`HOME=${dir}; cd ~/frontend; scp -F cfg f prod:/tmp`, "10.0.4.12"],
-    [`HOME=${dir}; cd '~root'; scp -F cfg f prod:/tmp`, "203.0.113.9"],
+    [`HOME=${dir}; cd '~root'; scp -F cfg f prod:/tmp`, "prod"],
     // After empty quotes bash leaves a ~ and zsh expands it.
     [`HOME=${dir}; cd ''~/frontend; scp -F cfg f prod:/tmp`, "prod"],
     // An assignment expands the ~ its value starts with.

@@ -3791,6 +3791,9 @@ _TRANSFER_MAX_DEPTH = 8
 _TRANSFER_MAX_CALLS = 32
 # How many words one brace expansion or curl URL glob is expanded into.
 _TRANSFER_MAX_WORDS = 64
+# A longer command, or one nesting compounds deeper, is skipped whole so it can't hold up the turn.
+_TRANSFER_MAX_CHARS = 20000
+_TRANSFER_MAX_NESTING = 100
 # Wrappers that run the command after them: (short options that take a value, long ones that do, operands before it).
 _TRANSFER_WRAPPERS = {
     'sudo': ('ugCDhprtTU', {'--user', '--group', '--close-from', '--chdir', '--host', '--prompt', '--role', '--type',
@@ -4197,7 +4200,7 @@ class _TransferLexer:
 
     def read(self) -> Optional[List[tuple]]:
         """The items, or None when the command can't be read the way the shell reads it."""
-        if self.depth > _TRANSFER_MAX_DEPTH:
+        if self.depth > _TRANSFER_MAX_DEPTH or len(self.text) > _TRANSFER_MAX_CHARS:
             return None
         while self.i < len(self.text):
             if not (self._quoted() if self.quote else self._unquoted()) or self.failed:
@@ -4661,7 +4664,7 @@ def _transfer_cd_words(args: List[str]) -> tuple:
 
 def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict, given: Dict) -> tuple:
     """(the folder a cd lands in from cwd, the status it leaves): 0 where it lands, the old folder and 1 when every
-    shell rejects it or the folder is not there; None for either when that is not known. given: its VAR=value words."""
+    shell rejects it; None for either when that is not known, as for a folder not there now. given: its VAR=values."""
     letters, folders = _transfer_cd_words(args)
     if any(c not in 'LPeqs@0123456789' for c in letters):
         return cwd, 1  # every shell rejects the cd and stays
@@ -4680,7 +4683,7 @@ def _transfer_cd(args: List[str], cwd: Optional[str], shell: Dict, given: Dict) 
     if target is None or os.path.basename(os.path.normpath(target)) in shell['names'] or len(landed) > 1:
         return None, None
     folder = landed.pop()
-    return (folder, 0) if folder else (cwd, 1)
+    return (folder, 0) if folder else (None, None)
 
 
 def _transfer_tilde(word: str, shell: Dict) -> str:
@@ -4906,6 +4909,8 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) ->
     if kind != '$(':
         shell['pipe']['leading'] = False  # a substitution runs inside the command that a leading `!` still awaits
     frames = shell['frames']
+    if len(frames) >= _TRANSFER_MAX_NESTING:
+        raise ValueError('nested too deep')  # caught where the walk starts, so the call sends no transfer
     frames.append({'kind': kind, 'base': runs, 'runs': runs, 'rel': True, 'alive': True, 'decided': False,
                    'saved': None, 'state': _transfer_snapshot(shell), 'status': shell['status'],
                    'calls': len(shell['calls']), 'piped_in': shell.pop('opening_pipe', False),
@@ -5838,6 +5843,11 @@ def _transfer_url_host(url: str) -> str:
         host = parts.hostname or ''
         if '[' in parts.netloc and not _transfer_ip(host):
             return ''  # brackets hold nothing but an IPv6 address, which older Pythons do not check
+        if '%' in host and '[' not in parts.netloc:
+            from urllib.parse import unquote
+            host = unquote(host, errors='strict').lower()  # curl decodes a host name; one still holding % is none
+            if '%' in host:
+                return ''
         if host.isascii():
             return host
         import unicodedata

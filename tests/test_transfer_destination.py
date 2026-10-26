@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '16f698a389b92085f72e93fa0de6c383a7ff57a42ea9f16d150c27ca7782663e'
+BLOCK_SHA256 = '2a8c78ed6adeb41ffa3bc61f242a176e3f6f3872c873c02bbfcd62e188748ad3'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -660,6 +660,16 @@ class TimeLimitTests(TransferTestCase):
             with self.subTest(hook=hook.__file__), patch.object(hook, '_transfer_walk', side_effect=RuntimeError):
                 self.assertIsNone(hook._transfer('curl -T f https://example.com', self.repo, {}))
 
+    def test_a_command_too_long_or_nested_too_deep_is_skipped_at_once(self):
+        for n in (1000, 3000):  # past the nesting cap, and past the length cap too
+            command = 'if true; then ' * n + 'scp f prod:/tmp' + '; fi' * n
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__, n=n):
+                    start = time.monotonic()
+                    self.assertIsNone(hook._transfer(command, self.repo, {}))
+                    self.assertIsNone(hook._transfer_next_cwd(command, self.repo))
+                    self.assertLess(time.monotonic() - start, 1.0)
+
 
 class ParserFindingTests(TransferTestCase):
     """Commands the shell reads in ways easy to get wrong. `cfg` in the repo maps prod to a public address and
@@ -777,10 +787,11 @@ class ParserFindingTests(TransferTestCase):
                         'cd frontend; while [ -f y ]; do cd ..; done; scp -F cfg f prod:/tmp',
                         'cd frontend; for x in *.txt; do cd ..; done; scp -F cfg f prod:/tmp',
                         'mkdir nowhere; cd nowhere; cd frontend; scp -F cfg f prod:/tmp',
+                        'cd nowhere; cd frontend; scp -F cfg f prod:/tmp',
                         'if [ -f y ]; then f() { cd frontend; }; fi; f; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, unknown)
         for command in ('cd -P frontend; scp -F cfg f prod:/tmp', 'cd -- frontend; scp -F cfg f prod:/tmp',
-                        'cd -L frontend; scp -F cfg f prod:/tmp', 'cd nowhere; cd frontend; scp -F cfg f prod:/tmp'):
+                        'cd -L frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'private', '10.0.4.12')])
         public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
         for command in ('cd frontend; for x in a; do cd ..; done; scp -F cfg f prod:/tmp',
@@ -822,12 +833,12 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd frontend -P; scp -F cfg f prod:/tmp', unknown),
                                   ('cd -Pe frontend; scp -F cfg f prod:/tmp', unknown),
                                   ('cd -q frontend; scp -F cfg f prod:/tmp', unknown),
-                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', public),
-                                  # A cd into a folder that is there succeeds, and one into a missing path or a file
-                                  # fails and stays, so && and || after it follow.
+                                  ('cd missing/../frontend; scp -F cfg f prod:/tmp', unknown),
+                                  # A cd into a folder that is there succeeds, and one into a file fails and stays, so
+                                  # && and || after it follow; a missing folder may have been there when it ran.
                                   ('cd frontend || cd ..; scp -F cfg f prod:/tmp', private),
-                                  ('cd nowhere || cd frontend; scp -F cfg f prod:/tmp', private),
-                                  ('cd nowhere && cd frontend; scp -F cfg f prod:/tmp', public),
+                                  ('cd nowhere || cd frontend; scp -F cfg f prod:/tmp', unknown),
+                                  ('cd nowhere && cd frontend; scp -F cfg f prod:/tmp', unknown),
                                   ('cd notes; scp -F cfg f prod:/tmp', public),
                                   ('cd cfg; scp -F cfg f prod:/tmp', public),
                                   # A command that only reads inside the folder, such as wc, does not name it.
@@ -850,11 +861,12 @@ class ParserFindingTests(TransferTestCase):
                                   (f'HOME={self.repo}; HOME={self.repo}/frontend cd ~; scp -F cfg f prod:/tmp', public),
                                   (f'HOME={self.repo}/frontend; scp -F ~/cfg f prod:/tmp', private),
                                   (f'HOME={self.repo}; HOME={self.repo}/frontend scp -F ~/cfg f prod:/tmp', public),
-                                  # A quoted or escaped ~ is a folder named ~, which is not there.
-                                  (f"HOME={self.repo}; cd '~/frontend'; scp -F cfg f prod:/tmp", public),
-                                  (f'HOME={self.repo}; cd \\~/frontend; scp -F cfg f prod:/tmp', public),
+                                  # A quoted or escaped ~ is a folder named ~, which is not there, so where the
+                                  # cd went is not known.
+                                  (f"HOME={self.repo}; cd '~/frontend'; scp -F cfg f prod:/tmp", unknown),
+                                  (f'HOME={self.repo}; cd \\~/frontend; scp -F cfg f prod:/tmp', unknown),
                                   (f'HOME={self.repo}; cd ~/frontend; scp -F cfg f prod:/tmp', private),
-                                  (f"HOME={self.repo}; cd '~root'; scp -F cfg f prod:/tmp", public),
+                                  (f"HOME={self.repo}; cd '~root'; scp -F cfg f prod:/tmp", unknown),
                                   # After empty quotes bash leaves a ~ and zsh expands it.
                                   (f"HOME={self.repo}; cd ''~/frontend; scp -F cfg f prod:/tmp", unknown),
                                   # An assignment expands the ~ its value starts with.
@@ -1086,6 +1098,24 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
                 with self.subTest(hook=path, first=first):
                     transfers = self._transfers(path, [first, 'scp -F cfg build.zip prod:/srv'])
                     self.assertEqual(transfers[-1], expected)
+
+    def test_claude_code_starts_the_walk_where_the_turn_started(self):
+        # Claude's Stop carries the folder the turn ended in; replaying the turn's cd from there would miss the folder.
+        hook = load_module('claude-code/hooks/unbound.py')
+        frontend = os.path.join(self.repo, 'frontend')
+        private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+        for command in ('cd frontend && scp build.zip prod:/srv', 'cd frontend && scp -F cfg build.zip prod:/srv'):
+            events = [
+                {'timestamp': '2026-10-22T16:39:58Z',
+                 'event': {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'session_id': 's1',
+                           'cwd': self.repo}},
+                {'timestamp': '2026-10-22T16:40:00Z',
+                 'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_input': {'command': command},
+                           'tool_response': {}, 'cwd': frontend}},
+            ]
+            with self.subTest(command=command):
+                entries = _tool_entries(hook.build_llm_exchange(events, cwd=frontend))
+                self.assertEqual([e.get('transfer') for e in entries], [private])
 
     def test_a_codex_workdir_does_not_move_later_calls(self):
         # A workdir is that call's own; the next call without one still starts in the session folder.

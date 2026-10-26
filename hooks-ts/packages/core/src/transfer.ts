@@ -43,6 +43,9 @@ const MAX_DEPTH = 8;
 const MAX_CALLS = 32;
 /** How many words one brace expansion or curl URL glob is expanded into. */
 const MAX_WORDS = 64;
+/** A longer command, or one nesting compounds deeper, is skipped whole so it can't hold up the turn. */
+const MAX_CHARS = 20_000;
+const MAX_NESTING = 100;
 /** Wrappers that run the command after them: short options that take a value, long ones that do, operands before it. */
 const WRAPPERS: Record<string, { short: string; long: readonly string[]; operands: number }> = {
   sudo: {
@@ -528,7 +531,7 @@ class Lexer {
 
   /** The items, or undefined when the command can't be read the way the shell reads it. */
   read(): Item[] | undefined {
-    if (this.depth > MAX_DEPTH) return undefined;
+    if (this.depth > MAX_DEPTH || this.text.length > MAX_CHARS) return undefined;
     for (; this.i < this.text.length; this.i++) {
       if (!(this.quote !== undefined ? this.quoted() : this.unquoted()) || this.failed) return undefined;
     }
@@ -1017,7 +1020,7 @@ function cdWords(args: string[]): [string, string[]] {
 }
 
 /** [the folder a cd lands in from `cwd`, the status it leaves]: 0 where it lands, the old folder and 1 when every
- *  shell rejects it or the folder is not there; undefined for either when that is not known. */
+ *  shell rejects it; undefined for either when that is not known, as for a folder not there now. */
 function cdTarget(args: string[], cwd: string | undefined, shell: Shell, given: Env): [string | undefined, number | undefined] {
   const [letters, folders] = cdWords(args);
   if (/[^LPeqs@0-9]/.test(letters)) return [cwd, 1]; // every shell rejects the cd and stays
@@ -1033,7 +1036,7 @@ function cdTarget(args: string[], cwd: string | undefined, shell: Shell, given: 
   // The folder is read after the command ran, so one the command names elsewhere may have been made or removed by it.
   if (target === undefined || shell.names.has(basename(normalize(target))) || landed.size > 1) return [undefined, undefined];
   const folder = [...landed][0];
-  return folder === undefined ? [cwd, 1] : [folder, 0];
+  return folder === undefined ? [undefined, undefined] : [folder, 0];
 }
 
 /** A word with a leading ~ or ~/ made the shell's HOME, which the shell reads before a VAR=value in front of the command
@@ -1460,6 +1463,7 @@ function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): voi
     shell.function = undefined;
   }
   if (kind !== "$(") shell.pipe.leading = false; // a substitution runs inside the command that a leading `!` still awaits
+  if (shell.frames.length >= MAX_NESTING) throw new Error("nested too deep"); // transferOf catches it
   shell.frames.push({
     kind, base: value, runs: value, rel: true, alive: true, decided: false, state: snapshot(shell),
     status: shell.status, calls: shell.calls.length, pipedIn: shell.openingPipe, pipedOut: endsPiped(head, shell),
@@ -3120,7 +3124,13 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State): Promis
 async function transferOf(command: string, cwd: string | undefined, state: State): Promise<Transfer | undefined> {
   let tool: string | undefined;
   const endpoints: TransferEndpoint[] = [];
-  for (const call of walk(new Lexer(command).read() ?? [], cwd, {}, state.env, 0)) {
+  let calls: Call[];
+  try {
+    calls = walk(new Lexer(command).read() ?? [], cwd, {}, state.env, 0);
+  } catch {
+    return undefined; // nested past MAX_NESTING, or unreadable: this call sends no transfer, and later calls still do
+  }
+  for (const call of calls) {
     const found = parse(call, state.env);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
