@@ -810,7 +810,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if gateway_url:
             # Recorded so teardown can recognise a custom endpoint as ours later; without
             # it a --gateway-url install leaves its own routing behind.

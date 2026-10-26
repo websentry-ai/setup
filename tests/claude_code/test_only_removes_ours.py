@@ -1131,7 +1131,7 @@ class TestGatewayMdmRecordsItsGateway(unittest.TestCase):
         self.assertEqual(config["api_key"], "ub-key")
 
     def test_no_gateway_url_records_only_the_key(self):
-        self.assertEqual(self._write(), {"api_key": "ub-key"})
+        self.assertEqual(self._write(), {"device_token": "ub-key", "api_key": "ub-key"})
 
     def test_what_it_records_is_what_the_matcher_accepts(self):
         custom = "https://unbound.acme-corp.internal"

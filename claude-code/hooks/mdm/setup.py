@@ -907,7 +907,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
@@ -1507,6 +1508,47 @@ def clear_managed_hooks() -> str:
         return "failed"
 
 
+def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) -> bool:
+    """Removes var_name for every user except those keep() names; False when any removal failed."""
+    if platform.system().lower() == "windows":
+        # One machine-wide value: it stays if any user still needs it.
+        if keep(None) or any(keep(home_dir) for _, home_dir in get_all_user_homes()):
+            return True
+        return remove_env_var_on_windows_machine(var_name) in ("cleared", "not_found")
+    ok = True
+    for username, home_dir in get_all_user_homes():
+        if not keep(home_dir) and remove_env_var_from_user(username, home_dir, var_name) not in ("cleared", "not_found"):
+            ok = False
+    return ok
+
+
+# Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
+def remove_legacy_key_env() -> None:
+    try:
+        _remove_env_var_for_all_users("UNBOUND_CLAUDE_API_KEY")
+    except Exception:
+        pass
+
+
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.codex", "~/.cursor", "~/.copilot", "~/.augment",
+    "/etc/codex", "/Library/Application Support/Cursor", "/etc/cursor",
+    "%ProgramData%/Cursor", "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        if (Path(os.path.expandvars(d)) / "hooks" / "unbound.py").exists():
+            return True
+    return False
+
+
 def clear_setup() -> bool:
     print("=" * 60)
     print("Claude Code Hooks - Clearing MDM Setup")
@@ -1557,6 +1599,10 @@ def clear_setup() -> bool:
     else:
         teardown_failed = True
         print(f"Failed to clear managed hooks in {managed_dir}")
+
+    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
+        teardown_failed = True
+        print("Failed to clear UNBOUND_DEVICE_TOKEN")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -2615,11 +2661,12 @@ def main():
         remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
                                  _unbound_base_url_matcher(username, home_dir))
 
-    success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
+    success, _ = set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
-        print("Failed to set UNBOUND_CLAUDE_API_KEY")
+        print("Failed to set UNBOUND_DEVICE_TOKEN")
         return False
-    debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
+    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
+    remove_legacy_key_env()
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:

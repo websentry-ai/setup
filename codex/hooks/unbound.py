@@ -50,7 +50,7 @@ SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'codex'
-SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CODEX_API_KEY'
+SKILL_POLICY_API_KEY_ENV = 'UNBOUND_DEVICE_TOKEN'
 CODEX_SELECTED_SKILL_KIND = 'skills.selected_skill_instructions'
 CODEX_SELECTED_SKILL_NAME_RE = re.compile(r'<name>\s*([^<\s][^<]*?)\s*</name>')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
@@ -3652,7 +3652,7 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
         if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
-        api_key = _cached_api_key or os.getenv('UNBOUND_CODEX_API_KEY')
+        api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
@@ -4456,10 +4456,10 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key")
+        api_key = unbound_config.get("device_token") or unbound_config.get("api_key")
         backend_url = unbound_config.get("base_url")
         if not (api_key and backend_url):
-            api_key = _machine_env('UNBOUND_CODEX_API_KEY')
+            api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CODEX_API_KEY')
             backend_url = _machine_env('UNBOUND_BACKEND_URL')
             if backend_url and not backend_url.startswith("https://"):
                 log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
@@ -4665,11 +4665,11 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("api_key")
+            api_key = unbound_config.get("device_token") or unbound_config.get("api_key")
             backend_url = unbound_config.get("base_url")
             if not (api_key and backend_url):
                 # Resolve as a unit -- never pair a config field with an env field.
-                api_key = _machine_env('UNBOUND_CODEX_API_KEY')
+                api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CODEX_API_KEY')
                 backend_url = _machine_env('UNBOUND_BACKEND_URL')
                 if backend_url and not backend_url.startswith("https://"):
                     log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')
@@ -4738,12 +4738,20 @@ def _dispatch_discovery() -> None:
 
 
 def get_api_key():
-    return os.getenv('UNBOUND_CODEX_API_KEY')
+    key = os.getenv('UNBOUND_DEVICE_TOKEN') or os.getenv('UNBOUND_CODEX_API_KEY')
+    if key:
+        return key
+    try:
+        with UNBOUND_CONFIG_PATH.open('r', encoding='utf-8') as f:
+            cfg = json.loads(f.read())
+        return cfg.get('device_token') or cfg.get('api_key')
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def main():
     global _cached_api_key
-    api_key = os.getenv('UNBOUND_CODEX_API_KEY')
+    api_key = get_api_key()
     _cached_api_key = api_key
 
     if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
