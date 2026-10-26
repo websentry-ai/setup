@@ -82,12 +82,13 @@ def test_hook_still_reads_the_per_tool_key_from_an_older_install(home, monkeypat
 
 
 @pytest.mark.parametrize("tool", sorted(HOOKS))
-def test_hook_reads_config_device_token_then_api_key(home, tool):
+def test_hook_reads_config_api_key_then_device_token(home, tool):
     hook = _load(HOOKS[tool], f"token_hook_{tool.replace('-', '_')}")
-    _write_config(home, {"device_token": "cfg-new", "api_key": "cfg-old"})
+    # An older writer (CLI login, pinned installer) updates only api_key, so it must win.
+    _write_config(home, {"device_token": "stale", "api_key": "relogged"})
+    assert hook.get_api_key() == "relogged"
+    _write_config(home, {"device_token": "cfg-new"})
     assert hook.get_api_key() == "cfg-new"
-    _write_config(home, {"api_key": "cfg-old"})
-    assert hook.get_api_key() == "cfg-old"
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))
@@ -149,7 +150,7 @@ def test_windows_machine_token_stays_while_any_user_still_needs_it(home, tmp_pat
 
 
 def test_every_config_writer_also_writes_device_token():
-    # Hooks prefer device_token, so a writer that updates only api_key would leave a stale key winning.
+    # Readers move to device_token once api_key writes stop, so every writer must already set it.
     files = subprocess.run(["git", "grep", "-lE", r"config\[['\"]api_key['\"]\] = api_key", "--", "*.py"],
                            cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
     assert files

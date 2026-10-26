@@ -4172,7 +4172,8 @@ def get_api_key():
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
             cfg = json.loads(f.read())
-            return cfg.get('device_token') or cfg.get('api_key')
+            # api_key first: every writer still sets it, and older writers set only it.
+            return cfg.get('api_key') or cfg.get('device_token')
     except FileNotFoundError:
         return None
     except Exception as e:
@@ -4282,7 +4283,8 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("device_token") or unbound_config.get("api_key")
+        # api_key first: every writer still sets it, and older writers set only it.
+        api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
         backend_url = unbound_config.get("base_url")
         if not (api_key and backend_url):
             api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CURSOR_API_KEY')
@@ -4491,7 +4493,8 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("device_token") or unbound_config.get("api_key")
+            # api_key first: every writer still sets it, and older writers set only it.
+            api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
             backend_url = unbound_config.get("base_url")
             if not (api_key and backend_url):
                 # Resolve as a unit -- never pair a config field with an env field.

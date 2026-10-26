@@ -900,6 +900,7 @@ def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) ->
     """Removes var_name for every user except those keep() names; False when any removal failed."""
     if platform.system().lower() == "windows":
         # One machine-wide value: it stays if any user still needs it.
+        # A planted hook file only keeps a value every user can already read; unbound-hook clear drops it regardless.
         if keep(None) or any(keep(home_dir) for _, home_dir in get_all_user_homes()):
             return True
         return remove_env_var_on_windows(var_name) in ("cleared", "not_found")
