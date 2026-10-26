@@ -1533,7 +1533,7 @@ def remove_legacy_key_env() -> None:
 # Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
 OTHER_HOOK_DIRS = (
     "~/.codex", "~/.cursor", "~/.copilot", "~/.augment",
-    "/etc/codex", "/Library/Application Support/Cursor", "/etc/cursor",
+    "/etc/codex", "%ProgramData%/OpenAI/Codex", "/Library/Application Support/Cursor", "/etc/cursor",
     "%ProgramData%/Cursor", "/etc/augment", "%ProgramData%/Augment",
 )
 

@@ -1273,7 +1273,7 @@ def remove_legacy_key_env() -> None:
 OTHER_HOOK_DIRS = (
     "~/.claude", "~/.codex", "~/.cursor", "~/.copilot",
     "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
-    "/etc/codex", "/Library/Application Support/Cursor", "/etc/cursor",
+    "/etc/codex", "%ProgramData%/OpenAI/Codex", "/Library/Application Support/Cursor", "/etc/cursor",
     "%ProgramData%/Cursor",
 )
 
