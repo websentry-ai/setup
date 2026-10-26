@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '3b6f9bb577443eeacb75dc66f18703066a0ea9ebe7b90c0e42d49b6753129b93'
+BLOCK_SHA256 = '41f406ad178a702b57f108c50d41d5f9c0a152813bafb773404f2b0159598858'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1045,6 +1045,17 @@ class ParserFindingTests(TransferTestCase):
         for command in ('pushd frontend; popd; scp -F cfg f prod:/tmp', 'pushd frontend; pushd; scp -F cfg f prod:/tmp',
                         'pushd frontend; pushd +1; scp -F cfg f prod:/tmp', 'pushd -n frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, [unknown])
+
+    def test_a_builtin_behind_a_wrapper_that_is_a_program_changes_nothing_here(self):
+        # env, sudo, nohup and the like run it as a program of its own, or fail; command and builtin run it here.
+        public = [_endpoint('out', 'prod', 'public', '203.0.113.9')]
+        for command in ('env cd frontend; scp -F cfg f prod:/tmp', 'sudo cd frontend; scp -F cfg f prod:/tmp',
+                        'nohup pushd frontend; scp -F cfg f prod:/tmp', 'nice -n 5 cd frontend; scp -F cfg f prod:/tmp',
+                        'timeout 5 cd frontend; scp -F cfg f prod:/tmp', 'env exit; scp -F cfg f prod:/tmp',
+                        'nohup source f; scp -F cfg f prod:/tmp', 'env eval x; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, public)
+        self.assert_endpoints('builtin export H=1; cd frontend; scp -F cfg f prod:/tmp',
+                              [_endpoint('out', 'prod', 'private', '10.0.4.12')])
 
     def test_eval_and_source_leave_every_function_unknown(self):
         # Their text may redefine a function, so a call after them may no longer run the body seen before.

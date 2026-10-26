@@ -678,6 +678,19 @@ test("a call that may not have run is never looked up", async () => {
   assert.deepEqual(seen, ["example.com"]);
 });
 
+test("a builtin behind a wrapper that is a program changes nothing here", async () => {
+  // env, sudo, nohup and the like run it as a program of its own, or fail; command and builtin run it here.
+  const dir = repo();
+  const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
+  for (const command of [
+    "env cd frontend; scp -F cfg f prod:/tmp", "sudo cd frontend; scp -F cfg f prod:/tmp",
+    "nohup pushd frontend; scp -F cfg f prod:/tmp", "nice -n 5 cd frontend; scp -F cfg f prod:/tmp",
+    "timeout 5 cd frontend; scp -F cfg f prod:/tmp", "env exit; scp -F cfg f prod:/tmp",
+    "nohup source f; scp -F cfg f prod:/tmp", "env eval x; scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "203.0.113.9", command);
+  assert.equal(await at("builtin export H=1; cd frontend; scp -F cfg f prod:/tmp"), "10.0.4.12");
+});
+
 test("eval and source leave every function unknown", async () => {
   // Their text may redefine a function, so a call after them may no longer run the body seen before.
   const dir = repo();

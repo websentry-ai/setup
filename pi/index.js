@@ -2865,7 +2865,7 @@ function moveTo(cwd, path, physical) {
 }
 function program(input, start) {
   const argv = [...input];
-  const out = { args: [], env: {}, cwd: start, otherUser: false };
+  const out = { args: [], env: {}, cwd: start, otherUser: false, external: false };
   let wrapper;
   let operands = 0;
   let optionsDone = false;
@@ -2887,6 +2887,7 @@ function program(input, start) {
       optionsDone = false;
       operands = WRAPPERS[wrapper].operands;
       out.otherUser ||= wrapper === "sudo" || wrapper === "doas";
+      out.external ||= !["command", "builtin", "exec"].includes(wrapper);
     } else {
       return { ...out, name: programName(token), args: argv.slice(i) };
     }
@@ -3628,36 +3629,37 @@ function simple(words2, item, before, shell, depth) {
   }
   const parsed = program(argv, shell.cwd);
   const { name } = parsed;
+  const own = parsed.external ? void 0 : name;
   const declares = name === "export" || DECLARES.includes(name);
   const args = parsed.args.map((arg) => declares && isAssignment(arg) ? assignedTilde(arg, shell) : tilde(arg, shell));
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
   const assigns = name === void 0 && argv.every(isAssignment);
   const status = shell.status;
-  shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
+  shell.status = name === "true" || own === ":" || own === "break" || own === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
   if (assigns && !substituted) shell.status = 0;
-  let moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
-  if (name === "pushd" || name === "popd") {
+  let moved = own === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
+  if (own === "pushd" || own === "popd") {
     const folders = args[0] === "--" ? args.slice(1) : args;
     const sure = name === "pushd" && folders.length === 1 && !/^[+-]/.test(folders[0]);
     moved = sure ? cdTarget(folders, parsed.cwd, shell, parsed.env) : [void 0, void 0];
   }
   if (moved !== void 0) shell.status = moved[1];
-  if (name === "set" || name === "shift") shell.args = void 0;
-  if (name === "return" || name === "exit") {
+  if (own === "set" || own === "shift") shell.args = void 0;
+  if (own === "return" || own === "exit") {
     const given = args[0];
     shell.status = given === void 0 ? status : /^\d+$/.test(given) ? Number(BigInt(given) % 256n > 0n) : void 0;
     if (name === "return" && shell.floor === void 0) shell.status = 1;
   }
-  if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
-  if (READERS.includes(name) && (before !== "|" && item.after !== "|" || subshell === void 0)) {
+  if (own === "return" || own === "exit" || own === "break" || own === "continue") jumpFrom(own, args, subshell, shell);
+  if (READERS.includes(own) && (before !== "|" && item.after !== "|" || subshell === void 0)) {
     forget(shell, readNames(name, args));
   }
-  if ((name === "eval" || name === "source" || name === ".") && (before !== "|" && item.after !== "|" || subshell === void 0)) {
+  if ((own === "eval" || own === "source" || own === ".") && (before !== "|" && item.after !== "|" || subshell === void 0)) {
     forget(shell, /* @__PURE__ */ new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
     shell.vars[UNKNOWN_ENV] = [void 0, void 0];
     for (const [fname, known2] of shell.functions) shell.functions.set(fname, [known2[0], true]);
   }
-  if (name === "cd" || name === "pushd" || name === "popd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
+  if (own === "cd" || own === "pushd" || own === "popd" || own === "export" || own === "unset" || DECLARES.includes(own) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
       if (moved !== void 0) shell.cwd = moved[0];
@@ -4126,7 +4128,7 @@ function netcat(args, sends) {
     }
   }
   if (positional[0] === void 0 || ["-l", "--listen", "-U", "--unixsock"].some((f) => flags.has(f))) return [];
-  return [[sends ? "out" : "", positional[0], void 0]];
+  return [[sends ? "out" : "", positional[0], void 0, void 0, ["--proxy", "-x", "-X"].some((f) => flags.has(f))]];
 }
 function socat(args, sends) {
   const addresses = [];
@@ -4146,7 +4148,7 @@ function httpieItem(item) {
   const match = /^(?:\\.|[^\\=:@])*(:=@|=@|:=|==|=|@|:)/.exec(item);
   return match !== null && match[1] !== "==" && match[1] !== ":";
 }
-function httpie(args, sends) {
+function httpie(args, sends, proxied = false) {
   const positional = [];
   const flags = /* @__PURE__ */ new Set();
   for (let i = 0; i < args.length; ) {
@@ -4170,11 +4172,13 @@ function httpie(args, sends) {
   const items = positional.slice(method ? 2 : 1);
   const readsStdin = sends && !flags.has("-I") && !flags.has("--ignore-stdin");
   const out = SENDING_METHODS.has(method) || flags.has("--raw") || readsStdin || items.some(httpieItem);
-  return [[out ? "out" : "in", url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES), void 0]];
+  const host = url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES);
+  return [[out ? "out" : "in", host, void 0, void 0, proxied || flags.has("--proxy")]];
 }
-function webCmdlet(args, sends) {
+function webCmdlet(args, sends, proxied = false) {
   let uri = "";
   let out = sends;
+  let proxy;
   const positional = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
@@ -4189,9 +4193,11 @@ function webCmdlet(args, sends) {
     if (name === "uri") uri = value;
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
+    else if (name === "proxy") proxy = value !== "";
+    else if (name === "noproxy") proxy ??= false;
   }
   uri ||= positional[0] ?? "";
-  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0]] : [];
+  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
 }
 function stdio(layers) {
   const fds = /* @__PURE__ */ new Map([[0, "null"], [1, "null"], [2, "null"]]);
@@ -4213,8 +4219,8 @@ function parse(call, processEnv) {
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
-  else if (tool === "httpie") raw = httpie(call.args, sends).map(([d, dest, options]) => [d, dest, options, void 0, proxiedEnv(call.env)]);
-  else if (tool === "powershell") raw = webCmdlet(call.args, sends);
+  else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env));
+  else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env));
   else return void 0;
   return [tool, raw.map(([d, dest, options, dial, proxied]) => [d, dest, call.otherUser ? void 0 : options, dial, proxied])];
 }

@@ -4646,8 +4646,10 @@ def _transfer_program_name(token: str) -> str:
 
 
 def _transfer_program(argv: List[str], cwd: Optional[str]) -> tuple:
-    """(program, its args, inline VAR=value settings, folder it runs in, whether it runs as another user)."""
+    """(program, its args, inline VAR=value settings, folder it runs in, whether it runs as another user, whether a
+    wrapper that is a program of its own runs it, so a builtin's name is a program too)."""
     env, argv, i, wrapper, operands, options_done, other_user = {}, list(argv), 0, None, 0, False, False
+    external = False
     while i < len(argv):
         token = argv[i]
         i += 1
@@ -4664,7 +4666,7 @@ def _transfer_program(argv: List[str], cwd: Optional[str]) -> tuple:
             continue
         if wrapper is not None and not options_done and token.startswith('-') and token != '-':
             if wrapper == 'command' and token in ('-v', '-V'):
-                return None, [], env, cwd, other_user  # only looks the command up
+                return None, [], env, cwd, other_user, external  # only looks the command up
             i, cwd = _transfer_wrapper_option(wrapper, token, argv, i, env, cwd)
             continue
         if wrapper is not None and operands > 0:
@@ -4674,9 +4676,10 @@ def _transfer_program(argv: List[str], cwd: Optional[str]) -> tuple:
             wrapper, options_done = _transfer_program_name(token), False
             operands = _TRANSFER_WRAPPERS[wrapper][2]
             other_user = other_user or wrapper in ('sudo', 'doas')
+            external = external or wrapper not in ('command', 'builtin', 'exec')
             continue
-        return _transfer_program_name(token), argv[i:], env, cwd, other_user
-    return None, [], env, cwd, other_user
+        return _transfer_program_name(token), argv[i:], env, cwd, other_user, external
+    return None, [], env, cwd, other_user, external
 
 
 def _transfer_cd_words(args: List[str]) -> tuple:
@@ -5671,7 +5674,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         if not known[1]:
             return []
         # A function that may not have been defined may leave the name to the program.
-    program, args, given, cwd, other_user = _transfer_program(words, shell['cwd'])
+    program, args, given, cwd, other_user, external = _transfer_program(words, shell['cwd'])
+    # After a wrapper that is a program of its own, a builtin's name is a program too, and changes nothing here.
+    builtin = None if external else program
     declares = program in ('export',) + _TRANSFER_DECLARES
     args = [_transfer_assigned_tilde(a, shell) if declares and _transfer_is_assignment(a) else _transfer_tilde(a, shell)
             for a in args]
@@ -5679,36 +5684,36 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     # A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
     assigns = program is None and all(_transfer_is_assignment(w) for w in words)
     status = shell['status']
-    shell['status'] = 0 if program in ('true', ':', 'break', 'continue') else 1 if program == 'false' else \
+    shell['status'] = 0 if program == 'true' or builtin in (':', 'break', 'continue') else 1 if program == 'false' else \
         _transfer_arithmetic(words[0]) if len(words) == 1 else None
     if assigns and not substituted:
         shell['status'] = 0
-    moved = _transfer_cd(args, cwd, shell, given) if program == 'cd' else None
-    if program in ('pushd', 'popd'):
+    moved = _transfer_cd(args, cwd, shell, given) if builtin == 'cd' else None
+    if builtin in ('pushd', 'popd'):
         # pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
         folders = args[1:] if args[:1] == ['--'] else args
         sure = program == 'pushd' and len(folders) == 1 and folders[0][:1] not in ('+', '-')
         moved = _transfer_cd(folders, cwd, shell, given) if sure else (None, None)
     if moved:
         shell['status'] = moved[1]
-    if program in ('set', 'shift'):
+    if builtin in ('set', 'shift'):
         shell['args'] = None  # the positional parameters may have changed
-    if program in ('return', 'exit'):
+    if builtin in ('return', 'exit'):
         # Either leaves the status it is given, or else the one before it; a return outside a function fails.
         shell['status'] = status if not args else int(int(args[0]) % 256 > 0) if args[0].isdigit() else None
         if program == 'return' and shell['floor'] is None:
             shell['status'] = 1
-    if program in ('return', 'exit', 'break', 'continue'):
+    if builtin in ('return', 'exit', 'break', 'continue'):
         _transfer_jump_from(program, args, subshell, shell)
-    if program in _TRANSFER_READERS and ((before != '|' and after != '|') or subshell is None):
+    if builtin in _TRANSFER_READERS and ((before != '|' and after != '|') or subshell is None):
         _transfer_forget(shell, _transfer_read_names(program, args))
-    if program in ('eval', 'source', '.') and ((before != '|' and after != '|') or subshell is None):
+    if builtin in ('eval', 'source', '.') and ((before != '|' and after != '|') or subshell is None):
         # Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
         _transfer_forget(shell, {name for name in shell['vars'] if not name.startswith('\0')} | {''})
         shell['vars'][_TRANSFER_UNKNOWN_ENV] = (None, None)
         # It may also redefine any function, so each one known may no longer run as written.
         shell['functions'] = {name: (known[0], True) for name, known in shell['functions'].items()}
-    if program in ('cd', 'pushd', 'popd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
+    if builtin in ('cd', 'pushd', 'popd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
             saved = _transfer_snapshot(shell)
@@ -5921,7 +5926,7 @@ def _transfer_url_host(url: str, schemes: frozenset) -> str:
 
 
 def _transfer_proxied(env: Dict) -> bool:
-    """Whether the command itself sets a proxy for curl, wget or HTTPie in their environment."""
+    """Whether the command itself sets a proxy for curl, wget, HTTPie or PowerShell in their environment."""
     return any(env.get(key) for key in _TRANSFER_PROXY_ENV)
 
 
@@ -6216,7 +6221,8 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
 
 
 def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
-    """nc's host: sent to when its stdin is fed in; a listener reaches no host."""
+    """nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x or
+    -X, reaches it through a proxy."""
     positional, flags, i = [], set(), 0
     while i < len(args):
         arg, i = args[i], i + 1
@@ -6231,7 +6237,7 @@ def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
             positional.append(arg)
     if not positional or flags & {'-l', '--listen', '-U', '--unixsock'}:
         return []
-    return [('out' if sends else '', positional[0], None)]
+    return [('out' if sends else '', positional[0], None, None, bool(flags & {'--proxy', '-x', '-X'}))]
 
 
 def _transfer_socat(args: List[str], sends: bool) -> List[tuple]:
@@ -6258,8 +6264,9 @@ def _transfer_httpie_item(item: str) -> bool:
     return bool(match) and match.group(1) not in ('==', ':')
 
 
-def _transfer_httpie(args: List[str], sends: bool) -> List[tuple]:
-    """HTTPie's URL: sent to when the request carries data or a sending method; else fetched from."""
+def _transfer_httpie(args: List[str], sends: bool, proxied: bool = False) -> List[tuple]:
+    """HTTPie's URL: sent to when the request carries data or a sending method; else fetched from. It goes through a
+    proxy with --proxy or one the command set."""
     positional, flags, i = [], set(), 0
     while i < len(args):
         arg, i = args[i], i + 1
@@ -6280,13 +6287,13 @@ def _transfer_httpie(args: List[str], sends: bool) -> List[tuple]:
     reads_stdin = sends and not flags & {'-I', '--ignore-stdin'}
     out = method in _TRANSFER_SENDING_METHODS or '--raw' in flags or reads_stdin or any(map(_transfer_httpie_item, items))
     host = 'localhost' if url.startswith(':') else _transfer_url_host(url, _TRANSFER_HTTPIE_SCHEMES)
-    return [('out' if out else 'in', host, None)]
+    return [('out' if out else 'in', host, None, None, proxied or '--proxy' in flags)]
 
 
-def _transfer_web_cmdlet(args: List[str], sends: bool) -> List[tuple]:
+def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) -> List[tuple]:
     """Invoke-WebRequest's or Invoke-RestMethod's URI: sent to with a body, file, form, piped input or sending
-    method; else fetched from."""
-    uri, out, positional, i = '', sends, [], 0
+    method; else fetched from. It goes through a proxy with -Proxy, or one the command set unless -NoProxy."""
+    uri, out, positional, proxy, i = '', sends, [], None, 0
     while i < len(args):
         arg, i = args[i], i + 1
         if not re.match(r'^-[A-Za-z]', arg):
@@ -6302,8 +6309,12 @@ def _transfer_web_cmdlet(args: List[str], sends: bool) -> List[tuple]:
             out = True
         elif name in ('method', 'custommethod') and value.upper() in _TRANSFER_SENDING_METHODS:
             out = True
+        elif name in ('proxy', 'noproxy'):
+            proxy = bool(value) if name == 'proxy' else proxy or False
     uri = uri or (positional[0] if positional else '')
-    return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None)] if uri else []
+    proxy = proxied if proxy is None else proxy
+    return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri \
+        else []
 
 
 def _transfer_stdio(layers: tuple) -> tuple:
@@ -6334,8 +6345,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
     elif tool in ('nc', 'socat'):
         raw = _transfer_netcat(args, sends) if tool == 'nc' else _transfer_socat(args, sends)
     elif tool in ('httpie', 'powershell'):
-        raw = _transfer_httpie(args, sends) if tool == 'httpie' else _transfer_web_cmdlet(args, sends)
-        raw = [e + (None, _transfer_proxied(env)) for e in raw] if tool == 'httpie' else raw
+        raw = (_transfer_httpie if tool == 'httpie' else _transfer_web_cmdlet)(args, sends, _transfer_proxied(env))
     else:
         return None
     # Under sudo, ssh runs as that user, with that user's config, which this can't read.

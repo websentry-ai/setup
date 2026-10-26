@@ -1170,12 +1170,14 @@ interface Program {
   env: Env;
   cwd: string | undefined;
   otherUser: boolean;
+  /** Whether a wrapper that is a program of its own runs it, so a builtin's name is a program too. */
+  external: boolean;
 }
 
 /** The program a simple command runs, its args, inline VAR=value settings and folder, past assignments and wrappers. */
 function program(input: string[], start: string | undefined): Program {
   const argv = [...input];
-  const out: Program = { args: [], env: {}, cwd: start, otherUser: false };
+  const out: Program = { args: [], env: {}, cwd: start, otherUser: false, external: false };
   let wrapper: string | undefined;
   let operands = 0;
   let optionsDone = false;
@@ -1197,6 +1199,7 @@ function program(input: string[], start: string | undefined): Program {
       optionsDone = false;
       operands = (WRAPPERS[wrapper] as { operands: number }).operands;
       out.otherUser ||= wrapper === "sudo" || wrapper === "doas";
+      out.external ||= !["command", "builtin", "exec"].includes(wrapper);
     } else {
       return { ...out, name: programName(token), args: argv.slice(i) };
     }
@@ -2223,43 +2226,45 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   }
   const parsed = program(argv, shell.cwd);
   const { name } = parsed;
+  // After a wrapper that is a program of its own, a builtin's name is a program too, and changes nothing here.
+  const own = parsed.external ? undefined : name;
   const declares = name === "export" || DECLARES.includes(name as string);
   const args = parsed.args.map((arg) => (declares && isAssignment(arg) ? assignedTilde(arg, shell) : tilde(arg, shell)));
   const env = CLEAN_ENV in parsed.env ? parsed.env : { ...exportedEnv(shell), ...parsed.env };
   // A command of nothing but assignments sets them in the shell, and succeeds unless a substitution in it fails.
   const assigns = name === undefined && argv.every(isAssignment);
   const status = shell.status;
-  shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1
+  shell.status = name === "true" || own === ":" || own === "break" || own === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
   if (assigns && !substituted) shell.status = 0;
-  let moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
-  if (name === "pushd" || name === "popd") {
+  let moved = own === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
+  if (own === "pushd" || own === "popd") {
     // pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
     const folders = args[0] === "--" ? args.slice(1) : args;
     const sure = name === "pushd" && folders.length === 1 && !/^[+-]/.test(folders[0] as string);
     moved = sure ? cdTarget(folders, parsed.cwd, shell, parsed.env) : [undefined, undefined];
   }
   if (moved !== undefined) shell.status = moved[1];
-  if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
-  if (name === "return" || name === "exit") {
+  if (own === "set" || own === "shift") shell.args = undefined; // the positional parameters may have changed
+  if (own === "return" || own === "exit") {
     // Either leaves the status it is given, or else the one before it; a return outside a function fails.
     const given = args[0];
     shell.status = given === undefined ? status : /^\d+$/.test(given) ? Number(BigInt(given) % 256n > 0n) : undefined;
     if (name === "return" && shell.floor === undefined) shell.status = 1;
   }
-  if (name === "return" || name === "exit" || name === "break" || name === "continue") jumpFrom(name, args, subshell, shell);
-  if (READERS.includes(name as string) && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
+  if (own === "return" || own === "exit" || own === "break" || own === "continue") jumpFrom(own, args, subshell, shell);
+  if (READERS.includes(own as string) && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
     forget(shell, readNames(name as string, args));
   }
-  if ((name === "eval" || name === "source" || name === ".") && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
+  if ((own === "eval" || own === "source" || own === ".") && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
     // Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
     forget(shell, new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
     shell.vars[UNKNOWN_ENV] = [undefined, undefined];
     // It may also redefine any function, so each one known may no longer run as written.
     for (const [fname, known] of shell.functions) shell.functions.set(fname, [known[0], true]);
   }
-  if (name === "cd" || name === "pushd" || name === "popd" || name === "export" || name === "unset" ||
-    DECLARES.includes(name as string) || assigns) {
+  if (own === "cd" || own === "pushd" || own === "popd" || own === "export" || own === "unset" ||
+    DECLARES.includes(own as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
     if (((before !== "|" && item.after !== "|") || subshell === undefined) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
@@ -2462,7 +2467,7 @@ function urlHost(url: string, schemes: ReadonlySet<string>): string {
 
 /** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
  *  --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. */
-/** Whether the command itself sets a proxy for curl, wget or HTTPie in their environment. */
+/** Whether the command itself sets a proxy for curl, wget, HTTPie or PowerShell in their environment. */
 function proxiedEnv(env: Env): boolean {
   return PROXY_ENV.some((key) => Boolean(env[key]));
 }
@@ -2799,7 +2804,8 @@ function netcat(args: string[], sends: boolean): Raw[] {
     }
   }
   if (positional[0] === undefined || ["-l", "--listen", "-U", "--unixsock"].some((f) => flags.has(f))) return [];
-  return [[sends ? "out" : "", positional[0], undefined]];
+  // ncat's --proxy, or OpenBSD nc's -x or -X, reaches the host through a proxy.
+  return [[sends ? "out" : "", positional[0], undefined, undefined, ["--proxy", "-x", "-X"].some((f) => flags.has(f))]];
 }
 
 function socat(args: string[], sends: boolean): Raw[] {
@@ -2824,7 +2830,7 @@ function httpieItem(item: string): boolean {
   return match !== null && match[1] !== "==" && match[1] !== ":";
 }
 
-function httpie(args: string[], sends: boolean): Raw[] {
+function httpie(args: string[], sends: boolean, proxied = false): Raw[] {
   const positional: string[] = [];
   const flags = new Set<string>();
   for (let i = 0; i < args.length; ) {
@@ -2848,12 +2854,15 @@ function httpie(args: string[], sends: boolean): Raw[] {
   const items = positional.slice(method ? 2 : 1);
   const readsStdin = sends && !flags.has("-I") && !flags.has("--ignore-stdin");
   const out = SENDING_METHODS.has(method) || flags.has("--raw") || readsStdin || items.some(httpieItem);
-  return [[out ? "out" : "in", url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES), undefined]];
+  const host = url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES);
+  // It goes through a proxy with --proxy or one the command set.
+  return [[out ? "out" : "in", host, undefined, undefined, proxied || flags.has("--proxy")]];
 }
 
-function webCmdlet(args: string[], sends: boolean): Raw[] {
+function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   let uri = "";
   let out = sends;
+  let proxy: boolean | undefined;
   const positional: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
@@ -2868,9 +2877,12 @@ function webCmdlet(args: string[], sends: boolean): Raw[] {
     if (name === "uri") uri = value;
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
+    else if (name === "proxy") proxy = value !== "";
+    else if (name === "noproxy") proxy ??= false;
   }
   uri ||= positional[0] ?? "";
-  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), undefined]] : [];
+  // It goes through a proxy with -Proxy, or one the command set unless -NoProxy.
+  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), undefined, undefined, proxy ?? proxied]] : [];
 }
 
 /** Whether a call's stdin is fed from a file or pipe, and whether its stdout goes to one, from the pipes and
@@ -2898,8 +2910,8 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
-  else if (tool === "httpie") raw = httpie(call.args, sends).map(([d, dest, options]): Raw => [d, dest, options, undefined, proxiedEnv(call.env)]);
-  else if (tool === "powershell") raw = webCmdlet(call.args, sends);
+  else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env));
+  else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env));
   else return undefined;
   // Under sudo, ssh runs as that user, with that user's config, which this can't read.
   return [tool, raw.map(([d, dest, options, dial, proxied]): Raw => [d, dest, call.otherUser ? undefined : options, dial, proxied])];
