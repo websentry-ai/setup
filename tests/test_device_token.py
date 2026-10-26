@@ -170,3 +170,24 @@ def test_relative_hook_dirs_never_count_as_in_use(home, tmp_path, monkeypatch, t
         monkeypatch.setattr(m, "OTHER_HOOK_DIRS", ("%ProgramData%/X",))
     assert setup.device_token_in_use() is False
     assert mdm.device_token_in_use(home) is False
+
+
+GATEWAYS = {
+    "claude-code": (REPO / "claude-code" / "gateway" / "setup.py", REPO / "claude-code" / "gateway" / "mdm" / "setup.py"),
+    "codex": (REPO / "codex" / "gateway" / "setup.py", REPO / "codex" / "gateway" / "mdm" / "setup.py"),
+}
+
+
+@pytest.mark.parametrize("tool", sorted(GATEWAYS))
+def test_gateway_switch_keeps_token_only_while_another_tool_is_hooked(home, monkeypatch, tool):
+    user_path, mdm_path = GATEWAYS[tool]
+    gw = _load(user_path, f"token_gw_{tool.replace('-', '_')}")
+    gw_mdm = _load(mdm_path, f"token_gw_mdm_{tool.replace('-', '_')}")
+    for m in (gw, gw_mdm):
+        monkeypatch.setattr(m, "OTHER_HOOK_DIRS", tuple(d for d in m.OTHER_HOOK_DIRS if d.startswith("~")))
+    _hook_on_disk(home, tool)
+    assert gw.device_token_in_use() is False
+    assert gw_mdm.device_token_in_use(home) is False
+    _hook_on_disk(home, next(t for t in sorted(HOOK_HOME) if t != tool))
+    assert gw.device_token_in_use() is True
+    assert gw_mdm.device_token_in_use(home) is True

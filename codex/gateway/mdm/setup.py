@@ -1119,6 +1119,28 @@ def _stdout_never_raises() -> None:
             pass
 
 
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.claude", "~/.cursor", "~/.copilot", "~/.augment",
+    "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
+    "/Library/Application Support/Cursor", "/etc/cursor", "%ProgramData%/Cursor",
+    "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
+            return True
+    return False
+
+
 def main():
     _stdout_never_raises()
     global DEBUG
@@ -1202,6 +1224,8 @@ def main():
     # Remove leftover hooks setup env var
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY")
+        if not device_token_in_use(home_dir):
+            remove_env_var_from_user(username, home_dir, "UNBOUND_DEVICE_TOKEN")
 
     print("\n📝 Setting environment variables system-wide...")
     success, env_changed = set_env_var_system_wide("OPENAI_API_KEY", codex_api_key)
