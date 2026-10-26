@@ -1354,9 +1354,13 @@ def main():
 
     print("\n📝 Setting environment variables system-wide...")
     # Remove leftover hooks setup env var
-    for username, home_dir in get_all_user_homes():
+    user_homes = get_all_user_homes()
+    # Windows holds one machine-wide token, so it stays while any user still has a hook.
+    keep_machine_token = platform.system().lower() == "windows" and any(
+        device_token_in_use(home_dir) for _, home_dir in user_homes)
+    for username, home_dir in user_homes:
         remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY")
-        if not device_token_in_use(home_dir):
+        if not keep_machine_token and not device_token_in_use(home_dir):
             remove_env_var_from_user(username, home_dir, "UNBOUND_DEVICE_TOKEN")
 
     success, env_changed = set_env_var_system_wide("UNBOUND_API_KEY", claude_api_key)

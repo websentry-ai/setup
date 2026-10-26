@@ -191,3 +191,27 @@ def test_gateway_switch_keeps_token_only_while_another_tool_is_hooked(home, monk
     _hook_on_disk(home, next(t for t in sorted(HOOK_HOME) if t != tool))
     assert gw.device_token_in_use() is True
     assert gw_mdm.device_token_in_use(home) is True
+
+
+
+@pytest.mark.parametrize("tool", sorted(GATEWAYS))
+@pytest.mark.parametrize("bob_hooked", [True, False])
+def test_gateway_mdm_decides_windows_machine_token_once(home, tmp_path, monkeypatch, tool, bob_hooked):
+    gw_mdm = _load(GATEWAYS[tool][1], f"token_gw_mdm_{tool.replace('-', '_')}")
+    removed = []
+    monkeypatch.setattr(gw_mdm.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(gw_mdm, "OTHER_HOOK_DIRS", tuple(d for d in gw_mdm.OTHER_HOOK_DIRS if d.startswith("~")))
+    monkeypatch.setattr(gw_mdm, "remove_env_var_from_user", lambda u, h, name, *a: removed.append(name) or "cleared")
+    monkeypatch.setattr(gw_mdm, "check_admin_privileges", lambda: True)
+    monkeypatch.setattr(gw_mdm, "get_device_identifier", lambda: "SERIAL")
+    monkeypatch.setattr(gw_mdm, "detect_install_state", lambda: None)
+    monkeypatch.setattr(gw_mdm, "fetch_api_key_from_mdm", lambda *a: "k")
+    # Stops main right after the hook-key cleanup.
+    monkeypatch.setattr(gw_mdm, "set_env_var_system_wide", lambda *a: (False, False))
+    alice, bob = tmp_path / "alice", tmp_path / "bob"
+    if bob_hooked:
+        _hook_on_disk(bob, next(t for t in sorted(HOOK_HOME) if t != tool))
+    monkeypatch.setattr(gw_mdm, "get_all_user_homes", lambda: [("alice", alice), ("bob", bob)])
+    monkeypatch.setattr(gw_mdm.sys, "argv", ["setup.py", "--api-key", "admin"])
+    assert not gw_mdm.main()
+    assert ("UNBOUND_DEVICE_TOKEN" in removed) is (not bob_hooked)
