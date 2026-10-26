@@ -130,32 +130,40 @@ MODULES = {
 }
 
 # The host kills the hook at these, and a killed hook never reaches its fail-open return.
+# augment installs _hook(15000) milliseconds. cursor sets seconds and gives its gated
+# events 15000, but leaves beforeSubmitPrompt on an undocumented default, so it takes the
+# conservative 60 the other installers write rather than a number nobody has verified.
 HOOK_CAP_SECONDS = {"augment": 15}
 DEFAULT_HOOK_CAP_SECONDS = 60
 
-INTER_ATTEMPT_SLEEP = 0.5
+# Nothing above models interpreter start, the stdin read or the fail-open write, and the
+# cap is a hard kill, so a budget that merely lands under it has no room to actually land.
+UNMODELLED_ALLOWANCE = 2
 
 
-def pretool_curl_timeouts(tool):
-    """Every per-attempt curl timeout send_to_hook_api asks for when the gateway never
-    answers, read off the real calls rather than restated from the module's constants."""
+def pretool_budget(tool):
+    """What send_to_hook_api actually spends and returns when the gateway never answers,
+    measured off the real calls rather than restated from the module's constants."""
     module = tool_module(MODULES[tool])
     with mock.patch.object(module.subprocess, "run",
                            side_effect=module.subprocess.TimeoutExpired("curl", 1)) as run, \
-            mock.patch.object(module.time, "sleep"), \
+            mock.patch.object(module.time, "sleep") as sleep, \
             mock.patch.object(module, "RUNNING_CLOUD", False, create=True):
-        module.send_to_hook_api({"a": 1}, "key")
-    return [c.kwargs["timeout"] for c in run.call_args_list]
+        result = module.send_to_hook_api({"a": 1}, "key")
+    timeouts = [c.kwargs["timeout"] for c in run.call_args_list]
+    slept = sum(c.args[0] for c in sleep.call_args_list)
+    return timeouts, slept, result
 
 
 @pytest.mark.parametrize("tool", sorted(MODULES))
 def test_the_pretool_budget_fits_inside_the_hook_timeout(tool):
     """A gateway that never answers must leave time for the fail-open return. Overshoot
     and the host kills the hook instead, which the user sees as a timeout warning."""
-    timeouts = pretool_curl_timeouts(tool)
+    timeouts, slept, result = pretool_budget(tool)
     assert timeouts, "send_to_hook_api never called curl"
-    worst_case = sum(timeouts) + INTER_ATTEMPT_SLEEP * (len(timeouts) - 1)
+    assert result == {}, "a gateway that never answers must still fail open"
+    worst_case = sum(timeouts) + slept
     cap = HOOK_CAP_SECONDS.get(tool, DEFAULT_HOOK_CAP_SECONDS)
-    assert worst_case < cap, (
+    assert worst_case + UNMODELLED_ALLOWANCE < cap, (
         "%s spends %.1fs worst case against a %ds hook timeout; it would be killed "
         "before it can fail open" % (tool, worst_case, cap))

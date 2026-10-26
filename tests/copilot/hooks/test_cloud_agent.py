@@ -754,7 +754,7 @@ class TestCloudPreToolBudget(unittest.TestCase):
         timeouts = self._attempts(False)
         self.assertEqual(timeouts, [20, 20])
         worst_case = sum(timeouts) + 0.5 * (len(timeouts) - 1)
-        self.assertLess(worst_case, 60)
+        self.assertLess(worst_case + self.UNMODELLED_ALLOWANCE, 60)
 
 
 class TestCloudCatchAllDenies(unittest.TestCase):
