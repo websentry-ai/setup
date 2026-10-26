@@ -91,7 +91,7 @@ SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'cursor'
-SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CURSOR_API_KEY'
+SKILL_POLICY_API_KEY_ENV = 'UNBOUND_DEVICE_TOKEN'
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
@@ -4168,13 +4168,15 @@ def process_stop_event(generation_id, api_key=None):
 
 def get_api_key():
     """Get API key from env var or ~/.unbound/config.json."""
-    key = os.getenv('UNBOUND_CURSOR_API_KEY')
+    key = os.getenv('UNBOUND_DEVICE_TOKEN') or os.getenv('UNBOUND_CURSOR_API_KEY')
     if key:
         return key
     try:
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
-            return json.loads(f.read()).get('api_key')
+            cfg = json.loads(f.read())
+            # api_key first: every writer still sets it, and older writers set only it.
+            return cfg.get('api_key') or cfg.get('device_token')
     except FileNotFoundError:
         return None
     except Exception as e:
@@ -4284,10 +4286,11 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key")
+        # api_key first: every writer still sets it, and older writers set only it.
+        api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
         backend_url = unbound_config.get("base_url")
         if not (api_key and backend_url):
-            api_key = _machine_env('UNBOUND_CURSOR_API_KEY')
+            api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CURSOR_API_KEY')
             backend_url = _machine_env('UNBOUND_BACKEND_URL')
             if backend_url and not backend_url.startswith("https://"):
                 log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
@@ -4493,11 +4496,12 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("api_key")
+            # api_key first: every writer still sets it, and older writers set only it.
+            api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
             backend_url = unbound_config.get("base_url")
             if not (api_key and backend_url):
                 # Resolve as a unit -- never pair a config field with an env field.
-                api_key = _machine_env('UNBOUND_CURSOR_API_KEY')
+                api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CURSOR_API_KEY')
                 backend_url = _machine_env('UNBOUND_BACKEND_URL')
                 if backend_url and not backend_url.startswith("https://"):
                     log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')

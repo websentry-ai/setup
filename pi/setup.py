@@ -574,7 +574,8 @@ def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
                 return False
         if not isinstance(config, dict):
             config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         # Atomic: this file is the shared identity store for six tools, so an interrupt
