@@ -2,6 +2,8 @@
 
 import importlib.util
 import json
+import re
+import subprocess
 
 import pytest
 
@@ -144,3 +146,12 @@ def test_windows_machine_token_stays_while_any_user_still_needs_it(home, tmp_pat
     monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [("alice", alice)])
     assert mdm._remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=mdm.device_token_in_use) is True
     assert removed == ["UNBOUND_DEVICE_TOKEN"]
+
+
+def test_every_config_writer_also_writes_device_token():
+    # Hooks prefer device_token, so a writer that updates only api_key would leave a stale key winning.
+    files = subprocess.run(["git", "grep", "-lE", r"config\[['\"]api_key['\"]\] = api_key", "--", "*.py"],
+                           cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+    assert files
+    missing = [f for f in files if not re.search(r"config\[['\"]device_token['\"]\] = api_key", (REPO / f).read_text())]
+    assert missing == []
