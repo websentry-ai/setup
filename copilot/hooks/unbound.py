@@ -6391,12 +6391,13 @@ def _transfer_words(text: str) -> List[str]:
 
 
 def _transfer_env(env: Dict, key: str) -> str:
-    """A variable as the command sees it: set or unset in the command, else inherited from the hook's environment."""
+    """A variable as the command sees it: set or unset in the command, else unknown when the hook's environment has it,
+    whose values never reach a host or a lookup."""
     if key in env:
         return env[key]
     if _TRANSFER_UNKNOWN_ENV in env:
         return _TRANSFER_SUBSTITUTED
-    return '' if _TRANSFER_CLEAN_ENV in env else os.environ.get(key, '')
+    return '' if _TRANSFER_CLEAN_ENV in env or not os.environ.get(key) else _TRANSFER_SUBSTITUTED
 
 
 def _transfer_is_assignment(token: str) -> bool:
@@ -6647,7 +6648,9 @@ def _transfer_variable(shell: Dict, name: str) -> tuple:
     if _TRANSFER_UNKNOWN_ENV in shell['vars']:
         return _TRANSFER_SUBSTITUTED, None
     inherited = _TRANSFER_CLEAN_ENV not in shell['vars'] and name in os.environ
-    return (os.environ[name] if inherited else None), inherited
+    # Only HOME and CDPATH, which place folders, are read from the hook's environment; any other value stays unknown.
+    value = os.environ.get(name) if name in ('HOME', 'CDPATH') else _TRANSFER_SUBSTITUTED
+    return (value if inherited else None), inherited
 
 
 def _transfer_exported(shell: Dict) -> Dict:
@@ -7651,7 +7654,7 @@ def _transfer_url_host(url: str) -> str:
     from urllib.parse import urlsplit
     try:
         text = url.strip()
-        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
+        parts = urlsplit(text if '://' in text else 'http://' + text)
         host = parts.hostname or ''
         if '[' in parts.netloc and not _transfer_ip(host):
             return ''  # brackets hold nothing but an IPv6 address, which older Pythons do not check
@@ -7698,7 +7701,7 @@ def _transfer_curl_glob(url: str) -> Optional[List[str]]:
     for text, values in pieces:
         urls = [u + text for u in urls]
         # Past the host a glob only changes the path, so one of its values stands for all.
-        in_host = not all(re.search(r'[/?#]', u[2:] if u.startswith('//') else u.split('://', 1)[-1]) for u in urls)
+        in_host = not all(re.search(r'[/?#]', u.split('://', 1)[-1]) for u in urls)
         urls = [u + v for u in urls for v in (values if in_host else values[:1])][:_TRANSFER_MAX_WORDS]
     return urls
 
@@ -7769,8 +7772,7 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     from urllib.parse import urlsplit
     host = _transfer_url_host(url)
     try:
-        text = url.strip()
-        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
+        parts = urlsplit(url.strip() if '://' in url else 'http://' + url.strip())
         port = str(parts.port or _TRANSFER_DEFAULT_PORTS.get(parts.scheme.lower(), ''))
     except ValueError:
         return None
@@ -7815,6 +7817,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             urls.append(arg)
             continue
         flags.add(arg)
+        if arg == '--no-globoff':
+            flags -= {'-g', '--globoff'}  # the last of them decides
         if arg == '--url' and value:
             urls.append(value)
         elif arg in ('-X', '--request') and value:
@@ -8355,7 +8359,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 
 
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
-                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None):
+                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None, ran=True):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal and unsupported native tools.
@@ -8401,9 +8405,10 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             candidates.append(shell_state['dir'])
         project = _project_for_paths(candidates, root_projects)
         # The cloud runner's Stop shares a shorter budget with the gateway post, as its git lookups do.
-        transfer = _transfer(script, start_dir,
-                             shell_state.setdefault('transfers', {'budget': 3.0} if RUNNING_CLOUD else {}))
-        shell_state['transfer_dir'] = _transfer_next_cwd(script, start_dir)
+        if ran:  # a call that never ran is not looked up, and moved no folder
+            transfer = _transfer(script, start_dir,
+                                 shell_state.setdefault('transfers', {'budget': 3.0} if RUNNING_CLOUD else {}))
+            shell_state['transfer_dir'] = _transfer_next_cwd(script, start_dir)
     elif name in READ_TOOLS:
         file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {
@@ -9003,6 +9008,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 'arguments': {},
                 'result': None,
                 'success': None,
+                'error_code': None,
                 'mcp_server_name': None,
                 'mcp_tool_name': None,
             }
@@ -9062,6 +9068,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 continue
             call = _register(call_id)
             call['success'] = data.get('success')
+            call['error_code'] = data['error'].get('code') if isinstance(data.get('error'), dict) else None
             result = data.get('result') or {}
             if isinstance(result, dict):
                 call['result'] = result.get('content')
@@ -9075,6 +9082,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     forwarded_now = set()
     for call_id in tool_calls:
         call = tool_data[call_id]
+        # A call with no result, or one denied or rejected before it ran, is not looked up.
+        ran = call['success'] is not None and call['error_code'] not in ('denied', 'rejected')
         if call_id in already_forwarded:
             # Sent on an earlier Stop of this session — don't resend, but still
             # follow any `cd` so later calls' project attribution keeps tracking
@@ -9085,14 +9094,15 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 if isinstance(command, str):
                     shell_state.setdefault('transfer_dir', shell_state.get('dir'))
                     shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
-                    shell_state['transfer_dir'] = _transfer_next_cwd(command, shell_state['transfer_dir'])
+                    if ran:
+                        shell_state['transfer_dir'] = _transfer_next_cwd(command, shell_state['transfer_dir'])
             continue
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
                                   shell_state=shell_state, root_projects=root_projects,
                                   mcp_servers=mcp_servers,
                                   mcp_server_name=call['mcp_server_name'],
                                   mcp_tool_name=call['mcp_tool_name'],
-                                  cwd=cwd)
+                                  cwd=cwd, ran=ran)
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.

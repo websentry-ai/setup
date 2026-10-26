@@ -970,11 +970,12 @@ function words(text: string): string[] {
   return (new Lexer(text).read() ?? []).filter((item) => item.kind === "cmd").flatMap((item) => item.argv);
 }
 
-/** A variable as the command sees it: set or unset in the command, else inherited from the hook's environment. */
+/** A variable as the command sees it: set or unset in the command, else unknown when the hook's environment has it,
+ *  whose values never reach a host or a lookup. */
 function envValue(env: Env, processEnv: Record<string, string | undefined>, key: string): string {
   if (key in env) return env[key] as string;
   if (UNKNOWN_ENV in env) return SUBSTITUTED;
-  return CLEAN_ENV in env ? "" : (processEnv[key] ?? "");
+  return CLEAN_ENV in env || !processEnv[key] ? "" : SUBSTITUTED;
 }
 
 /** NAME=value, or NAME+=value, which appends to the value. */
@@ -1389,7 +1390,9 @@ function variable(shell: Shell, name: string): Variable {
   if (set !== undefined) return set;
   if (UNKNOWN_ENV in shell.vars) return [SUBSTITUTED, undefined];
   const inherited = !(CLEAN_ENV in shell.vars) && shell.processEnv[name] !== undefined;
-  return [inherited ? shell.processEnv[name] : undefined, inherited];
+  // Only HOME and CDPATH, which place folders, are read from the hook's environment; any other value stays unknown.
+  const value = name === "HOME" || name === "CDPATH" ? shell.processEnv[name] : SUBSTITUTED;
+  return [inherited ? value : undefined, inherited];
 }
 
 /** The variables a command gets from the shell; one unset or not exported hides the hook's own value, and one that
@@ -2384,7 +2387,9 @@ function shortOption(arg: string, args: readonly string[], start: number, valueF
 function urlHost(url: string): string {
   try {
     const text = url.trim();
-    const full = text.includes("://") ? text : `${text.startsWith("//") ? "http:" : "http://"}${text}`;
+    // curl and wget reject a //host with no scheme, and a path names no host, though the URL standard reads one.
+    if (text.startsWith("/")) return "";
+    const full = text.includes("://") ? text : `http://${text}`;
     // A backslash is no part of a host, though the URL standard reads it as a slash.
     if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
     const host = new URL(full).hostname.toLowerCase();
@@ -2422,7 +2427,7 @@ function curlGlob(url: string): string[] | undefined {
   for (const [text, values] of pieces) {
     urls = urls.map((u) => u + text);
     // Past the host a glob only changes the path, so one of its values stands for all.
-    const inHost = !urls.every((u) => /[/?#]/.test(u.startsWith("//") ? u.slice(2) : u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
+    const inHost = !urls.every((u) => /[/?#]/.test(u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
     urls = urls.flatMap((u) => (inHost ? values : values.slice(0, 1)).map((v) => u + v)).slice(0, MAX_WORDS);
   }
   return urls;
@@ -2556,6 +2561,7 @@ function curlRequest(args: string[], start: number): [string[], boolean, [string
       continue;
     }
     flags.add(arg);
+    if (arg === "--no-globoff") ["-g", "--globoff"].forEach((flag) => flags.delete(flag)); // the last of them decides
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);

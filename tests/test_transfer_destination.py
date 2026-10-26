@@ -27,7 +27,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '6a4947ae6ac55988590d48407fbec6c6993344d35062b1ae567ddfdeb1d80c7d'
+BLOCK_SHA256 = '09be5b8255c3aa671668527f7aa901891621d1b86f7a8b20143a9dc338ed5334'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -184,17 +184,23 @@ class SharedCorpusTests(TransferTestCase):
         Path(self.home, '.ssh', 'config').write_text(
             ''.join(f'Host {alias}\n  HostName {name}\n' for alias, name in fixture['ssh_hosts'].items()))
 
+        looked_up = []
+
         def lookup(host, *args, **kwargs):
+            looked_up.append(host)
             if host not in fixture['addresses']:
                 raise socket.gaierror(socket.EAI_NONAME, 'unknown host')
             return [(socket.AF_INET6 if ':' in ip else socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, 0))
                     for ip in fixture['addresses'][host]]
 
-        with patch('socket.getaddrinfo', lookup):
+        # hook_env is the hook's own environment: none of its values may reach a host, a lookup or ssh -G.
+        with patch('socket.getaddrinfo', lookup), patch.dict(os.environ, fixture['hook_env']):
             for case in fixture['cases']:
                 for hook, transfer in self.each(case['command']):
                     with self.subTest(hook=hook, command=case['command']):
                         self.assertEqual(transfer, case['transfer'])
+        for value in fixture['hook_env'].values():
+            self.assertNotIn(value, json.dumps([looked_up, self.ssh_calls()]))
 
 
 class CurlTests(TransferTestCase):
@@ -358,6 +364,15 @@ class CopyTests(TransferTestCase):
         self.assert_hosts('rsync -a src prod::module', [('out', 'prod')])
         self.assert_hosts('rsync -a -e /usr/local/bin/custom-shell src prod:/dest', [('out', 'prod')])
         self.assertEqual(self.ssh_calls(), [])
+
+    def test_the_hooks_own_remote_shell_never_reaches_ssh_g(self):
+        # Only text the command wrote may reach a lookup; an RSYNC_RSH the hook inherited stays unknown.
+        with patch.dict(os.environ, {'RSYNC_RSH': 'ssh -o HostName=leak.example'}):
+            for command in ('rsync -a src prod:/dest', 'export RSYNC_RSH; rsync -a src prod:/dest'):
+                self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved')])
+            self.assert_endpoints('RSYNC_RSH="ssh -o HostName=10.9.9.9" rsync -a src prod:/dest',
+                                  [_endpoint('out', 'prod', 'private', '10.9.9.9')])
+        self.assertNotIn('leak.example', json.dumps(self.ssh_calls()))
 
     def test_bracketed_ipv6_and_scp_uris_resolve_without_their_login(self):
         self.assert_endpoints('scp -F none dump.sql deploy@[fd12:3456:789a::1]:/tmp/',
@@ -1141,6 +1156,89 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
             with self.subTest(command=command):
                 entries = _tool_entries(hook.build_llm_exchange(events, cwd=frontend))
                 self.assertEqual([e.get('transfer') for e in entries], [private])
+
+    def test_claude_code_seeds_the_walk_from_the_turns_first_prompt_only(self):
+        # The shell keeps its folder across the turn, so a later prompt's cwd does not move it back.
+        hook = load_module('claude-code/hooks/unbound.py')
+        private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+
+        def event(name, **fields):
+            return {'timestamp': '2026-10-22T16:40:00Z', 'event': {'hook_event_name': name, 'session_id': 's1', **fields}}
+
+        def bash(command):
+            return event('PostToolUse', tool_name='Bash', tool_input={'command': command}, tool_response={})
+
+        events = [event('UserPromptSubmit', prompt='ship it', cwd=self.repo), bash('cd frontend'),
+                  event('UserPromptSubmit', prompt='and the build', cwd=self.repo),
+                  bash('scp -F cfg build.zip prod:/srv')]
+        transfers = [e.get('transfer') for e in _tool_entries(hook.build_llm_exchange(events, cwd=self.repo))]
+        self.assertEqual(transfers[-1], private)
+
+    def _codex(self, calls):
+        """Each (arguments, output or None for none) through Codex's builder; the transfer of each call."""
+        hook, lines = load_module('codex/hooks/unbound.py'), []
+        for n, (arguments, output) in enumerate(calls):
+            lines.append({'type': 'response_item', 'timestamp': f'2026-10-22T16:40:0{n}Z',
+                          'payload': {'type': 'function_call', 'call_id': f'c{n}', 'name': 'exec_command',
+                                      'arguments': json.dumps(arguments)}})
+            if output is not None:
+                lines.append({'type': 'response_item', 'timestamp': f'2026-10-22T16:40:0{n}Z',
+                              'payload': {'type': 'function_call_output', 'call_id': f'c{n}', 'output': output}})
+        transcript = os.path.join(tempfile.mkdtemp(), 'rollout.jsonl')
+        Path(transcript).write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        return [e.get('transfer') for e in _tool_entries(hook.parse_codex_transcript_for_tools(transcript, None, self.repo))]
+
+    def test_a_relative_codex_workdir_is_under_the_session_folder(self):
+        private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+        self.assertEqual(self._codex([({'cmd': 'scp -F cfg build.zip prod:/srv', 'workdir': 'frontend'}, '')]), [private])
+
+    def test_a_call_that_never_ran_is_not_looked_up(self):
+        # Blocked, denied or rejected before it ran, or with no result at all; a command that ran and failed still is.
+        command = 'scp build.zip prod:/srv'
+        codex = self._codex([({'cmd': command}, 'Command blocked by PreToolUse hook: no'),
+                             ({'cmd': command}, 'exec command rejected by user'), ({'cmd': command}, None)])
+        self.assertEqual(codex, [None, None, None])
+
+        copilot, lines = load_module('copilot/hooks/unbound.py'), [
+            {'type': 'user.message', 'id': 'u1', 'timestamp': '2026-10-22T16:39:59.000Z', 'data': {'content': 'ship'}}]
+        for n, done in enumerate(({'success': False, 'error': {'message': 'no', 'code': 'denied'}},
+                                  {'success': False, 'error': {'message': 'no', 'code': 'rejected'}}, None)):
+            lines.append({'type': 'tool.execution_start', 'timestamp': f'2026-10-22T16:40:0{n}.000Z',
+                          'data': {'toolCallId': f'call-{n}', 'toolName': 'bash', 'arguments': {'command': command}}})
+            if done is not None:
+                lines.append({'type': 'tool.execution_complete', 'timestamp': f'2026-10-22T16:40:0{n}.500Z',
+                              'data': {'toolCallId': f'call-{n}', **done}})
+        events = Path(tempfile.mkdtemp(), 'events.jsonl')
+        events.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        output = copilot.build_exchange_from_transcript(str(events), 's1', cwd=self.repo)[0]
+        self.assertEqual([e.get('transfer') for e in _tool_entries(output)], [None, None, None])
+
+        augment = load_module('augment/hooks/unbound.py')
+        post = [{'timestamp': '2026-10-22T16:40:00.9Z',
+                 'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'launch-process',
+                           'tool_input': {'command': command}, 'tool_output': error, 'tool_error': error}}
+                for error in ('Failed to launch process: no shell', 'Tool call was denied')]
+        stop = {'hook_event_name': 'Stop', 'cwd': self.repo, 'conversation_id': 'c1',
+                'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}}
+        self.assertEqual([e.get('transfer') for e in _tool_entries(augment.build_llm_exchange(stop, post))],
+                         [None, None])
+        self.assertEqual(self.ssh_calls(), [])
+
+        ran = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+        self.assertEqual(self._codex([({'cmd': command}, 'Process exited with code 1\nOutput:\nlost connection')]), [ran])
+        failed = 'Here are the results from executing the command.\n<return-code>\n1\n</return-code>'
+        post = [{'timestamp': '2026-10-22T16:40:00.9Z',
+                 'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'launch-process',
+                           'tool_input': {'command': command}, 'tool_output': failed, 'tool_error': failed}}]
+        self.assertEqual([e.get('transfer') for e in _tool_entries(augment.build_llm_exchange(stop, post))], [ran])
+        lines = lines[:1] + [
+            {'type': 'tool.execution_start', 'timestamp': '2026-10-22T16:40:00.000Z',
+             'data': {'toolCallId': 'call-x', 'toolName': 'bash', 'arguments': {'command': command}}},
+            {'type': 'tool.execution_complete', 'timestamp': '2026-10-22T16:40:00.500Z',
+             'data': {'toolCallId': 'call-x', 'success': False, 'error': {'message': 'exit 1', 'code': 'failure'}}}]
+        events.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        output = copilot.build_exchange_from_transcript(str(events), 's1', cwd=self.repo)[0]
+        self.assertEqual([e.get('transfer') for e in _tool_entries(output)], [ran])
 
     def test_a_codex_workdir_does_not_move_later_calls(self):
         # A workdir is that call's own; the next call without one still starts in the session folder.

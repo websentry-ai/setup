@@ -5992,12 +5992,13 @@ def _transfer_words(text: str) -> List[str]:
 
 
 def _transfer_env(env: Dict, key: str) -> str:
-    """A variable as the command sees it: set or unset in the command, else inherited from the hook's environment."""
+    """A variable as the command sees it: set or unset in the command, else unknown when the hook's environment has it,
+    whose values never reach a host or a lookup."""
     if key in env:
         return env[key]
     if _TRANSFER_UNKNOWN_ENV in env:
         return _TRANSFER_SUBSTITUTED
-    return '' if _TRANSFER_CLEAN_ENV in env else os.environ.get(key, '')
+    return '' if _TRANSFER_CLEAN_ENV in env or not os.environ.get(key) else _TRANSFER_SUBSTITUTED
 
 
 def _transfer_is_assignment(token: str) -> bool:
@@ -6248,7 +6249,9 @@ def _transfer_variable(shell: Dict, name: str) -> tuple:
     if _TRANSFER_UNKNOWN_ENV in shell['vars']:
         return _TRANSFER_SUBSTITUTED, None
     inherited = _TRANSFER_CLEAN_ENV not in shell['vars'] and name in os.environ
-    return (os.environ[name] if inherited else None), inherited
+    # Only HOME and CDPATH, which place folders, are read from the hook's environment; any other value stays unknown.
+    value = os.environ.get(name) if name in ('HOME', 'CDPATH') else _TRANSFER_SUBSTITUTED
+    return (value if inherited else None), inherited
 
 
 def _transfer_exported(shell: Dict) -> Dict:
@@ -7252,7 +7255,7 @@ def _transfer_url_host(url: str) -> str:
     from urllib.parse import urlsplit
     try:
         text = url.strip()
-        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
+        parts = urlsplit(text if '://' in text else 'http://' + text)
         host = parts.hostname or ''
         if '[' in parts.netloc and not _transfer_ip(host):
             return ''  # brackets hold nothing but an IPv6 address, which older Pythons do not check
@@ -7299,7 +7302,7 @@ def _transfer_curl_glob(url: str) -> Optional[List[str]]:
     for text, values in pieces:
         urls = [u + text for u in urls]
         # Past the host a glob only changes the path, so one of its values stands for all.
-        in_host = not all(re.search(r'[/?#]', u[2:] if u.startswith('//') else u.split('://', 1)[-1]) for u in urls)
+        in_host = not all(re.search(r'[/?#]', u.split('://', 1)[-1]) for u in urls)
         urls = [u + v for u in urls for v in (values if in_host else values[:1])][:_TRANSFER_MAX_WORDS]
     return urls
 
@@ -7370,8 +7373,7 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     from urllib.parse import urlsplit
     host = _transfer_url_host(url)
     try:
-        text = url.strip()
-        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
+        parts = urlsplit(url.strip() if '://' in url else 'http://' + url.strip())
         port = str(parts.port or _TRANSFER_DEFAULT_PORTS.get(parts.scheme.lower(), ''))
     except ValueError:
         return None
@@ -7416,6 +7418,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             urls.append(arg)
             continue
         flags.add(arg)
+        if arg == '--no-globoff':
+            flags -= {'-g', '--globoff'}  # the last of them decides
         if arg == '--url' and value:
             urls.append(value)
         elif arg in ('-X', '--request') and value:
@@ -7970,6 +7974,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     shell_dir = cwd
     # Where the next shell call's transfer lookups start; only a cd that surely ran moves it.
     transfer_dir = cwd
+    turn_seeded = False
     root_projects = {}
     transfer_state = {}
 
@@ -7987,8 +7992,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             permission_mode = event.get('permission_mode')
 
         if hook_event_name == 'UserPromptSubmit':
-            # The turn's shell starts where the prompt was sent; the Stop's cwd is where it ended.
-            transfer_dir = event.get('cwd') or transfer_dir
+            # The turn's shell starts where its first prompt was sent; the Stop's cwd is where it ended.
+            if not turn_seeded:
+                transfer_dir, turn_seeded = event.get('cwd') or transfer_dir, True
             prompt = event.get('prompt')
             if prompt:
                 # The prompt's own cwd beats the session cwd for resolving a

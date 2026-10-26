@@ -2684,7 +2684,7 @@ function words(text) {
 function envValue(env, processEnv, key) {
   if (key in env) return env[key];
   if (UNKNOWN_ENV in env) return SUBSTITUTED;
-  return CLEAN_ENV in env ? "" : processEnv[key] ?? "";
+  return CLEAN_ENV in env || !processEnv[key] ? "" : SUBSTITUTED;
 }
 function isAssignment(token) {
   const eq = token.indexOf("=");
@@ -2927,7 +2927,8 @@ function variable(shell, name) {
   if (set !== void 0) return set;
   if (UNKNOWN_ENV in shell.vars) return [SUBSTITUTED, void 0];
   const inherited = !(CLEAN_ENV in shell.vars) && shell.processEnv[name] !== void 0;
-  return [inherited ? shell.processEnv[name] : void 0, inherited];
+  const value = name === "HOME" || name === "CDPATH" ? shell.processEnv[name] : SUBSTITUTED;
+  return [inherited ? value : void 0, inherited];
 }
 function exportedEnv(shell) {
   const env = {};
@@ -3761,7 +3762,8 @@ function shortOption(arg, args, start, valueFlags, seen) {
 function urlHost(url) {
   try {
     const text = url.trim();
-    const full = text.includes("://") ? text : `${text.startsWith("//") ? "http:" : "http://"}${text}`;
+    if (text.startsWith("/")) return "";
+    const full = text.includes("://") ? text : `http://${text}`;
     if (/^[^/]*:\/\/[^/?#]*\\/.test(full)) return "";
     const host = new URL(full).hostname.toLowerCase();
     return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
@@ -3791,7 +3793,7 @@ function curlGlob(url) {
   let urls = [""];
   for (const [text, values] of pieces) {
     urls = urls.map((u) => u + text);
-    const inHost = !urls.every((u) => /[/?#]/.test(u.startsWith("//") ? u.slice(2) : u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
+    const inHost = !urls.every((u) => /[/?#]/.test(u.includes("://") ? u.slice(u.indexOf("://") + 3) : u));
     urls = urls.flatMap((u) => (inHost ? values : values.slice(0, 1)).map((v) => u + v)).slice(0, MAX_WORDS);
   }
   return urls;
@@ -3910,6 +3912,7 @@ function curlRequest(args, start) {
       continue;
     }
     flags.add(arg);
+    if (arg === "--no-globoff") ["-g", "--globoff"].forEach((flag) => flags.delete(flag));
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);

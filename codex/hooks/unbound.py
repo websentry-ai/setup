@@ -4647,12 +4647,13 @@ def _transfer_words(text: str) -> List[str]:
 
 
 def _transfer_env(env: Dict, key: str) -> str:
-    """A variable as the command sees it: set or unset in the command, else inherited from the hook's environment."""
+    """A variable as the command sees it: set or unset in the command, else unknown when the hook's environment has it,
+    whose values never reach a host or a lookup."""
     if key in env:
         return env[key]
     if _TRANSFER_UNKNOWN_ENV in env:
         return _TRANSFER_SUBSTITUTED
-    return '' if _TRANSFER_CLEAN_ENV in env else os.environ.get(key, '')
+    return '' if _TRANSFER_CLEAN_ENV in env or not os.environ.get(key) else _TRANSFER_SUBSTITUTED
 
 
 def _transfer_is_assignment(token: str) -> bool:
@@ -4903,7 +4904,9 @@ def _transfer_variable(shell: Dict, name: str) -> tuple:
     if _TRANSFER_UNKNOWN_ENV in shell['vars']:
         return _TRANSFER_SUBSTITUTED, None
     inherited = _TRANSFER_CLEAN_ENV not in shell['vars'] and name in os.environ
-    return (os.environ[name] if inherited else None), inherited
+    # Only HOME and CDPATH, which place folders, are read from the hook's environment; any other value stays unknown.
+    value = os.environ.get(name) if name in ('HOME', 'CDPATH') else _TRANSFER_SUBSTITUTED
+    return (value if inherited else None), inherited
 
 
 def _transfer_exported(shell: Dict) -> Dict:
@@ -5907,7 +5910,7 @@ def _transfer_url_host(url: str) -> str:
     from urllib.parse import urlsplit
     try:
         text = url.strip()
-        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
+        parts = urlsplit(text if '://' in text else 'http://' + text)
         host = parts.hostname or ''
         if '[' in parts.netloc and not _transfer_ip(host):
             return ''  # brackets hold nothing but an IPv6 address, which older Pythons do not check
@@ -5954,7 +5957,7 @@ def _transfer_curl_glob(url: str) -> Optional[List[str]]:
     for text, values in pieces:
         urls = [u + text for u in urls]
         # Past the host a glob only changes the path, so one of its values stands for all.
-        in_host = not all(re.search(r'[/?#]', u[2:] if u.startswith('//') else u.split('://', 1)[-1]) for u in urls)
+        in_host = not all(re.search(r'[/?#]', u.split('://', 1)[-1]) for u in urls)
         urls = [u + v for u in urls for v in (values if in_host else values[:1])][:_TRANSFER_MAX_WORDS]
     return urls
 
@@ -6025,8 +6028,7 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     from urllib.parse import urlsplit
     host = _transfer_url_host(url)
     try:
-        text = url.strip()
-        parts = urlsplit(text if '://' in text else ('http:' if text.startswith('//') else 'http://') + text)
+        parts = urlsplit(url.strip() if '://' in url else 'http://' + url.strip())
         port = str(parts.port or _TRANSFER_DEFAULT_PORTS.get(parts.scheme.lower(), ''))
     except ValueError:
         return None
@@ -6071,6 +6073,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             urls.append(arg)
             continue
         flags.add(arg)
+        if arg == '--no-globoff':
+            flags -= {'-g', '--globoff'}  # the last of them decides
         if arg == '--url' and value:
             urls.append(value)
         elif arg in ('-X', '--request') and value:
@@ -6610,6 +6614,11 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
+# How Codex reports an exec_command that never ran: blocked by a hook, rejected by the user, or denied by the sandbox.
+_CODEX_NOT_RUN_OUTPUTS = ('Command blocked by PreToolUse hook', 'Tool call blocked by PreToolUse hook',
+                          'exec command rejected by user', 'rejected by user', 'Command denied by sandbox')
+
+
 def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None, session_cwd: Optional[str] = None) -> List[Dict]:
     """Parse Codex transcript for function_call/function_call_output pairs.
 
@@ -6706,8 +6715,11 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     candidates.append(shell_dir)
                 project = _project_for_paths(candidates, root_projects)
                 # Each exec_command starts a new shell in its workdir or the session folder, so no cd carries over.
-                start = workdir if isinstance(workdir, str) and workdir else session_cwd
-                transfer = _transfer(command, start, transfer_state)
+                start = os.path.join(session_cwd or '', workdir) if isinstance(workdir, str) and workdir else session_cwd
+                start = start if start and os.path.isabs(start) else None
+                # A call with no output, or one blocked or rejected before it ran, is not looked up.
+                ran = call_id in function_outputs and not str(output).startswith(_CODEX_NOT_RUN_OUTPUTS)
+                transfer = _transfer(command, start, transfer_state) if ran else None
                 # Parse exec_command output format to extract clean stdout and exit_code
                 stdout = output
                 exit_code = 0

@@ -14,6 +14,7 @@ import { resolveTransfers, type LookupLike, type ResolveOptions, type Transfer }
 interface Fixture {
   addresses: Record<string, string[]>;
   ssh_hosts: Record<string, string>;
+  hook_env: Record<string, string>;
   cases: { command: string; transfer: Transfer | null }[];
 }
 
@@ -79,9 +80,31 @@ function repo(): string {
 }
 
 test("every command in the shared corpus sends the same transfer as the Python hooks", async () => {
+  // hook_env is the hook's own environment: none of its values may reach a host, a lookup or ssh -G.
+  const seen: string[] = [];
+  const calls: string[][] = [];
+  const recording: LookupLike = async (host) => {
+    seen.push(host);
+    return lookup(host);
+  };
   for (const { command, transfer: expected } of FIXTURE.cases) {
-    assert.deepEqual((await transfer(command, "/")) ?? null, expected, command);
+    const found = await transfer(command, "/", { env: FIXTURE.hook_env, lookup: recording, execFile: fakeSsh(calls) });
+    assert.deepEqual(found ?? null, expected, command);
   }
+  for (const value of Object.values(FIXTURE.hook_env)) assert.ok(!JSON.stringify([seen, calls]).includes(value), value);
+});
+
+test("the hook's own remote shell never reaches ssh -G", async () => {
+  // Only text the command wrote may reach a lookup; an RSYNC_RSH the hook inherited stays unknown.
+  const calls: string[][] = [];
+  const env = { RSYNC_RSH: "ssh -o HostName=leak.example" };
+  for (const command of ["rsync -a src prod:/dest", "export RSYNC_RSH; rsync -a src prod:/dest"]) {
+    const found = await transfer(command, "/", { env, execFile: fakeSsh(calls) });
+    assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }], command);
+  }
+  const set = await transfer('RSYNC_RSH="ssh -o HostName=10.9.9.9" rsync -a src prod:/dest', "/", { env, execFile: fakeSsh(calls) });
+  assert.equal(set?.endpoints[0]?.resolved_host, "10.9.9.9");
+  assert.ok(!JSON.stringify(calls).includes("leak.example"));
 });
 
 test("a command nested too deep sends no transfer, and the turn's later calls still do", async () => {
