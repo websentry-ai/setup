@@ -1122,8 +1122,8 @@ function isFile(path: string): boolean {
   }
 }
 
-const LOOKS: ReadonlySet<string> = new Set(["cd", "[", "[[", "test", "ls", "echo", "printf", "stat", "cat", "wc", "head",
-  "tail", "grep", "diff", "file", "du", "readlink", "realpath", "basename", "dirname"]);
+const LOOKS: ReadonlySet<string> = new Set(["cd", "pushd", "popd", "dirs", "[", "[[", "test", "ls", "echo", "printf", "stat",
+  "cat", "wc", "head", "tail", "grep", "diff", "file", "du", "readlink", "realpath", "basename", "dirname"]);
 const MAKES_PARENTS: ReadonlySet<string> = new Set(["mkdir", "install", "git", "unzip"]);
 
 /** The folders the commands in `list` name, as path segments: each word's last, or every one for a command that may
@@ -1367,6 +1367,8 @@ interface Call {
   otherUser: boolean;
   /** The pipes and redirections around the call, from its own outward. */
   layers: Layer[];
+  /** Whether the call may not have run, so it is never looked up. */
+  unsure?: boolean;
 }
 
 function runs(shell: Shell): Maybe {
@@ -1556,6 +1558,11 @@ function wrap(shell: Shell, first: number, layer: Layer): void {
     const call = shell.calls[i] as Call;
     shell.calls[i] = { ...call, layers: [...call.layers, layer] };
   }
+}
+
+/** Mark each call from `first` on as one that may not have run, which is never looked up. */
+function markUnsure(calls: Call[], first = 0): void {
+  for (let i = first; i < calls.length; i++) calls[i] = { ...(calls[i] as Call), unsure: true };
 }
 
 /** What a return, exit, break or continue may change in the open compounds and the shell, to put back. */
@@ -2160,6 +2167,7 @@ function callFunction(known: [Item[], boolean], layer: Layer, subshell: Maybe, s
   }
   [shell.pipe, shell.start, shell.floor] = outer;
   wrap(shell, first, layer);
+  if (maybe) markUnsure(shell.calls, first);
   if (subshell) {
     restore(shell, state, true);
     revive(outside, shell);
@@ -2220,7 +2228,12 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
   if (assigns && !substituted) shell.status = 0;
-  const moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
+  let moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
+  if (name === "pushd" || name === "popd") {
+    // pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
+    const sure = name === "pushd" && args.length === 1 && !/^[+-]/.test(args[0] as string);
+    moved = sure ? cdTarget(args, parsed.cwd, shell, parsed.env) : [undefined, undefined];
+  }
   if (moved !== undefined) shell.status = moved[1];
   if (name === "set" || name === "shift") shell.args = undefined; // the positional parameters may have changed
   if (name === "return" || name === "exit") {
@@ -2240,7 +2253,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // It may also redefine any function, so each one known may no longer run as written.
     for (const [fname, known] of shell.functions) shell.functions.set(fname, [known[0], true]);
   }
-  if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name as string) || assigns) {
+  if (name === "cd" || name === "pushd" || name === "popd" || name === "export" || name === "unset" ||
+    DECLARES.includes(name as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
     if (((before !== "|" && item.after !== "|") || subshell === undefined) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
@@ -2327,7 +2341,16 @@ function command(item: Item, shell: Shell, depth: number): Call[] {
   let calls: Call[] = [];
   if (argv.length > 0) {
     shell.pipe.leading = false;
-    if (shell.pipe.runs !== false) calls = simple(argv, item, before, shell, depth);
+    if (shell.pipe.runs !== false) {
+      // Under a condition, or an && or || after a status, that is not known, it may not have run.
+      const sure = shell.pipe.runs === true && !doubt(shell.pipe) && !shell.frames.some((frame) => frame.doubt);
+      const first = shell.calls.length;
+      calls = simple(argv, item, before, shell, depth);
+      if (!sure) {
+        markUnsure(calls);
+        markUnsure(shell.calls, first); // and what a function it called ran
+      }
+    }
   }
   if (argv.length > 0 || closed !== undefined) finish(item.after, shell);
   return calls;
@@ -3176,12 +3199,14 @@ async function resolveAddresses(host: string, timeoutMs: number, state: State): 
 
 /** The kind of address a host resolves to, looked up once per turn: public when any address is public, else the
  *  first address's kind; unresolved when the lookup fails or the turn's budget is spent. */
-async function address(host: string, state: State): Promise<AddressKind> {
+async function address(host: string, state: State, lookup = true): Promise<AddressKind> {
   const cached = state.addresses.get(host);
   if (cached !== undefined) return cached;
   let found: readonly string[];
   if (isIP(host) !== 0) {
     found = [host];
+  } else if (!lookup) {
+    return "unresolved"; // a call that may not have run is never looked up
   } else {
     const remaining = state.deadline - state.now();
     found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
@@ -3198,8 +3223,9 @@ function addressKind(found: readonly string[]): AddressKind {
 }
 
 /** One place a transfer reached: its host as written without any login, the host it connects to, as ssh -G resolves
- *  it or curl's --connect-to and --resolve set it, and the kind of address that host has. */
-async function endpoint(raw: Raw, cwd: string | undefined, state: State): Promise<TransferEndpoint | undefined> {
+ *  it or curl's --connect-to and --resolve set it, and the kind of address that host has. Without `lookup`, neither
+ *  ssh -G nor DNS runs, and only an address as written is classified. */
+async function endpoint(raw: Raw, cwd: string | undefined, state: State, lookup = true): Promise<TransferEndpoint | undefined> {
   const [direction, rawDestination, sshOptions, dial] = raw;
   const destination = rawDestination.trim();
   const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : (destination.split("@").pop() ?? ""));
@@ -3208,10 +3234,10 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State): Promis
   let kind: AddressKind;
   if (dial !== undefined) {
     resolved = dial[0];
-    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state);
+    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
   } else {
-    resolved = (sshOptions === undefined ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
-    kind = await address(resolved, state);
+    resolved = (sshOptions === undefined || !lookup ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
+    kind = await address(resolved, state, lookup);
   }
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
@@ -3231,7 +3257,7 @@ async function transferOf(command: string, cwd: string | undefined, state: State
     const found = parse(call, state.env);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state);
+      const one = await endpoint(raw, call.cwd, state, call.unsure !== true);
       if (one !== undefined && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];

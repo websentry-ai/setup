@@ -2804,6 +2804,9 @@ function isFile(path) {
 }
 var LOOKS = /* @__PURE__ */ new Set([
   "cd",
+  "pushd",
+  "popd",
+  "dirs",
   "[",
   "[[",
   "test",
@@ -3078,6 +3081,9 @@ function wrap(shell, first, layer) {
     const call = shell.calls[i];
     shell.calls[i] = { ...call, layers: [...call.layers, layer] };
   }
+}
+function markUnsure(calls, first = 0) {
+  for (let i = first; i < calls.length; i++) calls[i] = { ...calls[i], unsure: true };
 }
 function liveness(shell) {
   return [shell.frames.map(({ runs: r, alive, left, jumped, repeats }) => ({ runs: r, alive, left, jumped, repeats })), shell.live];
@@ -3569,6 +3575,7 @@ function callFunction(known, layer, subshell, shell, depth) {
   }
   [shell.pipe, shell.start, shell.floor] = outer;
   wrap(shell, first, layer);
+  if (maybe) markUnsure(shell.calls, first);
   if (subshell) {
     restore(shell, state, true);
     revive(outside, shell);
@@ -3618,7 +3625,11 @@ function simple(words2, item, before, shell, depth) {
   const status = shell.status;
   shell.status = name === "true" || name === ":" || name === "break" || name === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
   if (assigns && !substituted) shell.status = 0;
-  const moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
+  let moved = name === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
+  if (name === "pushd" || name === "popd") {
+    const sure = name === "pushd" && args.length === 1 && !/^[+-]/.test(args[0]);
+    moved = sure ? cdTarget(args, parsed.cwd, shell, parsed.env) : [void 0, void 0];
+  }
   if (moved !== void 0) shell.status = moved[1];
   if (name === "set" || name === "shift") shell.args = void 0;
   if (name === "return" || name === "exit") {
@@ -3635,7 +3646,7 @@ function simple(words2, item, before, shell, depth) {
     shell.vars[UNKNOWN_ENV] = [void 0, void 0];
     for (const [fname, known2] of shell.functions) shell.functions.set(fname, [known2[0], true]);
   }
-  if (name === "cd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
+  if (name === "cd" || name === "pushd" || name === "popd" || name === "export" || name === "unset" || DECLARES.includes(name) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
       if (moved !== void 0) shell.cwd = moved[0];
@@ -3705,7 +3716,15 @@ function command(item, shell, depth) {
   let calls = [];
   if (argv.length > 0) {
     shell.pipe.leading = false;
-    if (shell.pipe.runs !== false) calls = simple(argv, item, before, shell, depth);
+    if (shell.pipe.runs !== false) {
+      const sure = shell.pipe.runs === true && !doubt(shell.pipe) && !shell.frames.some((frame) => frame.doubt);
+      const first = shell.calls.length;
+      calls = simple(argv, item, before, shell, depth);
+      if (!sure) {
+        markUnsure(calls);
+        markUnsure(shell.calls, first);
+      }
+    }
   }
   if (argv.length > 0 || closed !== void 0) finish(item.after, shell);
   return calls;
@@ -4435,12 +4454,14 @@ async function resolveAddresses(host, timeoutMs, state) {
     clearTimeout(timer);
   }
 }
-async function address(host, state) {
+async function address(host, state, lookup = true) {
   const cached = state.addresses.get(host);
   if (cached !== void 0) return cached;
   let found;
   if (isIP(host) !== 0) {
     found = [host];
+  } else if (!lookup) {
+    return "unresolved";
   } else {
     const remaining = state.deadline - state.now();
     found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
@@ -4453,7 +4474,7 @@ function addressKind(found) {
   const kinds = found.map(kindOf);
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : kinds[0];
 }
-async function endpoint(raw, cwd, state) {
+async function endpoint(raw, cwd, state, lookup = true) {
   const [direction, rawDestination, sshOptions, dial] = raw;
   const destination = rawDestination.trim();
   const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : destination.split("@").pop() ?? "");
@@ -4462,10 +4483,10 @@ async function endpoint(raw, cwd, state) {
   let kind;
   if (dial !== void 0) {
     resolved = dial[0];
-    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state);
+    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
   } else {
-    resolved = (sshOptions === void 0 ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
-    kind = await address(resolved, state);
+    resolved = (sshOptions === void 0 || !lookup ? "" : await sshHostname(destination, sshOptions, cwd, state)) || host;
+    kind = await address(resolved, state, lookup);
   }
   const out = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
@@ -4483,7 +4504,7 @@ async function transferOf(command2, cwd, state) {
     const found = parse(call, state.env);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state);
+      const one = await endpoint(raw, call.cwd, state, call.unsure !== true);
       if (one !== void 0 && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];

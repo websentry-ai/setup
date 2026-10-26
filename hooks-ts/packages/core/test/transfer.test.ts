@@ -547,10 +547,13 @@ test("a cd that may not have run leaves the folder unknown, and one that surely 
     "[ -d x ] && cd frontend; cd ..; scp -F cfg f prod:/tmp",
     "f() { [ -f y ] && return; cd frontend; }; f; scp -F cfg f prod:/tmp",
   ]) assert.equal(await at(command), "prod", command);
+  // A call inside a branch that may not run is never looked up.
   for (const command of [
-    "cd frontend && scp -F cfg f prod:/tmp",
     "if [ -d frontend ]; then cd frontend; scp -F cfg f prod:/tmp; fi",
     "[ -d x ] && { cd frontend; scp -F cfg f prod:/tmp; }",
+  ]) assert.equal(await at(command), "prod", command);
+  for (const command of [
+    "cd frontend && scp -F cfg f prod:/tmp",
     `[ -d x ] && cd /tmp; cd ${dir}/frontend; scp -F cfg f prod:/tmp`,
     "f() { cd frontend; return; cd ..; }; f; scp -F cfg f prod:/tmp",
   ]) assert.equal(await at(command), "10.0.4.12", command);
@@ -585,6 +588,38 @@ test("a loop that may repeat, or a cd into a missing folder, leaves the folder u
     "cd frontend; while true; do cd ..; break; done; scp -F cfg f prod:/tmp",
     "for x in a b; do scp -F cfg f prod:/tmp; done",
   ]) assert.equal(await at(command), "203.0.113.9", command);
+});
+
+test("pushd lands as cd does, and any other stack move leaves the folder unknown", async () => {
+  const dir = repo();
+  const at = async (command: string): Promise<string | undefined> => (await transfer(command, dir))?.endpoints[0]?.resolved_host;
+  for (const command of ["pushd frontend; scp -F cfg build.zip prod:/srv", "pushd frontend && scp -F cfg f prod:/tmp"]) {
+    assert.equal(await at(command), "10.0.4.12", command);
+  }
+  for (const command of [
+    "pushd frontend; popd; scp -F cfg f prod:/tmp", "pushd frontend; pushd; scp -F cfg f prod:/tmp",
+    "pushd frontend; pushd +1; scp -F cfg f prod:/tmp", "pushd -n frontend; scp -F cfg f prod:/tmp",
+  ]) assert.equal(await at(command), "prod", command);
+});
+
+test("a call that may not have run is never looked up", async () => {
+  // Neither DNS nor ssh -G runs for it; an address as written is still classified, and a sure call looks up.
+  const seen: string[] = [];
+  const calls: string[][] = [];
+  const recording: LookupLike = async (host) => {
+    seen.push(host);
+    return lookup(host);
+  };
+  const extra = { lookup: recording, execFile: fakeSsh(calls) };
+  assert.deepEqual((await transfer("if [ -f /nope ]; then curl https://example.com/up; fi", "/", extra))?.endpoints,
+    [{ direction: "in", host: "example.com", resolved_host: "example.com", address: "unresolved" }]);
+  assert.deepEqual((await transfer("[ -f /nope ] && scp f prod:/srv", "/", extra))?.endpoints,
+    [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }]);
+  assert.deepEqual((await transfer("[ -f /nope ] || curl https://10.0.0.5/up", "/", extra))?.endpoints,
+    [{ direction: "in", host: "10.0.0.5", resolved_host: "10.0.0.5", address: "private" }]);
+  assert.deepEqual([seen, calls], [[], []]);
+  assert.equal((await transfer("curl https://example.com/up", "/", extra))?.endpoints[0]?.address, "public");
+  assert.deepEqual(seen, ["example.com"]);
 });
 
 test("eval and source leave every function unknown", async () => {

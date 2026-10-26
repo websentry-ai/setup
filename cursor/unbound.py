@@ -4769,8 +4769,9 @@ def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[
     return './' + folder if folder.startswith('~') else folder
 
 
-_TRANSFER_LOOKS = frozenset({'cd', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat', 'wc', 'head', 'tail',
-                             'grep', 'diff', 'file', 'du', 'readlink', 'realpath', 'basename', 'dirname'})
+_TRANSFER_LOOKS = frozenset({'cd', 'pushd', 'popd', 'dirs', '[', '[[', 'test', 'ls', 'echo', 'printf', 'stat', 'cat',
+                             'wc', 'head', 'tail', 'grep', 'diff', 'file', 'du', 'readlink', 'realpath', 'basename',
+                             'dirname'})
 _TRANSFER_MAKES_PARENTS = frozenset({'mkdir', 'install', 'git', 'unzip'})
 
 
@@ -5026,7 +5027,13 @@ def _transfer_wrap(shell: Dict, first: int, layer: tuple) -> None:
     """Wrap each call from first on in one more level of (piped in, piped out, redirections)."""
     calls = shell['calls']
     for i in range(first, len(calls)):
-        calls[i] = calls[i][:5] + (calls[i][5] + (layer,),)
+        calls[i] = calls[i][:5] + (calls[i][5] + (layer,),) + calls[i][6:]
+
+
+def _transfer_unsure_calls(calls: List[tuple], first: int = 0) -> None:
+    """Mark each call from first on as one that may not have run, which is never looked up."""
+    for i in range(first, len(calls)):
+        calls[i] = calls[i][:6] + (True,)
 
 
 _TRANSFER_JUMP_MARKS = ('runs', 'alive', 'left', 'jumped', 'repeats')
@@ -5606,6 +5613,8 @@ def _transfer_call(known: tuple, layer: tuple, subshell: Optional[bool], shell: 
             shell['vars'].pop(name, None)
     shell['pipe'], shell['start'], shell['floor'] = outer
     _transfer_wrap(shell, first, layer)
+    if maybe:
+        _transfer_unsure_calls(shell['calls'], first)
     if subshell:
         _transfer_restore(shell, state, True)
         _transfer_revive(outside, shell)
@@ -5693,6 +5702,10 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     if assigns and not substituted:
         shell['status'] = 0
     moved = _transfer_cd(args, cwd, shell, given) if program == 'cd' else None
+    if program in ('pushd', 'popd'):
+        # pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
+        sure = program == 'pushd' and len(args) == 1 and args[0][:1] not in ('+', '-')
+        moved = _transfer_cd(args, cwd, shell, given) if sure else (None, None)
     if moved:
         shell['status'] = moved[1]
     if program in ('set', 'shift'):
@@ -5712,7 +5725,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         shell['vars'][_TRANSFER_UNKNOWN_ENV] = (None, None)
         # It may also redefine any function, so each one known may no longer run as written.
         shell['functions'] = {name: (known[0], True) for name, known in shell['functions'].items()}
-    if program in ('cd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
+    if program in ('cd', 'pushd', 'popd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
             saved = _transfer_snapshot(shell)
@@ -5739,9 +5752,9 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         lexer = _TransferLexer(inner, depth + 1)
         items = _transfer_script_stdin(lexer, lexer.read() or []) if script is not None else lexer.read() or []
         calls = _transfer_walk(items, cwd, env, depth + 1, positional)
-        calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) for call in calls]
+        calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) + call[6:] for call in calls]
     else:
-        calls = [(program, args, env, cwd, other_user, (layer,))] if program else []
+        calls = [(program, args, env, cwd, other_user, (layer,), False)] if program else []
     if program:
         _transfer_replace(words, subshell, shell)
     return calls
@@ -5792,7 +5805,14 @@ def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
     if words:
         shell['pipe']['leading'] = False
         if shell['pipe']['runs'] is not False:
+            # Under a condition, or an && or || after a status, that is not known, it may not have run.
+            sure = shell['pipe']['runs'] is True and not _transfer_doubt(shell['pipe']) and \
+                not any(frame['doubt'] for frame in shell['frames'])
+            first = len(shell['calls'])
             calls = _transfer_simple(words, before, after, io, shell, depth)
+            if not sure:
+                _transfer_unsure_calls(calls)
+                _transfer_unsure_calls(shell['calls'], first)  # and what a function it called ran
     if words or closed:
         _transfer_finish(after, shell)
     return calls
@@ -5842,7 +5862,8 @@ def _transfer_ends_piped(head: tuple, shell: Dict) -> bool:
 def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth: int,
                    positional: List[str] = ()) -> List[tuple]:
     """Each simple command that runs or may run, as (program, args, env, folder, as another user, its (piped in, piped
-    out, redirections) layers from its own outward); skipped branches and uncalled function bodies are left out."""
+    out, redirections) layers from its own outward, whether it may not have run); skipped branches and uncalled
+    function bodies are left out."""
     return _transfer_shell(items, cwd, exported, depth, positional)['calls']
 
 
@@ -6549,15 +6570,17 @@ def _transfer_resolve(host: str, timeout: float) -> list:
     return [] if worker.is_alive() else list(found)
 
 
-def _transfer_address(host: str, state: Dict) -> str:
+def _transfer_address(host: str, state: Dict, lookup: bool = True) -> str:
     """The kind of address a host resolves to, looked up once per turn: public when any address is public, else
-    the first address's kind; unresolved when the lookup fails or the turn's budget is spent."""
+    the first address's kind; unresolved when the lookup fails, the turn's budget is spent, or lookup is off."""
     import ipaddress
     key = ('address', host)
     if key not in state:
         try:
             addresses = [ipaddress.ip_address(host)]
         except ValueError:
+            if not lookup:
+                return 'unresolved'  # a call that may not have run is never looked up
             remaining = _transfer_deadline(state) - time.monotonic()
             addresses = _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else []
         state[key] = _transfer_address_kind(addresses)
@@ -6570,9 +6593,10 @@ def _transfer_address_kind(addresses: list) -> str:
     return 'unresolved' if not kinds else 'public' if 'public' in kinds else kinds[0]
 
 
-def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict) -> Optional[Dict]:
+def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool = True) -> Optional[Dict]:
     """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial]): the host as
-    written without a login, the host it connects to (ssh -G or curl's dial), and that host's address kind."""
+    written without a login, the host it connects to (ssh -G or curl's dial), and that host's address kind. Without
+    lookup, neither ssh -G nor DNS runs, and only an address as written is classified."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     destination = destination.strip()
@@ -6582,11 +6606,12 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict) -> Optional[
     if not host:
         return None
     if dial:
-        resolved, address = dial[0], _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state)
+        resolved = dial[0]
+        address = _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state, lookup)
     else:
-        resolved = (_transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None else '') \
-            or host
-        address = _transfer_address(resolved, state)
+        resolved = (_transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and lookup
+                    else '') or host
+        address = _transfer_address(resolved, state, lookup)
     endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
     return {k: v for k, v in endpoint.items() if v}
 
@@ -6598,13 +6623,13 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         if not isinstance(command, str) or not command.strip():
             return None
         tool, endpoints = None, []
-        for program, args, env, call_cwd, other_user, layers in \
+        for program, args, env, call_cwd, other_user, layers, unsure in \
                 _transfer_walk(_TransferLexer(command).read() or [], cwd, {}, 0):
             found = _transfer_parse(program, args, env, other_user, layers)
             for raw in (found[1] if found else []):
                 if len(endpoints) >= _TRANSFER_MAX_ENDPOINTS:
                     break
-                endpoint = _transfer_endpoint(raw, call_cwd, state)
+                endpoint = _transfer_endpoint(raw, call_cwd, state, not unsure)
                 if endpoint and endpoint not in endpoints:
                     endpoints.append(endpoint)
                     tool = tool or found[0]

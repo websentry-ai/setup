@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'bd1c3d07559dbe2a8f820729d1fbf4b2838cc271c1b8de85c746b44a5fc24c00'
+BLOCK_SHA256 = '6ef7f610349c9a20d198c4cf9cbe6ac6e85f9393d56932222fb259d509cd9e12'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -517,6 +517,23 @@ class PowerShellTests(TransferTestCase):
 
 
 class AddressTests(TransferTestCase):
+    def test_a_call_that_may_not_have_run_is_never_looked_up(self):
+        # Neither DNS nor ssh -G runs for it; an address as written is still classified, and a sure call looks up.
+        looked_up = []
+
+        def lookup(host, *args, **kwargs):
+            looked_up.append(host)
+            return _getaddrinfo(host, *args, **kwargs)
+
+        with patch('socket.getaddrinfo', lookup):
+            self.assert_endpoints('if [ -f /nope ]; then curl https://example.com/up; fi',
+                                  [_endpoint('in', 'example.com', 'unresolved')])
+            self.assert_endpoints('[ -f /nope ] && scp f prod:/srv', [_endpoint('out', 'prod', 'unresolved')])
+            self.assert_endpoints('[ -f /nope ] || curl https://10.0.0.5/up', [_endpoint('in', '10.0.0.5', 'private')])
+            self.assertEqual((looked_up, self.ssh_calls()), ([], []))
+            self.assert_endpoints('curl https://example.com/up', [_endpoint('in', 'example.com', 'public')])
+            self.assertEqual(set(looked_up), {'example.com'})
+
     def test_each_address_kind(self):
         cases = {
             'https://files.acme-infra.net/x': 'private',
@@ -867,10 +884,17 @@ class ParserFindingTests(TransferTestCase):
         private = [_endpoint('out', 'prod', 'private', '10.0.4.12')]
         for command in ('cd frontend && scp -F cfg f prod:/tmp',
                         'cd frontend; scp -F cfg f prod:/tmp',
-                        'if [ -d frontend ]; then cd frontend; scp -F cfg f prod:/tmp; fi',
-                        '[ -d x ] && { cd frontend; scp -F cfg f prod:/tmp; }',
                         f'[ -d x ] && cd /tmp; cd {self.repo}/frontend; scp -F cfg f prod:/tmp'):
             self.assert_endpoints(command, private)
+        # Inside a branch that may not run, the cd before a call still applies to it, but the call may not have run,
+        # so it is never looked up.
+        for command in ('if [ -d frontend ]; then cd frontend; scp -F cfg f prod:/tmp; fi',
+                        '[ -d x ] && { cd frontend; scp -F cfg f prod:/tmp; }'):
+            self.assert_endpoints(command, unknown)
+            for hook in HOOKS:
+                calls = hook._transfer_walk(hook._TransferLexer(command).read(), self.repo, {}, 0)
+                self.assertEqual([(c[3], c[6]) for c in calls if c[0] == 'scp'],
+                                 [(os.path.join(self.repo, 'frontend'), True)])
 
     def test_a_loop_that_may_repeat_or_a_cd_the_command_may_have_made_leaves_the_folder_unknown(self):
         # A body that runs again repeats its cd; a folder another command names may have been made or removed by it,
@@ -973,6 +997,14 @@ class ParserFindingTests(TransferTestCase):
             self.assert_endpoints(command, [expected])
         # exec replaces the shell even when what it runs is a builtin, so the scp never runs.
         self.assert_hosts('exec cd frontend; scp -F cfg f prod:/tmp', [])
+
+    def test_pushd_lands_as_cd_does_and_any_other_stack_move_leaves_the_folder_unknown(self):
+        private, unknown = (_endpoint('out', 'prod', 'private', '10.0.4.12'), _endpoint('out', 'prod', 'unresolved'))
+        for command in ('pushd frontend; scp -F cfg build.zip prod:/srv', 'pushd frontend && scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, [private])
+        for command in ('pushd frontend; popd; scp -F cfg f prod:/tmp', 'pushd frontend; pushd; scp -F cfg f prod:/tmp',
+                        'pushd frontend; pushd +1; scp -F cfg f prod:/tmp', 'pushd -n frontend; scp -F cfg f prod:/tmp'):
+            self.assert_endpoints(command, [unknown])
 
     def test_eval_and_source_leave_every_function_unknown(self):
         # Their text may redefine a function, so a call after them may no longer run the body seen before.
@@ -1260,17 +1292,36 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
                 entries = _tool_entries(hook.build_llm_exchange(events, cwd=frontend))
                 self.assertEqual([e.get('transfer') for e in entries], [private])
 
-    def test_a_failed_claude_bash_call_leaves_the_folder_unknown(self):
-        # Claude reports a command that exits non-zero as PostToolUseFailure; it ran, so its cd may have too.
+    def test_a_failed_claude_bash_call_is_read_and_leaves_the_folder_unknown(self):
+        # Claude reports a command that exits non-zero as PostToolUseFailure; it ran, so its upload and its cd may have.
         hook = load_module('claude-code/hooks/unbound.py')
+        failed = 'cd frontend && curl -T secret https://files.acme-infra.net/up | grep ok'
         events = [{'timestamp': '2026-10-22T16:40:00Z', 'event': {**fields, 'session_id': 's1'}} for fields in (
             {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'cwd': self.repo},
             {'hook_event_name': 'PostToolUseFailure', 'tool_name': 'Bash', 'error': 'Exit code 1',
-             'tool_input': {'command': 'cd frontend && npm test'}},
+             'tool_use_id': 't1', 'tool_input': {'command': failed}},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_response': {}, 'tool_use_id': 't2',
+             'tool_input': {'command': 'scp -F cfg build.zip prod:/srv'}})]
+        entries = _tool_entries(hook.build_llm_exchange(events, cwd=self.repo))
+        self.assertEqual([(e['tool_use_id'], e['tool_input'], e['tool_response']) for e in entries],
+                         [('t1', {'command': failed}, {'error': 'Exit code 1'}),
+                          ('t2', {'command': 'scp -F cfg build.zip prod:/srv'}, {})])
+        self.assertEqual([e.get('transfer') for e in entries],
+                         [{'tool': 'curl', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]},
+                          {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]}])
+
+    def test_a_claude_background_call_keeps_its_cd_to_itself(self):
+        # run_in_background runs the command in a shell of its own; its own lookups still start where the walk is.
+        hook = load_module('claude-code/hooks/unbound.py')
+        events = [{'timestamp': '2026-10-22T16:40:00Z', 'event': {**fields, 'session_id': 's1'}} for fields in (
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'cwd': self.repo},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_response': {},
+             'tool_input': {'command': 'cd frontend && scp -F cfg build.zip prod:/srv', 'run_in_background': True}},
             {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_response': {},
              'tool_input': {'command': 'scp -F cfg build.zip prod:/srv'}})]
         transfers = [e.get('transfer') for e in _tool_entries(hook.build_llm_exchange(events, cwd=self.repo))]
-        self.assertEqual(transfers[-1], {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]})
+        self.assertEqual(transfers, [{'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]},
+                                     {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'public', '203.0.113.9')]}])
 
     def test_claude_code_seeds_the_walk_from_a_prompt_that_carries_a_cwd(self):
         hook = load_module('claude-code/hooks/unbound.py')
