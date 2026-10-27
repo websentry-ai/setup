@@ -38,7 +38,8 @@ Two deliberate divergences from the Augment analog, both called out at the code:
     with `unbound login` would silently repoint all of them at this device key. It IS
     replaced when this installer is the one that wrote it -- recognised by a
     `pi_mdm_api_key_sha256` digest recorded beside it -- or a revoked key would survive every
-    later push in the one tier a GUI-launched pi reads.
+    later push in the one tier a GUI-launched pi reads. A leftover `api_key` is always
+    removed: no hook or CLI reads it any more.
   * an `export` line is only written after `_is_safe_env_value()` passes, because an rc file
     is a shell script and an unvalidated value in it is command injection. The rc file is
     also published with its group and other bits stripped: the line holds a plaintext key,

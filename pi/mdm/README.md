@@ -88,7 +88,7 @@ port of, both called out in comments at the code:
    So the installer records a `pi_mdm_api_key_sha256` digest beside any `device_token` it writes,
    and on a later push replaces the value only when it is absent, already equal to the key
    being installed, or matches that digest. Anything else is the user's own credential and is
-   left byte-identical. **Rotating a pi application key therefore takes effect in both tiers
+   kept. A leftover `api_key` is always removed: no hook or CLI reads it any more. **Rotating a pi application key therefore takes effect in both tiers
    on the next push.** The digest is provenance, not a secret — the key itself is in the same
    `0600` file — and no other tool reads that field.
 
