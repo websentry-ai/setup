@@ -287,6 +287,8 @@ test("HOOK-04 the recorded decision carries the typed command as its tool_input"
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.tool_name, "bash");
     assert.deepStrictEqual(entries[0]?.tool_input, { command: "echo hi" });
+    // The uncapped command rides along for transfer resolution only.
+    assert.equal((entries[0] as { transfer_command?: string } | undefined)?.transfer_command, "echo hi");
   } finally {
     await api.close();
   }

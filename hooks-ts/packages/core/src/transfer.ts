@@ -3514,6 +3514,8 @@ export interface ShellCall {
   tool_name?: unknown;
   tool_use_id?: unknown;
   tool_input?: unknown;
+  /** The command before the audit cap, as `transferCommand` bounds it; read in place of `tool_input.command`. */
+  transfer_command?: unknown;
   decision?: unknown;
   /** `false` when the call is known not to have run, such as a confirm the person declined. */
   ran?: unknown;
@@ -3525,6 +3527,11 @@ const NEVER_RAN: ReadonlySet<string> = new Set(["deny", "unavailable"]);
 
 /** Where each shell call of a turn sent to or fetched from, keyed by `tool_use_id`; each call starts in `cwd`.
  *  Never rejects. */
+/** A shell command bounded for `transfer_command`: only past MAX_CHARS is cut, and a cut one is still skipped whole. */
+export function transferCommand(command: string): string {
+  return command.length > MAX_CHARS ? command.slice(0, MAX_CHARS + 1) : command;
+}
+
 export async function resolveTransfers(
   calls: readonly ShellCall[], cwd: string | undefined, opts: ResolveOptions = {},
 ): Promise<Map<string, Transfer>> {
@@ -3543,7 +3550,8 @@ export async function resolveTransfers(
       // Every call's input, so a turn that names an ssh config makes no ssh lookups.
       turnText: calls.map((call) => {
         try {
-          return typeof call.tool_input === "string" ? call.tool_input : JSON.stringify(call.tool_input) ?? "";
+          const full = typeof call.transfer_command === "string" ? `${call.transfer_command}\n` : "";
+          return full + (typeof call.tool_input === "string" ? call.tool_input : JSON.stringify(call.tool_input) ?? "");
         } catch {
           return "";
         }
@@ -3552,7 +3560,9 @@ export async function resolveTransfers(
     };
     for (const call of calls) {
       const input = call.tool_input;
-      const command = input !== null && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>).command : undefined;
+      const command = typeof call.transfer_command === "string"
+        ? call.transfer_command
+        : input !== null && typeof input === "object" && !Array.isArray(input) ? (input as Record<string, unknown>).command : undefined;
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if ((typeof call.decision === "string" && NEVER_RAN.has(call.decision)) || call.ran === false) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;

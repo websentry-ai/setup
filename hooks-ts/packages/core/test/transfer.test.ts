@@ -10,7 +10,7 @@ import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
 
 import { defaultExecFile, type ExecFileLike } from "../src/accountIdentity.ts";
-import { resolveTransfers, type LookupLike, type ResolveOptions, type Transfer } from "../src/transfer.ts";
+import { resolveTransfers, transferCommand, type LookupLike, type ResolveOptions, type Transfer } from "../src/transfer.ts";
 
 interface Fixture {
   addresses: Record<string, string[]>;
@@ -130,6 +130,17 @@ test("a command nested too deep sends no transfer, and the turn's later calls st
   ], "/", options());
   assert.equal(found.get("c1"), undefined);
   assert.equal(found.get("c2")?.endpoints[0]?.host, "example.com");
+});
+
+test("transfer_command is read in place of the capped command, and its length cap still applies", async () => {
+  const found = await resolveTransfers([
+    { tool_name: "bash", tool_use_id: "c1", tool_input: { command: "echo cut" }, transfer_command: "curl https://example.com/a" },
+    { tool_name: "bash", tool_use_id: "c2", tool_input: { command: "echo" }, transfer_command: transferCommand(": " + "x".repeat(30_000) + "; curl https://example.com/b") },
+  ], "/", options());
+  assert.equal(found.get("c1")?.endpoints[0]?.host, "example.com");
+  assert.equal(found.get("c2"), undefined);
+  assert.equal(transferCommand("x".repeat(30_000)).length, 20_001);
+  assert.equal(transferCommand("curl https://example.com/a"), "curl https://example.com/a");
 });
 
 // The ssh on PATH; ssh -G runs a Match exec command, which these lookups never must.

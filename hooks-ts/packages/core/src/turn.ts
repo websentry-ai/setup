@@ -116,6 +116,8 @@ export interface TurnToolCall {
    * confirm was answered). Never sent; it keeps transfer lookups off calls that never ran.
    */
   ran?: false;
+  /** The shell command before the audit cap, bounded by `transferCommand`, so transfers resolve from what ran. Never sent. */
+  transfer_command?: string;
 }
 
 export interface TurnResult {
@@ -488,6 +490,7 @@ export function createTurnStore(): TurnStore {
         if (input !== null && typeof input === "object" && !Array.isArray(input)) {
           stored.tool_input = { ...input };
         }
+        if (typeof entry.transfer_command === "string") stored.transfer_command = entry.transfer_command;
         // Stamped at record time, from the id this call was actually made under — not read back off
         // the record, which may carry an older session's id or none at all.
         const incoming = idOf(sessionId);

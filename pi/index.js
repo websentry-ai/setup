@@ -1740,6 +1740,7 @@ function createTurnStore() {
         if (input !== null && typeof input === "object" && !Array.isArray(input)) {
           stored.tool_input = { ...input };
         }
+        if (typeof entry.transfer_command === "string") stored.transfer_command = entry.transfer_command;
         const incoming = idOf(sessionId);
         if (incoming !== void 0) stored.session_id = incoming;
         record.tool_calls.push(stored);
@@ -4748,6 +4749,9 @@ async function transferOf(command2, cwd, state) {
 }
 var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
 var NEVER_RAN = /* @__PURE__ */ new Set(["deny", "unavailable"]);
+function transferCommand(command2) {
+  return command2.length > MAX_CHARS ? command2.slice(0, MAX_CHARS + 1) : command2;
+}
 async function resolveTransfers(calls, cwd, opts = {}) {
   const transfers = /* @__PURE__ */ new Map();
   try {
@@ -4764,7 +4768,9 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       // Every call's input, so a turn that names an ssh config makes no ssh lookups.
       turnText: calls.map((call) => {
         try {
-          return typeof call.tool_input === "string" ? call.tool_input : JSON.stringify(call.tool_input) ?? "";
+          const full = typeof call.transfer_command === "string" ? `${call.transfer_command}
+` : "";
+          return full + (typeof call.tool_input === "string" ? call.tool_input : JSON.stringify(call.tool_input) ?? "");
         } catch {
           return "";
         }
@@ -4773,7 +4779,7 @@ async function resolveTransfers(calls, cwd, opts = {}) {
     };
     for (const call of calls) {
       const input = call.tool_input;
-      const command2 = input !== null && typeof input === "object" && !Array.isArray(input) ? input.command : void 0;
+      const command2 = typeof call.transfer_command === "string" ? call.transfer_command : input !== null && typeof input === "object" && !Array.isArray(input) ? input.command : void 0;
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if (typeof call.decision === "string" && NEVER_RAN.has(call.decision) || call.ran === false) continue;
       if (typeof command2 !== "string" || command2.trim() === "" || typeof call.tool_use_id !== "string") continue;
@@ -4873,6 +4879,7 @@ function postStandaloneTurn(entry, ctx, sessionId, deps) {
     if (input !== null && typeof input === "object" && !Array.isArray(input)) {
       call.tool_input = { ...input };
     }
+    if (typeof entry.transfer_command === "string") call.transfer_command = entry.transfer_command;
     if (call.decision === "confirm") call.ran = false;
     const record = { tool_calls: [call], results: [], started_at: now };
     if (typeof sessionId === "string" && sessionId !== "") {
@@ -4942,6 +4949,7 @@ async function decideToolCall(event, ctx, deps) {
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command2.trim() === "" && filePath === void 0) return void 0;
     const auditInput = auditToolInput(toolInput, command2);
+    const fullCommand = shell && command2 !== "" ? { transfer_command: transferCommand(command2) } : {};
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
     const toolsConfirmed = state.getToolsConfirmed();
@@ -4977,7 +4985,8 @@ async function decideToolCall(event, ctx, deps) {
       tool_name: event.toolName,
       tool_use_id: event.toolCallId,
       decision: outcome.kind,
-      tool_input: auditInput
+      tool_input: auditInput,
+      ...fullCommand
     });
     const result = await applyOutcome(outcome, ctx);
     if (outcome.kind === "confirm" && result !== void 0) noteSafe(() => deps.onDeclined?.(event.toolCallId));
@@ -5619,7 +5628,8 @@ async function decideUserBash(event, ctx, deps) {
       decision: outcome.kind,
       // `{}` in, so the only key out is the capped `command` — which is the entire content of a
       // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
-      tool_input: auditToolInput({}, command2)
+      tool_input: auditToolInput({}, command2),
+      ...typeof command2 === "string" && command2 !== "" ? { transfer_command: transferCommand(command2) } : {}
     });
     switch (outcome.kind) {
       case "allow":

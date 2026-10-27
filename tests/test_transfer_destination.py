@@ -1230,6 +1230,25 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
             hook.map_copilot_tool('bash', {'command': self.COMMAND}, '', shell_state=shell_state, root_projects={})
         self.assertLessEqual(shell_state['transfers']['deadline'] - time.monotonic(), 3.0)
 
+    def test_the_copilot_setup_backfill_looks_nothing_up(self):
+        # The backfill maps past calls only for MCP provenance, so neither setup runs ssh -G or DNS for them.
+        hook = load_module('copilot/hooks/unbound.py')
+        lines = [{'type': 'tool.execution_start', 'data': {'toolCallId': f'call-{n}', 'toolName': 'bash',
+                                                          'arguments': {'command': command}}}
+                 for n, command in enumerate([self.COMMAND, 'curl -T f https://example.com/up'])]
+        for setup in [load_module('copilot/hooks/setup.py'), load_module('copilot/hooks/mdm/setup.py')]:
+            with self.subTest(setup=setup.__file__), patch.object(setup, '_backfill_load_hook_module', return_value=hook), \
+                    patch('socket.getaddrinfo', side_effect=_getaddrinfo) as lookup:
+                self.assertEqual(setup._backfill_mcp_tool_provenance(lines), {})
+                self.assertEqual(self.ssh_calls(), [])
+                lookup.assert_not_called()
+        # The same calls mapped as a live turn do look up, so the checks above are not vacuous.
+        with patch('socket.getaddrinfo', side_effect=_getaddrinfo) as lookup:
+            for line in lines:
+                hook.map_copilot_tool('bash', line['data']['arguments'], '', shell_state={'dir': self.repo})
+        self.assertTrue(self.ssh_calls())
+        lookup.assert_called()
+
     def test_a_copilot_powershell_call_keeps_a_hashtable_whole(self):
         # A ; inside @{ } separates the hashtable's entries, so the cmdlet keeps its -Uri.
         hook = load_module('copilot/hooks/unbound.py')

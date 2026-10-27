@@ -42,6 +42,7 @@ import {
 } from "../../core/src/constants.ts";
 import { auditToolInput, buildPretoolPayload } from "../../core/src/payload.ts";
 import type { CheckHooks } from "../../core/src/policy.ts";
+import { transferCommand } from "../../core/src/transfer.ts";
 import { denyBashResult } from "./bashResult.ts";
 import { noteDecision } from "./decide.ts";
 import type { DecideCtx, DecideDeps } from "./decide.ts";
@@ -115,6 +116,7 @@ export async function decideUserBash(
       // `{}` in, so the only key out is the capped `command` — which is the entire content of a
       // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
       tool_input: auditToolInput({}, command),
+      ...(typeof command === "string" && command !== "" ? { transfer_command: transferCommand(command) } : {}),
     });
 
     switch (outcome.kind) {

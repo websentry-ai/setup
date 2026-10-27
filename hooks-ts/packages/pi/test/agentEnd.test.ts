@@ -20,9 +20,11 @@ import {
   MAX_ASSISTANT_CHARS,
   TURNLOG_PATH,
 } from "../../core/src/constants.ts";
+import { capCommand } from "../../core/src/payload.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import { createPolicyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
+import { resolveTransfers } from "../../core/src/transfer.ts";
 import { createTurnStore } from "../../core/src/turn.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
@@ -676,6 +678,52 @@ test("a shell call's transfer and call time ride on its tool_use entry", async (
       tool: "curl",
       endpoints: [{ direction: "out", host: "10.1.2.3", resolved_host: "10.1.2.3", address: "private" }],
     });
+  } finally {
+    await api.close();
+  }
+});
+
+test("a long command's transfer resolves from the full command, not the capped audit copy", async () => {
+  // Over the audit cap, with the heredoc's end in the cut: the spliced copy reads the scp as heredoc body.
+  const command = "cat > notes.txt <<'EOF'\n" + "note line\n".repeat(460) + "EOF\necho " + "y".repeat(4400) +
+    "\nscp build.zip prod:/srv";
+  assert.ok(command.length > 9_000 && capCommand(command).truncated);
+  const capped = await resolveTransfers(
+    [{ tool_name: "bash", tool_use_id: "capped", decision: "allow", tool_input: { command: capCommand(command).command } }], "/");
+  assert.equal(capped.size, 0, "the capped copy alone finds no transfer");
+
+  const api = await startMockApi({ mode: "allow" });
+  try {
+    const store = createTurnStore();
+    store.recordPrompt("ship it", "sess-long", 1_000);
+    await decideToolCall(createFakeToolCallEvent("bash", { command }, "call_scp"), createFakeCtx({ sessionId: "sess-long" }), {
+      checker: createPolicyChecker({
+        client: client(api),
+        state: createPolicyState(),
+        telemetry: createTelemetry({ client: client(api), apiKey: TEST_KEY }),
+      }),
+      apiKey: TEST_KEY,
+      entrypoint: "pi/0.87.1",
+      onDecision: (entry) => store.recordToolCall(entry, "sess-long", 1_001),
+    });
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx({ cwd: "/" }), { client: client(api), store, now: () => 5_000 });
+    for (let waited = 0; turnLogs(api).length === 0 && waited < 8_000; waited += 50) await sleep(50);
+
+    const entry = (turnLogs(api)[0]?.body as { messages?: { tool_use?: Record<string, unknown>[] }[] } | undefined)
+      ?.messages?.[1]?.tool_use?.[0];
+    const transfer = entry?.transfer as { tool?: string; endpoints?: { direction?: string; host?: string }[] } | undefined;
+    assert.equal(transfer?.tool, "scp", JSON.stringify(transfer));
+    assert.deepEqual(transfer?.endpoints?.map((e) => [e.direction, e.host]), [["out", "prod"]]);
+    assert.equal((entry?.tool_input as Record<string, unknown>).command, capCommand(command).command, "what is sent stays capped");
+    assert.ok(!JSON.stringify(turnLogs(api)[0]?.body).includes("transfer_command"), "the full command is never sent");
+
+    // A standalone row resolves from the full command too.
+    postStandaloneTurn({ tool_name: "bash", tool_use_id: "bang_long", decision: "allow", tool_input: { command: capCommand(command).command },
+      transfer_command: command }, { cwd: "/" }, "sess-long", { client: client(api), now: () => 5_000 });
+    for (let waited = 0; turnLogs(api).length < 2 && waited < 8_000; waited += 50) await sleep(50);
+    const bang = (turnLogs(api)[1]?.body as { messages?: { tool_use?: Record<string, unknown>[] }[] } | undefined)
+      ?.messages?.flatMap((m) => m.tool_use ?? [])[0];
+    assert.equal((bang?.transfer as { tool?: string } | undefined)?.tool, "scp", JSON.stringify(bang));
   } finally {
     await api.close();
   }

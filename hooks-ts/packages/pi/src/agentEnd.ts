@@ -219,6 +219,7 @@ export interface StandaloneTurnEntry {
   tool_use_id: string;
   decision: string;
   tool_input?: Record<string, unknown>;
+  transfer_command?: string;
 }
 
 /**
@@ -253,6 +254,7 @@ export function postStandaloneTurn(
     if (input !== null && typeof input === "object" && !Array.isArray(input)) {
       call.tool_input = { ...input };
     }
+    if (typeof entry.transfer_command === "string") call.transfer_command = entry.transfer_command;
     // Posted before its confirm is answered, so a `confirm` here is not known to have run.
     if (call.decision === "confirm") call.ran = false;
     const record: TurnRecord = { tool_calls: [call], results: [], started_at: now };
