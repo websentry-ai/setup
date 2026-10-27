@@ -1410,6 +1410,7 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
                 or config.get(MDM_KEY_PROVENANCE_FIELD) == _key_provenance(existing)):
             config["device_token"] = api_key
             config[MDM_KEY_PROVENANCE_FIELD] = _key_provenance(api_key)
+        # A leftover api_key goes whoever wrote it: nothing reads it, and an old login one is a CLI key no tool may use.
         config.pop("api_key", None)
         if urls:
             # URLs are tenant configuration, not identity, so they DO update unconditionally.

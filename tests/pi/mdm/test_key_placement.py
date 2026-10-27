@@ -470,3 +470,12 @@ def test_the_env_gate_is_stated_as_an_addition(unix):
     body = src.split("def _is_safe_env_value")[1].split("\ndef ")[0]
     assert "EXECUTED" in body or "executed" in body
     assert "allow-list" in body
+
+
+def test_a_leftover_api_key_is_replaced_by_the_device_token(unix, passthrough, home):
+    config_path = home / ".unbound" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"api_key": "old-login-key", "email": "alice@acme.test"}))
+    assert unix.write_unbound_config_for_user("alice", home, KEY) is True
+    config = json.loads(config_path.read_text())
+    assert (config.get("device_token"), "api_key" in config, config["email"]) == (KEY, False, "alice@acme.test")
