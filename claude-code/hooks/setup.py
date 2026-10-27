@@ -1144,16 +1144,16 @@ def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
     server bills each to the turn that ran it. No content leaves the machine."""
     subdir = None
     for candidate in (transcript_path.with_suffix('') / 'subagents', transcript_path.parent / 'subagents'):
-        if candidate.is_dir() and not candidate.is_symlink():
+        if candidate.is_dir() and not _is_reparse_point(candidate) and not _is_reparse_point(candidate.parent):
             subdir = candidate
             break
     if subdir is None:
         return []
     # reply id -> (usage, sidechain) for the reply and each advisor turn in it, kept apart as the hook keeps them.
     replies, advisors, first = {}, {}, {}
-    for path in sorted(subdir.rglob('*.jsonl')):
+    for path in sorted(_backfill_jsonl_files(subdir)):
         try:
-            if path.is_symlink() or not path.is_file() or path.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+            if not path.is_file() or path.stat().st_size > BACKFILL_MAX_FILE_BYTES:
                 continue
             with open(path, 'r', encoding='utf-8') as f:
                 for lineno, line in enumerate(f):
@@ -1433,15 +1433,23 @@ def _backfill_write_cutoff(config_dir: Path, ts: float) -> None:
         debug_print(f"failed to persist backfill timestamp: {e}")
 
 
+def _backfill_jsonl_files(root: Path, skip_dirs=()):
+    """Every .jsonl under root, never entering or yielding a symlink or Windows junction."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not _is_reparse_point(base / d)]
+        for name in filenames:
+            if name.endswith('.jsonl') and not _is_reparse_point(base / name):
+                yield base / name
+
+
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
-    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
+    # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
     # their session (_backfill_subagent_usage).
-    for p in root.rglob('*.jsonl'):
+    for p in _backfill_jsonl_files(root, skip_dirs=('subagents',)):
         if p.name.startswith('.'):
             continue
-        if 'subagents' in p.relative_to(root).parts:
-            continue
-        if not p.is_file() or p.is_symlink():
+        if not p.is_file():
             continue
         try:
             st = p.stat()
@@ -1577,16 +1585,20 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
 _IS_JUNCTION = getattr(os.path, 'isjunction', None)
+# Reparse tags with this bit redirect to another path (junction, symlink, WSL link); OneDrive placeholders lack it.
+_NAME_SURROGATE_BIT = 0x20000000
 
 
 def _is_reparse_point(path: Path) -> bool:
     """Symlink, or a Windows directory junction. os.path.islink reports False for
-    junctions and os.path.isjunction only exists on 3.12+, so both are checked and
-    an unreadable path is treated as suspect."""
+    junctions and os.path.isjunction only exists on 3.12+, so the link's reparse tag
+    is read too, and an unreadable path is treated as suspect."""
     try:
-        if path.is_symlink():
+        if path.is_symlink() or (_IS_JUNCTION and _IS_JUNCTION(path)):
             return True
-        return bool(_IS_JUNCTION and _IS_JUNCTION(path))
+        return bool(getattr(os.lstat(path), 'st_reparse_tag', 0) & _NAME_SURROGATE_BIT)
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
 
