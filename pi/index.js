@@ -3843,10 +3843,11 @@ function curl(args, proxied = false) {
   const out = [];
   const pins = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next, proxy] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next, proxy, scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    for (const url of urls) {
+    for (const written of urls) {
+      const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return out;
       out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, pins), proxied || proxy]));
@@ -3962,6 +3963,7 @@ function curlRequest(args, start) {
   const overrides = [];
   let method = "";
   let proxy = false;
+  let scheme = "";
   let i = start;
   while (i < args.length) {
     let arg = args[i++];
@@ -3985,10 +3987,11 @@ function curlRequest(args, start) {
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
     else if (CURL_PROXIES.has(arg) && value !== void 0) proxy = value !== "";
+    else if (arg === "--proto-default" && value !== void 0) scheme = value.trim().toLowerCase();
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy];
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy, scheme];
 }
 function wget(args, proxied = false) {
   const urls = [];

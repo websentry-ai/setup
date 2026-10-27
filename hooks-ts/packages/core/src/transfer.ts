@@ -2478,10 +2478,12 @@ function curl(args: string[], proxied = false): Raw[] {
   const out: Raw[] = [];
   const pins: string[] = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next, proxy] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next, proxy, scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    for (const url of urls) {
+    for (const written of urls) {
+      // A URL with no scheme takes --proto-default's, and so that scheme's port.
+      const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return out;
       out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, pins), proxied || proxy]));
@@ -2609,12 +2611,13 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
 
 /** The URLs of the curl request at args[start], whether it sends data, its --resolve and --connect-to values, whether
  *  it turns globbing off, and where the next request starts; a --next that is an option's value does not end it. */
-function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], boolean, number, boolean] {
+function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], boolean, number, boolean, string] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
   let method = "";
   let proxy = false;
+  let scheme = "";
   let i = start;
   while (i < args.length) {
     let arg = args[i++] as string;
@@ -2639,10 +2642,11 @@ function curlRequest(args: string[], start: number): [string[], boolean, [string
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
     else if (CURL_PROXIES.has(arg) && value !== undefined) proxy = value !== ""; // an empty one turns the proxy off
+    else if (arg === "--proto-default" && value !== undefined) scheme = value.trim().toLowerCase();
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy];
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy, scheme];
 }
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:

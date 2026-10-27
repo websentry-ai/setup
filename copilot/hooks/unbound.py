@@ -7748,10 +7748,12 @@ def _transfer_curl(args: List[str], proxied: bool = False) -> List[tuple]:
     whether it goes through a proxy, by option or by a proxy the command set."""
     endpoints, pins, i = [], [], 0
     while True:
-        urls, sends, overrides, globoff, i, proxy = _transfer_curl_request(args, i)
+        urls, sends, overrides, globoff, i, proxy, scheme = _transfer_curl_request(args, i)
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
         for url in urls:
+            # A URL with no scheme takes --proto-default's, and so that scheme's port.
+            url = scheme + '://' + url.strip() if scheme and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', url) else url
             expanded = [url] if globoff else _transfer_curl_glob(url)
             if expanded is None:
                 return endpoints
@@ -7866,9 +7868,9 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
     """(the URLs of the curl request at args[i], whether it sends data, its --resolve and --connect-to values, whether
-    it turns globbing off, where the next request starts, whether it names a proxy); a --next that is an option's value
-    does not end it."""
-    urls, flags, method, overrides, proxy = [], set(), '', [], False
+    it turns globbing off, where the next request starts, whether it names a proxy, its --proto-default scheme); a
+    --next that is an option's value does not end it."""
+    urls, flags, method, overrides, proxy, scheme = [], set(), '', [], False, ''
     while i < len(args):
         arg, value, i = args[i], None, i + 1
         if arg in ('-:', '--next'):
@@ -7896,9 +7898,11 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             overrides.append((arg, value))
         elif arg in _TRANSFER_CURL_PROXIES and value is not None:
             proxy = bool(value)  # an empty one turns the proxy off
+        elif arg == '--proto-default' and value is not None:
+            scheme = value.strip().lower()
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
-    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i, proxy
+    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i, proxy, scheme
 
 
 def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
@@ -9252,10 +9256,12 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 command = (call['arguments'].get('command') or call['arguments'].get('input')
                            or call['arguments'].get('text') or '')
                 if isinstance(command, str):
+                    # Read as map_copilot_tool reads it: a PowerShell tool's ; inside @{ } separates entries.
+                    script = _transfer_hashtables_emptied(command) if call['name'] == 'powershell' else command
                     shell_state.setdefault('transfer_dir', shell_state.get('dir'))
-                    shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
+                    shell_state['dir'] = _next_shell_dir(script, shell_state.get('dir'))
                     if ran:
-                        shell_state['transfer_dir'] = _transfer_next_cwd(command, shell_state['transfer_dir'])
+                        shell_state['transfer_dir'] = _transfer_next_cwd(script, shell_state['transfer_dir'])
             continue
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
                                   shell_state=shell_state, root_projects=root_projects,

