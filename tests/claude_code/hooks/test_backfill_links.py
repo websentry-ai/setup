@@ -124,6 +124,19 @@ class BackfillLinksTestCase(unittest.TestCase):
             self.assertEqual(list((home / ".claude" / "hooks").iterdir()), [])
         run.upload.assert_not_called()
 
+    def test_a_hooks_folder_linked_after_the_run_began_gets_no_state(self):
+        # Missing at the drain's check on a first run, then linked before the cutoff is written.
+        home = Path(self.root).parent / "home-late"
+        (home / ".claude" / "hooks").mkdir(parents=True)
+        mdm = uploaders[0]
+        with self._as_junction(home / ".claude" / "hooks"), mock.patch.object(mdm.platform, "system", return_value="Windows"):
+            mdm._backfill_write_cutoff(home, 1.0)
+            mdm._backfill_write_progress(home, 1.0, None)
+        self.assertEqual(list((home / ".claude" / "hooks").iterdir()), [])
+        with mock.patch.object(mdm.platform, "system", return_value="Windows"):
+            mdm._backfill_write_cutoff(home, 2.0)
+        self.assertEqual((home / ".claude" / "hooks" / mdm.BACKFILL_STATE_FILE).read_text(), "2.0")
+
 
 if __name__ == "__main__":
     unittest.main()
