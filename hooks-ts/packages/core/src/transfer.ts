@@ -81,6 +81,8 @@ const POWERSHELLS: ReadonlySet<string> = new Set(["powershell", "pwsh"]);
 const CLEAN_ENV = "\0clean";
 /** Set after eval or source, whose text may set any variable: one not set since then is unknown. */
 const UNKNOWN_ENV = "\0unknown";
+/** Set by set -a: "1" on, "" off, and a substitution when it may be either; plain assignments are then exported. */
+const ALLEXPORT = "\0allexport";
 /** Stands in for a substitution's output inside a word, so no host is read from it. */
 const SUBSTITUTED = "\0";
 /** Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has. */
@@ -1723,6 +1725,11 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
       const frame = frames.at(-1) as Frame;
       [frame.iterates, frame.repeats, frame.forever, frame.counter] = loop(word, rest, shell);
       touched(frame, loopCommands(frame, shell, shell.ends.get(`${shell.at},${item.argv.length - argv.length}`)?.[1]));
+      const name = word === "for" || word === "select" ? rest[0] ?? "" : "";
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && frame.iterates !== false) {
+        // Each pass sets the name, exported if it was or allexport is on.
+        shell.vars[name] = [SUBSTITUTED, autoExport(shell, variable(shell, name)[1])];
+      }
     }
     return word === "for" || word === "select" ? [] : rest; // a for loop's header runs nothing
   }
@@ -1946,6 +1953,7 @@ function marker(item: Item, shell: Shell): void {
 /** Apply an export, unset or declaration, or a command made only of assignments (name ""), to the commands after it. */
 function builtin(name: string, args: string[], shell: Shell): void {
   if (name === "unset") unset(args, shell);
+  else if (SETS.includes(name)) setOptions(name, args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
 }
@@ -1958,8 +1966,34 @@ function assign(name: string, args: string[], shell: Shell): void {
     const value = eq < 0 ? undefined : arg.slice(eq + 1);
     if (key.endsWith("+")) forget(shell, new Set([key.slice(0, -1)].filter(Boolean))); // bash appends, zsh rejects it
     else if (name === "export") shell.vars[key] = [value ?? variable(shell, key)[0], !args.includes("-n")];
-    else shell.vars[key] = [value, variable(shell, key)[1]]; // an exported one stays exported
+    else shell.vars[key] = [value, autoExport(shell, variable(shell, key)[1])];
   }
+}
+
+const SETS: readonly string[] = ["set", "setopt", "unsetopt"];
+const zshAllexport = (name: string): boolean =>
+  ["allexport", "noallexport"].includes(name.toLowerCase().replaceAll("_", ""));
+
+/** set -a, -o allexport or a cluster with a turns allexport on, and +a or +o allexport off. setopt, unsetopt and
+ *  zsh's spellings such as all_export leave it unknown, as bash has none of them. */
+function setOptions(name: string, args: string[], shell: Shell): void {
+  let i = 0;
+  while (name === "set" && /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i] as string)) {
+    const arg = args[i++] as string;
+    for (const flag of arg.slice(1)) {
+      const option = flag === "o" ? args[i++] ?? "" : flag === "a" ? "allexport" : "";
+      if (option === "allexport") shell.vars[ALLEXPORT] = [arg[0] === "-" ? "1" : "", true];
+      else if (zshAllexport(option)) forget(shell, new Set([ALLEXPORT]));
+    }
+  }
+  if (name !== "set" && args.some(zshAllexport)) forget(shell, new Set([ALLEXPORT]));
+}
+
+/** Whether a variable assigned now is exported: always while allexport is on, maybe while it may be, else as before. */
+function autoExport(shell: Shell, exported: Variable[1]): Variable[1] {
+  const allexport = shell.vars[ALLEXPORT]?.[0] ?? "";
+  if (exported === true || isLent(exported) || allexport === "") return exported;
+  return allexport === "1" ? true : undefined;
 }
 
 /** unset -f removes functions, and -v or a bare name variables with their export. A bare name with no variable set
@@ -2021,7 +2055,8 @@ function declare(name: string, args: string[], shell: Shell): void {
       continue;
     }
     const [current, exported] = variable(shell, key);
-    shell.vars[key] = [eq < 0 ? current : arg.slice(eq + 1), on !== "" ? true : off !== "" ? false : exported];
+    shell.vars[key] = [eq < 0 ? current : arg.slice(eq + 1),
+      on !== "" ? true : off !== "" ? false : eq >= 0 ? autoExport(shell, exported) : exported];
   }
 }
 
@@ -2286,13 +2321,13 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   }
   if ((own === "eval" || own === "source" || own === ".") && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
     // Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
-    forget(shell, new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
+    forget(shell, new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), "", ALLEXPORT]));
     shell.vars[UNKNOWN_ENV] = [undefined, undefined];
     // It may also redefine any function, so each one known may no longer run as written.
     for (const [fname, known] of shell.functions) shell.functions.set(fname, [known[0], true]);
   }
   if (own === "cd" || own === "pushd" || own === "popd" || own === "export" || own === "unset" ||
-    DECLARES.includes(own as string) || assigns) {
+    SETS.includes(own as string) || DECLARES.includes(own as string) || assigns) {
     // A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
     if (((before !== "|" && item.after !== "|") || subshell === undefined) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
@@ -3038,12 +3073,14 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
     const name = psParameter(colon < 0 ? arg.slice(1) : arg.slice(1, colon));
     if (name === "") return []; // a name that starts several parameters, which PowerShell rejects
     let value = colon < 0 ? "" : arg.slice(colon + 1);
-    if (colon < 0 && !PS_SWITCHES.has(name) && i < args.length) value = args[i++] as string;
+    // -Name: value binds the next word, even for a switch.
+    if ((colon >= 0 ? value === "" : !PS_SWITCHES.has(name)) && i < args.length) value = args[i++] as string;
     if (name === "uri") uri = value;
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
     else if (name === "proxy") proxy = value !== "";
-    else if (name === "noproxy") proxy ??= false;
+    // -NoProxy:$false, or a value not known here, leaves the proxy on.
+    else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) proxy ??= false;
   }
   uri ||= positional[0] ?? "";
   // It goes through a proxy with -Proxy, or one the command set unless -NoProxy.
@@ -3477,9 +3514,11 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
   } else {
     lookup &&= !(sshOptions !== undefined && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === undefined || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
+    // A failed or refused ssh -G leaves where a config sends the host unknown, so the host isn't looked up instead.
+    const failed = sshOptions !== undefined && lookup && name === "";
     // Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
-    resolved = jumps ? host : name || host;
-    kind = await address(resolved, state, lookup && !jumps);
+    resolved = jumps || failed ? host : name || host;
+    kind = failed ? "unresolved" : await address(resolved, state, lookup && !jumps);
   }
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;

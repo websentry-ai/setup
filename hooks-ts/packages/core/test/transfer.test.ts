@@ -373,6 +373,21 @@ test("Match criteria are read as ssh reads them", async () => {
   assert.equal(calls.length, 1);
 });
 
+test("a failed or refused ssh -G never falls back to looking up the host as written", async () => {
+  // Looking up the alias itself would classify a host the config may send elsewhere.
+  const dir = repo();
+  writeFileSync(join(dir, "exec.cfg"), 'Match exec "true"\n');
+  const lookups: string[] = [];
+  const recording: LookupLike = async (host) => (lookups.push(host), lookup(host));
+  const failing: ExecFileLike = async () => undefined;
+  const expected = [{ direction: "out", host: "example.com", resolved_host: "example.com", address: "unresolved" }];
+  assert.deepEqual((await transfer("scp f example.com:/tmp", dir, { execFile: failing, lookup: recording }))?.endpoints, expected);
+  for (const command of ["scp -F exec.cfg f example.com:/tmp", "scp -F '~/cfg' f example.com:/tmp"]) {
+    assert.deepEqual((await transfer(command, dir, { lookup: recording }))?.endpoints, expected, command);
+  }
+  assert.deepEqual(lookups, []);
+});
+
 test("a hanging lookup is cut off, the turn ends on time, and a spent budget runs nothing", async () => {
   let release: () => void = () => {};
   const hung = new Promise<void>((done) => (release = done));

@@ -3823,6 +3823,8 @@ _TRANSFER_POWERSHELLS = frozenset({'powershell', 'pwsh'})
 _TRANSFER_CLEAN_ENV = '\0clean'
 # Set after eval or source, whose text may set any variable: one not set since then is unknown.
 _TRANSFER_UNKNOWN_ENV = '\0unknown'
+# Set by set -a: '1' on, '' off, and a substitution when it may be either; plain assignments are then exported.
+_TRANSFER_ALLEXPORT = '\0allexport'
 # Stands in for a substitution's output inside a word, so no host is read from it.
 _TRANSFER_SUBSTITUTED = '\0'
 # Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has.
@@ -5178,6 +5180,11 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
             loop['iterates'], loop['repeats'], loop['forever'], loop['counter'] = _transfer_loop(keyword, rest, shell)
             end = shell['ends'].get((shell['at'], len(item[1]) - len(words)), ('', None))[1]
             _transfer_touched(loop, _transfer_loop_commands(loop, shell, end))
+            name = rest[0] if keyword in ('for', 'select') and rest else ''
+            if re.fullmatch(_TRANSFER_NAME, name) and loop['iterates'] is not False:
+                # Each pass sets the name, exported if it was or allexport is on.
+                exported = _transfer_auto_export(shell, _transfer_variable(shell, name)[1])
+                shell['vars'][name] = (_TRANSFER_SUBSTITUTED, exported)
         return [] if keyword in ('for', 'select') else rest  # a for loop's header runs nothing
     if keyword in ('!', 'function', 'time'):
         # `!` flips the status of the whole pipeline it leads, a compound included, and a second one flips it back;
@@ -5405,6 +5412,8 @@ def _transfer_builtin(program: str, args: List[str], shell: Dict) -> None:
     after it."""
     if program == 'unset':
         _transfer_unset(args, shell)
+    elif program in _TRANSFER_SETS:
+        _transfer_set(program, args, shell)
     elif program in _TRANSFER_DECLARES:
         _transfer_declare(program, args, shell)
     else:
@@ -5420,7 +5429,36 @@ def _transfer_assign(program: str, args: List[str], shell: Dict) -> None:
         elif program == 'export':
             shell['vars'][name] = (value if eq else _transfer_variable(shell, name)[0], '-n' not in args)
         else:
-            shell['vars'][name] = (value, _transfer_variable(shell, name)[1])  # an exported one stays exported
+            shell['vars'][name] = (value, _transfer_auto_export(shell, _transfer_variable(shell, name)[1]))
+
+
+_TRANSFER_SETS = ('set', 'setopt', 'unsetopt')
+
+
+def _transfer_set(program: str, args: List[str], shell: Dict) -> None:
+    """set -a, -o allexport or a cluster with a turns allexport on, and +a or +o allexport off. setopt, unsetopt and
+    zsh's spellings such as all_export leave it unknown, as bash has none of them."""
+    i = 0
+    while program == 'set' and i < len(args) and args[i][:1] in ('-', '+') and args[i] not in ('-', '--', '+'):
+        arg, i = args[i], i + 1
+        for flag in arg[1:]:
+            name = (args[i] if i < len(args) else '') if flag == 'o' else 'allexport' if flag == 'a' else ''
+            i += flag == 'o'
+            if name == 'allexport':
+                shell['vars'][_TRANSFER_ALLEXPORT] = ('1' if arg[0] == '-' else '', True)
+            elif name.lower().replace('_', '') in ('allexport', 'noallexport'):
+                _transfer_forget(shell, {_TRANSFER_ALLEXPORT})
+    if program != 'set' and any(a.lower().replace('_', '') in ('allexport', 'noallexport') for a in args):
+        _transfer_forget(shell, {_TRANSFER_ALLEXPORT})
+
+
+def _transfer_auto_export(shell: Dict, exported) -> Optional[bool]:
+    """Whether a variable assigned now is exported: always while allexport is on, maybe while it may be, else as
+    before."""
+    allexport = shell['vars'].get(_TRANSFER_ALLEXPORT, ('', True))[0]
+    if exported is True or exported in _TRANSFER_LENT or allexport == '':
+        return exported
+    return True if allexport == '1' else None
 
 
 def _transfer_unset(args: List[str], shell: Dict) -> None:
@@ -5471,7 +5509,8 @@ def _transfer_declare(program: str, args: List[str], shell: Dict) -> None:
                 shell['scoped'][-1].add(name.rstrip('+'))
             continue
         current, exported = _transfer_variable(shell, name)
-        shell['vars'][name] = (value if eq else current, True if on else False if off else exported)
+        shell['vars'][name] = (value if eq else current, True if on else False if off else
+                               _transfer_auto_export(shell, exported) if eq else exported)
 
 
 def _transfer_stdin_script(program: str, args: List[str]) -> Optional[List[str]]:
@@ -5734,11 +5773,11 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_forget(shell, _transfer_read_names(program, args))
     if builtin in ('eval', 'source', '.') and ((before != '|' and after != '|') or subshell is None):
         # Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
-        _transfer_forget(shell, {name for name in shell['vars'] if not name.startswith('\0')} | {''})
+        _transfer_forget(shell, {n for n in shell['vars'] if not n.startswith('\0')} | {'', _TRANSFER_ALLEXPORT})
         shell['vars'][_TRANSFER_UNKNOWN_ENV] = (None, None)
         # It may also redefine any function, so each one known may no longer run as written.
         shell['functions'] = {name: (known[0], True) for name, known in shell['functions'].items()}
-    if builtin in ('cd', 'pushd', 'popd', 'export', 'unset') + _TRANSFER_DECLARES or assigns:
+    if builtin in ('cd', 'pushd', 'popd', 'export', 'unset') + _TRANSFER_SETS + _TRANSFER_DECLARES or assigns:
         # A pipeline's commands run in subshells, so their cd and variables end with them, but for the last in zsh.
         if ((before != '|' and after != '|') or subshell is None) and _transfer_execs(words) is False:
             saved = _transfer_snapshot(shell)
@@ -6439,16 +6478,18 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
         name = _transfer_ps_parameter(name)
         if not name:
             return []  # a name that starts several parameters, which PowerShell rejects
-        if not colon and name not in _TRANSFER_PS_SWITCHES and i < len(args):
-            value, i = args[i], i + 1
+        if (colon and not value or not colon and name not in _TRANSFER_PS_SWITCHES) and i < len(args):
+            value, i = args[i], i + 1  # -Name: value binds the next word, even for a switch
         if name == 'uri':
             uri = value
         elif name in ('body', 'infile', 'form'):
             out = True
         elif name in ('method', 'custommethod') and value.upper() in _TRANSFER_SENDING_METHODS:
             out = True
-        elif name in ('proxy', 'noproxy'):
-            proxy = bool(value) if name == 'proxy' else proxy or False
+        elif name == 'proxy':
+            proxy = bool(value)
+        elif name == 'noproxy' and (not colon or value.lower() in ('$true', '1')):
+            proxy = proxy or False  # -NoProxy:$false, or a value not known here, leaves the proxy on
     uri = uri or (positional[0] if positional else '')
     proxy = proxied if proxy is None else proxy
     return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri \
@@ -6807,9 +6848,11 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         lookup = lookup and not (ssh_options is not None and _transfer_ssh_jumps(ssh_options))
         resolved, jumps = _transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and \
             lookup else ('', False)
+        # A failed or refused ssh -G leaves where a config sends the host unknown, so the host isn't looked up instead.
+        failed = ssh_options is not None and lookup and not resolved
         # Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
-        resolved = host if jumps else resolved or host
-        address = _transfer_address(resolved, state, lookup and not jumps)
+        resolved = host if jumps or failed else resolved or host
+        address = 'unresolved' if failed else _transfer_address(resolved, state, lookup and not jumps)
     endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
     return {k: v for k, v in endpoint.items() if v}
 

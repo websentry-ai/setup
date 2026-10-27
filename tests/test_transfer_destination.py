@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '696aedf383da72e8a3dd853bf9673d6930d3a289ae928be36a57c5de9e5d406a'
+BLOCK_SHA256 = '30fa404c3ee166f3599878f9355f4c70d50b7c3a75550ea6b45b97807b645489'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -825,6 +825,20 @@ class TimeLimitTests(TransferTestCase):
                 self.assertEqual({e['address'] for e in transfer['endpoints']}, {'unresolved'})
                 run.assert_not_called()
                 lookup.assert_not_called()
+
+    def test_a_failed_or_refused_ssh_lookup_never_falls_back_to_dns(self):
+        # The config sends example.com elsewhere, so looking up the alias itself would classify the wrong host.
+        Path(self.home, '.ssh', 'config').write_text('Host example.com\n  HostName 10.0.4.12\n')
+        Path(self.repo, 'exec.cfg').write_text('Match exec "true"\n')
+        for command, sleep in (('scp f example.com:/tmp', '3'), ('scp -F exec.cfg f example.com:/tmp', '0'),
+                               ("scp -F '~/cfg' f example.com:/tmp", '0')):
+            os.environ['FAKE_SSH_SLEEP'] = sleep
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__, command=command), patch.object(hook, '_TRANSFER_RUN_TIMEOUT', 0.3), \
+                        patch('socket.getaddrinfo', side_effect=_getaddrinfo) as lookup:
+                    transfer = hook._transfer(command, self.repo, {})
+                    self.assertEqual(transfer['endpoints'], [_endpoint('out', 'example.com', 'unresolved')])
+                    lookup.assert_not_called()
 
     def test_any_error_leaves_the_call_without_a_transfer(self):
         for hook in HOOKS:

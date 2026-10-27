@@ -1921,6 +1921,7 @@ var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]
 var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
 var UNKNOWN_ENV = "\0unknown";
+var ALLEXPORT = "\0allexport";
 var SUBSTITUTED = "\0";
 var BRACE_MARKS = { "{": "", ",": "", "}": "" };
 var LITERAL_TILDE = "";
@@ -3247,6 +3248,10 @@ function keyword(argv, item, shell) {
       const frame = frames.at(-1);
       [frame.iterates, frame.repeats, frame.forever, frame.counter] = loop(word, rest, shell);
       touched(frame, loopCommands(frame, shell, shell.ends.get(`${shell.at},${item.argv.length - argv.length}`)?.[1]));
+      const name = word === "for" || word === "select" ? rest[0] ?? "" : "";
+      if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) && frame.iterates !== false) {
+        shell.vars[name] = [SUBSTITUTED, autoExport(shell, variable(shell, name)[1])];
+      }
     }
     return word === "for" || word === "select" ? [] : rest;
   }
@@ -3431,6 +3436,7 @@ function marker(item, shell) {
 }
 function builtin(name, args, shell) {
   if (name === "unset") unset(args, shell);
+  else if (SETS.includes(name)) setOptions(name, args, shell);
   else if (DECLARES.includes(name)) declare(name, args, shell);
   else assign(name, args, shell);
 }
@@ -3441,8 +3447,27 @@ function assign(name, args, shell) {
     const value = eq < 0 ? void 0 : arg.slice(eq + 1);
     if (key.endsWith("+")) forget(shell, new Set([key.slice(0, -1)].filter(Boolean)));
     else if (name === "export") shell.vars[key] = [value ?? variable(shell, key)[0], !args.includes("-n")];
-    else shell.vars[key] = [value, variable(shell, key)[1]];
+    else shell.vars[key] = [value, autoExport(shell, variable(shell, key)[1])];
   }
+}
+var SETS = ["set", "setopt", "unsetopt"];
+var zshAllexport = (name) => ["allexport", "noallexport"].includes(name.toLowerCase().replaceAll("_", ""));
+function setOptions(name, args, shell) {
+  let i = 0;
+  while (name === "set" && /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i])) {
+    const arg = args[i++];
+    for (const flag of arg.slice(1)) {
+      const option = flag === "o" ? args[i++] ?? "" : flag === "a" ? "allexport" : "";
+      if (option === "allexport") shell.vars[ALLEXPORT] = [arg[0] === "-" ? "1" : "", true];
+      else if (zshAllexport(option)) forget(shell, /* @__PURE__ */ new Set([ALLEXPORT]));
+    }
+  }
+  if (name !== "set" && args.some(zshAllexport)) forget(shell, /* @__PURE__ */ new Set([ALLEXPORT]));
+}
+function autoExport(shell, exported) {
+  const allexport = shell.vars[ALLEXPORT]?.[0] ?? "";
+  if (exported === true || isLent(exported) || allexport === "") return exported;
+  return allexport === "1" ? true : void 0;
 }
 function unset(args, shell) {
   const sure = shell.pipe.runs === true && !doubt(shell.pipe);
@@ -3494,7 +3519,10 @@ function declare(name, args, shell) {
       continue;
     }
     const [current, exported] = variable(shell, key);
-    shell.vars[key] = [eq < 0 ? current : arg.slice(eq + 1), on !== "" ? true : off !== "" ? false : exported];
+    shell.vars[key] = [
+      eq < 0 ? current : arg.slice(eq + 1),
+      on !== "" ? true : off !== "" ? false : eq >= 0 ? autoExport(shell, exported) : exported
+    ];
   }
 }
 function stdinScript(name, args) {
@@ -3714,11 +3742,11 @@ function simple(words2, item, before, shell, depth) {
     forget(shell, readNames(name, args));
   }
   if ((own === "eval" || own === "source" || own === ".") && (before !== "|" && item.after !== "|" || subshell === void 0)) {
-    forget(shell, /* @__PURE__ */ new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), ""]));
+    forget(shell, /* @__PURE__ */ new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), "", ALLEXPORT]));
     shell.vars[UNKNOWN_ENV] = [void 0, void 0];
     for (const [fname, known2] of shell.functions) shell.functions.set(fname, [known2[0], true]);
   }
-  if (own === "cd" || own === "pushd" || own === "popd" || own === "export" || own === "unset" || DECLARES.includes(own) || assigns) {
+  if (own === "cd" || own === "pushd" || own === "popd" || own === "export" || own === "unset" || SETS.includes(own) || DECLARES.includes(own) || assigns) {
     if ((before !== "|" && item.after !== "|" || subshell === void 0) && execsThrough(argv) === false) {
       const saved = snapshot(shell);
       if (moved !== void 0) shell.cwd = moved[0];
@@ -4362,12 +4390,12 @@ function webCmdlet(args, sends, proxied = false) {
     const name = psParameter(colon < 0 ? arg.slice(1) : arg.slice(1, colon));
     if (name === "") return [];
     let value = colon < 0 ? "" : arg.slice(colon + 1);
-    if (colon < 0 && !PS_SWITCHES.has(name) && i < args.length) value = args[i++];
+    if ((colon >= 0 ? value === "" : !PS_SWITCHES.has(name)) && i < args.length) value = args[i++];
     if (name === "uri") uri = value;
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
     else if (name === "proxy") proxy = value !== "";
-    else if (name === "noproxy") proxy ??= false;
+    else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) proxy ??= false;
   }
   uri ||= positional[0] ?? "";
   return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
@@ -4718,8 +4746,9 @@ async function endpoint(raw, cwd, state, sure = true) {
   } else {
     lookup &&= !(sshOptions !== void 0 && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === void 0 || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
-    resolved = jumps ? host : name || host;
-    kind = await address(resolved, state, lookup && !jumps);
+    const failed = sshOptions !== void 0 && lookup && name === "";
+    resolved = jumps || failed ? host : name || host;
+    kind = failed ? "unresolved" : await address(resolved, state, lookup && !jumps);
   }
   const out = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
