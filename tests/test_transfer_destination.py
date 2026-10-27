@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '935a8b9b7468f217e4b4752921b4c7d4d4e0e63fe9ae2eb5cd011b3edc6ee910'
+BLOCK_SHA256 = '8e3d2f044bbe8617fe52d75a6803b5aee4167616bd9e2062d5d183e869a07b90'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -389,13 +389,14 @@ class CopyTests(TransferTestCase):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved')])
         self.assert_endpoints('scp -J jump f 10.0.4.12:/tmp', [_endpoint('out', '10.0.4.12', 'private')])
         self.assertEqual(self.ssh_calls(), [])
-        # A jump host the config names, as ssh -G reports it, keeps the config's name but is not looked up.
+        # A jump host the config names, as ssh -G reports it, carries the bytes where it sends them, so neither the
+        # config's HostName nor its address is reported.
         Path(self.repo, 'jump_cfg').write_text('Host prod\n  HostName files.acme-infra.net\n')
         self.assert_endpoints('scp -F jump_cfg f prod:/tmp',
                               [_endpoint('out', 'prod', 'private', 'files.acme-infra.net')])
-        Path(self.repo, 'jump_cfg').write_text('Host prod\n  HostName files.acme-infra.net\n  ProxyJump bastion\n')
-        self.assert_endpoints('scp -F jump_cfg f prod:/tmp',
-                              [_endpoint('out', 'prod', 'unresolved', 'files.acme-infra.net')])
+        for jump in ('ProxyJump bastion', 'ProxyCommand nc %h %p'):
+            Path(self.repo, 'jump_cfg').write_text(f'Host prod\n  HostName files.acme-infra.net\n  {jump}\n')
+            self.assert_endpoints('scp -F jump_cfg f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
 
     def test_rsync_reads_its_remote_shell_and_a_daemon_is_never_looked_up(self):
         for command in ('rsync -a -e "ssh -F frontend/cfg -p 2200" src prod:/dest',

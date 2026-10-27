@@ -100,7 +100,11 @@ const TOOLS: Record<string, string> = {
 };
 const SENDING_METHODS: ReadonlySet<string> = new Set(["POST", "PUT", "PATCH"]);
 /** The port a URL connects to when it names none, by scheme. */
-const DEFAULT_PORTS: Record<string, number> = { http: 80, https: 443, ftp: 21, ftps: 990, ws: 80, wss: 443 };
+const DEFAULT_PORTS: Record<string, number> = {
+  http: 80, https: 443, ftp: 21, ftps: 990, ws: 80, wss: 443, scp: 22, sftp: 22, imap: 143, imaps: 993, pop3: 110,
+  pop3s: 995, smtp: 25, smtps: 465, ldap: 389, ldaps: 636, dict: 2628, gopher: 70, gophers: 70, rtsp: 554, telnet: 23,
+  tftp: 69, mqtt: 1883, smb: 445, smbs: 445,
+};
 /** The URL schemes each tool speaks; a URL with any other reaches no host. */
 const CURL_SCHEMES: ReadonlySet<string> = new Set(("dict ftp ftps gopher gophers http https imap imaps ldap ldaps mqtt pop3 " +
   "pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss").split(" "));
@@ -116,8 +120,11 @@ const SSH_VALUE_FLAGS: Record<string, string> = {
 /** Of ssh's -o settings, only these change which host or user ssh -G resolves. */
 const SSH_IDENTITY_OPTIONS: ReadonlySet<string> = new Set(["hostname", "user", "port", "proxyjump", "proxycommand"]);
 /** A host reached through one of these is resolved by the proxy, so it is never looked up here. */
-const CURL_PROXIES: ReadonlySet<string> = new Set(["-x", "--proxy", "--preproxy", "--socks4", "--socks4a", "--socks5",
-  "--socks5-hostname"]);
+/** curl's proxy options and the kind of proxy each names; -x, --proxy and --preproxy name it by their URL's scheme. */
+const CURL_PROXIES: Record<string, string> = {
+  "-x": "", "--proxy": "", "--preproxy": "", "--socks4": "socks4", "--socks4a": "socks4a", "--socks5": "socks5",
+  "--socks5-hostname": "socks5h",
+};
 const PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ftp_proxy", "FTP_PROXY", "all_proxy", "ALL_PROXY"];
 const SSH_CONFIG_MAX_BYTES = 256 * 1024;
 const SSH_CONFIG_MAX_FILES = 32;
@@ -2472,13 +2479,44 @@ function proxiedEnv(env: Env): boolean {
   return PROXY_ENV.some((key) => Boolean(env[key]));
 }
 
-/** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each carries whether it goes
- *  through a proxy, by option or by a proxy the command set. */
-function curl(args: string[], proxied = false): Raw[] {
+/** The kind of proxy a curl proxy string names: its scheme, or `fallback` when it has none; empty for none. */
+function proxyKind(value: string, fallback = "http"): string {
+  const text = value.trim();
+  if (text === "") return "";
+  const kind = text.includes("://") ? (text.split("://")[0] as string).toLowerCase() : fallback;
+  return kind === "https" ? "http" : kind;
+}
+
+/** Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
+ *  SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and a --noproxy entry or an empty -x turns
+ *  the proxy off. `kind` is the request's own, or undefined for a proxy the command set in curl's environment. */
+function curlRemote(url: string, kind: string | undefined, noproxy: string[] | undefined, env: Env): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(urlText(url));
+  } catch {
+    return false;
+  }
+  const scheme = parsed.protocol.slice(0, -1).toLowerCase();
+  let proxy = kind;
+  if (proxy === undefined) {
+    const names = [`${scheme}_proxy`, ...(scheme === "http" ? [] : [`${scheme.toUpperCase()}_PROXY`]), "all_proxy", "ALL_PROXY"];
+    proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const entries = (noproxy ?? []).map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
+  if (!proxy || entries.some((entry) => entry === "*" || (entry !== "" && (host === entry || host.endsWith(`.${entry}`))))) return false;
+  return proxy !== "socks4" && proxy !== "socks5";
+}
+
+/** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each carries whether a proxy, by
+ *  option or one the command set in `env`, resolves its name; such a proxy is handed the --connect-to target, and no
+ *  --resolve pin applies. */
+function curl(args: string[], env: Env = {}): Raw[] {
   const out: Raw[] = [];
   const pins: string[] = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next, proxy, scheme] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const written of urls) {
@@ -2486,9 +2524,10 @@ function curl(args: string[], proxied = false): Raw[] {
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return out;
-      // Through a proxy, the proxy resolves the name, so no --resolve or --connect-to pin decides where it goes.
-      const through = proxied || proxy;
-      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, through ? undefined : curlDial(one, connects, pins), through]));
+      for (const one of expanded) {
+        const remote = curlRemote(one, kind, noproxy, env);
+        out.push([sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, remote ? [] : pins), remote]);
+      }
     }
     if (next >= args.length) return out;
     i = next;
@@ -2612,13 +2651,20 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
 }
 
 /** The URLs of the curl request at args[start], whether it sends data, its --resolve and --connect-to values, whether
- *  it turns globbing off, and where the next request starts; a --next that is an option's value does not end it. */
-function curlRequest(args: string[], start: number): [string[], boolean, [string, string][], boolean, number, boolean, string] {
+ *  it turns globbing off, where the next request starts, [the kind of proxy it names, empty for none and undefined
+ *  when it names none, its --noproxy entries], and its --proto-default scheme; a --next that is an option's value does
+ *  not end it. */
+function curlRequest(
+  args: string[], start: number,
+): [string[], boolean, [string, string][], boolean, number, [string | undefined, string[] | undefined], string] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
   let method = "";
-  let proxy = false;
+  // The kind of proxy the request names, empty for none and undefined when it names none, and its --noproxy entries.
+  let kind: string | undefined;
+  let preproxy: string | undefined;
+  let noproxy: string[] | undefined;
   let scheme = "";
   let i = start;
   while (i < args.length) {
@@ -2643,12 +2689,16 @@ function curlRequest(args: string[], start: number): [string[], boolean, [string
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
-    else if (CURL_PROXIES.has(arg) && value !== undefined) proxy = value !== ""; // an empty one turns the proxy off
+    else if (arg === "--preproxy" && value !== undefined) preproxy = proxyKind(value, "socks4");
+    // An empty one turns the proxy off; a --socks option names its kind, and -x its URL's scheme.
+    else if (Object.hasOwn(CURL_PROXIES, arg) && value !== undefined) kind = value.trim() === "" ? "" : CURL_PROXIES[arg] || proxyKind(value);
+    else if (arg === "--noproxy" && value !== undefined) noproxy = value.split(",");
     else if (arg === "--proto-default" && value !== undefined) scheme = value.trim().toLowerCase();
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy, scheme];
+  // Without -x, a --preproxy is the SOCKS proxy the request goes through.
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
 }
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:
@@ -2679,7 +2729,7 @@ function wget(args: string[], proxied = false): Raw[] {
     }
   }
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
-  const proxy = on && (proxied || settings.has("useproxy") || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
+  const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
   return urls.map((url): Raw => [direction, urlHost(url, WGET_SCHEMES), undefined, undefined, proxy]);
 }
@@ -2793,25 +2843,40 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }
 
+/** nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x,
+ *  reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or SOCKS4 (ncat's
+ *  --proxy-type socks4 or nc's -X 4), resolves it here; -X with no -x connects directly. */
 function netcat(args: string[], sends: boolean): Raw[] {
   const positional: string[] = [];
   const flags = new Set<string>();
+  const values = new Map<string, string>();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
     if (arg.startsWith("--")) {
-      if (!arg.includes("=") && NC_LONG_VALUES.has(arg)) i++;
-      flags.add(arg.split("=")[0] as string); // --proxy=host:port is --proxy
+      const eq = arg.indexOf("="); // --proxy=host:port is --proxy
+      const name = eq < 0 ? arg : arg.slice(0, eq);
+      const value = eq >= 0 ? arg.slice(eq + 1) : NC_LONG_VALUES.has(name) ? (args[i++] ?? "") : "";
+      flags.add(name);
+      values.set(name, value.toLowerCase());
     } else if (arg.startsWith("-") && arg.length > 1) {
       let flag: string;
-      [flag, , i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
+      let value: string | undefined;
+      [flag, value, i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
       flags.add(flag);
+      values.set(flag, (value ?? "").toLowerCase());
     } else {
       positional.push(arg);
     }
   }
   if (positional[0] === undefined || ["-l", "--listen", "-U", "--unixsock"].some((f) => flags.has(f))) return [];
-  // ncat's --proxy, or OpenBSD nc's -x or -X, reaches the host through a proxy.
-  return [[sends ? "out" : "", positional[0], undefined, undefined, ["--proxy", "-x", "-X"].some((f) => flags.has(f))]];
+  let remote: boolean;
+  if (flags.has("--proxy")) {
+    const dns = values.get("--proxy-dns") || (values.get("--proxy-type") === "socks4" ? "local" : "remote");
+    remote = dns !== "local" && dns !== "both";
+  } else {
+    remote = flags.has("-x") && values.get("-X") !== "4";
+  }
+  return [[sends ? "out" : "", positional[0], undefined, undefined, remote]];
 }
 
 function socat(args: string[], sends: boolean): Raw[] {
@@ -2933,7 +2998,7 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   let raw: Raw[];
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env);
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
@@ -3316,7 +3381,8 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
   } else {
     lookup &&= !(sshOptions !== undefined && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === undefined || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
-    resolved = name || host;
+    // Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
+    resolved = jumps ? host : name || host;
     kind = await address(resolved, state, lookup && !jumps);
   }
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };

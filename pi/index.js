@@ -1945,7 +1945,33 @@ var TOOLS = {
   irm: "powershell"
 };
 var SENDING_METHODS = /* @__PURE__ */ new Set(["POST", "PUT", "PATCH"]);
-var DEFAULT_PORTS = { http: 80, https: 443, ftp: 21, ftps: 990, ws: 80, wss: 443 };
+var DEFAULT_PORTS = {
+  http: 80,
+  https: 443,
+  ftp: 21,
+  ftps: 990,
+  ws: 80,
+  wss: 443,
+  scp: 22,
+  sftp: 22,
+  imap: 143,
+  imaps: 993,
+  pop3: 110,
+  pop3s: 995,
+  smtp: 25,
+  smtps: 465,
+  ldap: 389,
+  ldaps: 636,
+  dict: 2628,
+  gopher: 70,
+  gophers: 70,
+  rtsp: 554,
+  telnet: 23,
+  tftp: 69,
+  mqtt: 1883,
+  smb: 445,
+  smbs: 445
+};
 var CURL_SCHEMES = new Set("dict ftp ftps gopher gophers http https imap imaps ldap ldaps mqtt pop3 pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss".split(" "));
 var WGET_SCHEMES = /* @__PURE__ */ new Set(["http", "https", "ftp", "ftps"]);
 var HTTPIE_SCHEMES = /* @__PURE__ */ new Set(["http", "https"]);
@@ -1958,15 +1984,15 @@ var SSH_VALUE_FLAGS = {
   rsync: "efTMB@"
 };
 var SSH_IDENTITY_OPTIONS = /* @__PURE__ */ new Set(["hostname", "user", "port", "proxyjump", "proxycommand"]);
-var CURL_PROXIES = /* @__PURE__ */ new Set([
-  "-x",
-  "--proxy",
-  "--preproxy",
-  "--socks4",
-  "--socks4a",
-  "--socks5",
-  "--socks5-hostname"
-]);
+var CURL_PROXIES = {
+  "-x": "",
+  "--proxy": "",
+  "--preproxy": "",
+  "--socks4": "socks4",
+  "--socks4a": "socks4a",
+  "--socks5": "socks5",
+  "--socks5-hostname": "socks5h"
+};
 var PROXY_ENV = ["http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY", "ftp_proxy", "FTP_PROXY", "all_proxy", "ALL_PROXY"];
 var SSH_CONFIG_MAX_BYTES = 256 * 1024;
 var SSH_CONFIG_MAX_FILES = 32;
@@ -3839,19 +3865,45 @@ function urlHost(url, schemes) {
 function proxiedEnv(env) {
   return PROXY_ENV.some((key) => Boolean(env[key]));
 }
-function curl(args, proxied = false) {
+function proxyKind(value, fallback = "http") {
+  const text = value.trim();
+  if (text === "") return "";
+  const kind = text.includes("://") ? text.split("://")[0].toLowerCase() : fallback;
+  return kind === "https" ? "http" : kind;
+}
+function curlRemote(url, kind, noproxy, env) {
+  let parsed;
+  try {
+    parsed = new URL(urlText(url));
+  } catch {
+    return false;
+  }
+  const scheme = parsed.protocol.slice(0, -1).toLowerCase();
+  let proxy = kind;
+  if (proxy === void 0) {
+    const names = [`${scheme}_proxy`, ...scheme === "http" ? [] : [`${scheme.toUpperCase()}_PROXY`], "all_proxy", "ALL_PROXY"];
+    proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
+  }
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const entries = (noproxy ?? []).map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
+  if (!proxy || entries.some((entry) => entry === "*" || entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
+  return proxy !== "socks4" && proxy !== "socks5";
+}
+function curl(args, env = {}) {
   const out = [];
   const pins = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next, proxy, scheme] = curlRequest(args, i);
+    const [urls, sends, overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const written of urls) {
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return out;
-      const through = proxied || proxy;
-      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, through ? void 0 : curlDial(one, connects, pins), through]));
+      for (const one of expanded2) {
+        const remote2 = curlRemote(one, kind, noproxy, env);
+        out.push([sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, remote2 ? [] : pins), remote2]);
+      }
     }
     if (next >= args.length) return out;
     i = next;
@@ -3963,7 +4015,9 @@ function curlRequest(args, start) {
   const flags = /* @__PURE__ */ new Set();
   const overrides = [];
   let method = "";
-  let proxy = false;
+  let kind;
+  let preproxy;
+  let noproxy;
   let scheme = "";
   let i = start;
   while (i < args.length) {
@@ -3987,12 +4041,14 @@ function curlRequest(args, start) {
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
-    else if (CURL_PROXIES.has(arg) && value !== void 0) proxy = value !== "";
+    else if (arg === "--preproxy" && value !== void 0) preproxy = proxyKind(value, "socks4");
+    else if (Object.hasOwn(CURL_PROXIES, arg) && value !== void 0) kind = value.trim() === "" ? "" : CURL_PROXIES[arg] || proxyKind(value);
+    else if (arg === "--noproxy" && value !== void 0) noproxy = value.split(",");
     else if (arg === "--proto-default" && value !== void 0) scheme = value.trim().toLowerCase();
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, proxy, scheme];
+  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
 }
 function wget(args, proxied = false) {
   const urls = [];
@@ -4020,7 +4076,7 @@ function wget(args, proxied = false) {
     }
   }
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
-  const proxy = on && (proxied || settings.has("useproxy") || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
+  const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
   return urls.map((url) => [direction, urlHost(url, WGET_SCHEMES), void 0, void 0, proxy]);
 }
@@ -4118,21 +4174,34 @@ function sshPipe(args, fed, receives) {
 function netcat(args, sends) {
   const positional = [];
   const flags = /* @__PURE__ */ new Set();
+  const values = /* @__PURE__ */ new Map();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
     if (arg.startsWith("--")) {
-      if (!arg.includes("=") && NC_LONG_VALUES.has(arg)) i++;
-      flags.add(arg.split("=")[0]);
+      const eq = arg.indexOf("=");
+      const name = eq < 0 ? arg : arg.slice(0, eq);
+      const value = eq >= 0 ? arg.slice(eq + 1) : NC_LONG_VALUES.has(name) ? args[i++] ?? "" : "";
+      flags.add(name);
+      values.set(name, value.toLowerCase());
     } else if (arg.startsWith("-") && arg.length > 1) {
       let flag;
-      [flag, , i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
+      let value;
+      [flag, value, i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
       flags.add(flag);
+      values.set(flag, (value ?? "").toLowerCase());
     } else {
       positional.push(arg);
     }
   }
   if (positional[0] === void 0 || ["-l", "--listen", "-U", "--unixsock"].some((f) => flags.has(f))) return [];
-  return [[sends ? "out" : "", positional[0], void 0, void 0, ["--proxy", "-x", "-X"].some((f) => flags.has(f))]];
+  let remote2;
+  if (flags.has("--proxy")) {
+    const dns = values.get("--proxy-dns") || (values.get("--proxy-type") === "socks4" ? "local" : "remote");
+    remote2 = dns !== "local" && dns !== "both";
+  } else {
+    remote2 = flags.has("-x") && values.get("-X") !== "4";
+  }
+  return [[sends ? "out" : "", positional[0], void 0, void 0, remote2]];
 }
 function socat(args, sends) {
   const addresses = [];
@@ -4239,7 +4308,7 @@ function parse(call, processEnv) {
   let raw;
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env);
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
@@ -4551,7 +4620,7 @@ async function endpoint(raw, cwd, state, sure = true) {
   } else {
     lookup &&= !(sshOptions !== void 0 && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === void 0 || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
-    resolved = name || host;
+    resolved = jumps ? host : name || host;
     kind = await address(resolved, state, lookup && !jumps);
   }
   const out = { host, resolved_host: resolved, address: kind };

@@ -3905,7 +3905,10 @@ _TRANSFER_TOOLS = {
 }
 _TRANSFER_SENDING_METHODS = frozenset({'POST', 'PUT', 'PATCH'})
 # The port a URL connects to when it names none, by scheme.
-_TRANSFER_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ftp': 21, 'ftps': 990, 'ws': 80, 'wss': 443}
+_TRANSFER_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ftp': 21, 'ftps': 990, 'ws': 80, 'wss': 443, 'scp': 22,
+                           'sftp': 22, 'imap': 143, 'imaps': 993, 'pop3': 110, 'pop3s': 995, 'smtp': 25,
+                           'smtps': 465, 'ldap': 389, 'ldaps': 636, 'dict': 2628, 'gopher': 70, 'gophers': 70,
+                           'rtsp': 554, 'telnet': 23, 'tftp': 69, 'mqtt': 1883, 'smb': 445, 'smbs': 445}
 # The URL schemes each tool speaks; a URL with any other reaches no host.
 _TRANSFER_CURL_SCHEMES = frozenset({'dict', 'ftp', 'ftps', 'gopher', 'gophers', 'http', 'https', 'imap', 'imaps', 'ldap',
                                     'ldaps', 'mqtt', 'pop3', 'pop3s', 'rtsp', 'scp', 'sftp', 'smb', 'smbs', 'smtp',
@@ -3919,8 +3922,9 @@ _TRANSFER_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': 
 # Of ssh's -o settings, only these change which host or user ssh -G resolves.
 _TRANSFER_SSH_IDENTITY_OPTIONS = frozenset({'hostname', 'user', 'port', 'proxyjump', 'proxycommand'})
 # A host reached through one of these is resolved by the proxy, so it is never looked up here.
-_TRANSFER_CURL_PROXIES = frozenset({'-x', '--proxy', '--preproxy', '--socks4', '--socks4a', '--socks5',
-                                    '--socks5-hostname'})
+# curl's proxy options and the kind of proxy each names; -x, --proxy and --preproxy name it by their URL's scheme.
+_TRANSFER_CURL_PROXIES = {'-x': '', '--proxy': '', '--preproxy': '', '--socks4': 'socks4', '--socks4a': 'socks4a',
+                          '--socks5': 'socks5', '--socks5-hostname': 'socks5h'}
 _TRANSFER_PROXY_ENV = ('http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'ftp_proxy', 'FTP_PROXY', 'all_proxy',
                        'ALL_PROXY')
 _TRANSFER_SSH_CONFIG_MAX_BYTES = 256 * 1024
@@ -5998,13 +6002,40 @@ def _transfer_proxied(env: Dict) -> bool:
     return any(env.get(key) for key in _TRANSFER_PROXY_ENV)
 
 
-def _transfer_curl(args: List[str], proxied: bool = False) -> List[tuple]:
+def _transfer_proxy_kind(value: str, default: str = 'http') -> str:
+    """The kind of proxy a curl proxy string names: its scheme, or default when it has none; empty for none."""
+    value = value.strip()
+    if not value:
+        return ''
+    kind = value.split('://', 1)[0].lower() if '://' in value else default
+    return 'http' if kind == 'https' else kind
+
+
+def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[List[str]], env: Dict) -> bool:
+    """Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
+    SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and a --noproxy entry or an empty -x turns
+    the proxy off. kind is the request's own, or None for a proxy the command set in curl's environment."""
+    parts = _transfer_url_split(url)
+    scheme = parts.scheme.lower()
+    if kind is None:
+        names = [scheme + '_proxy'] + ([scheme.upper() + '_PROXY'] if scheme != 'http' else []) + ['all_proxy',
+                                                                                                    'ALL_PROXY']
+        kind = _transfer_proxy_kind(next((env[name] for name in names if env.get(name)), ''))
+    host = (parts.hostname or '').lower()
+    entries = [entry.strip().lower().lstrip('.') for entry in noproxy or []]
+    if not kind or any(entry == '*' or (entry and (host == entry or host.endswith('.' + entry))) for entry in entries):
+        return False
+    return kind not in ('socks4', 'socks5')
+
+
+def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
     """curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
     --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. Each carries
-    whether it goes through a proxy, by option or by a proxy the command set."""
+    whether a proxy, by option or one the command set in env, resolves its name; such a proxy is handed the
+    --connect-to target, and no --resolve pin applies."""
     endpoints, pins, i = [], [], 0
     while True:
-        urls, sends, overrides, globoff, i, proxy, scheme = _transfer_curl_request(args, i)
+        urls, sends, overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
         for url in urls:
@@ -6013,10 +6044,10 @@ def _transfer_curl(args: List[str], proxied: bool = False) -> List[tuple]:
             expanded = [url] if globoff else _transfer_curl_glob(url)
             if expanded is None:
                 return endpoints
-            # Through a proxy, the proxy resolves the name, so no --resolve or --connect-to pin decides where it goes.
-            endpoints += [('out' if sends else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
-                           None if proxied or proxy else _transfer_curl_dial(one, connects, pins), proxied or proxy)
-                          for one in expanded]
+            for one in expanded:
+                remote = _transfer_curl_remote(one, kind, noproxy, env or {})
+                endpoints.append(('out' if sends else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
+                                  _transfer_curl_dial(one, connects, [] if remote else pins), remote))
         if i >= len(args):
             return endpoints
 
@@ -6126,9 +6157,11 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
     """(the URLs of the curl request at args[i], whether it sends data, its --resolve and --connect-to values, whether
-    it turns globbing off, where the next request starts, whether it names a proxy, its --proto-default scheme); a
-    --next that is an option's value does not end it."""
-    urls, flags, method, overrides, proxy, scheme = [], set(), '', [], False, ''
+    it turns globbing off, where the next request starts, (the kind of proxy it names, empty for none and None when
+    it names none, its --noproxy entries), its --proto-default scheme); a --next that is an option's value does not
+    end it."""
+    urls, flags, method, overrides, scheme = [], set(), '', [], ''
+    kind, preproxy, noproxy = None, None, None
     while i < len(args):
         arg, value, i = args[i], None, i + 1
         if arg in ('-:', '--next'):
@@ -6154,13 +6187,20 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             method = value.upper()
         elif arg in ('--resolve', '--connect-to') and value:
             overrides.append((arg, value))
+        elif arg == '--preproxy' and value is not None:
+            preproxy = _transfer_proxy_kind(value, 'socks4')
         elif arg in _TRANSFER_CURL_PROXIES and value is not None:
-            proxy = bool(value)  # an empty one turns the proxy off
+            # An empty one turns the proxy off; a --socks option names its kind, and -x its URL's scheme.
+            kind = '' if not value.strip() else _TRANSFER_CURL_PROXIES[arg] or _transfer_proxy_kind(value)
+        elif arg == '--noproxy' and value is not None:
+            noproxy = value.split(',')
         elif arg == '--proto-default' and value is not None:
             scheme = value.strip().lower()
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
-    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i, proxy, scheme
+    # Without -x, a --preproxy is the SOCKS proxy the request goes through.
+    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i, \
+        (kind if kind is not None else preproxy, noproxy), scheme
 
 
 def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
@@ -6183,8 +6223,7 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
             key, _, setting = value.replace(' ', '').lower().partition('=')
             settings[key.replace('_', '')] = setting
     on = settings.get('useproxy', 'on') in ('on', 'yes', '1') and '--no-proxy' not in flags
-    proxy = on and (proxied or 'useproxy' in settings or any(settings.get(k) for k in ('httpproxy', 'httpsproxy',
-                                                                                       'ftpproxy')))
+    proxy = on and (proxied or any(settings.get(k) for k in ('httpproxy', 'httpsproxy', 'ftpproxy')))
     direction = 'out' if flags & _TRANSFER_WGET_UPLOADS else 'in'
     return [(direction, _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None, None, proxy) for url in urls]
 
@@ -6295,24 +6334,32 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
 
 
 def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
-    """nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x or
-    -X, reaches it through a proxy."""
-    positional, flags, i = [], set(), 0
+    """nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x,
+    reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or SOCKS4 (ncat's
+    --proxy-type socks4 or nc's -X 4), resolves it here; -X with no -x connects directly."""
+    positional, flags, values, i = [], set(), {}, 0
     while i < len(args):
         arg, i = args[i], i + 1
         if arg.startswith('--'):
-            if '=' not in arg and arg in _TRANSFER_NC_LONG_VALUES:
-                i += 1
-            flags.add(arg.split('=', 1)[0])  # --proxy=host:port is --proxy
+            name, eq, value = arg.partition('=')  # --proxy=host:port is --proxy
+            if not eq and name in _TRANSFER_NC_LONG_VALUES:
+                value, i = (args[i] if i < len(args) else ''), i + 1
+            flags.add(name)
+            values[name] = value.lower()
         elif arg.startswith('-') and len(arg) > 1:
-            flag, _, i = _transfer_short_option(arg, args, i, _TRANSFER_NC_SHORT_VALUES, flags)
+            flag, value, i = _transfer_short_option(arg, args, i, _TRANSFER_NC_SHORT_VALUES, flags)
             flags.add(flag)
+            values[flag] = (value or '').lower()
         else:
             positional.append(arg)
     if not positional or flags & {'-l', '--listen', '-U', '--unixsock'}:
         return []
-    return [('out' if sends else '', positional[0], None, None, bool(flags & {'--proxy', '-x', '-X'}))]
-
+    if '--proxy' in flags:
+        dns = values.get('--proxy-dns') or ('local' if values.get('--proxy-type') == 'socks4' else 'remote')
+        remote = dns not in ('local', 'both')
+    else:
+        remote = '-x' in flags and values.get('-X') != '4'
+    return [('out' if sends else '', positional[0], None, None, remote)]
 
 def _transfer_socat(args: List[str], sends: bool) -> List[tuple]:
     """The hosts socat's two addresses connect to: sent to when its stdin is fed in."""
@@ -6431,7 +6478,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
         raw = _transfer_ssh_pipe(args, sends, keeps)
     elif tool in ('curl', 'wget'):
         args = _transfer_stdin_args(tool, args, _transfer_stdin_text(layers))
-        raw = (_transfer_curl if tool == 'curl' else _transfer_wget)(args, _transfer_proxied(env))
+        raw = _transfer_curl(args, env) if tool == 'curl' else _transfer_wget(args, _transfer_proxied(env))
     elif tool in ('nc', 'socat'):
         raw = _transfer_netcat(args, sends) if tool == 'nc' else _transfer_socat(args, sends)
     elif tool in ('httpie', 'powershell'):
@@ -6730,7 +6777,8 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         lookup = lookup and not (ssh_options is not None and _transfer_ssh_jumps(ssh_options))
         resolved, jumps = _transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and \
             lookup else ('', False)
-        resolved = resolved or host
+        # Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
+        resolved = host if jumps else resolved or host
         address = _transfer_address(resolved, state, lookup and not jumps)
     endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
     return {k: v for k, v in endpoint.items() if v}
