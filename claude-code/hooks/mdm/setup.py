@@ -1904,9 +1904,15 @@ def _backfill_root_is_linked(*paths: Path) -> bool:
     return platform.system().lower() == "windows" and any(_is_reparse_point(p) for p in paths)
 
 
+# Size bands for transcripts over the cap, by upper bound, so a raised cap can be priced from real sizes.
+BACKFILL_SKIP_BANDS = (('under_100mb', 100 * 1024 * 1024), ('under_250mb', 250 * 1024 * 1024),
+                       ('under_500mb', 500 * 1024 * 1024), ('under_1gb', 1024 ** 3), ('1gb_or_more', None))
+
+
 def _backfill_empty_stats() -> Dict:
-    return {'files_seen': 0, 'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0},
-            'unreadable': 0}
+    return {'files_seen': 0, 'unreadable': 0,
+            'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0,
+                                 'by_size': {name: {'count': 0, 'total_bytes': 0} for name, _ in BACKFILL_SKIP_BANDS}}}
 
 
 # What this run could not send, for the server to report per device; MDM sends it once, after its uploads.
@@ -1930,6 +1936,9 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[
                 over['count'] += 1
                 over['total_bytes'] += st.st_size
                 over['largest_bytes'] = max(over['largest_bytes'], st.st_size)
+                band = over['by_size'][next(n for n, upper in BACKFILL_SKIP_BANDS if upper is None or st.st_size < upper)]
+                band['count'] += 1
+                band['total_bytes'] += st.st_size
                 continue
             if st.st_mtime < cutoff_mtime:
                 continue
@@ -2737,6 +2746,9 @@ def _backfill_add_stats(total: Dict, part: Optional[Dict]) -> None:
     over['count'] += more['count']
     over['total_bytes'] += more['total_bytes']
     over['largest_bytes'] = max(over['largest_bytes'], more['largest_bytes'])
+    for name, band in more['by_size'].items():
+        over['by_size'][name]['count'] += band['count']
+        over['by_size'][name]['total_bytes'] += band['total_bytes']
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:

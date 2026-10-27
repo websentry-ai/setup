@@ -58,6 +58,19 @@ def _run(up, home, more=()):
     return bodies
 
 
+# The size bands as the spec states them, by upper bound, written out apart from the code under test.
+BANDS = (("under_100mb", 100 << 20), ("under_250mb", 250 << 20), ("under_500mb", 500 << 20), ("under_1gb", 1 << 30),
+         ("1gb_or_more", None))
+
+
+def _by_size(sizes):
+    bands = {name: {"count": 0, "total_bytes": 0} for name, _ in BANDS}
+    for size in sizes:
+        band = bands[next(name for name, upper in BANDS if upper is None or size < upper)]
+        band["count"] += 1
+        band["total_bytes"] += size
+    return bands
+
 class UploaderStatsTestCase(unittest.TestCase):
 
     def _home(self):
@@ -84,7 +97,8 @@ class UploaderStatsTestCase(unittest.TestCase):
 
     def _expected(self, seen):
         return {"files_seen": seen, "unreadable": 2,
-                "skipped_over_cap": {"count": 2, "largest_bytes": self.big[1], "total_bytes": sum(self.big)}}
+                "skipped_over_cap": {"count": 2, "largest_bytes": self.big[1], "total_bytes": sum(self.big),
+                                     "by_size": _by_size(self.big)}}
 
     def test_every_standalone_upload_reports_what_was_seen_and_left_behind(self):
         bodies = _run(setup, self._populated_home())
@@ -151,6 +165,31 @@ class UploaderStatsTestCase(unittest.TestCase):
             return mock.Mock(wraps=result, st_reparse_tag=0xA0000003, st_mode=result.st_mode) if str(path) == hooks else result
         with patch("os.lstat", side_effect=lstat), patch.object(mdm.platform, "system", return_value="Windows"):
             self.assertEqual(mdm._backfill_home_stats(home), mdm._backfill_empty_stats())
+
+    def test_files_over_the_cap_are_counted_in_their_size_band(self):
+        # Sparse files report their full size without using the disk.
+        sizes = [60 << 20, 99 << 20, 100 << 20, 300 << 20, 700 << 20, (1 << 30) - 1, 1 << 30, 3 << 30]
+        for up in (mdm, setup):
+            with self.subTest(up.__name__):
+                home, projects = self._home()
+                for i, size in enumerate(sizes):
+                    with open(projects / f"big{i}.jsonl", "wb") as f:
+                        f.truncate(size)
+                with patch.object(up, "BACKFILL_MAX_FILE_BYTES", 50 << 20):
+                    over = up._backfill_walk_stats(home / ".claude" / "projects")["skipped_over_cap"]
+                self.assertEqual(over["by_size"], _by_size(sizes))
+                self.assertEqual((over["count"], over["largest_bytes"], over["total_bytes"]),
+                                 (len(sizes), max(sizes), sum(sizes)))
+                self.assertEqual([b["count"] for b in over["by_size"].values()], [2, 1, 1, 2, 2])
+
+    def test_mdm_sums_the_bands_of_every_profile(self):
+        sums = mdm._backfill_empty_stats()
+        for size in (60 << 20, 2 << 30):
+            part = mdm._backfill_empty_stats()
+            band = next(name for name, upper in BANDS if upper is None or size < upper)
+            part["skipped_over_cap"]["by_size"][band] = {"count": 1, "total_bytes": size}
+            mdm._backfill_add_stats(sums, part)
+        self.assertEqual(sums["skipped_over_cap"]["by_size"], _by_size([60 << 20, 2 << 30]))
 
     def test_the_size_cap_is_unchanged(self):
         self.assertEqual((mdm.BACKFILL_MAX_FILE_BYTES, setup.BACKFILL_MAX_FILE_BYTES), (50 * 1024 * 1024,) * 2)

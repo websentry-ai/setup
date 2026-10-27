@@ -90,6 +90,19 @@ AGREEING = (_valid, _blank_first, _bad_json_first, _array_first, _id_after_cap, 
 CLASSES = AGREEING + (_utf8_far_after,)
 
 
+# The size bands as the spec states them, by upper bound, written out apart from the code under test.
+BANDS = (("under_100mb", 100 << 20), ("under_250mb", 250 << 20), ("under_500mb", 500 << 20), ("under_1gb", 1 << 30),
+         ("1gb_or_more", None))
+
+
+def _by_size(sizes):
+    bands = {name: {"count": 0, "total_bytes": 0} for name, _ in BANDS}
+    for size in sizes:
+        band = bands[next(name for name, upper in BANDS if upper is None or size < upper)]
+        band["count"] += 1
+        band["total_bytes"] += size
+    return bands
+
 class PeekMatchesCollectorTestCase(unittest.TestCase):
     """A4: over 150 seeded transcripts, the peek finds a session id exactly when the collector files one."""
 
@@ -176,7 +189,7 @@ class _Home:
     def expected(self):
         return {"files_seen": self.seen, "unreadable": self.unreadable,
                 "skipped_over_cap": {"count": len(self.over), "largest_bytes": max(self.over, default=0),
-                                     "total_bytes": sum(self.over)}}
+                                     "total_bytes": sum(self.over), "by_size": _by_size(self.over)}}
 
 
 def _can_lock_files():
@@ -202,8 +215,11 @@ class WalkStatsTestCase(unittest.TestCase):
 
 
 def _stats(seen=0, unreadable=0, count=0, largest=0, total=0):
+    # Every over-cap size these tests use is far under 100 MB, so it all lands in the first band.
+    by_size = _by_size([])
+    by_size["under_100mb"] = {"count": count, "total_bytes": total}
     return {"files_seen": seen, "unreadable": unreadable,
-            "skipped_over_cap": {"count": count, "largest_bytes": largest, "total_bytes": total}}
+            "skipped_over_cap": {"count": count, "largest_bytes": largest, "total_bytes": total, "by_size": by_size}}
 
 
 def _fake_http(bodies, raw=None):

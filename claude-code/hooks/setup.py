@@ -1445,9 +1445,15 @@ def _backfill_jsonl_files(root: Path, skip_dirs=()):
                 yield base / name
 
 
+# Size bands for transcripts over the cap, by upper bound, so a raised cap can be priced from real sizes.
+BACKFILL_SKIP_BANDS = (('under_100mb', 100 * 1024 * 1024), ('under_250mb', 250 * 1024 * 1024),
+                       ('under_500mb', 500 * 1024 * 1024), ('under_1gb', 1024 ** 3), ('1gb_or_more', None))
+
+
 def _backfill_empty_stats() -> Dict:
-    return {'files_seen': 0, 'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0},
-            'unreadable': 0}
+    return {'files_seen': 0, 'unreadable': 0,
+            'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0,
+                                 'by_size': {name: {'count': 0, 'total_bytes': 0} for name, _ in BACKFILL_SKIP_BANDS}}}
 
 
 # What this run could not send, carried on every upload so the server can report it per device.
@@ -1471,6 +1477,9 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[
                 over['count'] += 1
                 over['total_bytes'] += st.st_size
                 over['largest_bytes'] = max(over['largest_bytes'], st.st_size)
+                band = over['by_size'][next(n for n, upper in BACKFILL_SKIP_BANDS if upper is None or st.st_size < upper)]
+                band['count'] += 1
+                band['total_bytes'] += st.st_size
                 continue
             if st.st_mtime < cutoff_mtime:
                 continue
