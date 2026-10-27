@@ -769,7 +769,7 @@ def clear_setup() -> bool:
     Everything is derived from HOME and the env -- no API key, no network call. The shared
     contract test runs this against a pristine HOME with only HOME/PATH/SHELL set, so any
     other input would turn that into a traceback. In particular ~/.unbound/config.json is
-    never opened: its api_key is shared with five other tools.
+    never opened: its device_token is shared with five other tools.
     """
     print("=" * 60)
     print("Pi Coding Agent Extension - Clearing Setup")

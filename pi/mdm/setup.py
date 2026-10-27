@@ -1403,14 +1403,14 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
         # So ownership is tracked instead of guessed: the value is replaced when it is
         # absent, when it is already the key we are about to write, or when its digest
         # matches the one we recorded the last time we wrote it. Anything else is the user's
-        # own credential and is left byte-identical.
+        # own credential and is kept.
         existing = config.get("device_token")
         existing = existing.strip() if isinstance(existing, str) else ""
         if (not existing or existing == api_key
                 or config.get(MDM_KEY_PROVENANCE_FIELD) == _key_provenance(existing)):
             config["device_token"] = api_key
             config[MDM_KEY_PROVENANCE_FIELD] = _key_provenance(api_key)
-        # A leftover api_key goes whoever wrote it: nothing reads it, and an old login one is a CLI key no tool may use.
+        # No hook or CLI reads api_key any more, so a leftover one is dropped whoever wrote it.
         config.pop("api_key", None)
         if urls:
             # URLs are tenant configuration, not identity, so they DO update unconditionally.
@@ -1506,7 +1506,7 @@ def _clear_in_home(extdir: Path) -> List[str]:
 def clear_setup() -> bool:
     """Undo this installer across every home: our two files, and our export line.
 
-    Never touches ~/.unbound/config.json -- its api_key is shared with five other tools, so
+    Never touches ~/.unbound/config.json -- its device_token is shared with five other tools, so
     removing it would log the user out of all of them. Posts nothing: install_state is an
     install-time enum with no uninstall value, and no installer in this repo reports a clear.
     """
@@ -1554,7 +1554,7 @@ def clear_setup() -> bool:
         print(f"  {username}: {files}; {ENV_API_KEY_PI}: {env_status}")
 
     print("\nThe extension directories, and every other file in them, were left in place.")
-    print("~/.unbound/config.json was NOT touched: its api_key is shared with the other")
+    print("~/.unbound/config.json was NOT touched: its device_token is shared with the other")
     print("Unbound tools on this device.")
     print("=" * 60)
     print("Clear Complete!")
