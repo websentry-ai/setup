@@ -2474,9 +2474,17 @@ function urlHost(url: string, schemes: ReadonlySet<string>): string {
 
 /** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
  *  --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. */
-/** Whether the command itself sets a proxy for curl, wget, HTTPie or PowerShell in their environment. */
-function proxiedEnv(env: Env): boolean {
-  return PROXY_ENV.some((key) => Boolean(env[key]));
+/** A proxy or no_proxy variable as the tool sees it, undefined when unset: set or unset in the command, else inherited
+ *  from the agent's environment. It only decides whether a host is looked up here, and is never sent. */
+function proxySetting(env: Env, processEnv: Record<string, string | undefined>, name: string): string | undefined {
+  if (name in env) return env[name];
+  if (UNKNOWN_ENV in env) return SUBSTITUTED;
+  return CLEAN_ENV in env ? undefined : processEnv[name];
+}
+
+/** Whether curl, wget, HTTPie or PowerShell finds a proxy in its environment, the command's or the agent's. */
+function proxiedEnv(env: Env, processEnv: Record<string, string | undefined>): boolean {
+  return PROXY_ENV.some((key) => Boolean(proxySetting(env, processEnv, key)));
 }
 
 /** The kind of proxy a curl proxy string names: its scheme, or `fallback` when it has none; empty for none. */
@@ -2489,8 +2497,9 @@ function proxyKind(value: string, fallback = "http"): string {
 
 /** Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
  *  SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
- *  a no_proxy or NO_PROXY one the command set), turns the proxy off. `kind` is the request's own, or undefined for a proxy the command set in curl's environment. */
-function curlRemote(url: string, kind: string | undefined, noproxy: string | undefined, env: Env): boolean {
+ *  a no_proxy or NO_PROXY one), turns the proxy off. `kind` is the request's own, or undefined for a proxy in curl's
+ *  environment, which the command sets or the agent's shell passes on. */
+function curlRemote(url: string, kind: string | undefined, noproxy: string | undefined, env: Env, processEnv: Record<string, string | undefined>): boolean {
   let parsed: URL;
   try {
     parsed = new URL(urlText(url));
@@ -2501,11 +2510,11 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string | und
   let proxy = kind;
   if (proxy === undefined) {
     const names = [`${scheme}_proxy`, ...(scheme === "http" ? [] : [`${scheme.toUpperCase()}_PROXY`]), "all_proxy", "ALL_PROXY"];
-    proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
+    proxy = proxyKind(names.map((name) => proxySetting(env, processEnv, name)).find((value) => value !== undefined) ?? "");
   }
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   // --noproxy overrides a no_proxy or NO_PROXY the command set.
-  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "");
+  const bypass = noproxy ?? ["no_proxy", "NO_PROXY"].map((name) => proxySetting(env, processEnv, name)).find((value) => value !== undefined) ?? "";
   // As curl reads the list: * alone bypasses every host, else entries split on commas and blanks, their dots aside.
   const entries = bypass.split(/[,\s]+/).map((entry) => entry.toLowerCase().replace(/^\.+|\.+$/g, ""));
   if (!proxy || bypass === "*" || entries.some((entry) => entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
@@ -2513,9 +2522,9 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string | und
 }
 
 /** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each carries whether a proxy, by
- *  option or one the command set in `env`, resolves its name; such a proxy is handed the --connect-to target, and no
+ *  option or one in its environment, resolves its name; such a proxy is handed the --connect-to target, and no
  *  --resolve pin applies. */
-function curl(args: string[], env: Env = {}): Raw[] {
+function curl(args: string[], env: Env = {}, processEnv: Record<string, string | undefined> = {}): Raw[] {
   const out: Raw[] = [];
   const pins: string[] = [];
   for (let i = 0; ; ) {
@@ -2528,7 +2537,7 @@ function curl(args: string[], env: Env = {}): Raw[] {
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return out;
       for (const one of expanded) {
-        const remote = curlRemote(one, kind, noproxy, env);
+        const remote = curlRemote(one, kind, noproxy, env, processEnv);
         out.push([sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, remote ? [] : pins), remote]);
       }
     }
@@ -3026,12 +3035,12 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   let raw: Raw[];
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env);
-  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv);
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
-  else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env));
-  else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env));
+  else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));
+  else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
   else return undefined;
   // Under sudo, ssh runs as that user, with that user's config, which this can't read.
   return [tool, raw.map(([d, dest, options, dial, proxied]): Raw => [d, dest, call.otherUser ? undefined : options, dial, proxied])];

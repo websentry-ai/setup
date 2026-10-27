@@ -3862,8 +3862,13 @@ function urlHost(url, schemes) {
     return "";
   }
 }
-function proxiedEnv(env) {
-  return PROXY_ENV.some((key) => Boolean(env[key]));
+function proxySetting(env, processEnv, name) {
+  if (name in env) return env[name];
+  if (UNKNOWN_ENV in env) return SUBSTITUTED;
+  return CLEAN_ENV in env ? void 0 : processEnv[name];
+}
+function proxiedEnv(env, processEnv) {
+  return PROXY_ENV.some((key) => Boolean(proxySetting(env, processEnv, key)));
 }
 function proxyKind(value, fallback = "http") {
   const text = value.trim();
@@ -3871,7 +3876,7 @@ function proxyKind(value, fallback = "http") {
   const kind = text.includes("://") ? text.split("://")[0].toLowerCase() : fallback;
   return kind === "https" ? "http" : kind;
 }
-function curlRemote(url, kind, noproxy, env) {
+function curlRemote(url, kind, noproxy, env, processEnv) {
   let parsed;
   try {
     parsed = new URL(urlText(url));
@@ -3882,15 +3887,15 @@ function curlRemote(url, kind, noproxy, env) {
   let proxy = kind;
   if (proxy === void 0) {
     const names = [`${scheme}_proxy`, ...scheme === "http" ? [] : [`${scheme.toUpperCase()}_PROXY`], "all_proxy", "ALL_PROXY"];
-    proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
+    proxy = proxyKind(names.map((name) => proxySetting(env, processEnv, name)).find((value) => value !== void 0) ?? "");
   }
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "");
+  const bypass = noproxy ?? ["no_proxy", "NO_PROXY"].map((name) => proxySetting(env, processEnv, name)).find((value) => value !== void 0) ?? "";
   const entries = bypass.split(/[,\s]+/).map((entry) => entry.toLowerCase().replace(/^\.+|\.+$/g, ""));
   if (!proxy || bypass === "*" || entries.some((entry) => entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
   return proxy !== "socks4" && proxy !== "socks5";
 }
-function curl(args, env = {}) {
+function curl(args, env = {}, processEnv = {}) {
   const out = [];
   const pins = [];
   for (let i = 0; ; ) {
@@ -3902,7 +3907,7 @@ function curl(args, env = {}) {
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return out;
       for (const one of expanded2) {
-        const remote2 = curlRemote(one, kind, noproxy, env);
+        const remote2 = curlRemote(one, kind, noproxy, env, processEnv);
         out.push([sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, remote2 ? [] : pins), remote2]);
       }
     }
@@ -4334,12 +4339,12 @@ function parse(call, processEnv) {
   let raw;
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env);
-  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env));
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv);
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
   else if (tool === "nc") raw = netcat(call.args, sends);
   else if (tool === "socat") raw = socat(call.args, sends);
-  else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env));
-  else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env));
+  else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));
+  else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
   else return void 0;
   return [tool, raw.map(([d, dest, options, dial, proxied]) => [d, dest, call.otherUser ? void 0 : options, dial, proxied])];
 }

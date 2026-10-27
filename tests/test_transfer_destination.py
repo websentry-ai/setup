@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'e46ed3453ce53e5d47edfbd073715c4d4e44cce1bbfcd09fddf9a890775f7acc'
+BLOCK_SHA256 = 'b0aadd82c731fa704bfcdb9d76ddf7fc30651a7e211f85894ccc68c46736967f'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -153,6 +153,10 @@ class TransferTestCase(unittest.TestCase):
                 [patch.object(hook, '_transfer_home', lambda home=self.home: home) for hook in HOOKS]:
             patcher.start()
             self.addCleanup(patcher.stop)
+        # A proxy this machine's shell sets would change what is looked up; the dict patch above puts it back.
+        for key in [k for k in os.environ if k.lower() in ('http_proxy', 'https_proxy', 'ftp_proxy', 'all_proxy',
+                                                           'no_proxy')]:
+            del os.environ[key]
 
     def ssh_calls(self):
         """Each ssh -G call, with the vetted config copy it was handed shown as <vetted>."""
@@ -222,8 +226,11 @@ class SharedCorpusTests(TransferTestCase):
         # hook_env is the hook's own environment: none of its values may reach a host, a lookup or ssh -G.
         with patch('socket.getaddrinfo', lookup), patch.dict(os.environ, fixture['hook_env']):
             for case in fixture['cases']:
-                for hook, transfer in self.each(case['command']):
-                    with self.subTest(hook=hook, command=case['command']):
+                # env is what the agent's shell passes on, such as a proxy.
+                with patch.dict(os.environ, case.get('env', {})):
+                    results = self.each(case['command'])
+                for hook, transfer in results:
+                    with self.subTest(hook=hook, command=case['command'], env=case.get('env')):
                         self.assertEqual(transfer, case['transfer'])
         for value in fixture['hook_env'].values():
             self.assertNotIn(value, json.dumps([looked_up, self.ssh_calls()]))

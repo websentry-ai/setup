@@ -6113,6 +6113,263 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128",
+    "no_proxy": "example.com"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/x",
+   "env": {
+    "HTTPS_PROXY": "http://proxy.corp:3128",
+    "NO_PROXY": ".com"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy= curl https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --noproxy '*' https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -x '' https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/x",
+   "env": {
+    "http_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl http://example.com/x",
+   "env": {
+    "http_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/x",
+   "env": {
+    "https_proxy": "socks5://proxy.corp:1080"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/x",
+   "env": {
+    "ALL_PROXY": "socks5h://proxy.corp:1080"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "env -i curl https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "no_proxy=example.com curl https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget https://example.com/a",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --no-proxy https://example.com/a",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "http example.com/api",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "httpie",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
   }
  ]
 }

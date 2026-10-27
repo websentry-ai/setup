@@ -16,7 +16,8 @@ interface Fixture {
   addresses: Record<string, string[]>;
   ssh_hosts: Record<string, string>;
   hook_env: Record<string, string>;
-  cases: { command: string; transfer: Transfer | null }[];
+  /** env is what the agent's shell passes on, such as a proxy. */
+  cases: { command: string; transfer: Transfer | null; env?: Record<string, string> }[];
 }
 
 const FIXTURE = JSON.parse(
@@ -101,8 +102,8 @@ test("every command in the shared corpus sends the same transfer as the Python h
     seen.push(host);
     return lookup(host);
   };
-  for (const { command, transfer: expected } of FIXTURE.cases) {
-    const found = await transfer(command, "/", { env: FIXTURE.hook_env, lookup: recording, execFile: fakeSsh(calls) });
+  for (const { command, transfer: expected, env } of FIXTURE.cases) {
+    const found = await transfer(command, "/", { env: { ...FIXTURE.hook_env, ...env }, lookup: recording, execFile: fakeSsh(calls) });
     assert.deepEqual(found ?? null, expected, command);
   }
   for (const value of Object.values(FIXTURE.hook_env)) assert.ok(!JSON.stringify([seen, calls]).includes(value), value);

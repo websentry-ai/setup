@@ -5997,9 +5997,19 @@ def _transfer_url_host(url: str, schemes: frozenset) -> str:
         return ''
 
 
+def _transfer_proxy_setting(env: Dict, name: str) -> Optional[str]:
+    """A proxy or no_proxy variable as the tool sees it, None when unset: set or unset in the command, else inherited
+    from the agent's environment. It only decides whether a host is looked up here, and is never sent."""
+    if name in env:
+        return env[name]
+    if _TRANSFER_UNKNOWN_ENV in env:
+        return _TRANSFER_SUBSTITUTED
+    return None if _TRANSFER_CLEAN_ENV in env else os.environ.get(name)
+
+
 def _transfer_proxied(env: Dict) -> bool:
-    """Whether the command itself sets a proxy for curl, wget, HTTPie or PowerShell in their environment."""
-    return any(env.get(key) for key in _TRANSFER_PROXY_ENV)
+    """Whether curl, wget, HTTPie or PowerShell finds a proxy in its environment, the command's or the agent's."""
+    return any(_transfer_proxy_setting(env, key) for key in _TRANSFER_PROXY_ENV)
 
 
 def _transfer_proxy_kind(value: str, default: str = 'http') -> str:
@@ -6014,16 +6024,19 @@ def _transfer_proxy_kind(value: str, default: str = 'http') -> str:
 def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str], env: Dict) -> bool:
     """Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
     SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
-    a no_proxy or NO_PROXY one the command set), turns the proxy off. kind is the request's own, or None for a proxy
-    the command set in curl's environment."""
+    a no_proxy or NO_PROXY one), turns the proxy off. kind is the request's own, or None for a proxy in curl's
+    environment, which the command sets or the agent's shell passes on."""
     parts = _transfer_url_split(url)
     scheme = parts.scheme.lower()
     if kind is None:
         names = [scheme + '_proxy'] + ([scheme.upper() + '_PROXY'] if scheme != 'http' else []) + ['all_proxy',
                                                                                                     'ALL_PROXY']
-        kind = _transfer_proxy_kind(next((env[name] for name in names if env.get(name)), ''))
+        settings = (_transfer_proxy_setting(env, name) for name in names)
+        kind = _transfer_proxy_kind(next((value for value in settings if value is not None), ''))
     host = (parts.hostname or '').lower().rstrip('.')
-    noproxy = noproxy if noproxy is not None else env.get('no_proxy') or env.get('NO_PROXY') or ''
+    if noproxy is None:
+        settings = (_transfer_proxy_setting(env, name) for name in ('no_proxy', 'NO_PROXY'))
+        noproxy = next((value for value in settings if value is not None), '')
     # As curl reads the list: * alone bypasses every host, else entries split on commas and blanks, their dots aside.
     entries = [entry.strip('.').lower() for entry in re.split(r'[,\s]+', noproxy)]
     if not kind or noproxy == '*' or any(entry and (host == entry or host.endswith('.' + entry)) for entry in entries):
@@ -6034,7 +6047,7 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str],
 def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
     """curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
     --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. Each carries
-    whether a proxy, by option or one the command set in env, resolves its name; such a proxy is handed the
+    whether a proxy, by option or one in its environment, resolves its name; such a proxy is handed the
     --connect-to target, and no --resolve pin applies."""
     endpoints, pins, i = [], [], 0
     while True:
