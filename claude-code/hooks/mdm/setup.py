@@ -2719,7 +2719,9 @@ def _backfill_report(sessions_sent: int, batches: int, statuses: set) -> None:
 
 def _backfill_home_stats(home_dir: Path) -> Dict:
     projects_root = home_dir / '.claude' / 'projects'
-    if not projects_root.exists() or _backfill_root_is_linked(home_dir / '.claude', projects_root):
+    # The same folders _backfill_drain_home refuses, so a profile it won't upload adds nothing.
+    if not projects_root.exists() or _backfill_root_is_linked(
+            home_dir / '.claude', projects_root, home_dir / '.claude' / 'hooks'):
         return _backfill_empty_stats()
     return _backfill_walk_stats(projects_root)
 

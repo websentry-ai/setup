@@ -3,11 +3,13 @@ from real file sizes: transcripts seen, those over the cap (count, largest, tota
 
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 from tests.conftest import tool_module
@@ -128,6 +130,18 @@ class UploaderStatsTestCase(unittest.TestCase):
                     dropped = [p.name for p in sorted(projects.iterdir()) if up._backfill_collect_session(p) is None]
                 self.assertEqual(stats["unreadable"], len(dropped))
                 self.assertEqual(stats["unreadable"], 2)
+
+    def test_mdm_counts_nothing_for_a_profile_it_refuses(self):
+        home = self._populated_home()
+        (home / ".claude" / "hooks").mkdir()
+        hooks, real_lstat = str(home / ".claude" / "hooks"), os.lstat
+
+        def lstat(path, *args, **kwargs):
+            result = real_lstat(path, *args, **kwargs)
+            # A junction's reparse tag, as Windows reports it, on the profile's hooks folder.
+            return mock.Mock(wraps=result, st_reparse_tag=0xA0000003, st_mode=result.st_mode) if str(path) == hooks else result
+        with patch("os.lstat", side_effect=lstat), patch.object(mdm.platform, "system", return_value="Windows"):
+            self.assertEqual(mdm._backfill_home_stats(home), mdm._backfill_empty_stats())
 
     def test_the_size_cap_is_unchanged(self):
         self.assertEqual((mdm.BACKFILL_MAX_FILE_BYTES, setup.BACKFILL_MAX_FILE_BYTES), (50 * 1024 * 1024,) * 2)
