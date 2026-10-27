@@ -1,0 +1,69 @@
+{
+  "advisor_usage": [],
+  "multiline_replies": [],
+  "progress_lines": [
+    {
+      "type": "assistant",
+      "timestamp": "2026-09-01T10:30:10.000Z",
+      "isSidechain": true,
+      "message": {
+        "id": "msg_p1",
+        "usage": {
+          "input_tokens": 5,
+          "output_tokens": 44,
+          "cache_read_input_tokens": 600,
+          "cache_creation_input_tokens": 120
+        }
+      }
+    }
+  ],
+  "sidechain_lines": [],
+  "subagent_files": [
+    {
+      "type": "assistant",
+      "timestamp": "2026-09-01T10:10:05.000Z",
+      "isSidechain": true,
+      "message": {
+        "id": "msg_s1",
+        "usage": {
+          "input_tokens": 4,
+          "output_tokens": 20,
+          "cache_read_input_tokens": 500,
+          "cache_creation_input_tokens": 400,
+          "cache_creation": {
+            "ephemeral_5m_input_tokens": 200,
+            "ephemeral_1h_input_tokens": 200
+          }
+        }
+      }
+    },
+    {
+      "type": "assistant",
+      "timestamp": "2026-09-01T10:10:30.000Z",
+      "isSidechain": true,
+      "message": {
+        "id": "msg_s2",
+        "usage": {
+          "input_tokens": 1,
+          "output_tokens": 80,
+          "cache_read_input_tokens": 900,
+          "cache_creation_input_tokens": 0
+        }
+      }
+    },
+    {
+      "type": "assistant",
+      "timestamp": "2026-09-01T10:11:00.000Z",
+      "isSidechain": true,
+      "message": {
+        "id": "msg_s3",
+        "usage": {
+          "input_tokens": 2,
+          "output_tokens": 33,
+          "cache_read_input_tokens": 700,
+          "cache_creation_input_tokens": 0
+        }
+      }
+    }
+  ]
+}
