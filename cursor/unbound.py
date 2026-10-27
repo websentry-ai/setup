@@ -5968,8 +5968,10 @@ def _transfer_curl(args: List[str], proxied: bool = False) -> List[tuple]:
             expanded = [url] if globoff else _transfer_curl_glob(url)
             if expanded is None:
                 return endpoints
+            # Through a proxy, the proxy resolves the name, so no --resolve or --connect-to pin decides where it goes.
             endpoints += [('out' if sends else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
-                           _transfer_curl_dial(one, connects, pins), proxied or proxy) for one in expanded]
+                           None if proxied or proxy else _transfer_curl_dial(one, connects, pins), proxied or proxy)
+                          for one in expanded]
         if i >= len(args):
             return endpoints
 

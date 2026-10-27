@@ -4464,8 +4464,8 @@
      {
       "direction": "in",
       "host": "example.com",
-      "resolved_host": "10.20.30.40",
-      "address": "private"
+      "resolved_host": "example.com",
+      "address": "unresolved"
      }
     ]
    }
@@ -5147,6 +5147,76 @@
   {
    "command": "curl --proto-default ssh example.com/up",
    "transfer": null
+  },
+  {
+   "command": "curl -x http://proxy:3128 --resolve example.com:443:10.20.30.40 -T secret https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --resolve example.com:443:10.20.30.40 -T secret https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -x '' --resolve example.com:443:10.20.30.40 -T secret https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -x http://proxy:3128 --connect-to example.com:443:10.20.30.40:443 -T secret https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 curl --resolve example.com:443:10.20.30.40 -T secret https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
   }
  ]
 }

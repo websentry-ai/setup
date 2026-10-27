@@ -3850,7 +3850,8 @@ function curl(args, proxied = false) {
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return out;
-      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, pins), proxied || proxy]));
+      const through = proxied || proxy;
+      out.push(...expanded2.map((one) => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, through ? void 0 : curlDial(one, connects, pins), through]));
     }
     if (next >= args.length) return out;
     i = next;

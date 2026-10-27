@@ -2486,7 +2486,9 @@ function curl(args: string[], proxied = false): Raw[] {
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return out;
-      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, pins), proxied || proxy]));
+      // Through a proxy, the proxy resolves the name, so no --resolve or --connect-to pin decides where it goes.
+      const through = proxied || proxy;
+      out.push(...expanded.map((one): Raw => [sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, through ? undefined : curlDial(one, connects, pins), through]));
     }
     if (next >= args.length) return out;
     i = next;
