@@ -475,7 +475,11 @@ class SessionsUnchangedTestCase(unittest.TestCase):
                     for body in current:
                         body.pop("uploader_stats")
                 self.assertGreater(len(then), 1)
-                self.assertEqual([json.dumps(b).encode("utf-8") for b in current], then)
+                # Each session byte for byte; upload order follows file times, which two fresh homes can tie on.
+                def sessions(bodies):
+                    return sorted(json.dumps(s, sort_keys=True) for b in bodies for s in b["sessions"])
+                self.assertEqual(sessions(current), sessions(json.loads(b) for b in then))
+                self.assertEqual([set(b) for b in current], [{"tool_type", "sessions"}] * len(current))
 
 
 @unittest.skipUnless(os.environ.get("UNBOUND_SLOW_TESTS") == "1", "50,000 files; set UNBOUND_SLOW_TESTS=1")
