@@ -2488,8 +2488,8 @@ function proxyKind(value: string, fallback = "http"): string {
 }
 
 /** Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
- *  SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and a --noproxy entry or an empty -x turns
- *  the proxy off. `kind` is the request's own, or undefined for a proxy the command set in curl's environment. */
+ *  SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
+ *  a no_proxy or NO_PROXY one the command set), turns the proxy off. `kind` is the request's own, or undefined for a proxy the command set in curl's environment. */
 function curlRemote(url: string, kind: string | undefined, noproxy: string[] | undefined, env: Env): boolean {
   let parsed: URL;
   try {
@@ -2504,7 +2504,9 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string[] | u
     proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
   }
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const entries = (noproxy ?? []).map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
+  // --noproxy overrides a no_proxy or NO_PROXY the command set.
+  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "").split(",");
+  const entries = bypass.map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
   if (!proxy || entries.some((entry) => entry === "*" || (entry !== "" && (host === entry || host.endsWith(`.${entry}`))))) return false;
   return proxy !== "socks4" && proxy !== "socks5";
 }

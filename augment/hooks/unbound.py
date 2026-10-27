@@ -5945,8 +5945,9 @@ def _transfer_proxy_kind(value: str, default: str = 'http') -> str:
 
 def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[List[str]], env: Dict) -> bool:
     """Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
-    SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and a --noproxy entry or an empty -x turns
-    the proxy off. kind is the request's own, or None for a proxy the command set in curl's environment."""
+    SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
+    a no_proxy or NO_PROXY one the command set), turns the proxy off. kind is the request's own, or None for a proxy
+    the command set in curl's environment."""
     parts = _transfer_url_split(url)
     scheme = parts.scheme.lower()
     if kind is None:
@@ -5954,7 +5955,9 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[List[
                                                                                                     'ALL_PROXY']
         kind = _transfer_proxy_kind(next((env[name] for name in names if env.get(name)), ''))
     host = (parts.hostname or '').lower()
-    entries = [entry.strip().lower().lstrip('.') for entry in noproxy or []]
+    if noproxy is None:
+        noproxy = (env.get('no_proxy') or env.get('NO_PROXY') or '').split(',')
+    entries = [entry.strip().lower().lstrip('.') for entry in noproxy]
     if not kind or any(entry == '*' or (entry and (host == entry or host.endswith('.' + entry))) for entry in entries):
         return False
     return kind not in ('socks4', 'socks5')

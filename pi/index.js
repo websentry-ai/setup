@@ -3885,7 +3885,8 @@ function curlRemote(url, kind, noproxy, env) {
     proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
   }
   const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const entries = (noproxy ?? []).map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
+  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "").split(",");
+  const entries = bypass.map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
   if (!proxy || entries.some((entry) => entry === "*" || entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
   return proxy !== "socks4" && proxy !== "socks5";
 }
