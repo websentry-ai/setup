@@ -43,7 +43,7 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  * A **non-absolute** `homeDir` is refused outright. `os.homedir()` can fail, and the caller's
  * fallback is `""`; `join("", ".unbound/config.json")` resolves relative to the process cwd — i.e.
  * the repository pi was started in. A repo-planted `.unbound/config.json` could then supply both
- * `api_key` and `gateway_url`, sending the Bearer token to an attacker's https host (which passes
+ * `device_token` and `gateway_url`, sending the Bearer token to an attacker's https host (which passes
  * the https-only check) and silently replacing the policy engine. The config file is a
  * user-profile artifact; anything that is not an absolute path is not it.
  */
@@ -76,13 +76,13 @@ function usableString(candidate: unknown): string | undefined {
 
 /**
  * The four locked key tiers: the pi-specific env var, the generic env var (6 other tools honour
- * it), then `api_key` from the config file, then `undefined` — which means "extension inactive",
+ * it), then `device_token` from the config file, then `undefined` — which means "extension inactive",
  * never "block" (RES-06).
  */
 export function resolveApiKey(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
   const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
   if (fromEnv !== undefined) return fromEnv;
-  return usableString(readUnboundConfig(homeDir).api_key);
+  return usableString(readUnboundConfig(homeDir).device_token);
 }
 
 /**

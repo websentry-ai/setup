@@ -37,11 +37,11 @@ PRETOOL_EVENT = {
 }
 
 KEY_ENV = {
-    "claude-code": "UNBOUND_CLAUDE_API_KEY",
-    "codex": "UNBOUND_CODEX_API_KEY",
-    "copilot": "UNBOUND_COPILOT_API_KEY",
-    "augment": "UNBOUND_AUGMENT_API_KEY",
-    "cursor": "UNBOUND_CURSOR_API_KEY",
+    "claude-code": "UNBOUND_DEVICE_TOKEN",
+    "codex": "UNBOUND_DEVICE_TOKEN",
+    "copilot": "UNBOUND_DEVICE_TOKEN",
+    "augment": "UNBOUND_DEVICE_TOKEN",
+    "cursor": "UNBOUND_DEVICE_TOKEN",
 }
 
 CURL_SHIM = """#!/bin/sh
@@ -116,7 +116,7 @@ def _assert_routed_to(urls, gateway):
 @pytest.mark.parametrize("tool", list(PRETOOL_EVENT))
 def test_tenant_gateway_from_config_is_honoured(tool, sandbox_home, curl_shim):
     _write_config(sandbox_home, json.dumps(
-        {"api_key": "test-key", "gateway_url": TENANT_GATEWAY}))
+        {"device_token": "test-key", "gateway_url": TENANT_GATEWAY}))
     got, urls = _run_hook(tool, sandbox_home, curl_shim)
     assert got.returncode == 0
     json.loads(got.stdout)
@@ -125,7 +125,7 @@ def test_tenant_gateway_from_config_is_honoured(tool, sandbox_home, curl_shim):
 
 def test_trailing_slash_is_stripped(sandbox_home, curl_shim):
     _write_config(sandbox_home, json.dumps(
-        {"api_key": "test-key", "gateway_url": TENANT_GATEWAY + "/"}))
+        {"device_token": "test-key", "gateway_url": TENANT_GATEWAY + "/"}))
     _, urls = _run_hook("claude-code", sandbox_home, curl_shim)
     _assert_routed_to(urls, TENANT_GATEWAY)
 
@@ -137,7 +137,7 @@ def test_trailing_slash_is_stripped(sandbox_home, curl_shim):
     "https://tenant-api.example.com/pre%20fix",  # percent-encoded path prefix
 ])
 def test_well_formed_base_urls_are_kept(gateway, sandbox_home, curl_shim):
-    _write_config(sandbox_home, json.dumps({"api_key": "test-key", "gateway_url": gateway}))
+    _write_config(sandbox_home, json.dumps({"device_token": "test-key", "gateway_url": gateway}))
     _, urls = _run_hook("claude-code", sandbox_home, curl_shim)
     _assert_routed_to(urls, gateway)
 
@@ -145,7 +145,7 @@ def test_well_formed_base_urls_are_kept(gateway, sandbox_home, curl_shim):
 @pytest.mark.parametrize("tool", list(PRETOOL_EVENT))
 def test_env_var_wins_over_config(tool, sandbox_home, curl_shim):
     _write_config(sandbox_home, json.dumps(
-        {"api_key": "test-key", "gateway_url": TENANT_GATEWAY}))
+        {"device_token": "test-key", "gateway_url": TENANT_GATEWAY}))
     got, urls = _run_hook(tool, sandbox_home, curl_shim,
                           gateway_env="https://env-api.example.com")
     assert got.returncode == 0
@@ -156,41 +156,41 @@ def test_env_var_wins_over_config(tool, sandbox_home, curl_shim):
 # means no config.json at all.
 DEFAULT_GATEWAY_CONFIGS = {
     "missing_file": None,
-    "gateway_absent": json.dumps({"api_key": "test-key"}),
-    "gateway_empty": json.dumps({"api_key": "test-key", "gateway_url": ""}),
-    "gateway_blank": json.dumps({"api_key": "test-key", "gateway_url": "   "}),
-    "gateway_null": json.dumps({"api_key": "test-key", "gateway_url": None}),
-    "gateway_default": json.dumps({"api_key": "test-key", "gateway_url": DEFAULT_GATEWAY}),
-    "gateway_default_slash": json.dumps({"api_key": "test-key", "gateway_url": DEFAULT_GATEWAY + "/"}),
-    "gateway_http": json.dumps({"api_key": "test-key", "gateway_url": "http://tenant-api.example.com"}),
-    "gateway_no_scheme": json.dumps({"api_key": "test-key", "gateway_url": "tenant-api.example.com"}),
-    "gateway_no_host": json.dumps({"api_key": "test-key", "gateway_url": "https://"}),
-    "gateway_whitespace": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com /x"}),
-    "gateway_newline": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com\nX: y"}),
-    "gateway_query": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com?route=x"}),
-    "gateway_empty_query": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com?"}),
-    "gateway_fragment": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com#x"}),
-    "gateway_userinfo": json.dumps({"api_key": "test-key", "gateway_url": "https://user:pw@tenant-api.example.com"}),
-    "gateway_bad_port": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com:99999"}),
-    "gateway_empty_userinfo": json.dumps({"api_key": "test-key", "gateway_url": "https://@evil.example"}),
-    "gateway_brace_host": json.dumps({"api_key": "test-key", "gateway_url": "https://{a,b}.example.com"}),
-    "gateway_range_host": json.dumps({"api_key": "test-key", "gateway_url": "https://[1-3].example.com"}),
-    "gateway_glob_path": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com/{a,b}"}),
-    "gateway_brackets_path": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com/[1-3]"}),
-    "gateway_backslash": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\\evil.example.com"}),
-    "gateway_zero_width": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\u200b.example.com"}),
-    "gateway_bidi": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\u202e.example.com"}),
-    "gateway_homoglyph": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-\u0430pi.example.com"}),
-    "gateway_encoded_at": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com%40evil.example"}),
-    "gateway_encoded_slash": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com%2Fevil.example"}),
-    "gateway_encoded_port": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com%3A8443"}),
-    "gateway_int": json.dumps({"api_key": "test-key", "gateway_url": 42}),
-    "gateway_list": json.dumps({"api_key": "test-key", "gateway_url": [TENANT_GATEWAY]}),
-    "gateway_dict": json.dumps({"api_key": "test-key", "gateway_url": {"url": TENANT_GATEWAY}}),
+    "gateway_absent": json.dumps({"device_token": "test-key"}),
+    "gateway_empty": json.dumps({"device_token": "test-key", "gateway_url": ""}),
+    "gateway_blank": json.dumps({"device_token": "test-key", "gateway_url": "   "}),
+    "gateway_null": json.dumps({"device_token": "test-key", "gateway_url": None}),
+    "gateway_default": json.dumps({"device_token": "test-key", "gateway_url": DEFAULT_GATEWAY}),
+    "gateway_default_slash": json.dumps({"device_token": "test-key", "gateway_url": DEFAULT_GATEWAY + "/"}),
+    "gateway_http": json.dumps({"device_token": "test-key", "gateway_url": "http://tenant-api.example.com"}),
+    "gateway_no_scheme": json.dumps({"device_token": "test-key", "gateway_url": "tenant-api.example.com"}),
+    "gateway_no_host": json.dumps({"device_token": "test-key", "gateway_url": "https://"}),
+    "gateway_whitespace": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com /x"}),
+    "gateway_newline": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com\nX: y"}),
+    "gateway_query": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com?route=x"}),
+    "gateway_empty_query": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com?"}),
+    "gateway_fragment": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com#x"}),
+    "gateway_userinfo": json.dumps({"device_token": "test-key", "gateway_url": "https://user:pw@tenant-api.example.com"}),
+    "gateway_bad_port": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com:99999"}),
+    "gateway_empty_userinfo": json.dumps({"device_token": "test-key", "gateway_url": "https://@evil.example"}),
+    "gateway_brace_host": json.dumps({"device_token": "test-key", "gateway_url": "https://{a,b}.example.com"}),
+    "gateway_range_host": json.dumps({"device_token": "test-key", "gateway_url": "https://[1-3].example.com"}),
+    "gateway_glob_path": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com/{a,b}"}),
+    "gateway_brackets_path": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com/[1-3]"}),
+    "gateway_backslash": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api\\evil.example.com"}),
+    "gateway_zero_width": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api\u200b.example.com"}),
+    "gateway_bidi": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api\u202e.example.com"}),
+    "gateway_homoglyph": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-\u0430pi.example.com"}),
+    "gateway_encoded_at": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com%40evil.example"}),
+    "gateway_encoded_slash": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com%2Fevil.example"}),
+    "gateway_encoded_port": json.dumps({"device_token": "test-key", "gateway_url": "https://tenant-api.example.com%3A8443"}),
+    "gateway_int": json.dumps({"device_token": "test-key", "gateway_url": 42}),
+    "gateway_list": json.dumps({"device_token": "test-key", "gateway_url": [TENANT_GATEWAY]}),
+    "gateway_dict": json.dumps({"device_token": "test-key", "gateway_url": {"url": TENANT_GATEWAY}}),
     "config_is_list": json.dumps([TENANT_GATEWAY]),
-    "malformed_json": '{"api_key": "test-key", "gateway_url": "' + TENANT_GATEWAY,
+    "malformed_json": '{"device_token": "test-key", "gateway_url": "' + TENANT_GATEWAY,
     "empty_file": "",
-    "oversized": json.dumps({"api_key": "test-key", "gateway_url": TENANT_GATEWAY,
+    "oversized": json.dumps({"device_token": "test-key", "gateway_url": TENANT_GATEWAY,
                              "pad": "x" * (1024 * 1024)}),
 }
 
@@ -210,7 +210,7 @@ def test_unreadable_config_keeps_default_gateway(sandbox_home, curl_shim):
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root reads through file modes")
     _write_config(sandbox_home, json.dumps(
-        {"api_key": "test-key", "gateway_url": TENANT_GATEWAY}))
+        {"device_token": "test-key", "gateway_url": TENANT_GATEWAY}))
     (sandbox_home / ".unbound" / "config.json").chmod(0)
     got, urls = _run_hook("claude-code", sandbox_home, curl_shim)
     assert got.returncode == 0
@@ -235,7 +235,7 @@ def test_symlinked_config_is_followed(sandbox_home, curl_shim):
     """A user-managed symlink (dotfiles) resolves to the same file the hook
     modules read api_key from."""
     real = sandbox_home / "dotfiles-config.json"
-    real.write_text(json.dumps({"api_key": "test-key", "gateway_url": TENANT_GATEWAY}))
+    real.write_text(json.dumps({"device_token": "test-key", "gateway_url": TENANT_GATEWAY}))
     (sandbox_home / ".unbound").mkdir()
     (sandbox_home / ".unbound" / "config.json").symlink_to(real)
     _, urls = _run_hook("claude-code", sandbox_home, curl_shim)
@@ -272,7 +272,7 @@ def test_detached_entries_resolve_gateway_before_import(entry, sandbox_home, mon
     from unbound_hook import hook_cmd
 
     _write_config(sandbox_home, json.dumps(
-        {"api_key": "test-key", "gateway_url": TENANT_GATEWAY}))
+        {"device_token": "test-key", "gateway_url": TENANT_GATEWAY}))
     monkeypatch.setenv("HOME", str(sandbox_home))
     # set-then-delete so monkeypatch restores the variable the helper exports
     monkeypatch.setenv("UNBOUND_GATEWAY_URL", "placeholder")

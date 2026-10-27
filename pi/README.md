@@ -213,7 +213,7 @@ unbound setup pi --clear
 removes exactly `index.js` and `index.js.sha256` from the resolved extension directory, prints a
 per-file `cleared` / `not_found`, leaves the directory itself and every file it did not write
 (including a live `index.ts` and any `.unbound-disabled` file), needs no API key, and makes **no
-network call at all**. It never opens `~/.unbound/config.json` — that `api_key` is shared with
+network call at all**. It never opens `~/.unbound/config.json` — that `device_token` is shared with
 Cursor, Claude Code, Codex, Copilot and Augment Code, so removing pi must not log those tools out.
 
 **`--clear` sends nothing to the backend, and that is deliberate.** Two facts drive it:

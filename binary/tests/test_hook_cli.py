@@ -226,7 +226,7 @@ def test_mcp_diagnostic_subcommand_fails_open(sandbox_home):
     res = run_cli_dev(
         ["mcp-diagnostic", "claude-code"], None, sandbox_home,
         extra_env={"UNBOUND_DIAG_SERVER": "nullfp_demo",
-                   "UNBOUND_DIAG_API_KEY": "test-key",
+                   "UNBOUND_DIAG_DEVICE_TOKEN": "test-key",
                    "UNBOUND_DIAG_CWD": str(sandbox_home)},
         stdin_close=True,
     )
@@ -241,7 +241,7 @@ def test_mcp_diagnostic_unknown_tool_is_noop(sandbox_home):
 def test_sync_skills_subcommand_fails_open(sandbox_home):
     res = run_cli_dev(
         ["sync-skills", "claude-code"], None, sandbox_home,
-        extra_env={"UNBOUND_CLAUDE_API_KEY": "test-key"}, stdin_close=True,
+        extra_env={"UNBOUND_DEVICE_TOKEN": "test-key"}, stdin_close=True,
     )
     assert res.returncode == 0
 

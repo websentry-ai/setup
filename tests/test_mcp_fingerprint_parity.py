@@ -605,7 +605,7 @@ class TestMcpScanDispatchCommand(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'unbound.json'
             config.write_text(json.dumps(
-                {'api_key': self.API_KEY, 'base_url': self.DOMAIN}))
+                {'device_token': self.API_KEY, 'base_url': self.DOMAIN}))
             with patch.object(hook, 'UNBOUND_CONFIG_PATH', config), \
                     patch.object(hook, 'RUNNING_FROZEN', False), \
                     patch.object(hook, '_is_windows', return_value=windows), \

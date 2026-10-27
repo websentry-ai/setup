@@ -1190,7 +1190,7 @@ function usableString(candidate) {
 function resolveApiKey(env, homeDir) {
   const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
   if (fromEnv !== void 0) return fromEnv;
-  return usableString(readUnboundConfig(homeDir).api_key);
+  return usableString(readUnboundConfig(homeDir).device_token);
 }
 function normalizeGatewayUrl(raw) {
   const candidate = usableString(raw);

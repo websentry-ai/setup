@@ -190,7 +190,7 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
                 config_file = home / ".unbound" / "config.json"
                 self.assertTrue(config_file.exists(), f"{name}: config.json was not written")
                 data = json.loads(config_file.read_text())
-                self.assertEqual(data["api_key"], "sk-test-key")
+                self.assertEqual(data["device_token"], "sk-test-key")
                 self.assertEqual(data["base_url"], "https://backend")
                 self.assertFalse(
                     any("Could not write config" in m for m in logs),

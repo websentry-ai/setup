@@ -564,7 +564,7 @@ def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
                 config = {}
             except OSError as e:
                 # But a file we could not READ is a file we know nothing about, and publishing
-                # a fresh object over it would drop this user's email, org and the api_key six
+                # a fresh object over it would drop this user's email, org and the device token six
                 # tools authenticate with -- a mode-000 config in a writable directory cannot
                 # be read and can still be replaced. This is the rule the rc rewrite already
                 # follows: refuse rather than rewrite what we could not read.
@@ -575,7 +575,7 @@ def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
         if not isinstance(config, dict):
             config = {}
         config['device_token'] = api_key
-        config['api_key'] = api_key  # read by older CLIs and hooks
+        config.pop('api_key', None)
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         # Atomic: this file is the shared identity store for six tools, so an interrupt

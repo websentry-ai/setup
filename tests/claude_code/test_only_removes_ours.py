@@ -65,7 +65,7 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
     def _home(gateway_url=None):
         home = Path(tempfile.mkdtemp())
         (home / ".unbound").mkdir()
-        body = {"api_key": "k"}
+        body = {"device_token": "k"}
         if gateway_url:
             body["gateway_url"] = gateway_url
         (home / ".unbound" / "config.json").write_text(json.dumps(body))
@@ -99,9 +99,9 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
         for mod in USER_LEVEL:
             with patch.object(mod.Path, "home", staticmethod(lambda: home)):
                 self.assertTrue(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
-                config.write_text(json.dumps({"api_key": "k", "gateway_url": OURS}))
+                config.write_text(json.dumps({"device_token": "k", "gateway_url": OURS}))
                 self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
-                config.write_text(json.dumps({"api_key": "k",
+                config.write_text(json.dumps({"device_token": "k",
                                               "gateway_url": self.CUSTOM}))
 
     def test_a_corrupt_record_is_not_a_match(self):
@@ -737,7 +737,7 @@ class TestEveryTreeRecordsWhatItRoutesAt(unittest.TestCase):
         home = Path(tempfile.mkdtemp())
         (home / ".unbound").mkdir()
         (home / ".unbound" / "config.json").write_text(
-            json.dumps({"api_key": "k", "gateway_url": self.CUSTOM}))
+            json.dumps({"device_token": "k", "gateway_url": self.CUSTOM}))
         for mod in USER_LEVEL:
             with patch.object(mod.Path, "home", staticmethod(lambda: home)):
                 # exactly as written, and with the trailing slash a shell export may carry
@@ -1128,10 +1128,10 @@ class TestGatewayMdmRecordsItsGateway(unittest.TestCase):
     def test_a_custom_gateway_is_recorded(self):
         config = self._write("https://unbound.acme-corp.internal/")
         self.assertEqual(config["gateway_url"], "https://unbound.acme-corp.internal")
-        self.assertEqual(config["api_key"], "ub-key")
+        self.assertEqual(config["device_token"], "ub-key")
 
     def test_no_gateway_url_records_only_the_key(self):
-        self.assertEqual(self._write(), {"device_token": "ub-key", "api_key": "ub-key"})
+        self.assertEqual(self._write(), {"device_token": "ub-key"})
 
     def test_what_it_records_is_what_the_matcher_accepts(self):
         custom = "https://unbound.acme-corp.internal"

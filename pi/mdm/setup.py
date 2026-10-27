@@ -9,7 +9,7 @@ Run as root, once per device, from an MDM (Jamf and friends):
 What lands on disk, per enumerated user: one file, `<home>/.pi/agent/extensions/unbound/
 index.js`, mode 0644, owned by that user, plus a sibling `index.js.sha256` so an operator
 can verify it by hand. The key is placed where the extension looks for it: an
-`export UNBOUND_PI_API_KEY=...` line in that user's shell rc files, and `api_key` in that
+`export UNBOUND_PI_API_KEY=...` line in that user's shell rc files, and `device_token` in that
 user's `~/.unbound/config.json` -- the latter ONLY when it is absent (see below).
 
 Writing into another user's home as root is the dangerous part of this script, so every
@@ -33,7 +33,7 @@ in-home write goes through three primitives, all of them ported from
 
 Two deliberate divergences from the Augment analog, both called out at the code:
 
-  * `config.json`'s `api_key` is not assigned unconditionally. That file is the shared
+  * `config.json`'s `device_token` is not assigned unconditionally. That file is the shared
     identity store for unbound-cli and five other tools; overwriting a key the user minted
     with `unbound login` would silently repoint all of them at this device key. It IS
     replaced when this installer is the one that wrote it -- recognised by a
@@ -101,7 +101,7 @@ PI_AGENT_DIR_SEGMENTS = (".pi", "agent")
 # writing the generic UNBOUND_API_KEY instead would hand this device key to six other tools.
 ENV_API_KEY_PI = "UNBOUND_PI_API_KEY"
 
-# How this installer remembers which `api_key` in the shared config.json is its own, so a
+# How this installer remembers which `device_token` in the shared config.json is its own, so a
 # rotation can replace the value it wrote without ever touching one the user manages. A
 # digest, not the key: the field is provenance, and the key itself is already in the same
 # file. Read by nothing else -- the other tools read named fields and ignore extras.
@@ -1379,7 +1379,7 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
                 config = {}
             except OSError as e:
                 # A file we could not READ is a file we know nothing about. Publishing a fresh
-                # object over it would drop this user's email, org and the api_key six tools
+                # object over it would drop this user's email, org and the device token six tools
                 # authenticate with -- and would hand them the device key in its place, which
                 # is the exact clobber the ownership check above exists to prevent. Same rule
                 # as append_to_file: refuse rather than rewrite what we could not read.
@@ -1387,10 +1387,10 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
                 return False
         if not isinstance(config, dict):
             config = {}
-        # DELIBERATE DIVERGENCE from augment/hooks/mdm/setup.py:770, which assigns
-        # config['api_key'] unconditionally. This file is the shared identity store for
+        # DELIBERATE DIVERGENCE from augment/hooks/mdm/setup.py, which assigns
+        # config['device_token'] unconditionally. This file is the shared identity store for
         # unbound-cli and five other tools (Cursor, Claude Code, Codex, Copilot, Augment):
-        # on a device where the user has run `unbound login`, overwriting api_key would
+        # on a device where the user has run `unbound login`, overwriting device_token would
         # silently repoint ALL of them at this device key.
         #
         # But a blanket "never overwrite" was the other half of the bug. The value this
@@ -1404,13 +1404,13 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
         # absent, when it is already the key we are about to write, or when its digest
         # matches the one we recorded the last time we wrote it. Anything else is the user's
         # own credential and is left byte-identical.
-        existing = config.get("api_key")
+        existing = config.get("device_token")
         existing = existing.strip() if isinstance(existing, str) else ""
         if (not existing or existing == api_key
                 or config.get(MDM_KEY_PROVENANCE_FIELD) == _key_provenance(existing)):
             config["device_token"] = api_key
-            config["api_key"] = api_key  # read by older CLIs and hooks
             config[MDM_KEY_PROVENANCE_FIELD] = _key_provenance(api_key)
+        config.pop("api_key", None)
         if urls:
             # URLs are tenant configuration, not identity, so they DO update unconditionally.
             config.update({k: v for k, v in urls.items() if v})

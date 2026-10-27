@@ -30,9 +30,9 @@ SCRIPTS = {
     "codex": REPO / "codex" / "hooks" / "unbound.py",
 }
 KEY_ENVS = {
-    "copilot": "UNBOUND_COPILOT_API_KEY",
-    "cursor": "UNBOUND_CURSOR_API_KEY",
-    "codex": "UNBOUND_CODEX_API_KEY",
+    "copilot": "UNBOUND_DEVICE_TOKEN",
+    "cursor": "UNBOUND_DEVICE_TOKEN",
+    "codex": "UNBOUND_DEVICE_TOKEN",
 }
 
 
@@ -235,7 +235,7 @@ def test_skill_sync_does_not_follow_authenticated_redirects(tmp_path):
             **os.environ,
             "HOME": str(home),
             "UNBOUND_GATEWAY_URL": f"http://127.0.0.1:{server.server_port}",
-            "UNBOUND_CODEX_API_KEY": "test-key",
+            "UNBOUND_DEVICE_TOKEN": "test-key",
         }
         result = subprocess.run(
             [sys.executable, str(SCRIPTS["codex"]), "--sync-skills"],

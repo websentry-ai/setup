@@ -477,14 +477,14 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
     def test_targeted_scan_uses_resolved_config(self):
         config_path = Path(self._tmp.name) / "unbound.json"
         config_path.write_text(json.dumps({
-            "api_key": "secret-api-key",
+            "device_token": "secret-api-key",
             "base_url": "https://backend.example.com",
         }))
         with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
             unbound, "RUNNING_FROZEN", True
         ), patch.object(unbound.os.path, "isfile", return_value=True), patch.object(
             unbound.subprocess, "Popen"
-        ) as popen, patch.dict(os.environ, {"UNBOUND_COPILOT_API_KEY": ""}):
+        ) as popen, patch.dict(os.environ, {"UNBOUND_DEVICE_TOKEN": ""}):
             unbound._dispatch_mcp_server_scan(
                 "microsoft/markitdown", {"command": "uvx", "args": ["markitdown-mcp"]}
             )
@@ -503,7 +503,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         config_path = Path(self._tmp.name) / "unbound.json"
         install_path = Path(self._tmp.name) / "install.sh"
         config_path.write_text(json.dumps({
-            "api_key": "secret-api-key",
+            "device_token": "secret-api-key",
             "base_url": "https://backend.example.com",
         }))
         with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
@@ -1597,7 +1597,7 @@ class TestLocalScriptFingerprint(ProcessPreToolUseBase):
     def test_targeted_scan_uploads_the_hashed_script_body(self):
         config_path = Path(self.cwd) / "unbound.json"
         config_path.write_text(json.dumps({
-            "api_key": "secret-api-key",
+            "device_token": "secret-api-key",
             "base_url": "https://backend.example.com",
         }))
         with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
@@ -1624,7 +1624,7 @@ class TestLocalScriptFingerprint(ProcessPreToolUseBase):
     def _scan_payload(self, server_config):
         config_path = Path(self.cwd) / "unbound.json"
         config_path.write_text(json.dumps({
-            "api_key": "secret-api-key",
+            "device_token": "secret-api-key",
             "base_url": "https://backend.example.com",
         }))
         with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(

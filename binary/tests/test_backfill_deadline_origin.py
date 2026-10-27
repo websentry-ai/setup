@@ -19,7 +19,7 @@ def test_backfill_cmd_reorigins_the_deadline_per_tool(tmp_path):
     with patch.object(m, "check_admin_privileges", return_value=True), \
          patch.object(m, "get_all_user_homes", return_value=[("u", tmp_path)]), \
          patch.object(backfill_cmd, "_read_user_config",
-                      return_value={"api_key": "k", "base_url": "https://b"}), \
+                      return_value={"device_token": "k", "base_url": "https://b"}), \
          patch.object(m, "run_backfill", side_effect=fake_run_backfill):
         code = backfill_cmd.run(["--all", "--tools", "claude-code"])
 

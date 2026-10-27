@@ -451,7 +451,7 @@ class TestNoDurableFileIsWrittenByTruncation:
         assert pi_setup.write_unbound_config("newkey", {"base_url": "https://b"}) is True
         import json as _json
         data = _json.loads(cfg.read_text())
-        assert data["api_key"] == "newkey"
+        assert data["device_token"] == "newkey"
         assert data["email"] == "someone@example.com", "unrelated fields preserved"
         assert data["org_name"] == "Acme"
         assert data["base_url"] == "https://b"

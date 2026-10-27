@@ -15,7 +15,7 @@
 #
 # python3 (the hooks' only dependency) is installed automatically via the dependsOn the
 # official python feature. Both hooks read credentials the same way: an env key
-# (UNBOUND_CLAUDE_API_KEY / UNBOUND_CURSOR_API_KEY) or a mounted ~/.unbound/config.json,
+# (UNBOUND_DEVICE_TOKEN) or a mounted ~/.unbound/config.json,
 # which link-unbound.sh already links into every home — so Cursor needs no extra plumbing.
 set -euo pipefail
 
@@ -57,4 +57,4 @@ install -D -m 0644 "$HERE/cursor-hooks.json" /etc/cursor/hooks.json
 install -D -m 0755 "$HERE/link-unbound.sh" /usr/local/share/unbound/link-unbound.sh
 
 echo "unbound-hooks: installed Claude Code + Cursor hooks and managed settings"
-echo "unbound-hooks: mount ~/.unbound/config.json (or set UNBOUND_CLAUDE_API_KEY / UNBOUND_CURSOR_API_KEY) to supply creds"
+echo "unbound-hooks: mount ~/.unbound/config.json (or set UNBOUND_DEVICE_TOKEN) to supply creds"

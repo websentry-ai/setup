@@ -30,11 +30,11 @@ restamp on upgrade.
 
 | Setting | Value |
 |---|---|
-| Secret (Settings → Secrets and variables → Agents) | `UNBOUND_COPILOT_API_KEY` |
+| Secret (Settings → Secrets and variables → Agents) | `UNBOUND_DEVICE_TOKEN` |
 | Secret | `UNBOUND_GATEWAY_URL` |
 | Allowlist (Settings → Copilot → Internet access) | the gateway host, `raw.githubusercontent.com`, `api.github.com` |
 
-The first two are required. Without the gateway the session reports nothing; without
+The first two are required. A repository stamped from an older release reads a secret with the older per-tool name; rename it to `UNBOUND_DEVICE_TOKEN` when you restamp. Without the gateway the session reports nothing; without
 `raw.githubusercontent.com` the hook never loads and every `preToolUse` denies.
 `api.github.com` only names the session's user: without it the session still reports, as
 `Cloud Agent` rather than a login.
@@ -51,7 +51,7 @@ required — an override is not pinned to a commit.
 
 Three limits are known and accepted. Each needs gateway-side work to close, not a hook change.
 
-**`UNBOUND_COPILOT_API_KEY` is readable by the agent, not just by the hook.** GitHub exposes
+**`UNBOUND_DEVICE_TOKEN` is readable by the agent, not just by the hook.** GitHub exposes
 Agents secrets as environment variables "so they can be used by scripts and tools that Copilot
 runs" — there is no hook-only channel. A prompt-injected agent can read the key, send it to any
 allowlisted host, and call the gateway directly with forged telemetry. A dedicated application

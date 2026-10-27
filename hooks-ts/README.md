@@ -173,7 +173,7 @@ Three things about that directory:
 
 1. `UNBOUND_PI_API_KEY`
 2. `UNBOUND_API_KEY`
-3. `api_key` in `~/.unbound/config.json` (written by `unbound login`)
+3. `device_token` in `~/.unbound/config.json` (written by setup)
 4. none — the extension goes **inactive**: it notifies
    `Unbound: no API key found — extension inactive` once at session start, makes zero HTTP requests
    and never blocks anything. A developer who has not logged in is never blocked by a policy engine

@@ -90,7 +90,7 @@ class TestWhatItNeverTouches:
     def test_it_leaves_the_shared_config_byte_identical(self, pi_setup, clear_env):
         """~/.unbound/config.json holds the key six tools read; --clear must not
         so much as rewrite it (CONTEXT-locked, RESEARCH E3)."""
-        original = {"api_key": "shared-key", "base_url": "https://backend.getunbound.ai"}
+        original = {"device_token": "shared-key", "base_url": "https://backend.getunbound.ai"}
         path = clear_env.write_config(original)
         before = path.read_bytes()
         extdir = clear_env.extension_dir()
@@ -98,7 +98,7 @@ class TestWhatItNeverTouches:
         (extdir / "index.js").write_text("// unbound\n")
         pi_setup.clear_setup()
         assert path.read_bytes() == before
-        assert json.loads(path.read_text())["api_key"] == "shared-key"
+        assert json.loads(path.read_text())["device_token"] == "shared-key"
 
     def test_it_needs_no_api_key(self, pi_setup, clear_env):
         """The CLI omits --api-key on a clear run (setup.js:258-259)."""
