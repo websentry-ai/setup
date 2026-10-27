@@ -155,7 +155,8 @@ const CURL_LONG_VALUES: ReadonlySet<string> = new Set(
    --time-cond --tls-max --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii
    --trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out`.split(/\s+/),
 );
-const CURL_UPLOADS: ReadonlySet<string> = new Set(["-T", "--upload-file", "-F", "--form", "--form-string", "--json"]);
+/** Bodies curl sends to every URL of a request; each -T or --upload-file goes to one URL instead, in order. */
+const CURL_UPLOADS: ReadonlySet<string> = new Set(["-F", "--form", "--form-string", "--json"]);
 const CURL_BODIES: ReadonlySet<string> = new Set(
   ["-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode"],
 );
@@ -243,6 +244,9 @@ interface State {
   home: string;
   sshHosts: Map<string, [string, boolean]>;
   addresses: Map<string, AddressKind>;
+  /** Every call's input in the turn, and the command being read, to tell whether any names an ssh config. */
+  turnText: string;
+  callText: string;
 }
 
 type Env = Record<string, string>;
@@ -2546,23 +2550,25 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string | und
  *  option or one in its environment, resolves its name; such a proxy is handed the --connect-to target, and no
  *  --resolve pin applies. */
 function curl(args: string[], env: Env = {}, processEnv: Record<string, string | undefined> = {}): Raw[] {
-  const out: Raw[] = [];
+  const raws: Raw[] = [];
   const pins: string[] = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    for (const written of urls) {
+    for (const [index, written] of urls.entries()) {
+      // The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
+      const out = sends || index < uploads;
       // A URL with no scheme takes --proto-default's, and so that scheme's port.
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded = globoff ? [url] : curlGlob(url);
-      if (expanded === undefined) return out;
+      if (expanded === undefined) return raws;
       for (const one of expanded) {
         const remote = curlRemote(one, kind, noproxy, env, processEnv);
-        out.push([sends ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, remote ? [] : pins), remote]);
+        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, remote ? [] : pins), remote]);
       }
     }
-    if (next >= args.length) return out;
+    if (next >= args.length) return raws;
     i = next;
   }
 }
@@ -2683,13 +2689,14 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
   return [addresses[0] ?? target[0], addresses];
 }
 
-/** The URLs of the curl request at args[start], whether it sends data, its --resolve and --connect-to values, whether
+/** The URLs of the curl request at args[start], [whether it sends a body to every URL, how many -T uploads it pairs
+ *  with its first URLs], its --resolve and --connect-to values, whether
  *  it turns globbing off, where the next request starts, [the kind of proxy it names, empty for none and undefined
  *  when it names none, its --noproxy entries], and its --proto-default scheme; a --next that is an option's value does
  *  not end it. */
 function curlRequest(
   args: string[], start: number,
-): [string[], boolean, [string, string][], boolean, number, [string | undefined, string | undefined], string] {
+): [string[], [boolean, number], [string, string][], boolean, number, [string | undefined, string | undefined], string] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
@@ -2699,6 +2706,7 @@ function curlRequest(
   let preproxy: string | undefined;
   let noproxy: string | undefined;
   let scheme = "";
+  let uploads = 0;
   let i = start;
   while (i < args.length) {
     let arg = args[i++] as string;
@@ -2732,11 +2740,12 @@ function curlRequest(
     else if (Object.hasOwn(CURL_PROXIES, arg) && value !== undefined) kind = value.trim() === "" ? "" : CURL_PROXIES[arg] || proxyKind(value);
     else if (arg === "--noproxy" && value !== undefined) noproxy = value;
     else if (arg === "--proto-default" && value !== undefined) scheme = value.trim().toLowerCase();
+    else if ((arg === "-T" || arg === "--upload-file") && value !== undefined) uploads++;
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
   // Without -x, a --preproxy is the SOCKS proxy the request goes through.
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
+  return [urls, [Boolean(sends), uploads], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
 }
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:
@@ -3341,12 +3350,37 @@ function sshJumps(options: readonly string[]): boolean {
   return false;
 }
 
+/** The user's and the system's ssh configs, as a command names them. */
+const SSH_CONFIG_NAMES = /\.ssh\/config\b|ssh_config\b/;
+
+/** Whether a call in the turn names an ssh config this lookup reads: the user's or the system's, or a -F file anywhere
+ *  but as a -F. A call that may rewrite one can change where an earlier transfer resolves, as ssh -G reads the configs
+ *  only at the end of the turn. */
+function sshConfigNamed(options: readonly string[], state: State): boolean {
+  const text = `${state.turnText}\n${state.callText}`;
+  if (SSH_CONFIG_NAMES.test(text)) return true;
+  const names = options.filter((v, i) => options[i - 1] === "-F" && v !== "none").map((v) => basename(v));
+  const rest = text.replace(/-F\s*\S+/g, " ");
+  return names.some((name) => name !== "" && namesWord(rest, name));
+}
+
+/** Whether `word` stands in `text` as a word of its own: no letter, digit, _, . or - right before or after it. */
+function namesWord(text: string, word: string): boolean {
+  const part = /[\w.-]/;
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (!part.test(text[at - 1] ?? " ") && !part.test(text[at + word.length] ?? " ")) return true;
+  }
+  return false;
+}
+
 /** [the host ssh connects to for a destination, read from ssh -G, empty when it can't be looked up safely, whether
  *  ssh -G reports a jump host or proxy command for it]. */
 async function sshHostname(destination: string, options: string[], cwd: string | undefined, state: State): Promise<[string, boolean]> {
   // The lookup runs elsewhere, so a relative config path is resolved against the folder the command ran in.
   // A HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e, names no file this can read.
   if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return ["", false];
+  // A config it reads may have changed since the transfer, so neither ssh -G nor DNS runs.
+  if (sshConfigNamed(options, state)) return ["", true];
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute(value) || cwd === undefined ? value : join(cwd, value);
@@ -3465,6 +3499,7 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
 
 /** Where one shell command's transfers went; undefined when it ran none. */
 async function transferOf(command: string, cwd: string | undefined, state: State): Promise<Transfer | undefined> {
+  state.callText = command;
   let tool: string | undefined;
   const endpoints: TransferEndpoint[] = [];
   let calls: Call[];
@@ -3517,6 +3552,15 @@ export async function resolveTransfers(
       home: opts.home ?? accountHome(),
       sshHosts: new Map(),
       addresses: new Map(),
+      // Every call's input, so a turn that names an ssh config makes no ssh lookups.
+      turnText: calls.map((call) => {
+        try {
+          return typeof call.tool_input === "string" ? call.tool_input : JSON.stringify(call.tool_input) ?? "";
+        } catch {
+          return "";
+        }
+      }).join("\n"),
+      callText: "",
     };
     for (const call of calls) {
       const input = call.tool_input;

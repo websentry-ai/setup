@@ -6484,6 +6484,188 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl -T build.zip https://files.acme-infra.net/a https://example.com/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -T a -T b https://files.acme-infra.net/1 https://example.com/2",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     },
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -T a https://files.acme-infra.net/1 https://example.com/2 https://cgnat.example/3",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "cgnat.example",
+      "resolved_host": "cgnat.example",
+      "address": "cgnat"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/a -T build.zip https://files.acme-infra.net/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -d x https://example.com/a https://files.acme-infra.net/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -T a https://files.acme-infra.net/1 --next https://example.com/2",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp f prod:/tmp; sed -i 's/HostName 203.0.113.9/HostName 10.0.4.12/' ~/.ssh/config",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp f prod:/tmp && cat /etc/ssh/ssh_config",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -F cfg f prod:/tmp; sed -i s/a/b/ cfg",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp f prod:/tmp; echo done",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
   }
  ]
 }

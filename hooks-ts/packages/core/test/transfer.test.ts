@@ -660,6 +660,23 @@ test("pushd lands as cd does, and any other stack move leaves the folder unknown
   ]) assert.equal(await at(command), "prod", command);
 });
 
+test("a turn that names an ssh config makes no ssh lookup", async () => {
+  // ssh -G reads the configs at the end of the turn, so a later call that may rewrite one leaves the turn's ssh
+  // destinations unresolved; a turn that names none still resolves.
+  for (const [second, expected] of [
+    ["sed -i 's/HostName 203.0.113.9/HostName 10.0.4.12/' ~/.ssh/config", "unresolved"],
+    ["echo done", "private"],
+  ] as const) {
+    const calls: string[][] = [];
+    const found = await resolveTransfers([
+      { tool_name: "bash", tool_use_id: "c1", tool_input: { command: "scp build.zip prod:/srv" } },
+      { tool_name: "bash", tool_use_id: "c2", tool_input: { command: second } },
+    ], "/", options({ execFile: fakeSsh(calls) }));
+    assert.equal(found.get("c1")?.endpoints[0]?.address, expected, second);
+    assert.equal(calls.length, expected === "private" ? 1 : 0, second);
+  }
+});
+
 test("a proxied or unsure call is unresolved whatever an earlier call found", async () => {
   // The turn caches each lookup, but a call that must not look up never reads it.
   const found = await resolveTransfers([
@@ -745,9 +762,10 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ['cd "\\frontend"; scp -F cfg f prod:/tmp', "prod"],
     ['cd "\\~/frontend"; scp -F cfg f prod:/tmp', "prod"],
     ['cd "front\\\nend"; scp -F cfg f prod:/tmp', "10.0.4.12"],
-    ["cd cfg; scp -F cfg f prod:/tmp", "203.0.113.9"],
+    // Naming the -F file anywhere else in the turn means no lookup, as it may be rewritten.
+    ["cd cfg; scp -F cfg f prod:/tmp", "prod"],
     // A command that only reads inside the folder, such as wc, does not name it.
-    ["wc -c frontend/cfg; cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
+    ["wc -c frontend/notes; cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // Every shell fails that cd, so the || after it surely runs.
     ["cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // An arithmetic for that stops after one pass keeps its cd, unless its body touches the counter.

@@ -2021,7 +2021,7 @@ var CURL_LONG_VALUES = new Set(
    --time-cond --tls-max --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii
    --trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out`.split(/\s+/)
 );
-var CURL_UPLOADS = /* @__PURE__ */ new Set(["-T", "--upload-file", "-F", "--form", "--form-string", "--json"]);
+var CURL_UPLOADS = /* @__PURE__ */ new Set(["-F", "--form", "--form-string", "--json"]);
 var CURL_BODIES = /* @__PURE__ */ new Set(
   ["-d", "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode"]
 );
@@ -3928,22 +3928,23 @@ function curlRemote(url, kind, noproxy, env, processEnv) {
   return proxy !== "socks4" && proxy !== "socks5";
 }
 function curl(args, env = {}, processEnv = {}) {
-  const out = [];
+  const raws = [];
   const pins = [];
   for (let i = 0; ; ) {
-    const [urls, sends, overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    for (const written of urls) {
+    for (const [index, written] of urls.entries()) {
+      const out = sends || index < uploads;
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
-      if (expanded2 === void 0) return out;
+      if (expanded2 === void 0) return raws;
       for (const one of expanded2) {
         const remote2 = curlRemote(one, kind, noproxy, env, processEnv);
-        out.push([sends ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, remote2 ? [] : pins), remote2]);
+        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, remote2 ? [] : pins), remote2]);
       }
     }
-    if (next >= args.length) return out;
+    if (next >= args.length) return raws;
     i = next;
   }
 }
@@ -4057,6 +4058,7 @@ function curlRequest(args, start) {
   let preproxy;
   let noproxy;
   let scheme = "";
+  let uploads = 0;
   let i = start;
   while (i < args.length) {
     let arg = args[i++];
@@ -4088,10 +4090,11 @@ function curlRequest(args, start) {
     else if (Object.hasOwn(CURL_PROXIES, arg) && value !== void 0) kind = value.trim() === "" ? "" : CURL_PROXIES[arg] || proxyKind(value);
     else if (arg === "--noproxy" && value !== void 0) noproxy = value;
     else if (arg === "--proto-default" && value !== void 0) scheme = value.trim().toLowerCase();
+    else if ((arg === "-T" || arg === "--upload-file") && value !== void 0) uploads++;
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, Boolean(sends), overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
+  return [urls, [Boolean(sends), uploads], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
 }
 function wget(args, proxied = false) {
   const urls = [];
@@ -4605,8 +4608,25 @@ function sshJumps(options) {
   }
   return false;
 }
+var SSH_CONFIG_NAMES = /\.ssh\/config\b|ssh_config\b/;
+function sshConfigNamed(options, state) {
+  const text = `${state.turnText}
+${state.callText}`;
+  if (SSH_CONFIG_NAMES.test(text)) return true;
+  const names = options.filter((v, i) => options[i - 1] === "-F" && v !== "none").map((v) => basename(v));
+  const rest = text.replace(/-F\s*\S+/g, " ");
+  return names.some((name) => name !== "" && namesWord(rest, name));
+}
+function namesWord(text, word) {
+  const part = /[\w.-]/;
+  for (let at = text.indexOf(word); at >= 0; at = text.indexOf(word, at + 1)) {
+    if (!part.test(text[at - 1] ?? " ") && !part.test(text[at + word.length] ?? " ")) return true;
+  }
+  return false;
+}
 async function sshHostname(destination, options, cwd, state) {
   if (options.some((v, i) => options[i - 1] === "-F" && (v.startsWith("~") || v.startsWith(SUBSTITUTED)))) return ["", false];
+  if (sshConfigNamed(options, state)) return ["", true];
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
     return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join5(cwd, value);
@@ -4702,6 +4722,7 @@ async function endpoint(raw, cwd, state, sure = true) {
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
 }
 async function transferOf(command2, cwd, state) {
+  state.callText = command2;
   let tool;
   const endpoints = [];
   let calls;
@@ -4737,7 +4758,16 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       deadline: now() + (opts.budgetMs ?? TURN_BUDGET_MS),
       home: opts.home ?? accountHome(),
       sshHosts: /* @__PURE__ */ new Map(),
-      addresses: /* @__PURE__ */ new Map()
+      addresses: /* @__PURE__ */ new Map(),
+      // Every call's input, so a turn that names an ssh config makes no ssh lookups.
+      turnText: calls.map((call) => {
+        try {
+          return typeof call.tool_input === "string" ? call.tool_input : JSON.stringify(call.tool_input) ?? "";
+        } catch {
+          return "";
+        }
+      }).join("\n"),
+      callText: ""
     };
     for (const call of calls) {
       const input = call.tool_input;

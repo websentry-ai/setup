@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '85636f96f6e0b8a7ef24d8f9523b0814d598ddae082309a4e06aa51da764fbfa'
+BLOCK_SHA256 = '9236c988198a78597c643348c49dd4968095350fe88458da4516139abe91281e'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1022,9 +1022,10 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd "\\frontend"; scp -F cfg f prod:/tmp', unknown),
                                   ('cd "\\~/frontend"; scp -F cfg f prod:/tmp', unknown),
                                   ('cd "front\\\nend"; scp -F cfg f prod:/tmp', private),
-                                  ('cd cfg; scp -F cfg f prod:/tmp', public),
+                                  # Naming the -F file anywhere else in the turn means no lookup, as it may be rewritten.
+                                  ('cd cfg; scp -F cfg f prod:/tmp', unknown),
                                   # A command that only reads inside the folder, such as wc, does not name it.
-                                  ('wc -c frontend/cfg; cd frontend; scp -F cfg f prod:/tmp', private),
+                                  ('wc -c frontend/notes; cd frontend; scp -F cfg f prod:/tmp', private),
                                   # Every shell fails that cd, so the || after it surely runs.
                                   ('cd -Z frontend || cd frontend; scp -F cfg f prod:/tmp', private),
                                   # An arithmetic for that stops after one pass keeps its cd, unless its body
@@ -1526,6 +1527,32 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         events.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
         output = copilot.build_exchange_from_transcript(str(events), 's1', cwd=self.repo)[0]
         self.assertEqual([e.get('transfer') for e in _tool_entries(output)], [ran])
+
+    def test_a_turn_that_names_an_ssh_config_makes_no_ssh_lookup(self):
+        # ssh -G reads the configs at the end of the turn, so a later call that may rewrite one leaves the turn's
+        # ssh destinations unresolved; a turn that names none still resolves.
+        unknown = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved')]}
+        private = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]}
+        for path in ('claude-code/hooks/unbound.py', 'codex/hooks/unbound.py', 'copilot/hooks/unbound.py',
+                     'augment/hooks/unbound.py'):
+            for second, expected in (("sed -i 's/HostName 203.0.113.9/HostName 10.0.4.12/' ~/.ssh/config", unknown),
+                                     ('echo done', private)):
+                with self.subTest(hook=path, second=second):
+                    self.assertEqual(self._transfers(path, ['scp build.zip prod:/srv', second])[0], expected)
+        cursor = load_module('cursor/unbound.py')
+        roots = {'workspace_roots': [self.repo], 'conversation_id': 'c1', 'generation_id': 'g1'}
+        events = [{'timestamp': '2026-10-22T22:09:59+05:30',
+                   'event': {'hook_event_name': 'beforeSubmitPrompt', 'prompt': 'ship it', **roots}},
+                  {'timestamp': '2026-10-22T22:10:00+05:30',
+                   'event': {'hook_event_name': 'afterShellExecution', 'command': 'scp build.zip prod:/srv',
+                             'cwd': self.repo, 'output': '', **roots}},
+                  {'timestamp': '2026-10-22T22:10:01+05:30',
+                   'event': {'hook_event_name': 'afterFileEdit', 'file_path': os.path.join(self.home, '.ssh', 'config'),
+                             'edits': [], **roots}},
+                  {'timestamp': '2026-10-22T22:10:02+05:30',
+                   'event': {'hook_event_name': 'afterAgentResponse', 'text': 'shipped', **roots}}]
+        transfers = [e.get('transfer') for e in _tool_entries(cursor.build_llm_exchange(events)) if e.get('transfer')]
+        self.assertEqual(transfers, [unknown])
 
     def test_a_codex_workdir_does_not_move_later_calls(self):
         # A workdir is that call's own; the next call without one still starts in the session folder.

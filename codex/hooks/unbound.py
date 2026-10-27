@@ -3954,7 +3954,8 @@ _TRANSFER_CURL_LONG_VALUES = frozenset((
     '--socks5-gssapi-service --socks5-hostname --speed-limit --speed-time --stderr --telnet-option --tftp-blksize '
     '--time-cond --tls-max --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii '
     '--trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out').split())
-_TRANSFER_CURL_UPLOADS = frozenset({'-T', '--upload-file', '-F', '--form', '--form-string', '--json'})
+# Bodies curl sends to every URL of a request; each -T or --upload-file goes to one URL instead, in order.
+_TRANSFER_CURL_UPLOADS = frozenset({'-F', '--form', '--form-string', '--json'})
 _TRANSFER_CURL_BODIES = frozenset({'-d', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode'})
 # The switches a --no- option turns back off, so the last of them decides.
 _TRANSFER_CURL_UNDOES = {'--no-globoff': {'-g', '--globoff'}, '--no-get': {'-G', '--get'}}
@@ -6072,10 +6073,12 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
     --connect-to target, and no --resolve pin applies."""
     endpoints, pins, i = [], [], 0
     while True:
-        urls, sends, overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
+        urls, (sends, uploads), overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
-        for url in urls:
+        for index, url in enumerate(urls):
+            # The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
+            out = sends or index < uploads
             # A URL with no scheme takes --proto-default's, and so that scheme's port.
             url = scheme + '://' + url.strip() if scheme and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', url) else url
             expanded = [url] if globoff else _transfer_curl_glob(url)
@@ -6083,7 +6086,7 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
                 return endpoints
             for one in expanded:
                 remote = _transfer_curl_remote(one, kind, noproxy, env or {})
-                endpoints.append(('out' if sends else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
+                endpoints.append(('out' if out else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
                                   _transfer_curl_dial(one, connects, [] if remote else pins), remote))
         if i >= len(args):
             return endpoints
@@ -6193,11 +6196,12 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """(the URLs of the curl request at args[i], whether it sends data, its --resolve and --connect-to values, whether
+    """(the URLs of the curl request at args[i], (whether it sends a body to every URL, how many -T uploads it pairs
+    with its first URLs), its --resolve and --connect-to values, whether
     it turns globbing off, where the next request starts, (the kind of proxy it names, empty for none and None when
     it names none, its --noproxy value), its --proto-default scheme); a --next that is an option's value does not
     end it."""
-    urls, flags, method, overrides, scheme = [], set(), '', [], ''
+    urls, flags, method, overrides, scheme, uploads = [], set(), '', [], '', 0
     kind, preproxy, noproxy = None, None, None
     while i < len(args):
         arg, value, i = args[i], None, i + 1
@@ -6236,10 +6240,12 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             noproxy = value
         elif arg == '--proto-default' and value is not None:
             scheme = value.strip().lower()
+        elif arg in ('-T', '--upload-file') and value is not None:
+            uploads += 1
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
     # Without -x, a --preproxy is the SOCKS proxy the request goes through.
-    return urls, bool(sends), overrides, bool(flags & {'-g', '--globoff'}), i, \
+    return urls, (bool(sends), uploads), overrides, bool(flags & {'-g', '--globoff'}), i, \
         (kind if kind is not None else preproxy, noproxy), scheme
 
 
@@ -6755,12 +6761,42 @@ def _transfer_ssh_jumps(options: List[str]) -> bool:
     return False
 
 
+# The user's and the system's ssh configs, as a command names them.
+_TRANSFER_SSH_CONFIG_NAMES = re.compile(r'\.ssh/config\b|ssh_config\b')
+
+
+def _transfer_turn_text(inputs) -> str:
+    """Every tool call's input in a turn as one text, to tell whether any names an ssh config. Never raises."""
+    import json
+    parts = []
+    for item in inputs:
+        try:
+            parts.append(item if isinstance(item, str) else json.dumps(item, default=str))
+        except Exception:
+            pass
+    return '\n'.join(parts)
+
+
+def _transfer_ssh_config_named(options: List[str], state: Dict) -> bool:
+    """Whether a call in the turn names an ssh config this lookup reads: the user's or the system's, or a -F file
+    anywhere but as a -F. A call that may rewrite one can change where an earlier transfer resolves, as ssh -G reads
+    the configs only at the end of the turn."""
+    text = state.get('turn_text', '') + '\n' + state.get('call_text', '')
+    if _TRANSFER_SSH_CONFIG_NAMES.search(text):
+        return True
+    names = {os.path.basename(v) for i, v in enumerate(options) if i and options[i - 1] == '-F' and v != 'none'}
+    text = re.sub(r'-F\s*\S+', ' ', text)
+    return any(name and re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', text) for name in names)
+
+
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> tuple:
     """(the host ssh connects to for a destination, read from ssh -G, empty when it can't be looked up safely, whether
     ssh -G reports a jump host or proxy command for it)."""
     configs = [v for i, v in enumerate(options) if i and options[i - 1] == '-F']
     if any(v.startswith(('~', _TRANSFER_SUBSTITUTED)) for v in configs):
         return '', False  # a HOME not known, or a ~ the shell left, which ssh reads as it is, as in rsync -e
+    if _transfer_ssh_config_named(options, state):
+        return '', True  # a config it reads may have changed since the transfer, so neither ssh -G nor DNS runs
     key = ('ssh', destination, tuple(options), cwd)
     if key not in state:
         state[key] = '', False
@@ -6864,7 +6900,7 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
     try:
         if not isinstance(command, str) or not command.strip():
             return None
-        tool, endpoints = None, []
+        tool, endpoints, state['call_text'] = None, [], command
         for program, args, env, call_cwd, other_user, layers, unsure in \
                 _transfer_walk(_TransferLexer(command).read() or [], cwd, {}, 0):
             found = _transfer_parse(program, args, env, other_user, layers)
@@ -6970,7 +7006,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
         # (seeded with the session cwd); root_projects caches origin lookups.
         shell_dir = session_cwd
         root_projects: Dict[str, Optional[str]] = {}
-        transfer_state: Dict = {}
+        # Every call's input, so a turn that names an ssh config makes no ssh lookups.
+        transfer_state: Dict = {'turn_text': _transfer_turn_text(c.get('arguments') for c in function_calls.values())}
         for call_id, call_data in function_calls.items():
             name = call_data.get('name', '')
             args = call_data.get('arguments', {})
