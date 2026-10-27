@@ -2056,9 +2056,40 @@ var HTTPIE_LONG_VALUES = new Set(
 var PS_SWITCHES = new Set(
   `usebasicparsing usedefaultcredentials proxyusedefaultcredentials disablekeepalive passthru skipcertificatecheck
    skipheadervalidation skiphttperrorcheck allowunencryptedauthentication allowinsecureredirect noproxy
-   preserveauthorizationonredirect preservehttpmethodonredirect resume followrellink verbose debug whatif
-   confirm`.split(/\s+/)
+   preserveauthorizationonredirect preservehttpmethodonredirect resume followrellink preserveheaderscase verbose debug
+   whatif confirm`.split(/\s+/)
 );
+var PS_COMMON = new Set(
+  `verbose debug whatif confirm erroraction warningaction informationaction progressaction errorvariable
+   warningvariable informationvariable outvariable outbuffer pipelinevariable`.split(/\s+/)
+);
+var PS_OWN = /* @__PURE__ */ new Set([
+  ...[...PS_SWITCHES].filter((name) => !PS_COMMON.has(name)),
+  ...`uri method body headers outfile infile contenttype useragent proxy credential timeoutsec websession
+   sessionvariable form maximumredirection maximumretrycount retryintervalsec certificatethumbprint certificate
+   authentication token custommethod sslprotocol transferencoding proxycredential connectiontimeoutseconds
+   operationtimeoutseconds httpversion responseheadersvariable statuscodevariable maximumfollowrellink
+   unixsocket`.split(/\s+/)
+]);
+var PS_ALIASES = {
+  vb: "verbose",
+  db: "debug",
+  wi: "whatif",
+  cf: "confirm",
+  ea: "erroraction",
+  wa: "warningaction",
+  infa: "informationaction",
+  proga: "progressaction",
+  ev: "errorvariable",
+  wv: "warningvariable",
+  iv: "informationvariable",
+  ov: "outvariable",
+  ob: "outbuffer",
+  pv: "pipelinevariable",
+  cm: "custommethod",
+  sv: "sessionvariable",
+  rhv: "responseheadersvariable"
+};
 var ADDRESS_KINDS = [
   ["loopback", ["127.0.0.0/8", "0.0.0.0/32", "::1/128", "::/128"]],
   ["private", ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]],
@@ -4295,6 +4326,16 @@ function httpie(args, sends, proxied = false) {
   const host = url.startsWith(":") ? "localhost" : urlHost(url, HTTPIE_SCHEMES);
   return [[out ? "out" : "in", host, void 0, void 0, proxied || flags.has("--proxy")]];
 }
+function psParameter(written) {
+  const name = written.toLowerCase();
+  if (PS_OWN.has(name) || PS_COMMON.has(name)) return name;
+  if (Object.hasOwn(PS_ALIASES, name)) return PS_ALIASES[name];
+  for (const group of [PS_OWN, PS_COMMON]) {
+    const found = [...group].filter((parameter) => parameter.startsWith(name));
+    if (found.length > 0) return found.length === 1 ? found[0] : "";
+  }
+  return name;
+}
 function webCmdlet(args, sends, proxied = false) {
   let uri = "";
   let out = sends;
@@ -4311,7 +4352,8 @@ function webCmdlet(args, sends, proxied = false) {
       continue;
     }
     const colon = arg.indexOf(":");
-    const name = (colon < 0 ? arg.slice(1) : arg.slice(1, colon)).toLowerCase();
+    const name = psParameter(colon < 0 ? arg.slice(1) : arg.slice(1, colon));
+    if (name === "") return [];
     let value = colon < 0 ? "" : arg.slice(colon + 1);
     if (colon < 0 && !PS_SWITCHES.has(name) && i < args.length) value = args[i++];
     if (name === "uri") uri = value;

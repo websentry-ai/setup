@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b0aadd82c731fa704bfcdb9d76ddf7fc30651a7e211f85894ccc68c46736967f'
+BLOCK_SHA256 = 'd3786ea839ba14068c77dfe2989ccc06d4c89388a7411142f0a1c58b720d95dd'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1260,6 +1260,27 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         output = hook.build_exchange_from_transcript(str(events), 's1', cwd=self.repo, already_forwarded={'call-0'})[0]
         self.assertEqual([e.get('transfer') for e in _tool_entries(output)],
                          [{'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'public', '203.0.113.9')]}])
+
+    def test_a_failed_copilot_call_leaves_the_folder_unknown(self):
+        # A command that ran and failed may have stopped anywhere, sent on an earlier Stop or not.
+        hook = load_module('copilot/hooks/unbound.py')
+        lines = [{'type': 'user.message', 'id': 'u1', 'timestamp': '2026-10-22T16:39:59.000Z',
+                  'data': {'content': 'go'}}]
+        done = [{'success': False, 'error': {'message': 'exit 1', 'code': 'failure'}},
+                {'success': True, 'result': {'content': ''}}]
+        for n, (command, result) in enumerate(zip(('cd frontend && npm test', 'scp -F cfg f prod:/tmp'), done)):
+            lines += [{'type': 'tool.execution_start', 'timestamp': f'2026-10-22T16:40:0{n}.000Z',
+                       'data': {'toolCallId': f'call-{n}', 'toolName': 'bash', 'arguments': {'command': command}}},
+                      {'type': 'tool.execution_complete', 'timestamp': f'2026-10-22T16:40:0{n}.500Z',
+                       'data': {'toolCallId': f'call-{n}', **result}}]
+        events = Path(tempfile.mkdtemp(), 'events.jsonl')
+        events.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        unknown = {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved')]}
+        for forwarded in (set(), {'call-0'}):
+            with self.subTest(forwarded=forwarded):
+                output = hook.build_exchange_from_transcript(str(events), 's1', cwd=self.repo,
+                                                             already_forwarded=forwarded)[0]
+                self.assertEqual([e.get('transfer') for e in _tool_entries(output)][-1], unknown)
 
     def test_augment(self):
         hook = load_module('augment/hooks/unbound.py')

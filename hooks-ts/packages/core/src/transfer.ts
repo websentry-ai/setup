@@ -191,9 +191,28 @@ const HTTPIE_LONG_VALUES: ReadonlySet<string> = new Set(
 const PS_SWITCHES: ReadonlySet<string> = new Set(
   `usebasicparsing usedefaultcredentials proxyusedefaultcredentials disablekeepalive passthru skipcertificatecheck
    skipheadervalidation skiphttperrorcheck allowunencryptedauthentication allowinsecureredirect noproxy
-   preserveauthorizationonredirect preservehttpmethodonredirect resume followrellink verbose debug whatif
-   confirm`.split(/\s+/),
+   preserveauthorizationonredirect preservehttpmethodonredirect resume followrellink preserveheaderscase verbose debug
+   whatif confirm`.split(/\s+/),
 );
+/** Their own parameters that take a value, the common ones, and the aliases, for PowerShell's resolving of a name. */
+const PS_COMMON: ReadonlySet<string> = new Set(
+  `verbose debug whatif confirm erroraction warningaction informationaction progressaction errorvariable
+   warningvariable informationvariable outvariable outbuffer pipelinevariable`.split(/\s+/),
+);
+const PS_OWN: ReadonlySet<string> = new Set([
+  ...[...PS_SWITCHES].filter((name) => !PS_COMMON.has(name)),
+  ...`uri method body headers outfile infile contenttype useragent proxy credential timeoutsec websession
+   sessionvariable form maximumredirection maximumretrycount retryintervalsec certificatethumbprint certificate
+   authentication token custommethod sslprotocol transferencoding proxycredential connectiontimeoutseconds
+   operationtimeoutseconds httpversion responseheadersvariable statuscodevariable maximumfollowrellink
+   unixsocket`.split(/\s+/),
+]);
+const PS_ALIASES: Record<string, string> = {
+  vb: "verbose", db: "debug", wi: "whatif", cf: "confirm", ea: "erroraction", wa: "warningaction",
+  infa: "informationaction", proga: "progressaction", ev: "errorvariable", wv: "warningvariable",
+  iv: "informationvariable", ov: "outvariable", ob: "outbuffer", pv: "pipelinevariable", cm: "custommethod",
+  sv: "sessionvariable", rhv: "responseheadersvariable",
+};
 /** Address kinds, checked in order; any other address is public. */
 const ADDRESS_KINDS: readonly [AddressKind, readonly string[]][] = [
   ["loopback", ["127.0.0.0/8", "0.0.0.0/32", "::1/128", "::/128"]],
@@ -2984,6 +3003,20 @@ function httpie(args: string[], sends: boolean, proxied = false): Raw[] {
   return [[out ? "out" : "in", host, undefined, undefined, proxied || flags.has("--proxy")]];
 }
 
+/** The web cmdlet parameter a -Name binds to, as PowerShell resolves it: an exact name or alias, else the one parameter
+ *  it starts, the cmdlet's own before the common ones; empty when it starts several, which PowerShell rejects, and the
+ *  name itself when it starts none. */
+function psParameter(written: string): string {
+  const name = written.toLowerCase();
+  if (PS_OWN.has(name) || PS_COMMON.has(name)) return name;
+  if (Object.hasOwn(PS_ALIASES, name)) return PS_ALIASES[name] as string;
+  for (const group of [PS_OWN, PS_COMMON]) {
+    const found = [...group].filter((parameter) => parameter.startsWith(name));
+    if (found.length > 0) return found.length === 1 ? (found[0] as string) : "";
+  }
+  return name;
+}
+
 function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   let uri = "";
   let out = sends;
@@ -3000,7 +3033,8 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
       continue;
     }
     const colon = arg.indexOf(":");
-    const name = (colon < 0 ? arg.slice(1) : arg.slice(1, colon)).toLowerCase();
+    const name = psParameter(colon < 0 ? arg.slice(1) : arg.slice(1, colon));
+    if (name === "") return []; // a name that starts several parameters, which PowerShell rejects
     let value = colon < 0 ? "" : arg.slice(colon + 1);
     if (colon < 0 && !PS_SWITCHES.has(name) && i < args.length) value = args[i++] as string;
     if (name === "uri") uri = value;
