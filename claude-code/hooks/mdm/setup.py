@@ -1858,8 +1858,11 @@ def _backfill_write_state_text(home: Path, text: str) -> None:
     # half-written state.
     try:
         path = _backfill_state_path(home)
+        # Checked again at the write, before and after creating hooks: either folder can be linked by now.
+        if _backfill_root_is_linked(home / '.claude', path.parent):
+            debug_print("backfill state not written: .claude or its hooks folder is a link")
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
-        # Checked again at the write: a hooks folder missing when the run began can be linked by now.
         if _backfill_root_is_linked(home / '.claude', path.parent):
             debug_print("backfill state not written: .claude or its hooks folder is a link")
             return

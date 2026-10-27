@@ -137,6 +137,14 @@ class BackfillLinksTestCase(unittest.TestCase):
             mdm._backfill_write_cutoff(home, 2.0)
         self.assertEqual((home / ".claude" / "hooks" / mdm.BACKFILL_STATE_FILE).read_text(), "2.0")
 
+    def test_a_linked_claude_folder_gets_no_hooks_folder_created_in_it(self):
+        home = Path(self.root).parent / "home-nohooks"
+        (home / ".claude").mkdir(parents=True)
+        mdm = uploaders[0]
+        with self._as_junction(home / ".claude"), mock.patch.object(mdm.platform, "system", return_value="Windows"):
+            mdm._backfill_write_cutoff(home, 1.0)
+        self.assertFalse((home / ".claude" / "hooks").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
