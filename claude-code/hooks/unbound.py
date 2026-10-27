@@ -7642,7 +7642,7 @@ def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
         if arg.startswith('--'):
             if '=' not in arg and arg in _TRANSFER_NC_LONG_VALUES:
                 i += 1
-            flags.add(arg)
+            flags.add(arg.split('=', 1)[0])  # --proxy=host:port is --proxy
         elif arg.startswith('-') and len(arg) > 1:
             flag, _, i = _transfer_short_option(arg, args, i, _TRANSFER_NC_SHORT_VALUES, flags)
             flags.add(flag)
@@ -7654,8 +7654,7 @@ def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
 
 
 def _transfer_socat(args: List[str], sends: bool) -> List[tuple]:
-    """The hosts socat's two addresses connect to: sent to when its stdin is fed in. A host a PROXY or SOCKS address
-    names, or one with a proxyport= or socksport= option, is reached through that proxy."""
+    """The hosts socat's two addresses connect to: sent to when its stdin is fed in."""
     addresses, i = [], 0
     while i < len(args):
         arg, i = args[i], i + 1
@@ -7665,14 +7664,28 @@ def _transfer_socat(args: List[str], sends: bool) -> List[tuple]:
             addresses.append(arg)
     endpoints = []
     for address in addresses[:2]:
-        match = re.match(r'^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|'
-                         r'(proxy(?:-connect)?|socks4a?|socks5(?:-connect)?):[^:,]+):(\[[^\]]+\]|[^:,]+):', address,
-                         re.IGNORECASE)
-        if match:
-            proxied = bool(match.group(1) or re.search(r',\s*(?:proxyport|socksport)=', address, re.IGNORECASE))
-            endpoints.append(('out' if sends else '', match.group(2), None, None, proxied))
+        target = _transfer_socat_target(address)
+        if target:
+            endpoints.append(('out' if sends else '', target[0], None, None, target[1]))
     return endpoints
 
+
+def _transfer_socat_target(address: str) -> Optional[tuple]:
+    """(the host a socat address connects to, whether a proxy reaches it), read from its colon fields, a bracketed
+    address being one field; None for an address that connects to none, or one socat rejects."""
+    body, *options = re.split(r',(?![^\[]*\])', address)
+    kind, *fields = re.split(r':(?![^\[]*\])', body)
+    kind, options = kind.lower(), {o.split('=', 1)[0].strip().lower() for o in options}
+    # Each type's fields, the target's place among them, and whether a proxy reaches it. SOCKS4 sends the server an
+    # address, so socat looks the target up itself; SOCKS4A and SOCKS5 send the name.
+    shape = {'proxy': (3, 1, True), 'proxy-connect': (3, 1, True), 'socks4': (3, 1, False), 'socks4a': (3, 1, True),
+             'socks5': (4, 2, True), 'socks5-connect': (4, 2, True)}.get(kind)
+    if shape is None and re.fullmatch(r'(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?', kind):
+        # A proxy option on a direct address is one socat refuses, so it connects nowhere.
+        shape = None if options & {'proxyport', 'socksport'} else (2, 0, False)
+    if shape is None or len(fields) != shape[0]:
+        return None
+    return fields[shape[1]], shape[2]
 
 def _transfer_httpie_item(item: str) -> bool:
     """Whether an HTTPie request item is data (=, :=, @, =@, :=@) rather than a header (:) or a query (==)."""
@@ -8015,16 +8028,17 @@ def _transfer_address(host: str, state: Dict, lookup: bool = True) -> str:
     """The kind of address a host resolves to, looked up once per turn: public when any address is public, else
     the first address's kind; unresolved when the lookup fails, the turn's budget is spent, or lookup is off."""
     import ipaddress
+    try:
+        return _transfer_address_kind([ipaddress.ip_address(host)])
+    except ValueError:
+        pass
+    if not lookup:
+        return 'unresolved'  # whatever an earlier call found: this one may not have run, or a proxy reaches the host
     key = ('address', host)
     if key not in state:
-        try:
-            addresses = [ipaddress.ip_address(host)]
-        except ValueError:
-            if not lookup:
-                return 'unresolved'  # a call that may not have run is never looked up
-            remaining = _transfer_deadline(state) - time.monotonic()
-            addresses = _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else []
-        state[key] = _transfer_address_kind(addresses)
+        remaining = _transfer_deadline(state) - time.monotonic()
+        state[key] = _transfer_address_kind(
+            _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else [])
     return state[key]
 
 

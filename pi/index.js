@@ -4118,7 +4118,7 @@ function netcat(args, sends) {
     const arg = args[i++];
     if (arg.startsWith("--")) {
       if (!arg.includes("=") && NC_LONG_VALUES.has(arg)) i++;
-      flags.add(arg);
+      flags.add(arg.split("=")[0]);
     } else if (arg.startsWith("-") && arg.length > 1) {
       let flag;
       [flag, , i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
@@ -4139,11 +4139,30 @@ function socat(args, sends) {
   }
   const out = [];
   for (const address2 of addresses.slice(0, 2)) {
-    const match = /^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|(proxy(?:-connect)?|socks4a?|socks5(?:-connect)?):[^:,]+):(\[[^\]]+\]|[^:,]+):/i.exec(address2);
-    const proxied = match?.[1] !== void 0 || /,\s*(?:proxyport|socksport)=/i.test(address2);
-    if (match !== null) out.push([sends ? "out" : "", match[2], void 0, void 0, proxied]);
+    const target = socatTarget(address2);
+    if (target !== void 0) out.push([sends ? "out" : "", target[0], void 0, void 0, target[1]]);
   }
   return out;
+}
+function socatTarget(address2) {
+  const [body = "", ...options] = address2.split(/,(?![^[]*\])/);
+  const [first = "", ...fields] = body.split(/:(?![^[]*\])/);
+  const kind = first.toLowerCase();
+  const optionNames = new Set(options.map((option) => option.split("=")[0].trim().toLowerCase()));
+  const shapes = {
+    proxy: [3, 1, true],
+    "proxy-connect": [3, 1, true],
+    socks4: [3, 1, false],
+    socks4a: [3, 1, true],
+    socks5: [4, 2, true],
+    "socks5-connect": [4, 2, true]
+  };
+  let shape = Object.hasOwn(shapes, kind) ? shapes[kind] : void 0;
+  if (shape === void 0 && /^(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?$/.test(kind)) {
+    shape = optionNames.has("proxyport") || optionNames.has("socksport") ? void 0 : [2, 0, false];
+  }
+  if (shape === void 0 || fields.length !== shape[0]) return void 0;
+  return [fields[shape[1]], shape[2]];
 }
 function httpieItem(item) {
   const match = /^(?:\\.|[^\\=:@])*(:=@|=@|:=|==|=|@|:)/.exec(item);
@@ -4501,18 +4520,12 @@ async function resolveAddresses(host, timeoutMs, state) {
   }
 }
 async function address(host, state, lookup = true) {
+  if (isIP(host) !== 0) return addressKind([host]);
+  if (!lookup) return "unresolved";
   const cached = state.addresses.get(host);
   if (cached !== void 0) return cached;
-  let found;
-  if (isIP(host) !== 0) {
-    found = [host];
-  } else if (!lookup) {
-    return "unresolved";
-  } else {
-    const remaining = state.deadline - state.now();
-    found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
-  }
-  const kind = addressKind(found);
+  const remaining = state.deadline - state.now();
+  const kind = addressKind(remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : []);
   state.addresses.set(host, kind);
   return kind;
 }

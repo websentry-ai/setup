@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '3ef9b17808e8d07fd89219903a007280ce8fc0679d44a82836b4f63037265004'
+BLOCK_SHA256 = '5a4dd0f707a87c5334498f9986de78310676e8286198a3d75bd27cad528e35c2'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -539,6 +539,18 @@ class PowerShellTests(TransferTestCase):
 
 
 class AddressTests(TransferTestCase):
+    def test_a_proxied_or_unsure_call_is_unresolved_whatever_an_earlier_call_found(self):
+        # The turn caches each lookup, but a call that must not look up never reads it.
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                state = {}
+                self.assertEqual(hook._transfer('curl https://files.acme-infra.net/a', self.repo, state)['endpoints'],
+                                 [_endpoint('in', 'files.acme-infra.net', 'private')])
+                for command in ('curl --socks5-hostname proxy.example:1080 -T secret https://files.acme-infra.net/up',
+                                '[ -f /nope ] && curl -T secret https://files.acme-infra.net/up'):
+                    self.assertEqual(hook._transfer(command, self.repo, state)['endpoints'],
+                                     [_endpoint('out', 'files.acme-infra.net', 'unresolved')], command)
+
     def test_a_call_that_may_not_have_run_is_never_looked_up(self):
         # Neither DNS nor ssh -G runs for it; an address as written is still classified, and a sure call looks up.
         looked_up = []

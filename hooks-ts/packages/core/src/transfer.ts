@@ -2794,7 +2794,7 @@ function netcat(args: string[], sends: boolean): Raw[] {
     const arg = args[i++] as string;
     if (arg.startsWith("--")) {
       if (!arg.includes("=") && NC_LONG_VALUES.has(arg)) i++;
-      flags.add(arg);
+      flags.add(arg.split("=")[0] as string); // --proxy=host:port is --proxy
     } else if (arg.startsWith("-") && arg.length > 1) {
       let flag: string;
       [flag, , i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
@@ -2817,13 +2817,32 @@ function socat(args: string[], sends: boolean): Raw[] {
   }
   const out: Raw[] = [];
   for (const address of addresses.slice(0, 2)) {
-    const match =
-      /^(?:(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?|(proxy(?:-connect)?|socks4a?|socks5(?:-connect)?):[^:,]+):(\[[^\]]+\]|[^:,]+):/i.exec(address);
-    // A PROXY or SOCKS address, or a proxyport= or socksport= option, reaches the host through that proxy.
-    const proxied = match?.[1] !== undefined || /,\s*(?:proxyport|socksport)=/i.test(address);
-    if (match !== null) out.push([sends ? "out" : "", match[2] as string, undefined, undefined, proxied]);
+    const target = socatTarget(address);
+    if (target !== undefined) out.push([sends ? "out" : "", target[0], undefined, undefined, target[1]]);
   }
   return out;
+}
+
+/** [the host a socat address connects to, whether a proxy reaches it], read from its colon fields, a bracketed address
+ *  being one field; undefined for an address that connects to none, or one socat rejects. */
+function socatTarget(address: string): [string, boolean] | undefined {
+  const [body = "", ...options] = address.split(/,(?![^[]*\])/);
+  const [first = "", ...fields] = body.split(/:(?![^[]*\])/);
+  const kind = first.toLowerCase();
+  const optionNames = new Set(options.map((option) => (option.split("=")[0] as string).trim().toLowerCase()));
+  // Each type's fields, the target's place among them, and whether a proxy reaches it. SOCKS4 sends the server an
+  // address, so socat looks the target up itself; SOCKS4A and SOCKS5 send the name.
+  const shapes: Record<string, [number, number, boolean]> = {
+    proxy: [3, 1, true], "proxy-connect": [3, 1, true], socks4: [3, 1, false], socks4a: [3, 1, true],
+    socks5: [4, 2, true], "socks5-connect": [4, 2, true],
+  };
+  let shape = Object.hasOwn(shapes, kind) ? shapes[kind] : undefined;
+  if (shape === undefined && /^(?:tcp|udp|sctp|dccp|openssl|ssl)[46]?(?:-connect|-sendto|-datagram)?$/.test(kind)) {
+    // A proxy option on a direct address is one socat refuses, so it connects nowhere.
+    shape = optionNames.has("proxyport") || optionNames.has("socksport") ? undefined : [2, 0, false];
+  }
+  if (shape === undefined || fields.length !== shape[0]) return undefined;
+  return [fields[shape[1]] as string, shape[2]];
 }
 
 /** Whether an HTTPie request item is data (=, :=, @, =@, :=@) rather than a header (:) or a query (==). */
@@ -3256,18 +3275,13 @@ async function resolveAddresses(host: string, timeoutMs: number, state: State): 
 /** The kind of address a host resolves to, looked up once per turn: public when any address is public, else the
  *  first address's kind; unresolved when the lookup fails or the turn's budget is spent. */
 async function address(host: string, state: State, lookup = true): Promise<AddressKind> {
+  if (isIP(host) !== 0) return addressKind([host]);
+  // Whatever an earlier call found: this one may not have run, or a proxy reaches the host.
+  if (!lookup) return "unresolved";
   const cached = state.addresses.get(host);
   if (cached !== undefined) return cached;
-  let found: readonly string[];
-  if (isIP(host) !== 0) {
-    found = [host];
-  } else if (!lookup) {
-    return "unresolved"; // a call that may not have run is never looked up
-  } else {
-    const remaining = state.deadline - state.now();
-    found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
-  }
-  const kind = addressKind(found);
+  const remaining = state.deadline - state.now();
+  const kind = addressKind(remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : []);
   state.addresses.set(host, kind);
   return kind;
 }

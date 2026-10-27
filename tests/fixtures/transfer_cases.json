@@ -4843,24 +4843,14 @@
       "direction": "out",
       "host": "files.acme-infra.net",
       "resolved_host": "files.acme-infra.net",
-      "address": "unresolved"
+      "address": "private"
      }
     ]
    }
   },
   {
    "command": "socat - SOCKS5:proxy.example:files.acme-infra.net:443 < secret.txt",
-   "transfer": {
-    "tool": "socat",
-    "endpoints": [
-     {
-      "direction": "out",
-      "host": "files.acme-infra.net",
-      "resolved_host": "files.acme-infra.net",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "socat - PROXY:proxy.example:files.acme-infra.net:443,proxyport=3128 < secret.txt",
@@ -4892,17 +4882,7 @@
   },
   {
    "command": "socat - TCP:files.acme-infra.net:443,socksport=1080 < secret.txt",
-   "transfer": {
-    "tool": "socat",
-    "endpoints": [
-     {
-      "direction": "out",
-      "host": "files.acme-infra.net",
-      "resolved_host": "files.acme-infra.net",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "socat - TCP:files.acme-infra.net:443 < secret.txt",
@@ -4917,6 +4897,204 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl https://files.acme-infra.net/a; curl --socks5-hostname proxy.example:1080 -T secret https://files.acme-infra.net/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     },
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/a; [ -f /nope ] && curl -T f https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat --proxy=proxy.corp:3128 --proxy-type=http example.com 443 < request.txt",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "nc -xproxy.corp:1080 example.com 80 < request.txt",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -xhttp://proxy.corp:3128 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --proxy=http://proxy.corp:3128 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --execute=use_proxy=on https://example.com/a",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget -euse_proxy=on https://example.com/a",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "Invoke-WebRequest -Uri https://example.com/a -Proxy:http://proxy.corp:3128",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - SOCKS5:proxy.example:1080:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - SOCKS5-CONNECT:[2001:db8::1]:1080:example.com:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - PROXY:[2001:db8::1]:files.acme-infra.net:443 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - SOCKS4A:[2001:db8::1]:files.acme-infra.net:443,socksport=1080 < secret.txt",
+   "transfer": {
+    "tool": "socat",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "socat - TCP:files.acme-infra.net:443,proxyport=3128 < secret.txt",
+   "transfer": null
   }
  ]
 }

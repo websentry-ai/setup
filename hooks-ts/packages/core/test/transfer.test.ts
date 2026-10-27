@@ -658,6 +658,16 @@ test("pushd lands as cd does, and any other stack move leaves the folder unknown
   ]) assert.equal(await at(command), "prod", command);
 });
 
+test("a proxied or unsure call is unresolved whatever an earlier call found", async () => {
+  // The turn caches each lookup, but a call that must not look up never reads it.
+  const found = await resolveTransfers([
+    { tool_name: "bash", tool_use_id: "c1", tool_input: { command: "curl https://files.acme-infra.net/a" } },
+    { tool_name: "bash", tool_use_id: "c2", tool_input: { command: "curl --socks5-hostname proxy.example:1080 -T secret https://files.acme-infra.net/up" } },
+    { tool_name: "bash", tool_use_id: "c3", tool_input: { command: "[ -f /nope ] && curl -T secret https://files.acme-infra.net/up" } },
+  ], "/", options());
+  assert.deepEqual(["c1", "c2", "c3"].map((id) => found.get(id)?.endpoints[0]?.address), ["private", "unresolved", "unresolved"]);
+});
+
 test("a call that may not have run is never looked up", async () => {
   // Neither DNS nor ssh -G runs for it; an address as written is still classified, and a sure call looks up.
   const seen: string[] = [];
