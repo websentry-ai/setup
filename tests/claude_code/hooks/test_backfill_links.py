@@ -109,6 +109,18 @@ class BackfillLinksTestCase(unittest.TestCase):
                 mock.patch.object(mdm.platform, "system", return_value="Windows"):
             self.assertEqual(mdm._backfill_collect_sessions(home)[0], [])
 
+    def test_the_mdm_uploader_writes_nothing_through_a_linked_claude_folder(self):
+        home = Path(self.root).parent / "home"
+        shutil.copytree(self.root, home / ".claude" / "projects")
+        mdm = uploaders[0]
+        run = mock.Mock(has_time_for_a_batch=mock.Mock(return_value=True), slowest_batch=0.0,
+                        completed_watermark=1.0, force_epoch=None, force_days=None)
+        with self._as_junction(home / ".claude"), mock.patch.object(mdm.platform, "system", return_value="Windows"), \
+                mock.patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)):
+            self.assertEqual(mdm._backfill_drain_home(run, ("alice", home)), (0, 0, "unreadable"))
+        self.assertFalse((home / ".claude" / "hooks").exists())
+        run.upload.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
