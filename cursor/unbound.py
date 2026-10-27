@@ -30,7 +30,8 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 ).rstrip("/")
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
-# Two attempts plus the inter-attempt sleep stay under the 60s hook timeout the installers write.
+# Two attempts plus the inter-attempt sleep stay under the host's hook timeout, so the
+# fail-open return still runs when the gateway never answers.
 PRETOOL_ATTEMPTS = 2
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
