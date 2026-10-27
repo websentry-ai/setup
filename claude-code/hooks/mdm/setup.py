@@ -2609,7 +2609,7 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
     upload lands. Returns (sessions_sent, batches, status); status is 'done',
     'more' (history left for the next run), 'failed' or 'unreadable'."""
     username, home_dir = user_home
-    if _backfill_root_is_linked(home_dir / '.claude', home_dir / '.claude' / 'projects'):
+    if _backfill_root_is_linked(home_dir / '.claude', home_dir / '.claude' / 'projects', home_dir / '.claude' / 'hooks'):
         # Refused, not empty: writing the cutoff would follow the link into another profile as SYSTEM.
         return 0, 0, 'unreadable'
     start, home_forced, sent_total, batches = None, None, 0, 0

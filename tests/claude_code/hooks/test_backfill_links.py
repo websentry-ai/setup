@@ -115,10 +115,13 @@ class BackfillLinksTestCase(unittest.TestCase):
         mdm = uploaders[0]
         run = mock.Mock(has_time_for_a_batch=mock.Mock(return_value=True), slowest_batch=0.0,
                         completed_watermark=1.0, force_epoch=None, force_days=None)
-        with self._as_junction(home / ".claude"), mock.patch.object(mdm.platform, "system", return_value="Windows"), \
-                mock.patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)):
-            self.assertEqual(mdm._backfill_drain_home(run, ("alice", home)), (0, 0, "unreadable"))
-        self.assertFalse((home / ".claude" / "hooks").exists())
+        (home / ".claude" / "hooks").mkdir()
+        for linked in (home / ".claude", home / ".claude" / "hooks"):
+            with self.subTest(linked.name), self._as_junction(linked), \
+                    mock.patch.object(mdm.platform, "system", return_value="Windows"), \
+                    mock.patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)):
+                self.assertEqual(mdm._backfill_drain_home(run, ("alice", home)), (0, 0, "unreadable"))
+            self.assertEqual(list((home / ".claude" / "hooks").iterdir()), [])
         run.upload.assert_not_called()
 
 
