@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'd3786ea839ba14068c77dfe2989ccc06d4c89388a7411142f0a1c58b720d95dd'
+BLOCK_SHA256 = '85636f96f6e0b8a7ef24d8f9523b0814d598ddae082309a4e06aa51da764fbfa'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -101,8 +101,7 @@ for line in (lines_of(config) if config != 'none' else []):
 print('hostname ' + overrides.get('hostname', hostname).lower())
 print('port ' + overrides.get('port', port))
 for key in ('proxyjump', 'proxycommand'):
-    if overrides.get(key, 'none').lower() != 'none':
-        print(key + ' ' + overrides[key])
+    print(key + ' ' + overrides.get(key, 'none'))  # as some ssh versions print it for a host with neither
 '''
 
 
@@ -359,6 +358,8 @@ class CopyTests(TransferTestCase):
     def test_scp_to_a_nickname_reports_the_address_ssh_resolves_it_to(self):
         self.assert_endpoints('scp build.zip prod:/srv', [_endpoint('out', 'prod', 'private', '10.0.4.12')], 'scp')
         self.assertEqual(self.ssh_calls()[0]['argv'], ['-G', '-F', '<vetted>', '--', 'prod'])
+        # ssh runs from the vetted folder, never the project's, where Windows would look for a planted ssh first.
+        self.assertTrue(all('unbound-ssh-' in call['cwd'] for call in self.ssh_calls()))
 
     def test_scp_and_rsync_copy_directions(self):
         cases = {

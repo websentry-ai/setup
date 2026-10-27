@@ -3369,15 +3369,16 @@ function touched(frame, commands) {
 }
 function leaves(commands, shell, called, seen) {
   for (const words2 of commands) {
-    for (let k = 0; k < words2.length; k++) {
-      const word = words2[k];
-      const count = words2[k + 1] ?? "1";
-      if (["break", "eval", "source", "."].includes(word) || word === "return" && !called || word === "continue" && !(/^\d+$/.test(count) && Number(count) <= 1)) return true;
-      const known = shell.functions.get(word);
-      if (known !== void 0 && !seen.has(word)) {
-        seen.add(word);
-        if (leaves(ownCommands(known[0]), shell, true, seen)) return true;
-      }
+    let lead = words2.filter((w) => !KEYWORDS.has(w) && !isAssignment(w));
+    while (lead[0] === "command" || lead[0] === "builtin") lead = lead.slice(1);
+    const word = lead[0];
+    if (word === void 0) continue;
+    const count = lead[1] ?? "1";
+    if (["break", "eval", "source", "."].includes(word) || word === "return" && !called || word === "continue" && !(/^\d+$/.test(count) && Number(count) <= 1)) return true;
+    const known = shell.functions.get(word);
+    if (known !== void 0 && !seen.has(word)) {
+      seen.add(word);
+      if (leaves(ownCommands(known[0]), shell, true, seen)) return true;
     }
   }
   return false;
@@ -3555,7 +3556,7 @@ function shellString(name, args) {
     let hasC = false;
     for (let i = 0; i < args.length; ) {
       const arg = args[i++];
-      if (["-o", "+o", "-O", "+O"].includes(arg)) i++;
+      if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++;
       else if ((arg.startsWith("-") || arg.startsWith("+")) && !arg.startsWith("--") && arg.length > 1) hasC ||= arg.includes("c");
       else if (!arg.startsWith("--")) return hasC ? arg : void 0;
     }
@@ -4620,7 +4621,8 @@ async function sshHostname(destination, options, cwd, state) {
   const line = lines.find((l) => l.startsWith("hostname "));
   const found = [
     line === void 0 ? "" : cleanHost(line.slice("hostname ".length)),
-    lines.some((l) => l.startsWith("proxyjump ") || l.startsWith("proxycommand "))
+    // Some ssh versions print `proxyjump none` and `proxycommand none` for a host with neither.
+    lines.some((l) => /^(?:proxyjump|proxycommand)\s+(?!none\s*$)\S/i.test(l))
   ];
   state.sshHosts.set(key, found);
   return found;

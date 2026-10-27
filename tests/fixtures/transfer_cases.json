@@ -6448,6 +6448,42 @@
   {
    "command": "iwr -Uri https://example.com/a -Prox:http://proxy.corp:3128",
    "transfer": null
+  },
+  {
+   "command": "while true; do ls .; done; curl https://example.com/x",
+   "transfer": null
+  },
+  {
+   "command": "while true; do echo break eval; done; curl https://example.com/x",
+   "transfer": null
+  },
+  {
+   "command": "bash --rcfile /dev/null -c 'curl https://example.com/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash --init-file /dev/null -c 'curl https://example.com/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

@@ -67,8 +67,8 @@ function fakeSsh(calls: string[][] = []): ExecFileLike {
         else if (key?.toLowerCase() === "proxyjump" && current.includes(host)) jump ??= values.join(" ");
       }
     }
-    const proxy = jump === undefined || jump.toLowerCase() === "none" ? "" : `proxyjump ${jump}\n`;
-    return `hostname ${(hostname ?? FIXTURE.ssh_hosts[host] ?? host).toLowerCase()}\nport 22\n${proxy}`;
+    // As some ssh versions print it for a host with neither.
+    return `hostname ${(hostname ?? FIXTURE.ssh_hosts[host] ?? host).toLowerCase()}\nport 22\nproxyjump ${jump ?? "none"}\nproxycommand none\n`;
   };
 }
 

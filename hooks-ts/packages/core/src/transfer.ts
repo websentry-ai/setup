@@ -1871,16 +1871,18 @@ function touched(frame: Frame, commands: string[][] | undefined): void {
  *  function, where it only ends the call), eval or source, or a call to a function that could. */
 function leaves(commands: string[][], shell: Shell, called: boolean, seen: Set<string>): boolean {
   for (const words of commands) {
-    for (let k = 0; k < words.length; k++) {
-      const word = words[k] as string;
-      const count = words[k + 1] ?? "1";
-      if (["break", "eval", "source", "."].includes(word) || (word === "return" && !called) ||
-          (word === "continue" && !(/^\d+$/.test(count) && Number(count) <= 1))) return true;
-      const known = shell.functions.get(word);
-      if (known !== undefined && !seen.has(word)) {
-        seen.add(word);
-        if (leaves(ownCommands(known[0]), shell, true, seen)) return true;
-      }
+    // Only the word in command position runs; an argument that names break, eval or a function does not.
+    let lead = words.filter((w) => !KEYWORDS.has(w) && !isAssignment(w));
+    while (lead[0] === "command" || lead[0] === "builtin") lead = lead.slice(1);
+    const word = lead[0];
+    if (word === undefined) continue;
+    const count = lead[1] ?? "1";
+    if (["break", "eval", "source", "."].includes(word) || (word === "return" && !called) ||
+        (word === "continue" && !(/^\d+$/.test(count) && Number(count) <= 1))) return true;
+    const known = shell.functions.get(word);
+    if (known !== undefined && !seen.has(word)) {
+      seen.add(word);
+      if (leaves(ownCommands(known[0]), shell, true, seen)) return true;
     }
   }
   return false;
@@ -2097,7 +2099,7 @@ function shellString(name: string, args: string[]): string | undefined {
     let hasC = false;
     for (let i = 0; i < args.length; ) {
       const arg = args[i++] as string;
-      if (["-o", "+o", "-O", "+O"].includes(arg)) i++;
+      if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++; // each takes the word after it
       else if ((arg.startsWith("-") || arg.startsWith("+")) && !arg.startsWith("--") && arg.length > 1) hasC ||= arg.includes("c");
       else if (!arg.startsWith("--")) return hasC ? arg : undefined;
     }
@@ -3359,7 +3361,8 @@ async function sshHostname(destination: string, options: string[], cwd: string |
   const lines = out.split(/\r?\n/);
   const line = lines.find((l) => l.startsWith("hostname "));
   const found: [string, boolean] = [line === undefined ? "" : cleanHost(line.slice("hostname ".length)),
-    lines.some((l) => l.startsWith("proxyjump ") || l.startsWith("proxycommand "))];
+    // Some ssh versions print `proxyjump none` and `proxycommand none` for a host with neither.
+    lines.some((l) => /^(?:proxyjump|proxycommand)\s+(?!none\s*$)\S/i.test(l))];
   state.sshHosts.set(key, found);
   return found;
 }

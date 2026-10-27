@@ -5780,7 +5780,8 @@ def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[
             if options is None:
                 return None
             argv = argv[:2] + options + argv[end:]
-        result = subprocess.run(argv, cwd=cwd if cwd and os.path.isdir(cwd) else None, capture_output=True,
+        # From the vetted folder, not the project's, which Windows would search for a planted ssh first.
+        result = subprocess.run(argv, cwd=folder, capture_output=True,
                                 text=True, timeout=min(_TRANSFER_RUN_TIMEOUT, remaining), stdin=subprocess.DEVNULL)
         return result.stdout if result.returncode == 0 else None
     except Exception:
@@ -7141,15 +7142,20 @@ def _transfer_leaves(commands: List[List[str]], shell: Dict, called: bool, seen:
     """Whether commands could leave the loop they run in: a break, a continue past it, a return (but in a called
     function, where it only ends the call), eval or source, or a call to a function that could."""
     for words in commands:
-        for k, word in enumerate(words):
-            count = words[k + 1] if k + 1 < len(words) else '1'
-            if word in ('break', 'eval', 'source', '.') or (word == 'return' and not called) or \
-                    (word == 'continue' and not (re.fullmatch(r'[0-9]+', count) and int(count) <= 1)):
+        # Only the word in command position runs; an argument that names break, eval or a function does not.
+        lead = [w for w in words if w not in _TRANSFER_KEYWORDS and not _transfer_is_assignment(w)]
+        while lead[:1] in (['command'], ['builtin']):
+            lead = lead[1:]
+        if not lead:
+            continue
+        word, count = lead[0], lead[1] if len(lead) > 1 else '1'
+        if word in ('break', 'eval', 'source', '.') or (word == 'return' and not called) or \
+                (word == 'continue' and not (re.fullmatch(r'[0-9]+', count) and int(count) <= 1)):
+            return True
+        if word in shell['functions'] and word not in seen:
+            seen.add(word)
+            if _transfer_leaves(_transfer_own_commands(shell['functions'][word][0]), shell, True, seen):
                 return True
-            if word in shell['functions'] and word not in seen:
-                seen.add(word)
-                if _transfer_leaves(_transfer_own_commands(shell['functions'][word][0]), shell, True, seen):
-                    return True
     return False
 
 
@@ -7364,8 +7370,8 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
         has_c, i = False, 0
         while i < len(args):
             arg, i = args[i], i + 1
-            if arg in ('-o', '+o', '-O', '+O'):
-                i += 1
+            if arg in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
+                i += 1  # each takes the word after it
             elif arg[:1] in '-+' and not arg.startswith('--') and len(arg) > 1:
                 has_c = has_c or 'c' in arg
             elif not arg.startswith('--'):
@@ -8507,7 +8513,9 @@ def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[s
             target = destination.replace('[', '').replace(']', '')
             out = _transfer_run(['ssh', '-G'] + options + ['--', target], cwd, state) or ''
             names = [line.split(None, 1)[1] for line in out.splitlines() if line.startswith('hostname ')]
-            jumps = any(line.startswith(('proxyjump ', 'proxycommand ')) for line in out.splitlines())
+            # Some ssh versions print `proxyjump none` and `proxycommand none` for a host with neither.
+            jumps = any(line.split(None, 1)[0] in ('proxyjump', 'proxycommand') and line.split(None, 1)[1:] != ['none']
+                        for line in out.lower().splitlines() if line.strip())
             state[key] = (_transfer_clean_host(names[0]) if names else ''), jumps
     return state[key]
 
