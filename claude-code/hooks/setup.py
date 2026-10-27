@@ -1343,7 +1343,9 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> bool:
-    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions, 'uploader_stats': _backfill_uploader_stats}
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if _backfill_uploader_stats is not None:
+        payload['uploader_stats'] = _backfill_uploader_stats
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.

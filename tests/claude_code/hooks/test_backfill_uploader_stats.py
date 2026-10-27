@@ -86,23 +86,32 @@ class UploaderStatsTestCase(unittest.TestCase):
         return {"files_seen": seen, "unreadable": 2,
                 "skipped_over_cap": {"count": 2, "largest_bytes": self.big[1], "total_bytes": sum(self.big)}}
 
-    def test_every_upload_reports_what_was_seen_and_left_behind(self):
-        for up in (mdm, setup):
-            with self.subTest(up.__name__):
-                # A home of its own: a run records how far it got, so a second run in the same home sends nothing.
-                bodies = _run(up, self._populated_home())
-                self.assertTrue(bodies)
-                self.assertEqual(sorted(s["session_id"] for b in bodies for s in b["sessions"]), ["a", "b"])
-                for body in bodies:
-                    self.assertEqual(set(body), {"tool_type", "sessions", "uploader_stats"})
-                    self.assertEqual(body["uploader_stats"], self._expected(6))
+    def test_every_standalone_upload_reports_what_was_seen_and_left_behind(self):
+        bodies = _run(setup, self._populated_home())
+        self.assertEqual(sorted(s["session_id"] for b in bodies for s in b["sessions"]), ["a", "b"])
+        for body in bodies:
+            self.assertEqual(set(body), {"tool_type", "sessions", "uploader_stats"})
+            self.assertEqual(body["uploader_stats"], self._expected(6))
+
+    def test_mdm_uploads_first_then_sends_the_counts_once(self):
+        bodies = _run(mdm, self._populated_home())
+        *uploads, counts = bodies
+        self.assertEqual(sorted(s["session_id"] for b in uploads for s in b["sessions"]), ["a", "b"])
+        self.assertTrue(all("uploader_stats" not in b for b in uploads))
+        self.assertEqual((counts["sessions"], counts["uploader_stats"]), ([], self._expected(6)))
+
+    def test_mdm_skips_the_count_when_the_run_is_out_of_time(self):
+        # Time for the one batch this home needs, none left for the count.
+        with patch.object(mdm._BackfillRun, "has_time_for_a_batch", side_effect=[True, False]):
+            bodies = _run(mdm, self._populated_home())
+        self.assertTrue(bodies)
+        self.assertTrue(all("uploader_stats" not in b for b in bodies))
 
     def test_mdm_counts_every_profile_of_the_run(self):
         other, projects = self._home()
         (projects / "c.jsonl").write_text(json.dumps({"type": "user", "sessionId": "c"}) + "\n")
         bodies = _run(mdm, self._populated_home(), more=[("bob", other)])
-        self.assertEqual({json.dumps(b["uploader_stats"], sort_keys=True) for b in bodies},
-                         {json.dumps(self._expected(7), sort_keys=True)})
+        self.assertEqual(bodies[-1]["uploader_stats"], self._expected(7))
 
     def test_a_run_that_only_skips_still_reports_its_counts(self):
         for up in (mdm, setup):

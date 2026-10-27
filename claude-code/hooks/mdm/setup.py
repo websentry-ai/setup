@@ -1909,8 +1909,8 @@ def _backfill_empty_stats() -> Dict:
             'unreadable': 0}
 
 
-# What this run could not send, carried on every upload so the server can report it per device.
-_backfill_uploader_stats = _backfill_empty_stats()
+# What this run could not send, for the server to report per device; MDM sends it once, after its uploads.
+_backfill_uploader_stats = None
 
 
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[Dict] = None):
@@ -2427,7 +2427,9 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> bool:
-    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions, 'uploader_stats': _backfill_uploader_stats}
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if _backfill_uploader_stats is not None:
+        payload['uploader_stats'] = _backfill_uploader_stats
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.
@@ -2745,6 +2747,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     serial, which is what lets the server attribute a profile's history to the
     person who ran it rather than to the key's owner."""
     global _backfill_uploader_stats
+    _backfill_uploader_stats = None
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -2759,11 +2762,6 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         # Fetched once, before privileges are dropped: one call per device, not per profile.
         run = _BackfillRun(api_key, backend_url, device_serial,
                            _backfill_force_config(api_key, backend_url), completed_watermark)
-        # Counted for every profile before any upload, so each upload carries the same numbers.
-        stats = _backfill_empty_stats()
-        for username, home_dir in user_homes:
-            _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
-        _backfill_uploader_stats = stats
         sessions_sent, batches, statuses = 0, 0, set()
         for user_home in user_homes:
             try:
@@ -2775,9 +2773,14 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print(f"backfill {user_home[0]}: {status}, {sent} sessions in {home_batches} batches")
             sessions_sent, batches = sessions_sent + sent, batches + home_batches
             statuses.add(status)
-        if not batches and _backfill_skipped_anything(stats):
-            # Nothing else went up, so the counts go alone; a device whose every transcript is skipped still reports.
-            _backfill_upload_chunk(api_key, backend_url, [])
+        # Counted after the uploads, with the time left, so a large history never holds an upload back.
+        if run.has_time_for_a_batch():
+            stats = _backfill_empty_stats()
+            for username, home_dir in user_homes:
+                _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
+            if _backfill_skipped_anything(stats):
+                _backfill_uploader_stats = stats
+                _backfill_upload_chunk(api_key, backend_url, [])
         _backfill_report(sessions_sent, batches, statuses)
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
