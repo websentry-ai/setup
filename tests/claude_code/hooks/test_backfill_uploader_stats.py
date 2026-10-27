@@ -102,6 +102,33 @@ class UploaderStatsTestCase(unittest.TestCase):
         self.assertEqual({json.dumps(b["uploader_stats"], sort_keys=True) for b in bodies},
                          {json.dumps(self._expected(7), sort_keys=True)})
 
+    def test_a_run_that_only_skips_still_reports_its_counts(self):
+        for up in (mdm, setup):
+            with self.subTest(up.__name__):
+                home, projects = self._home()
+                (projects / "big.jsonl").write_text(json.dumps({"sessionId": "big", "pad": "x" * 5000}) + "\n")
+                bodies = _run(up, home)
+                self.assertEqual([b["sessions"] for b in bodies], [[]])
+                self.assertEqual(bodies[0]["uploader_stats"]["skipped_over_cap"]["count"], 1)
+
+    def test_a_run_with_nothing_skipped_and_nothing_to_send_uploads_nothing(self):
+        for up in (mdm, setup):
+            with self.subTest(up.__name__):
+                home, _ = self._home()
+                self.assertEqual(_run(up, home), [])
+
+    def test_unreadable_counts_the_files_the_collector_drops(self):
+        for up in (mdm, setup):
+            with self.subTest(up.__name__):
+                home, projects = self._home()
+                (projects / "array-first.jsonl").write_text("[1, 2]\n" + json.dumps({"sessionId": "x"}) + "\n")
+                (projects / "late-id.jsonl").write_text("{}\n" * 6 + json.dumps({"sessionId": "y"}) + "\n")
+                with patch.object(up, "BACKFILL_MAX_LINES_PER_FILE", 5):
+                    stats = up._backfill_walk_stats(home / ".claude" / "projects")
+                    dropped = [p.name for p in sorted(projects.iterdir()) if up._backfill_collect_session(p) is None]
+                self.assertEqual(stats["unreadable"], len(dropped))
+                self.assertEqual(stats["unreadable"], 2)
+
     def test_the_size_cap_is_unchanged(self):
         self.assertEqual((mdm.BACKFILL_MAX_FILE_BYTES, setup.BACKFILL_MAX_FILE_BYTES), (50 * 1024 * 1024,) * 2)
 

@@ -1478,22 +1478,31 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[
 
 
 def _backfill_first_session_id(transcript_path: Path):
-    """The session id _backfill_collect_session would file a transcript under, or None; reads up to the first one."""
+    """The session id _backfill_collect_session would file a transcript under, or None, by its rules up to that id.
+    A file that breaks only after it is still counted readable: telling would mean reading every transcript whole."""
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
-            for line in f:
+            for lineno, line in enumerate(f):
+                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
+                    return None
                 if not line.strip():
                     continue
                 try:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                sid = entry.get('sessionId') or entry.get('session_id') if isinstance(entry, dict) else None
+                if not isinstance(entry, dict):
+                    return None
+                sid = entry.get('sessionId') or entry.get('session_id')
                 if sid:
                     return sid
     except Exception:
         return None
     return None
+
+
+def _backfill_skipped_anything(stats: Dict) -> bool:
+    return bool(stats['skipped_over_cap']['count'] or stats['unreadable'])
 
 
 def _backfill_walk_stats(root: Path) -> Dict:
@@ -1842,6 +1851,9 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
                     sessions.append(session)
         _backfill_attach_identity(sessions, get_device_identifier(), _backfill_account_email(home))
         if not sessions:
+            if _backfill_skipped_anything(_backfill_uploader_stats):
+                # Nothing else goes up, so the counts go alone; a device whose every transcript is skipped still reports.
+                _backfill_upload_chunk(api_key, backend_url, [])
             _backfill_write_cutoff(config_dir, started_at)
             print("[backfill] No past sessions found.")
             return
