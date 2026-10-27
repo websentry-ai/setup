@@ -6666,6 +6666,46 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl --unix-socket /var/run/docker.sock http://example.com/containers/json",
+   "transfer": null
+  },
+  {
+   "command": "curl --abstract-unix-socket docker http://example.com/x",
+   "transfer": null
+  },
+  {
+   "command": "curl --unix-socket=/var/run/docker.sock -T secret http://example.com/up",
+   "transfer": null
+  },
+  {
+   "command": "curl --unix-socket /var/run/docker.sock http://example.com/a --next https://example.com/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

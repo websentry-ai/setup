@@ -3931,10 +3931,10 @@ function curl(args, env = {}, processEnv = {}) {
   const raws = [];
   const pins = [];
   for (let i = 0; ; ) {
-    const [urls, [sends, uploads], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads, local], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    for (const [index, written] of urls.entries()) {
+    for (const [index, written] of (local ? [] : urls).entries()) {
       const out = sends || index < uploads;
       const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
@@ -4059,6 +4059,7 @@ function curlRequest(args, start) {
   let noproxy;
   let scheme = "";
   let uploads = 0;
+  let local = false;
   let i = start;
   while (i < args.length) {
     let arg = args[i++];
@@ -4091,10 +4092,11 @@ function curlRequest(args, start) {
     else if (arg === "--noproxy" && value !== void 0) noproxy = value;
     else if (arg === "--proto-default" && value !== void 0) scheme = value.trim().toLowerCase();
     else if ((arg === "-T" || arg === "--upload-file") && value !== void 0) uploads++;
+    else if ((arg === "--unix-socket" || arg === "--abstract-unix-socket") && value !== void 0) local = true;
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, [Boolean(sends), uploads], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
+  return [urls, [Boolean(sends), uploads, local], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
 }
 function wget(args, proxied = false) {
   const urls = [];

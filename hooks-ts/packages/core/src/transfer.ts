@@ -2553,10 +2553,11 @@ function curl(args: string[], env: Env = {}, processEnv: Record<string, string |
   const raws: Raw[] = [];
   const pins: string[] = [];
   for (let i = 0; ; ) {
-    const [urls, [sends, uploads], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads, local], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
-    for (const [index, written] of urls.entries()) {
+    // Through --unix-socket or --abstract-unix-socket, the request reaches a local socket, not the URL's host.
+    for (const [index, written] of (local ? [] : urls).entries()) {
       // The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
       const out = sends || index < uploads;
       // A URL with no scheme takes --proto-default's, and so that scheme's port.
@@ -2690,13 +2691,13 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
 }
 
 /** The URLs of the curl request at args[start], [whether it sends a body to every URL, how many -T uploads it pairs
- *  with its first URLs], its --resolve and --connect-to values, whether
+ *  with its first URLs, whether it goes to a local socket instead], its --resolve and --connect-to values, whether
  *  it turns globbing off, where the next request starts, [the kind of proxy it names, empty for none and undefined
  *  when it names none, its --noproxy entries], and its --proto-default scheme; a --next that is an option's value does
  *  not end it. */
 function curlRequest(
   args: string[], start: number,
-): [string[], [boolean, number], [string, string][], boolean, number, [string | undefined, string | undefined], string] {
+): [string[], [boolean, number, boolean], [string, string][], boolean, number, [string | undefined, string | undefined], string] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
@@ -2707,6 +2708,7 @@ function curlRequest(
   let noproxy: string | undefined;
   let scheme = "";
   let uploads = 0;
+  let local = false;
   let i = start;
   while (i < args.length) {
     let arg = args[i++] as string;
@@ -2741,11 +2743,12 @@ function curlRequest(
     else if (arg === "--noproxy" && value !== undefined) noproxy = value;
     else if (arg === "--proto-default" && value !== undefined) scheme = value.trim().toLowerCase();
     else if ((arg === "-T" || arg === "--upload-file") && value !== undefined) uploads++;
+    else if ((arg === "--unix-socket" || arg === "--abstract-unix-socket") && value !== undefined) local = true;
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
   // Without -x, a --preproxy is the SOCKS proxy the request goes through.
-  return [urls, [Boolean(sends), uploads], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
+  return [urls, [Boolean(sends), uploads, local], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
 }
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:

@@ -6028,10 +6028,11 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
     --connect-to target, and no --resolve pin applies."""
     endpoints, pins, i = [], [], 0
     while True:
-        urls, (sends, uploads), overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
+        urls, (sends, uploads, local), overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
-        for index, url in enumerate(urls):
+        # Through --unix-socket or --abstract-unix-socket, the request reaches a local socket, not the URL's host.
+        for index, url in enumerate([] if local else urls):
             # The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
             out = sends or index < uploads
             # A URL with no scheme takes --proto-default's, and so that scheme's port.
@@ -6152,11 +6153,11 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
     """(the URLs of the curl request at args[i], (whether it sends a body to every URL, how many -T uploads it pairs
-    with its first URLs), its --resolve and --connect-to values, whether
+    with its first URLs, whether it goes to a local socket instead), its --resolve and --connect-to values, whether
     it turns globbing off, where the next request starts, (the kind of proxy it names, empty for none and None when
     it names none, its --noproxy value), its --proto-default scheme); a --next that is an option's value does not
     end it."""
-    urls, flags, method, overrides, scheme, uploads = [], set(), '', [], '', 0
+    urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
     kind, preproxy, noproxy = None, None, None
     while i < len(args):
         arg, value, i = args[i], None, i + 1
@@ -6197,10 +6198,12 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             scheme = value.strip().lower()
         elif arg in ('-T', '--upload-file') and value is not None:
             uploads += 1
+        elif arg in ('--unix-socket', '--abstract-unix-socket') and value is not None:
+            local = True
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
     # Without -x, a --preproxy is the SOCKS proxy the request goes through.
-    return urls, (bool(sends), uploads), overrides, bool(flags & {'-g', '--globoff'}), i, \
+    return urls, (bool(sends), uploads, local), overrides, bool(flags & {'-g', '--globoff'}), i, \
         (kind if kind is not None else preproxy, noproxy), scheme
 
 
