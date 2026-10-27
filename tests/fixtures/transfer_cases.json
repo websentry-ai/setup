@@ -5549,7 +5549,7 @@
       "direction": "out",
       "host": "example.com",
       "resolved_host": "example.com",
-      "address": "public"
+      "address": "unresolved"
      }
     ]
    }
@@ -5689,7 +5689,7 @@
       "direction": "in",
       "host": "example.com",
       "resolved_host": "example.com",
-      "address": "public"
+      "address": "unresolved"
      }
     ]
    }
@@ -5766,6 +5766,342 @@
   },
   {
    "command": "https_proxy=http://proxy:3128 no_proxy=example.com curl --resolve example.com:443:10.20.30.40 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync -a -- -report.zip 10.0.0.1:/srv/",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "10.0.0.1",
+      "resolved_host": "10.0.0.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync -a -- -e 10.0.0.1:/srv/",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "10.0.0.1",
+      "resolved_host": "10.0.0.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/a -- -T",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget https://example.com/a -- --post-data=x",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "echo hi | nc example.com 80 -- -l",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "http example.com/api -- --offline",
+   "transfer": {
+    "tool": "httpie",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "Invoke-WebRequest -- https://example.com/a",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { cd /tmp; }; eval 'f() { cd /; }'; f && curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { cd /tmp; }; source x.sh; f && curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "f() { cd /tmp; }; f && curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd \"\\/tmp\" && curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "cd \"/tmp\" && curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 no_proxy='nomatch,*' curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 no_proxy='* ' curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 no_proxy='*' curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 no_proxy='other.example example.com' curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 no_proxy=example.com. curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "https_proxy=http://proxy:3128 no_proxy=example.com curl --resolve example.com.:443:10.20.30.40 https://example.com./x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com.",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -x http://proxy:3128 --noproxy 'nomatch,*' https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat --proxy proxy.corp:1080 --proxy-type socks4 --proxy-dns remote example.com 443 < request.txt",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat --proxy proxy.corp:1080 --proxy-type socks4 --proxy-dns local example.com 443 < request.txt",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --preproxy 127.0.0.1:1080 --resolve example.com:443:10.20.30.40 https://example.com/a",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --preproxy socks4://127.0.0.1:1080 --resolve example.com:443:10.20.30.40 https://example.com/a",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "10.20.30.40",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --preproxy socks5://127.0.0.1:1080 --resolve example.com:443:10.20.30.40 https://example.com/a",
    "transfer": {
     "tool": "curl",
     "endpoints": [

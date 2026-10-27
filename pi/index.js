@@ -3884,10 +3884,10 @@ function curlRemote(url, kind, noproxy, env) {
     const names = [`${scheme}_proxy`, ...scheme === "http" ? [] : [`${scheme.toUpperCase()}_PROXY`], "all_proxy", "ALL_PROXY"];
     proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "").split(",");
-  const entries = bypass.map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
-  if (!proxy || entries.some((entry) => entry === "*" || entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "");
+  const entries = bypass.split(/[,\s]+/).map((entry) => entry.toLowerCase().replace(/^\.+|\.+$/g, ""));
+  if (!proxy || bypass === "*" || entries.some((entry) => entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
   return proxy !== "socks4" && proxy !== "socks5";
 }
 function curl(args, env = {}) {
@@ -4023,6 +4023,11 @@ function curlRequest(args, start) {
   let i = start;
   while (i < args.length) {
     let arg = args[i++];
+    if (arg === "--") {
+      urls.push(...args.slice(i));
+      i = args.length;
+      break;
+    }
     let value;
     if (arg === "-:" || arg === "--next") break;
     if (arg.startsWith("--")) {
@@ -4042,9 +4047,9 @@ function curlRequest(args, start) {
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
-    else if (arg === "--preproxy" && value !== void 0) preproxy = proxyKind(value, "socks4");
+    else if (arg === "--preproxy" && value !== void 0) preproxy = proxyKind(value, "socks4a");
     else if (Object.hasOwn(CURL_PROXIES, arg) && value !== void 0) kind = value.trim() === "" ? "" : CURL_PROXIES[arg] || proxyKind(value);
-    else if (arg === "--noproxy" && value !== void 0) noproxy = value.split(",");
+    else if (arg === "--noproxy" && value !== void 0) noproxy = value;
     else if (arg === "--proto-default" && value !== void 0) scheme = value.trim().toLowerCase();
   }
   const has = (set) => [...flags].some((f) => set.has(f));
@@ -4057,6 +4062,10 @@ function wget(args, proxied = false) {
   const settings = /* @__PURE__ */ new Map();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
+    if (arg === "--") {
+      urls.push(...args.slice(i));
+      break;
+    }
     let name;
     let value;
     if (arg.startsWith("--")) {
@@ -4118,6 +4127,10 @@ function rsyncArgs(args, env, processEnv) {
   const operands = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
+    if (arg === "--") {
+      operands.push(...args.slice(i));
+      break;
+    }
     if (arg === "--rsh" && i < args.length) shell = args[i++];
     else if (arg.startsWith("--rsh=")) shell = arg.slice("--rsh=".length);
     else if (RSYNC_VALUE_OPTIONS.has(arg)) i++;
@@ -4178,6 +4191,10 @@ function netcat(args, sends) {
   const values = /* @__PURE__ */ new Map();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
+    if (arg === "--") {
+      positional.push(...args.slice(i));
+      break;
+    }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       const name = eq < 0 ? arg : arg.slice(0, eq);
@@ -4197,7 +4214,7 @@ function netcat(args, sends) {
   if (positional[0] === void 0 || ["-l", "--listen", "-U", "--unixsock"].some((f) => flags.has(f))) return [];
   let remote2;
   if (flags.has("--proxy")) {
-    const dns = values.get("--proxy-dns") || (values.get("--proxy-type") === "socks4" ? "local" : "remote");
+    const dns = values.get("--proxy-dns");
     remote2 = dns !== "local" && dns !== "both";
   } else {
     remote2 = flags.has("-x") && values.get("-X") !== "4";
@@ -4247,6 +4264,10 @@ function httpie(args, sends, proxied = false) {
   const flags = /* @__PURE__ */ new Set();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
+    if (arg === "--") {
+      positional.push(...args.slice(i));
+      break;
+    }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       const name = eq < 0 ? arg : arg.slice(0, eq);
@@ -4276,6 +4297,10 @@ function webCmdlet(args, sends, proxied = false) {
   const positional = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
+    if (arg === "--") {
+      positional.push(...args.slice(i));
+      break;
+    }
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
       continue;

@@ -5943,7 +5943,7 @@ def _transfer_proxy_kind(value: str, default: str = 'http') -> str:
     return 'http' if kind == 'https' else kind
 
 
-def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[List[str]], env: Dict) -> bool:
+def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str], env: Dict) -> bool:
     """Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
     SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
     a no_proxy or NO_PROXY one the command set), turns the proxy off. kind is the request's own, or None for a proxy
@@ -5954,11 +5954,11 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[List[
         names = [scheme + '_proxy'] + ([scheme.upper() + '_PROXY'] if scheme != 'http' else []) + ['all_proxy',
                                                                                                     'ALL_PROXY']
         kind = _transfer_proxy_kind(next((env[name] for name in names if env.get(name)), ''))
-    host = (parts.hostname or '').lower()
-    if noproxy is None:
-        noproxy = (env.get('no_proxy') or env.get('NO_PROXY') or '').split(',')
-    entries = [entry.strip().lower().lstrip('.') for entry in noproxy]
-    if not kind or any(entry == '*' or (entry and (host == entry or host.endswith('.' + entry))) for entry in entries):
+    host = (parts.hostname or '').lower().rstrip('.')
+    noproxy = noproxy if noproxy is not None else env.get('no_proxy') or env.get('NO_PROXY') or ''
+    # As curl reads the list: * alone bypasses every host, else entries split on commas and blanks, their dots aside.
+    entries = [entry.strip('.').lower() for entry in re.split(r'[,\s]+', noproxy)]
+    if not kind or noproxy == '*' or any(entry and (host == entry or host.endswith('.' + entry)) for entry in entries):
         return False
     return kind not in ('socks4', 'socks5')
 
@@ -6093,12 +6093,15 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
     """(the URLs of the curl request at args[i], whether it sends data, its --resolve and --connect-to values, whether
     it turns globbing off, where the next request starts, (the kind of proxy it names, empty for none and None when
-    it names none, its --noproxy entries), its --proto-default scheme); a --next that is an option's value does not
+    it names none, its --noproxy value), its --proto-default scheme); a --next that is an option's value does not
     end it."""
     urls, flags, method, overrides, scheme = [], set(), '', [], ''
     kind, preproxy, noproxy = None, None, None
     while i < len(args):
         arg, value, i = args[i], None, i + 1
+        if arg == '--':
+            urls, i = urls + args[i:], len(args)  # every word after it is a URL, a --next too
+            break
         if arg in ('-:', '--next'):
             break
         if arg.startswith('--'):
@@ -6123,12 +6126,12 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
         elif arg in ('--resolve', '--connect-to') and value:
             overrides.append((arg, value))
         elif arg == '--preproxy' and value is not None:
-            preproxy = _transfer_proxy_kind(value, 'socks4')
+            preproxy = _transfer_proxy_kind(value, 'socks4a')  # curl sends a scheme-less one the name
         elif arg in _TRANSFER_CURL_PROXIES and value is not None:
             # An empty one turns the proxy off; a --socks option names its kind, and -x its URL's scheme.
             kind = '' if not value.strip() else _TRANSFER_CURL_PROXIES[arg] or _transfer_proxy_kind(value)
         elif arg == '--noproxy' and value is not None:
-            noproxy = value.split(',')
+            noproxy = value
         elif arg == '--proto-default' and value is not None:
             scheme = value.strip().lower()
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
@@ -6144,6 +6147,9 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
     urls, flags, settings, i = [], set(), {}, 0
     while i < len(args):
         arg, name, value, i = args[i], None, None, i + 1
+        if arg == '--':
+            urls.extend(args[i:])  # every word after it is a URL
+            break
         if arg.startswith('--'):
             name, eq, value = arg.partition('=')
             if not eq and name in _TRANSFER_WGET_LONG_VALUES:
@@ -6200,6 +6206,9 @@ def _transfer_rsync_args(args: List[str], env: Dict) -> tuple:
     shell, operands, i = _transfer_env(env, 'RSYNC_RSH'), [], 0
     while i < len(args):
         arg, i = args[i], i + 1
+        if arg == '--':
+            operands.extend(args[i:])  # every word after it is an operand
+            break
         if arg == '--rsh' and i < len(args):
             shell, i = args[i], i + 1
         elif arg.startswith('--rsh='):
@@ -6270,11 +6279,14 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
 
 def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
     """nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x,
-    reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or SOCKS4 (ncat's
-    --proxy-type socks4 or nc's -X 4), resolves it here; -X with no -x connects directly."""
+    reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or nc's -X 4 (SOCKS4),
+    resolves it here; -X with no -x connects directly."""
     positional, flags, values, i = [], set(), {}, 0
     while i < len(args):
         arg, i = args[i], i + 1
+        if arg == '--':
+            positional.extend(args[i:])  # every word after it is an operand
+            break
         if arg.startswith('--'):
             name, eq, value = arg.partition('=')  # --proxy=host:port is --proxy
             if not eq and name in _TRANSFER_NC_LONG_VALUES:
@@ -6290,8 +6302,7 @@ def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
     if not positional or flags & {'-l', '--listen', '-U', '--unixsock'}:
         return []
     if '--proxy' in flags:
-        dns = values.get('--proxy-dns') or ('local' if values.get('--proxy-type') == 'socks4' else 'remote')
-        remote = dns not in ('local', 'both')
+        remote = values.get('--proxy-dns') not in ('local', 'both')  # SOCKS4 too sends ncat the name
     else:
         remote = '-x' in flags and values.get('-X') != '4'
     return [('out' if sends else '', positional[0], None, None, remote)]
@@ -6342,6 +6353,9 @@ def _transfer_httpie(args: List[str], sends: bool, proxied: bool = False) -> Lis
     positional, flags, i = [], set(), 0
     while i < len(args):
         arg, i = args[i], i + 1
+        if arg == '--':
+            positional.extend(args[i:])  # every word after it is an operand
+            break
         if arg.startswith('--'):
             name, eq, _ = arg.partition('=')
             if not eq and name in _TRANSFER_HTTPIE_LONG_VALUES:
@@ -6368,6 +6382,9 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
     uri, out, positional, proxy, i = '', sends, [], None, 0
     while i < len(args):
         arg, i = args[i], i + 1
+        if arg == '--':
+            positional.extend(args[i:])  # PowerShell's end of parameters: every word after it is an argument
+            break
         if not re.match(r'^-[A-Za-z]', arg):
             positional.append(arg)
             continue

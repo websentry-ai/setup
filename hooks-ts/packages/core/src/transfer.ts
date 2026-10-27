@@ -2490,7 +2490,7 @@ function proxyKind(value: string, fallback = "http"): string {
 /** Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
  *  SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
  *  a no_proxy or NO_PROXY one the command set), turns the proxy off. `kind` is the request's own, or undefined for a proxy the command set in curl's environment. */
-function curlRemote(url: string, kind: string | undefined, noproxy: string[] | undefined, env: Env): boolean {
+function curlRemote(url: string, kind: string | undefined, noproxy: string | undefined, env: Env): boolean {
   let parsed: URL;
   try {
     parsed = new URL(urlText(url));
@@ -2503,11 +2503,12 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string[] | u
     const names = [`${scheme}_proxy`, ...(scheme === "http" ? [] : [`${scheme.toUpperCase()}_PROXY`]), "all_proxy", "ALL_PROXY"];
     proxy = proxyKind(names.map((name) => env[name]).find(Boolean) ?? "");
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
+  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
   // --noproxy overrides a no_proxy or NO_PROXY the command set.
-  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "").split(",");
-  const entries = bypass.map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""));
-  if (!proxy || entries.some((entry) => entry === "*" || (entry !== "" && (host === entry || host.endsWith(`.${entry}`))))) return false;
+  const bypass = noproxy ?? (env.no_proxy || env.NO_PROXY || "");
+  // As curl reads the list: * alone bypasses every host, else entries split on commas and blanks, their dots aside.
+  const entries = bypass.split(/[,\s]+/).map((entry) => entry.toLowerCase().replace(/^\.+|\.+$/g, ""));
+  if (!proxy || bypass === "*" || entries.some((entry) => entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
   return proxy !== "socks4" && proxy !== "socks5";
 }
 
@@ -2658,19 +2659,24 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
  *  not end it. */
 function curlRequest(
   args: string[], start: number,
-): [string[], boolean, [string, string][], boolean, number, [string | undefined, string[] | undefined], string] {
+): [string[], boolean, [string, string][], boolean, number, [string | undefined, string | undefined], string] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const overrides: [string, string][] = [];
   let method = "";
-  // The kind of proxy the request names, empty for none and undefined when it names none, and its --noproxy entries.
+  // The kind of proxy the request names, empty for none and undefined when it names none, and its --noproxy value.
   let kind: string | undefined;
   let preproxy: string | undefined;
-  let noproxy: string[] | undefined;
+  let noproxy: string | undefined;
   let scheme = "";
   let i = start;
   while (i < args.length) {
     let arg = args[i++] as string;
+    if (arg === "--") {
+      urls.push(...args.slice(i)); // every word after it is a URL, a --next too
+      i = args.length;
+      break;
+    }
     let value: string | undefined;
     if (arg === "-:" || arg === "--next") break;
     if (arg.startsWith("--")) {
@@ -2691,10 +2697,10 @@ function curlRequest(
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
-    else if (arg === "--preproxy" && value !== undefined) preproxy = proxyKind(value, "socks4");
+    else if (arg === "--preproxy" && value !== undefined) preproxy = proxyKind(value, "socks4a"); // curl sends a scheme-less one the name
     // An empty one turns the proxy off; a --socks option names its kind, and -x its URL's scheme.
     else if (Object.hasOwn(CURL_PROXIES, arg) && value !== undefined) kind = value.trim() === "" ? "" : CURL_PROXIES[arg] || proxyKind(value);
-    else if (arg === "--noproxy" && value !== undefined) noproxy = value.split(",");
+    else if (arg === "--noproxy" && value !== undefined) noproxy = value;
     else if (arg === "--proto-default" && value !== undefined) scheme = value.trim().toLowerCase();
   }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
@@ -2711,6 +2717,10 @@ function wget(args: string[], proxied = false): Raw[] {
   const settings = new Map<string, string>();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
+    if (arg === "--") {
+      urls.push(...args.slice(i)); // every word after it is a URL
+      break;
+    }
     let name: string | undefined;
     let value: string | undefined;
     if (arg.startsWith("--")) {
@@ -2780,6 +2790,10 @@ function rsyncArgs(args: string[], env: Env, processEnv: Record<string, string |
   const operands: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
+    if (arg === "--") {
+      operands.push(...args.slice(i)); // every word after it is an operand
+      break;
+    }
     if (arg === "--rsh" && i < args.length) shell = args[i++] as string;
     else if (arg.startsWith("--rsh=")) shell = arg.slice("--rsh=".length);
     else if (RSYNC_VALUE_OPTIONS.has(arg)) i++;
@@ -2846,14 +2860,18 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
 }
 
 /** nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x,
- *  reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or SOCKS4 (ncat's
- *  --proxy-type socks4 or nc's -X 4), resolves it here; -X with no -x connects directly. */
+ *  reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or nc's -X 4 (SOCKS4),
+ *  resolves it here; -X with no -x connects directly. */
 function netcat(args: string[], sends: boolean): Raw[] {
   const positional: string[] = [];
   const flags = new Set<string>();
   const values = new Map<string, string>();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
+    if (arg === "--") {
+      positional.push(...args.slice(i)); // every word after it is an operand
+      break;
+    }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("="); // --proxy=host:port is --proxy
       const name = eq < 0 ? arg : arg.slice(0, eq);
@@ -2873,8 +2891,8 @@ function netcat(args: string[], sends: boolean): Raw[] {
   if (positional[0] === undefined || ["-l", "--listen", "-U", "--unixsock"].some((f) => flags.has(f))) return [];
   let remote: boolean;
   if (flags.has("--proxy")) {
-    const dns = values.get("--proxy-dns") || (values.get("--proxy-type") === "socks4" ? "local" : "remote");
-    remote = dns !== "local" && dns !== "both";
+    const dns = values.get("--proxy-dns");
+    remote = dns !== "local" && dns !== "both"; // SOCKS4 too sends ncat the name
   } else {
     remote = flags.has("-x") && values.get("-X") !== "4";
   }
@@ -2929,6 +2947,10 @@ function httpie(args: string[], sends: boolean, proxied = false): Raw[] {
   const flags = new Set<string>();
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
+    if (arg === "--") {
+      positional.push(...args.slice(i)); // every word after it is an operand
+      break;
+    }
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       const name = eq < 0 ? arg : arg.slice(0, eq);
@@ -2960,6 +2982,10 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   const positional: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
+    if (arg === "--") {
+      positional.push(...args.slice(i)); // PowerShell's end of parameters: every word after it is an argument
+      break;
+    }
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
       continue;
