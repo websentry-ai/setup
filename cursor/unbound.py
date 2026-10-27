@@ -4782,9 +4782,8 @@ def _transfer_assigned_tilde(word: str, shell: Dict) -> str:
 
 
 def _transfer_cd_path(folders: List[str], shell: Dict, given: Dict) -> Optional[str]:
-    """Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a ~ still
-    there, which was quoted, a folder named ~. None when not known: a variable, substitution or glob, or a relative
-    folder that CDPATH may find somewhere else first."""
+    """Where a cd goes as the shell expands its folder, HOME for none; None when not known, including a
+    relative folder that CDPATH may find somewhere else first."""
     unknown = '$' + _TRANSFER_SUBSTITUTED
     if not folders:
         home = given['HOME'] if 'HOME' in given else _transfer_variable(shell, 'HOME')[0]
@@ -5898,9 +5897,8 @@ def _transfer_ends_piped(head: tuple, shell: Dict) -> bool:
 
 def _transfer_walk(items: List[tuple], cwd: Optional[str], exported: Dict, depth: int,
                    positional: List[str] = ()) -> List[tuple]:
-    """Each simple command that runs or may run, as (program, args, env, folder, as another user, its (piped in, piped
-    out, redirections) layers from its own outward, whether it may not have run); skipped branches and uncalled
-    function bodies are left out."""
+    """Each simple command that runs or may run, as (program, args, env, folder, other_user, layers, unsure);
+    skipped branches and uncalled function bodies are left out."""
     return _transfer_shell(items, cwd, exported, depth, positional)['calls']
 
 
@@ -5999,10 +5997,8 @@ def _transfer_proxy_kind(value: str, default: str = 'http') -> str:
 
 
 def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str], env: Dict) -> bool:
-    """Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
-    SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
-    a no_proxy or NO_PROXY one), turns the proxy off. kind is the request's own, or None for a proxy in curl's
-    environment, which the command sets or the agent's shell passes on."""
+    """Whether a proxy resolves a curl URL's name: HTTP, SOCKS4A and socks5h do, SOCKS4 and SOCKS5 resolve here,
+    and an empty -x or a --noproxy (else no_proxy) entry turns it off. kind None is curl's environment proxy."""
     parts = _transfer_url_split(url)
     scheme = parts.scheme.lower()
     if kind is None:
@@ -6022,10 +6018,8 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str],
 
 
 def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
-    """curl's URLs: sent to when their request uploads or sends data, else fetched from. Each --next starts a request,
-    --resolve pins carry on, and globs reach every host unless --globoff; a rejected glob stops curl. Each carries
-    whether a proxy, by option or one in its environment, resolves its name; such a proxy is handed the
-    --connect-to target, and no --resolve pin applies."""
+    """curl's URLs, sent to when their request uploads or sends data, else fetched from, each with whether a proxy
+    resolves its name (it then gets the --connect-to target and no --resolve pin); pins carry past --next."""
     endpoints, pins, i = [], [], 0
     while True:
         urls, (sends, uploads, local), overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
@@ -6152,11 +6146,8 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """(the URLs of the curl request at args[i], (whether it sends a body to every URL, how many -T uploads it pairs
-    with its first URLs, whether it goes to a local socket instead), its --resolve and --connect-to values, whether
-    it turns globbing off, where the next request starts, (the kind of proxy it names, empty for none and None when
-    it names none, its --noproxy value), its --proto-default scheme); a --next that is an option's value does not
-    end it."""
+    """The curl request at args[i]: URLs, (sends body, -T count, local socket), --resolve and --connect-to,
+    globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
     urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
     kind, preproxy, noproxy = None, None, None
     while i < len(args):
@@ -6236,9 +6227,8 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
 
 
 def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:
-    """(operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; switches, when
-    given, collects the flags such as -n, and the first -o StdinNull as StdinNull=yes, =no, or =bad for a value ssh
-    rejects."""
+    """(operands, the options that change which host or user ssh -G resolves) for ssh, scp or sftp; switches,
+    if given, collects flags such as -n and the first -o StdinNull as yes, no or bad (a value ssh rejects)."""
     passthrough, operands, i = [], [], 0
     switches = set() if switches is None else switches
     value_flags = _TRANSFER_SSH_VALUE_FLAGS[program]
@@ -6344,9 +6334,8 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
 
 
 def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
-    """nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x,
-    reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or nc's -X 4 (SOCKS4),
-    resolves it here; -X with no -x connects directly."""
+    """nc's host, sent to when stdin is fed in; ncat --proxy or nc -x resolve it remotely unless ncat --proxy-dns
+    local/both or nc -X 4 resolves it here; a listener reaches no host and -X without -x connects directly."""
     positional, flags, values, i = [], set(), {}, 0
     while i < len(args):
         arg, i = args[i], i + 1
@@ -6443,9 +6432,8 @@ def _transfer_httpie(args: List[str], sends: bool, proxied: bool = False) -> Lis
 
 
 def _transfer_ps_parameter(name: str) -> str:
-    """The web cmdlet parameter a -Name binds to, as PowerShell resolves it: an exact name or alias, else the one
-    parameter it starts, the cmdlet's own before the common ones; empty when it starts several, which PowerShell
-    rejects, and the name itself when it starts none."""
+    """The web cmdlet parameter a -Name binds to, as PowerShell resolves it: exact name or alias, else the one
+    it prefixes, cmdlet's own first; empty when ambiguous and the name itself when it prefixes none."""
     name = name.lower()
     if name in _TRANSFER_PS_OWN or name in _TRANSFER_PS_COMMON:
         return name
@@ -6736,9 +6724,8 @@ def _transfer_turn_text(inputs) -> str:
 
 
 def _transfer_ssh_config_named(options: List[str], state: Dict) -> bool:
-    """Whether a call in the turn names an ssh config this lookup reads: the user's or the system's, or a -F file
-    anywhere but as a -F. A call that may rewrite one can change where an earlier transfer resolves, as ssh -G reads
-    the configs only at the end of the turn."""
+    """Whether a call in the turn names an ssh config this lookup reads (user, system, or a -F file other than
+    as -F); rewriting one can move an earlier transfer, as ssh -G reads configs only at turn end."""
     text = state.get('turn_text', '') + '\n' + state.get('call_text', '')
     if _TRANSFER_SSH_CONFIG_NAMES.search(text):
         return True
@@ -6825,10 +6812,8 @@ def _transfer_address_kind(addresses: list) -> str:
 
 
 def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool = True) -> Optional[Dict]:
-    """One place a transfer reached, from (direction, destination, ssh -G options or None[, curl's dial[, whether a
-    proxy reaches it]]): the host as written without a login, the host it connects to (ssh -G or curl's dial), and that
-    host's address kind. Without lookup, neither ssh -G nor DNS runs, and only an address as written is classified; a
-    host a proxy or jump host reaches is never looked up here either."""
+    """One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
+    its address kind. Without lookup only a literal address is classified; a proxy or jump host's target never is."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     lookup = lookup and not (len(raw) > 4 and raw[4])

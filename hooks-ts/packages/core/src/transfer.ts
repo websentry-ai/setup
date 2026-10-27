@@ -1,9 +1,6 @@
-// Transfer resolution — where each shell transfer went, as host and address kind only.
-// Parity with the Python hooks' transfer block: the same tools, directions, shell reading, ssh -G lookup and
-// address kinds, and the same wire object on each `tool_use` entry.
-//
-// Total by construction: no `throw` escapes. A failed or slow lookup leaves the host as written and its address
-// `unresolved`; every lookup has a deadline and the turn shares one budget, so the turn log is never held up long.
+// Transfer resolution: where each shell transfer went, as host and address kind only, in parity with the Python
+// hooks' transfer block. No `throw` escapes: a failed or slow lookup leaves the address `unresolved`, and every
+// lookup has a deadline within one turn budget, so the turn log is never held up long.
 
 import { lookup as dnsLookup } from "node:dns/promises";
 import {
@@ -1130,8 +1127,7 @@ function readNames(name: string, args: string[]): Set<string> {
   return new Set([...names, name === "read" ? "REPLY" : "MAPFILE"]);
 }
 
-/** Where a cd goes as the shell expands its folder: HOME for none, with a VAR=value in front applied, and a ~ still
- *  there, which was quoted, a folder named ~. Undefined when not known: a variable, substitution or glob, or a relative
+/** Where a cd goes as the shell expands its folder, HOME for none; undefined when not known, including a relative
  *  folder that CDPATH may find somewhere else first. */
 function cdPath(folders: string[], shell: Shell, given: Env): string | undefined {
   const known = (value: string | undefined): value is string => !!value && !value.includes("$") && !value.includes(SUBSTITUTED);
@@ -2520,10 +2516,8 @@ function proxyKind(value: string, fallback = "http"): string {
   return kind === "https" ? "http" : kind;
 }
 
-/** Whether a curl URL's name goes to a proxy that resolves it: an HTTP proxy, which sends CONNECT with the name, or
- *  SOCKS4A or SOCKS5 with the hostname. SOCKS4 and SOCKS5 resolve here, and an empty -x, or a --noproxy entry (else
- *  a no_proxy or NO_PROXY one), turns the proxy off. `kind` is the request's own, or undefined for a proxy in curl's
- *  environment, which the command sets or the agent's shell passes on. */
+/** Whether a proxy resolves a curl URL's name: HTTP, SOCKS4A and socks5h do, SOCKS4 and SOCKS5 resolve here, and an
+ *  empty -x or a --noproxy (else no_proxy) entry turns it off. `kind` undefined is curl's environment proxy. */
 function curlRemote(url: string, kind: string | undefined, noproxy: string | undefined, env: Env, processEnv: Record<string, string | undefined>): boolean {
   let parsed: URL;
   try {
@@ -2546,9 +2540,8 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string | und
   return proxy !== "socks4" && proxy !== "socks5";
 }
 
-/** curl's URLs: sent to when their request uploads or sends data, else fetched from. Each carries whether a proxy, by
- *  option or one in its environment, resolves its name; such a proxy is handed the --connect-to target, and no
- *  --resolve pin applies. */
+/** curl's URLs, sent to when their request uploads or sends data, else fetched from, each with whether a proxy
+ *  resolves its name (it then gets the --connect-to target and no --resolve pin). */
 function curl(args: string[], env: Env = {}, processEnv: Record<string, string | undefined> = {}): Raw[] {
   const raws: Raw[] = [];
   const pins: string[] = [];
@@ -2690,11 +2683,8 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
   return [addresses[0] ?? target[0], addresses];
 }
 
-/** The URLs of the curl request at args[start], [whether it sends a body to every URL, how many -T uploads it pairs
- *  with its first URLs, whether it goes to a local socket instead], its --resolve and --connect-to values, whether
- *  it turns globbing off, where the next request starts, [the kind of proxy it names, empty for none and undefined
- *  when it names none, its --noproxy entries], and its --proto-default scheme; a --next that is an option's value does
- *  not end it. */
+/** The curl request at args[start]: URLs, [sends body, -T count, local socket], --resolve and --connect-to, globoff,
+ *  next start, [proxy kind: '' off, undefined unnamed; --noproxy entries], --proto-default. */
 function curlRequest(
   args: string[], start: number,
 ): [string[], [boolean, number, boolean], [string, string][], boolean, number, [string | undefined, string | undefined], string] {
@@ -2901,9 +2891,8 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }
 
-/** nc's host: sent to when its stdin is fed in; a listener reaches no host. ncat's --proxy, or OpenBSD nc's -x,
- *  reaches it through a proxy that resolves the name, unless ncat's --proxy-dns local or both, or nc's -X 4 (SOCKS4),
- *  resolves it here; -X with no -x connects directly. */
+/** nc's host, sent to when stdin is fed in; ncat --proxy or nc -x resolve it remotely unless ncat --proxy-dns
+ *  local/both or nc -X 4 resolves it here; a listener reaches no host and -X without -x connects directly. */
 function netcat(args: string[], sends: boolean): Raw[] {
   const positional: string[] = [];
   const flags = new Set<string>();
@@ -3017,9 +3006,8 @@ function httpie(args: string[], sends: boolean, proxied = false): Raw[] {
   return [[out ? "out" : "in", host, undefined, undefined, proxied || flags.has("--proxy")]];
 }
 
-/** The web cmdlet parameter a -Name binds to, as PowerShell resolves it: an exact name or alias, else the one parameter
- *  it starts, the cmdlet's own before the common ones; empty when it starts several, which PowerShell rejects, and the
- *  name itself when it starts none. */
+/** The web cmdlet parameter a -Name binds to, as PowerShell resolves it: exact name or alias, else the one it prefixes,
+ *  cmdlet's own first; empty when ambiguous and the name itself when it prefixes none. */
 function psParameter(written: string): string {
   const name = written.toLowerCase();
   if (PS_OWN.has(name) || PS_COMMON.has(name)) return name;
@@ -3356,9 +3344,8 @@ function sshJumps(options: readonly string[]): boolean {
 /** The user's and the system's ssh configs, as a command names them. */
 const SSH_CONFIG_NAMES = /\.ssh\/config\b|ssh_config\b/;
 
-/** Whether a call in the turn names an ssh config this lookup reads: the user's or the system's, or a -F file anywhere
- *  but as a -F. A call that may rewrite one can change where an earlier transfer resolves, as ssh -G reads the configs
- *  only at the end of the turn. */
+/** Whether a call in the turn names an ssh config this lookup reads (user, system, or a -F file other than as -F);
+ *  rewriting one can move an earlier transfer, as ssh -G reads configs only at turn end. */
 function sshConfigNamed(options: readonly string[], state: State): boolean {
   const text = `${state.turnText}\n${state.callText}`;
   if (SSH_CONFIG_NAMES.test(text)) return true;
@@ -3474,10 +3461,8 @@ function addressKind(found: readonly string[]): AddressKind {
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : (kinds[0] as AddressKind);
 }
 
-/** One place a transfer reached: its host as written without any login, the host it connects to, as ssh -G resolves
- *  it or curl's --connect-to and --resolve set it, and the kind of address that host has. Unless the call surely ran,
- *  neither ssh -G nor DNS runs, and only an address as written is classified; a host a proxy or jump host reaches is
- *  never looked up here either. */
+/** One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
+ *  its address kind. Without lookup only a literal address is classified; a proxy or jump host's target never is. */
 async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = true): Promise<TransferEndpoint | undefined> {
   const [direction, rawDestination, sshOptions, dial, proxied] = raw;
   let lookup = sure && proxied !== true;
