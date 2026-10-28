@@ -8424,6 +8424,12 @@
     "tool": "scp",
     "endpoints": [
      {
+      "direction": "in",
+      "host": "c",
+      "resolved_host": "c",
+      "address": "unresolved"
+     },
+     {
       "direction": "out",
       "host": "8.8.8.8",
       "resolved_host": "8.8.8.8",
@@ -8434,13 +8440,29 @@
   },
   {
    "command": "scp file C:x",
-   "transfer": null
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "c",
+      "resolved_host": "c",
+      "address": "unresolved"
+     }
+    ]
+   }
   },
   {
    "command": "scp c:/dir/file 8.8.8.8:/x",
    "transfer": {
     "tool": "scp",
     "endpoints": [
+     {
+      "direction": "in",
+      "host": "c",
+      "resolved_host": "c",
+      "address": "unresolved"
+     },
      {
       "direction": "out",
       "host": "8.8.8.8",
@@ -8484,17 +8506,7 @@
   },
   {
    "command": "set -euo pipefail; false | ls; curl -T secret https://192.168.1.1/up",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "out",
-      "host": "192.168.1.1",
-      "resolved_host": "192.168.1.1",
-      "address": "private"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "set -euo pipefail; ls | false; curl -T secret https://192.168.1.1/up",
@@ -8564,6 +8576,213 @@
       "host": "192.168.1.1",
       "resolved_host": "192.168.1.1",
       "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -S /opt/company/ssh-wrapper build.zip prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -S /opt/company/ssh-wrapper build.zip example.com:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -S ssh build.zip example.com:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp -S /usr/bin/ssh build.zip example.com:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sftp -S /opt/w example.com",
+   "transfer": {
+    "tool": "sftp",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync -e /opt/w -a f example.com:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync --rsh=nc -a f example.com:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync -e 'ssh -p 2222' -a f example.com:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "rsync -a f example.com::mod",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp build.zip a:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "a",
+      "resolved_host": "a",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -eu; false | ls; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -euo pipefail; ls | false | ls; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -euo pipefail; ls | ls; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr -Proxy http://proxy.corp:3128 -NoProxy https://example.com/up'",
+   "transfer": null
+  },
+  {
+   "command": "pwsh -c 'iwr -NoProxy -Proxy http://proxy.corp:3128 https://example.com/up'",
+   "transfer": null
+  },
+  {
+   "command": "pwsh -c 'iwr -Proxy http://proxy.corp:3128 -NoProxy:$false https://example.com/up'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr -Proxy http://proxy.corp:3128 https://example.com/up'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
      }
     ]
    }

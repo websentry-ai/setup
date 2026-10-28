@@ -351,8 +351,8 @@ function firstValid(stdout) {
 async function probeSerial(opts, timeoutMs) {
   const run2 = opts.execFile ?? defaultExecFile;
   const exec = (file, args) => attempt(() => run2(file, args, { timeoutMs, maxBytes: MAX_SERIAL_PROBE_BYTES })).catch(() => void 0);
-  const platform = opts.platform ?? process.platform;
-  if (platform === "darwin") {
+  const platform2 = opts.platform ?? process.platform;
+  if (platform2 === "darwin") {
     const out = await exec(probeToolPath("system_profiler"), ["SPHardwareDataType"]);
     for (const line of (out ?? "").split("\n")) {
       if (!line.includes("Serial Number")) continue;
@@ -363,7 +363,7 @@ async function probeSerial(opts, timeoutMs) {
     }
     return void 0;
   }
-  if (platform === "linux") {
+  if (platform2 === "linux") {
     const dmi = firstValid(await exec(probeToolPath("dmidecode"), ["-s", "system-serial-number"]));
     if (dmi !== void 0) return dmi;
     const read = opts.readFile ?? ((path) => readSmallRegularFile(path, 4096));
@@ -376,7 +376,7 @@ async function probeSerial(opts, timeoutMs) {
     }
     return void 0;
   }
-  if (platform === "win32") {
+  if (platform2 === "win32") {
     const bios = firstValid(
       await exec(probeToolPath("powershell"), ["-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"])
     );
@@ -1925,6 +1925,8 @@ var ALLEXPORT = "\0allexport";
 var ERREXIT = "\0errexit";
 var PIPEFAIL = "\0pipefail";
 var SUBSTITUTED = "\0";
+var CONFIG_UNKNOWN = ["-F", SUBSTITUTED];
+var platform = { windows: process.platform === "win32" };
 var BRACE_MARKS = { "{": "", ",": "", "}": "" };
 var LITERAL_TILDE = "";
 function unmark(word) {
@@ -3133,9 +3135,7 @@ function end(shell) {
   if (pipe.runs === false) {
     status = pipe.prior;
   } else {
-    const statuses = [...pipe.statuses, status];
-    const failed = statuses.lastIndexOf(1);
-    if (failed >= 0 && !statuses.slice(failed).includes(void 0) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
+    if (pipe.statuses.includes(1) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : void 0;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : void 0;
     if (pipe.prior === void 0 && skipped !== void 0 && status !== skipped) status = void 0;
@@ -4346,6 +4346,7 @@ function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
     }
+    if (flag === "-S" && name !== "ssh" && programName(value ?? "") !== "ssh") passthrough.push(...CONFIG_UNKNOWN);
   }
   return [operands, passthrough];
 }
@@ -4370,7 +4371,7 @@ function rsyncArgs(args, env, processEnv) {
   }
   if (!shell) return [operands, []];
   const shellArgv = words(shell);
-  if (shellArgv[0] === void 0 || programName(shellArgv[0]) !== "ssh") return [operands, void 0];
+  if (shellArgv[0] === void 0 || programName(shellArgv[0]) !== "ssh") return [operands, [...CONFIG_UNKNOWN]];
   return [operands, sshArgs("ssh", [...shellArgv.slice(1), "-"])[1]];
 }
 function remote(arg) {
@@ -4380,7 +4381,7 @@ function remote(arg) {
   }
   if (arg.includes("://")) return void 0;
   const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-  if (match === null || /^[A-Za-z]:/.test(arg)) return void 0;
+  if (match === null || platform.windows && /^[A-Za-z]:/.test(arg)) return void 0;
   return [match[1], void 0, match[2] === void 0];
 }
 function copy(name, args, env, processEnv) {
@@ -4528,6 +4529,7 @@ function psParameter(written) {
   return name;
 }
 function webCmdlet(args, sends, proxied = false) {
+  const named = /* @__PURE__ */ new Set();
   let uri = "";
   let out = sends;
   let proxy;
@@ -4551,9 +4553,15 @@ function webCmdlet(args, sends, proxied = false) {
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
     else if (name === "unixsocket" && value !== "") return [];
-    else if (name === "proxy") proxy = value !== "";
-    else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) proxy ??= false;
+    else if (name === "proxy") {
+      proxy = value !== "";
+      if (proxy) named.add(name);
+    } else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) {
+      proxy = false;
+      named.add(name);
+    }
   }
+  if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
   return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
 }
@@ -4580,7 +4588,7 @@ function parse(call, processEnv) {
   else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));
   else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
   else return void 0;
-  const unknown = call.otherUser ? ["-F", SUBSTITUTED] : [];
+  const unknown = call.otherUser ? CONFIG_UNKNOWN : [];
   return [tool, raw.map(([d, dest, options, dial, proxied]) => [
     d,
     dest,

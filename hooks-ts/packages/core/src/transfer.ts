@@ -89,6 +89,10 @@ const ERREXIT = "\0errexit";
 const PIPEFAIL = "\0pipefail";
 /** Stands in for a substitution's output inside a word, so no host is read from it. */
 const SUBSTITUTED = "\0";
+/** Added to a call's ssh options when the config it reads isn't known, so ssh -G and DNS never run for it. */
+const CONFIG_UNKNOWN = ["-F", SUBSTITUTED];
+/** Whether the hook runs on Windows, where scp reads a one-letter X: as a drive; a test may set it. */
+export const platform = { windows: process.platform === "win32" };
 /** Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has. */
 const BRACE_MARKS: Record<string, string> = { "{": "\x01", ",": "\x02", "}": "\x03" };
 /** Marks a quoted or escaped ~ that starts a word, which the shell leaves as it is; `tilde` turns it back. */
@@ -1585,10 +1589,8 @@ function end(shell: Shell): void {
   if (pipe.runs === false) {
     status = pipe.prior;
   } else {
-    const statuses = [...pipe.statuses, status];
-    const failed = statuses.lastIndexOf(1);
-    // Under pipefail, a command that surely fails fails the pipeline, unless one after it has a status not known.
-    if (failed >= 0 && !statuses.slice(failed).includes(undefined) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
+    // Under pipefail the pipeline leaves its last non-zero status, so one command that surely fails fails it.
+    if (pipe.statuses.includes(1) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : undefined;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : undefined;
     if (pipe.prior === undefined && skipped !== undefined && status !== skipped) status = undefined;
@@ -3040,12 +3042,14 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
     }
+    // scp's or sftp's own program may connect anywhere.
+    if (flag === "-S" && name !== "ssh" && programName(value ?? "") !== "ssh") passthrough.push(...CONFIG_UNKNOWN);
   }
   return [operands, passthrough];
 }
 
-/** The operands, and ssh options for its remote shell (undefined when that shell isn't ssh), for rsync. */
-function rsyncArgs(args: string[], env: Env, processEnv: Record<string, string | undefined>): [string[], string[] | undefined] {
+/** The operands, and ssh options for its remote shell (an unknown config when that shell isn't ssh), for rsync. */
+function rsyncArgs(args: string[], env: Env, processEnv: Record<string, string | undefined>): [string[], string[]] {
   let shell = envValue(env, processEnv, "RSYNC_RSH");
   const operands: string[] = [];
   for (let i = 0; i < args.length; ) {
@@ -3066,7 +3070,8 @@ function rsyncArgs(args: string[], env: Env, processEnv: Record<string, string |
   }
   if (!shell) return [operands, []];
   const shellArgv = words(shell);
-  if (shellArgv[0] === undefined || programName(shellArgv[0]) !== "ssh") return [operands, undefined];
+  // A remote shell of its own may connect anywhere.
+  if (shellArgv[0] === undefined || programName(shellArgv[0]) !== "ssh") return [operands, [...CONFIG_UNKNOWN]];
   return [operands, sshArgs("ssh", [...shellArgv.slice(1), "-"])[1]];
 }
 
@@ -3080,8 +3085,9 @@ function remote(arg: string): [string, string | undefined, boolean] | undefined 
   if (arg.includes("://")) return undefined;
   // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
   const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-  // One letter before the colon is a drive, a local path as Windows OpenSSH reads it, with or without a slash after.
-  if (match === null || /^[A-Za-z]:/.test(arg)) return undefined;
+  // On Windows one letter before the colon is a drive, a local path, with or without a slash after; elsewhere scp
+  // dials host C.
+  if (match === null || (platform.windows && /^[A-Za-z]:/.test(arg))) return undefined;
   return [match[1] as string, undefined, match[2] === undefined];
 }
 
@@ -3249,6 +3255,7 @@ function psParameter(written: string): string {
 }
 
 function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
+  const named = new Set<string>();
   let uri = "";
   let out = sends;
   let proxy: boolean | undefined;
@@ -3273,10 +3280,17 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
     else if (name === "unixsocket" && value !== "") return []; // it reaches a local socket, not the URI's host
-    else if (name === "proxy") proxy = value !== "";
-    // -NoProxy:$false, or a value not known here, leaves the proxy on.
-    else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) proxy ??= false;
+    else if (name === "proxy") {
+      proxy = value !== "";
+      if (proxy) named.add(name);
+    } else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) {
+      // -NoProxy:$false, or a value not known here, leaves the proxy on.
+      proxy = false;
+      named.add(name);
+    }
   }
+  // -Proxy and -NoProxy are in different parameter sets, so PowerShell rejects the call.
+  if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
   // It goes through a proxy with -Proxy, or one the command set unless -NoProxy.
   return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), undefined, undefined, proxy ?? proxied]] : [];
@@ -3311,7 +3325,7 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
   else return undefined;
   // Under sudo, ssh reads that user's config, which isn't known here, so the host is never looked up.
-  const unknown = call.otherUser ? ["-F", SUBSTITUTED] : [];
+  const unknown = call.otherUser ? CONFIG_UNKNOWN : [];
   return [tool, raw.map(([d, dest, options, dial, proxied]): Raw => [d, dest, options && [...options, ...unknown], dial,
     proxied])];
 }

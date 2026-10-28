@@ -11,7 +11,7 @@ import test from "node:test";
 
 import { defaultExecFile, type ExecFileLike } from "../src/accountIdentity.ts";
 import {
-  ipv4Mapped, resolveTransfers, transferCommand, type LookupLike, type ResolveOptions, type Transfer,
+  ipv4Mapped, platform, resolveTransfers, transferCommand, type LookupLike, type ResolveOptions, type Transfer,
 } from "../src/transfer.ts";
 
 interface Fixture {
@@ -142,6 +142,21 @@ test("an IPv4-mapped address is read as its IPv4 address in every form, as Pytho
   assert.equal(ipv4Mapped("::ffff:0:1"), "0.0.0.1");
   for (const other of ["fe80::1", "::1", "2001:db8::ffff:a00:1", "10.0.0.1", "example.com"]) {
     assert.equal(ipv4Mapped(other), other, other);
+  }
+});
+
+test("a one-letter host is a drive only on Windows", async () => {
+  // Windows OpenSSH reads C:file as a local path; elsewhere scp dials host a.
+  assert.deepEqual(await hosts("scp build.zip a:/srv", "/"), [["out", "a"]]);
+  const before = platform.windows;
+  platform.windows = true;
+  try {
+    for (const command of ["scp C:file prod:/srv", "scp c:/dir/file prod:/srv"]) {
+      assert.deepEqual(await hosts(command, "/"), [["out", "prod"]], command);
+    }
+    assert.equal(await transfer("scp build.zip a:/srv", "/"), undefined);
+  } finally {
+    platform.windows = before;
   }
 });
 

@@ -5643,6 +5643,10 @@ _TRANSFER_ERREXIT = '\0errexit'
 _TRANSFER_PIPEFAIL = '\0pipefail'
 # Stands in for a substitution's output inside a word, so no host is read from it.
 _TRANSFER_SUBSTITUTED = '\0'
+# Added to a call's ssh options when the config it reads isn't known, so ssh -G and DNS never run for it.
+_TRANSFER_CONFIG_UNKNOWN = ('-F', _TRANSFER_SUBSTITUTED)
+# Whether the hook runs on Windows, where scp reads a one-letter X: as a drive.
+_TRANSFER_WINDOWS = os.name == 'nt'
 # Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has.
 _TRANSFER_BRACE_MARKS = {'{': '\1', ',': '\2', '}': '\3'}
 _TRANSFER_UNMARK = {1: '{', 2: ',', 3: '}'}
@@ -6827,11 +6831,8 @@ def _transfer_end(shell: Dict) -> None:
     if pipe['runs'] is False:
         status = pipe['prior']
     else:
-        statuses = pipe['statuses'] + [status]
-        failed = max((k for k, one in enumerate(statuses) if one == 1), default=-1)
-        # Under pipefail, a command that surely fails fails the pipeline, unless one after it has a status not known.
-        if failed >= 0 and None not in statuses[failed:] and \
-                shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0] == '1':
+        # Under pipefail the pipeline leaves its last non-zero status, so one command that surely fails fails it.
+        if 1 in pipe['statuses'] and shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0] == '1':
             status = 1
         status = {0: 1, 1: 0}.get(status) if pipe['negate'] else status
         skipped = {'&&': 1, '||': 0}.get(pipe['before'])
@@ -8260,11 +8261,13 @@ def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = 
                 switches.add('StdinNull=' + setting)
         if value and flag[1:] in identity_flags and (flag != '-o' or option in _TRANSFER_SSH_IDENTITY_OPTIONS):
             passthrough += ['-p' if flag == '-P' else flag, value]
+        if flag == '-S' and program != 'ssh' and _transfer_program_name(value or '') != 'ssh':
+            passthrough += list(_TRANSFER_CONFIG_UNKNOWN)  # scp's or sftp's own program may connect anywhere
     return operands, passthrough
 
 
 def _transfer_rsync_args(args: List[str], env: Dict) -> tuple:
-    """(operands, ssh options for its remote shell, or None when that shell isn't ssh) for rsync."""
+    """(operands, ssh options for its remote shell, an unknown config when that shell isn't ssh) for rsync."""
     shell, operands, i = _transfer_env(env, 'RSYNC_RSH'), [], 0
     while i < len(args):
         arg, i = args[i], i + 1
@@ -8286,7 +8289,7 @@ def _transfer_rsync_args(args: List[str], env: Dict) -> tuple:
         return operands, []
     words = _transfer_words(shell)
     if not words or _transfer_program_name(words[0]) != 'ssh':
-        return operands, None
+        return operands, list(_TRANSFER_CONFIG_UNKNOWN)  # a remote shell of its own may connect anywhere
     return operands, _transfer_ssh_args('ssh', words[1:] + ['-'])[1]
 
 
@@ -8301,8 +8304,9 @@ def _transfer_remote(arg: str) -> Optional[tuple]:
         return None
     # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
     match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
-    # One letter before the colon is a drive, a local path as Windows OpenSSH reads it, with or without a slash after.
-    if not match or re.match(r'^[A-Za-z]:', arg):
+    # On Windows one letter before the colon is a drive, a local path, with or without a slash after; elsewhere scp
+    # dials host C.
+    if not match or (_TRANSFER_WINDOWS and re.match(r'^[A-Za-z]:', arg)):
         return None
     return match.group(1), None, not match.group(2)
 
@@ -8457,7 +8461,7 @@ def _transfer_ps_parameter(name: str) -> str:
 def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) -> List[tuple]:
     """Invoke-WebRequest's or Invoke-RestMethod's URI: sent to with a body, file, form, piped input or sending
     method; else fetched from. It goes through a proxy with -Proxy, or one the command set unless -NoProxy."""
-    uri, out, positional, proxy, i = '', sends, [], None, 0
+    uri, out, positional, proxy, named, i = '', sends, [], None, set(), 0
     while i < len(args):
         arg, i = args[i], i + 1
         if arg == '--':
@@ -8482,8 +8486,11 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
             return []  # it reaches a local socket, not the URI's host
         elif name == 'proxy':
             proxy = bool(value)
+            named |= {name} if value else set()
         elif name == 'noproxy' and (not colon or value.lower() in ('$true', '1')):
-            proxy = proxy or False  # -NoProxy:$false, or a value not known here, leaves the proxy on
+            proxy, named = False, named | {name}  # -NoProxy:$false, or a value not known here, leaves the proxy on
+    if named == {'proxy', 'noproxy'}:
+        return []  # -Proxy and -NoProxy are in different parameter sets, so PowerShell rejects the call
     uri = uri or (positional[0] if positional else '')
     proxy = proxied if proxy is None else proxy
     return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri \
@@ -8522,7 +8529,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
     else:
         return None
     # Under sudo, ssh reads that user's config, which isn't known here, so the host is never looked up.
-    unknown = ['-F', _TRANSFER_SUBSTITUTED] if other_user else []
+    unknown = list(_TRANSFER_CONFIG_UNKNOWN) if other_user else []
     return tool, [(e[0], e[1], None if e[2] is None else list(e[2]) + unknown) + e[3:] for e in raw]
 
 

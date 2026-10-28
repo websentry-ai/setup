@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b8deb37b8c6a3c12e49e5dd09789679b6afea887e4fb43c1998cbb7a4aca4acf'
+BLOCK_SHA256 = '6bcf8ece203e95f2f934a61cc9e20a1c00c1d3016747a294ce7bb9454a90dd57'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -772,6 +772,16 @@ class SshLookupTests(TransferTestCase):
     def test_a_tilde_config_path_is_expanded_as_the_shell_does(self):
         Path(self.home, 'alt_cfg').write_text('Host prod\n  HostName 10.9.8.7\n')
         self.assert_endpoints('scp -F ~/alt_cfg f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.9.8.7')])
+
+    def test_a_one_letter_host_is_a_drive_only_on_windows(self):
+        # Windows OpenSSH reads C:file as a local path; elsewhere scp dials host c.
+        self.assert_hosts('scp build.zip a:/srv', [('out', 'a')])
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.object(hook, '_TRANSFER_WINDOWS', True):
+                for command in ('scp C:file prod:/srv', 'scp c:/dir/file prod:/srv'):
+                    found = hook._transfer(command, self.repo, {})
+                    self.assertEqual([e['host'] for e in found['endpoints']], ['prod'], command)
+                self.assertIsNone(hook._transfer('scp build.zip a:/srv', self.repo, {}))
 
     def test_sudo_and_dash_led_destinations_are_never_looked_up(self):
         self.assert_hosts('sudo -u deploy scp f prod:/tmp', [('out', 'prod')])
