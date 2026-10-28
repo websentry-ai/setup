@@ -2861,6 +2861,10 @@ const CURLRC_SAFE: ReadonlySet<string> = new Set(
    speed-limit speed-time expect100-timeout`.split(/\s+/),
 );
 const CURLRC_SAFE_SHORT = "AsSv#mfiwRYy";
+/** Options whose value picks where a request goes, besides the proxies; a variable expanded into one leaves that unknown. */
+const CURL_ROUTES: ReadonlySet<string> = new Set(
+  ["--url", "--resolve", "--connect-to", "--preproxy", "--noproxy", "--proto-default", "--unix-socket", "--abstract-unix-socket"],
+);
 /** Command-line options that send curl's own name lookups to another resolver. */
 const CURL_RESOLVERS: ReadonlySet<string> = new Set(
   ["--doh-url", "--dns-servers", "--dns-interface", "--dns-ipv4-addr", "--dns-ipv6-addr"],
@@ -3086,9 +3090,11 @@ function curlRequest(
   let scheme = "";
   let uploads = 0;
   let local = false;
+  let routed = false;
   let i = start;
   while (i < args.length) {
     let arg = args[i++] as string;
+    let expand = false;
     if (arg === "--") {
       urls.push(...args.slice(i)); // every word after it is a URL, a --next too
       i = args.length;
@@ -3106,7 +3112,8 @@ function curlRequest(
         return [undefined, [false, 0, false, false, false], [], false, args.length, [undefined, undefined], ""];
       }
       if (arg === "--next") break;
-      if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
+      expand = arg.startsWith("--expand-");
+      if (expand) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
     } else if (arg.startsWith("-") && arg.length > 1) {
       [arg, value, i] = shortOption(arg, args, i, CURL_SHORT_VALUES, flags);
@@ -3116,6 +3123,7 @@ function curlRequest(
     }
     flags.add(arg);
     for (const flag of CURL_UNDOES[arg] ?? []) flags.delete(flag);
+    routed ||= expand && value !== undefined && value.includes("{{") && (CURL_ROUTES.has(arg) || Object.hasOwn(CURL_PROXIES, arg));
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
@@ -3130,7 +3138,7 @@ function curlRequest(
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
   // Without -x, a --preproxy is the SOCKS proxy the request goes through.
-  const config = flags.has("-K") || flags.has("--config");
+  const config = flags.has("-K") || flags.has("--config") || routed;
   const resolver = [...flags].some((flag) => CURL_RESOLVERS.has(flag));
   const globoff = flags.has("-g") || flags.has("--globoff");
   const marks: [boolean, number, boolean, boolean, boolean] = [Boolean(sends), uploads, local, config, resolver];

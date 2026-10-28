@@ -9574,6 +9574,48 @@
   {
    "command": "curl --doh https://dns.example/q https://example.com/x",
    "transfer": null
+  },
+  {
+   "command": "curl -q -x '' --variable dst=10.0.0.1 --expand-connect-to '::{{dst}}:' -T file https://8.8.8.8/upload",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q --variable dst=10.0.0.1 --expand-resolve=8.8.8.8:443:{{dst}} https://8.8.8.8/a",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q --variable x=secret --expand-data '{{x}}' https://8.8.8.8/a",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

@@ -6467,13 +6467,19 @@ def _transfer_curl_long(name: str) -> str:
     return _transfer_prefixed('--' + word, _TRANSFER_CURL_LONG_OPTIONS)
 
 
+# Options whose value picks where a request goes, besides the proxies; a variable expanded into one leaves that unknown.
+_TRANSFER_CURL_ROUTES = frozenset({'--url', '--resolve', '--connect-to', '--preproxy', '--noproxy', '--proto-default',
+                                   '--unix-socket', '--abstract-unix-socket'})
+
+
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """The curl request at args[i]: URLs (None when rejected), (sends body, -T count, local socket, -K, own resolver),
+    """The curl request at args[i]: URLs (None when rejected), (sends body, -T count, local socket, -K or an expanded
+    route, own resolver),
     --resolve and --connect-to, globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
     urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
-    kind, preproxy, noproxy = None, None, None
+    kind, preproxy, noproxy, routed = None, None, None, False
     while i < len(args):
-        arg, value, i = args[i], None, i + 1
+        arg, value, expand, i = args[i], None, False, i + 1
         if arg == '--':
             urls, i = urls + args[i:], len(args)  # every word after it is a URL, a --next too
             break
@@ -6485,7 +6491,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
                 return None, (False, 0, False, False, False), [], False, len(args), (None, None), ''  # rejected
             if arg == '--next':
                 break
-            arg = '--' + arg[len('--expand-'):] if arg.startswith('--expand-') else arg
+            expand = arg.startswith('--expand-')
+            arg = '--' + arg[len('--expand-'):] if expand else arg
             if eq:
                 value = attached
             elif arg in _TRANSFER_CURL_LONG_VALUES and i < len(args):
@@ -6499,6 +6506,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             continue
         flags.add(arg)
         flags -= _TRANSFER_CURL_UNDOES.get(arg, set())
+        routed = routed or bool(expand and value and '{{' in value and
+                                (arg in _TRANSFER_CURL_ROUTES or arg in _TRANSFER_CURL_PROXIES))
         if arg == '--url' and value:
             urls.append(value)
         elif arg in ('-X', '--request') and value:
@@ -6521,7 +6530,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
     # Without -x, a --preproxy is the SOCKS proxy the request goes through.
-    marks = (bool(sends), uploads, local, bool(flags & {'-K', '--config'}), bool(flags & _TRANSFER_CURL_RESOLVERS))
+    marks = (bool(sends), uploads, local, bool(flags & {'-K', '--config'}) or routed,
+             bool(flags & _TRANSFER_CURL_RESOLVERS))
     return urls, marks, overrides, bool(flags & {'-g', '--globoff'}), i, \
         (kind if kind is not None else preproxy, noproxy), scheme
 

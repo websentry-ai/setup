@@ -4192,6 +4192,9 @@ var CURLRC_SAFE = new Set(
    speed-limit speed-time expect100-timeout`.split(/\s+/)
 );
 var CURLRC_SAFE_SHORT = "AsSv#mfiwRYy";
+var CURL_ROUTES = /* @__PURE__ */ new Set(
+  ["--url", "--resolve", "--connect-to", "--preproxy", "--noproxy", "--proto-default", "--unix-socket", "--abstract-unix-socket"]
+);
 var CURL_RESOLVERS = /* @__PURE__ */ new Set(
   ["--doh-url", "--dns-servers", "--dns-interface", "--dns-ipv4-addr", "--dns-ipv6-addr"]
 );
@@ -4378,9 +4381,11 @@ function curlRequest(args, start) {
   let scheme = "";
   let uploads = 0;
   let local = false;
+  let routed = false;
   let i = start;
   while (i < args.length) {
     let arg = args[i++];
+    let expand = false;
     if (arg === "--") {
       urls.push(...args.slice(i));
       i = args.length;
@@ -4396,7 +4401,8 @@ function curlRequest(args, start) {
         return [void 0, [false, 0, false, false, false], [], false, args.length, [void 0, void 0], ""];
       }
       if (arg === "--next") break;
-      if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
+      expand = arg.startsWith("--expand-");
+      if (expand) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
     } else if (arg.startsWith("-") && arg.length > 1) {
       [arg, value, i] = shortOption(arg, args, i, CURL_SHORT_VALUES, flags);
@@ -4406,6 +4412,7 @@ function curlRequest(args, start) {
     }
     flags.add(arg);
     for (const flag of CURL_UNDOES[arg] ?? []) flags.delete(flag);
+    routed ||= expand && value !== void 0 && value.includes("{{") && (CURL_ROUTES.has(arg) || Object.hasOwn(CURL_PROXIES, arg));
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();
     else if ((arg === "--resolve" || arg === "--connect-to") && value) overrides.push([arg, value]);
@@ -4418,7 +4425,7 @@ function curlRequest(args, start) {
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  const config = flags.has("-K") || flags.has("--config");
+  const config = flags.has("-K") || flags.has("--config") || routed;
   const resolver = [...flags].some((flag) => CURL_RESOLVERS.has(flag));
   const globoff = flags.has("-g") || flags.has("--globoff");
   const marks = [Boolean(sends), uploads, local, config, resolver];
