@@ -9205,73 +9205,23 @@
   },
   {
    "command": "curl -q -K routing.conf -T payload https://10.0.0.1/upload",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "out",
-      "host": "10.0.0.1",
-      "resolved_host": "10.0.0.1",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl -K - https://10.0.0.1/a",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "10.0.0.1",
-      "resolved_host": "10.0.0.1",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl --config=x https://example.com/a",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl --conf x https://example.com/a",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl -sK x https://example.com/a",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl -T payload https://10.0.0.1/upload",
@@ -9289,37 +9239,11 @@
   },
   {
    "command": "curl https://example.com/a --next -K x https://example.com/b",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "public"
-     },
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl -K x https://example.com/a --next https://example.com/b",
-   "transfer": {
-    "tool": "curl",
-    "endpoints": [
-     {
-      "direction": "in",
-      "host": "example.com",
-      "resolved_host": "example.com",
-      "address": "unresolved"
-     }
-    ]
-   }
+   "transfer": null
   },
   {
    "command": "curl -K - https://8.8.4.4/b <<< 'url = https://8.8.8.8/a'",
@@ -9838,6 +9762,34 @@
       "direction": "in",
       "host": "10.0.0.1",
       "resolved_host": "10.0.0.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ssh ssh://deploy@8.8.8.8:2222 'cat > /x' < f",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ssh ssh://prod 'cat > /x' < f",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
       "address": "private"
      }
     ]

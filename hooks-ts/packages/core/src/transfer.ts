@@ -115,6 +115,8 @@ const DEFAULT_PORTS: Record<string, number> = {
 /** The URL schemes each tool speaks; a URL with any other reaches no host. */
 const CURL_SCHEMES: ReadonlySet<string> = new Set(("dict ftp ftps gopher gophers http https imap imaps ldap ldaps mqtt pop3 " +
   "pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss").split(" "));
+/** Schemes a destination URL may carry, curl's and the ssh:// URI ssh itself takes. */
+const SSH_URL_SCHEMES: ReadonlySet<string> = new Set([...CURL_SCHEMES, "ssh"]);
 const WGET_SCHEMES: ReadonlySet<string> = new Set(["http", "https", "ftp", "ftps"]);
 const HTTPIE_SCHEMES: ReadonlySet<string> = new Set(["http", "https"]);
 const POWERSHELL_SCHEMES: ReadonlySet<string> = new Set(["http", "https", "ftp"]);
@@ -2825,7 +2827,7 @@ function curl(
     const [urls, [sends, uploads, local, config, resolver], overrides, globoff, next, [kind, noproxy], scheme] =
       curlRequest(args, i);
     if (urls === undefined) return []; // curl reads every option before it sends anything
-    // A -K config this doesn't read may reroute this request and those after it, a literal address included.
+    // A variable expanded into a route may reroute this request and those after it, a literal address included.
     configured ||= config;
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
@@ -3134,7 +3136,8 @@ function curlLong(name: string): string {
   return prefixed(`--${word}`, CURL_LONG_OPTIONS);
 }
 
-/** The curl request at args[start]: URLs (undefined when rejected), [body, -T count, local socket, -K, own resolver],
+/** The curl request at args[start]: URLs (undefined when rejected or under a -K config this doesn't read), [body,
+ *  -T count, local socket, an expanded route, own resolver],
  *  --resolve and --connect-to, globoff, next start, [proxy kind: '' off, undefined unnamed; --noproxy], scheme. */
 function curlRequest(
   args: string[], start: number,
@@ -3201,10 +3204,14 @@ function curlRequest(
     else if ((arg === "-T" || arg === "--upload-file") && value !== undefined) uploads++;
     else if ((arg === "--unix-socket" || arg === "--abstract-unix-socket") && value !== undefined) local = true;
   }
+  // A config this doesn't read may add an upload, a body or a URL, or change where any request goes.
+  if (flags.has("-K") || flags.has("--config")) {
+    return [undefined, [false, 0, false, false, false], [], false, args.length, [undefined, undefined], ""];
+  }
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
   // Without -x, a --preproxy is the SOCKS proxy the request goes through.
-  const config = flags.has("-K") || flags.has("--config") || routed;
+  const config = routed;
   const resolver = [...flags].some((flag) => CURL_RESOLVERS.has(flag));
   const globoff = flags.has("-g") || flags.has("--globoff");
   const marks: [boolean, number, boolean, boolean, boolean] = [Boolean(sends), uploads, local, config, resolver];
@@ -3760,7 +3767,7 @@ function configLine(line: string, bases: readonly string[], homes: readonly stri
  *  PROGRAMDATA's ssh on Windows. */
 function sshSystemDir(processEnv: Record<string, string | undefined>): string {
   if (process.platform === "win32") return join(processEnv.PROGRAMDATA ?? "", "ssh");
-  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => dir !== "" && isFile(join(dir, "ssh")));
+  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => isAbsolute(dir) && isFile(join(dir, "ssh")));
   const prefix = dirname(bin ?? "/usr/bin");
   return prefix === "/usr" || prefix === "/" ? "/etc/ssh" : join(prefix, "etc", "ssh");
 }
@@ -3999,7 +4006,7 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
   const [direction, rawDestination, sshOptions, dial, proxied] = raw;
   let lookup = sure && proxied !== true;
   const destination = rawDestination.trim();
-  const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : (destination.split("@").pop() ?? ""));
+  const host = cleanHost(destination.includes("://") ? urlHost(destination, SSH_URL_SCHEMES) : (destination.split("@").pop() ?? ""));
   if (host === "") return undefined;
   let resolved: string;
   let kind: AddressKind;

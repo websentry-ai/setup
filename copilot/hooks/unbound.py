@@ -8069,7 +8069,7 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None, state: Optional[
     while True:
         urls, (sends, uploads, local, config, resolver), overrides, globoff, i, (kind, noproxy), scheme = \
             _transfer_curl_request(args, i)
-        # A -K config this doesn't read may reroute this request and those after it, a literal address included.
+        # A variable expanded into a route may reroute this request and those after it, a literal address included.
         configured = configured or config
         if urls is None:
             return []  # curl reads every option before it sends anything
@@ -8366,8 +8366,8 @@ _TRANSFER_CURL_ROUTES = frozenset({'--url', '--resolve', '--connect-to', '--prep
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """The curl request at args[i]: URLs (None when rejected), (sends body, -T count, local socket, -K or an expanded
-    route, own resolver),
+    """The curl request at args[i]: URLs (None when rejected or under a -K config this doesn't read), (sends body,
+    -T count, local socket, an expanded route, own resolver),
     --resolve and --connect-to, globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
     urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
     kind, preproxy, noproxy, routed = None, None, None, False
@@ -8422,11 +8422,13 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             uploads += 1
         elif arg in ('--unix-socket', '--abstract-unix-socket') and value is not None:
             local = True
+    if flags & {'-K', '--config'}:
+        # A config this doesn't read may add an upload, a body or a URL, or change where any request goes.
+        return None, (False, 0, False, False, False), [], False, len(args), (None, None), ''
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
     # Without -x, a --preproxy is the SOCKS proxy the request goes through.
-    marks = (bool(sends), uploads, local, bool(flags & {'-K', '--config'}) or routed,
-             bool(flags & _TRANSFER_CURL_RESOLVERS))
+    marks = (bool(sends), uploads, local, routed, bool(flags & _TRANSFER_CURL_RESOLVERS))
     return urls, marks, overrides, bool(flags & {'-g', '--globoff'}), i, \
         (kind if kind is not None else preproxy, noproxy), scheme
 
@@ -8900,10 +8902,9 @@ def _transfer_ssh_config_line(line: str, homes: List[str], bases: tuple) -> Opti
 def _transfer_ssh_system_dir() -> str:
     """The folder of the system config the ssh on PATH reads: its install prefix's etc/ssh, /etc/ssh for one in /usr,
     and PROGRAMDATA's ssh on Windows."""
-    import shutil
     if os.name == 'nt':
         return os.path.join(os.environ.get('PROGRAMDATA') or '', 'ssh')
-    prefix = os.path.dirname(os.path.dirname(shutil.which('ssh') or '/usr/bin/ssh'))
+    prefix = os.path.dirname(os.path.dirname(_transfer_executable('ssh') or '/usr/bin/ssh'))
     return '/etc/ssh' if prefix in ('/usr', '/') else os.path.join(prefix, 'etc', 'ssh')
 
 
@@ -9103,7 +9104,7 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
     dial = raw[3] if len(raw) > 3 else None
     lookup = lookup and not (len(raw) > 4 and raw[4])
     destination = destination.strip()
-    host = _transfer_url_host(destination, _TRANSFER_CURL_SCHEMES) if '://' in destination else \
+    host = _transfer_url_host(destination, _TRANSFER_CURL_SCHEMES | {'ssh'}) if '://' in destination else \
         destination.rsplit('@', 1)[-1]
     host = _transfer_clean_host(host)
     if not host:

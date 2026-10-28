@@ -1980,6 +1980,7 @@ var DEFAULT_PORTS = {
   smbs: 445
 };
 var CURL_SCHEMES = new Set("dict ftp ftps gopher gophers http https imap imaps ldap ldaps mqtt pop3 pop3s rtsp scp sftp smb smbs smtp smtps telnet tftp ws wss".split(" "));
+var SSH_URL_SCHEMES = /* @__PURE__ */ new Set([...CURL_SCHEMES, "ssh"]);
 var WGET_SCHEMES = /* @__PURE__ */ new Set(["http", "https", "ftp", "ftps"]);
 var HTTPIE_SCHEMES = /* @__PURE__ */ new Set(["http", "https"]);
 var POWERSHELL_SCHEMES = /* @__PURE__ */ new Set(["http", "https", "ftp"]);
@@ -4468,9 +4469,12 @@ function curlRequest(args, start) {
     else if ((arg === "-T" || arg === "--upload-file") && value !== void 0) uploads++;
     else if ((arg === "--unix-socket" || arg === "--abstract-unix-socket") && value !== void 0) local = true;
   }
+  if (flags.has("-K") || flags.has("--config")) {
+    return [void 0, [false, 0, false, false, false], [], false, args.length, [void 0, void 0], ""];
+  }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  const config = flags.has("-K") || flags.has("--config") || routed;
+  const config = routed;
   const resolver = [...flags].some((flag) => CURL_RESOLVERS.has(flag));
   const globoff = flags.has("-g") || flags.has("--globoff");
   const marks = [Boolean(sends), uploads, local, config, resolver];
@@ -4938,7 +4942,7 @@ function configLine(line, bases, homes) {
 }
 function sshSystemDir(processEnv) {
   if (process.platform === "win32") return join5(processEnv.PROGRAMDATA ?? "", "ssh");
-  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => dir !== "" && isFile(join5(dir, "ssh")));
+  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => isAbsolute3(dir) && isFile(join5(dir, "ssh")));
   const prefix = dirname3(bin ?? "/usr/bin");
   return prefix === "/usr" || prefix === "/" ? "/etc/ssh" : join5(prefix, "etc", "ssh");
 }
@@ -5132,7 +5136,7 @@ async function endpoint(raw, cwd, state, sure = true) {
   const [direction, rawDestination, sshOptions, dial, proxied] = raw;
   let lookup = sure && proxied !== true;
   const destination = rawDestination.trim();
-  const host = cleanHost(destination.includes("://") ? urlHost(destination, CURL_SCHEMES) : destination.split("@").pop() ?? "");
+  const host = cleanHost(destination.includes("://") ? urlHost(destination, SSH_URL_SCHEMES) : destination.split("@").pop() ?? "");
   if (host === "") return void 0;
   let resolved;
   let kind;

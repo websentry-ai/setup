@@ -58,7 +58,7 @@ function fakeSsh(calls: string[][] = []): ExecFileLike {
       else if (args[i] === "-o" && /^hostname=/i.test(args[i + 1] as string)) hostname = (args[i + 1] as string).split("=")[1];
       else if (args[i] === "-F") config = args[i + 1];
     }
-    const host = destination.split("@").pop() as string;
+    const host = /^ssh:\/\/(?:[^@/]*@)?([^:/]*)/.exec(destination)?.[1] ?? (destination.split("@").pop() as string);
     let jump: string | undefined;
     if (config !== undefined && config !== "none") {
       let current: string[] = [];
