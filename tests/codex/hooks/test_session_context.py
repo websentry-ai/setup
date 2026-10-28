@@ -1,6 +1,6 @@
 """
 The Codex UserPromptSubmit hook reports how big the session's context is
-(metadata.session_context), read off the rollout's cumulative token_count snapshots.
+(metadata.session_context), read off the newest token_count's last_token_usage.
 A gateway warning arrives as user_notice on an allow and must reach the user.
 """
 
@@ -16,13 +16,13 @@ from tests.conftest import tool_module
 unbound = tool_module("codex/hooks")
 
 
-def _token_count(input_tokens, output_tokens, last=None):
-    total = {"input_tokens": input_tokens, "cached_input_tokens": 0,
-             "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}
+def _token_count(input_tokens, output_tokens):
+    last = {"input_tokens": input_tokens, "cached_input_tokens": 0,
+            "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens}
     return {"type": "event_msg",
             "payload": {"type": "token_count",
-                        "info": {"total_token_usage": total, "last_token_usage": last or total,
-                                 "model_context_window": 258400}}}
+                        "info": {"total_token_usage": dict(last, input_tokens=input_tokens * 3),
+                                 "last_token_usage": last, "model_context_window": 258400}}}
 
 
 def _rate_limits_only():
@@ -89,45 +89,25 @@ class TestPromptSendsSessionContext(unittest.TestCase):
     def _assert_context(self, context, tokens):
         self.assertEqual(context, {"context_tokens": tokens})
 
-    def test_delta_of_the_last_two_cumulative_snapshots(self):
-        # last_token_usage is deliberately wrong (openai/codex#14489); the delta is what counts.
-        bogus_last = {"input_tokens": 1, "output_tokens": 1}
-        metadata = self._metadata([
-            _token_count(10_000, 200),
-            _token_count(30_000, 500),
-            _token_count(75_000, 1_100, last=bogus_last),
-            _rate_limits_only(),
-            _token_count(75_000, 1_100),  # sticky re-emit of the same totals
-            _user_message(),
-        ])
-        self._assert_context(metadata["session_context"], (75_000 - 30_000) + (1_100 - 500))
+    def test_newest_snapshot_last_usage_is_the_context(self):
+        metadata = self._metadata([_token_count(10_000, 200), _token_count(45_000, 600), _user_message()])
+        self._assert_context(metadata["session_context"], 45_600)
         self.assertEqual(metadata["cwd"], "/work/codex")  # existing metadata kept
 
-    def test_single_snapshot_uses_its_totals(self):
-        metadata = self._metadata([_token_count(13_563, 13), _user_message()])
-        self._assert_context(metadata["session_context"], 13_576)
+    def test_rate_limit_reemit_still_reports_the_last_request(self):
+        # openai/codex#14489: the re-emit repeats last_token_usage, which is still the newest request's size.
+        metadata = self._metadata([_token_count(10_000, 200), _token_count(45_000, 600),
+                                   _rate_limits_only(), _token_count(45_000, 600)])
+        self._assert_context(metadata["session_context"], 45_600)
 
-    def test_whole_file_single_snapshot_ignores_last_token_usage(self):
-        metadata = self._metadata([_token_count(13_563, 13, last={"input_tokens": 1, "output_tokens": 1})])
-        self._assert_context(metadata["session_context"], 13_576)
+    def test_rate_limit_only_event_steps_back_to_the_last_request(self):
+        metadata = self._metadata([_token_count(45_000, 600), _rate_limits_only()])
+        self._assert_context(metadata["session_context"], 45_600)
 
-    def _truncated_metadata(self, newest):
-        # older snapshots sit before the tail window, so only the newest one is visible
-        self.path.write_text("\n".join(json.dumps(e) for e in [
-            _token_count(10_000, 100), _user_message(), newest]) + "\n")
-        tail = len(json.dumps(newest)) + 2
-        with patch.object(unbound, "SKILL_TRANSCRIPT_TAIL_BYTES", tail):
-            return self._metadata(transcript_path=str(self.path))
-
-    def test_truncated_tail_single_snapshot_uses_last_token_usage(self):
-        last = {"input_tokens": 40_000, "cached_input_tokens": 0, "output_tokens": 250}
-        metadata = self._truncated_metadata(_token_count(90_000, 900, last=last))
-        self._assert_context(metadata["session_context"], 40_250)
-
-    def test_truncated_tail_single_snapshot_without_last_usage_omits_the_key(self):
-        newest = _token_count(90_000, 900)
-        newest["payload"]["info"].pop("last_token_usage")
-        self.assertNotIn("session_context", self._truncated_metadata(newest))
+    def test_cached_input_is_not_added_again(self):
+        newest = _token_count(45_000, 600)
+        newest["payload"]["info"]["last_token_usage"]["cached_input_tokens"] = 40_000
+        self._assert_context(self._metadata([newest])["session_context"], 45_600)
 
     def test_compaction_after_the_newest_snapshot_omits_the_key(self):
         for compaction in (_compacted, _context_compacted):
@@ -139,8 +119,8 @@ class TestPromptSendsSessionContext(unittest.TestCase):
 
     def test_compaction_between_snapshots_still_measures_the_newest_request(self):
         metadata = self._metadata([_token_count(50_000, 300), _compacted(),
-                                   _token_count(62_000, 400)])
-        self._assert_context(metadata["session_context"], 12_000 + 100)
+                                   _token_count(12_000, 100)])
+        self._assert_context(metadata["session_context"], 12_100)
 
     def test_missing_unreadable_or_unusable_rollout_omits_the_key(self):
         self.assertNotIn("session_context", self._metadata(transcript_path=None))

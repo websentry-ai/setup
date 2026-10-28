@@ -4106,54 +4106,31 @@ def _codex_same_totals(left: Dict, right: Dict) -> bool:
     return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
 
 
-def _rollout_last_two_totals(lines: List[bytes], whole_file: bool) -> Optional[Tuple[Dict, Dict]]:
-    """(newest token_count totals, prior distinct totals or {}); None if compacted after it."""
-    latest, latest_total = None, None
-    for raw in reversed(lines):
-        try:
-            entry = json.loads(raw)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        payload = entry.get('payload') if isinstance(entry.get('payload'), dict) else {}
-        if entry.get('type') == 'compacted' or payload.get('type') == 'context_compacted':
-            if latest is None:
-                return None
-            continue  # totals are cumulative, so the delta across a compaction still holds
-        if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
-            continue
-        total = (payload.get('info') or {}).get('total_token_usage')
-        if not isinstance(total, dict):
-            continue
-        if latest is None:
-            latest, latest_total = entry, total
-        elif not _codex_same_totals(total, latest_total):  # sticky re-emits repeat the same totals
-            return latest_total, total
-    if latest is None:
-        return None
-    if whole_file:  # one snapshot in the whole rollout is the first request
-        return latest_total, {}
-    last = latest['payload']['info'].get('last_token_usage')  # prior totals fell outside the tail
-    return (last, {}) if isinstance(last, dict) else None
-
-
 def _rollout_session_context(transcript_path) -> Optional[Dict]:
-    """Context size at the newest token_count; totals delta, not last_token_usage (openai/codex#14489)."""
+    """Context size at the newest token_count; None if compacted since or unmeasurable."""
     if not isinstance(transcript_path, str) or not transcript_path or transcript_path == 'undefined':
         return None
     try:
-        lines = _skill_policy_transcript_tail(transcript_path)
-        whole_file = os.path.getsize(transcript_path) <= SKILL_TRANSCRIPT_TAIL_BYTES  # sized after the read, so growth only errs False
-        found = _rollout_last_two_totals(lines, whole_file)
-        if found is None:
-            return None
-        latest_total, previous_total = found
-        context_tokens = sum(
-            max(_codex_token(latest_total, field) - _codex_token(previous_total, field), 0)
-            for field in ('input_tokens', 'output_tokens')
-        )
-        return {'context_tokens': context_tokens}
+        for raw in reversed(_skill_policy_transcript_tail(transcript_path)):
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue  # blank, or a tail cut mid-line
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get('payload') if isinstance(entry.get('payload'), dict) else {}
+            if entry.get('type') == 'compacted' or payload.get('type') == 'context_compacted':
+                return None
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            # A rate-limit re-emit repeats the last request's usage, still its size (openai/codex#14489).
+            last = (payload.get('info') or {}).get('last_token_usage')
+            if not isinstance(last, dict):
+                continue
+            tokens = sum(_codex_token(last, f) for f in ('input_tokens', 'output_tokens'))  # cached is inside input
+            if tokens:
+                return {'context_tokens': tokens}
+        return None
     except Exception:
         return None
 
