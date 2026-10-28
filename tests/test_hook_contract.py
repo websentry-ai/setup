@@ -6,13 +6,15 @@ exit non-zero. These run the real `unbound.py` as a subprocess, the way the
 editor invokes it, against a gateway address nothing is listening on.
 """
 
+import contextlib
 import json
 import subprocess
 import sys
+from unittest import mock
 
 import pytest
 
-from tests.conftest import REPO
+from tests.conftest import REPO, tool_module
 
 # Every tool that ships a hook, and the event names it is invoked with.
 HOOKS = {
@@ -117,3 +119,71 @@ class TestEveryHookFailsOpen:
                            stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=60, env=env)
         assert r.returncode == 0, r.stderr[-400:]
+
+
+# Where each tool's hook module lives, for the in-process budget probe.
+MODULES = {
+    "claude-code": "claude-code/hooks",
+    "cursor": "cursor",
+    "copilot": "copilot/hooks",
+    "codex": "codex/hooks",
+    "augment": "augment/hooks",
+}
+
+# A tool added to HOOKS but not here would keep the fail-open checks and silently lose
+# the budget check, which is the kind of gap nothing reports.
+assert set(MODULES) == set(HOOKS), "MODULES and HOOKS disagree on the tool list"
+
+# The host kills the hook at these, and a killed hook never reaches its fail-open return.
+# augment installs _hook(15000) milliseconds. cursor sets seconds and gives its gated
+# events 15000, but leaves beforeSubmitPrompt on an undocumented default, so it takes the
+# conservative 60 the other installers write rather than a number nobody has verified.
+HOOK_CAP_SECONDS = {"augment": 15}
+DEFAULT_HOOK_CAP_SECONDS = 60
+
+# Nothing above models interpreter start, the stdin read or the fail-open write, and the
+# cap is a hard kill, so a budget that merely lands under it has no room to actually land.
+UNMODELLED_ALLOWANCE = 2
+
+
+def pretool_budget(tool):
+    """What send_to_hook_api actually spends and returns when the gateway never answers,
+    measured off the real calls rather than restated from the module's constants."""
+    module = tool_module(MODULES[tool])
+    # log_error appends to the real ~/<tool>/hooks/error.log and rotates it to 25 lines,
+    # so an unpatched probe evicts a developer's live diagnostics on their own machine.
+    patches = [
+        mock.patch.object(module.subprocess, "run",
+                          side_effect=module.subprocess.TimeoutExpired("curl", 1)),
+        mock.patch.object(module.time, "sleep"),
+        mock.patch.object(module, "log_error"),
+    ]
+    # Only copilot has a cloud branch; create=True elsewhere would turn a rename of it
+    # into a silent no-op, and the probe would then measure the cloud budget instead.
+    if hasattr(module, "RUNNING_CLOUD"):
+        patches.append(mock.patch.object(module, "RUNNING_CLOUD", False))
+    with contextlib.ExitStack() as stack:
+        run, sleep = (stack.enter_context(p) for p in patches[:2])
+        for extra in patches[2:]:
+            stack.enter_context(extra)
+        result = module.send_to_hook_api({"a": 1}, "key")
+    timeouts = [c.kwargs["timeout"] for c in run.call_args_list]
+    slept = sum(c.args[0] for c in sleep.call_args_list)
+    return timeouts, slept, result, sleep.call_count
+
+
+@pytest.mark.parametrize("tool", sorted(MODULES))
+def test_the_pretool_budget_fits_inside_the_hook_timeout(tool):
+    """A gateway that never answers must leave time for the fail-open return. Overshoot
+    and the host kills the hook instead, which the user sees as a timeout warning."""
+    timeouts, slept, result, sleeps = pretool_budget(tool)
+    assert timeouts, "send_to_hook_api never called curl"
+    assert result == {}, "a gateway that never answers must still fail open"
+    # Bounding only the total lets the retry shape drift; one sleep per gap pins it.
+    assert sleeps == len(timeouts) - 1, (
+        "%s slept %d times across %d attempts" % (tool, sleeps, len(timeouts)))
+    worst_case = sum(timeouts) + slept
+    cap = HOOK_CAP_SECONDS.get(tool, DEFAULT_HOOK_CAP_SECONDS)
+    assert worst_case + UNMODELLED_ALLOWANCE < cap, (
+        "%s spends %.1fs worst case against a %ds hook timeout; it would be killed "
+        "before it can fail open" % (tool, worst_case, cap))

@@ -6,6 +6,7 @@ import stat
 import sys
 import platform
 import shutil
+import shlex
 import subprocess
 import hashlib
 import json
@@ -407,7 +408,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
@@ -894,6 +896,50 @@ def restart_cursor() -> bool:
         return False
 
 
+def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) -> bool:
+    """Removes var_name for every user except those keep() names; False when any removal failed."""
+    if platform.system().lower() == "windows":
+        # One machine-wide value: it stays if any user still needs it.
+        # A planted hook file only keeps a value every user can already read; unbound-hook clear drops it regardless.
+        if keep(None) or any(keep(home_dir) for _, home_dir in get_all_user_homes()):
+            return True
+        return remove_env_var_on_windows(var_name) in ("cleared", "not_found")
+    ok = True
+    for username, home_dir in get_all_user_homes():
+        if not keep(home_dir) and remove_env_var_from_user(username, home_dir, var_name) not in ("cleared", "not_found"):
+            ok = False
+    return ok
+
+
+# Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
+def remove_legacy_key_env() -> None:
+    try:
+        _remove_env_var_for_all_users("UNBOUND_CURSOR_API_KEY")
+    except Exception:
+        pass
+
+
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.claude", "~/.codex", "~/.copilot", "~/.augment",
+    "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
+    "/etc/codex", "%ProgramData%/OpenAI/Codex", "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
+            return True
+    return False
+
+
 def clear_setup() -> bool:
     """Remove hooks and environment variables set by the setup script."""
     print("=" * 60)
@@ -976,6 +1022,10 @@ def clear_setup() -> bool:
     for username, home_dir in (get_all_user_homes() or []):
         remove_hook_logs_for_user(username, home_dir)
 
+    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
+        teardown_failed = True
+        print("Failed to clear UNBOUND_DEVICE_TOKEN")
+
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
@@ -1047,19 +1097,82 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
         return None
 
 
+def _is_unbound_hook_command(cmd, script_path) -> bool:
+    """Ours when the command RUNS our hook or the /opt/unbound binary, not merely
+    mentions one: a decoy like '/bin/true # <our path>' is not ours."""
+    if not cmd or not isinstance(cmd, str):
+        return False
+    if "/opt/unbound/" in cmd and "unbound-hook" in cmd:
+        return True
+    try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a path
+        # containing spaces stays one token; only the quotes it leaves are stripped.
+        tokens = shlex.split(cmd, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t for t in (t.strip().strip('"').strip("'") for t in tokens) if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    program = os.path.normcase(os.path.normpath(tokens[0]))
+    # hooks.json ships the relative form; the Windows rewrite makes it absolute.
+    return program in (os.path.normcase(os.path.normpath(str(script_path))),
+                       os.path.normcase(os.path.normpath("./hooks/unbound.py")))
+
+
+def _unbound_hooks_registered(hooks_path, script_path) -> Optional[bool]:
+    """True when hooks.json registers OUR hook on any event. Any event, not the
+    enforcing one alone: the install writes them together, and under-matching reports
+    'fresh', which the backend counts as a removal, so demanding one named event would
+    accuse every device whose cursor ships a different event set. False when it does
+    not, None when it could not be read. Unparseable raises, because cursor refuses
+    such a file too."""
+    if not hooks_path.exists():
+        return False
+    try:
+        with open(hooks_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except OSError as e:
+        debug_print(f"Could not read {hooks_path}: {e}")
+        return None
+    events = data.get("hooks") if isinstance(data, dict) else None
+    for entries in events.values() if isinstance(events, dict) else ():
+        for item in entries if isinstance(entries, list) else []:
+            if isinstance(item, dict) and _is_unbound_hook_command(
+                    item.get("command", ""), script_path):
+                return True
+    return False
+
+
 def detect_install_state() -> Optional[str]:
     """Inspect the enterprise hooks.json target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error."""
+    'fresh' (neither our hook entries nor the script), 'persisted' (both),
+    'tampered' (one without the other), None when hooks.json was unreadable."""
     try:
         enterprise_dir = get_enterprise_hooks_dir()
-        hooks_json = enterprise_dir / "hooks.json"
         script_path = enterprise_dir / "hooks" / "unbound.py"
-        if not hooks_json.exists():
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        # An enterprise hooks.json can be the org's own, so the file existing is
+        # not our install; only our own hook entries are.
+        try:
+            registered = _unbound_hooks_registered(
+                enterprise_dir / "hooks.json", script_path)
+        except ValueError:
+            # Cursor refuses a hooks.json it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return 'tampered'
+        if registered is None:
+            return None
+        if registered == script_path.exists():
+            return 'persisted' if registered else 'fresh'
+        return 'tampered'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None
@@ -1201,12 +1314,14 @@ def main():
     print("✅ API key received")
 
     # Set environment variable
-    debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
-    success, env_changed, message = set_env_var("UNBOUND_CURSOR_API_KEY", cursor_api_key)
+    debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+    success, env_changed, message = set_env_var("UNBOUND_DEVICE_TOKEN", cursor_api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return False
     print(f"✅ Environment variable set ({message})")
+    remove_legacy_key_env()
 
     url_ok, _, url_message = set_env_var("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
