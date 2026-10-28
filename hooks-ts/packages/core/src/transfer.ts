@@ -2356,32 +2356,6 @@ function soften(outside: Liveness, shell: Shell): void {
 
 /** The calls one simple command makes, after applying its cd, export, unset or declaration; a defined function runs
  *  its body with the command's words as its positional parameters. */
-const BASH_SET_FLAGS = "abefhkmnptuvxBCEHPT";
-const BASH_SET_NAMES: ReadonlySet<string> = new Set(
-  `allexport braceexpand emacs errexit errtrace functrace hashall histexpand history ignoreeof interactive-comments
-   keyword monitor noclobber noexec noglob nolog notify nounset onecmd physical pipefail posix privileged verbose vi
-   xtrace`.split(/\s+/),
-);
-
-/** Whether a builtin surely succeeds, with nothing redirected: echo, set with options bash knows, or export, unset or a
- *  declaration of plain names; local only in a function, as bash rejects it outside one. */
-function succeeds(own: string | undefined, args: string[], io: Item["io"], shell: Shell): boolean {
-  if (io.length > 0 || own === undefined || !["echo", "set", "export", "unset", ...DECLARES].includes(own) ||
-    (own === "local" && shell.floor === undefined)) return false;
-  if (own === "set") {
-    for (let i = 0; /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i] as string); ) {
-      const arg = args[i++] as string;
-      for (const flag of arg.slice(1)) {
-        if (flag === "o" && BASH_SET_NAMES.has(args[i] ?? "")) i++;
-        else if (!BASH_SET_FLAGS.includes(flag)) return false;
-      }
-    }
-    return true;
-  }
-  const plainName = (arg: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(arg.split("=")[0]?.replace(/\+$/, "") ?? "");
-  return own === "echo" || args.filter((arg) => !/^[-+]/.test(arg)).every(plainName);
-}
-
 function simple(words: string[], item: Item, before: string, shell: Shell, depth: number): Call[] {
   const layer: Layer = [before === "|", item.after === "|", item.io];
   const lead = words.findIndex((word) => !isAssignment(word));
@@ -2420,7 +2394,7 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   const status = shell.status;
   shell.status = name === "true" || own === ":" || own === "break" || own === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
-  if ((assigns || succeeds(own, args, item.io, shell)) && !substituted) shell.status = 0;
+  if (assigns && !substituted) shell.status = 0;
   let moved = own === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
   if (own === "pushd" || own === "popd") {
     // pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
@@ -2602,15 +2576,15 @@ function exempt(shell: Shell): boolean {
   return shell.exempt > 0 || shell.frames.some((frame) => frame.exempt || frame.cond);
 }
 
-/** Under set -e, a command that fails where it is not ignored ends the shell or subshell, and one that may fail, or
- *  fails while set -e may be on, may end it. bash ignores it in a command substitution, and zsh does not. */
+/** Under set -e, a command that surely fails where it is not ignored ends the shell or subshell; one whose status isn't
+ *  known goes on. bash ignores set -e in a command substitution and zsh does not, so there it only may end it. */
 function errexit(after: string, shell: Shell): void {
   const on = shell.vars[ERREXIT]?.[0] ?? "";
-  if (on === "" || ["&&", "||", "|"].includes(after) || shell.status === 0 || shell.pipe.runs === false ||
-    shell.pipe.negate || exempt(shell)) return;
+  if (on === "" || ["&&", "||", "|"].includes(after) || shell.status === 0 || shell.status === undefined ||
+    shell.pipe.runs === false || shell.pipe.negate || exempt(shell)) return;
   const outside = liveness(shell);
   jump("exit", [], shell);
-  if (shell.status === undefined || on !== "1" || shell.frames.some((frame) => frame.kind === "$(")) {
+  if (on !== "1" || shell.frames.some((frame) => frame.kind === "$(")) {
     soften(outside, shell);
   }
 }

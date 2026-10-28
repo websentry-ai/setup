@@ -7631,7 +7631,7 @@
       "direction": "in",
       "host": "example.com",
       "resolved_host": "example.com",
-      "address": "unresolved"
+      "address": "public"
      }
     ]
    }
@@ -7659,7 +7659,7 @@
       "direction": "in",
       "host": "example.com",
       "resolved_host": "example.com",
-      "address": "unresolved"
+      "address": "public"
      }
     ]
    }
@@ -7859,7 +7859,7 @@
       "direction": "in",
       "host": "example.com",
       "resolved_host": "example.com",
-      "address": "unresolved"
+      "address": "public"
      }
     ]
    }

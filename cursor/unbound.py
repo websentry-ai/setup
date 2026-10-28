@@ -5824,33 +5824,6 @@ def _transfer_take_back(shell: Dict, before: Dict) -> None:
             shell['vars'][name] = entry
 
 
-_TRANSFER_BASH_SET_FLAGS = frozenset('abefhkmnptuvxBCEHPT')
-_TRANSFER_BASH_SET_NAMES = frozenset((
-    'allexport braceexpand emacs errexit errtrace functrace hashall histexpand history ignoreeof interactive-comments '
-    'keyword monitor noclobber noexec noglob nolog notify nounset onecmd physical pipefail posix privileged verbose vi '
-    'xtrace').split())
-
-
-def _transfer_succeeds(builtin: Optional[str], args: List[str], io: list, shell: Dict) -> bool:
-    """Whether a builtin surely succeeds, with nothing redirected: echo, set with options bash knows, or export, unset
-    or a declaration of plain names; local only in a function, as bash rejects it outside one."""
-    if io or builtin not in ('echo', 'set', 'export', 'unset') + _TRANSFER_DECLARES or \
-            (builtin == 'local' and shell['floor'] is None):
-        return False
-    if builtin == 'set':
-        i = 0
-        while i < len(args) and args[i][:1] in ('-', '+') and args[i] not in ('-', '--', '+'):
-            arg, i = args[i], i + 1
-            for flag in arg[1:]:
-                if flag == 'o' and i < len(args) and args[i] in _TRANSFER_BASH_SET_NAMES:
-                    i += 1
-                elif flag not in _TRANSFER_BASH_SET_FLAGS:
-                    return False
-        return True
-    return builtin == 'echo' or all(re.fullmatch(_TRANSFER_NAME, a.partition('=')[0].rstrip('+'))
-                                    for a in args if not a.startswith(('-', '+')))
-
-
 def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
     """The calls one simple command makes, after applying its cd, export, unset or declaration; a defined function runs
     its body with the command's words as its positional parameters."""
@@ -5888,7 +5861,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     status = shell['status']
     shell['status'] = 0 if program == 'true' or builtin in (':', 'break', 'continue') else 1 if program == 'false' else \
         _transfer_arithmetic(words[0]) if len(words) == 1 else None
-    if (assigns or _transfer_succeeds(builtin, args, io, shell)) and not substituted:
+    if assigns and not substituted:
         shell['status'] = 0
     moved = _transfer_cd(args, cwd, shell, given) if builtin == 'cd' else None
     if builtin in ('pushd', 'popd'):
@@ -6059,15 +6032,15 @@ def _transfer_exempt(shell: Dict) -> bool:
 
 
 def _transfer_errexit(after: str, shell: Dict) -> None:
-    """Under set -e, a command that fails where it is not ignored ends the shell or subshell, and one that may fail,
-    or fails while set -e may be on, may end it. bash ignores it in a command substitution, and zsh does not."""
+    """Under set -e, a command that surely fails where it is not ignored ends the shell or subshell; one whose status
+    isn't known goes on. bash ignores set -e in a command substitution and zsh does not, so there it only may end it."""
     errexit = shell['vars'].get(_TRANSFER_ERREXIT, ('', True))[0]
-    if not errexit or after in ('&&', '||', '|') or shell['status'] == 0 or shell['pipe']['runs'] is False or \
+    if not errexit or after in ('&&', '||', '|') or shell['status'] in (0, None) or shell['pipe']['runs'] is False or \
             shell['pipe']['negate'] or _transfer_exempt(shell):
         return
     outside = _transfer_liveness(shell)
     _transfer_jump('exit', [], shell)
-    if shell['status'] is None or errexit != '1' or any(f['kind'] == '$(' for f in shell['frames']):
+    if errexit != '1' or any(f['kind'] == '$(' for f in shell['frames']):
         _transfer_soften(outside, shell)
 
 
