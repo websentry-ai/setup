@@ -6528,30 +6528,31 @@ def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = 
 
 
 def _transfer_rsync_args(args: List[str], env: Dict) -> tuple:
-    """(operands, ssh options for its remote shell, an unknown config when that shell isn't ssh) for rsync."""
-    shell, operands, i = _transfer_env(env, 'RSYNC_RSH'), [], 0
+    """(operands, ssh options for its remote shell, an unknown config when that shell isn't ssh, whether -e or --rsh
+    named it) for rsync."""
+    shell, operands, explicit, i = _transfer_env(env, 'RSYNC_RSH'), [], False, 0
     while i < len(args):
         arg, i = args[i], i + 1
         if arg == '--':
             operands.extend(args[i:])  # every word after it is an operand
             break
         if arg == '--rsh' and i < len(args):
-            shell, i = args[i], i + 1
+            shell, explicit, i = args[i], True, i + 1
         elif arg.startswith('--rsh='):
-            shell = arg.split('=', 1)[1]
+            shell, explicit = arg.split('=', 1)[1], True
         elif arg in _TRANSFER_RSYNC_VALUE_OPTIONS:
             i += 1
         elif arg.startswith('-') and not arg.startswith('--'):
             flag, value, i = _transfer_short_option(arg, args, i, _TRANSFER_SSH_VALUE_FLAGS['rsync'], set())
-            shell = value if flag == '-e' else shell
+            shell, explicit = (value, True) if flag == '-e' else (shell, explicit)
         elif not arg.startswith('-'):
             operands.append(arg)
     if not shell:
-        return operands, []
+        return operands, [], False
     words = _transfer_words(shell)
     if not words or _transfer_program_name(words[0]) != 'ssh':
-        return operands, list(_TRANSFER_CONFIG_UNKNOWN)  # a remote shell of its own may connect anywhere
-    return operands, _transfer_ssh_args('ssh', words[1:] + ['-'])[1]
+        return operands, list(_TRANSFER_CONFIG_UNKNOWN), explicit  # a remote shell of its own may connect anywhere
+    return operands, _transfer_ssh_args('ssh', words[1:] + ['-'])[1], explicit
 
 
 def _transfer_remote(arg: str) -> Optional[tuple]:
@@ -6574,7 +6575,8 @@ def _transfer_remote(arg: str) -> Optional[tuple]:
 
 def _transfer_copy(program: str, args: List[str], env: Dict) -> List[tuple]:
     """Each remote side of an scp, sftp or rsync copy: fetched from as a source, sent to as the target."""
-    operands, options = _transfer_rsync_args(args, env) if program == 'rsync' else _transfer_ssh_args(program, args)
+    operands, options, explicit = _transfer_rsync_args(args, env) if program == 'rsync' else \
+        _transfer_ssh_args(program, args) + (False,)
     remotes = [_transfer_remote(op) for op in operands]
     if program == 'sftp' and operands:
         # sftp takes one destination: a bare host opens a session, a host:path or URI fetches that path.
@@ -6588,6 +6590,8 @@ def _transfer_copy(program: str, args: List[str], env: Dict) -> List[tuple]:
     for remote, direction in remotes:
         if remote:
             destination, port, via_ssh = remote
+            # With -e or --rsh, though not RSYNC_RSH alone, rsync reaches a daemon through that shell, on no TCP port.
+            via_ssh, port = (True, None) if explicit and not via_ssh else (via_ssh, port)
             ssh_options = (options + (['-p', port] if port else [])) if via_ssh and options is not None else None
             endpoints.append((direction, destination, ssh_options))
     return endpoints

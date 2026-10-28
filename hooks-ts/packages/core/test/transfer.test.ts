@@ -145,6 +145,14 @@ test("an IPv4-mapped address is read as its IPv4 address in every form, as Pytho
   }
 });
 
+test("a daemon over an explicit shell takes no daemon port", async () => {
+  // rsync -e reaches rsync://host:873/module through ssh; 873 is the daemon's port, not ssh's.
+  const calls: string[][] = [];
+  const found = await transfer("rsync -e ssh f rsync://prod:873/module", "/", { execFile: fakeSsh(calls) });
+  assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "10.0.4.12", address: "private" }]);
+  assert.ok(calls.length > 0 && calls.every((call) => !call.includes("873")), JSON.stringify(calls));
+});
+
 test("a one-letter host is a drive only on Windows", async () => {
   // Windows OpenSSH reads C:file as a local path; elsewhere scp dials host a.
   assert.deepEqual(await hosts("scp build.zip a:/srv", "/"), [["out", "a"]]);

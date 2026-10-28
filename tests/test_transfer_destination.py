@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '397bdf8077a6c8c926c88cfa9055f8c7c2fb343031a390493c7a1f5af8281199'
+BLOCK_SHA256 = '42fa474ada05a3052967ed36bf64e72070d2c0f7d9b79bea2f55551e58b58b3c'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -772,6 +772,12 @@ class SshLookupTests(TransferTestCase):
     def test_a_tilde_config_path_is_expanded_as_the_shell_does(self):
         Path(self.home, 'alt_cfg').write_text('Host prod\n  HostName 10.9.8.7\n')
         self.assert_endpoints('scp -F ~/alt_cfg f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.9.8.7')])
+
+    def test_a_daemon_over_an_explicit_shell_takes_no_daemon_port(self):
+        # rsync -e reaches rsync://host:873/module through ssh; 873 is the daemon's port, not ssh's.
+        self.assert_hosts('rsync -e ssh f rsync://prod:873/module', [('out', 'prod')])
+        self.assertTrue(self.ssh_calls())
+        self.assertFalse(any('873' in call['argv'] for call in self.ssh_calls()), self.ssh_calls())
 
     def test_a_one_letter_host_is_a_drive_only_on_windows(self):
         # Windows OpenSSH reads C:file as a local path; elsewhere scp dials host c.

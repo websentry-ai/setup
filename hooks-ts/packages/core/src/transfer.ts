@@ -3055,9 +3055,13 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
   return [operands, passthrough];
 }
 
-/** The operands, and ssh options for its remote shell (an unknown config when that shell isn't ssh), for rsync. */
-function rsyncArgs(args: string[], env: Env, processEnv: Record<string, string | undefined>): [string[], string[]] {
+/** The operands, ssh options for its remote shell (an unknown config when that shell isn't ssh), and whether -e or
+ *  --rsh named it, for rsync. */
+function rsyncArgs(
+  args: string[], env: Env, processEnv: Record<string, string | undefined>,
+): [string[], string[], boolean] {
   let shell = envValue(env, processEnv, "RSYNC_RSH");
+  let explicit = false;
   const operands: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
@@ -3065,21 +3069,23 @@ function rsyncArgs(args: string[], env: Env, processEnv: Record<string, string |
       operands.push(...args.slice(i)); // every word after it is an operand
       break;
     }
-    if (arg === "--rsh" && i < args.length) shell = args[i++] as string;
-    else if (arg.startsWith("--rsh=")) shell = arg.slice("--rsh=".length);
+    if (arg === "--rsh" && i < args.length) [shell, explicit] = [args[i++] as string, true];
+    else if (arg.startsWith("--rsh=")) [shell, explicit] = [arg.slice("--rsh=".length), true];
     else if (RSYNC_VALUE_OPTIONS.has(arg)) i++;
     else if (arg.startsWith("-") && !arg.startsWith("--")) {
       let flag: string;
       let value: string | undefined;
       [flag, value, i] = shortOption(arg, args, i, SSH_VALUE_FLAGS.rsync as string, new Set());
-      if (flag === "-e" && value !== undefined) shell = value;
+      if (flag === "-e" && value !== undefined) [shell, explicit] = [value, true];
     } else if (!arg.startsWith("-")) operands.push(arg);
   }
-  if (!shell) return [operands, []];
+  if (!shell) return [operands, [], false];
   const shellArgv = words(shell);
   // A remote shell of its own may connect anywhere.
-  if (shellArgv[0] === undefined || programName(shellArgv[0]) !== "ssh") return [operands, [...CONFIG_UNKNOWN]];
-  return [operands, sshArgs("ssh", [...shellArgv.slice(1), "-"])[1]];
+  if (shellArgv[0] === undefined || programName(shellArgv[0]) !== "ssh") {
+    return [operands, [...CONFIG_UNKNOWN], explicit];
+  }
+  return [operands, sshArgs("ssh", [...shellArgv.slice(1), "-"])[1], explicit];
 }
 
 /** The destination, port and whether ssh carries it, for a remote copy operand; undefined for a local path. */
@@ -3099,7 +3105,8 @@ function remote(arg: string): [string, string | undefined, boolean] | undefined 
 }
 
 function copy(name: string, args: string[], env: Env, processEnv: Record<string, string | undefined>): Raw[] {
-  const [operands, options] = name === "rsync" ? rsyncArgs(args, env, processEnv) : sshArgs(name, args);
+  const [operands, options, explicit] =
+    name === "rsync" ? rsyncArgs(args, env, processEnv) : [...sshArgs(name, args), false] as const;
   let remotes: [ReturnType<typeof remote>, string][];
   if (name === "sftp" && operands.length > 0) {
     // sftp takes one destination: a bare host opens a session, a host:path or URI fetches that path.
@@ -3114,7 +3121,8 @@ function copy(name: string, args: string[], env: Env, processEnv: Record<string,
   const out: Raw[] = [];
   for (const [found, direction] of remotes) {
     if (found === undefined) continue;
-    const [destination, port, viaSsh] = found;
+    // With -e or --rsh, though not RSYNC_RSH alone, rsync reaches a daemon through that shell, on no TCP port.
+    const [destination, port, viaSsh] = explicit && !found[2] ? [found[0], undefined, true] : found;
     const sshOptions = viaSsh && options !== undefined ? [...options, ...(port === undefined ? [] : ["-p", port])] : undefined;
     out.push([direction, destination, sshOptions]);
   }

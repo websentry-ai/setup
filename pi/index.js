@@ -4356,6 +4356,7 @@ function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
 }
 function rsyncArgs(args, env, processEnv) {
   let shell = envValue(env, processEnv, "RSYNC_RSH");
+  let explicit = false;
   const operands = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
@@ -4363,20 +4364,22 @@ function rsyncArgs(args, env, processEnv) {
       operands.push(...args.slice(i));
       break;
     }
-    if (arg === "--rsh" && i < args.length) shell = args[i++];
-    else if (arg.startsWith("--rsh=")) shell = arg.slice("--rsh=".length);
+    if (arg === "--rsh" && i < args.length) [shell, explicit] = [args[i++], true];
+    else if (arg.startsWith("--rsh=")) [shell, explicit] = [arg.slice("--rsh=".length), true];
     else if (RSYNC_VALUE_OPTIONS.has(arg)) i++;
     else if (arg.startsWith("-") && !arg.startsWith("--")) {
       let flag;
       let value;
       [flag, value, i] = shortOption(arg, args, i, SSH_VALUE_FLAGS.rsync, /* @__PURE__ */ new Set());
-      if (flag === "-e" && value !== void 0) shell = value;
+      if (flag === "-e" && value !== void 0) [shell, explicit] = [value, true];
     } else if (!arg.startsWith("-")) operands.push(arg);
   }
-  if (!shell) return [operands, []];
+  if (!shell) return [operands, [], false];
   const shellArgv = words(shell);
-  if (shellArgv[0] === void 0 || programName(shellArgv[0]) !== "ssh") return [operands, [...CONFIG_UNKNOWN]];
-  return [operands, sshArgs("ssh", [...shellArgv.slice(1), "-"])[1]];
+  if (shellArgv[0] === void 0 || programName(shellArgv[0]) !== "ssh") {
+    return [operands, [...CONFIG_UNKNOWN], explicit];
+  }
+  return [operands, sshArgs("ssh", [...shellArgv.slice(1), "-"])[1], explicit];
 }
 function remote(arg) {
   const uri = /^(scp|sftp|rsync):\/\/(?:([^@/;:]+)(?:[;:][^@/]*)?@)?(\[[^\]/]+\]|[^/:[\]@]+)(?::(\d+))?(?=\/|$)/.exec(arg);
@@ -4389,7 +4392,7 @@ function remote(arg) {
   return [match[1], void 0, match[2] === void 0];
 }
 function copy(name, args, env, processEnv) {
-  const [operands, options] = name === "rsync" ? rsyncArgs(args, env, processEnv) : sshArgs(name, args);
+  const [operands, options, explicit] = name === "rsync" ? rsyncArgs(args, env, processEnv) : [...sshArgs(name, args), false];
   let remotes;
   if (name === "sftp" && operands.length > 0) {
     const first = operands[0];
@@ -4403,7 +4406,7 @@ function copy(name, args, env, processEnv) {
   const out = [];
   for (const [found, direction] of remotes) {
     if (found === void 0) continue;
-    const [destination, port, viaSsh] = found;
+    const [destination, port, viaSsh] = explicit && !found[2] ? [found[0], void 0, true] : found;
     const sshOptions = viaSsh && options !== void 0 ? [...options, ...port === void 0 ? [] : ["-p", port]] : void 0;
     out.push([direction, destination, sshOptions]);
   }
