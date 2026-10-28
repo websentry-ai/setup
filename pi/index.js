@@ -3135,7 +3135,10 @@ function end(shell) {
   if (pipe.runs === false) {
     status = pipe.prior;
   } else {
-    if (pipe.statuses.includes(1) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
+    const statuses = [...pipe.statuses, status];
+    if (shell.vars[PIPEFAIL]?.[0] === "1") {
+      status = statuses.includes(1) ? 1 : statuses.includes(void 0) ? void 0 : status;
+    }
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : void 0;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : void 0;
     if (pipe.prior === void 0 && skipped !== void 0 && status !== skipped) status = void 0;
@@ -4556,9 +4559,9 @@ function webCmdlet(args, sends, proxied = false) {
     else if (name === "proxy") {
       proxy = value !== "";
       if (proxy) named.add(name);
-    } else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) {
-      proxy = false;
+    } else if (name === "noproxy") {
       named.add(name);
+      if (colon < 0 || ["$true", "1"].includes(value.toLowerCase())) proxy = false;
     }
   }
   if (named.size === 2) return [];

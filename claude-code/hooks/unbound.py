@@ -6432,9 +6432,11 @@ def _transfer_end(shell: Dict) -> None:
     if pipe['runs'] is False:
         status = pipe['prior']
     else:
-        # Under pipefail the pipeline leaves its last non-zero status, so one command that surely fails fails it.
-        if 1 in pipe['statuses'] and shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0] == '1':
-            status = 1
+        # Under pipefail the pipeline leaves its last non-zero status: one command that surely fails fails it, and
+        # otherwise one whose status isn't known leaves it unknown.
+        statuses = pipe['statuses'] + [status]
+        if shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0] == '1':
+            status = 1 if 1 in statuses else None if None in statuses else status
         status = {0: 1, 1: 0}.get(status) if pipe['negate'] else status
         skipped = {'&&': 1, '||': 0}.get(pipe['before'])
         if pipe['prior'] is None and skipped is not None and status != skipped:
@@ -8088,10 +8090,12 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
         elif name == 'proxy':
             proxy = bool(value)
             named |= {name} if value else set()
-        elif name == 'noproxy' and (not colon or value.lower() in ('$true', '1')):
-            proxy, named = False, named | {name}  # -NoProxy:$false, or a value not known here, leaves the proxy on
+        elif name == 'noproxy':
+            named.add(name)
+            # -NoProxy:$false, or a value not known here, leaves the proxy on.
+            proxy = False if not colon or value.lower() in ('$true', '1') else proxy
     if named == {'proxy', 'noproxy'}:
-        return []  # -Proxy and -NoProxy are in different parameter sets, so PowerShell rejects the call
+        return []  # -Proxy and -NoProxy, whatever its value, are in different parameter sets: PowerShell rejects them
     uri = uri or (positional[0] if positional else '')
     proxy = proxied if proxy is None else proxy
     return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri \

@@ -1589,8 +1589,12 @@ function end(shell: Shell): void {
   if (pipe.runs === false) {
     status = pipe.prior;
   } else {
-    // Under pipefail the pipeline leaves its last non-zero status, so one command that surely fails fails it.
-    if (pipe.statuses.includes(1) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
+    // Under pipefail the pipeline leaves its last non-zero status: one command that surely fails fails it, and
+    // otherwise one whose status isn't known leaves it unknown.
+    const statuses = [...pipe.statuses, status];
+    if (shell.vars[PIPEFAIL]?.[0] === "1") {
+      status = statuses.includes(1) ? 1 : statuses.includes(undefined) ? undefined : status;
+    }
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : undefined;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : undefined;
     if (pipe.prior === undefined && skipped !== undefined && status !== skipped) status = undefined;
@@ -3283,13 +3287,13 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
     else if (name === "proxy") {
       proxy = value !== "";
       if (proxy) named.add(name);
-    } else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) {
-      // -NoProxy:$false, or a value not known here, leaves the proxy on.
-      proxy = false;
+    } else if (name === "noproxy") {
       named.add(name);
+      // -NoProxy:$false, or a value not known here, leaves the proxy on.
+      if (colon < 0 || ["$true", "1"].includes(value.toLowerCase())) proxy = false;
     }
   }
-  // -Proxy and -NoProxy are in different parameter sets, so PowerShell rejects the call.
+  // -Proxy and -NoProxy, whatever its value, are in different parameter sets: PowerShell rejects them.
   if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
   // It goes through a proxy with -Proxy, or one the command set unless -NoProxy.
