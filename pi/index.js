@@ -1922,6 +1922,7 @@ var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
 var UNKNOWN_ENV = "\0unknown";
 var ALLEXPORT = "\0allexport";
+var ERREXIT = "\0errexit";
 var SUBSTITUTED = "\0";
 var BRACE_MARKS = { "{": "", ",": "", "}": "" };
 var LITERAL_TILDE = "";
@@ -2072,7 +2073,42 @@ var WGET_LONG_VALUES = new Set(
    --private-key-type --ca-certificate --ca-directory --crl-file --pinnedpubkey --random-file --egd-file --ciphers
    --hsts-file --ftp-user --ftp-password --http-user --http-password --warc-file --warc-header --warc-max-size
    --warc-dedup --warc-tempdir --local-encoding --remote-encoding --restrict-file-names --prefer-family
-   --report-speed --progress --use-askpass`.split(/\s+/)
+   --report-speed --progress --use-askpass --bind-dns-address --dns-servers --dot-style --http-passwd
+   --input-metalink --metalink-index --no --preferred-location --proxy-passwd --start-pos`.split(/\s+/)
+);
+var WGET_LONG_OPTIONS = new Set(
+  `accept accept-regex adjust-extension append-output ask-password auth-no-challenge background backup-converted
+   backups base bind-address bind-dns-address body-data body-file ca-certificate ca-directory cache certificate
+   certificate-type check-certificate ciphers clobber compression config connect-timeout content-disposition
+   content-on-error continue convert-file-only convert-links cookies crl-file cut-dirs debug default-page
+   delete-after directories directory-prefix dns-cache dns-servers dns-timeout domains dont-remove-listing dot-style
+   egd-file exclude-directories exclude-domains execute follow-ftp follow-tags force-directories force-html
+   ftp-password ftp-stmlf ftp-user ftps-clear-data-connection ftps-fallback-to-ftp ftps-implicit ftps-resume-ssl
+   glob header help host-directories hsts hsts-file html-extension htmlify http-keep-alive http-passwd http-password
+   http-user https-only if-modified-since ignore-case ignore-length ignore-tags include-directories inet4-only
+   inet6-only input-file input-metalink iri keep-badhash keep-session-cookies level limit-rate load-cookies
+   local-encoding max-redirect metalink-index metalink-over-http method mirror netrc no no-adjust-extension
+   no-ask-password no-auth-no-challenge no-background no-backup-converted no-backups no-cache no-check-certificate
+   no-clobber no-config no-content-disposition no-content-on-error no-continue no-convert-file-only no-convert-links
+   no-cookies no-debug no-delete-after no-directories no-dns-cache no-follow-ftp no-force-directories no-force-html
+   no-ftp-stmlf no-ftps-clear-data-connection no-ftps-fallback-to-ftp no-ftps-implicit no-ftps-resume-ssl no-glob
+   no-host-directories no-hsts no-html-extension no-htmlify no-http-keep-alive no-https-only no-if-modified-since
+   no-ignore-case no-ignore-length no-inet4-only no-inet6-only no-iri no-keep-badhash no-keep-session-cookies
+   no-metalink-over-http no-mirror no-netrc no-no-clobber no-no-config no-no-parent no-page-requisites no-parent
+   no-passive-ftp no-preserve-permissions no-protocol-directories no-proxy no-quiet no-random-wait no-recursive
+   no-relative no-remove-listing no-report-speed no-restrict-file-names no-retr-symlinks no-retry-connrefused
+   no-retry-on-host-error no-save-headers no-server-response no-show-progress no-span-hosts no-spider
+   no-strict-comments no-timestamping no-trust-server-names no-unlink no-use-server-timestamps no-verbose
+   no-warc-cdx no-warc-compression no-warc-digests no-warc-keep-log no-wdebug no-xattr output-document output-file
+   page-requisites parent passive-ftp password pinnedpubkey post-data post-file prefer-family preferred-location
+   preserve-permissions private-key private-key-type progress protocol-directories proxy proxy-passwd proxy-password
+   proxy-user proxy__compat quiet quota random-file random-wait read-timeout recursive referer regex-type reject
+   reject-regex rejected-log relative remote-encoding remove-listing report-speed restrict-file-names retr-symlinks
+   retry-connrefused retry-on-host-error retry-on-http-error save-cookies save-headers secure-protocol
+   server-response show-progress span-hosts spider start-pos strict-comments timeout timestamping tries
+   trust-server-names unlink use-askpass use-server-timestamps user user-agent verbose version wait waitretry
+   warc-cdx warc-compression warc-dedup warc-digests warc-file warc-header warc-keep-log warc-max-size warc-tempdir
+   wdebug xattr`.split(/\s+/)
 );
 var WGET_UPLOADS = /* @__PURE__ */ new Set(["--post-data", "--post-file", "--body-data", "--body-file"]);
 var NC_SHORT_VALUES = "eGgIiMmOoPpqsTVWwXx";
@@ -3138,7 +3174,9 @@ function openFrame(kind, runsHere, shell, head) {
     continued: false,
     doubt: doubt(shell.pipe),
     unsure: /* @__PURE__ */ new Set(),
-    outside: liveness(shell)
+    outside: liveness(shell),
+    cond: kind === "if" || kind === "while" || kind === "until",
+    exempt: exempt(shell) || shell.pipe.negate || endsList(head, shell)
   });
   shell.openingPipe = false;
   shell.start = snapshot(shell);
@@ -3307,7 +3345,10 @@ function keyword(argv, item, shell) {
     return rest;
   }
   const top = frames.at(-1);
-  if (top !== void 0) branch(word, top, shell);
+  if (top !== void 0) {
+    branch(word, top, shell);
+    top.cond = word === "elif";
+  }
   pipeline("", runs(shell), shell);
   return rest;
 }
@@ -3464,6 +3505,7 @@ function marker(item, shell) {
     } else {
       closeFrame(frame, [frame.pipedIn, item.after === "|", item.io], shell, item.after === "&");
       finish(item.after, shell);
+      if (frame.kind === "(") errexit(item.after, shell);
     }
   }
 }
@@ -3484,18 +3526,24 @@ function assign(name, args, shell) {
   }
 }
 var SETS = ["set", "setopt", "unsetopt"];
-var zshAllexport = (name) => ["allexport", "noallexport"].includes(name.toLowerCase().replaceAll("_", ""));
+var SET_OPTIONS = { allexport: ALLEXPORT, errexit: ERREXIT };
+var SET_FLAGS = { a: "allexport", e: "errexit" };
+function zshOptions(name) {
+  const plain = name.toLowerCase().replaceAll("_", "");
+  return Object.entries(SET_OPTIONS).filter(([option]) => plain === option || plain === `no${option}`).map(([, key]) => key);
+}
 function setOptions(name, args, shell) {
   let i = 0;
   while (name === "set" && /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i])) {
     const arg = args[i++];
     for (const flag of arg.slice(1)) {
-      const option = flag === "o" ? args[i++] ?? "" : flag === "a" ? "allexport" : "";
-      if (option === "allexport") shell.vars[ALLEXPORT] = [arg[0] === "-" ? "1" : "", true];
-      else if (zshAllexport(option)) forget(shell, /* @__PURE__ */ new Set([ALLEXPORT]));
+      const option = flag === "o" ? args[i++] ?? "" : SET_FLAGS[flag] ?? "";
+      const key = Object.hasOwn(SET_OPTIONS, option) ? SET_OPTIONS[option] : void 0;
+      if (key !== void 0) shell.vars[key] = [arg[0] === "-" ? "1" : "", true];
+      else forget(shell, new Set(zshOptions(option)));
     }
   }
-  if (name !== "set" && args.some(zshAllexport)) forget(shell, /* @__PURE__ */ new Set([ALLEXPORT]));
+  if (name !== "set") forget(shell, new Set(args.flatMap(zshOptions)));
 }
 function autoExport(shell, exported) {
   const allexport = shell.vars[ALLEXPORT]?.[0] ?? "";
@@ -3728,6 +3776,27 @@ function soften(outside, shell) {
   });
   if (shell.live === false && outside[1] !== false) shell.live = void 0;
 }
+var BASH_SET_FLAGS = "abefhkmnptuvxBCEHPT";
+var BASH_SET_NAMES = new Set(
+  `allexport braceexpand emacs errexit errtrace functrace hashall histexpand history ignoreeof interactive-comments
+   keyword monitor noclobber noexec noglob nolog notify nounset onecmd physical pipefail posix privileged verbose vi
+   xtrace`.split(/\s+/)
+);
+function succeeds(own, args, io, shell) {
+  if (io.length > 0 || own === void 0 || !["echo", "set", "export", "unset", ...DECLARES].includes(own) || own === "local" && shell.floor === void 0) return false;
+  if (own === "set") {
+    for (let i = 0; /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i]); ) {
+      const arg = args[i++];
+      for (const flag of arg.slice(1)) {
+        if (flag === "o" && BASH_SET_NAMES.has(args[i] ?? "")) i++;
+        else if (!BASH_SET_FLAGS.includes(flag)) return false;
+      }
+    }
+    return true;
+  }
+  const plainName = (arg) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(arg.split("=")[0]?.replace(/\+$/, "") ?? "");
+  return own === "echo" || args.filter((arg) => !/^[-+]/.test(arg)).every(plainName);
+}
 function simple(words2, item, before, shell, depth) {
   const layer = [before === "|", item.after === "|", item.io];
   const lead = words2.findIndex((word) => !isAssignment(word));
@@ -3742,7 +3811,10 @@ function simple(words2, item, before, shell, depth) {
     const outer = shell.args;
     shell.args = argv.slice(argv.indexOf(called) + 1);
     const lent = lend(shell, argv.slice(0, argv.indexOf(called)));
+    const ignored = item.after === "&&" || item.after === "||" || shell.pipe.negate || exempt(shell) ? 1 : 0;
+    shell.exempt += ignored;
     callFunction(known, layer, subshell, shell, depth);
+    shell.exempt -= ignored;
     takeBack(shell, lent);
     shell.args = outer;
     if (!known[1]) return [];
@@ -3756,7 +3828,7 @@ function simple(words2, item, before, shell, depth) {
   const assigns = name === void 0 && argv.every(isAssignment);
   const status = shell.status;
   shell.status = name === "true" || own === ":" || own === "break" || own === "continue" ? 0 : name === "false" ? 1 : argv.length === 1 ? arithmetic(argv[0]) : void 0;
-  if (assigns && !substituted) shell.status = 0;
+  if ((assigns || succeeds(own, args, item.io, shell)) && !substituted) shell.status = 0;
   let moved = own === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : void 0;
   if (own === "pushd" || own === "popd") {
     const folders = args[0] === "--" ? args.slice(1) : args;
@@ -3775,7 +3847,8 @@ function simple(words2, item, before, shell, depth) {
     forget(shell, readNames(name, args));
   }
   if ((own === "eval" || own === "source" || own === ".") && (before !== "|" && item.after !== "|" || subshell === void 0)) {
-    forget(shell, /* @__PURE__ */ new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), "", ALLEXPORT]));
+    const names = Object.keys(shell.vars).filter((key) => !key.startsWith("\0"));
+    forget(shell, /* @__PURE__ */ new Set([...names, "", ...Object.values(SET_OPTIONS)]));
     shell.vars[UNKNOWN_ENV] = [void 0, void 0];
     for (const [fname, known2] of shell.functions) shell.functions.set(fname, [known2[0], true]);
   }
@@ -3860,6 +3933,7 @@ function command(item, shell, depth) {
     }
   }
   if (argv.length > 0 || closed !== void 0) finish(item.after, shell);
+  if (argv.length > 0) errexit(item.after, shell);
   return calls;
 }
 function walkItems(list, shell, depth) {
@@ -3893,6 +3967,24 @@ function compoundEnds(list) {
   });
   return ends;
 }
+function endsList(head, shell) {
+  const item = shell.items[shell.at] ?? head;
+  const k = head.kind === "cmd" && item.kind === "cmd" ? item.argv.length - head.argv.length : 0;
+  const after = shell.ends.get(`${shell.at},${k}`)?.[0];
+  return after === "&&" || after === "||";
+}
+function exempt(shell) {
+  return shell.exempt > 0 || shell.frames.some((frame) => frame.exempt || frame.cond);
+}
+function errexit(after, shell) {
+  const on = shell.vars[ERREXIT]?.[0] ?? "";
+  if (on === "" || ["&&", "||", "|"].includes(after) || shell.status === 0 || shell.pipe.runs === false || shell.pipe.negate || exempt(shell)) return;
+  const outside = liveness(shell);
+  jump("exit", [], shell);
+  if (shell.status === void 0 || on !== "1" || shell.frames.some((frame) => frame.kind === "$(")) {
+    soften(outside, shell);
+  }
+}
 function endsPiped(head, shell) {
   const item = shell.items[shell.at] ?? head;
   const k = head.kind === "cmd" && item.kind === "cmd" ? item.argv.length - head.argv.length : 0;
@@ -3921,7 +4013,8 @@ function walk(items, cwd, exported, processEnv, depth, positional = []) {
     args: [...positional],
     ends: /* @__PURE__ */ new Map(),
     names: namedSegments(items),
-    scoped: []
+    scoped: [],
+    exempt: 0
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -4112,12 +4205,15 @@ function curlDial(url, connects, pins) {
   if (target[0] === host && addresses.length === 0) return void 0;
   return [addresses[0] ?? target[0], addresses];
 }
+function prefixed(name, options) {
+  const word = name.slice(2);
+  const hits = word === "" || options.has(word) ? [word] : [...options].filter((option) => option.startsWith(word));
+  return hits.length === 1 ? `--${hits[0]}` : hits.length > 1 ? "" : name;
+}
 function curlLong(name) {
   const word = name.slice(2).toLowerCase();
-  if (word === "") return name;
-  if (CURL_LONG_OPTIONS.has(word) || /^(no|expand)-/.test(word)) return `--${word}`;
-  const hits = [...CURL_LONG_OPTIONS].filter((option) => option.startsWith(word));
-  return hits.length === 1 ? `--${hits[0]}` : hits.length > 1 ? "" : name;
+  if (word === "" || /^(no|expand)-/.test(word)) return word === "" ? name : `--${word}`;
+  return prefixed(`--${word}`, CURL_LONG_OPTIONS);
 }
 function curlRequest(args, start) {
   const urls = [];
@@ -4184,7 +4280,8 @@ function wget(args, proxied = false) {
     let value;
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
-      name = eq < 0 ? arg : arg.slice(0, eq);
+      name = prefixed(eq < 0 ? arg : arg.slice(0, eq), WGET_LONG_OPTIONS);
+      if (name === "") return [];
       value = eq < 0 ? void 0 : arg.slice(eq + 1);
       if (eq < 0 && WGET_LONG_VALUES.has(name)) value = args[i++];
       flags.add(name);

@@ -83,6 +83,8 @@ const CLEAN_ENV = "\0clean";
 const UNKNOWN_ENV = "\0unknown";
 /** Set by set -a: "1" on, "" off, and a substitution when it may be either; plain assignments are then exported. */
 const ALLEXPORT = "\0allexport";
+/** Set by set -e, held as allexport is: a command that fails then ends the shell. */
+const ERREXIT = "\0errexit";
 /** Stands in for a substitution's output inside a word, so no host is read from it. */
 const SUBSTITUTED = "\0";
 /** Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has. */
@@ -204,7 +206,43 @@ const WGET_LONG_VALUES: ReadonlySet<string> = new Set(
    --private-key-type --ca-certificate --ca-directory --crl-file --pinnedpubkey --random-file --egd-file --ciphers
    --hsts-file --ftp-user --ftp-password --http-user --http-password --warc-file --warc-header --warc-max-size
    --warc-dedup --warc-tempdir --local-encoding --remote-encoding --restrict-file-names --prefer-family
-   --report-speed --progress --use-askpass`.split(/\s+/),
+   --report-speed --progress --use-askpass --bind-dns-address --dns-servers --dot-style --http-passwd
+   --input-metalink --metalink-index --no --preferred-location --proxy-passwd --start-pos`.split(/\s+/),
+);
+/** GNU wget's long options without the --, each --no- form included, for getopt's reading of a prefix as one option. */
+const WGET_LONG_OPTIONS: ReadonlySet<string> = new Set(
+  `accept accept-regex adjust-extension append-output ask-password auth-no-challenge background backup-converted
+   backups base bind-address bind-dns-address body-data body-file ca-certificate ca-directory cache certificate
+   certificate-type check-certificate ciphers clobber compression config connect-timeout content-disposition
+   content-on-error continue convert-file-only convert-links cookies crl-file cut-dirs debug default-page
+   delete-after directories directory-prefix dns-cache dns-servers dns-timeout domains dont-remove-listing dot-style
+   egd-file exclude-directories exclude-domains execute follow-ftp follow-tags force-directories force-html
+   ftp-password ftp-stmlf ftp-user ftps-clear-data-connection ftps-fallback-to-ftp ftps-implicit ftps-resume-ssl
+   glob header help host-directories hsts hsts-file html-extension htmlify http-keep-alive http-passwd http-password
+   http-user https-only if-modified-since ignore-case ignore-length ignore-tags include-directories inet4-only
+   inet6-only input-file input-metalink iri keep-badhash keep-session-cookies level limit-rate load-cookies
+   local-encoding max-redirect metalink-index metalink-over-http method mirror netrc no no-adjust-extension
+   no-ask-password no-auth-no-challenge no-background no-backup-converted no-backups no-cache no-check-certificate
+   no-clobber no-config no-content-disposition no-content-on-error no-continue no-convert-file-only no-convert-links
+   no-cookies no-debug no-delete-after no-directories no-dns-cache no-follow-ftp no-force-directories no-force-html
+   no-ftp-stmlf no-ftps-clear-data-connection no-ftps-fallback-to-ftp no-ftps-implicit no-ftps-resume-ssl no-glob
+   no-host-directories no-hsts no-html-extension no-htmlify no-http-keep-alive no-https-only no-if-modified-since
+   no-ignore-case no-ignore-length no-inet4-only no-inet6-only no-iri no-keep-badhash no-keep-session-cookies
+   no-metalink-over-http no-mirror no-netrc no-no-clobber no-no-config no-no-parent no-page-requisites no-parent
+   no-passive-ftp no-preserve-permissions no-protocol-directories no-proxy no-quiet no-random-wait no-recursive
+   no-relative no-remove-listing no-report-speed no-restrict-file-names no-retr-symlinks no-retry-connrefused
+   no-retry-on-host-error no-save-headers no-server-response no-show-progress no-span-hosts no-spider
+   no-strict-comments no-timestamping no-trust-server-names no-unlink no-use-server-timestamps no-verbose
+   no-warc-cdx no-warc-compression no-warc-digests no-warc-keep-log no-wdebug no-xattr output-document output-file
+   page-requisites parent passive-ftp password pinnedpubkey post-data post-file prefer-family preferred-location
+   preserve-permissions private-key private-key-type progress protocol-directories proxy proxy-passwd proxy-password
+   proxy-user proxy__compat quiet quota random-file random-wait read-timeout recursive referer regex-type reject
+   reject-regex rejected-log relative remote-encoding remove-listing report-speed restrict-file-names retr-symlinks
+   retry-connrefused retry-on-host-error retry-on-http-error save-cookies save-headers secure-protocol
+   server-response show-progress span-hosts spider start-pos strict-comments timeout timestamping tries
+   trust-server-names unlink use-askpass use-server-timestamps user user-agent verbose version wait waitretry
+   warc-cdx warc-compression warc-dedup warc-digests warc-file warc-header warc-keep-log warc-max-size warc-tempdir
+   wdebug xattr`.split(/\s+/),
 );
 const WGET_UPLOADS: ReadonlySet<string> = new Set(["--post-data", "--post-file", "--body-data", "--body-file"]);
 const NC_SHORT_VALUES = "eGgIiMmOoPpqsTVWwXx";
@@ -1386,6 +1424,10 @@ interface Frame {
   /** What may or may not have changed inside, made unknown when the compound ends. */
   unsure: Set<string>;
   outside: Liveness;
+  /** In an if, while or until condition, where set -e is ignored. */
+  cond: boolean;
+  /** Run in an && or || list but as its last command, or behind a !, so set -e is ignored inside. */
+  exempt: boolean;
 }
 
 interface Shell {
@@ -1421,6 +1463,8 @@ interface Shell {
   scoped: Set<string>[];
   /** What follows the end of each compound in `items`, by where it opens. */
   ends: Map<string, [string, number]>;
+  /** How many function calls being walked run with set -e ignored. */
+  exempt: number;
 }
 
 /** The pipes and redirections around a call at one level: piped in, piped out, and its redirections. */
@@ -1567,7 +1611,8 @@ function openFrame(kind: string, runsHere: Maybe, shell: Shell, head: Item): voi
     status: shell.status, calls: shell.calls.length, pipedIn: shell.openingPipe, pipedOut: endsPiped(head, shell),
     outer: [shell.pipe, shell.start],
     defines: name, head: [shell.at, head], iterates: undefined, repeats: false, forever: false, continued: false, doubt: doubt(shell.pipe), unsure: new Set(),
-    outside: liveness(shell),
+    outside: liveness(shell), cond: kind === "if" || kind === "while" || kind === "until",
+    exempt: exempt(shell) || shell.pipe.negate || endsList(head, shell),
   });
   shell.openingPipe = false;
   shell.start = snapshot(shell); // the body starts a list of its own
@@ -1787,7 +1832,10 @@ function keyword(argv: string[], item: Item, shell: Shell): string[] {
     return rest;
   }
   const top = frames.at(-1);
-  if (top !== undefined) branch(word, top, shell);
+  if (top !== undefined) {
+    branch(word, top, shell);
+    top.cond = word === "elif"; // a then or do starts the body, and an elif another condition
+  }
   pipeline("", runs(shell), shell);
   return rest;
 }
@@ -1979,6 +2027,7 @@ function marker(item: Item, shell: Shell): void {
     } else {
       closeFrame(frame, [frame.pipedIn, item.after === "|", item.io], shell, item.after === "&");
       finish(item.after, shell);
+      if (frame.kind === "(") errexit(item.after, shell); // a subshell that fails is a command that fails
     }
   }
 }
@@ -2004,22 +2053,31 @@ function assign(name: string, args: string[], shell: Shell): void {
 }
 
 const SETS: readonly string[] = ["set", "setopt", "unsetopt"];
-const zshAllexport = (name: string): boolean =>
-  ["allexport", "noallexport"].includes(name.toLowerCase().replaceAll("_", ""));
+const SET_OPTIONS: Record<string, string> = { allexport: ALLEXPORT, errexit: ERREXIT };
+const SET_FLAGS: Record<string, string> = { a: "allexport", e: "errexit" };
 
-/** set -a, -o allexport or a cluster with a turns allexport on, and +a or +o allexport off. setopt, unsetopt and
- *  zsh's spellings such as all_export leave it unknown, as bash has none of them. */
+/** The options a zsh spelling such as all_export or noerrexit names, ignoring case and underscores. */
+function zshOptions(name: string): string[] {
+  const plain = name.toLowerCase().replaceAll("_", "");
+  return Object.entries(SET_OPTIONS)
+    .filter(([option]) => plain === option || plain === `no${option}`)
+    .map(([, key]) => key);
+}
+
+/** set -a or -e, -o allexport or errexit, or a cluster with a or e turns the option on, and the + forms off. setopt,
+ *  unsetopt and zsh's spellings such as all_export leave it unknown, as bash has none of them. */
 function setOptions(name: string, args: string[], shell: Shell): void {
   let i = 0;
   while (name === "set" && /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i] as string)) {
     const arg = args[i++] as string;
     for (const flag of arg.slice(1)) {
-      const option = flag === "o" ? args[i++] ?? "" : flag === "a" ? "allexport" : "";
-      if (option === "allexport") shell.vars[ALLEXPORT] = [arg[0] === "-" ? "1" : "", true];
-      else if (zshAllexport(option)) forget(shell, new Set([ALLEXPORT]));
+      const option = flag === "o" ? args[i++] ?? "" : SET_FLAGS[flag] ?? "";
+      const key = Object.hasOwn(SET_OPTIONS, option) ? SET_OPTIONS[option] : undefined;
+      if (key !== undefined) shell.vars[key] = [arg[0] === "-" ? "1" : "", true];
+      else forget(shell, new Set(zshOptions(option)));
     }
   }
-  if (name !== "set" && args.some(zshAllexport)) forget(shell, new Set([ALLEXPORT]));
+  if (name !== "set") forget(shell, new Set(args.flatMap(zshOptions)));
 }
 
 /** Whether a variable assigned now is exported: always while allexport is on, maybe while it may be, else as before. */
@@ -2298,6 +2356,32 @@ function soften(outside: Liveness, shell: Shell): void {
 
 /** The calls one simple command makes, after applying its cd, export, unset or declaration; a defined function runs
  *  its body with the command's words as its positional parameters. */
+const BASH_SET_FLAGS = "abefhkmnptuvxBCEHPT";
+const BASH_SET_NAMES: ReadonlySet<string> = new Set(
+  `allexport braceexpand emacs errexit errtrace functrace hashall histexpand history ignoreeof interactive-comments
+   keyword monitor noclobber noexec noglob nolog notify nounset onecmd physical pipefail posix privileged verbose vi
+   xtrace`.split(/\s+/),
+);
+
+/** Whether a builtin surely succeeds, with nothing redirected: echo, set with options bash knows, or export, unset or a
+ *  declaration of plain names; local only in a function, as bash rejects it outside one. */
+function succeeds(own: string | undefined, args: string[], io: Item["io"], shell: Shell): boolean {
+  if (io.length > 0 || own === undefined || !["echo", "set", "export", "unset", ...DECLARES].includes(own) ||
+    (own === "local" && shell.floor === undefined)) return false;
+  if (own === "set") {
+    for (let i = 0; /^[-+]/.test(args[i] ?? "") && !["-", "--", "+"].includes(args[i] as string); ) {
+      const arg = args[i++] as string;
+      for (const flag of arg.slice(1)) {
+        if (flag === "o" && BASH_SET_NAMES.has(args[i] ?? "")) i++;
+        else if (!BASH_SET_FLAGS.includes(flag)) return false;
+      }
+    }
+    return true;
+  }
+  const plainName = (arg: string): boolean => /^[A-Za-z_][A-Za-z0-9_]*$/.test(arg.split("=")[0]?.replace(/\+$/, "") ?? "");
+  return own === "echo" || args.filter((arg) => !/^[-+]/.test(arg)).every(plainName);
+}
+
 function simple(words: string[], item: Item, before: string, shell: Shell, depth: number): Call[] {
   const layer: Layer = [before === "|", item.after === "|", item.io];
   const lead = words.findIndex((word) => !isAssignment(word));
@@ -2314,7 +2398,11 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     const outer = shell.args;
     shell.args = argv.slice(argv.indexOf(called as string) + 1);
     const lent = lend(shell, argv.slice(0, argv.indexOf(called as string)));
+    // A body called in an && or || list but as its last command, or behind a !, runs with set -e ignored.
+    const ignored = item.after === "&&" || item.after === "||" || shell.pipe.negate || exempt(shell) ? 1 : 0;
+    shell.exempt += ignored;
     callFunction(known, layer, subshell, shell, depth);
+    shell.exempt -= ignored;
     takeBack(shell, lent);
     shell.args = outer;
     if (!known[1]) return [];
@@ -2332,7 +2420,7 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   const status = shell.status;
   shell.status = name === "true" || own === ":" || own === "break" || own === "continue" ? 0 : name === "false" ? 1
     : argv.length === 1 ? arithmetic(argv[0] as string) : undefined;
-  if (assigns && !substituted) shell.status = 0;
+  if ((assigns || succeeds(own, args, item.io, shell)) && !substituted) shell.status = 0;
   let moved = own === "cd" ? cdTarget(args, parsed.cwd, shell, parsed.env) : undefined;
   if (own === "pushd" || own === "popd") {
     // pushd DIR lands as cd DIR does; popd and any other pushd move by a folder stack this does not keep.
@@ -2354,7 +2442,8 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
   }
   if ((own === "eval" || own === "source" || own === ".") && ((before !== "|" && item.after !== "|") || subshell === undefined)) {
     // Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
-    forget(shell, new Set([...Object.keys(shell.vars).filter((key) => !key.startsWith("\0")), "", ALLEXPORT]));
+    const names = Object.keys(shell.vars).filter((key) => !key.startsWith("\0"));
+    forget(shell, new Set([...names, "", ...Object.values(SET_OPTIONS)]));
     shell.vars[UNKNOWN_ENV] = [undefined, undefined];
     // It may also redefine any function, so each one known may no longer run as written.
     for (const [fname, known] of shell.functions) shell.functions.set(fname, [known[0], true]);
@@ -2459,6 +2548,7 @@ function command(item: Item, shell: Shell, depth: number): Call[] {
     }
   }
   if (argv.length > 0 || closed !== undefined) finish(item.after, shell);
+  if (argv.length > 0) errexit(item.after, shell);
   return calls;
 }
 
@@ -2498,6 +2588,33 @@ function compoundEnds(list: Item[]): Map<string, [string, number]> {
   return ends;
 }
 
+/** Whether the compound opening at `head`, in the item being read, is followed by && or ||. */
+function endsList(head: Item, shell: Shell): boolean {
+  const item = shell.items[shell.at] ?? head;
+  const k = head.kind === "cmd" && item.kind === "cmd" ? item.argv.length - head.argv.length : 0;
+  const after = shell.ends.get(`${shell.at},${k}`)?.[0];
+  return after === "&&" || after === "||";
+}
+
+/** Whether set -e is ignored here: in a condition, or in a compound or function body run in an && or || list but as
+ *  its last command, or behind a !. */
+function exempt(shell: Shell): boolean {
+  return shell.exempt > 0 || shell.frames.some((frame) => frame.exempt || frame.cond);
+}
+
+/** Under set -e, a command that fails where it is not ignored ends the shell or subshell, and one that may fail, or
+ *  fails while set -e may be on, may end it. bash ignores it in a command substitution, and zsh does not. */
+function errexit(after: string, shell: Shell): void {
+  const on = shell.vars[ERREXIT]?.[0] ?? "";
+  if (on === "" || ["&&", "||", "|"].includes(after) || shell.status === 0 || shell.pipe.runs === false ||
+    shell.pipe.negate || exempt(shell)) return;
+  const outside = liveness(shell);
+  jump("exit", [], shell);
+  if (shell.status === undefined || on !== "1" || shell.frames.some((frame) => frame.kind === "$(")) {
+    soften(outside, shell);
+  }
+}
+
 /** Whether the compound opening at `head`, in the item being read, is piped or backgrounded at its end. */
 function endsPiped(head: Item, shell: Shell): boolean {
   const item = shell.items[shell.at] ?? head;
@@ -2516,7 +2633,7 @@ function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv:
     start: [cwd, { ...vars }, new Map()], processEnv, calls: [], openingPipe: false,
     pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false },
     functions: new Map(), callsLeft: MAX_CALLS, items, at: 0, live: true, floor: undefined, args: [...positional],
-    ends: new Map(), names: namedSegments(items), scoped: [],
+    ends: new Map(), names: namedSegments(items), scoped: [], exempt: 0,
   };
   walkItems(items, shell, depth);
   return shell.calls;
@@ -2752,14 +2869,19 @@ function curlDial(url: string, connects: readonly string[], pins: readonly strin
   return [addresses[0] ?? target[0], addresses];
 }
 
-/** A long option as curl up to 8.5 reads it, ignoring case: the exact name, else the one option it starts; "" when it
- *  starts several, which curl rejects. A --no- or --expand- form, or a name that starts none, is kept. */
+/** A long option as getopt and curl up to 8.5 read it: the exact name, else the one option it starts; "" when it starts
+ *  several, which the tool rejects, and the name as written when it starts none. */
+function prefixed(name: string, options: ReadonlySet<string>): string {
+  const word = name.slice(2);
+  const hits = word === "" || options.has(word) ? [word] : [...options].filter((option) => option.startsWith(word));
+  return hits.length === 1 ? `--${hits[0]}` : hits.length > 1 ? "" : name;
+}
+
+/** A curl long option, read ignoring case as curl up to 8.5 does; a --no- or --expand- form must be exact. */
 function curlLong(name: string): string {
   const word = name.slice(2).toLowerCase();
-  if (word === "") return name;
-  if (CURL_LONG_OPTIONS.has(word) || /^(no|expand)-/.test(word)) return `--${word}`;
-  const hits = [...CURL_LONG_OPTIONS].filter((option) => option.startsWith(word));
-  return hits.length === 1 ? `--${hits[0]}` : hits.length > 1 ? "" : name;
+  if (word === "" || /^(no|expand)-/.test(word)) return word === "" ? name : `--${word}`;
+  return prefixed(`--${word}`, CURL_LONG_OPTIONS);
 }
 
 /** The curl request at args[start]: URLs (undefined when curl rejects it), [sends body, -T count, local socket],
@@ -2842,7 +2964,8 @@ function wget(args: string[], proxied = false): Raw[] {
     let value: string | undefined;
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
-      name = eq < 0 ? arg : arg.slice(0, eq);
+      name = prefixed(eq < 0 ? arg : arg.slice(0, eq), WGET_LONG_OPTIONS);
+      if (name === "") return []; // wget rejects an option that starts several, and fetches nothing
       value = eq < 0 ? undefined : arg.slice(eq + 1);
       if (eq < 0 && WGET_LONG_VALUES.has(name)) value = args[i++];
       flags.add(name);

@@ -3825,6 +3825,8 @@ _TRANSFER_CLEAN_ENV = '\0clean'
 _TRANSFER_UNKNOWN_ENV = '\0unknown'
 # Set by set -a: '1' on, '' off, and a substitution when it may be either; plain assignments are then exported.
 _TRANSFER_ALLEXPORT = '\0allexport'
+# Set by set -e, held as allexport is: a command that fails then ends the shell.
+_TRANSFER_ERREXIT = '\0errexit'
 # Stands in for a substitution's output inside a word, so no host is read from it.
 _TRANSFER_SUBSTITUTED = '\0'
 # Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has.
@@ -3937,7 +3939,43 @@ _TRANSFER_WGET_LONG_VALUES = frozenset((
     '--private-key-type --ca-certificate --ca-directory --crl-file --pinnedpubkey --random-file --egd-file --ciphers '
     '--hsts-file --ftp-user --ftp-password --http-user --http-password --warc-file --warc-header --warc-max-size '
     '--warc-dedup --warc-tempdir --local-encoding --remote-encoding --restrict-file-names --prefer-family '
-    '--report-speed --progress --use-askpass').split())
+    '--report-speed --progress --use-askpass --bind-dns-address --dns-servers --dot-style --http-passwd '
+    '--input-metalink --metalink-index --no --preferred-location --proxy-passwd --start-pos').split())
+# GNU wget's long options without the --, each --no- form included, for getopt's reading of a prefix as one option.
+_TRANSFER_WGET_LONG_OPTIONS = frozenset((
+    'accept accept-regex adjust-extension append-output ask-password auth-no-challenge background backup-converted '
+    'backups base bind-address bind-dns-address body-data body-file ca-certificate ca-directory cache certificate '
+    'certificate-type check-certificate ciphers clobber compression config connect-timeout content-disposition '
+    'content-on-error continue convert-file-only convert-links cookies crl-file cut-dirs debug default-page '
+    'delete-after directories directory-prefix dns-cache dns-servers dns-timeout domains dont-remove-listing '
+    'dot-style egd-file exclude-directories exclude-domains execute follow-ftp follow-tags force-directories '
+    'force-html ftp-password ftp-stmlf ftp-user ftps-clear-data-connection ftps-fallback-to-ftp ftps-implicit '
+    'ftps-resume-ssl glob header help host-directories hsts hsts-file html-extension htmlify http-keep-alive '
+    'http-passwd http-password http-user https-only if-modified-since ignore-case ignore-length ignore-tags '
+    'include-directories inet4-only inet6-only input-file input-metalink iri keep-badhash keep-session-cookies level '
+    'limit-rate load-cookies local-encoding max-redirect metalink-index metalink-over-http method mirror netrc no '
+    'no-adjust-extension no-ask-password no-auth-no-challenge no-background no-backup-converted no-backups no-cache '
+    'no-check-certificate no-clobber no-config no-content-disposition no-content-on-error no-continue '
+    'no-convert-file-only no-convert-links no-cookies no-debug no-delete-after no-directories no-dns-cache '
+    'no-follow-ftp no-force-directories no-force-html no-ftp-stmlf no-ftps-clear-data-connection '
+    'no-ftps-fallback-to-ftp no-ftps-implicit no-ftps-resume-ssl no-glob no-host-directories no-hsts '
+    'no-html-extension no-htmlify no-http-keep-alive no-https-only no-if-modified-since no-ignore-case '
+    'no-ignore-length no-inet4-only no-inet6-only no-iri no-keep-badhash no-keep-session-cookies '
+    'no-metalink-over-http no-mirror no-netrc no-no-clobber no-no-config no-no-parent no-page-requisites no-parent '
+    'no-passive-ftp no-preserve-permissions no-protocol-directories no-proxy no-quiet no-random-wait no-recursive '
+    'no-relative no-remove-listing no-report-speed no-restrict-file-names no-retr-symlinks no-retry-connrefused '
+    'no-retry-on-host-error no-save-headers no-server-response no-show-progress no-span-hosts no-spider '
+    'no-strict-comments no-timestamping no-trust-server-names no-unlink no-use-server-timestamps no-verbose '
+    'no-warc-cdx no-warc-compression no-warc-digests no-warc-keep-log no-wdebug no-xattr output-document output-file '
+    'page-requisites parent passive-ftp password pinnedpubkey post-data post-file prefer-family preferred-location '
+    'preserve-permissions private-key private-key-type progress protocol-directories proxy proxy-passwd '
+    'proxy-password proxy-user proxy__compat quiet quota random-file random-wait read-timeout recursive referer '
+    'regex-type reject reject-regex rejected-log relative remote-encoding remove-listing report-speed '
+    'restrict-file-names retr-symlinks retry-connrefused retry-on-host-error retry-on-http-error save-cookies '
+    'save-headers secure-protocol server-response show-progress span-hosts spider start-pos strict-comments timeout '
+    'timestamping tries trust-server-names unlink use-askpass use-server-timestamps user user-agent verbose version '
+    'wait waitretry warc-cdx warc-compression warc-dedup warc-digests warc-file warc-header warc-keep-log '
+    'warc-max-size warc-tempdir wdebug xattr').split())
 _TRANSFER_WGET_UPLOADS = frozenset({'--post-data', '--post-file', '--body-data', '--body-file'})
 _TRANSFER_NC_SHORT_VALUES = frozenset('eGgIiMmOoPpqsTVWwXx')
 _TRANSFER_NC_LONG_VALUES = frozenset((
@@ -5006,7 +5044,8 @@ def _transfer_open(kind: str, runs: Optional[bool], shell: Dict, head: tuple) ->
                    'outer': (shell['pipe'], shell['start']), 'defines': name, 'head': (shell['at'], head),
                    'iterates': None, 'repeats': False, 'forever': False, 'counter': None, 'continued': False,
                    'left': None, 'doubt': _transfer_doubt(shell['pipe']),
-                   'jumped': None,
+                   'jumped': None, 'cond': kind in ('if', 'while', 'until'),
+                   'exempt': _transfer_exempt(shell) or shell['pipe']['negate'] or _transfer_ends_list(head, shell),
                    'unsure': set(), 'outside': _transfer_liveness(shell)})
     shell['start'] = _transfer_snapshot(shell)  # the body starts a list of its own
     _transfer_pipeline('', runs, shell)
@@ -5240,6 +5279,7 @@ def _transfer_keyword(words: List[str], item: tuple, shell: Dict) -> List[str]:
         return rest
     if frames:
         _transfer_branch(keyword, frames[-1], shell)
+        frames[-1]['cond'] = keyword == 'elif'  # a then or do starts the body, and an elif another condition
     _transfer_pipeline('', _transfer_runs(shell), shell)
     return rest
 
@@ -5437,6 +5477,8 @@ def _transfer_marker(item: tuple, shell: Dict) -> None:
             else:
                 _transfer_close(frame, (frame['piped_in'], after == '|', tuple(io or ())), shell, after == '&')
                 _transfer_finish(after, shell)
+                if frame['kind'] == '(':
+                    _transfer_errexit(after, shell)  # a subshell that fails is a command that fails
 
 
 def _transfer_builtin(program: str, args: List[str], shell: Dict) -> None:
@@ -5467,21 +5509,31 @@ def _transfer_assign(program: str, args: List[str], shell: Dict) -> None:
 _TRANSFER_SETS = ('set', 'setopt', 'unsetopt')
 
 
+_TRANSFER_SET_OPTIONS = {'allexport': _TRANSFER_ALLEXPORT, 'errexit': _TRANSFER_ERREXIT}
+_TRANSFER_SET_FLAGS = {'a': 'allexport', 'e': 'errexit'}
+
+
 def _transfer_set(program: str, args: List[str], shell: Dict) -> None:
-    """set -a, -o allexport or a cluster with a turns allexport on, and +a or +o allexport off. setopt, unsetopt and
-    zsh's spellings such as all_export leave it unknown, as bash has none of them."""
+    """set -a or -e, -o allexport or errexit, or a cluster with a or e turns the option on, and the + forms off. setopt,
+    unsetopt and zsh's spellings such as all_export leave it unknown, as bash has none of them."""
     i = 0
     while program == 'set' and i < len(args) and args[i][:1] in ('-', '+') and args[i] not in ('-', '--', '+'):
         arg, i = args[i], i + 1
         for flag in arg[1:]:
-            name = (args[i] if i < len(args) else '') if flag == 'o' else 'allexport' if flag == 'a' else ''
+            name = (args[i] if i < len(args) else '') if flag == 'o' else _TRANSFER_SET_FLAGS.get(flag, '')
             i += flag == 'o'
-            if name == 'allexport':
-                shell['vars'][_TRANSFER_ALLEXPORT] = ('1' if arg[0] == '-' else '', True)
-            elif name.lower().replace('_', '') in ('allexport', 'noallexport'):
-                _transfer_forget(shell, {_TRANSFER_ALLEXPORT})
-    if program != 'set' and any(a.lower().replace('_', '') in ('allexport', 'noallexport') for a in args):
-        _transfer_forget(shell, {_TRANSFER_ALLEXPORT})
+            if name in _TRANSFER_SET_OPTIONS:
+                shell['vars'][_TRANSFER_SET_OPTIONS[name]] = ('1' if arg[0] == '-' else '', True)
+            else:
+                _transfer_forget(shell, set(_transfer_zsh_options(name)))
+    if program != 'set':
+        _transfer_forget(shell, {key for arg in args for key in _transfer_zsh_options(arg)})
+
+
+def _transfer_zsh_options(name: str) -> List[str]:
+    """The options a zsh spelling such as all_export or noerrexit names, ignoring case and underscores."""
+    name = name.lower().replace('_', '')
+    return [key for option, key in _TRANSFER_SET_OPTIONS.items() if name in (option, 'no' + option)]
 
 
 def _transfer_auto_export(shell: Dict, exported) -> Optional[bool]:
@@ -5749,6 +5801,33 @@ def _transfer_take_back(shell: Dict, before: Dict) -> None:
             shell['vars'][name] = entry
 
 
+_TRANSFER_BASH_SET_FLAGS = frozenset('abefhkmnptuvxBCEHPT')
+_TRANSFER_BASH_SET_NAMES = frozenset((
+    'allexport braceexpand emacs errexit errtrace functrace hashall histexpand history ignoreeof interactive-comments '
+    'keyword monitor noclobber noexec noglob nolog notify nounset onecmd physical pipefail posix privileged verbose vi '
+    'xtrace').split())
+
+
+def _transfer_succeeds(builtin: Optional[str], args: List[str], io: list, shell: Dict) -> bool:
+    """Whether a builtin surely succeeds, with nothing redirected: echo, set with options bash knows, or export, unset
+    or a declaration of plain names; local only in a function, as bash rejects it outside one."""
+    if io or builtin not in ('echo', 'set', 'export', 'unset') + _TRANSFER_DECLARES or \
+            (builtin == 'local' and shell['floor'] is None):
+        return False
+    if builtin == 'set':
+        i = 0
+        while i < len(args) and args[i][:1] in ('-', '+') and args[i] not in ('-', '--', '+'):
+            arg, i = args[i], i + 1
+            for flag in arg[1:]:
+                if flag == 'o' and i < len(args) and args[i] in _TRANSFER_BASH_SET_NAMES:
+                    i += 1
+                elif flag not in _TRANSFER_BASH_SET_FLAGS:
+                    return False
+        return True
+    return builtin == 'echo' or all(re.fullmatch(_TRANSFER_NAME, a.partition('=')[0].rstrip('+'))
+                                    for a in args if not a.startswith(('-', '+')))
+
+
 def _transfer_simple(words: List[str], before: str, after: str, io: list, shell: Dict, depth: int) -> List[tuple]:
     """The calls one simple command makes, after applying its cd, export, unset or declaration; a defined function runs
     its body with the command's words as its positional parameters."""
@@ -5764,7 +5843,11 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     if known:
         outer, shell['args'] = shell['args'], words[words.index(name) + 1:]
         lent = _transfer_lend(shell, words[:words.index(name)])
+        # A body called in an && or || list but as its last command, or behind a !, runs with set -e ignored.
+        exempt = after in ('&&', '||') or shell['pipe']['negate'] or _transfer_exempt(shell)
+        shell['exempt'] = shell.get('exempt', 0) + exempt
         _transfer_call(known, layer, subshell, shell, depth)  # looked up first: the body may remove the function
+        shell['exempt'] -= exempt
         _transfer_take_back(shell, lent)
         shell['args'] = outer
         if not known[1]:
@@ -5782,7 +5865,7 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
     status = shell['status']
     shell['status'] = 0 if program == 'true' or builtin in (':', 'break', 'continue') else 1 if program == 'false' else \
         _transfer_arithmetic(words[0]) if len(words) == 1 else None
-    if assigns and not substituted:
+    if (assigns or _transfer_succeeds(builtin, args, io, shell)) and not substituted:
         shell['status'] = 0
     moved = _transfer_cd(args, cwd, shell, given) if builtin == 'cd' else None
     if builtin in ('pushd', 'popd'):
@@ -5805,7 +5888,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         _transfer_forget(shell, _transfer_read_names(program, args))
     if builtin in ('eval', 'source', '.') and ((before != '|' and after != '|') or subshell is None):
         # Their text may set any variable or change folder, so every one, inherited ones included, becomes unknown.
-        _transfer_forget(shell, {n for n in shell['vars'] if not n.startswith('\0')} | {'', _TRANSFER_ALLEXPORT})
+        options = set(_TRANSFER_SET_OPTIONS.values())
+        _transfer_forget(shell, {n for n in shell['vars'] if not n.startswith('\0')} | {''} | options)
         shell['vars'][_TRANSFER_UNKNOWN_ENV] = (None, None)
         # It may also redefine any function, so each one known may no longer run as written.
         shell['functions'] = {name: (known[0], True) for name, known in shell['functions'].items()}
@@ -5899,6 +5983,8 @@ def _transfer_command(item: tuple, shell: Dict, depth: int) -> List[tuple]:
                 _transfer_unsure_calls(shell['calls'], first)  # and what a function it called ran
     if words or closed:
         _transfer_finish(after, shell)
+    if words:
+        _transfer_errexit(after, shell)
     return calls
 
 
@@ -5934,6 +6020,32 @@ def _transfer_ends(items: List[tuple]) -> Dict:
                     break  # the rest is its header
             k += 2 if words[k] == 'function' else 1
     return ends
+
+
+def _transfer_ends_list(head: tuple, shell: Dict) -> bool:
+    """Whether the compound opening at head, in the item being read, is followed by && or ||."""
+    item = shell['items'][shell['at']] if shell['at'] < len(shell['items']) else head
+    k = len(item[1]) - len(head[1]) if head[0] == 'cmd' and item[0] == 'cmd' else 0
+    return shell['ends'].get((shell['at'], k), ('', None))[0] in ('&&', '||')
+
+
+def _transfer_exempt(shell: Dict) -> bool:
+    """Whether set -e is ignored here: in a condition, or in a compound or function body run in an && or || list but
+    as its last command, or behind a !."""
+    return bool(shell.get('exempt')) or any(f['exempt'] or f['cond'] for f in shell['frames'])
+
+
+def _transfer_errexit(after: str, shell: Dict) -> None:
+    """Under set -e, a command that fails where it is not ignored ends the shell or subshell, and one that may fail,
+    or fails while set -e may be on, may end it. bash ignores it in a command substitution, and zsh does not."""
+    errexit = shell['vars'].get(_TRANSFER_ERREXIT, ('', True))[0]
+    if not errexit or after in ('&&', '||', '|') or shell['status'] == 0 or shell['pipe']['runs'] is False or \
+            shell['pipe']['negate'] or _transfer_exempt(shell):
+        return
+    outside = _transfer_liveness(shell)
+    _transfer_jump('exit', [], shell)
+    if shell['status'] is None or errexit != '1' or any(f['kind'] == '$(' for f in shell['frames']):
+        _transfer_soften(outside, shell)
 
 
 def _transfer_ends_piped(head: tuple, shell: Dict) -> bool:
@@ -6195,14 +6307,20 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     return (str(addresses[0]) if addresses else target[0]), addresses
 
 
-def _transfer_curl_long(name: str) -> str:
-    """A long option as curl up to 8.5 reads it, ignoring case: the exact name, else the one option it starts; '' when
-    it starts several, which curl rejects. A --no- or --expand- form, or a name that starts none, is kept."""
-    word = name[2:].lower()
-    if not word or word in _TRANSFER_CURL_LONG_OPTIONS or word.startswith(('no-', 'expand-')):
-        return '--' + word if word else name
-    hits = [option for option in _TRANSFER_CURL_LONG_OPTIONS if option.startswith(word)]
+def _transfer_prefixed(name: str, options: frozenset) -> str:
+    """A long option as getopt and curl up to 8.5 read it: the exact name, else the one option it starts; '' when it
+    starts several, which the tool rejects, and the name as written when it starts none."""
+    word = name[2:]
+    hits = [word] if not word or word in options else [option for option in options if option.startswith(word)]
     return '--' + hits[0] if len(hits) == 1 else '' if hits else name
+
+
+def _transfer_curl_long(name: str) -> str:
+    """A curl long option, read ignoring case as curl up to 8.5 does; a --no- or --expand- form must be exact."""
+    word = name[2:].lower()
+    if not word or word.startswith(('no-', 'expand-')):
+        return '--' + word if word else name
+    return _transfer_prefixed('--' + word, _TRANSFER_CURL_LONG_OPTIONS)
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
@@ -6274,6 +6392,9 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
             break
         if arg.startswith('--'):
             name, eq, value = arg.partition('=')
+            name = _transfer_prefixed(name, _TRANSFER_WGET_LONG_OPTIONS)
+            if not name:
+                return []  # wget rejects an option that starts several, and fetches nothing
             if not eq and name in _TRANSFER_WGET_LONG_VALUES:
                 value, i = (args[i] if i < len(args) else None), i + 1
             flags.add(name)

@@ -7361,6 +7361,508 @@
   {
    "command": "curl https://example.com/a --next --pro x https://8.8.4.4/b",
    "transfer": null
+  },
+  {
+   "command": "set -e; false; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; false || true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; if false; then :; fi; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set +e; false; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; set +e; false; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -ex; false; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -o errexit; false; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; set +o errexit; false; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; true && false; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; false && true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; ! true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; while false; do :; done; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; if true; then false; fi; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; (false); curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; (false; curl -T secret https://192.168.1.1/up)",
+   "transfer": null
+  },
+  {
+   "command": "(set -e); false; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "{ set -e; }; false; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; { false; curl -T secret https://192.168.1.1/up; } || true",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; ! { false; curl -T secret https://192.168.1.1/up; }",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; if { false; curl -T secret https://192.168.1.1/up; }; then :; fi",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; f() { false; curl -T secret https://192.168.1.1/up; }; f || true",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; f() { false; }; f; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; false & curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "setopt errexit; false; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; ls; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -euo pipefail; export X=1; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; local x=1; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; echo $(false; curl -T secret https://192.168.1.1/up)",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --post-f body.txt https://8.8.8.8/up",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --body-d x https://8.8.8.8/up",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --post-file body.txt https://8.8.8.8/up",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --post-f=body.txt https://8.8.8.8/up",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --pro x https://8.8.8.8/up",
+   "transfer": null
+  },
+  {
+   "command": "wget https://8.8.8.8/a --po x",
+   "transfer": null
+  },
+  {
+   "command": "wget --no-prox https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget https://example.com/x",
+   "env": {
+    "https_proxy": "http://proxy.corp:3128"
+   },
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "setopt errexit; false; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; echo $(false; curl https://example.com/x)",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; ls && false; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; false; curl https://example.com/x",
+   "transfer": null
+  },
+  {
+   "command": "set -e; true; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; set -o pipefail; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; set -o bogus; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
   }
  ]
 }
