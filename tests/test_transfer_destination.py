@@ -1352,6 +1352,42 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
                 'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}}
         self._check(hook.build_llm_exchange(stop, post))
 
+    def test_a_slow_lookup_never_holds_up_a_hook_with_a_short_timeout(self):
+        # Augment kills its Stop hook at 10 s and Cursor's has no timeout of ours, so lookups get 3 s and the turn is
+        # still built, with the hosts unresolved.
+        def slow(*args, **kwargs):
+            time.sleep(1.4)
+            raise socket.gaierror('slow')
+
+        os.environ['FAKE_SSH_SLEEP'] = '4'
+        command = 'scp f prod:/tmp; ' + '; '.join(f'curl -T f https://slow{n}.example/up' for n in range(6))
+        augment, cursor = load_module('augment/hooks/unbound.py'), load_module('cursor/unbound.py')
+        roots = {'workspace_roots': [self.repo], 'conversation_id': 'c1', 'generation_id': 'g1'}
+        builders = {
+            'augment': lambda: augment.build_llm_exchange(
+                {'hook_event_name': 'Stop', 'cwd': self.repo, 'conversation_id': 'c1',
+                 'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}},
+                [{'timestamp': '2026-10-22T16:40:00.9Z',
+                  'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'launch-process',
+                            'tool_input': {'command': command}, 'tool_output': ''}}]),
+            'cursor': lambda: cursor.build_llm_exchange([
+                {'timestamp': '2026-10-22T22:09:59+05:30',
+                 'event': {'hook_event_name': 'beforeSubmitPrompt', 'prompt': 'ship it', **roots}},
+                {'timestamp': '2026-10-22T22:10:00.700+05:30',
+                 'event': {'hook_event_name': 'afterShellExecution', 'command': command, 'cwd': self.repo,
+                           'output': '', **roots}},
+                {'timestamp': '2026-10-22T22:10:02+05:30',
+                 'event': {'hook_event_name': 'afterAgentResponse', 'text': 'shipped', **roots}}]),
+        }
+        for agent, build in builders.items():
+            with self.subTest(agent=agent), patch('socket.getaddrinfo', slow):
+                started = time.monotonic()
+                output = build()
+                self.assertLess(time.monotonic() - started, 4.5)
+                entries = [e for e in _tool_entries(output) if e.get('transfer')]
+                self.assertEqual(len(entries), 1, entries)
+                self.assertEqual({e['address'] for e in entries[0]['transfer']['endpoints']}, {'unresolved'})
+
     def test_codex(self):
         hook = load_module('codex/hooks/unbound.py')
         transcript = os.path.join(tempfile.mkdtemp(), 'rollout.jsonl')

@@ -7156,8 +7156,9 @@ def build_llm_exchange(events, api_key=None):
     workspace_roots = []
     read_skills = set()
     root_projects = {}
-    # Every call's input, so a turn that names an ssh config makes no ssh lookups.
-    transfer_state = {'turn_text': _transfer_turn_text(
+    # Every call's input, so a turn that names an ssh config makes no ssh lookups. Cursor's stop hook is registered
+    # with no timeout of ours, so the lookups get 3 s, leaving its default time to build and send the turn.
+    transfer_state = {'budget': 3.0, 'turn_text': _transfer_turn_text(
         {key: (log.get('event') or {}).get(key) for key in ('command', 'file_path', 'tool_input')}
         for log in events if isinstance(log, dict))}
 

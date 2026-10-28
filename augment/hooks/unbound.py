@@ -7137,9 +7137,11 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     cwd = event.get('cwd')
     shell_dir = cwd
     root_projects = {}
-    # Every call's input, so a turn that names an ssh config makes no ssh lookups.
-    transfer_state = {'turn_text': _transfer_turn_text((log['event'] if 'event' in log else log).get('tool_input')
-                                                       for log in post_tool_events if isinstance(log, dict))}
+    # Every call's input, so a turn that names an ssh config makes no ssh lookups. Augment kills its Stop hook at 10 s,
+    # so the lookups get 3 s of it and the turn is still built and sent.
+    transfer_state = {'budget': 3.0, 'turn_text': _transfer_turn_text(
+        (log['event'] if 'event' in log else log).get('tool_input')
+        for log in post_tool_events if isinstance(log, dict))}
 
     read_skills = set()
     mcp_servers = read_augment_mcp_servers(event)
