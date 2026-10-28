@@ -194,7 +194,7 @@ def _endpoint(direction, host, address, resolved=None):
 
 class TheBlockIsSharedTests(unittest.TestCase):
     def _block(self, path):
-        text = (REPO_ROOT / path).read_text()
+        text = (REPO_ROOT / path).read_text(encoding='utf-8')
         self.assertEqual(text.count(START), 1, path)
         self.assertEqual(text.count(END), 1, path)
         return text[text.index(START):text.index(END) + len(END)]
@@ -920,6 +920,23 @@ class SshLookupTests(TransferTestCase):
                     self.assertNotEqual(os.path.realpath(os.path.dirname(program)), os.path.realpath(self.repo))
                     self.assertEqual(hook._transfer('scp f prod:/tmp', self.repo, {})['endpoints'],
                                      [_endpoint('out', 'prod', 'private', '10.0.4.12')])
+
+
+@unittest.skipUnless(os.name == 'nt' and REAL_SSH, 'Windows runs a program in the working folder before PATH')
+class WindowsPlantedSshTests(unittest.TestCase):
+    def test_an_ssh_exe_planted_in_the_working_folder_is_never_run(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, folder, True)
+        Path(folder, 'backup.conf').write_text('Host backup\n  HostName 10.0.4.12\n')
+        # Any other program under ssh's name: it prints no hostname line, so the alias would stay unresolved.
+        shutil.copy(Path(os.environ['SystemRoot'], 'System32', 'whoami.exe'), Path(folder, 'ssh.exe'))
+        here = os.getcwd()
+        os.chdir(folder)
+        self.addCleanup(os.chdir, here)
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                endpoint = hook._transfer('scp -F backup.conf f backup:/tmp', folder, {})['endpoints'][0]
+                self.assertEqual((endpoint['host'], endpoint.get('resolved_host')), ('backup', '10.0.4.12'))
 
 
 class TimeLimitTests(TransferTestCase):
