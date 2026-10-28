@@ -7863,6 +7863,230 @@
      }
     ]
    }
+  },
+  {
+   "command": "bash -ec 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -nc 'curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -ac 'RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a f prod:/srv'",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -c 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -e -c 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -lec 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -ce 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "sh -o errexit -c 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -e +e -c 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -n +n -c 'curl -T secret https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -o noexec -c 'curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "set -e; bash -c 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -a; bash -c 'RSYNC_RSH=\"ssh -o HostName=8.8.8.8\"; rsync -a f prod:/srv'",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -euo pipefail -c 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -euo pipefail -c 'curl -T secret https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -ec 'false'; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "zsh -o err_exit -c 'false; curl https://example.com/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "zsh -o no_exec -c 'curl https://example.com/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "zsh -ec 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "dash -ec 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash - x <<< 'curl -T f https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -e - x <<< 'false; curl -T f https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -- x <<< 'curl -T f https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash -e <<< 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "bash <<< 'false; curl -T secret https://192.168.1.1/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -n <<< 'curl -T secret https://192.168.1.1/up'",
+   "transfer": null
   }
  ]
 }

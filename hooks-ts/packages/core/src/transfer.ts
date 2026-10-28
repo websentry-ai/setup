@@ -2155,16 +2155,42 @@ function declare(name: string, args: string[], shell: Shell): void {
  *  undefined for any other command. */
 function stdinScript(name: string, args: string[]): string[] | undefined {
   if (!SHELLS.has(name)) return undefined;
-  for (let i = 0; i < args.length; ) {
+  const [i, letters, , end] = shellFlags(args);
+  if (letters.has("c")) return undefined;
+  return letters.has("s") || end === "-" ? args.slice(i) : i >= args.length ? [] : undefined; // else a script file
+}
+
+const SHELL_FLAGS: Record<string, string> = { a: "allexport", e: "errexit", n: "noexec" };
+const ZSH_SPELLINGS: Record<string, string> = {
+  allexport: "allexport", noallexport: "allexport", errexit: "errexit", noerrexit: "errexit",
+  exec: "noexec", noexec: "noexec",
+};
+
+/** A shell's startup options as bash reads them: [where its operands start, the option letters given, the options set
+ *  as {name: "1" on, "" off, or a substitution when not known}, the - or -- that ended them, else ""]. */
+function shellFlags(args: string[]): [number, Set<string>, Record<string, string>, string] {
+  const letters = new Set<string>();
+  const options: Record<string, string> = {};
+  let i = 0;
+  while (i < args.length) {
     const arg = args[i++] as string;
-    const option = arg.length > 1 && (arg[0] === "-" || arg[0] === "+");
-    if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++;
-    else if (arg === "-") return args.slice(i);
-    else if (arg === "--") return i < args.length ? undefined : [];
-    else if (option && arg[1] !== "-" && (arg.includes("c") || arg.includes("s"))) return arg.includes("c") ? undefined : args.slice(i);
-    else if (!option) return undefined; // a script file
+    if (arg === "-" || arg === "--") return [i, letters, options, arg];
+    if (arg === "--rcfile" || arg === "--init-file") i++;
+    else if (!(arg.length > 1 && (arg[0] === "-" || arg[0] === "+"))) return [i - 1, letters, options, ""];
+    else if (!arg.startsWith("--")) {
+      for (const flag of arg.slice(1)) {
+        letters.add(flag);
+        // -o and -O take the word after the cluster, as in -eo pipefail.
+        const option = flag === "o" || flag === "O" ? args[i++] ?? "" : SHELL_FLAGS[flag] ?? "";
+        const spelled = Object.hasOwn(ZSH_SPELLINGS, option.toLowerCase().replaceAll("_", ""))
+          ? ZSH_SPELLINGS[option.toLowerCase().replaceAll("_", "")] : undefined;
+        if (flag !== "O" && Object.values(SHELL_FLAGS).includes(option)) options[option] = arg[0] === "-" ? "1" : "";
+        // zsh's spellings, which bash rejects.
+        else if (flag !== "O" && spelled !== undefined) options[spelled] = SUBSTITUTED;
+      }
+    }
   }
-  return [];
+  return [i, letters, options, ""];
 }
 
 /** A script read from stdin: each command's stdin is the script's lines after the one it ends on, which a command
@@ -2222,13 +2248,8 @@ function curlConfig(text: string): string[] {
 /** The command string `sh -c` or `powershell -Command` runs; undefined for any other command. */
 function shellString(name: string, args: string[]): string | undefined {
   if (SHELLS.has(name)) {
-    let hasC = false;
-    for (let i = 0; i < args.length; ) {
-      const arg = args[i++] as string;
-      if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++; // each takes the word after it
-      else if ((arg.startsWith("-") || arg.startsWith("+")) && !arg.startsWith("--") && arg.length > 1) hasC ||= arg.includes("c");
-      else if (!arg.startsWith("--")) return hasC ? arg : undefined;
-    }
+    const [i, letters] = shellFlags(args);
+    return letters.has("c") && i < args.length ? args[i] : undefined;
   }
   if (POWERSHELLS.has(name)) {
     for (let i = 0; i < args.length; i++) {
@@ -2448,7 +2469,17 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     // The string's commands run as the wrapper's user and read its stdin and write its stdout.
     const lexer = new Lexer(inner, depth + 1);
     const read = lexer.read() ?? [];
-    const calls = walk(script === undefined ? read : scriptStdin(inner, lexer, read), parsed.cwd, env, shell.processEnv, depth + 1, positional);
+    // A new shell starts with its own options, not the outer shell's: -e, -a and -n, or their -o names.
+    const options = SHELLS.has(name as string) ? shellFlags(args)[2] : {};
+    const ownKeys = Object.values(SET_OPTIONS);
+    const nested: Env = Object.fromEntries(Object.entries(env).filter(([key]) => !ownKeys.includes(key)));
+    for (const [option, value] of Object.entries(options)) {
+      if (option !== "noexec") nested[SET_OPTIONS[option] as string] = value;
+    }
+    const items = script === undefined ? read : scriptStdin(inner, lexer, read);
+    const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
+    // zsh's spelling of -n, which bash rejects: it may not run them.
+    if (options.noexec !== undefined && options.noexec !== "") markUnsure(calls);
     return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,

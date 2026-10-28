@@ -5670,20 +5670,10 @@ def _transfer_stdin_script(program: str, args: List[str]) -> Optional[List[str]]
     None for any other command."""
     if program not in _TRANSFER_SHELLS:
         return None
-    i = 0
-    while i < len(args):
-        arg, i = args[i], i + 1
-        if arg in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
-            i += 1
-        elif arg == '-':
-            return args[i:]
-        elif arg == '--':
-            return None if i < len(args) else []
-        elif len(arg) > 1 and arg[0] in '-+' and arg[1] != '-' and ('c' in arg or 's' in arg):
-            return None if 'c' in arg else args[i:]
-        elif not (len(arg) > 1 and arg[0] in '-+'):
-            return None  # a script file
-    return []
+    i, letters, _, end = _transfer_shell_flags(args)
+    if 'c' in letters:
+        return None
+    return args[i:] if 's' in letters or end == '-' else [] if i >= len(args) else None  # else a script file
 
 
 def _transfer_script_stdin(lexer, items: List[tuple]) -> List[tuple]:
@@ -5743,18 +5733,42 @@ def _transfer_curl_config(text: str) -> List[str]:
     return args
 
 
+_TRANSFER_SHELL_FLAGS = {'a': 'allexport', 'e': 'errexit', 'n': 'noexec'}
+_TRANSFER_ZSH_SPELLINGS = {'allexport': 'allexport', 'noallexport': 'allexport', 'errexit': 'errexit',
+                           'noerrexit': 'errexit', 'exec': 'noexec', 'noexec': 'noexec'}
+
+
+def _transfer_shell_flags(args: List[str]) -> tuple:
+    """A shell's startup options as bash reads them: (where its operands start, the option letters given, the options
+    set as {name: '1' on, '' off, or a substitution when not known}, the - or -- that ended them, else '')."""
+    i, letters, options = 0, set(), {}
+    while i < len(args):
+        arg, i = args[i], i + 1
+        if arg in ('-', '--'):
+            return i, letters, options, arg
+        if arg in ('--rcfile', '--init-file'):
+            i += 1
+        elif not (len(arg) > 1 and arg[0] in '-+'):
+            return i - 1, letters, options, ''
+        elif not arg.startswith('--'):
+            for flag in arg[1:]:
+                letters.add(flag)
+                # -o and -O take the word after the cluster, as in -eo pipefail.
+                name = (args[i] if i < len(args) else '') if flag in 'oO' else _TRANSFER_SHELL_FLAGS.get(flag, '')
+                i += flag in 'oO'
+                spelled = _TRANSFER_ZSH_SPELLINGS.get(name.lower().replace('_', ''))
+                if flag != 'O' and name in _TRANSFER_SHELL_FLAGS.values():
+                    options[name] = '1' if arg[0] == '-' else ''
+                elif flag != 'O' and spelled:
+                    options[spelled] = _TRANSFER_SUBSTITUTED  # zsh's spellings, which bash rejects
+    return i, letters, options, ''
+
+
 def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
     """The command string `sh -c` or `powershell -Command` runs; None for any other command."""
     if program in _TRANSFER_SHELLS:
-        has_c, i = False, 0
-        while i < len(args):
-            arg, i = args[i], i + 1
-            if arg in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file'):
-                i += 1  # each takes the word after it
-            elif arg[:1] in '-+' and not arg.startswith('--') and len(arg) > 1:
-                has_c = has_c or 'c' in arg
-            elif not arg.startswith('--'):
-                return arg if has_c else None
+        i, letters = _transfer_shell_flags(args)[:2]
+        return args[i] if 'c' in letters and i < len(args) else None
     if program in _TRANSFER_POWERSHELLS:
         for i, arg in enumerate(args):
             name = arg[1:].lower() if arg[:1] in '-/' else ''
@@ -5960,7 +5974,13 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         # The string's commands run as the wrapper's user and read its stdin and write its stdout.
         lexer = _TransferLexer(inner, depth + 1)
         items = _transfer_script_stdin(lexer, lexer.read() or []) if script is not None else lexer.read() or []
-        calls = _transfer_walk(items, cwd, env, depth + 1, positional)
+        # A new shell starts with its own options, not the outer shell's: -e, -a and -n, or their -o names.
+        options = _transfer_shell_flags(args)[2] if program in _TRANSFER_SHELLS else {}
+        nested = {k: v for k, v in env.items() if k not in _TRANSFER_SET_OPTIONS.values()}
+        nested.update((_TRANSFER_SET_OPTIONS[name], value) for name, value in options.items() if name != 'noexec')
+        calls = [] if options.get('noexec') == '1' else _transfer_walk(items, cwd, nested, depth + 1, positional)
+        if options.get('noexec'):
+            _transfer_unsure_calls(calls)  # zsh's spelling of -n, which bash rejects: it may not run them
         calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) + call[6:] for call in calls]
     else:
         calls = [(program, args, env, cwd, other_user, (layer,), False)] if program else []

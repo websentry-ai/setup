@@ -3608,16 +3608,39 @@ function declare(name, args, shell) {
 }
 function stdinScript(name, args) {
   if (!SHELLS.has(name)) return void 0;
-  for (let i = 0; i < args.length; ) {
+  const [i, letters, , end2] = shellFlags(args);
+  if (letters.has("c")) return void 0;
+  return letters.has("s") || end2 === "-" ? args.slice(i) : i >= args.length ? [] : void 0;
+}
+var SHELL_FLAGS = { a: "allexport", e: "errexit", n: "noexec" };
+var ZSH_SPELLINGS = {
+  allexport: "allexport",
+  noallexport: "allexport",
+  errexit: "errexit",
+  noerrexit: "errexit",
+  exec: "noexec",
+  noexec: "noexec"
+};
+function shellFlags(args) {
+  const letters = /* @__PURE__ */ new Set();
+  const options = {};
+  let i = 0;
+  while (i < args.length) {
     const arg = args[i++];
-    const option = arg.length > 1 && (arg[0] === "-" || arg[0] === "+");
-    if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++;
-    else if (arg === "-") return args.slice(i);
-    else if (arg === "--") return i < args.length ? void 0 : [];
-    else if (option && arg[1] !== "-" && (arg.includes("c") || arg.includes("s"))) return arg.includes("c") ? void 0 : args.slice(i);
-    else if (!option) return void 0;
+    if (arg === "-" || arg === "--") return [i, letters, options, arg];
+    if (arg === "--rcfile" || arg === "--init-file") i++;
+    else if (!(arg.length > 1 && (arg[0] === "-" || arg[0] === "+"))) return [i - 1, letters, options, ""];
+    else if (!arg.startsWith("--")) {
+      for (const flag of arg.slice(1)) {
+        letters.add(flag);
+        const option = flag === "o" || flag === "O" ? args[i++] ?? "" : SHELL_FLAGS[flag] ?? "";
+        const spelled = Object.hasOwn(ZSH_SPELLINGS, option.toLowerCase().replaceAll("_", "")) ? ZSH_SPELLINGS[option.toLowerCase().replaceAll("_", "")] : void 0;
+        if (flag !== "O" && Object.values(SHELL_FLAGS).includes(option)) options[option] = arg[0] === "-" ? "1" : "";
+        else if (flag !== "O" && spelled !== void 0) options[spelled] = SUBSTITUTED;
+      }
+    }
   }
-  return [];
+  return [i, letters, options, ""];
 }
 function scriptStdin(text, lexer, list) {
   return list.map((item) => {
@@ -3663,13 +3686,8 @@ function curlConfig(text) {
 }
 function shellString(name, args) {
   if (SHELLS.has(name)) {
-    let hasC = false;
-    for (let i = 0; i < args.length; ) {
-      const arg = args[i++];
-      if (["-o", "+o", "-O", "+O", "--rcfile", "--init-file"].includes(arg)) i++;
-      else if ((arg.startsWith("-") || arg.startsWith("+")) && !arg.startsWith("--") && arg.length > 1) hasC ||= arg.includes("c");
-      else if (!arg.startsWith("--")) return hasC ? arg : void 0;
-    }
+    const [i, letters] = shellFlags(args);
+    return letters.has("c") && i < args.length ? args[i] : void 0;
   }
   if (POWERSHELLS.has(name)) {
     for (let i = 0; i < args.length; i++) {
@@ -3852,7 +3870,15 @@ function simple(words2, item, before, shell, depth) {
   if (inner !== void 0) {
     const lexer = new Lexer(inner, depth + 1);
     const read = lexer.read() ?? [];
-    const calls = walk(script === void 0 ? read : scriptStdin(inner, lexer, read), parsed.cwd, env, shell.processEnv, depth + 1, positional);
+    const options = SHELLS.has(name) ? shellFlags(args)[2] : {};
+    const ownKeys = Object.values(SET_OPTIONS);
+    const nested = Object.fromEntries(Object.entries(env).filter(([key]) => !ownKeys.includes(key)));
+    for (const [option, value] of Object.entries(options)) {
+      if (option !== "noexec") nested[SET_OPTIONS[option]] = value;
+    }
+    const items = script === void 0 ? read : scriptStdin(inner, lexer, read);
+    const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
+    if (options.noexec !== void 0 && options.noexec !== "") markUnsure(calls);
     return replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
