@@ -810,7 +810,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if gateway_url:
             # Recorded so teardown can recognise a custom endpoint as ours later; without
             # it a --gateway-url install leaves its own routing behind.
@@ -1171,6 +1172,25 @@ def clear_setup() -> bool:
     return not teardown_failed
 
 
+def _unbound_gateway_registered(managed_dir) -> Optional[bool]:
+    """True when the managed settings on this device are the ones this setup wrote,
+    False when they are somebody else's or absent, None when one was unreadable."""
+    if _dropin_present(managed_dir):
+        return True
+    flat = managed_dir / "managed-settings.json"
+    if not flat.exists():
+        return False
+    try:
+        settings = json.loads(flat.read_text(encoding="utf-8"))
+    except OSError as e:
+        debug_print(f"Could not read {flat}: {e}")
+        return None
+    if _managed_settings_is_exactly_ours(settings, managed_dir):
+        return True
+    return isinstance(settings, dict) and _is_unbound_key_helper_setting(
+        settings.get("apiKeyHelper"), managed_dir)
+
+
 def detect_install_state() -> Optional[str]:
     """MDM gateway install state, inspected before this run reasserts it.
     'fresh' = the managed settings this script deploys are absent;
@@ -1179,11 +1199,15 @@ def detect_install_state() -> Optional[str]:
     env block alone). None on any error."""
     try:
         managed_dir = get_managed_settings_dir()
-        config_present = (
-            (managed_dir / "managed-settings.json").exists()
-            or (managed_dir / "managed-settings.d" / "unbound.json").exists()
-        )
-        if not config_present:
+        try:
+            registered = _unbound_gateway_registered(managed_dir)
+        except ValueError:
+            # Claude Code refuses a config it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return "tampered"
+        if registered is None:
+            return None
+        if not registered:
             return "fresh"
         if platform.system().lower() == "windows":
             return "persisted"
@@ -1225,6 +1249,27 @@ def _stdout_never_raises() -> None:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError, OSError):
             pass
+
+
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.codex", "~/.cursor", "~/.copilot", "~/.augment",
+    "/etc/codex", "%ProgramData%/OpenAI/Codex", "/Library/Application Support/Cursor", "/etc/cursor",
+    "%ProgramData%/Cursor", "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
+            return True
+    return False
 
 
 def main():
@@ -1309,8 +1354,14 @@ def main():
 
     print("\n📝 Setting environment variables system-wide...")
     # Remove leftover hooks setup env var
-    for username, home_dir in get_all_user_homes():
+    user_homes = get_all_user_homes()
+    # Windows holds one machine-wide token, so it stays while any user still has a hook.
+    keep_machine_token = platform.system().lower() == "windows" and any(
+        device_token_in_use(home_dir) for _, home_dir in user_homes)
+    for username, home_dir in user_homes:
         remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY")
+        if not keep_machine_token and not device_token_in_use(home_dir):
+            remove_env_var_from_user(username, home_dir, "UNBOUND_DEVICE_TOKEN")
 
     success, env_changed = set_env_var_system_wide("UNBOUND_API_KEY", claude_api_key)
     if not success:

@@ -6,7 +6,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
@@ -50,7 +50,7 @@ SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'codex'
-SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CODEX_API_KEY'
+SKILL_POLICY_API_KEY_ENV = 'UNBOUND_DEVICE_TOKEN'
 CODEX_SELECTED_SKILL_KIND = 'skills.selected_skill_instructions'
 CODEX_SELECTED_SKILL_NAME_RE = re.compile(r'<name>\s*([^<\s][^<]*?)\s*</name>')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
@@ -63,6 +63,10 @@ PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
+
+# Two attempts plus the inter-attempt sleep stay under the host's hook timeout, so the
+# fail-open return still runs when the gateway never answers.
+PRETOOL_ATTEMPTS = 2
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
@@ -1280,7 +1284,7 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    for attempt in range(3):
+    for attempt in range(PRETOOL_ATTEMPTS):
         try:
             result = subprocess.run(
                 ["curl", "-fsSL", "-X", "POST",
@@ -1307,7 +1311,7 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         except Exception as e:
             log_error(f"Hook API error: {str(e)}", 'api_call')
 
-        if attempt < 2:
+        if attempt < PRETOOL_ATTEMPTS - 1:
             time.sleep(0.5)
 
     return {}
@@ -3108,30 +3112,52 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
     return False
 
 
+def _log_event_name(log: Dict) -> Optional[str]:
+    return (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+
+
+def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach the prompts of each session's turn still in progress (from its first prompt after its latest Stop):
+    trimming them away leaves the turn's Stop nothing to send. A turn idle for a day is let go."""
+    sessions = [log.get('session_id') or (log.get('event') or {}).get('session_id') for log in logs]
+    opened, last_seen = {}, {}
+    for index, (log, session_id) in enumerate(zip(logs, sessions)):
+        name = _log_event_name(log)
+        last_seen[session_id] = log.get('timestamp')
+        if name == 'Stop':
+            opened.pop(session_id, None)
+        elif name == 'UserPromptSubmit':
+            opened.setdefault(session_id, index)
+    stale = (datetime.utcnow() - timedelta(days=1)).isoformat() + 'Z'
+    keep = {id(log) for log in kept}
+    for session_id, start in opened.items():
+        if not _ts_lt(last_seen[session_id], stale):
+            keep.update(id(logs[i]) for i in range(start, len(logs))
+                        if sessions[i] == session_id and _log_event_name(logs[i]) == 'UserPromptSubmit')
+    return [log for log in logs if id(log) in keep]
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
-    session_order = []
-    seen_sessions = set()
+    # By latest activity, not first appearance: an older terminal can still be the busy one.
+    last_seen = {}
+    for index, log in enumerate(logs):
+        if log.get('session_id'):
+            last_seen[log['session_id']] = index
 
-    for log in logs:
-        session_id = log.get('session_id')
-        if session_id and session_id not in seen_sessions:
-            session_order.append(session_id)
-            seen_sessions.add(session_id)
-
-    if len(session_order) > 1:
-        most_recent_session = session_order[-1]
+    if len(last_seen) > 1:
+        most_recent_session = max(last_seen, key=last_seen.get)
         kept_logs = [
             log for log in logs
             if log.get('session_id') == most_recent_session
-        ]
-        save_logs(kept_logs)
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        ][-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept_logs = logs[-AUDIT_LOG_TOTAL_LIMIT:]
+    save_logs(_keep_open_turns(logs, kept_logs))
 
 
 def _strip_git_suffix(segment: str) -> str:
@@ -3652,7 +3678,7 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
         if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
-        api_key = _cached_api_key or os.getenv('UNBOUND_CODEX_API_KEY')
+        api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
@@ -8059,10 +8085,11 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key")
+        # api_key first: every writer still sets it, and older writers set only it.
+        api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
         backend_url = unbound_config.get("base_url")
         if not (api_key and backend_url):
-            api_key = _machine_env('UNBOUND_CODEX_API_KEY')
+            api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CODEX_API_KEY')
             backend_url = _machine_env('UNBOUND_BACKEND_URL')
             if backend_url and not backend_url.startswith("https://"):
                 log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
@@ -8268,11 +8295,12 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("api_key")
+            # api_key first: every writer still sets it, and older writers set only it.
+            api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
             backend_url = unbound_config.get("base_url")
             if not (api_key and backend_url):
                 # Resolve as a unit -- never pair a config field with an env field.
-                api_key = _machine_env('UNBOUND_CODEX_API_KEY')
+                api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CODEX_API_KEY')
                 backend_url = _machine_env('UNBOUND_BACKEND_URL')
                 if backend_url and not backend_url.startswith("https://"):
                     log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')
@@ -8341,12 +8369,21 @@ def _dispatch_discovery() -> None:
 
 
 def get_api_key():
-    return os.getenv('UNBOUND_CODEX_API_KEY')
+    key = os.getenv('UNBOUND_DEVICE_TOKEN') or os.getenv('UNBOUND_CODEX_API_KEY')
+    if key:
+        return key
+    try:
+        with UNBOUND_CONFIG_PATH.open('r', encoding='utf-8') as f:
+            cfg = json.loads(f.read())
+        # api_key first: every writer still sets it, and older writers set only it.
+        return cfg.get('api_key') or cfg.get('device_token')
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def main():
     global _cached_api_key
-    api_key = os.getenv('UNBOUND_CODEX_API_KEY')
+    api_key = get_api_key()
     _cached_api_key = api_key
 
     if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':

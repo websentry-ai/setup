@@ -30,6 +30,7 @@ def _run(cmd, payload, home, extra_env=None, stdin_close=False):
     # never talk to the real gateway.
     env.setdefault("UNBOUND_GATEWAY_URL", "http://127.0.0.1:9")
     env.pop("UNBOUND_HOOK_FROZEN", None)
+    env.pop("UNBOUND_DEVICE_TOKEN", None)
     env.pop("UNBOUND_CLAUDE_API_KEY", None)
     env.pop("UNBOUND_CURSOR_API_KEY", None)
     env.pop("UNBOUND_COPILOT_API_KEY", None)

@@ -1893,3 +1893,18 @@ def test_setup_bounds_the_module_s_own_user_calls_until_the_report(env, monkeypa
     monkeypatch.setattr(m, "run_backfill", lambda *a, **k: seen.append(m._RUN_AS_USER_TIMEOUT))
     assert setup_cmd.run(["--api-key", "admin-key", "--backfill"]) == 0
     assert seen == [setup_cmd._USER_CHECK_TIMEOUT, None]
+
+
+def test_clear_command_removes_the_shared_token(env, monkeypatch):
+    """Each tool's clear keeps the token while another tool's hook file remains;
+    the sweep deletes those files, so the full clear must drop it at the end."""
+    monkeypatch.setattr(env["modules"]["copilot"], "managed_settings_path",
+                        lambda: env["tmp"] / "managed-copilot" / "managed-settings.json")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    removed = []
+    for m in env["modules"].values():
+        monkeypatch.setattr(m, "device_token_in_use", lambda home_dir: True, raising=False)
+        monkeypatch.setattr(m, "remove_env_var_from_user",
+                            lambda u, h, name: removed.append(name) or "cleared")
+    assert clear_cmd.run([]) == 0
+    assert "UNBOUND_DEVICE_TOKEN" in removed

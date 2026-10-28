@@ -667,7 +667,7 @@ class TestSkillsSyncDispatchTarget(unittest.TestCase):
 
         argv, kwargs = popen.call_args[0][0], popen.call_args[1]
         self.assertNotIn("test-key", argv)
-        self.assertEqual(kwargs["env"]["UNBOUND_CLAUDE_API_KEY"], "test-key")
+        self.assertEqual(kwargs["env"]["UNBOUND_DEVICE_TOKEN"], "test-key")
 
     def test_the_child_is_detached_on_this_platform(self):
         with patch.object(unbound.subprocess, "Popen") as popen:

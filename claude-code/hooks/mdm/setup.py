@@ -11,7 +11,9 @@ import subprocess
 import signal
 import threading
 import hashlib
+import bisect
 import json
+from datetime import datetime, timezone
 import shlex
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -27,13 +29,21 @@ MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
 BACKFILL_TOOL_TYPE = "claude-code"
-BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
+# A transcript over one chunk is read a slice at a time (_backfill_read_slice), so this only stops a runaway file.
+BACKFILL_MAX_FILE_BYTES = 1024 ** 3
+# Lines read from one subagent file, or scanned for a transcript's session id.
 BACKFILL_MAX_LINES_PER_FILE = 50000
+# Usage records of the subagents one session ran; the server reads at most this many.
+BACKFILL_MAX_SUBAGENT_REPLIES = 50000
+# The server parses at most this many entries of a session or slice, so a slice never holds more.
+BACKFILL_MAX_ENTRIES_PER_SLICE = 10000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_BATCH_BYTES = 32 * 1024 * 1024  # transcript bytes held in memory per batch
 BACKFILL_MAX_BATCHES_PER_HOME = 200
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+# Where each transcript too big to read whole stopped, beside the walk's state, which other writes replace.
+BACKFILL_RESUME_FILE = '.unbound_backfill_resume'
 _SCRIPT_START = time.time()
 # All measured from script start. No new batch starts unless it can land before the
 # soft stop (margin: 90s or 1.5x the slowest batch so far); the hard kill backs it up
@@ -907,7 +917,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
@@ -1347,18 +1358,36 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
 
 
 def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
-    """A hook command is ours if it points at OUR managed python hook
-    (script_path) or the /opt/unbound hook binary. Both forms are recognized so a
-    binary-install hook is stripped on clear instead of being orphaned. Matches the
-    specific script path (NOT a bare 'unbound.py' substring) and requires both the
-    install prefix and the binary name, so a foreign hook in a shared/Enterprise
-    config that merely references some other unbound.py / mentions /opt/unbound/
-    isn't stripped."""
-    # A non-string command is never ours; matching one raises and would abandon
-    # every remaining entry in the file.
-    if not cmd or not isinstance(cmd, str):
-        return False
-    return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
+    """Ours when the command RUNS our managed hook or the /opt/unbound binary, not
+    merely mentions one: a decoy like '/bin/true # <our path>' is not ours."""
+    return _command_targets_hook(cmd, script_path)
+
+
+def _unbound_hooks_registered(settings_candidates, script_path) -> Optional[bool]:
+    """True when one of these configs registers OUR hook on any event. Any event, not
+    the enforcing one alone: the install writes them together, and under-matching
+    reports 'fresh', which the backend counts as a removal, so demanding one named
+    event would accuse every device whose tool ships a different event set. False when
+    none does, None when one could not be read. Unparseable raises, because the tool
+    refuses such a file too. Same rule the uninstall strips by."""
+    for settings_path in settings_candidates:
+        if not settings_path.exists():
+            continue
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except OSError as e:
+            debug_print(f"Could not read {settings_path}: {e}")
+            return None
+        events = settings.get("hooks") if isinstance(settings, dict) else None
+        for entries in events.values() if isinstance(events, dict) else ():
+            for item in entries if isinstance(entries, list) else []:
+                hooks = item.get("hooks") if isinstance(item, dict) else None
+                for hook in hooks if isinstance(hooks, list) else []:
+                    if isinstance(hook, dict) and _is_unbound_hook_command(
+                            hook.get("command", ""), script_path):
+                        return True
+    return False
 
 
 def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path,
@@ -1503,6 +1532,50 @@ def clear_managed_hooks() -> str:
         return "failed"
 
 
+def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) -> bool:
+    """Removes var_name for every user except those keep() names; False when any removal failed."""
+    if platform.system().lower() == "windows":
+        # One machine-wide value: it stays if any user still needs it.
+        # A planted hook file only keeps a value every user can already read; unbound-hook clear drops it regardless.
+        if keep(None) or any(keep(home_dir) for _, home_dir in get_all_user_homes()):
+            return True
+        return remove_env_var_on_windows_machine(var_name) in ("cleared", "not_found")
+    ok = True
+    for username, home_dir in get_all_user_homes():
+        if not keep(home_dir) and remove_env_var_from_user(username, home_dir, var_name) not in ("cleared", "not_found"):
+            ok = False
+    return ok
+
+
+# Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
+def remove_legacy_key_env() -> None:
+    try:
+        _remove_env_var_for_all_users("UNBOUND_CLAUDE_API_KEY")
+    except Exception:
+        pass
+
+
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.codex", "~/.cursor", "~/.copilot", "~/.augment",
+    "/etc/codex", "%ProgramData%/OpenAI/Codex", "/Library/Application Support/Cursor", "/etc/cursor",
+    "%ProgramData%/Cursor", "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
+            return True
+    return False
+
+
 def clear_setup() -> bool:
     print("=" * 60)
     print("Claude Code Hooks - Clearing MDM Setup")
@@ -1554,10 +1627,156 @@ def clear_setup() -> bool:
         teardown_failed = True
         print(f"Failed to clear managed hooks in {managed_dir}")
 
+    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
+        teardown_failed = True
+        print("Failed to clear UNBOUND_DEVICE_TOKEN")
+
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
     return not teardown_failed
+
+
+def _backfill_ts(value):
+    """A transcript timestamp as an aware UTC datetime, or None. Never raises: like the live hook, it takes ISO
+    strings with or without an offset and epoch seconds or milliseconds."""
+    try:
+        if isinstance(value, str):
+            at = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            return at.replace(tzinfo=timezone.utc) if at.tzinfo is None else at.astimezone(timezone.utc)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return datetime.fromtimestamp(value / 1000.0 if value > 10_000_000_000 else value, timezone.utc)
+    except (ValueError, OverflowError, OSError):
+        pass
+    return None
+
+
+def _backfill_usage_total(usage: Dict) -> int:
+    """A reply's tokens summed as the live hook sums them: cache writes from their TTL split when present."""
+    total = 0
+    for key in ('input_tokens', 'output_tokens', 'cache_read_input_tokens'):
+        try:
+            total += int(usage.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
+    split = usage.get('cache_creation')
+    keys, source = ((('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens'), split) if isinstance(split, dict)
+                    else (('cache_creation_input_tokens',), usage))
+    for key in keys:
+        try:
+            total += int(source.get(key) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
+def _backfill_usage_record(entry) -> Optional[Dict]:
+    """A subagent line's reply usage without its content, unwrapping a progress line."""
+    if not isinstance(entry, dict):
+        return None
+    data = entry.get('data') if isinstance(entry.get('data'), dict) else {}
+    line = data.get('message') if isinstance(data.get('message'), dict) else entry
+    msg = line.get('message') if isinstance(line.get('message'), dict) else {}
+    reply_id, usage = msg.get('id'), msg.get('usage')
+    if line is entry and entry.get('type') != 'assistant':
+        return None
+    if not isinstance(reply_id, str) or not reply_id or not isinstance(usage, dict):
+        return None
+    return {'type': 'assistant', 'timestamp': line.get('timestamp'), 'isSidechain': line.get('isSidechain') is True,
+            'message': {'id': reply_id, 'usage': usage}}
+
+
+def _backfill_keep(kept, usage, sidechain) -> bool:
+    """Whether a copy replaces the one kept: a copy outside a subagent wins, then the largest. The hook's rule."""
+    return (kept is None or (kept[1] and not sidechain)
+            or (kept[1] == sidechain and _backfill_usage_total(usage) > _backfill_usage_total(kept[0])))
+
+
+def _backfill_advisors(usage: Dict) -> List[Dict]:
+    iterations = usage.get('iterations')
+    return [it for it in iterations if isinstance(it, dict) and it.get('type') == 'advisor_message'
+            and it.get('model')] if isinstance(iterations, list) else []
+
+
+def _backfill_subagent_usage(transcript_path: Path) -> List[Dict]:
+    """One usage record per reply of the subagents this session ran, which Claude Code writes under subagents/
+    beside the transcript: the reply's first line's time and its largest copy, as the live hook bills it. The
+    server bills each to the turn that ran it. No content leaves the machine."""
+    subdir = None
+    for candidate in (transcript_path.with_suffix('') / 'subagents', transcript_path.parent / 'subagents'):
+        if candidate.is_dir() and not _is_reparse_point(candidate) and not _is_reparse_point(candidate.parent):
+            subdir = candidate
+            break
+    if subdir is None:
+        return []
+    # reply id -> (usage, sidechain) for the reply and each advisor turn in it, kept apart as the hook keeps them.
+    replies, advisors, first = {}, {}, {}
+    for path in sorted(_backfill_jsonl_files(subdir)):
+        try:
+            if not path.is_file() or path.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+                continue
+            with open(path, 'r', encoding='utf-8') as f:
+                # Bounded pieces: a line longer than a chunk is never held whole, and its pieces don't parse.
+                for lineno, line in enumerate(iter(lambda: f.readline(BACKFILL_CHUNK_BYTES), '')):
+                    if lineno >= BACKFILL_MAX_LINES_PER_FILE:
+                        break
+                    try:
+                        record = _backfill_usage_record(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+                    if record is None:
+                        continue
+                    reply_id, at = record['message']['id'], _backfill_ts(record['timestamp'])
+                    if reply_id not in replies and len(replies) >= BACKFILL_MAX_SUBAGENT_REPLIES:
+                        continue
+                    if at is not None and (reply_id not in first or at < first[reply_id][0]):
+                        first[reply_id] = (at, record['timestamp'])
+                    usage, sidechain = record['message']['usage'], record['isSidechain']
+                    if _backfill_keep(replies.get(reply_id), usage, sidechain):
+                        replies[reply_id] = (usage, sidechain)
+                    parts = advisors.setdefault(reply_id, {})
+                    for index, advisor in enumerate(_backfill_advisors(usage)):
+                        if _backfill_keep(parts.get(index), advisor, sidechain):
+                            parts[index] = (advisor, sidechain)
+        except (OSError, UnicodeDecodeError):
+            continue
+    records = []
+    for reply_id, (usage, sidechain) in replies.items():
+        parts = advisors.get(reply_id)
+        if parts:
+            usage = dict(usage, iterations=[parts[i][0] for i in sorted(parts)])
+        at, stamp = first.get(reply_id, (None, None))
+        if at is not None and not isinstance(stamp, str):
+            stamp = at.isoformat().replace('+00:00', 'Z')
+        records.append({'type': 'assistant', 'timestamp': stamp, 'isSidechain': sidechain,
+                        'message': {'id': reply_id, 'usage': usage}})
+    epoch = datetime.fromtimestamp(0, timezone.utc)
+    records.sort(key=lambda r: (first.get(r['message']['id']) is None,
+                                first.get(r['message']['id'], (epoch,))[0]))
+    return records
+
+
+def _backfill_subagent_owners(entries: List[Dict], boundaries: List[int], records: List[Dict]) -> List[int]:
+    """The entry each subagent reply rides with when a session is sliced: the last line of the first exchange that
+    ends at or after the reply's first line, the turn the server bills it to. A later reply rides with the last."""
+    starts = sorted(set([0] + [b for b in boundaries if b > 0]))
+    ends, lasts, latest = [], [], None
+    for k, start in enumerate(starts):
+        stop = starts[k + 1] if k + 1 < len(starts) else len(entries)
+        for entry in entries[start:stop]:
+            if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant', 'progress'):
+                at = _backfill_ts(entry.get('timestamp'))
+                if at is not None and (latest is None or at > latest):
+                    latest = at
+        if latest is not None:
+            ends.append(latest)
+            lasts.append(stop - 1)
+    owners = []
+    for record in records:
+        at = _backfill_ts(record.get('timestamp'))
+        k = bisect.bisect_left(ends, at) if at is not None else len(ends)
+        owners.append(lasts[k] if k < len(lasts) else len(entries) - 1)
+    return owners
 
 
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
@@ -1570,13 +1789,14 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for lineno, line in enumerate(f):
-                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
-                    break
+                # The id is looked for only as far as _backfill_first_session_id looks; the content is read whole.
+                if not session_id and lineno >= BACKFILL_MAX_LINES_PER_FILE:
+                    return None
                 if not line.strip():
                     continue
                 try:
                     entry = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     continue
                 entries.append(entry)
                 if not session_id:
@@ -1590,7 +1810,15 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 
     if not session_id or not entries:
         return None
-    return {'session_id': session_id, 'entries': entries}
+    session = {'session_id': session_id, 'entries': entries}
+    try:
+        subagents = _backfill_subagent_usage(transcript_path)
+    except Exception:
+        # The session still uploads without its subagents rather than not at all.
+        subagents = []
+    if subagents:
+        session['subagents'] = subagents
+    return session
 
 
 def _backfill_state_path(home: Path) -> Path:
@@ -1645,17 +1873,52 @@ def _backfill_walk_start(state: Dict[str, object], force_epoch, force_days) -> T
     return resume, False
 
 
-def _backfill_write_state_text(home: Path, text: str) -> None:
+def _backfill_write_state_text(home: Path, text: str, name: str = BACKFILL_STATE_FILE) -> None:
     # Write via temp + atomic replace so an overlapping cron run never reads a
     # half-written state.
     try:
-        path = _backfill_state_path(home)
+        path = _backfill_state_path(home).with_name(name)
+        # Checked again at the write, before and after creating hooks: either folder can be linked by now.
+        if _backfill_root_is_linked(home / '.claude', path.parent):
+            debug_print("backfill state not written: .claude or its hooks folder is a link")
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
+        if _backfill_root_is_linked(home / '.claude', path.parent):
+            debug_print("backfill state not written: .claude or its hooks folder is a link")
+            return
         tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
         tmp.write_text(text)
         os.replace(tmp, path)
     except OSError as e:
         debug_print(f"failed to persist backfill state: {e}")
+
+
+def _backfill_read_file_resume(home: Path, session: Dict, force_epoch) -> Optional[Dict]:
+    """Where this transcript's next slice starts, saved by an earlier run, or None to send it from the top. A point
+    saved for another file at this path, or outside the forced walk under way, is not used."""
+    try:
+        saved = json.loads(_backfill_state_path(home).with_name(BACKFILL_RESUME_FILE).read_text())
+        saved = saved[session['transcript_path']]
+        if (saved['file_id'] == session['file_id'] and (force_epoch is None or saved['force_epoch'] == force_epoch)
+                and all(isinstance(saved[k], int) and not isinstance(saved[k], bool) and saved[k] >= 0
+                        for k in ('offset', 'base'))):
+            return {k: saved[k] for k in ('offset', 'base', 'latest')}
+    except Exception:
+        pass
+    return None
+
+
+def _backfill_write_file_resume(home: Path, session: Dict, resume: Dict, force_epoch, forced: bool = False) -> None:
+    if forced and force_epoch is None:
+        force_epoch = _backfill_read_state(home)['force_epoch']  # config miss mid-walk: keep the latch
+    try:
+        saved = json.loads(_backfill_state_path(home).with_name(BACKFILL_RESUME_FILE).read_text())
+    except (OSError, ValueError):
+        saved = {}
+    # Transcripts deleted since are dropped, so it holds only the big transcripts still on disk.
+    saved = {p: r for p, r in saved.items() if os.path.isfile(p)} if isinstance(saved, dict) else {}
+    saved[session['transcript_path']] = dict(resume, file_id=session['file_id'], force_epoch=force_epoch)
+    _backfill_write_state_text(home, json.dumps(saved), BACKFILL_RESUME_FILE)
 
 
 def _backfill_write_cutoff(home: Path, ts: float) -> None:
@@ -1674,22 +1937,103 @@ def _backfill_write_progress(home: Path, cursor: float, force_epoch: Optional[fl
          'completed_at': state['completed_at']}))
 
 
-def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
-    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
-    for p in root.rglob('*.jsonl'):
+def _backfill_jsonl_files(root: Path, skip_dirs=()):
+    """Every .jsonl under root, never entering or yielding a symlink or Windows junction."""
+    for dirpath, dirnames, filenames in os.walk(root):
+        base = Path(dirpath)
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not _is_reparse_point(base / d)]
+        for name in filenames:
+            if name.endswith('.jsonl') and not _is_reparse_point(base / name):
+                yield base / name
+
+
+def _backfill_root_is_linked(*paths: Path) -> bool:
+    """On Windows a linked .claude or projects folder can point into another profile, so it is not walked."""
+    return platform.system().lower() == "windows" and any(_is_reparse_point(p) for p in paths)
+
+
+# Size bands for transcripts over the cap, by upper bound, so a raised cap can be priced from real sizes.
+BACKFILL_SKIP_BANDS = (('under_100mb', 100 * 1024 * 1024), ('under_250mb', 250 * 1024 * 1024),
+                       ('under_500mb', 500 * 1024 * 1024), ('under_1gb', 1024 ** 3), ('1gb_or_more', None))
+
+
+def _backfill_empty_stats() -> Dict:
+    return {'files_seen': 0, 'unreadable': 0,
+            'skipped_over_cap': {'count': 0, 'largest_bytes': 0, 'total_bytes': 0,
+                                 'by_size': {name: {'count': 0, 'total_bytes': 0} for name, _ in BACKFILL_SKIP_BANDS}}}
+
+
+# What this run could not send, for the server to report per device; MDM sends it once, after its uploads.
+_backfill_uploader_stats = None
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float, stats: Optional[Dict] = None):
+    # Skip hidden, linked, oversized (50MB cap), or files older than cutoff. Subagent files go up with
+    # their session (_backfill_subagent_usage). stats counts the transcripts seen and those over the cap.
+    stats = stats if stats is not None else _backfill_empty_stats()
+    for p in _backfill_jsonl_files(root, skip_dirs=('subagents',)):
         if p.name.startswith('.'):
             continue
-        if not p.is_file() or p.is_symlink():
+        if not p.is_file():
             continue
         try:
             st = p.stat()
+            stats['files_seen'] += 1
             if st.st_size > BACKFILL_MAX_FILE_BYTES:
+                over = stats['skipped_over_cap']
+                over['count'] += 1
+                over['total_bytes'] += st.st_size
+                over['largest_bytes'] = max(over['largest_bytes'], st.st_size)
+                band = over['by_size'][next(n for n, upper in BACKFILL_SKIP_BANDS if upper is None or st.st_size < upper)]
+                band['count'] += 1
+                band['total_bytes'] += st.st_size
                 continue
             if st.st_mtime < cutoff_mtime:
                 continue
         except OSError:
             continue
         yield p
+
+
+def _backfill_first_session_id(transcript_path: Path):
+    """The session id _backfill_collect_session would file a transcript under, or None, by its rules up to that id.
+    A file that breaks only after it is still counted readable: telling would mean reading every transcript whole."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            seen = 0
+            # Read in bounded pieces and stopped after one chunk: a transcript the collector reads whole is no bigger.
+            for lineno, line in enumerate(iter(lambda: f.readline(BACKFILL_CHUNK_BYTES), '')):
+                seen += len(line)
+                if lineno >= BACKFILL_MAX_LINES_PER_FILE or seen > BACKFILL_CHUNK_BYTES:
+                    return None
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, RecursionError):
+                    continue
+                if not isinstance(entry, dict):
+                    return None
+                sid = entry.get('sessionId') or entry.get('session_id')
+                if sid:
+                    return sid
+    except Exception:
+        return None
+    return None
+
+
+def _backfill_skipped_anything(stats: Dict) -> bool:
+    return bool(stats['skipped_over_cap']['count'] or stats['unreadable'])
+
+
+def _backfill_walk_stats(root: Path) -> Dict:
+    """uploader_stats for every transcript under root, whatever its age: how many, which are over the cap, and
+    which can't be read."""
+    stats = _backfill_empty_stats()
+    for path in _backfill_iter_transcripts(root, 0, stats):
+        if not _backfill_first_session_id(path):
+            stats['unreadable'] += 1
+    return stats
 
 
 def _backfill_oldest_first(paths):
@@ -1728,21 +2072,19 @@ def _backfill_is_real_user_prompt(content) -> bool:
     return False
 
 
+def _backfill_is_exchange_start(entry) -> bool:
+    """A real user prompt outside a subagent: where the server starts a new exchange."""
+    if not isinstance(entry, dict) or entry.get('isSidechain') or entry.get('type') != 'user':
+        return False
+    # Another session's message (e.g. a subagent hand-back) is model output, not a prompt.
+    if isinstance(entry.get('origin'), dict) and entry['origin'].get('kind') == 'peer':
+        return False
+    msg = entry.get('message')
+    return isinstance(msg, dict) and msg.get('role') == 'user' and _backfill_is_real_user_prompt(msg.get('content'))
+
+
 def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
-    boundaries = []
-    for i, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            continue
-        if entry.get('isSidechain'):
-            continue
-        if entry.get('type') != 'user':
-            continue
-        msg = entry.get('message') or {}
-        if msg.get('role') != 'user':
-            continue
-        if _backfill_is_real_user_prompt(msg.get('content')):
-            boundaries.append(i)
-    return boundaries
+    return [i for i, entry in enumerate(entries) if _backfill_is_exchange_start(entry)]
 
 
 def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
@@ -1753,22 +2095,31 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     globally stable per (org, tool, session, record_index)."""
     session_id = session.get('session_id')
     entries = session.get('entries') or []
+    subagents = session.get('subagents') or []
     # A slice is a fresh dict, so the identity has to be carried over explicitly or
     # an oversized session silently loses the attribution the whole change is for.
     identity = {k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}
     try:
-        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
+        if (len(entries) <= BACKFILL_MAX_ENTRIES_PER_SLICE
+                and len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes):
             yield session
             return
         # +2 for the `, ` separator json.dumps puts between array elements.
         entry_sizes = [len(json.dumps(e).encode('utf-8')) + 2 for e in entries]
+        subagent_sizes = [len(json.dumps(r).encode('utf-8')) + 2 for r in subagents]
     except (TypeError, ValueError):
         debug_print(f"skipping unserializable session {session_id}")
         return
 
     boundaries = _backfill_exchange_boundaries(entries)
+    # Each subagent reply rides with the exchange it is billed to, so a slice carries the replies its turns hold.
+    owners = _backfill_subagent_owners(entries, boundaries, subagents)
+    bare_sizes = list(entry_sizes)
+    for size, owner in zip(subagent_sizes, owners):
+        entry_sizes[owner] += size
     n = len(entries)
-    record_index_base = 0
+    # A slice cut again keeps its place in the session.
+    record_index_base = session.get('record_index_base') or 0
     start_idx = 0
     while start_idx < n:
         ends = [b for b in boundaries if b > start_idx]
@@ -1779,6 +2130,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': [],
+            **({'subagents': []} if subagents else {}),
             **identity,
         }).encode('utf-8'))
         cum = wrap
@@ -1791,9 +2143,19 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             # -2: last entry has no trailing `, ` and `[]` was counted in wrap.
             if cum - 2 > max_chunk_bytes:
                 break
+            # An exchange over the entry cap on its own still goes alone rather than ending the session.
+            if last_fit_end is not None and end_idx - start_idx > BACKFILL_MAX_ENTRIES_PER_SLICE:
+                break
             last_fit_end = end_idx
             last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)
 
+        # An exchange that fits only without its subagent records still goes, without them, so its turns are kept.
+        bare = last_fit_end is None and len(json.dumps({
+            'session_id': session_id, 'record_index_base': record_index_base, 'entries': [], **identity,
+        }).encode('utf-8')) + sum(bare_sizes[start_idx:ends[0]]) - 2 <= max_chunk_bytes
+        if bare:
+            last_fit_end = ends[0]
+            last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < last_fit_end)
         if last_fit_end is None:
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
@@ -1803,24 +2165,170 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'record_index_base': record_index_base,
             'entries': entries[start_idx:last_fit_end],
         }
+        if subagents and not bare:
+            slice_payload['subagents'] = [r for r, owner in zip(subagents, owners)
+                                          if start_idx <= owner < last_fit_end]
         slice_payload.update(identity)
         yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
 
 
+def _backfill_read_session(transcript_path: Path) -> Optional[Dict]:
+    """A transcript up to one chunk read whole; a bigger one as its session id, path and subagent usage, read a slice
+    at a time as it is sent (_backfill_read_slice). None when it names no session."""
+    try:
+        st = transcript_path.stat()
+        if st.st_size <= BACKFILL_CHUNK_BYTES:
+            return _backfill_collect_session(transcript_path)
+    except OSError:
+        return None
+    session_id = _backfill_first_session_id(transcript_path)
+    if not session_id:
+        return None
+    session = {'session_id': session_id, 'transcript_path': str(transcript_path), 'file_id': [st.st_dev, st.st_ino]}
+    try:
+        # Read once here, not once per slice.
+        subagents = _backfill_subagent_usage(transcript_path)
+    except Exception:
+        subagents = []
+    if subagents:
+        session['subagents'] = subagents
+    return session
+
+
+def _backfill_exchanges(f, offset: int, max_bytes: int):
+    """(exchange, last) for each exchange of a transcript opened in binary, read line by line from offset: its first
+    line's offset, entries, their payload bytes, real prompts and newest time. One over max_bytes keeps no entries."""
+    f.seek(offset)
+    exchange, whole = None, True
+    for raw in iter(lambda: f.readline(max_bytes), b''):
+        at, offset, starts_line = offset, offset + len(raw), whole
+        whole = raw.endswith(b'\n') or len(raw) < max_bytes
+        if not (starts_line and whole):
+            # Longer than any slice: read past in pieces, never held whole, and its exchange is too big to send.
+            if exchange is None:
+                exchange = {'offset': at, 'entries': None, 'bytes': 0, 'prompts': 0, 'newest': None}
+            exchange['entries'] = None
+            continue
+        try:
+            entry = json.loads(raw)
+        except (ValueError, RecursionError):  # blank, undecodable, unparseable or nested too deep: skipped
+            continue
+        starts = _backfill_is_exchange_start(entry)
+        if starts and exchange is not None:
+            exchange['end'] = at
+            yield exchange, False
+            exchange = None
+        if exchange is None:
+            exchange = {'offset': at, 'entries': [], 'bytes': 0, 'prompts': int(starts), 'newest': None}
+        if exchange['entries'] is not None:
+            exchange['entries'].append(entry)
+            exchange['bytes'] += len(json.dumps(entry).encode('utf-8')) + 2
+            if exchange['bytes'] > max_bytes:
+                exchange['entries'] = None
+        if isinstance(entry, dict) and entry.get('type') in ('user', 'assistant', 'progress'):
+            when = _backfill_ts(entry.get('timestamp'))
+            if when is not None and (exchange['newest'] is None or when > exchange['newest']):
+                exchange['newest'] = when
+    if exchange is not None:
+        exchange['end'] = offset
+        yield exchange, True
+
+
+def _backfill_read_slice(session: Dict, resume: Optional[Dict], max_bytes: int):
+    """(slice, resume) for a transcript too big to read whole: the whole exchanges from resume on that fit one slice,
+    and where the next slice starts, or None after the last. None when the file can't be read."""
+    resume = resume or {'offset': 0, 'base': 0, 'latest': None}
+    records = session.get('subagents') or []
+    piece = {'session_id': session['session_id'], 'record_index_base': resume['base'], 'entries': [],
+             **({'subagents': []} if records else {}),
+             **{k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}}
+    # +2: the last item of each array has no `, ` after it, as _backfill_slice_session counts it.
+    room = max_bytes - len(json.dumps(piece).encode('utf-8')) + 2
+    latest = _backfill_ts(resume['latest'])
+    times = [_backfill_ts(r.get('timestamp')) for r in records]
+    # A reply rides with the first exchange whose newest line reaches its time, so one at or before the cut went
+    # earlier; one with no time rides with the last, as _backfill_subagent_owners assigns them.
+    timed = sorted((t, i) for i, t in enumerate(times) if t is not None and (latest is None or t > latest))
+    untimed = [i for i, t in enumerate(times) if t is None]
+    sizes = [len(json.dumps(r).encode('utf-8')) + 2 for r in records]
+    base, used, owned, k = resume['base'], 0, [], 0
+    nxt = None
+    try:
+        with open(session['transcript_path'], 'rb') as f:
+            st = os.fstat(f.fileno())
+            if session.get('file_id') and [st.st_dev, st.st_ino] != list(session['file_id']):
+                # Not the file the walk found: replaced, or swapped for a link since.
+                debug_print(f"stopped reading {session['transcript_path']}: the file changed under the walk")
+                return None
+            if resume['offset']:
+                if resume['offset'] <= st.st_size:
+                    f.seek(resume['offset'] - 1)
+                if resume['offset'] > st.st_size or f.read(1) != b'\n':
+                    # No line starts there any more, so the file was replaced: send it from the top.
+                    return _backfill_read_slice(session, None, max_bytes)
+            for exchange, last in _backfill_exchanges(f, resume['offset'], room):
+                newest = exchange['newest']
+                reached = newest if newest is not None and (latest is None or newest > latest) else latest
+                j = k if reached is None else bisect.bisect_right(timed, (reached, len(records)))
+                j = len(timed) if last else j
+                mine = [i for _, i in timed[k:j]] + (untimed if last else [])
+                mine_bytes = sum(sizes[i] for i in mine)
+                entries = exchange['entries']
+                fits = entries is not None and used + exchange['bytes'] <= room and (
+                    not piece['entries'] or len(piece['entries']) + len(entries) <= BACKFILL_MAX_ENTRIES_PER_SLICE)
+                if piece['entries'] and not (fits and used + exchange['bytes'] + mine_bytes <= room):
+                    if entries is None:
+                        # Too big for any slice: passed over here rather than read again by the next one.
+                        debug_print(f"skipped an exchange of session {session['session_id']} over {max_bytes} bytes")
+                        base, latest = base + exchange['prompts'], reached
+                        if last:
+                            break
+                    nxt = {'offset': exchange['end'] if entries is None else exchange['offset'], 'base': base,
+                           'latest': latest.isoformat() if latest else None}
+                    break
+                if fits:
+                    piece['entries'] += entries
+                    used += exchange['bytes']
+                    # An exchange that fits only without its subagent records still goes, so its turns are kept.
+                    if used + mine_bytes <= room:
+                        owned += mine
+                        used += mine_bytes
+                else:
+                    # Too big for any slice: the rest of the session still goes, and its prompt still counts.
+                    debug_print(f"skipped an exchange of session {session['session_id']} over {max_bytes} bytes")
+                base += exchange['prompts']
+                latest, k = reached, j
+                if not piece['entries']:
+                    piece['record_index_base'] = base
+    except Exception as e:
+        # One unreadable transcript stops only itself.
+        debug_print(f"could not read {session['transcript_path']}: {e!r}")
+        return None
+    if not piece['entries']:
+        return None, nxt
+    if records:
+        piece['subagents'] = [records[i] for i in sorted(owned)]
+    return piece, nxt
+
+
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
 _IS_JUNCTION = getattr(os.path, 'isjunction', None)
+# Reparse tags with this bit redirect to another path (junction, symlink, WSL link); OneDrive placeholders lack it.
+_NAME_SURROGATE_BIT = 0x20000000
 
 
 def _is_reparse_point(path: Path) -> bool:
     """Symlink, or a Windows directory junction. os.path.islink reports False for
-    junctions and os.path.isjunction only exists on 3.12+, so both are checked and
-    an unreadable path is treated as suspect."""
+    junctions and os.path.isjunction only exists on 3.12+, so the link's reparse tag
+    is read too, and an unreadable path is treated as suspect."""
     try:
-        if path.is_symlink():
+        if path.is_symlink() or (_IS_JUNCTION and _IS_JUNCTION(path)):
             return True
-        return bool(_IS_JUNCTION and _IS_JUNCTION(path))
+        return bool(getattr(os.lstat(path), 'st_reparse_tag', 0) & _NAME_SURROGATE_BIT)
+    except FileNotFoundError:
+        return False
     except OSError:
         return True
 
@@ -1983,20 +2491,24 @@ def _backfill_read_batch(stamped) -> Tuple[List[Dict], object]:
     resume point, so files sharing one mtime never pin the walk in place."""
     sessions: List[Dict] = []
     bytes_read, last, skipped = 0, None, 0
-    capped = False
+    capped = streaming = False
     for mtime, size, transcript_path in stamped:
         # Every session is held in memory (then pickled back through a pipe) before
         # upload, so a batch is bounded by bytes as well as count. A heavy profile
-        # had one unbatched run reach 17 GB and outlive the MDM timeout.
-        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN or (
-                last is not None and bytes_read + size > BACKFILL_BATCH_BYTES):
+        # had one unbatched run reach 17 GB and outlive the MDM timeout. A transcript
+        # over one chunk is sent a slice at a time (_backfill_stream_file), in a batch of its own.
+        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN or (last is not None and (
+                streaming or size > BACKFILL_CHUNK_BYTES or bytes_read + size > BACKFILL_BATCH_BYTES)):
             capped = last
             break
         bytes_read += size
         last = (mtime, str(transcript_path))
-        session = _backfill_collect_session(transcript_path)
+        session = _backfill_read_session(transcript_path)
         if session:
             sessions.append(session)
+            streaming = 'transcript_path' in session
+            # Subagent usage rides with its session, so it is held in the batch too.
+            bytes_read += len(json.dumps(session.get('subagents') or []))
         else:
             skipped += 1
     if skipped:
@@ -2011,7 +2523,7 @@ def _backfill_collect_sessions(home_dir: Path, force_epoch=None, force_days=None
     # to resume strictly after: files are read in (mtime, path) order, so the next
     # batch (start) picks up there instead of re-reading the same slice forever.
     projects_root = home_dir / '.claude' / 'projects'
-    if not projects_root.exists():
+    if not projects_root.exists() or _backfill_root_is_linked(home_dir / '.claude', projects_root):
         # Three values like every other exit: the caller unpacks one shape, and a
         # profile with no history here was not behind the request either.
         return [], False, False
@@ -2116,6 +2628,8 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> bool:
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if _backfill_uploader_stats is not None:
+        payload['uploader_stats'] = _backfill_uploader_stats
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.
@@ -2149,6 +2663,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         debug_print("upload-url response missing fields")
         return False
 
+    put_started = time.time()
     code, _ = _backfill_http_request(
         upload_url,
         method='PUT',
@@ -2171,6 +2686,8 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         debug_print(f"from-s3 request failed: HTTP {code}")
         return False
 
+    # Rest as long as the upload took (at most 30s), so a long history holds the uplink half the time at most.
+    time.sleep(min(max(time.time() - put_started, 0), 30))
     return True
 
 
@@ -2352,11 +2869,52 @@ class _BackfillRun:
         return sent, failed
 
 
+def _backfill_read_slice_or_false(session: Dict, resume: Optional[Dict], max_bytes: int):
+    """_backfill_read_slice, with False for a file it cannot read: None is what a failed privilege drop returns."""
+    result = _backfill_read_slice(session, resume, max_bytes)
+    return False if result is None else result
+
+
+def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], session: Dict,
+                          forced: bool) -> Tuple[int, Optional[str]]:
+    """Send a transcript too big to read whole a slice at a time, each read as its owner, saving where the next one
+    starts once it lands so a later run carries on there. (sessions sent, status to stop the home with, or None)."""
+    username, home_dir = user_home
+    sent, tag = 0, run.force_epoch if forced else None
+    # Attached before the slices are cut, so each one's size counts it.
+    _backfill_attach_identity([session], run.device_serial, None)
+    resume = _run_as_user(username, _backfill_read_file_resume, home_dir, session, tag)
+    while True:
+        if not run.has_time_for_a_batch():
+            return sent, 'more'
+        began = time.time()
+        result = _run_as_user(username, _backfill_read_slice_or_false, session, resume, BACKFILL_CHUNK_BYTES)
+        if result is None:
+            return sent, 'unreadable'
+        if result is False:
+            # Skipped like any unreadable file, so the walk saves progress past it instead of stopping here every run.
+            return sent, None
+        piece, resume = result
+        if piece:
+            landed, failed = run.upload([piece], forced)
+            if failed:
+                return sent, 'failed'
+            sent = max(sent, landed)
+        run.slowest_batch = max(run.slowest_batch, time.time() - began)
+        if resume is None:
+            # The point saved last is where the last slice starts: an append re-sends that slice onward, not the file.
+            return sent, None
+        _run_as_user(username, _backfill_write_file_resume, home_dir, session, resume, tag, forced)
+
+
 def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tuple[int, int, str]:
     """Collect and upload one home a batch at a time, saving progress after each
     upload lands. Returns (sessions_sent, batches, status); status is 'done',
     'more' (history left for the next run), 'failed' or 'unreadable'."""
     username, home_dir = user_home
+    if _backfill_root_is_linked(home_dir / '.claude', home_dir / '.claude' / 'projects', home_dir / '.claude' / 'hooks'):
+        # Refused, not empty: writing the cutoff would follow the link into another profile as SYSTEM.
+        return 0, 0, 'unreadable'
     start, home_forced, sent_total, batches = None, None, 0, 0
     for _ in range(BACKFILL_MAX_BATCHES_PER_HOME):
         if not run.has_time_for_a_batch():
@@ -2370,12 +2928,20 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
         sessions, capped, forced = result
         # The first batch decides; the rest of this home's walk serves the same request.
         home_forced = forced if home_forced is None else home_forced
+        # A head names a transcript to stream, never a session to send.
+        heads = [s for s in sessions if 'transcript_path' in s]
+        sessions = [s for s in sessions if 'transcript_path' not in s]
         if sessions:
             sent, failed = run.upload(sessions, home_forced)
             sent_total, batches = sent_total + sent, batches + 1
             if failed:
                 return sent_total, batches, 'failed'
         run.slowest_batch = max(run.slowest_batch, time.time() - began)
+        for head in heads:
+            sent, stopped = _backfill_stream_file(run, user_home, head, home_forced)
+            sent_total, batches = sent_total + sent, batches + 1
+            if stopped:
+                return sent_total, batches, stopped
         if not capped:
             # The pre-fetch watermark, not now: a force request that arrived mid-run
             # must still read as pending on the next run.
@@ -2402,6 +2968,29 @@ def _backfill_report(sessions_sent: int, batches: int, statuses: set) -> None:
     print(line)
 
 
+def _backfill_home_stats(home_dir: Path) -> Dict:
+    projects_root = home_dir / '.claude' / 'projects'
+    # The same folders _backfill_drain_home refuses, so a profile it won't upload adds nothing.
+    if not projects_root.exists() or _backfill_root_is_linked(
+            home_dir / '.claude', projects_root, home_dir / '.claude' / 'hooks'):
+        return _backfill_empty_stats()
+    return _backfill_walk_stats(projects_root)
+
+
+def _backfill_add_stats(total: Dict, part: Optional[Dict]) -> None:
+    if not part:
+        return
+    total['files_seen'] += part['files_seen']
+    total['unreadable'] += part['unreadable']
+    over, more = total['skipped_over_cap'], part['skipped_over_cap']
+    over['count'] += more['count']
+    over['total_bytes'] += more['total_bytes']
+    over['largest_bytes'] = max(over['largest_bytes'], more['largest_bytes'])
+    for name, band in more['by_size'].items():
+        over['by_size'][name]['count'] += band['count']
+        over['by_size'][name]['total_bytes'] += band['total_bytes']
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
@@ -2409,6 +2998,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     shared. Each session carries its own home's signed-in email plus the machine
     serial, which is what lets the server attribute a profile's history to the
     person who ran it rather than to the key's owner."""
+    global _backfill_uploader_stats
+    _backfill_uploader_stats = None
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -2434,6 +3025,14 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print(f"backfill {user_home[0]}: {status}, {sent} sessions in {home_batches} batches")
             sessions_sent, batches = sessions_sent + sent, batches + home_batches
             statuses.add(status)
+        # Counted after the uploads, with the time left, so a large history never holds an upload back.
+        if run.has_time_for_a_batch():
+            stats = _backfill_empty_stats()
+            for username, home_dir in user_homes:
+                _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
+            if _backfill_skipped_anything(stats):
+                _backfill_uploader_stats = stats
+                _backfill_upload_chunk(api_key, backend_url, [])
         _backfill_report(sessions_sent, batches, statuses)
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
@@ -2441,25 +3040,29 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error.
+    'fresh' (neither our hook entries nor the script), 'persisted' (both),
+    'tampered' (one without the other), None when the config was unreadable.
     With skip_settings no config is written, so the hook script is the marker."""
     try:
         managed_dir = get_managed_settings_dir()
         script_path = managed_dir / "hooks" / "unbound.py"
         if skip_settings:
             return 'persisted' if script_path.exists() else 'fresh'
-        # The install prefers the drop-in and only falls back to the flat file,
-        # so checking one of them reports every drop-in install as 'fresh'.
-        config_present = (
-            (managed_dir / "managed-settings.d" / "unbound.json").exists()
-            or (managed_dir / "managed-settings.json").exists()
-        )
-        if not config_present:
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        # managed-settings.json is shared with org/Enterprise policy, so the file
+        # existing is not our install; only our own hook entries are.
+        try:
+            registered = _unbound_hooks_registered(
+                [managed_dir / "managed-settings.d" / "unbound.json",
+                 managed_dir / "managed-settings.json"], script_path)
+        except ValueError:
+            # Claude Code refuses a config it cannot parse, ours included, so
+            # enforcement is dead rather than unknown.
+            return 'tampered'
+        if registered is None:
+            return None
+        if registered == script_path.exists():
+            return 'persisted' if registered else 'fresh'
+        return 'tampered'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None
@@ -2607,11 +3210,14 @@ def main():
         remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
                                  _unbound_base_url_matcher(username, home_dir))
 
-    success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
+    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
+
+    success, _ = set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
     if not success:
-        print("Failed to set UNBOUND_CLAUDE_API_KEY")
+        print("Failed to set UNBOUND_DEVICE_TOKEN")
         return False
-    debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
+    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
+    remove_legacy_key_env()
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:

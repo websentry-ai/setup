@@ -552,7 +552,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['api_key'] = api_key
+        config['device_token'] = api_key
+        config['api_key'] = api_key  # read by older CLIs and hooks
         if frontend_url:
             # Custom-tenant devices need the tenant frontend to build console links.
             config['frontend_url'] = frontend_url
@@ -1118,6 +1119,28 @@ def _stdout_never_raises() -> None:
             pass
 
 
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+OTHER_HOOK_DIRS = (
+    "~/.claude", "~/.cursor", "~/.copilot", "~/.augment",
+    "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
+    "/Library/Application Support/Cursor", "/etc/cursor", "%ProgramData%/Cursor",
+    "/etc/augment", "%ProgramData%/Augment",
+)
+
+
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
+    for d in OTHER_HOOK_DIRS:
+        if d.startswith("~"):
+            if home_dir is None:
+                continue
+            d = str(home_dir) + d[1:]
+        p = Path(os.path.expandvars(d))
+        # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
+        if p.is_absolute() and (p / "hooks" / "unbound.py").exists():
+            return True
+    return False
+
+
 def main():
     _stdout_never_raises()
     global DEBUG
@@ -1199,8 +1222,14 @@ def main():
     print("✅ API key received")
 
     # Remove leftover hooks setup env var
-    for username, home_dir in get_all_user_homes():
+    user_homes = get_all_user_homes()
+    # Windows holds one machine-wide token, so it stays while any user still has a hook.
+    keep_machine_token = platform.system().lower() == "windows" and any(
+        device_token_in_use(home_dir) for _, home_dir in user_homes)
+    for username, home_dir in user_homes:
         remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY")
+        if not keep_machine_token and not device_token_in_use(home_dir):
+            remove_env_var_from_user(username, home_dir, "UNBOUND_DEVICE_TOKEN")
 
     print("\n📝 Setting environment variables system-wide...")
     success, env_changed = set_env_var_system_wide("OPENAI_API_KEY", codex_api_key)
