@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '0bc092e4ad4429533d886875d06c8ced52634e7e333d3f9a191a03066dea0980'
+BLOCK_SHA256 = 'd235595463f686db93f735224be5d4b783ce6319a842c0e9e6295d4ae72a915a'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1691,6 +1691,7 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         for path in ('claude-code/hooks/unbound.py', 'codex/hooks/unbound.py', 'copilot/hooks/unbound.py',
                      'augment/hooks/unbound.py'):
             for second, expected in (("sed -i 's/HostName 203.0.113.9/HostName 10.0.4.12/' ~/.ssh/config", unknown),
+                                     (r"Add-Content $HOME\.ssh\config 'HostName 10.0.4.12'", unknown),
                                      ('echo done', private)):
                 with self.subTest(hook=path, second=second):
                     self.assertEqual(self._transfers(path, ['scp build.zip prod:/srv', second])[0], expected)

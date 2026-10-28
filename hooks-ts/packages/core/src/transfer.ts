@@ -3776,7 +3776,7 @@ function sshJumps(options: readonly string[]): boolean {
 }
 
 /** The user's and the system's ssh configs, as a command names them. */
-const SSH_CONFIG_NAMES = /\.ssh\/config\b|ssh_config\b/;
+const SSH_CONFIG_NAMES = /\.ssh(?:\/|\\+)config\b|ssh_config\b/;
 
 /** Whether a call in the turn names an ssh config this lookup reads (user, system, or a -F file other than as -F);
  *  rewriting one can move an earlier transfer, as ssh -G reads configs only at turn end. */
