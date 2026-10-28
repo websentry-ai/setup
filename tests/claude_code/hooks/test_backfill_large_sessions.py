@@ -349,6 +349,28 @@ class RunBackfillTestCase(unittest.TestCase):
         self.assertEqual(self._bases(sessions)[0], 0)
         self.assertEqual(self._sent_entries(sessions), self._expected())
 
+    def test_a_config_miss_mid_forced_walk_keeps_the_resume_point_for_that_walk(self):
+        epoch = time.time() - 100
+        state = self.home / ".claude" / "hooks" / ".unbound_last_backfill"
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({"cursor": 1.0, "cursor_path": None, "force_epoch": epoch, "completed_at": None}))
+        sessions = []
+        self._mdm_run(sessions, 3)  # the force config is missed: the latched walk carries on
+        self.assertEqual(self._resume()["force_epoch"], epoch)
+        sent_bases = self._bases(sessions)
+        sessions.clear()
+        with patch.object(mdm, "_backfill_force_config", return_value=(epoch, None)):
+            budget = iter([True] * 100)
+            with ExitStack() as stack:
+                for ctx in self._patches(mdm, sessions)[2:]:
+                    stack.enter_context(ctx)
+                stack.enter_context(patch.object(mdm, "_backfill_http_request", side_effect=_fake_http(sessions)))
+                stack.enter_context(patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)))
+                stack.enter_context(patch.object(mdm._BackfillRun, "has_time_for_a_batch",
+                                                 side_effect=lambda: next(budget)))
+                mdm.run_backfill("key", "https://backend", [("alice", self.home)])
+        self.assertFalse(set(self._bases(sessions)) & set(sent_bases))
+
     def test_mdm_starts_a_replaced_file_over(self):
         sessions = []
         self._mdm_run(sessions, 3)

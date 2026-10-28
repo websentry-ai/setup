@@ -1894,7 +1894,9 @@ def _backfill_read_file_resume(home: Path, session: Dict, force_epoch) -> Option
     return None
 
 
-def _backfill_write_file_resume(home: Path, session: Dict, resume: Dict, force_epoch) -> None:
+def _backfill_write_file_resume(home: Path, session: Dict, resume: Dict, force_epoch, forced: bool = False) -> None:
+    if forced and force_epoch is None:
+        force_epoch = _backfill_read_state(home)['force_epoch']  # config miss mid-walk: keep the latch
     try:
         saved = json.loads(_backfill_state_path(home).with_name(BACKFILL_RESUME_FILE).read_text())
     except (OSError, ValueError):
@@ -2876,7 +2878,7 @@ def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], sessio
         if resume is None:
             # The point saved last is where the last slice starts: an append re-sends that slice onward, not the file.
             return sent, None
-        _run_as_user(username, _backfill_write_file_resume, home_dir, session, resume, tag)
+        _run_as_user(username, _backfill_write_file_resume, home_dir, session, resume, tag, forced)
 
 
 def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tuple[int, int, str]:
