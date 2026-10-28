@@ -2,8 +2,9 @@
 Tests for agent messages (e.g. a subagent hand-back) in claude-code/hooks/unbound.py.
 
 Claude Code delivers another session's message as a UserPromptSubmit whose prompt
-starts with `<agent-message `. It is model output, so it is never policy-checked
-and never becomes, or joins, a turn's user prompt.
+starts with `<agent-message `, and records it in the transcript with origin kind
+'peer'. Confirmed by that record, it never becomes, or joins, a turn's user prompt.
+The prefix alone can be typed, so it is still policy-checked and still recorded.
 """
 
 import io
@@ -34,7 +35,7 @@ def _user_messages(exchange):
 
 
 class TestAgentMessageSubmit(unittest.TestCase):
-    def test_is_logged_without_a_policy_check(self):
+    def test_is_still_policy_checked(self):
         event = json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": SESSION,
                             "prompt": HANDBACK})
         out = io.StringIO()
@@ -45,23 +46,25 @@ class TestAgentMessageSubmit(unittest.TestCase):
              patch.object(unbound.sys, "stdin", io.StringIO(event)), \
              patch.object(unbound.sys, "stdout", out):
             unbound.main()
-        check.assert_not_called()
+        check.assert_called_once()
         self.assertEqual(audit.call_count, 1)
-        self.assertEqual(json.loads(out.getvalue()), {"suppressOutput": True})
 
-    def test_leading_whitespace_is_still_an_agent_message(self):
-        self.assertTrue(unbound._is_agent_message("\n  " + HANDBACK))
-        self.assertFalse(unbound._is_agent_message("explain <agent-message from=x>"))
+    def test_only_a_prefixed_message_the_transcript_marks_as_a_peer_counts(self):
+        peers = ["Another Claude session sent a message:\n" + HANDBACK]
+        self.assertTrue(unbound._is_agent_message("\n  " + HANDBACK, peers))
+        self.assertFalse(unbound._is_agent_message(HANDBACK, []))
+        self.assertFalse(unbound._is_agent_message("explain <agent-message from=x>", peers))
 
 
 class TestAgentMessageTurn(unittest.TestCase):
     def setUp(self):
         self.captured = {}
+        self.peers = [HANDBACK]
 
         def fake_parse(path, prompt_timestamp=None, include_usage=True,
                        subagent_floor=None, subagent_ceiling=None):
             self.captured["anchor"] = prompt_timestamp
-            return {"assistant_messages": [], "usage": None, "model": None}
+            return {"assistant_messages": [], "usage": None, "model": None, "agent_messages": self.peers}
 
         real_build = unbound.build_llm_exchange
 
@@ -108,22 +111,33 @@ class TestAgentMessageTurn(unittest.TestCase):
         self.assertEqual(len(out["exchange"]["messages"][1]["tool_use"]), 1)
         self.assertEqual(out["anchor"], "2026-10-28T06:05:00Z")
 
-    def test_recent_user_prompts_skip_it(self):
-        logs = [_log("UserPromptSubmit", "2026-10-28T06:01:05Z", prompt="real prompt", prompt_id="p1"),
-                _log("UserPromptSubmit", "2026-10-28T06:01:22Z", prompt=HANDBACK, prompt_id="p2")]
-        with patch.object(unbound, "load_existing_logs", lambda: logs):
-            self.assertEqual(unbound.get_recent_user_prompts_for_session(SESSION, 5), ["real prompt"])
+    def test_a_typed_prefix_with_no_peer_record_stays_the_user_prompt(self):
+        self.peers = []
+        out = self._run([
+            _log("UserPromptSubmit", "2026-10-28T06:05:00Z", prompt=HANDBACK, prompt_id="p2"),
+            _log("Stop", "2026-10-28T06:05:30Z"),
+        ])
+        self.assertEqual(_user_messages(out["exchange"]), [HANDBACK])
 
 
 class TestAgentMessageInTranscript(unittest.TestCase):
-    def test_a_consumed_agent_message_is_not_a_queued_prompt(self):
+    def _queued(self, *records):
         path = Path(tempfile.mkdtemp()) / "session.jsonl"
         with open(path, "w", encoding="utf-8") as f:
             for content in (HANDBACK, "queued question"):
                 f.write(json.dumps({"type": "queue-operation", "operation": "remove",
                                     "timestamp": "2026-10-28T06:01:22Z", "content": content}) + "\n")
-        data = unbound.parse_transcript_file(str(path), "2026-10-28T06:01:05Z")
-        self.assertEqual(data["queued_prompts"], ["queued question"])
+            f.write("".join(json.dumps(record) + "\n" for record in records))
+        return unbound.parse_transcript_file(str(path), "2026-10-28T06:01:05Z")["queued_prompts"]
+
+    def test_a_consumed_agent_message_is_not_a_queued_prompt(self):
+        attachment = {"type": "attachment", "timestamp": "2026-10-28T06:01:22Z",
+                      "attachment": {"type": "queued_command", "prompt": HANDBACK,
+                                     "origin": {"kind": "peer", "from": "a2eaece700394f3d9"}}}
+        self.assertEqual(self._queued(attachment), ["queued question"])
+
+    def test_a_queued_prompt_typed_with_the_prefix_is_kept(self):
+        self.assertEqual(self._queued(), [HANDBACK, "queued question"])
 
     def test_backfill_does_not_cut_an_exchange_at_it(self):
         peer = {"type": "user", "isMeta": True, "origin": {"kind": "peer", "handback": True},
