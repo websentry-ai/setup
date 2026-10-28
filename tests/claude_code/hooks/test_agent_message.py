@@ -123,14 +123,14 @@ class TestAgentMessageTurn(unittest.TestCase):
 
 
 class TestAgentMessageInTranscript(unittest.TestCase):
-    def _queued(self, *records):
+    def _queued(self, *records, floor=None):
         path = Path(tempfile.mkdtemp()) / "session.jsonl"
         with open(path, "w", encoding="utf-8") as f:
             for content in (HANDBACK, "queued question"):
                 f.write(json.dumps({"type": "queue-operation", "operation": "remove",
                                     "timestamp": "2026-10-28T06:01:22Z", "content": content}) + "\n")
             f.write("".join(json.dumps(record) + "\n" for record in records))
-        return unbound.parse_transcript_file(str(path), "2026-10-28T06:01:05Z")["queued_prompts"]
+        return unbound.parse_transcript_file(str(path), "2026-10-28T06:01:05Z", subagent_floor=floor)["queued_prompts"]
 
     def test_a_consumed_agent_message_is_not_a_queued_prompt(self):
         attachment = {"type": "attachment", "timestamp": "2026-10-28T06:01:22Z",
@@ -148,7 +148,12 @@ class TestAgentMessageInTranscript(unittest.TestCase):
     def test_a_peer_record_from_an_earlier_turn_confirms_nothing(self):
         attachment = {"type": "attachment", "timestamp": "2026-10-28T06:00:00Z",
                       "attachment": {"type": "queued_command", "prompt": HANDBACK, "origin": {"kind": "peer"}}}
-        self.assertEqual(self._queued(attachment), [HANDBACK, "queued question"])
+        self.assertEqual(self._queued(attachment, floor="2026-10-28T06:00:30Z"), [HANDBACK, "queued question"])
+
+    def test_with_no_previous_stop_a_record_written_with_the_opening_prompt_confirms_it(self):
+        attachment = {"type": "attachment", "timestamp": "2026-10-28T06:01:05Z",
+                      "attachment": {"type": "queued_command", "prompt": HANDBACK, "origin": {"kind": "peer"}}}
+        self.assertEqual(self._queued(attachment), ["queued question"])
 
     def test_a_queued_prompt_typed_with_the_prefix_is_kept(self):
         self.assertEqual(self._queued(), [HANDBACK, "queued question"])

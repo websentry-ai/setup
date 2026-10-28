@@ -850,7 +850,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
                     peer = _peer_text(entry)
-                    if peer and not (queue_floor and not _ts_lt(queue_floor, entry_timestamp)):
+                    # Floored at the previous Stop only: a hand-back opening the turn is written as its prompt is.
+                    if peer and not (subagent_floor and not _ts_lt(subagent_floor, entry_timestamp)):
                         conversation_data['agent_messages'].append(peer)
 
                     if entry_type == 'queue-operation':
