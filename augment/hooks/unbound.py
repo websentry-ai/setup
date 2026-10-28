@@ -6236,12 +6236,14 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str],
 def _transfer_curl(args: List[str], env: Optional[Dict] = None, state: Optional[Dict] = None) -> List[tuple]:
     """curl's URLs, sent to when their request uploads or sends data, else fetched from, each with whether a proxy
     resolves its name (it then gets the --connect-to target and no --resolve pin); pins carry past --next."""
-    # Unless its first argument is -q or --disable, curl first reads its default config, which may reroute any request.
+    # Unless its first argument is -q or --disable, curl first reads its default config; one with any option beyond the
+    # safe ones may change where it connects, what it sends or which URLs it fetches, so nothing is claimed for it.
     skips = bool(args) and (args[0].startswith('-q') or args[0] == '--disable')
-    configured = not skips and state is not None and _transfer_curlrc_reroutes(env or {}, state)
-    endpoints, pins, i = [], [], 0
+    if not skips and state is not None and _transfer_curlrc_unsafe(env or {}, state):
+        return []
+    endpoints, pins, configured, i = [], [], False, 0
     while True:
-        urls, (sends, uploads, local, config), overrides, globoff, i, (kind, noproxy), scheme = \
+        urls, (sends, uploads, local, config, resolver), overrides, globoff, i, (kind, noproxy), scheme = \
             _transfer_curl_request(args, i)
         # A -K config this doesn't read may reroute this request and those after it, a literal address included.
         configured = configured or config
@@ -6260,16 +6262,25 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None, state: Optional[
                 return endpoints
             for one in expanded:
                 remote = _transfer_curl_remote(one, kind, noproxy, env or {})
+                # With its own resolver a name isn't looked up here; a pin or a literal address still holds.
                 endpoints.append(('out' if out else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
                                   _transfer_curl_dial(one, connects, [] if remote else pins),
-                                  'rerouted' if configured else remote))
+                                  'rerouted' if configured else remote or resolver))
         if i >= len(args):
             return endpoints
 
 
-_TRANSFER_CURLRC_ROUTING = frozenset((
-    'connect-to resolve proxy proxy1.0 preproxy noproxy socks4 socks4a socks5 socks5-hostname url config next '
-    'unix-socket abstract-unix-socket doh-url dns-servers').split())
+# Default-config options that can't change where curl connects, what it sends or which URLs it fetches, and their
+# short forms; a config with any other may change any of that.
+_TRANSFER_CURLRC_SAFE = frozenset((
+    'user-agent silent show-error verbose progress-bar progress-meter no-progress-meter connect-timeout max-time retry '
+    'retry-delay retry-max-time retry-connrefused retry-all-errors compressed fail fail-with-body include show-headers '
+    'write-out create-dirs remote-time limit-rate keepalive keepalive-time no-keepalive tcp-nodelay http1.1 http2 '
+    'speed-limit speed-time expect100-timeout').split())
+_TRANSFER_CURLRC_SAFE_SHORT = frozenset('AsSv#mfiwRYy')
+# Command-line options that send curl's own name lookups to another resolver.
+_TRANSFER_CURL_RESOLVERS = frozenset({'--doh-url', '--dns-servers', '--dns-interface', '--dns-ipv4-addr',
+                                     '--dns-ipv6-addr'})
 
 
 def _transfer_curlrc(env: Dict) -> Optional[str]:
@@ -6297,20 +6308,20 @@ def _transfer_curlrc(env: Dict) -> Optional[str]:
     return os.path.join(home, '.curlrc') if home and os.path.isfile(os.path.join(home, '.curlrc')) else None
 
 
-def _transfer_curlrc_reroutes(env: Dict, state: Dict) -> bool:
-    """Whether curl's default config names an option that can change where a request goes, read once a turn by option
-    names alone, never their values; true when it can't be found or read."""
+def _transfer_curlrc_unsafe(env: Dict, state: Dict) -> bool:
+    """Whether curl's default config names an option outside the safe ones, read once a turn by option names alone,
+    never their values; true when where it is isn't known or it can't be read."""
     path = _transfer_curlrc(env)
     if path is None:
         return False
     if ('curlrc', path) not in state:
-        state[('curlrc', path)] = not path or _transfer_curlrc_routing(path)
+        state[('curlrc', path)] = not path or _transfer_curlrc_has_unsafe(path)
     return state[('curlrc', path)]
 
 
-def _transfer_curlrc_routing(path: str) -> bool:
-    """Whether a curl config names a routing option, as curl reads one: an option per line, -x or --name or name before
-    a space, = or :, # and blank lines skipped; true when it can't be read."""
+def _transfer_curlrc_has_unsafe(path: str) -> bool:
+    """Whether a curl config names an option outside the safe ones, as curl reads one: an option per line, -x or --name
+    or name before a space, = or :, # and blank lines skipped; true when it can't be read."""
     try:
         with open(path, 'rb') as handle:
             data = handle.read(_TRANSFER_SSH_CONFIG_MAX_BYTES + 1)
@@ -6324,11 +6335,15 @@ def _transfer_curlrc_routing(path: str) -> bool:
             continue
         name = re.match(r'[^\s]*' if line[0] == '-' else r'[^\s=:]*', line).group()
         if line[0] == '-' and not name.startswith('--'):
-            if set(name[1:]) & {'x', 'K', ':'}:
-                return True
+            # A cluster's letters up to the one that takes a value, whose value the rest is.
+            for flag in name[1:]:
+                if flag not in _TRANSFER_CURLRC_SAFE_SHORT:
+                    return True
+                if flag in _TRANSFER_CURL_SHORT_VALUES:
+                    break
             continue
-        option = _transfer_curl_long('--' + name[2:] if name.startswith('--') else '--' + name)
-        if not option or option[2:] in _TRANSFER_CURLRC_ROUTING:
+        option = _transfer_curl_long('--' + name[2:] if name.startswith('--') else '--' + name)[2:]
+        if (option[3:] if option.startswith('no-') else option) not in _TRANSFER_CURLRC_SAFE:
             return True
     return False
 
@@ -6453,7 +6468,7 @@ def _transfer_curl_long(name: str) -> str:
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """The curl request at args[i]: URLs (None when curl rejects it), (sends body, -T count, local socket, -K config),
+    """The curl request at args[i]: URLs (None when rejected), (sends body, -T count, local socket, -K, own resolver),
     --resolve and --connect-to, globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
     urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
     kind, preproxy, noproxy = None, None, None
@@ -6467,7 +6482,7 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             arg, eq, attached = arg.partition('=')
             arg = _transfer_curl_long(arg)
             if not arg:
-                return None, (False, 0, False, False), [], False, len(args), (None, None), ''  # curl rejects it
+                return None, (False, 0, False, False, False), [], False, len(args), (None, None), ''  # rejected
             if arg == '--next':
                 break
             arg = '--' + arg[len('--expand-'):] if arg.startswith('--expand-') else arg
@@ -6506,8 +6521,9 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
     # Without -x, a --preproxy is the SOCKS proxy the request goes through.
-    return urls, (bool(sends), uploads, local, bool(flags & {'-K', '--config'})), overrides, \
-        bool(flags & {'-g', '--globoff'}), i, (kind if kind is not None else preproxy, noproxy), scheme
+    marks = (bool(sends), uploads, local, bool(flags & {'-K', '--config'}), bool(flags & _TRANSFER_CURL_RESOLVERS))
+    return urls, marks, overrides, bool(flags & {'-g', '--globoff'}), i, \
+        (kind if kind is not None else preproxy, noproxy), scheme
 
 
 def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:

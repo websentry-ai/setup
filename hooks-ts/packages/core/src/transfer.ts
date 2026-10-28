@@ -2816,11 +2816,13 @@ function curl(
 ): Raw[] {
   const raws: Raw[] = [];
   const pins: string[] = [];
-  // Unless its first argument is -q or --disable, curl first reads its default config, which may reroute every request.
+  // Unless its first argument is -q or --disable, curl first reads its default config; one with any option beyond the
+  // safe ones may change where it connects, what it sends or which URLs it fetches, so nothing is claimed for it.
   const skips = args.length > 0 && ((args[0] as string).startsWith("-q") || args[0] === "--disable");
-  let configured = !skips && state !== undefined && curlrcReroutes(env, state);
+  if (!skips && state !== undefined && curlrcUnsafe(env, state)) return [];
+  let configured = false;
   for (let i = 0; ; ) {
-    const [urls, [sends, uploads, local, config], overrides, globoff, next, [kind, noproxy], scheme] =
+    const [urls, [sends, uploads, local, config, resolver], overrides, globoff, next, [kind, noproxy], scheme] =
       curlRequest(args, i);
     if (urls === undefined) return []; // curl reads every option before it sends anything
     // A -K config this doesn't read may reroute this request and those after it, a literal address included.
@@ -2838,7 +2840,9 @@ function curl(
       for (const one of expanded) {
         const remote = curlRemote(one, kind, noproxy, env, processEnv);
         const dial = curlDial(one, connects, remote ? [] : pins);
-        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, dial, configured ? "rerouted" : remote]);
+        // With its own resolver a name isn't looked up here; a pin or a literal address still holds.
+        const proxied = configured ? "rerouted" : remote || resolver;
+        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, dial, proxied]);
       }
     }
     if (next >= args.length) return raws;
@@ -2848,9 +2852,18 @@ function curl(
 
 /** The URLs curl makes of one by expanding its {a,b} sets and [1-3] or [a-c] ranges, as far as they change the host;
  *  undefined for a glob curl rejects. */
-const CURLRC_ROUTING: ReadonlySet<string> = new Set(
-  `connect-to resolve proxy proxy1.0 preproxy noproxy socks4 socks4a socks5 socks5-hostname url config next
-   unix-socket abstract-unix-socket doh-url dns-servers`.split(/\s+/),
+/** Default-config options that can't change where curl connects, what it sends or which URLs it fetches, and their
+ *  short forms; a config with any other may change any of that. */
+const CURLRC_SAFE: ReadonlySet<string> = new Set(
+  `user-agent silent show-error verbose progress-bar progress-meter no-progress-meter connect-timeout max-time retry
+   retry-delay retry-max-time retry-connrefused retry-all-errors compressed fail fail-with-body include show-headers
+   write-out create-dirs remote-time limit-rate keepalive keepalive-time no-keepalive tcp-nodelay http1.1 http2
+   speed-limit speed-time expect100-timeout`.split(/\s+/),
+);
+const CURLRC_SAFE_SHORT = "AsSv#mfiwRYy";
+/** Command-line options that send curl's own name lookups to another resolver. */
+const CURL_RESOLVERS: ReadonlySet<string> = new Set(
+  ["--doh-url", "--dns-servers", "--dns-interface", "--dns-ipv4-addr", "--dns-ipv6-addr"],
 );
 
 /** The default config curl 8.5 reads, found as it finds one: .curlrc in $CURL_HOME, $XDG_CONFIG_HOME or $HOME, on
@@ -2883,22 +2896,22 @@ function regularFile(path: string): boolean {
   return statSync(path, { throwIfNoEntry: false })?.isFile() ?? false;
 }
 
-/** Whether curl's default config names an option that can change where a request goes, read once a turn by option
- *  names alone, never their values; true when it can't be found or read. */
-function curlrcReroutes(env: Env, state: State): boolean {
+/** Whether curl's default config names an option outside the safe ones, read once a turn by option names alone, never
+ *  their values; true when where it is isn't known or it can't be read. */
+function curlrcUnsafe(env: Env, state: State): boolean {
   const path = curlrc(env, state);
   if (path === undefined) return false;
-  let routes = state.curlrc.get(path);
-  if (routes === undefined) {
-    routes = path === "" || curlrcRouting(path);
-    state.curlrc.set(path, routes);
+  let unsafe = state.curlrc.get(path);
+  if (unsafe === undefined) {
+    unsafe = path === "" || curlrcHasUnsafe(path);
+    state.curlrc.set(path, unsafe);
   }
-  return routes;
+  return unsafe;
 }
 
-/** Whether a curl config names a routing option, as curl reads one: an option per line, -x or --name or name before a
- *  space, = or :, # and blank lines skipped; true when it can't be read. */
-function curlrcRouting(path: string): boolean {
+/** Whether a curl config names an option outside the safe ones, as curl reads one: an option per line, -x or --name or
+ *  name before a space, = or :, # and blank lines skipped; true when it can't be read. */
+function curlrcHasUnsafe(path: string): boolean {
   let text: string;
   try {
     const data = readFileSync(path);
@@ -2912,11 +2925,15 @@ function curlrcRouting(path: string): boolean {
     if (line === "" || "#/\r*".includes(line[0] as string)) continue;
     const name = (line[0] === "-" ? /^\S*/ : /^[^\s=:]*/).exec(line)?.[0] ?? "";
     if (line[0] === "-" && !name.startsWith("--")) {
-      if ([...name.slice(1)].some((flag) => "xK:".includes(flag))) return true;
+      // A cluster's letters up to the one that takes a value, whose value the rest is.
+      for (const flag of name.slice(1)) {
+        if (!CURLRC_SAFE_SHORT.includes(flag)) return true;
+        if (CURL_SHORT_VALUES.includes(flag)) break;
+      }
       continue;
     }
-    const option = curlLong(name.startsWith("--") ? name : `--${name}`);
-    if (option === "" || CURLRC_ROUTING.has(option.slice(2))) return true;
+    const option = curlLong(name.startsWith("--") ? name : `--${name}`).slice(2);
+    if (!CURLRC_SAFE.has(option.startsWith("no-") ? option.slice(3) : option)) return true;
   }
   return false;
 }
@@ -3050,12 +3067,12 @@ function curlLong(name: string): string {
   return prefixed(`--${word}`, CURL_LONG_OPTIONS);
 }
 
-/** The curl request at args[start]: URLs (undefined when curl rejects it), [body, -T count, local socket, -K config],
+/** The curl request at args[start]: URLs (undefined when rejected), [body, -T count, local socket, -K, own resolver],
  *  --resolve and --connect-to, globoff, next start, [proxy kind: '' off, undefined unnamed; --noproxy], scheme. */
 function curlRequest(
   args: string[], start: number,
 ): [
-  string[] | undefined, [boolean, number, boolean, boolean], [string, string][], boolean, number,
+  string[] | undefined, [boolean, number, boolean, boolean, boolean], [string, string][], boolean, number,
   [string | undefined, string | undefined], string,
 ] {
   const urls: string[] = [];
@@ -3085,7 +3102,9 @@ function curlRequest(
       if (eq >= 0) value = arg.slice(eq + 1);
       arg = curlLong(eq >= 0 ? arg.slice(0, eq) : arg);
       // curl rejects an option that starts several.
-      if (arg === "") return [undefined, [false, 0, false, false], [], false, args.length, [undefined, undefined], ""];
+      if (arg === "") {
+        return [undefined, [false, 0, false, false, false], [], false, args.length, [undefined, undefined], ""];
+      }
       if (arg === "--next") break;
       if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
@@ -3112,8 +3131,10 @@ function curlRequest(
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
   // Without -x, a --preproxy is the SOCKS proxy the request goes through.
   const config = flags.has("-K") || flags.has("--config");
+  const resolver = [...flags].some((flag) => CURL_RESOLVERS.has(flag));
   const globoff = flags.has("-g") || flags.has("--globoff");
-  return [urls, [Boolean(sends), uploads, local, config], overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
+  const marks: [boolean, number, boolean, boolean, boolean] = [Boolean(sends), uploads, local, config, resolver];
+  return [urls, marks, overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
 }
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:

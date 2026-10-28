@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '13ce924f5a5af981527e438276344f3346f3ddb5557b3b73b88bb8b8fa728de4'
+BLOCK_SHA256 = '0bc092e4ad4429533d886875d06c8ced52634e7e333d3f9a191a03066dea0980'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -774,30 +774,36 @@ class SshLookupTests(TransferTestCase):
         Path(self.home, 'alt_cfg').write_text('Host prod\n  HostName 10.9.8.7\n')
         self.assert_endpoints('scp -F ~/alt_cfg f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.9.8.7')])
 
-    def test_curls_default_config_reroutes_unless_q_comes_first(self):
-        # curl reads ~/.curlrc first unless -q leads; one naming a routing option leaves its requests unresolved.
+    def test_curls_default_config_claims_nothing_unless_it_holds_only_safe_options(self):
+        # curl reads ~/.curlrc first unless -q leads; one with any option beyond the safe ones may change the
+        # destination, direction, URLs or body, so that call reports no transfer.
         private = [_endpoint('out', '10.0.0.1', 'private')]
-        unresolved = [_endpoint('out', '10.0.0.1', 'unresolved')]
         curlrc = Path(self.home, '.curlrc')
         self.assert_endpoints('curl -T f https://10.0.0.1/up', private)  # no curlrc
-        curlrc.write_text('# routes\nuser-agent = x\n')
-        self.assert_endpoints('curl -T f https://10.0.0.1/up', private)
-        for routing in ('connect-to = 10.0.0.1:443:example.com:443\n', '--proxy http://p:1\n', '-x http://p:1\n',
-                        'resolve example.com:443:1.2.3.4\n', 'conn x\n'):
-            curlrc.write_text(routing)
-            with self.subTest(routing=routing):
-                self.assert_endpoints('curl -T f https://10.0.0.1/up', unresolved)
+        safes = ('# tuning\nuser-agent = x\nsilent\n', '-sSA "agent"\n--no-progress-meter\nmax-time: 5\n', '-sAgent\n')
+        for safe in safes:
+            curlrc.write_text(safe)
+            with self.subTest(safe=safe):
+                self.assert_endpoints('curl -T f https://10.0.0.1/up', private)
+        for unsafe in ('upload-file = x\n', 'globoff\n', 'connect-to = a:443:b:443\n', '-x http://p:1\n', 'conn x\n',
+                       'location\n', '-sL\n', 'future-option\n'):
+            curlrc.write_text(unsafe)
+            for hook in HOOKS:
+                with self.subTest(unsafe=unsafe, hook=hook.__file__):
+                    self.assertIsNone(hook._transfer('curl -T f https://10.0.0.1/up', self.repo, {}))
+                    self.assertIsNone(hook._transfer('curl https://{a,b}.example.com/x', self.repo, {}))
+                    # -q counts only as the first argument.
+                    self.assertIsNone(hook._transfer('curl -T f -q https://10.0.0.1/up', self.repo, {}))
+            with self.subTest(unsafe=unsafe):
                 self.assert_endpoints('curl -q -T f https://10.0.0.1/up', private)
                 self.assert_endpoints('curl --disable -T f https://10.0.0.1/up', private)
-                self.assert_endpoints('curl -T f -q https://10.0.0.1/up', unresolved)  # -q counts only first
-        # $CURL_HOME comes before $HOME, and a command's own setting counts.
+        # $CURL_HOME and $XDG_CONFIG_HOME come before $HOME, and a command's own setting counts.
         elsewhere = tempfile.mkdtemp()
         Path(elsewhere, '.curlrc').write_text('user-agent = x\n')
         self.assert_endpoints(f'CURL_HOME={elsewhere} curl -T f https://10.0.0.1/up', private)
-        with patch.dict(os.environ, {'CURL_HOME': elsewhere}):
-            self.assert_endpoints('curl -T f https://10.0.0.1/up', private)
-        with patch.dict(os.environ, {'XDG_CONFIG_HOME': elsewhere}):
-            self.assert_endpoints('curl -T f https://10.0.0.1/up', private)
+        for key in ('CURL_HOME', 'XDG_CONFIG_HOME'):
+            with patch.dict(os.environ, {key: elsewhere}):
+                self.assert_endpoints('curl -T f https://10.0.0.1/up', private)
 
     def test_a_relative_include_is_read_under_home_only(self):
         # ssh reads the account's ~/.ssh/config but globs its relative Include under $HOME, so only that tree counts.

@@ -9446,6 +9446,134 @@
   {
    "command": "curl -q -T f $'https://example.com/upload",
    "transfer": null
+  },
+  {
+   "command": "curl --doh-url https://dns.example/dns-query https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --dns-servers 1.1.1.1 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --dns-interface eth0 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --dns-ipv4-addr 10.0.0.2 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --dns-servers 1.1.1.1 https://8.8.8.8/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --dns-servers 1.1.1.1 --resolve example.com:443:10.0.0.9 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "10.0.0.9",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --dns-servers 1.1.1.1 https://example.com/a --next https://example.com/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl https://example.com/a --next --doh-url https://dns.example/q https://split.example/b",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "split.example",
+      "resolved_host": "split.example",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --doh https://dns.example/q https://example.com/x",
+   "transfer": null
   }
  ]
 }

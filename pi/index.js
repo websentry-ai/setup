@@ -4161,9 +4161,10 @@ function curl(args, env = {}, processEnv = {}, state) {
   const raws = [];
   const pins = [];
   const skips = args.length > 0 && (args[0].startsWith("-q") || args[0] === "--disable");
-  let configured = !skips && state !== void 0 && curlrcReroutes(env, state);
+  if (!skips && state !== void 0 && curlrcUnsafe(env, state)) return [];
+  let configured = false;
   for (let i = 0; ; ) {
-    const [urls, [sends, uploads, local, config], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads, local, config, resolver], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     if (urls === void 0) return [];
     configured ||= config;
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
@@ -4176,16 +4177,23 @@ function curl(args, env = {}, processEnv = {}, state) {
       for (const one of expanded2) {
         const remote2 = curlRemote(one, kind, noproxy, env, processEnv);
         const dial = curlDial(one, connects, remote2 ? [] : pins);
-        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, dial, configured ? "rerouted" : remote2]);
+        const proxied = configured ? "rerouted" : remote2 || resolver;
+        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, dial, proxied]);
       }
     }
     if (next >= args.length) return raws;
     i = next;
   }
 }
-var CURLRC_ROUTING = new Set(
-  `connect-to resolve proxy proxy1.0 preproxy noproxy socks4 socks4a socks5 socks5-hostname url config next
-   unix-socket abstract-unix-socket doh-url dns-servers`.split(/\s+/)
+var CURLRC_SAFE = new Set(
+  `user-agent silent show-error verbose progress-bar progress-meter no-progress-meter connect-timeout max-time retry
+   retry-delay retry-max-time retry-connrefused retry-all-errors compressed fail fail-with-body include show-headers
+   write-out create-dirs remote-time limit-rate keepalive keepalive-time no-keepalive tcp-nodelay http1.1 http2
+   speed-limit speed-time expect100-timeout`.split(/\s+/)
+);
+var CURLRC_SAFE_SHORT = "AsSv#mfiwRYy";
+var CURL_RESOLVERS = /* @__PURE__ */ new Set(
+  ["--doh-url", "--dns-servers", "--dns-interface", "--dns-ipv4-addr", "--dns-ipv6-addr"]
 );
 function curlrc(env, state) {
   const setting = (key) => key in env ? env[key] : CLEAN_ENV in env ? void 0 : state.env[key];
@@ -4213,17 +4221,17 @@ function curlrc(env, state) {
 function regularFile(path) {
   return statSync(path, { throwIfNoEntry: false })?.isFile() ?? false;
 }
-function curlrcReroutes(env, state) {
+function curlrcUnsafe(env, state) {
   const path = curlrc(env, state);
   if (path === void 0) return false;
-  let routes = state.curlrc.get(path);
-  if (routes === void 0) {
-    routes = path === "" || curlrcRouting(path);
-    state.curlrc.set(path, routes);
+  let unsafe = state.curlrc.get(path);
+  if (unsafe === void 0) {
+    unsafe = path === "" || curlrcHasUnsafe(path);
+    state.curlrc.set(path, unsafe);
   }
-  return routes;
+  return unsafe;
 }
-function curlrcRouting(path) {
+function curlrcHasUnsafe(path) {
   let text;
   try {
     const data = readFileSync3(path);
@@ -4237,11 +4245,14 @@ function curlrcRouting(path) {
     if (line === "" || "#/\r*".includes(line[0])) continue;
     const name = (line[0] === "-" ? /^\S*/ : /^[^\s=:]*/).exec(line)?.[0] ?? "";
     if (line[0] === "-" && !name.startsWith("--")) {
-      if ([...name.slice(1)].some((flag) => "xK:".includes(flag))) return true;
+      for (const flag of name.slice(1)) {
+        if (!CURLRC_SAFE_SHORT.includes(flag)) return true;
+        if (CURL_SHORT_VALUES.includes(flag)) break;
+      }
       continue;
     }
-    const option = curlLong(name.startsWith("--") ? name : `--${name}`);
-    if (option === "" || CURLRC_ROUTING.has(option.slice(2))) return true;
+    const option = curlLong(name.startsWith("--") ? name : `--${name}`).slice(2);
+    if (!CURLRC_SAFE.has(option.startsWith("no-") ? option.slice(3) : option)) return true;
   }
   return false;
 }
@@ -4381,7 +4392,9 @@ function curlRequest(args, start) {
       const eq = arg.indexOf("=");
       if (eq >= 0) value = arg.slice(eq + 1);
       arg = curlLong(eq >= 0 ? arg.slice(0, eq) : arg);
-      if (arg === "") return [void 0, [false, 0, false, false], [], false, args.length, [void 0, void 0], ""];
+      if (arg === "") {
+        return [void 0, [false, 0, false, false, false], [], false, args.length, [void 0, void 0], ""];
+      }
       if (arg === "--next") break;
       if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
@@ -4406,8 +4419,10 @@ function curlRequest(args, start) {
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
   const config = flags.has("-K") || flags.has("--config");
+  const resolver = [...flags].some((flag) => CURL_RESOLVERS.has(flag));
   const globoff = flags.has("-g") || flags.has("--globoff");
-  return [urls, [Boolean(sends), uploads, local, config], overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
+  const marks = [Boolean(sends), uploads, local, config, resolver];
+  return [urls, marks, overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
 }
 function wget(args, proxied = false) {
   const urls = [];

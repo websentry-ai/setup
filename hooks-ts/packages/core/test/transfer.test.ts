@@ -156,21 +156,29 @@ test("a call that may not have run is reported but not looked up", async () => {
   assert.deepEqual(lookups, ["example.com"]);
 });
 
-test("curl's default config reroutes unless -q comes first", async () => {
-  // curl reads ~/.curlrc first unless -q leads; one naming a routing option leaves its requests unresolved.
+test("curl's default config claims nothing unless it holds only safe options", async () => {
+  // curl reads ~/.curlrc first unless -q leads; one with any option beyond the safe ones may change the destination,
+  // direction, URLs or body, so that call reports no transfer.
   const home = mkdtempSync(join(tmpdir(), "curlrc-"));
+  const found = async (command: string, env: Record<string, string> = {}): Promise<Transfer | undefined> =>
+    await transfer(command, "/", { home, env: { HOME: home, ...env } });
   const kind = async (command: string, env: Record<string, string> = {}): Promise<string | undefined> =>
-    (await transfer(command, "/", { home, env: { HOME: home, ...env } }))?.endpoints[0]?.address;
+    (await found(command, env))?.endpoints[0]?.address;
   assert.equal(await kind("curl -T f https://10.0.0.1/up"), "private");
-  writeFileSync(join(home, ".curlrc"), "# routes\nuser-agent = x\n");
-  assert.equal(await kind("curl -T f https://10.0.0.1/up"), "private");
-  const routings = ["connect-to = 10.0.0.1:443:example.com:443\n", "--proxy http://p:1\n", "-x http://p\n", "conn x\n"];
-  for (const routing of routings) {
-    writeFileSync(join(home, ".curlrc"), routing);
-    assert.equal(await kind("curl -T f https://10.0.0.1/up"), "unresolved", routing);
-    assert.equal(await kind("curl -q -T f https://10.0.0.1/up"), "private", routing);
-    assert.equal(await kind("curl --disable -T f https://10.0.0.1/up"), "private", routing);
-    assert.equal(await kind("curl -T f -q https://10.0.0.1/up"), "unresolved", routing);
+  const safes = ["# tuning\nuser-agent = x\nsilent\n", '-sSA "agent"\n--no-progress-meter\nmax-time: 5\n', "-sAgent\n"];
+  for (const safe of safes) {
+    writeFileSync(join(home, ".curlrc"), safe);
+    assert.equal(await kind("curl -T f https://10.0.0.1/up"), "private", safe);
+  }
+  const unsafes = ["upload-file = x\n", "globoff\n", "connect-to = a:443:b:443\n", "-x http://p:1\n", "conn x\n",
+    "location\n", "-sL\n", "future-option\n"];
+  for (const unsafe of unsafes) {
+    writeFileSync(join(home, ".curlrc"), unsafe);
+    assert.equal(await found("curl -T f https://10.0.0.1/up"), undefined, unsafe);
+    assert.equal(await found("curl https://{a,b}.example.com/x"), undefined, unsafe);
+    assert.equal(await found("curl -T f -q https://10.0.0.1/up"), undefined, unsafe);
+    assert.equal(await kind("curl -q -T f https://10.0.0.1/up"), "private", unsafe);
+    assert.equal(await kind("curl --disable -T f https://10.0.0.1/up"), "private", unsafe);
   }
   const elsewhere = mkdtempSync(join(tmpdir(), "curl-home-"));
   writeFileSync(join(elsewhere, ".curlrc"), "user-agent = x\n");
