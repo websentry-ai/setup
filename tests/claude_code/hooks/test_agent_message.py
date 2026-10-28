@@ -136,6 +136,13 @@ class TestAgentMessageInTranscript(unittest.TestCase):
                                      "origin": {"kind": "peer", "from": "a2eaece700394f3d9"}}}
         self.assertEqual(self._queued(attachment), ["queued question"])
 
+    def test_a_peer_entry_written_as_content_blocks_still_confirms_it(self):
+        peer = {"type": "user", "isMeta": True, "timestamp": "2026-10-28T06:01:22Z",
+                "origin": {"kind": "peer", "handback": True},
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "Another Claude session sent a message:\n" + HANDBACK}]}}
+        self.assertEqual(self._queued(peer), ["queued question"])
+
     def test_a_queued_prompt_typed_with_the_prefix_is_kept(self):
         self.assertEqual(self._queued(), [HANDBACK, "queued question"])
 

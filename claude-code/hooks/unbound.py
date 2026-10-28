@@ -782,7 +782,11 @@ def _peer_text(entry: Dict) -> Optional[str]:
     if not isinstance(origin, dict) or origin.get('kind') != 'peer':
         return None
     text = attachment.get('prompt') if attachment else (entry.get('message') or {}).get('content')
-    return text if isinstance(text, str) else json.dumps(text)
+    if isinstance(text, list):
+        # Content blocks are matched by their text, as the submitted prompt carries it.
+        text = '\n'.join(block['text'] for block in text
+                         if isinstance(block, dict) and isinstance(block.get('text'), str))
+    return text if isinstance(text, str) and text else None
 
 
 def _typed_user_text(entry: Dict) -> str:
