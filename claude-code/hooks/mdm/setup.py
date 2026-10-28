@@ -2852,6 +2852,12 @@ class _BackfillRun:
         return sent, failed
 
 
+def _backfill_read_slice_or_false(session: Dict, resume: Optional[Dict], max_bytes: int):
+    """_backfill_read_slice, with False for a file it cannot read: None is what a failed privilege drop returns."""
+    result = _backfill_read_slice(session, resume, max_bytes)
+    return False if result is None else result
+
+
 def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], session: Dict,
                           forced: bool) -> Tuple[int, Optional[str]]:
     """Send a transcript too big to read whole a slice at a time, each read as its owner, saving where the next one
@@ -2865,9 +2871,12 @@ def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], sessio
         if not run.has_time_for_a_batch():
             return sent, 'more'
         began = time.time()
-        result = _run_as_user(username, _backfill_read_slice, session, resume, BACKFILL_CHUNK_BYTES)
+        result = _run_as_user(username, _backfill_read_slice_or_false, session, resume, BACKFILL_CHUNK_BYTES)
         if result is None:
             return sent, 'unreadable'
+        if result is False:
+            # Skipped like any unreadable file, so the walk saves progress past it instead of stopping here every run.
+            return sent, None
         piece, resume = result
         if piece:
             landed, failed = run.upload([piece], forced)
