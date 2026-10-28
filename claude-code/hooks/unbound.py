@@ -80,6 +80,9 @@ POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
+# Re-reads of a transcript whose last reply has not landed yet: the gap is milliseconds, the Stop hook's timeout 60s.
+STOP_TRANSCRIPT_REREADS = 2
+STOP_TRANSCRIPT_REREAD_SECONDS = 0.25
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -795,9 +798,12 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'queued_prompts': [],
         'usage': None,
         'model': None,
+        'finished': False,
     }
 
     if not transcript_path or not os.path.exists(transcript_path):
+        # Waiting cannot bring a missing transcript, so a Stop does not re-read for it.
+        conversation_data['finished'] = True
         return conversation_data
 
     queue_floor = subagent_floor or user_prompt_timestamp
@@ -864,6 +870,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
                             # Model is captured unconditionally so it survives even on usage-less assistant entries.
                             turn_model = turn_model or message.get('model')
+                            if progress is None and not entry.get('isSidechain'):
+                                conversation_data['finished'] = message.get('stop_reason') not in (None, 'tool_use')
 
                             if include_usage:
                                 _record_usage(entry, message, usage_by_key)
@@ -872,7 +880,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     continue
 
     except Exception:
-        pass
+        # A read that failed fails again; re-reading it would only delay the Stop.
+        conversation_data['finished'] = True
 
     if include_usage:
         try:
@@ -5530,9 +5539,14 @@ def process_stop_event(event: Dict, api_key: str):
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
-        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
-                                                subagent_floor=previous_stop,
-                                                subagent_ceiling=stop_timestamp)
+        for attempt in range(STOP_TRANSCRIPT_REREADS + 1):
+            transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
+                                                    subagent_floor=previous_stop,
+                                                    subagent_ceiling=stop_timestamp)
+            # Claude Code can fire Stop before the turn's last reply reaches the transcript.
+            if transcript_data.get('finished', True) or attempt == STOP_TRANSCRIPT_REREADS:
+                break
+            time.sleep(STOP_TRANSCRIPT_REREAD_SECONDS)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
