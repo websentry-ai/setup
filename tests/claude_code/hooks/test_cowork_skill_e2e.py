@@ -73,7 +73,7 @@ class CoworkHookE2E(unittest.TestCase):
             HOME=str(self.home), USERPROFILE=str(self.home),
             APPDATA=str(self.home / "AppData" / "Roaming"),
             UNBOUND_GATEWAY_URL="http://127.0.0.1:%d" % self.server.server_address[1],
-            UNBOUND_CLAUDE_API_KEY="test-key",
+            UNBOUND_DEVICE_TOKEN="test-key",
         )
         for key in ("CLAUDE_CONFIG_DIR", "UNBOUND_HOOK_TOOL"):
             self.env.pop(key, None)

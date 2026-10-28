@@ -67,37 +67,30 @@ def _hook_on_disk(home, tool):
 
 
 @pytest.mark.parametrize("tool", sorted(HOOKS))
-def test_hook_prefers_the_device_token_over_the_per_tool_key(home, monkeypatch, tool):
+def test_hook_reads_only_the_device_token_env(home, monkeypatch, tool):
     hook = _load(HOOKS[tool], f"token_hook_{tool.replace('-', '_')}")
-    monkeypatch.setenv("UNBOUND_DEVICE_TOKEN", "new")
     monkeypatch.setenv(LEGACY[tool], "old")
+    assert hook.get_api_key() is None
+    monkeypatch.setenv("UNBOUND_DEVICE_TOKEN", "new")
     assert hook.get_api_key() == "new"
 
 
 @pytest.mark.parametrize("tool", sorted(HOOKS))
-def test_hook_still_reads_the_per_tool_key_from_an_older_install(home, monkeypatch, tool):
+def test_hook_reads_only_config_device_token(home, tool):
     hook = _load(HOOKS[tool], f"token_hook_{tool.replace('-', '_')}")
-    monkeypatch.setenv(LEGACY[tool], "old")
-    assert hook.get_api_key() == "old"
-
-
-@pytest.mark.parametrize("tool", sorted(HOOKS))
-def test_hook_reads_config_api_key_then_device_token(home, tool):
-    hook = _load(HOOKS[tool], f"token_hook_{tool.replace('-', '_')}")
-    # An older writer (CLI login, pinned installer) updates only api_key, so it must win.
-    _write_config(home, {"device_token": "stale", "api_key": "relogged"})
-    assert hook.get_api_key() == "relogged"
-    _write_config(home, {"device_token": "cfg-new"})
+    _write_config(home, {"api_key": "old"})
+    assert hook.get_api_key() is None
+    _write_config(home, {"device_token": "cfg-new", "api_key": "old"})
     assert hook.get_api_key() == "cfg-new"
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))
-def test_setup_writes_both_config_fields(home, tool):
+def test_setup_writes_device_token_and_drops_api_key(home, tool):
     setup = _load(SETUPS[tool], f"token_setup_{tool.replace('-', '_')}")
     _write_config(home, {"api_key": "old", "email": "a@b.co"})
     setup.write_unbound_config("k2")
     config = json.loads((home / ".unbound" / "config.json").read_text())
-    assert (config["device_token"], config["api_key"], config["email"]) == ("k2", "k2", "a@b.co")
+    assert config == {"device_token": "k2", "email": "a@b.co"}
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))
@@ -149,13 +142,20 @@ def test_windows_machine_token_stays_while_any_user_still_needs_it(home, tmp_pat
     assert removed == ["UNBOUND_DEVICE_TOKEN"]
 
 
-def test_every_config_writer_also_writes_device_token():
-    # Readers move to device_token once api_key writes stop, so every writer must already set it.
-    files = subprocess.run(["git", "grep", "-lE", r"config\[['\"]api_key['\"]\] = api_key", "--", "*.py"],
-                           cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
-    assert files
-    missing = [f for f in files if not re.search(r"config\[['\"]device_token['\"]\] = api_key", (REPO / f).read_text())]
-    assert missing == []
+def test_no_config_writer_writes_api_key():
+    # Nothing reads config.json api_key any more, so every writer drops it instead.
+    writers = subprocess.run(["git", "grep", "-lE", r"config\[['\"]device_token['\"]\] = api_key", "--", "*.py"],
+                             cwd=REPO, capture_output=True, text=True, check=True).stdout.split()
+    assert writers
+    wrong = [f for f in writers if re.search(r"config\[['\"]api_key['\"]\] =", (REPO / f).read_text())
+             or not re.search(r"config\.pop\(['\"]api_key['\"], None\)", (REPO / f).read_text())]
+    assert wrong == []
+
+
+def test_hooks_have_no_per_tool_key_env():
+    names = subprocess.run(["git", "grep", "-nE", r"UNBOUND_[A-Z]+_API_KEY", "--", *map(str, HOOKS.values())],
+                           cwd=REPO, capture_output=True, text=True).stdout
+    assert names == ""
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))

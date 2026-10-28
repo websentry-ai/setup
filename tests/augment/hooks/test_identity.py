@@ -100,7 +100,7 @@ class TestReadAccountIdentity(_IsolatedConfig):
     def test_falls_back_to_config_email_when_no_context(self):
         """No context (the real Auggie 0.30.0 event shape) -> email comes from
         ~/.unbound/config.json."""
-        self._write_config({"api_key": "sk-x", "email": "bob@corp.io"})
+        self._write_config({"device_token": "sk-x", "email": "bob@corp.io"})
         result = unbound.read_account_identity({})
         self.assertEqual(result["user_email"], "bob@corp.io")
         self.assertEqual(result["email_domain"], "corp.io")
@@ -129,7 +129,7 @@ class TestReadAccountIdentity(_IsolatedConfig):
 
     def test_config_without_email_field_returns_none(self):
         """A config.json that has no `email` key -> user_email None."""
-        self._write_config({"api_key": "sk-only"})
+        self._write_config({"device_token": "sk-only"})
         result = unbound.read_account_identity({})
         self.assertIsNone(result["user_email"])
 

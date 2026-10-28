@@ -6,7 +6,7 @@
 #
 # onto ANY base image that has python3 (the hook's only dependency). No host listener,
 # no credentials, and no network egress are baked in — the hook resolves the key at
-# runtime (UNBOUND_CLAUDE_API_KEY env passthrough or a mounted ~/.unbound/config.json,
+# runtime (UNBOUND_DEVICE_TOKEN env passthrough or a mounted ~/.unbound/config.json,
 # which the hook reads natively) and talks to the Unbound gateway directly over HTTPS.
 #
 # Zero-drift: the hook is sourced DIRECTLY from this repo's canonical copy at

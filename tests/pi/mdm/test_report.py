@@ -298,7 +298,7 @@ def test_clear_removes_our_two_files_and_the_export_from_every_home(
 
 
 def test_clear_never_opens_the_shared_config(pi_mdm_setup, device, monkeypatch):
-    """~/.unbound/config.json's api_key is shared with five other tools, so removing it
+    """~/.unbound/config.json's device_token is shared with five other tools, so removing it
     would log the user out of all of them. Asserted by byte-comparison, not by absence."""
     mod = pi_mdm_setup
     assert mod.main() is True

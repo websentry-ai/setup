@@ -53,8 +53,8 @@ way the other MDM installers in this repo do.
 | `<home>/.pi/agent/extensions/unbound/index.js` | `0644` | that user |
 | `<home>/.pi/agent/extensions/unbound/index.js.sha256` | `0644` | that user |
 | an `export UNBOUND_PI_API_KEY="…"` line in `~/.zprofile` + the user's bash login profile (macOS) or `~/.zshrc` + `~/.bashrc` (Linux) | group/other bits stripped (`0644` → `0600`) | that user |
-| `api_key` in `<home>/.unbound/config.json`, **only when absent or previously written by this installer** | `0600` in a `0700` dir | that user |
-| `pi_mdm_api_key_sha256` in the same file — the digest that marks that `api_key` as ours | `0600` in a `0700` dir | that user |
+| `device_token` in `<home>/.unbound/config.json`, **only when absent or previously written by this installer** | `0600` in a `0700` dir | that user |
+| `pi_mdm_api_key_sha256` in the same file — the digest that marks that `device_token` as ours | `0600` in a `0700` dir | that user |
 
 **Default agent directory only.** `PI_CODING_AGENT_DIR` belongs to the *target user's* shell
 environment, which root running from an MDM cannot read. Reading root's own copy of it would
@@ -65,7 +65,7 @@ is not covered by an MDM push and must run the per-user `unbound setup pi` inste
 ## Key placement, and one deliberate divergence
 
 The extension resolves its key in this order (`hooks-ts/packages/core/src/config.ts`):
-`UNBOUND_PI_API_KEY` → `UNBOUND_API_KEY` → `~/.unbound/config.json` `api_key` → inactive.
+`UNBOUND_PI_API_KEY` → `UNBOUND_API_KEY` → `~/.unbound/config.json` `device_token` → inactive.
 
 Both tier 1 and tier 3 are written, because an rc export is invisible to a shell that is
 already open and to a GUI-launched pi, while `config.json` is what makes the *current*
@@ -74,7 +74,7 @@ session work.
 Two things differ from the `augment/hooks/mdm/setup.py` analog this script is otherwise a
 port of, both called out in comments at the code:
 
-1. **`config.json`'s `api_key` is written by ownership, not assigned.** Augment overwrites it
+1. **`config.json`'s `device_token` is written by ownership, not assigned.** Augment overwrites it
    unconditionally. That file is the shared identity store for `unbound-cli` and five other
    tools (Cursor, Claude Code, Codex, Copilot, Augment), so on a device where the user has run
    `unbound login`, overwriting it would silently repoint **all of them** at this device key.
@@ -85,10 +85,10 @@ port of, both called out in comments at the code:
    tier a GUI-launched pi and every already-open shell read. The extension went on
    authenticating with a revoked key, after a redeployment that reported success.
 
-   So the installer records a `pi_mdm_api_key_sha256` digest beside any `api_key` it writes,
+   So the installer records a `pi_mdm_api_key_sha256` digest beside any `device_token` it writes,
    and on a later push replaces the value only when it is absent, already equal to the key
    being installed, or matches that digest. Anything else is the user's own credential and is
-   left byte-identical. **Rotating a pi application key therefore takes effect in both tiers
+   kept. A leftover `api_key` is always removed: no hook or CLI reads it any more. **Rotating a pi application key therefore takes effect in both tiers
    on the next push.** The digest is provenance, not a secret — the key itself is in the same
    `0600` file — and no other tool reads that field.
 
@@ -156,7 +156,7 @@ prints a per-user result table.
 ## What counts as a successful push
 
 An account is covered only when **both** halves landed: the extension, and a key it can read
-(the `UNBOUND_PI_API_KEY` export, or `api_key` in `~/.unbound/config.json` — either one is
+(the `UNBOUND_PI_API_KEY` export, or `device_token` in `~/.unbound/config.json` — either one is
 enough). An extension with no readable key loads and enforces nothing, so a run where no
 account got a key exits `1` even though every `index.js` is on disk. The extension is left in
 place; removing it would be worse, and the next push repairs the key. Exiting `0` there used
@@ -201,7 +201,7 @@ Removes `index.js` and `index.js.sha256` from every enumerated home, and the
 `UNBOUND_PI_API_KEY` export line from every user's rc files. It leaves the extension
 directory, every file in it that this installer did not write, any `index.ts` or
 `index.ts.unbound-disabled`, and — deliberately — `~/.unbound/config.json` entirely alone:
-its `api_key` is shared with the other Unbound tools, so removing it would log the user out
+its `device_token` is shared with the other Unbound tools, so removing it would log the user out
 of all of them. It makes no network call. Without root it refuses cleanly (exit `1`, no
 traceback).
 

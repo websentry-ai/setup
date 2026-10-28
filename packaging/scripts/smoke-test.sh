@@ -70,7 +70,7 @@ echo "--- unbound-hook hook claude-code PreToolUse (gateway_url from config.json
 smoke_tmp="$(mktemp -d)"
 trap 'rm -rf "$smoke_tmp"' EXIT
 mkdir -p "$smoke_tmp/home/.unbound" "$smoke_tmp/bin"
-printf '%s' '{"api_key":"smoke-key","gateway_url":"https://127.0.0.1:9"}' \
+printf '%s' '{"device_token":"smoke-key","gateway_url":"https://127.0.0.1:9"}' \
   > "$smoke_tmp/home/.unbound/config.json"
 cat > "$smoke_tmp/bin/curl" <<'SHIM'
 #!/bin/sh
@@ -83,7 +83,7 @@ cat > /dev/null
 exit 7
 SHIM
 chmod +x "$smoke_tmp/bin/curl"
-out="$(printf '%s' "$sample" | env -u UNBOUND_GATEWAY_URL -u UNBOUND_DEVICE_TOKEN -u UNBOUND_CLAUDE_API_KEY \
+out="$(printf '%s' "$sample" | env -u UNBOUND_GATEWAY_URL -u UNBOUND_DEVICE_TOKEN \
   HOME="$smoke_tmp/home" PATH="$smoke_tmp/bin:$PATH" \
   SMOKE_CURL_LOG="$smoke_tmp/curl.log" "$hook" hook claude-code PreToolUse)"
 echo "$out"

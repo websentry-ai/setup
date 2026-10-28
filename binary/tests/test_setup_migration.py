@@ -177,7 +177,7 @@ def test_setup_full_run_configures_everything(env):
 
     # per-user config written for every tool (same device key)
     cfg = json.loads((env["home"] / ".unbound" / "config.json").read_text())
-    assert cfg["api_key"] == "per-device-key"
+    assert cfg["device_token"] == "per-device-key"
     assert cfg["base_url"] == "https://backend.getunbound.ai"
 
     # completion notify fired once per tool (5: claude, cursor, codex, copilot, augment)
@@ -321,7 +321,7 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
         (p / ".self_update_check").write_text("")
         (p / ".self_update.lock").write_text("")
     (home / ".unbound").mkdir(exist_ok=True)
-    (home / ".unbound" / "config.json").write_text(json.dumps({"api_key": "KEEP-ME"}))
+    (home / ".unbound" / "config.json").write_text(json.dumps({"device_token": "KEEP-ME"}))
     # python-era copilot registration (commands point at unbound.py)
     (home / ".copilot" / "hooks" / "unbound.json").write_text(json.dumps(
         {"version": 1, "hooks": {"PreToolUse": [
@@ -376,7 +376,7 @@ def _assert_swept(home: Path, tmp: Path):
     assert aug_settings.get("editorSetting") == "keep"
     assert "hooks" not in aug_settings
     # config.json preserved byte-for-byte
-    assert json.loads((home / ".unbound" / "config.json").read_text()) == {"api_key": "KEEP-ME"}
+    assert json.loads((home / ".unbound" / "config.json").read_text()) == {"device_token": "KEEP-ME"}
 
 
 def test_sweep_full_python_install(env):
@@ -472,12 +472,12 @@ def test_sweep_half_installed(env):
     (home / ".local" / "share" / "unbound").mkdir(parents=True)
     (home / ".local" / "share" / "unbound" / "install.sh").write_text("#!/bin/bash")
     (home / ".unbound").mkdir()
-    (home / ".unbound" / "config.json").write_text(json.dumps({"api_key": "KEEP-ME"}))
+    (home / ".unbound" / "config.json").write_text(json.dumps({"device_token": "KEEP-ME"}))
     status, reason = migration.run_sweep(log=lambda *_: None)
     assert (status, reason) == ("configured", None)
     assert not (home / ".claude" / "hooks" / "unbound.py").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
-    assert json.loads((home / ".unbound" / "config.json").read_text()) == {"api_key": "KEEP-ME"}
+    assert json.loads((home / ".unbound" / "config.json").read_text()) == {"device_token": "KEEP-ME"}
 
 
 def test_sweep_previously_binary_is_noop(env):
@@ -497,7 +497,7 @@ def test_sweep_runs_inside_setup(env):
     # swept AND freshly configured
     assert not (env["home"] / ".claude" / "hooks" / "unbound.py").exists()
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
-    assert json.loads((env["home"] / ".unbound" / "config.json").read_text())["api_key"] == "per-device-key"
+    assert json.loads((env["home"] / ".unbound" / "config.json").read_text())["device_token"] == "per-device-key"
     # the python-era managed scripts are removed; codex now lives in its system hooks.json
     for tool in ("managed-claude", "enterprise-cursor"):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()

@@ -1,12 +1,12 @@
 """Where the device key lands, and the two places this installer deliberately differs.
 
-Tier 1 is `UNBOUND_PI_API_KEY` in each user's rc files. Tier 3 is `api_key` in that user's
+Tier 1 is `UNBOUND_PI_API_KEY` in each user's rc files. Tier 3 is `device_token` in that user's
 `~/.unbound/config.json`. Both are written, because an rc export is invisible to a shell
 that is already open and to a GUI-launched pi -- but:
 
   * an rc file is EXECUTED by the user's login shell, so the value passes a charset gate
     before any append (`_is_safe_env_value`, an addition to the Augment analog); and
-  * `config.json` `api_key` is written by ownership, where Augment assigns unconditionally --
+  * `config.json` `device_token` is written by ownership, where Augment assigns unconditionally --
     that file is the shared identity store for unbound-cli, Cursor, Claude Code, Codex,
     Copilot and Augment, and clobbering it would repoint all of them at this device key. A
     key THIS installer wrote is still rotatable, tracked by a digest beside it.
@@ -280,7 +280,7 @@ def test_an_absent_api_key_is_written(unix, passthrough, home):
     assert unix.write_unbound_config_for_user("alice", home, KEY,
                                               urls={"base_url": "https://b.test"}) is True
     config = json.loads((home / ".unbound" / "config.json").read_text())
-    assert config["api_key"] == KEY
+    assert config["device_token"] == KEY
     assert config["base_url"] == "https://b.test"
 
 
@@ -292,7 +292,7 @@ def test_an_existing_different_api_key_is_left_byte_identical(unix, passthrough,
     unbound_dir.mkdir()
     config_path = unbound_dir / "config.json"
     config_path.write_text(json.dumps({
-        "api_key": "the-users-own-key-do-not-touch",
+        "device_token": "the-users-own-key-do-not-touch",
         "email": "alice@acme.test",
         "org_name": "Acme",
         "base_url": "https://old.test",
@@ -303,7 +303,7 @@ def test_an_existing_different_api_key_is_left_byte_identical(unix, passthrough,
         "frontend_url": "https://app.test"}) is True
 
     config = json.loads(config_path.read_text())
-    assert config["api_key"] == "the-users-own-key-do-not-touch"
+    assert config["device_token"] == "the-users-own-key-do-not-touch"
     assert KEY not in config_path.read_text()
     # URLs are tenant configuration, not identity, so they DO update.
     assert config["base_url"] == "https://new.test"
@@ -323,11 +323,11 @@ def test_a_rotated_key_replaces_the_one_this_installer_wrote(unix, passthrough, 
     config_path = home / ".unbound" / "config.json"
 
     assert unix.write_unbound_config_for_user("alice", home, "pi-key-v1") is True
-    assert json.loads(config_path.read_text())["api_key"] == "pi-key-v1"
+    assert json.loads(config_path.read_text())["device_token"] == "pi-key-v1"
 
     assert unix.write_unbound_config_for_user("alice", home, "pi-key-v2") is True
     config = json.loads(config_path.read_text())
-    assert config["api_key"] == "pi-key-v2"
+    assert config["device_token"] == "pi-key-v2"
     assert "pi-key-v1" not in config_path.read_text(), "the revoked key survived the push"
 
 
@@ -339,11 +339,11 @@ def test_a_key_the_user_manages_is_still_never_rotated(unix, passthrough, home):
     assert unix.write_unbound_config_for_user("alice", home, "pi-key-v1") is True
 
     config = json.loads(config_path.read_text())
-    config["api_key"] = "the-users-own-key-do-not-touch"
+    config["device_token"] = "the-users-own-key-do-not-touch"
     config_path.write_text(json.dumps(config, indent=2))
 
     assert unix.write_unbound_config_for_user("alice", home, "pi-key-v2") is True
-    assert json.loads(config_path.read_text())["api_key"] == "the-users-own-key-do-not-touch"
+    assert json.loads(config_path.read_text())["device_token"] == "the-users-own-key-do-not-touch"
     assert "pi-key-v2" not in config_path.read_text()
 
 
@@ -367,14 +367,14 @@ def test_a_pre_existing_identical_key_is_adopted_rather_than_orphaned(unix, pass
     unbound_dir = home / ".unbound"
     unbound_dir.mkdir()
     config_path = unbound_dir / "config.json"
-    config_path.write_text(json.dumps({"api_key": "pi-key-v1", "email": "alice@acme.test"}))
+    config_path.write_text(json.dumps({"device_token": "pi-key-v1", "email": "alice@acme.test"}))
 
     assert unix.write_unbound_config_for_user("alice", home, "pi-key-v1") is True
     assert unix.MDM_KEY_PROVENANCE_FIELD in json.loads(config_path.read_text())
 
     assert unix.write_unbound_config_for_user("alice", home, "pi-key-v2") is True
     config = json.loads(config_path.read_text())
-    assert config["api_key"] == "pi-key-v2"
+    assert config["device_token"] == "pi-key-v2"
     assert config["email"] == "alice@acme.test", "the merge still preserves everything else"
 
 
@@ -394,7 +394,7 @@ def test_a_corrupt_config_is_replaced_rather_than_fatal(unix, passthrough, home)
     unbound_dir.mkdir()
     (unbound_dir / "config.json").write_text("{ this is not json")
     assert unix.write_unbound_config_for_user("alice", home, KEY) is True
-    assert json.loads((unbound_dir / "config.json").read_text())["api_key"] == KEY
+    assert json.loads((unbound_dir / "config.json").read_text())["device_token"] == KEY
 
 
 @pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
@@ -402,14 +402,14 @@ def test_a_corrupt_config_is_replaced_rather_than_fatal(unix, passthrough, home)
 def test_an_unreadable_config_is_refused_not_replaced(unix, passthrough, home):
     """Unreadable is not the same as corrupt. A mode-000 config in a writable directory cannot
     be read and CAN still be replaced, and publishing a fresh object over it would drop this
-    user's email, org and the api_key six tools authenticate with -- replacing their own
+    user's email, org and the device_token six tools authenticate with -- replacing their own
     credential with the device key, the exact clobber the ownership check exists to prevent.
     A file that merely fails to parse has nothing left in it to lose; one we could not read we
     know nothing about. Same rule append_to_file already applies to rc files."""
     unbound_dir = home / ".unbound"
     unbound_dir.mkdir()
     config_path = unbound_dir / "config.json"
-    original = json.dumps({"api_key": "the-users-own-key", "email": "alice@acme.test"})
+    original = json.dumps({"device_token": "the-users-own-key", "email": "alice@acme.test"})
     config_path.write_text(original)
     os.chmod(config_path, 0o000)
     try:
@@ -470,3 +470,12 @@ def test_the_env_gate_is_stated_as_an_addition(unix):
     body = src.split("def _is_safe_env_value")[1].split("\ndef ")[0]
     assert "EXECUTED" in body or "executed" in body
     assert "allow-list" in body
+
+
+def test_a_leftover_api_key_is_replaced_by_the_device_token(unix, passthrough, home):
+    config_path = home / ".unbound" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({"api_key": "old-login-key", "email": "alice@acme.test"}))
+    assert unix.write_unbound_config_for_user("alice", home, KEY) is True
+    config = json.loads(config_path.read_text())
+    assert (config.get("device_token"), "api_key" in config, config["email"]) == (KEY, False, "alice@acme.test")

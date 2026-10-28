@@ -5556,15 +5556,14 @@ def get_api_key():
     cursor-from-Finder issue. setup.py already writes the key to
     ~/.unbound/config.json, so use it as a tier-2 lookup.
     """
-    key = os.getenv('UNBOUND_DEVICE_TOKEN') or os.getenv('UNBOUND_CLAUDE_API_KEY')
+    key = os.getenv('UNBOUND_DEVICE_TOKEN')
     if key:
         return key
     try:
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
             cfg = json.loads(f.read())
-            # api_key first: every writer still sets it, and older writers set only it.
-            return cfg.get('api_key') or cfg.get('device_token')
+            return cfg.get('device_token')
     except FileNotFoundError:
         return None
     except json.JSONDecodeError as e:
@@ -5685,17 +5684,16 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict, cwd: Option
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        # api_key first: every writer still sets it, and older writers set only it.
-        api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
+        api_key = unbound_config.get("device_token")
         backend_url = unbound_config.get("base_url")
         if not (api_key and backend_url):
-            api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CLAUDE_API_KEY')
+            api_key = _machine_env('UNBOUND_DEVICE_TOKEN')
             backend_url = _machine_env('UNBOUND_BACKEND_URL')
             if backend_url and not backend_url.startswith("https://"):
                 log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
                 backend_url = None
         if not api_key or not backend_url:
-            log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
+            log_error("mcp scan dispatch: device_token/base_url missing in config", 'mcp_server')
             return
 
         if RUNNING_FROZEN:
@@ -6202,7 +6200,7 @@ def _diag_unbound_client():
         for k in ('email', 'org_name', 'gateway_url', 'base_url', 'frontend_url', 'discovery_local_dir'):
             if c.get(k):
                 out[k] = c[k]
-        out['api_key'] = 'present' if c.get('api_key') else 'absent'
+        out['device_token'] = 'present' if c.get('device_token') else 'absent'
     except Exception:
         out['config'] = 'missing-or-unreadable'
     for fname in ('identity.json', 'discovery-cache.json'):
@@ -6541,7 +6539,7 @@ def _render_mcp_diagnostic(d):
 def _run_mcp_diagnostic_cli():
     server = os.environ.get('UNBOUND_DIAG_SERVER') or ''
     cwd = os.environ.get('UNBOUND_DIAG_CWD') or None
-    api_key = os.environ.get('UNBOUND_DIAG_API_KEY') or get_api_key()
+    api_key = os.environ.get('UNBOUND_DIAG_DEVICE_TOKEN') or get_api_key()
     if not server or not api_key:
         return
     try:
@@ -6598,7 +6596,7 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
     # and loses it) and forward it so the replay sees the real --plugin-*/--mcp-config.
     child_env = {'UNBOUND_DIAG_SERVER': server_name,
                  'UNBOUND_DIAG_CWD': cwd or '',
-                 'UNBOUND_DIAG_API_KEY': api_key}
+                 'UNBOUND_DIAG_DEVICE_TOKEN': api_key}
     try:
         found = _claude_launch_argv()
         if found:
@@ -6771,18 +6769,17 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            # api_key first: every writer still sets it, and older writers set only it.
-            api_key = unbound_config.get("api_key") or unbound_config.get("device_token")
+            api_key = unbound_config.get("device_token")
             backend_url = unbound_config.get("base_url")
             if not (api_key and backend_url):
                 # Resolve as a unit -- never pair a config field with an env field.
-                api_key = _machine_env('UNBOUND_DEVICE_TOKEN') or _machine_env('UNBOUND_CLAUDE_API_KEY')
+                api_key = _machine_env('UNBOUND_DEVICE_TOKEN')
                 backend_url = _machine_env('UNBOUND_BACKEND_URL')
                 if backend_url and not backend_url.startswith("https://"):
                     log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')
                     backend_url = None
             if not api_key:
-                log_error("discovery gate: no api_key in env or config", 'discovery_gate')
+                log_error("discovery gate: no device token in env or config", 'discovery_gate')
                 return
             if not backend_url:
                 log_error("discovery gate: no base_url in config or env", 'discovery_gate')

@@ -1232,7 +1232,7 @@ class TestLocalScriptFingerprint(ProcessPreToolUseBase):
 
     def _scan_payload(self, server_config):
         config_path = self.root / "unbound.json"
-        _write_json(config_path, {"api_key": "secret-api-key",
+        _write_json(config_path, {"device_token": "secret-api-key",
                                   "base_url": "https://backend.example.com"})
         with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), \
              patch.object(unbound, "RUNNING_FROZEN", True), \

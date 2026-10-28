@@ -21,11 +21,11 @@ HOOKS = {
 }
 
 TOOL_API_KEY_ENV = {
-    "claude-code": "UNBOUND_CLAUDE_API_KEY",
-    "cursor": "UNBOUND_CURSOR_API_KEY",
-    "copilot": "UNBOUND_COPILOT_API_KEY",
-    "codex": "UNBOUND_CODEX_API_KEY",
-    "augment": "UNBOUND_AUGMENT_API_KEY",
+    "claude-code": "UNBOUND_DEVICE_TOKEN",
+    "cursor": "UNBOUND_DEVICE_TOKEN",
+    "copilot": "UNBOUND_DEVICE_TOKEN",
+    "codex": "UNBOUND_DEVICE_TOKEN",
+    "augment": "UNBOUND_DEVICE_TOKEN",
 }
 
 
@@ -47,7 +47,7 @@ def windows_hook(request, tmp_path, monkeypatch):
     state_dir.mkdir()
     config_path = state_dir / "config.json"
     config_path.write_text(
-        json.dumps({"api_key": "test-key", "base_url": "https://backend.example"}),
+        json.dumps({"device_token": "test-key", "base_url": "https://backend.example"}),
         encoding="utf-8",
     )
 
@@ -358,7 +358,7 @@ def test_partial_config_does_not_mix_with_env(request, windows_hook, monkeypatch
     tool = request.node.callspec.params["windows_hook"]
 
     hook.UNBOUND_CONFIG_PATH.write_text(
-        json.dumps({"api_key": "file-key"}), encoding="utf-8"
+        json.dumps({"device_token": "file-key"}), encoding="utf-8"
     )
     monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "env-key")
     monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://env.example")

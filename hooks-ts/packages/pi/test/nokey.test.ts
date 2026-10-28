@@ -196,7 +196,7 @@ test("RES-06 with a key: session_start is silent and tool_call issues exactly on
 
 test("RES-06 the key resolves from ~/.unbound/config.json when no env var is set", async () => {
   const api = await startMockApi({ mode: "allow" });
-  const home = createFakeHome({ api_key: "unb_from_config_file_000", gateway_url: api.url });
+  const home = createFakeHome({ device_token: "unb_from_config_file_000", gateway_url: api.url });
   try {
     const stub = await build({
       env: {},

@@ -97,12 +97,12 @@ def run(argv) -> int:
     backend_url = m0.normalize_url(opts["backend_url"]) if opts["backend_url"] else None
     for username, home_dir in user_homes:
         cfg = _read_user_config(m0, username, home_dir) or {}
-        api_key = api_key or cfg.get("api_key")
+        api_key = api_key or cfg.get("device_token")
         backend_url = backend_url or cfg.get("base_url")
         if api_key and backend_url:
             break
     if not opts["dry_run"] and (not api_key or not backend_url):
-        print("Error: no api_key/base_url found in ~/.unbound/config.json for the "
+        print("Error: no device_token/base_url found in ~/.unbound/config.json for the "
               "selected users — run `unbound-hook setup` first.", file=sys.stderr)
         return 1
 

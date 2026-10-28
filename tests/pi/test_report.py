@@ -35,7 +35,7 @@ class TestWriteUnboundConfig:
         """The user path writes unconditionally: unbound-cli already handed us this
         user's own key (the MDM path in 10-02 is the one that must not clobber)."""
         pi_setup.write_unbound_config("k-1", {})
-        assert json.loads(fake_home.config_path.read_text())["api_key"] == "k-1"
+        assert json.loads(fake_home.config_path.read_text())["device_token"] == "k-1"
 
     def test_it_merges_rather_than_truncating_other_keys(self, pi_setup, fake_home):
         """~/.unbound/config.json is shared with unbound-cli and five other tools."""
@@ -44,7 +44,8 @@ class TestWriteUnboundConfig:
         config = json.loads(fake_home.config_path.read_text())
         assert config["email"] == "a@b.c"
         assert config["org_name"] == "Acme"
-        assert config["api_key"] == "k-2"
+        assert config["device_token"] == "k-2"
+        assert "api_key" not in config
         assert config["base_url"] == "https://backend.example.com"
 
     def test_it_sets_only_non_empty_urls(self, pi_setup, fake_home):
@@ -59,7 +60,7 @@ class TestWriteUnboundConfig:
         fake_home.unbound_dir.mkdir(parents=True, exist_ok=True)
         fake_home.config_path.write_text("{not json")
         assert pi_setup.write_unbound_config("k-3", {}) is True
-        assert json.loads(fake_home.config_path.read_text())["api_key"] == "k-3"
+        assert json.loads(fake_home.config_path.read_text())["device_token"] == "k-3"
 
     def test_an_unwritable_config_returns_false_rather_than_raising(self, pi_setup, monkeypatch):
         def deny(*a, **k):
@@ -161,7 +162,7 @@ class TestMainHappyPath:
                             ["setup.py", "--api-key", "k-user", "--backend-url", "https://b.example.com"])
         assert pi_setup.main() is True
         assert pi_setup.artifact_path(fake_home.agent_dir).read_bytes() == ARTIFACT
-        assert json.loads(fake_home.config_path.read_text())["api_key"] == "k-user"
+        assert json.loads(fake_home.config_path.read_text())["device_token"] == "k-user"
         body = wired[0]
         assert body["tool_type"] == "pi"
         assert body["install_mode"] == "user"
@@ -260,7 +261,7 @@ class TestKeyResolution:
         monkeypatch.setattr(pi_setup.sys, "argv", ["setup.py", "--domain", "app.example.com"])
         assert pi_setup.main() is True
         assert seen["url"] == "https://app.example.com"
-        assert json.loads(fake_home.config_path.read_text())["api_key"] == "minted-by-callback"
+        assert json.loads(fake_home.config_path.read_text())["device_token"] == "minted-by-callback"
         assert captured_reports[0]["tool_type"] == "pi"
 
     def test_a_failed_callback_returns_false(self, pi_setup, fake_home, monkeypatch):

@@ -1,6 +1,6 @@
 // RES-06 — identity resolution.
 //
-// Four key tiers (UNBOUND_PI_API_KEY -> UNBOUND_API_KEY -> ~/.unbound/config.json api_key -> none)
+// Four key tiers (UNBOUND_PI_API_KEY -> UNBOUND_API_KEY -> ~/.unbound/config.json device_token -> none)
 // and three URL tiers (UNBOUND_GATEWAY_URL -> config.gateway_url -> https://api.getunbound.ai),
 // mirroring unbound-cli `src/config.js:95-97`. Every malformed / unreadable input must resolve to
 // `undefined` rather than throw: an exception escaping a pi `tool_call` handler is a BLOCK
@@ -25,7 +25,7 @@ import {
 const NO_ENV: NodeJS.ProcessEnv = {};
 
 test("resolveApiKey: UNBOUND_PI_API_KEY beats the config file", () => {
-  const home = createFakeHome({ api_key: "from-file" });
+  const home = createFakeHome({ device_token: "from-file" });
   try {
     assert.equal(
       resolveApiKey({ UNBOUND_PI_API_KEY: "from-pi-env", UNBOUND_API_KEY: "from-generic-env" }, home.homeDir),
@@ -37,7 +37,7 @@ test("resolveApiKey: UNBOUND_PI_API_KEY beats the config file", () => {
 });
 
 test("resolveApiKey: the generic UNBOUND_API_KEY is the second tier", () => {
-  const home = createFakeHome({ api_key: "from-file" });
+  const home = createFakeHome({ device_token: "from-file" });
   try {
     assert.equal(resolveApiKey({ UNBOUND_API_KEY: "from-generic-env" }, home.homeDir), "from-generic-env");
   } finally {
@@ -45,8 +45,8 @@ test("resolveApiKey: the generic UNBOUND_API_KEY is the second tier", () => {
   }
 });
 
-test("resolveApiKey: falls back to config.json api_key when no env var is set", () => {
-  const home = createFakeHome({ api_key: "from-file" });
+test("resolveApiKey: falls back to config.json device_token when no env var is set", () => {
+  const home = createFakeHome({ device_token: "from-file" });
   try {
     assert.equal(resolveApiKey(NO_ENV, home.homeDir), "from-file");
   } finally {
@@ -75,7 +75,7 @@ test("resolveApiKey: malformed JSON -> undefined, never throws", () => {
 });
 
 test("resolveApiKey: an unreadable config file -> undefined, never throws", { skip: process.getuid?.() === 0 ? "root can read 0000 files" : false }, () => {
-  const home = createFakeHome({ api_key: "from-file" });
+  const home = createFakeHome({ device_token: "from-file" });
   const configFile = join(home.homeDir, ".unbound", "config.json");
   chmodSync(configFile, 0o000);
   try {
@@ -87,11 +87,11 @@ test("resolveApiKey: an unreadable config file -> undefined, never throws", { sk
   }
 });
 
-test("resolveApiKey: a non-string or blank api_key is rejected", () => {
-  const numeric = createFakeHome({ api_key: 12345 });
-  const blank = createFakeHome({ api_key: "   " });
-  const empty = createFakeHome({ api_key: "" });
-  const usable = createFakeHome({ api_key: "from-file" });
+test("resolveApiKey: a non-string or blank device_token is rejected", () => {
+  const numeric = createFakeHome({ device_token: 12345 });
+  const blank = createFakeHome({ device_token: "   " });
+  const empty = createFakeHome({ device_token: "" });
+  const usable = createFakeHome({ device_token: "from-file" });
   try {
     assert.equal(resolveApiKey(NO_ENV, numeric.homeDir), undefined);
     assert.equal(resolveApiKey(NO_ENV, blank.homeDir), undefined);
@@ -108,10 +108,10 @@ test("resolveApiKey: a non-string or blank api_key is rejected", () => {
 
 test("readUnboundConfig: a blank or relative home is refused, never resolved against cwd", () => {
   // os.homedir() can throw and the pi adapter's fallback is "". join("", ".unbound/config.json")
-  // would read the *repository* pi was started in, letting a planted file supply api_key and
+  // would read the *repository* pi was started in, letting a planted file supply device_token and
   // gateway_url — i.e. ship the Bearer token to an attacker's https host and replace the policy
   // engine. Every non-absolute home must therefore read as "no config at all".
-  const home = createFakeHome({ api_key: "from-file", gateway_url: "https://evil.example.com" });
+  const home = createFakeHome({ device_token: "from-file", gateway_url: "https://evil.example.com" });
   try {
     for (const bogus of ["", ".", "./x", "relative/path"]) {
       assert.deepEqual(readUnboundConfig(bogus), {});
@@ -129,7 +129,7 @@ test("resolveApiKey: surrounding whitespace is stripped from every tier", () => 
   // A padded key would be sent as `Bearer <key>\n`, which undici rejects as an invalid header
   // value (and the gateway would 401 anyway) — and both outcomes fail OPEN, i.e. silently no
   // enforcement at all. Every tier must therefore hand back a trimmed token.
-  const home = createFakeHome({ api_key: "  from-file\n" });
+  const home = createFakeHome({ device_token: "  from-file\n" });
   try {
     assert.equal(resolveApiKey({ UNBOUND_PI_API_KEY: "pi-key\n" }, home.homeDir), "pi-key");
     assert.equal(resolveApiKey({ UNBOUND_API_KEY: " generic-key " }, home.homeDir), "generic-key");
@@ -315,7 +315,7 @@ test("readUnboundConfig: a FIFO config.json is an empty config, not a permanent 
 
 test("readUnboundConfig: a config above MAX_CONFIG_BYTES is refused, and identity falls through", () => {
   // Padded past the cap with a key nothing reads, so the only thing under test is the size guard.
-  const home = createFakeHome({ api_key: "from-file", pad: "x".repeat(MAX_CONFIG_BYTES) });
+  const home = createFakeHome({ device_token: "from-file", pad: "x".repeat(MAX_CONFIG_BYTES) });
   try {
     assert.deepEqual(readUnboundConfig(home.homeDir), {});
     // An unreadable config is an INERT extension, never a block: no key, default URL.
@@ -334,7 +334,7 @@ test("readUnboundConfig: a symlinked config.json is refused even when the target
   const home = createFakeHome();
   try {
     const target = join(home.homeDir, "real_config.json");
-    writeFileSync(target, JSON.stringify({ api_key: "from-link" }), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(target, JSON.stringify({ device_token: "from-link" }), { encoding: "utf8", mode: 0o600 });
     symlinkSync(target, join(home.homeDir, ".unbound", "config.json"));
 
     // Following the link is what would let a symlink-to-FIFO block; `unbound login` writes a real

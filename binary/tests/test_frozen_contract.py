@@ -21,12 +21,12 @@ from conftest import REPO, TOOL_PY
 
 MCP_SCAN_TOOLS = ("claude-code", "cursor", "codex")  # copilot has no mcp scan
 SKILL_SYNC_TOOLS = {
-    "claude-code": "UNBOUND_CLAUDE_API_KEY",
-    "cursor": "UNBOUND_CURSOR_API_KEY",
-    "copilot": "UNBOUND_COPILOT_API_KEY",
-    "codex": "UNBOUND_CODEX_API_KEY",
+    "claude-code": "UNBOUND_DEVICE_TOKEN",
+    "cursor": "UNBOUND_DEVICE_TOKEN",
+    "copilot": "UNBOUND_DEVICE_TOKEN",
+    "codex": "UNBOUND_DEVICE_TOKEN",
 }
-API_KEY_ENV = {**SKILL_SYNC_TOOLS, "augment": "UNBOUND_AUGMENT_API_KEY"}
+API_KEY_ENV = {**SKILL_SYNC_TOOLS, "augment": "UNBOUND_DEVICE_TOKEN"}
 
 
 @pytest.fixture
@@ -48,7 +48,7 @@ def frozen_module(tmp_path, monkeypatch, request):
     fake_bin.write_text("#!/bin/sh\n")
     config = tmp_path / "config.json"
     config.write_text(json.dumps(
-        {"api_key": "contract-key", "base_url": "https://backend.example"}))
+        {"device_token": "contract-key", "base_url": "https://backend.example"}))
     monkeypatch.setattr(m, "FROZEN_DISCOVERY_BIN", str(fake_bin))
     monkeypatch.setattr(m, "UNBOUND_CONFIG_PATH", config)
     for attr in ("DISCOVERY_CACHE_PATH", "DISCOVERY_LOCK_PATH",

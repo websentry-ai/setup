@@ -9,7 +9,7 @@ Run as root, once per device, from an MDM (Jamf and friends):
 What lands on disk, per enumerated user: one file, `<home>/.pi/agent/extensions/unbound/
 index.js`, mode 0644, owned by that user, plus a sibling `index.js.sha256` so an operator
 can verify it by hand. The key is placed where the extension looks for it: an
-`export UNBOUND_PI_API_KEY=...` line in that user's shell rc files, and `api_key` in that
+`export UNBOUND_PI_API_KEY=...` line in that user's shell rc files, and `device_token` in that
 user's `~/.unbound/config.json` -- the latter ONLY when it is absent (see below).
 
 Writing into another user's home as root is the dangerous part of this script, so every
@@ -33,12 +33,13 @@ in-home write goes through three primitives, all of them ported from
 
 Two deliberate divergences from the Augment analog, both called out at the code:
 
-  * `config.json`'s `api_key` is not assigned unconditionally. That file is the shared
+  * `config.json`'s `device_token` is not assigned unconditionally. That file is the shared
     identity store for unbound-cli and five other tools; overwriting a key the user minted
     with `unbound login` would silently repoint all of them at this device key. It IS
     replaced when this installer is the one that wrote it -- recognised by a
     `pi_mdm_api_key_sha256` digest recorded beside it -- or a revoked key would survive every
-    later push in the one tier a GUI-launched pi reads.
+    later push in the one tier a GUI-launched pi reads. A leftover `api_key` is always
+    removed: no hook or CLI reads it any more.
   * an `export` line is only written after `_is_safe_env_value()` passes, because an rc file
     is a shell script and an unvalidated value in it is command injection. The rc file is
     also published with its group and other bits stripped: the line holds a plaintext key,
@@ -101,7 +102,7 @@ PI_AGENT_DIR_SEGMENTS = (".pi", "agent")
 # writing the generic UNBOUND_API_KEY instead would hand this device key to six other tools.
 ENV_API_KEY_PI = "UNBOUND_PI_API_KEY"
 
-# How this installer remembers which `api_key` in the shared config.json is its own, so a
+# How this installer remembers which `device_token` in the shared config.json is its own, so a
 # rotation can replace the value it wrote without ever touching one the user manages. A
 # digest, not the key: the field is provenance, and the key itself is already in the same
 # file. Read by nothing else -- the other tools read named fields and ignore extras.
@@ -1379,7 +1380,7 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
                 config = {}
             except OSError as e:
                 # A file we could not READ is a file we know nothing about. Publishing a fresh
-                # object over it would drop this user's email, org and the api_key six tools
+                # object over it would drop this user's email, org and the device token six tools
                 # authenticate with -- and would hand them the device key in its place, which
                 # is the exact clobber the ownership check above exists to prevent. Same rule
                 # as append_to_file: refuse rather than rewrite what we could not read.
@@ -1387,10 +1388,10 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
                 return False
         if not isinstance(config, dict):
             config = {}
-        # DELIBERATE DIVERGENCE from augment/hooks/mdm/setup.py:770, which assigns
-        # config['api_key'] unconditionally. This file is the shared identity store for
+        # DELIBERATE DIVERGENCE from augment/hooks/mdm/setup.py, which assigns
+        # config['device_token'] unconditionally. This file is the shared identity store for
         # unbound-cli and five other tools (Cursor, Claude Code, Codex, Copilot, Augment):
-        # on a device where the user has run `unbound login`, overwriting api_key would
+        # on a device where the user has run `unbound login`, overwriting device_token would
         # silently repoint ALL of them at this device key.
         #
         # But a blanket "never overwrite" was the other half of the bug. The value this
@@ -1403,14 +1404,15 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
         # So ownership is tracked instead of guessed: the value is replaced when it is
         # absent, when it is already the key we are about to write, or when its digest
         # matches the one we recorded the last time we wrote it. Anything else is the user's
-        # own credential and is left byte-identical.
-        existing = config.get("api_key")
+        # own credential and is kept.
+        existing = config.get("device_token")
         existing = existing.strip() if isinstance(existing, str) else ""
         if (not existing or existing == api_key
                 or config.get(MDM_KEY_PROVENANCE_FIELD) == _key_provenance(existing)):
             config["device_token"] = api_key
-            config["api_key"] = api_key  # read by older CLIs and hooks
             config[MDM_KEY_PROVENANCE_FIELD] = _key_provenance(api_key)
+        # No hook or CLI reads api_key any more, so a leftover one is dropped whoever wrote it.
+        config.pop("api_key", None)
         if urls:
             # URLs are tenant configuration, not identity, so they DO update unconditionally.
             config.update({k: v for k, v in urls.items() if v})
@@ -1505,7 +1507,7 @@ def _clear_in_home(extdir: Path) -> List[str]:
 def clear_setup() -> bool:
     """Undo this installer across every home: our two files, and our export line.
 
-    Never touches ~/.unbound/config.json -- its api_key is shared with five other tools, so
+    Never touches ~/.unbound/config.json -- its device_token is shared with five other tools, so
     removing it would log the user out of all of them. Posts nothing: install_state is an
     install-time enum with no uninstall value, and no installer in this repo reports a clear.
     """
@@ -1553,7 +1555,7 @@ def clear_setup() -> bool:
         print(f"  {username}: {files}; {ENV_API_KEY_PI}: {env_status}")
 
     print("\nThe extension directories, and every other file in them, were left in place.")
-    print("~/.unbound/config.json was NOT touched: its api_key is shared with the other")
+    print("~/.unbound/config.json was NOT touched: its device_token is shared with the other")
     print("Unbound tools on this device.")
     print("=" * 60)
     print("Clear Complete!")

@@ -31,11 +31,6 @@ def _run(cmd, payload, home, extra_env=None, stdin_close=False):
     env.setdefault("UNBOUND_GATEWAY_URL", "http://127.0.0.1:9")
     env.pop("UNBOUND_HOOK_FROZEN", None)
     env.pop("UNBOUND_DEVICE_TOKEN", None)
-    env.pop("UNBOUND_CLAUDE_API_KEY", None)
-    env.pop("UNBOUND_CURSOR_API_KEY", None)
-    env.pop("UNBOUND_COPILOT_API_KEY", None)
-    env.pop("UNBOUND_CODEX_API_KEY", None)
-    env.pop("UNBOUND_AUGMENT_API_KEY", None)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -75,5 +70,5 @@ def discovery_enabled_home(sandbox_home):
     SessionStart dispatches a discovery run."""
     (sandbox_home / ".unbound").mkdir()
     (sandbox_home / ".unbound" / "config.json").write_text(json.dumps(
-        {"api_key": "test-key", "base_url": "https://backend.example"}))
+        {"device_token": "test-key", "base_url": "https://backend.example"}))
     return sandbox_home

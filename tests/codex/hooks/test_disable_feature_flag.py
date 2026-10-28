@@ -24,7 +24,7 @@ model = "gpt-5-codex"
 
 [model_providers.unbound]
 name = "Unbound"
-env_key = "UNBOUND_CODEX_API_KEY"
+env_key = "UNBOUND_DEVICE_TOKEN"
 extra_headers = [
     "x-one",
     "x-two",

@@ -553,7 +553,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['device_token'] = api_key
-        config['api_key'] = api_key  # read by older CLIs and hooks
+        config.pop('api_key', None)
         if frontend_url:
             # Custom-tenant devices need the tenant frontend to build console links.
             config['frontend_url'] = frontend_url

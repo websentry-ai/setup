@@ -1484,10 +1484,7 @@ def test_a_failing_report_never_changes_the_decision(hook, repos, boom):
 def test_a_missing_api_key_still_denies_and_files_nothing(hook, repos, monkeypatch):
     """No api key is not a reason to let the call through. It is only a reason
     for the incident to go unrecorded."""
-    for var in ('UNBOUND_DEVICE_TOKEN', 'UNBOUND_CLAUDE_API_KEY', 'UNBOUND_CURSOR_API_KEY',
-                'UNBOUND_COPILOT_API_KEY', 'UNBOUND_CODEX_API_KEY',
-                'UNBOUND_AUGMENT_API_KEY'):
-        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv('UNBOUND_DEVICE_TOKEN', raising=False)
     _set_policies(hook, [BLOCK_ORG])
     posts = []
     stack = _stubs(hook, MagicMock(return_value={}), posts)

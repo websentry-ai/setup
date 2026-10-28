@@ -207,7 +207,7 @@ class TestDiagRender(unittest.TestCase):
             'resolution': {'sources': {'claude_json': 'miss', 'plugin_by_key': 'miss'}, 'resolved': False, 'via': None, 'config': None},
             'mcp_inventory': [{'source': 'plugin installed:context7', 'file': '/c/.mcp.json', 'servers': {'context7': 'cmd=npx, args=2'}}],
             'target_appears': {'exact': [], 'near': []},
-            'unbound_client': {'org_name': 'unbound', 'api_key': 'present'},
+            'unbound_client': {'org_name': 'unbound', 'device_token': 'present'},
             'plugin_registries': {'installed_plugins.json': ['context7'], 'cache_dir': '/cache'},
             'launch_flags': ['--permission-mode auto'],
             'project_mcp_json': [{'file': '/.mcp.json', 'servers': ['x']}],
