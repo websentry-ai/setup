@@ -2062,6 +2062,9 @@ def _backfill_is_exchange_start(entry) -> bool:
     """A real user prompt outside a subagent: where the server starts a new exchange."""
     if not isinstance(entry, dict) or entry.get('isSidechain') or entry.get('type') != 'user':
         return False
+    # Another session's message (e.g. a subagent hand-back) is model output, not a prompt.
+    if isinstance(entry.get('origin'), dict) and entry['origin'].get('kind') == 'peer':
+        return False
     msg = entry.get('message')
     return isinstance(msg, dict) and msg.get('role') == 'user' and _backfill_is_real_user_prompt(msg.get('content'))
 

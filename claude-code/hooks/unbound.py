@@ -769,6 +769,30 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
         _record_usage(entry, message, usage_by_key)
 
 
+def _is_agent_message(text, agent_messages) -> bool:
+    """Another session's message (e.g. a subagent hand-back), confirmed by a transcript record only Claude Code writes
+    for one: the prefix alone can be typed, so it never decides on its own."""
+    if not isinstance(text, str) or not text.lstrip().startswith('<agent-message '):
+        return False
+    # The whole hand-back, not an excerpt a user quotes; records are this turn's only (parse_transcript_file).
+    text = text.strip()
+    return any(m.strip() == text or m.strip().endswith('\n' + text) for m in agent_messages)
+
+
+def _peer_text(entry: Dict) -> Optional[str]:
+    """The text of a transcript record Claude Code marks as from another session (origin kind 'peer'), else None."""
+    attachment = entry.get('attachment') if isinstance(entry.get('attachment'), dict) else {}
+    origin = entry.get('origin') or attachment.get('origin')
+    if not isinstance(origin, dict) or origin.get('kind') != 'peer':
+        return None
+    text = attachment.get('prompt') if attachment else (entry.get('message') or {}).get('content')
+    if isinstance(text, list):
+        # Content blocks are matched by their text, as the submitted prompt carries it.
+        text = '\n'.join(block['text'] for block in text
+                         if isinstance(block, dict) and isinstance(block.get('text'), str))
+    return text if isinstance(text, str) and text else None
+
+
 def _typed_user_text(entry: Dict) -> str:
     """The typed text of a transcript entry, forwarded verbatim so DLP scans what
     the user wrote. Only text blocks are prompt text: tool results, meta entries
@@ -801,6 +825,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'queued_prompts': [],
         'usage': None,
         'model': None,
+        'agent_messages': [],
         'finished': False,
     }
 
@@ -828,6 +853,10 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                         entry = progress
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
+                    peer = _peer_text(entry)
+                    # Floored at the previous Stop only: a hand-back opening the turn is written as its prompt is.
+                    if peer and not (subagent_floor and not _ts_lt(subagent_floor, entry_timestamp)):
+                        conversation_data['agent_messages'].append(peer)
 
                     if entry_type == 'queue-operation':
                         # Typing while Claude is working enqueues the prompt and consumes it
@@ -886,6 +915,10 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     except Exception:
         # A read that failed fails again; re-reading it would only delay the Stop.
         conversation_data['finished'] = True
+
+    # Filtered once the whole transcript is read: a queued hand-back's own peer record follows its queue entry.
+    conversation_data['queued_prompts'] = [q for q in conversation_data['queued_prompts']
+                                           if not _is_agent_message(q, conversation_data['agent_messages'])]
 
     if include_usage:
         try:
@@ -5212,7 +5245,7 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
     return str(max(copies, key=lambda c: (c.stat().st_mtime, str(c))))
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None, agent_messages: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
     prev_prompt_id = None
@@ -5242,7 +5275,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
-            if prompt:
+            if prompt and not _is_agent_message(prompt, agent_messages or ()):
                 # The prompt's own cwd beats the session cwd for resolving a
                 # repo-level skill when the agent was opened at a parent dir. Held per
                 # prompt: a turn can carry several, each submitted from its own directory.
@@ -5339,6 +5372,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
+    elif any(_is_agent_message((e.get('event') or e).get('prompt'), agent_messages or ()) for e in events):
+        # A turn another session's message started still reports its tokens and tool calls, with no user text.
+        messages.append({'role': 'user', 'content': ''})
     
 
     all_responses = list(transcript_assistant_messages or [])
@@ -5547,6 +5583,7 @@ def process_stop_event(event: Dict, api_key: str):
 
     transcript_assistant_messages = []
     transcript_queued_prompts = []
+    transcript_agent_messages = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
@@ -5563,6 +5600,7 @@ def process_stop_event(event: Dict, api_key: str):
             if msg.get('content')
         ]
         transcript_queued_prompts = transcript_data.get('queued_prompts') or []
+        transcript_agent_messages = transcript_data.get('agent_messages') or []
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
 
@@ -5583,6 +5621,7 @@ def process_stop_event(event: Dict, api_key: str):
         request_completed=request_completed,
         cwd=event.get('cwd'),
         queued_prompts=transcript_queued_prompts,
+        agent_messages=transcript_agent_messages,
     )
 
     if exchange:
