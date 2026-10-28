@@ -3179,12 +3179,16 @@ function wget(args: string[], proxied = false): Raw[] {
     }
     if ((name === "-e" || name === "--execute") && value) {
       const [key = "", ...setting] = value.replace(/ /g, "").toLowerCase().split("=");
-      settings.set(key.replace(/_/g, ""), setting.join("="));
+      settings.set(key.replace(/[_-]/g, ""), setting.join("="));
     }
   }
+  if (["-h", "--help", "-V", "--version"].some((f) => flags.has(f))) return []; // it prints and exits before fetching anything
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
   const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
-  const direction = [...flags].some((f) => WGET_UPLOADS.has(f)) ? "out" : "in";
+  // An -e post_data, post_file, body_data or body_file setting sends as its option does.
+  const sends = [...flags].some((f) => WGET_UPLOADS.has(f)) ||
+    ["postdata", "postfile", "bodydata", "bodyfile"].some((k) => Boolean(settings.get(k)));
+  const direction = sends ? "out" : "in";
   return urls.map((url): Raw => [direction, urlHost(url, WGET_SCHEMES), undefined, undefined, proxy]);
 }
 

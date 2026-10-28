@@ -4029,6 +4029,16 @@ def _transfer_deadline(state: Dict) -> float:
     return state.setdefault('deadline', time.monotonic() + state.get('budget', _TRANSFER_TURN_BUDGET))
 
 
+def _transfer_executable(name: str) -> Optional[str]:
+    """The program's absolute path from PATH's absolute folders; Windows would otherwise run a copy planted in this
+    process's working folder first, whatever folder the child is given. None when there is none."""
+    for folder in os.environ.get('PATH', '').split(os.pathsep):
+        path = os.path.join(folder, name + ('.exe' if os.name == 'nt' else ''))
+        if os.path.isabs(folder) and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
 def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[str]:
     """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing. ssh -G
     is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked."""
@@ -4047,8 +4057,10 @@ def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[
             if options is None:
                 return None
             argv = argv[:2] + options + argv[end:]
-        # From the vetted folder, not the project's, which Windows would search for a planted ssh first.
-        result = subprocess.run(argv, cwd=folder, capture_output=True,
+        program = _transfer_executable(argv[0])
+        if program is None:
+            return None
+        result = subprocess.run([program] + argv[1:], cwd=folder, capture_output=True,
                                 text=True, timeout=min(_TRANSFER_RUN_TIMEOUT, remaining), stdin=subprocess.DEVNULL)
         return result.stdout if result.returncode == 0 else None
     except Exception:
@@ -6564,11 +6576,16 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
             urls.append(arg)
         if name in ('-e', '--execute') and value:
             key, _, setting = value.replace(' ', '').lower().partition('=')
-            settings[key.replace('_', '')] = setting
+            settings[key.replace('_', '').replace('-', '')] = setting
+    if flags & {'-h', '--help', '-V', '--version'}:
+        return []  # it prints and exits before fetching anything
     on = settings.get('useproxy', 'on') in ('on', 'yes', '1') and '--no-proxy' not in flags
     proxy = on and (proxied or any(settings.get(k) for k in ('httpproxy', 'httpsproxy', 'ftpproxy')))
-    direction = 'out' if flags & _TRANSFER_WGET_UPLOADS else 'in'
-    return [(direction, _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None, None, proxy) for url in urls]
+    # An -e post_data, post_file, body_data or body_file setting sends as its option does.
+    sends = flags & _TRANSFER_WGET_UPLOADS or \
+        any(settings.get(k) for k in ('postdata', 'postfile', 'bodydata', 'bodyfile'))
+    return [('out' if sends else 'in', _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None, None, proxy)
+            for url in urls]
 
 
 def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = None) -> tuple:

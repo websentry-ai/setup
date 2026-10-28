@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '159b41ec81bcb5922bbb900731b5914ea15f0ac117266b180b3a9dfd199e3367'
+BLOCK_SHA256 = '3a57fad76050e494f9c62118ed47808c08f48aff87e2573e5aeb4864195caec4'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -858,9 +858,27 @@ class SshLookupTests(TransferTestCase):
                                 'rsync -a f prod:/x', 'nc example.com 80 < f', 'sftp prod'):
                     hook._transfer(command, self.repo, {})
                 self.assertTrue(run.call_args_list)
-                self.assertTrue(all(list(call.args[0][:2]) == ['ssh', '-G'] for call in run.call_args_list))
+                self.assertTrue(all(os.path.isabs(call.args[0][0]) and os.path.basename(call.args[0][0]) == 'ssh' and
+                                    call.args[0][1] == '-G' for call in run.call_args_list))
                 self.assertIsNone(hook._transfer_run(['curl', 'https://example.com'], None, {}))
                 self.assertIsNone(hook._transfer_run(['git', 'remote', 'get-url', 'origin'], None, {}))
+
+    def test_ssh_is_run_from_an_absolute_path_never_from_the_working_folder(self):
+        # Windows searches this process's working folder before PATH, as a relative PATH entry does everywhere.
+        planted = Path(self.repo, 'ssh')
+        planted.write_text('#!/bin/sh\necho "hostname 8.8.8.8"\n')
+        planted.chmod(0o755)
+        here = os.getcwd()
+        os.chdir(self.repo)
+        self.addCleanup(os.chdir, here)
+        with patch.dict(os.environ, {'PATH': '.' + os.pathsep + os.environ['PATH']}):
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__):
+                    program = hook._transfer_executable('ssh')
+                    self.assertTrue(os.path.isabs(program))
+                    self.assertNotEqual(os.path.realpath(os.path.dirname(program)), os.path.realpath(self.repo))
+                    self.assertEqual(hook._transfer('scp f prod:/tmp', self.repo, {})['endpoints'],
+                                     [_endpoint('out', 'prod', 'private', '10.0.4.12')])
 
 
 class TimeLimitTests(TransferTestCase):
