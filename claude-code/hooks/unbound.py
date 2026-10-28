@@ -5423,13 +5423,17 @@ def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
     return restored + kept if restored else kept
 
 
+def _log_event_name(log: Dict) -> Optional[str]:
+    return (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+
+
 def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
-    """Re-attach each session's turn still in progress, from its first prompt after its latest Stop: trimming
-    that prompt away leaves the turn's Stop nothing to send. A turn idle for a day is let go."""
+    """Re-attach the prompts of each session's turn still in progress (from its first prompt after its latest Stop):
+    trimming them away leaves the turn's Stop nothing to send. A turn idle for a day is let go."""
     sessions = [log.get('session_id') or (log.get('event') or {}).get('session_id') for log in logs]
     opened, last_seen = {}, {}
     for index, (log, session_id) in enumerate(zip(logs, sessions)):
-        name = (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+        name = _log_event_name(log)
         last_seen[session_id] = log.get('timestamp')
         if name == 'Stop':
             opened.pop(session_id, None)
@@ -5439,7 +5443,8 @@ def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
     keep = {id(log) for log in kept}
     for session_id, start in opened.items():
         if not _ts_lt(last_seen[session_id], stale):
-            keep.update(id(logs[i]) for i in range(start, len(logs)) if sessions[i] == session_id)
+            keep.update(id(logs[i]) for i in range(start, len(logs))
+                        if sessions[i] == session_id and _log_event_name(logs[i]) == 'UserPromptSubmit')
     return [log for log in logs if id(log) in keep]
 
 
@@ -5460,7 +5465,7 @@ def cleanup_old_logs():
         kept_logs = [
             log for log in logs
             if log.get('session_id') == most_recent_session
-        ]
+        ][-AUDIT_LOG_TOTAL_LIMIT:]
     else:
         kept_logs = logs[-AUDIT_LOG_TOTAL_LIMIT:]
     save_logs(_keep_latest_stop(logs, _keep_open_turns(logs, kept_logs)))

@@ -68,13 +68,26 @@ class TestAuditLogTrim(unittest.TestCase):
         self.assertEqual(self._prompts(self._stop("older")), ["long job"])
 
     def test_the_session_kept_is_the_one_active_last_not_the_one_started_last(self):
-        self._turn("first", "first prompt", 1)
-        self._turn("second", "second prompt", 1)
-        self.assertEqual(self._prompts(self._stop("second")), ["second prompt"])
+        self._turn("first", "first prompt", 0)
+        self._turn("second", "second prompt", 0)
         for i in range(120):
             self._log(_event("PostToolUse", "first", tool_name="Bash",
                              tool_input={"command": str(i)}, tool_response={}))
-        self.assertEqual(self._prompts(self._stop("first")), ["first prompt"])
+        calls = [log for log in unbound.load_existing_logs() if log["session_id"] == "first"
+                 and log["event"]["hook_event_name"] == "PostToolUse"]
+        self.assertGreaterEqual(len(calls), unbound.AUDIT_LOG_TOTAL_LIMIT - 10)
+
+    def test_an_interrupted_turn_elsewhere_does_not_let_the_log_grow(self):
+        self._turn("interrupted", "never stopped", 1)
+        for n in range(40):
+            self._turn("busy", "turn %d" % n, 10)
+            self._stop("busy")
+        self.assertLessEqual(len(unbound.load_existing_logs()), unbound.AUDIT_LOG_TOTAL_LIMIT + 3)
+
+    def test_a_very_long_turn_keeps_the_log_bounded_and_still_sends(self):
+        self._turn("s1", "run them all", 400)
+        self.assertLessEqual(len(unbound.load_existing_logs()), unbound.AUDIT_LOG_TOTAL_LIMIT + 2)
+        self.assertEqual(self._prompts(self._stop("s1")), ["run them all"])
 
     def test_a_finished_turn_is_trimmed_as_before(self):
         self._turn("s1", "short", 1)
