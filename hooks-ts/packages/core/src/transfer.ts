@@ -3785,7 +3785,7 @@ function sshConfigNamed(options: readonly string[], state: State): boolean {
   if (SSH_CONFIG_NAMES.test(text)) return true;
   const names = options.filter((v, i) => options[i - 1] === "-F" && v !== "none").map((v) => basename(v));
   const rest = text.replace(/-F\s*\S+/g, " ");
-  return names.some((name) => name !== "" && namesWord(rest, name));
+  return names.some((name) => name !== "" && namesWord(rest.toLowerCase(), name.toLowerCase()));
 }
 
 /** Whether `word` stands in `text` as a word of its own: no letter, digit, _, . or - right before or after it. */
@@ -3932,7 +3932,7 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
     const failed = sshOptions !== undefined && !(lookup && name !== "");
     // Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
     resolved = jumps || failed ? host : name || host;
-    kind = failed ? "unresolved" : await address(resolved, state, lookup && !jumps);
+    kind = failed || jumps ? "unresolved" : await address(resolved, state, lookup);
   }
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;

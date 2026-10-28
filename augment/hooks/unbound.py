@@ -7097,7 +7097,8 @@ def _transfer_ssh_config_named(options: List[str], state: Dict) -> bool:
         return True
     names = {os.path.basename(v) for i, v in enumerate(options) if i and options[i - 1] == '-F' and v != 'none'}
     text = re.sub(r'-F\s*\S+', ' ', text)
-    return any(name and re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', text) for name in names)
+    return any(name and re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', text, re.IGNORECASE)
+               for name in names)
 
 
 def _transfer_ssh_hostname(destination: str, options: List[str], cwd: Optional[str], state: Dict) -> tuple:
@@ -7203,7 +7204,7 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         failed = ssh_options is not None and not (lookup and resolved)
         # Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
         resolved = host if jumps or failed else resolved or host
-        address = 'unresolved' if failed else _transfer_address(resolved, state, lookup and not jumps)
+        address = 'unresolved' if failed or jumps else _transfer_address(resolved, state, lookup)
     endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
     return {k: v for k, v in endpoint.items() if v}
 

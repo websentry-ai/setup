@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '70ee0c56d097bc215386367be4a9ef4210e32c3e3f212d2c7ef576e005e836c1'
+BLOCK_SHA256 = '1ad5a6c277cee7b18e4234d8adb6dea4bc39a74c2555e9f0f6dfac88c4226460'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -406,6 +406,9 @@ class CopyTests(TransferTestCase):
         for jump in ('ProxyJump bastion', 'ProxyCommand nc %h %p'):
             Path(self.repo, 'jump_cfg').write_text(f'Host prod\n  HostName files.acme-infra.net\n  {jump}\n')
             self.assert_endpoints('scp -F jump_cfg f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+        # Behind a jump not even a literal address counts, as the config's HostName may send it elsewhere.
+        Path(self.repo, 'jump_cfg').write_text('Host 10.0.0.1\n  HostName 8.8.8.8\n  ProxyJump bastion\n')
+        self.assert_endpoints('scp -F jump_cfg f 10.0.0.1:/srv', [_endpoint('out', '10.0.0.1', 'unresolved')])
 
     def test_a_literal_ssh_target_ssh_g_never_read_stays_unresolved(self):
         # A config or -o HostName may send a literal address elsewhere, so a call that may not have run classifies nothing.
@@ -1117,6 +1120,8 @@ class ParserFindingTests(TransferTestCase):
                                   ('cd "front\\\nend"; scp -F cfg f prod:/tmp', private),
                                   # Naming the -F file anywhere else in the turn means no lookup, as it may be rewritten.
                                   ('cd cfg; scp -F cfg f prod:/tmp', unknown),
+                                  # In any case, as on a file system that ignores it.
+                                  ('echo CFG; scp -F cfg f prod:/tmp', unknown),
                                   # A command that only reads inside the folder, such as wc, does not name it.
                                   ('wc -c frontend/notes; cd frontend; scp -F cfg f prod:/tmp', private),
                                   # Every shell fails that cd, so the || after it surely runs.

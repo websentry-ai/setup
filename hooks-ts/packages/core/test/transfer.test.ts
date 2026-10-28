@@ -328,6 +328,9 @@ test("a host reached through a jump host or proxy command is never looked up", a
   writeFileSync(join(dir, "jump_cfg"), "Host prod\n  HostName files.acme-infra.net\n  ProxyJump bastion\n");
   assert.deepEqual((await transfer("scp -F jump_cfg f prod:/tmp", dir, extra))?.endpoints,
     [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }]);
+  // Behind a jump not even a literal address counts, as the config's HostName may send it elsewhere.
+  writeFileSync(join(dir, "jump_cfg"), "Host 10.0.0.1\n  HostName 8.8.8.8\n  ProxyJump bastion\n");
+  assert.equal((await transfer("scp -F jump_cfg f 10.0.0.1:/srv", dir, extra))?.endpoints[0]?.address, "unresolved");
   writeFileSync(join(dir, "jump_cfg"), "Host prod\n  HostName files.acme-infra.net\n");
   assert.deepEqual((await transfer("scp -F jump_cfg f prod:/tmp", dir, extra))?.endpoints,
     [{ direction: "out", host: "prod", resolved_host: "files.acme-infra.net", address: "private" }]);
@@ -892,6 +895,8 @@ test("a cd lands where bash and zsh both do, or leaves the folder unknown", asyn
     ['cd "front\\\nend"; scp -F cfg f prod:/tmp', "10.0.4.12"],
     // Naming the -F file anywhere else in the turn means no lookup, as it may be rewritten.
     ["cd cfg; scp -F cfg f prod:/tmp", "prod"],
+    // In any case, as on a file system that ignores it.
+    ["echo CFG; scp -F cfg f prod:/tmp", "prod"],
     // A command that only reads inside the folder, such as wc, does not name it.
     ["wc -c frontend/notes; cd frontend; scp -F cfg f prod:/tmp", "10.0.4.12"],
     // Every shell fails that cd, so the || after it surely runs.

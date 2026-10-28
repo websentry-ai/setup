@@ -4970,7 +4970,7 @@ ${state.callText}`;
   if (SSH_CONFIG_NAMES.test(text)) return true;
   const names = options.filter((v, i) => options[i - 1] === "-F" && v !== "none").map((v) => basename(v));
   const rest = text.replace(/-F\s*\S+/g, " ");
-  return names.some((name) => name !== "" && namesWord(rest, name));
+  return names.some((name) => name !== "" && namesWord(rest.toLowerCase(), name.toLowerCase()));
 }
 function namesWord(text, word) {
   const part = /[\w.-]/;
@@ -5086,7 +5086,7 @@ async function endpoint(raw, cwd, state, sure = true) {
     const [name, jumps] = sshOptions === void 0 || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
     const failed = sshOptions !== void 0 && !(lookup && name !== "");
     resolved = jumps || failed ? host : name || host;
-    kind = failed ? "unresolved" : await address(resolved, state, lookup && !jumps);
+    kind = failed || jumps ? "unresolved" : await address(resolved, state, lookup);
   }
   const out = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
