@@ -8006,9 +8006,12 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str],
 def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
     """curl's URLs, sent to when their request uploads or sends data, else fetched from, each with whether a proxy
     resolves its name (it then gets the --connect-to target and no --resolve pin); pins carry past --next."""
-    endpoints, pins, i = [], [], 0
+    endpoints, pins, configured, i = [], [], False, 0
     while True:
-        urls, (sends, uploads, local), overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
+        urls, (sends, uploads, local, config), overrides, globoff, i, (kind, noproxy), scheme = \
+            _transfer_curl_request(args, i)
+        # A -K config this doesn't read may reroute this request and those after it, a literal address included.
+        configured = configured or config
         if urls is None:
             return []  # curl reads every option before it sends anything
         pins += [value for option, value in overrides if option == '--resolve']
@@ -8025,7 +8028,8 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
             for one in expanded:
                 remote = _transfer_curl_remote(one, kind, noproxy, env or {})
                 endpoints.append(('out' if out else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
-                                  _transfer_curl_dial(one, connects, [] if remote else pins), remote))
+                                  _transfer_curl_dial(one, connects, [] if remote else pins),
+                                  'rerouted' if configured else remote))
         if i >= len(args):
             return endpoints
 
@@ -8150,7 +8154,7 @@ def _transfer_curl_long(name: str) -> str:
 
 
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """The curl request at args[i]: URLs (None when curl rejects the command), (sends body, -T count, local socket),
+    """The curl request at args[i]: URLs (None when curl rejects it), (sends body, -T count, local socket, -K config),
     --resolve and --connect-to, globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
     urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
     kind, preproxy, noproxy = None, None, None
@@ -8164,7 +8168,7 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             arg, eq, attached = arg.partition('=')
             arg = _transfer_curl_long(arg)
             if not arg:
-                return None, (False, 0, False), [], False, len(args), (None, None), ''  # curl rejects the command
+                return None, (False, 0, False, False), [], False, len(args), (None, None), ''  # curl rejects it
             if arg == '--next':
                 break
             arg = '--' + arg[len('--expand-'):] if arg.startswith('--expand-') else arg
@@ -8203,8 +8207,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
     sends = flags & _TRANSFER_CURL_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         (flags & _TRANSFER_CURL_BODIES and not flags & {'-G', '--get'})
     # Without -x, a --preproxy is the SOCKS proxy the request goes through.
-    return urls, (bool(sends), uploads, local), overrides, bool(flags & {'-g', '--globoff'}), i, \
-        (kind if kind is not None else preproxy, noproxy), scheme
+    return urls, (bool(sends), uploads, local, bool(flags & {'-K', '--config'})), overrides, \
+        bool(flags & {'-g', '--globoff'}), i, (kind if kind is not None else preproxy, noproxy), scheme
 
 
 def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
@@ -8869,7 +8873,9 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
     host = _transfer_clean_host(host)
     if not host:
         return None
-    if dial:
+    if len(raw) > 4 and raw[4] == 'rerouted':
+        resolved, address = host, 'unresolved'  # a config this didn't read may send it anywhere
+    elif dial:
         resolved = dial[0]
         address = _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state, lookup)
     else:

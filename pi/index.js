@@ -4109,9 +4109,11 @@ function curlRemote(url, kind, noproxy, env, processEnv) {
 function curl(args, env = {}, processEnv = {}) {
   const raws = [];
   const pins = [];
+  let configured = false;
   for (let i = 0; ; ) {
-    const [urls, [sends, uploads, local], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads, local, config], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     if (urls === void 0) return [];
+    configured ||= config;
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const [index, written] of (local ? [] : urls).entries()) {
@@ -4121,7 +4123,8 @@ function curl(args, env = {}, processEnv = {}) {
       if (expanded2 === void 0) return raws;
       for (const one of expanded2) {
         const remote2 = curlRemote(one, kind, noproxy, env, processEnv);
-        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, curlDial(one, connects, remote2 ? [] : pins), remote2]);
+        const dial = curlDial(one, connects, remote2 ? [] : pins);
+        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), void 0, dial, configured ? "rerouted" : remote2]);
       }
     }
     if (next >= args.length) return raws;
@@ -4264,7 +4267,7 @@ function curlRequest(args, start) {
       const eq = arg.indexOf("=");
       if (eq >= 0) value = arg.slice(eq + 1);
       arg = curlLong(eq >= 0 ? arg.slice(0, eq) : arg);
-      if (arg === "") return [void 0, [false, 0, false], [], false, args.length, [void 0, void 0], ""];
+      if (arg === "") return [void 0, [false, 0, false, false], [], false, args.length, [void 0, void 0], ""];
       if (arg === "--next") break;
       if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
@@ -4288,7 +4291,9 @@ function curlRequest(args, start) {
   }
   const has = (set) => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get");
-  return [urls, [Boolean(sends), uploads, local], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
+  const config = flags.has("-K") || flags.has("--config");
+  const globoff = flags.has("-g") || flags.has("--globoff");
+  return [urls, [Boolean(sends), uploads, local, config], overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
 }
 function wget(args, proxied = false) {
   const urls = [];
@@ -4942,7 +4947,9 @@ async function endpoint(raw, cwd, state, sure = true) {
   if (host === "") return void 0;
   let resolved;
   let kind;
-  if (dial !== void 0) {
+  if (proxied === "rerouted") {
+    [resolved, kind] = [host, "unresolved"];
+  } else if (dial !== void 0) {
     resolved = dial[0];
     kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
   } else {

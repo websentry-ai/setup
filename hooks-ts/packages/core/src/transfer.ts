@@ -328,7 +328,10 @@ interface State {
 type Env = Record<string, string>;
 /** Where curl connects for a URL when --connect-to or --resolve change it: the host, and the addresses pinned for it. */
 type Dial = [resolvedHost: string, addresses: string[]];
-type Raw = [direction: string, destination: string, sshOptions: string[] | undefined, dial?: Dial | undefined, proxied?: boolean];
+type Raw = [
+  direction: string, destination: string, sshOptions: string[] | undefined, dial?: Dial | undefined,
+  proxied?: boolean | "rerouted",
+];
 
 /** Run one allowlisted lookup within its timeout and the turn's budget; undefined when refused, slow or failing. ssh -G
  *  is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked. */
@@ -2764,9 +2767,13 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string | und
 function curl(args: string[], env: Env = {}, processEnv: Record<string, string | undefined> = {}): Raw[] {
   const raws: Raw[] = [];
   const pins: string[] = [];
+  let configured = false;
   for (let i = 0; ; ) {
-    const [urls, [sends, uploads, local], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    const [urls, [sends, uploads, local, config], overrides, globoff, next, [kind, noproxy], scheme] =
+      curlRequest(args, i);
     if (urls === undefined) return []; // curl reads every option before it sends anything
+    // A -K config this doesn't read may reroute this request and those after it, a literal address included.
+    configured ||= config;
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     // Through --unix-socket or --abstract-unix-socket, the request reaches a local socket, not the URL's host.
@@ -2779,7 +2786,8 @@ function curl(args: string[], env: Env = {}, processEnv: Record<string, string |
       if (expanded === undefined) return raws;
       for (const one of expanded) {
         const remote = curlRemote(one, kind, noproxy, env, processEnv);
-        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, curlDial(one, connects, remote ? [] : pins), remote]);
+        const dial = curlDial(one, connects, remote ? [] : pins);
+        raws.push([out ? "out" : "in", urlHost(one, CURL_SCHEMES), undefined, dial, configured ? "rerouted" : remote]);
       }
     }
     if (next >= args.length) return raws;
@@ -2918,12 +2926,12 @@ function curlLong(name: string): string {
   return prefixed(`--${word}`, CURL_LONG_OPTIONS);
 }
 
-/** The curl request at args[start]: URLs (undefined when curl rejects it), [sends body, -T count, local socket],
+/** The curl request at args[start]: URLs (undefined when curl rejects it), [body, -T count, local socket, -K config],
  *  --resolve and --connect-to, globoff, next start, [proxy kind: '' off, undefined unnamed; --noproxy], scheme. */
 function curlRequest(
   args: string[], start: number,
 ): [
-  string[] | undefined, [boolean, number, boolean], [string, string][], boolean, number,
+  string[] | undefined, [boolean, number, boolean, boolean], [string, string][], boolean, number,
   [string | undefined, string | undefined], string,
 ] {
   const urls: string[] = [];
@@ -2953,7 +2961,7 @@ function curlRequest(
       if (eq >= 0) value = arg.slice(eq + 1);
       arg = curlLong(eq >= 0 ? arg.slice(0, eq) : arg);
       // curl rejects an option that starts several.
-      if (arg === "") return [undefined, [false, 0, false], [], false, args.length, [undefined, undefined], ""];
+      if (arg === "") return [undefined, [false, 0, false, false], [], false, args.length, [undefined, undefined], ""];
       if (arg === "--next") break;
       if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
@@ -2979,7 +2987,9 @@ function curlRequest(
   const has = (set: ReadonlySet<string>): boolean => [...flags].some((f) => set.has(f));
   const sends = has(CURL_UPLOADS) || SENDING_METHODS.has(method) || (has(CURL_BODIES) && !flags.has("-G") && !flags.has("--get"));
   // Without -x, a --preproxy is the SOCKS proxy the request goes through.
-  return [urls, [Boolean(sends), uploads, local], overrides, flags.has("-g") || flags.has("--globoff"), i, [kind ?? preproxy, noproxy], scheme];
+  const config = flags.has("-K") || flags.has("--config");
+  const globoff = flags.has("-g") || flags.has("--globoff");
+  return [urls, [Boolean(sends), uploads, local, config], overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
 }
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:
@@ -3764,7 +3774,9 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
   if (host === "") return undefined;
   let resolved: string;
   let kind: AddressKind;
-  if (dial !== undefined) {
+  if (proxied === "rerouted") {
+    [resolved, kind] = [host, "unresolved"]; // a config this didn't read may send it anywhere
+  } else if (dial !== undefined) {
     resolved = dial[0];
     kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
   } else {
