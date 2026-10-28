@@ -85,6 +85,8 @@ const UNKNOWN_ENV = "\0unknown";
 const ALLEXPORT = "\0allexport";
 /** Set by set -e, held as allexport is: a command that fails then ends the shell. */
 const ERREXIT = "\0errexit";
+/** Set by set -o pipefail, held as allexport is: a pipeline fails when a command in it fails. */
+const PIPEFAIL = "\0pipefail";
 /** Stands in for a substitution's output inside a word, so no host is read from it. */
 const SUBSTITUTED = "\0";
 /** Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has. */
@@ -1375,6 +1377,8 @@ interface Pipeline {
   negate: boolean;
   /** A `!` or a function name was read, and the command it leads is still to come. */
   leading: boolean;
+  /** The statuses of the commands before the last, for pipefail. */
+  statuses: (number | undefined)[];
 }
 
 /** What a return, exit, break or continue may change in a frame, to put back after a subshell. */
@@ -1560,7 +1564,7 @@ function pop(frames: Frame[], kinds: readonly string[]): Frame | undefined {
 
 /** Start a pipeline: whether it runs, and the operator and status before it, which settle the status it leaves. */
 function pipeline(before: string, runsHere: Maybe, shell: Shell): void {
-  shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false };
+  shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false, statuses: [] };
 }
 
 /** Start the pipeline a command or compound begins, unless it continues one after a | or a leading `!`; && and ||
@@ -1581,6 +1585,10 @@ function end(shell: Shell): void {
   if (pipe.runs === false) {
     status = pipe.prior;
   } else {
+    const statuses = [...pipe.statuses, status];
+    const failed = statuses.lastIndexOf(1);
+    // Under pipefail, a command that surely fails fails the pipeline, unless one after it has a status not known.
+    if (failed >= 0 && !statuses.slice(failed).includes(undefined) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : undefined;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : undefined;
     if (pipe.prior === undefined && skipped !== undefined && status !== skipped) status = undefined;
@@ -1590,7 +1598,8 @@ function end(shell: Shell): void {
 
 /** End a pipeline element: the pipeline ends unless a | follows, and a backgrounded list runs in a subshell. */
 function finish(after: string, shell: Shell): void {
-  if (after !== "|") end(shell);
+  if (after === "|") shell.pipe.statuses.push(shell.status); // for pipefail
+  else end(shell);
   if (after === "&") {
     restore(shell, shell.start, true);
     shell.status = 0; // starting a background job succeeds
@@ -2055,7 +2064,7 @@ function assign(name: string, args: string[], shell: Shell): void {
 }
 
 const SETS: readonly string[] = ["set", "setopt", "unsetopt"];
-const SET_OPTIONS: Record<string, string> = { allexport: ALLEXPORT, errexit: ERREXIT };
+const SET_OPTIONS: Record<string, string> = { allexport: ALLEXPORT, errexit: ERREXIT, pipefail: PIPEFAIL };
 const SET_FLAGS: Record<string, string> = { a: "allexport", e: "errexit" };
 
 /** The options a zsh spelling such as all_export or noerrexit names, ignoring case and underscores. */
@@ -2165,7 +2174,7 @@ function stdinScript(name: string, args: string[]): string[] | undefined {
 const SHELL_FLAGS: Record<string, string> = { a: "allexport", e: "errexit", n: "noexec" };
 const ZSH_SPELLINGS: Record<string, string> = {
   allexport: "allexport", noallexport: "allexport", errexit: "errexit", noerrexit: "errexit",
-  exec: "noexec", noexec: "noexec",
+  exec: "noexec", noexec: "noexec", pipefail: "pipefail", nopipefail: "pipefail",
 };
 
 /** A shell's startup options as bash reads them: [where its operands start, the option letters given, the options set
@@ -2186,7 +2195,8 @@ function shellFlags(args: string[]): [number, Set<string>, Record<string, string
         const option = flag === "o" || flag === "O" ? args[i++] ?? "" : SHELL_FLAGS[flag] ?? "";
         const spelled = Object.hasOwn(ZSH_SPELLINGS, option.toLowerCase().replaceAll("_", ""))
           ? ZSH_SPELLINGS[option.toLowerCase().replaceAll("_", "")] : undefined;
-        if (flag !== "O" && Object.values(SHELL_FLAGS).includes(option)) options[option] = arg[0] === "-" ? "1" : "";
+        const known = Object.values(SHELL_FLAGS).includes(option) || option === "pipefail";
+        if (flag !== "O" && known) options[option] = arg[0] === "-" ? "1" : "";
         // zsh's spellings, which bash rejects.
         else if (flag !== "O" && spelled !== undefined) options[spelled] = SUBSTITUTED;
       }
@@ -2641,7 +2651,7 @@ function walk(items: Item[], cwd: string | undefined, exported: Env, processEnv:
   const shell: Shell = {
     cwd, vars, status: undefined, frames: [], function: undefined,
     start: [cwd, { ...vars }, new Map()], processEnv, calls: [], openingPipe: false,
-    pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false },
+    pipe: { before: "", prior: undefined, runs: true, negate: false, leading: false, statuses: [] },
     functions: new Map(), callsLeft: MAX_CALLS, items, at: 0, live: true, floor: undefined, args: [...positional],
     ends: new Map(), names: namedSegments(items), scoped: [], exempt: 0,
   };
@@ -3070,8 +3080,8 @@ function remote(arg: string): [string, string | undefined, boolean] | undefined 
   if (arg.includes("://")) return undefined;
   // A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
   const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-  // A drive letter is a local path only on Windows; elsewhere scp dials host C.
-  if (match === null || (process.platform === "win32" && /^[A-Za-z]:[\\/]/.test(arg))) return undefined;
+  // One letter before the colon is a drive, a local path as Windows OpenSSH reads it, with or without a slash after.
+  if (match === null || /^[A-Za-z]:/.test(arg)) return undefined;
   return [match[1] as string, undefined, match[2] === undefined];
 }
 
@@ -3111,7 +3121,7 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
 
 /** nc's host, sent to when stdin is fed in; ncat --proxy or nc -x resolve it remotely unless ncat --proxy-dns
  *  local/both or nc -X 4 resolves it here; a listener reaches no host and -X without -x connects directly. */
-function netcat(args: string[], sends: boolean): Raw[] {
+function netcat(args: string[], sends: boolean, ncat = false): Raw[] {
   const positional: string[] = [];
   const flags = new Set<string>();
   const values = new Map<string, string>();
@@ -3130,7 +3140,8 @@ function netcat(args: string[], sends: boolean): Raw[] {
     } else if (arg.startsWith("-") && arg.length > 1) {
       let flag: string;
       let value: string | undefined;
-      [flag, value, i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
+      // ncat's -c runs a command, while OpenBSD and macOS nc's -c is a switch.
+      [flag, value, i] = shortOption(arg, args, i, ncat ? `${NC_SHORT_VALUES}c` : NC_SHORT_VALUES, flags);
       flags.add(flag);
       values.set(flag, (value ?? "").toLowerCase());
     } else {
@@ -3261,6 +3272,7 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
     if (name === "uri") uri = value;
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
+    else if (name === "unixsocket" && value !== "") return []; // it reaches a local socket, not the URI's host
     else if (name === "proxy") proxy = value !== "";
     // -NoProxy:$false, or a value not known here, leaves the proxy on.
     else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) proxy ??= false;
@@ -3293,7 +3305,7 @@ function parse(call: Call, processEnv: Record<string, string | undefined>): [str
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
   else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv);
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
-  else if (tool === "nc") raw = netcat(call.args, sends);
+  else if (tool === "nc") raw = netcat(call.args, sends, call.name === "ncat");
   else if (tool === "socat") raw = socat(call.args, sends);
   else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));
   else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
@@ -3622,9 +3634,23 @@ const KIND_LISTS: [AddressKind, BlockList][] = ADDRESS_KINDS.map(([kind, network
   return [kind, list];
 });
 
+/** The IPv4 address an IPv4-mapped IPv6 address carries, written ::ffff:a.b.c.d or ::ffff:a00:1; else the address. */
+export function ipv4Mapped(address: string): string {
+  if (isIP(address) !== 6) return address;
+  try {
+    const host = new URL(`http://[${address}]/`).hostname; // the canonical form
+    const match = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(host);
+    if (match === null) return address;
+    const [high, low] = [parseInt(match[1] as string, 16), parseInt(match[2] as string, 16)];
+    return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+  } catch {
+    return address;
+  }
+}
+
 function kindOf(raw: string): AddressKind {
-  // An IPv4-mapped IPv6 address is the IPv4 address it carries.
-  const address = /^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(raw) ? raw.slice(7) : raw.split("%")[0] as string;
+  // An IPv4-mapped IPv6 address is the IPv4 address it carries, in any of its forms.
+  const address = ipv4Mapped(raw.split("%")[0] as string);
   const family = isIP(address) === 6 ? "ipv6" : "ipv4";
   for (const [kind, list] of KIND_LISTS) if (list.check(address, family)) return kind;
   return "public";

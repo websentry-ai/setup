@@ -1923,6 +1923,7 @@ var CLEAN_ENV = "\0clean";
 var UNKNOWN_ENV = "\0unknown";
 var ALLEXPORT = "\0allexport";
 var ERREXIT = "\0errexit";
+var PIPEFAIL = "\0pipefail";
 var SUBSTITUTED = "\0";
 var BRACE_MARKS = { "{": "", ",": "", "}": "" };
 var LITERAL_TILDE = "";
@@ -3118,7 +3119,7 @@ function pop(frames, kinds) {
   return void 0;
 }
 function pipeline(before, runsHere, shell) {
-  shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false };
+  shell.pipe = { before, prior: shell.status, runs: runsHere, negate: false, leading: false, statuses: [] };
 }
 function begin(before, shell) {
   if (before === "|") shell.status = shell.pipe.prior === 0 ? 0 : void 0;
@@ -3132,6 +3133,9 @@ function end(shell) {
   if (pipe.runs === false) {
     status = pipe.prior;
   } else {
+    const statuses = [...pipe.statuses, status];
+    const failed = statuses.lastIndexOf(1);
+    if (failed >= 0 && !statuses.slice(failed).includes(void 0) && shell.vars[PIPEFAIL]?.[0] === "1") status = 1;
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : void 0;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : void 0;
     if (pipe.prior === void 0 && skipped !== void 0 && status !== skipped) status = void 0;
@@ -3139,7 +3143,8 @@ function end(shell) {
   shell.status = status;
 }
 function finish(after, shell) {
-  if (after !== "|") end(shell);
+  if (after === "|") shell.pipe.statuses.push(shell.status);
+  else end(shell);
   if (after === "&") {
     restore(shell, shell.start, true);
     shell.status = 0;
@@ -3527,7 +3532,7 @@ function assign(name, args, shell) {
   }
 }
 var SETS = ["set", "setopt", "unsetopt"];
-var SET_OPTIONS = { allexport: ALLEXPORT, errexit: ERREXIT };
+var SET_OPTIONS = { allexport: ALLEXPORT, errexit: ERREXIT, pipefail: PIPEFAIL };
 var SET_FLAGS = { a: "allexport", e: "errexit" };
 function zshOptions(name) {
   const plain = name.toLowerCase().replaceAll("_", "");
@@ -3620,7 +3625,9 @@ var ZSH_SPELLINGS = {
   errexit: "errexit",
   noerrexit: "errexit",
   exec: "noexec",
-  noexec: "noexec"
+  noexec: "noexec",
+  pipefail: "pipefail",
+  nopipefail: "pipefail"
 };
 function shellFlags(args) {
   const letters = /* @__PURE__ */ new Set();
@@ -3636,7 +3643,8 @@ function shellFlags(args) {
         letters.add(flag);
         const option = flag === "o" || flag === "O" ? args[i++] ?? "" : SHELL_FLAGS[flag] ?? "";
         const spelled = Object.hasOwn(ZSH_SPELLINGS, option.toLowerCase().replaceAll("_", "")) ? ZSH_SPELLINGS[option.toLowerCase().replaceAll("_", "")] : void 0;
-        if (flag !== "O" && Object.values(SHELL_FLAGS).includes(option)) options[option] = arg[0] === "-" ? "1" : "";
+        const known = Object.values(SHELL_FLAGS).includes(option) || option === "pipefail";
+        if (flag !== "O" && known) options[option] = arg[0] === "-" ? "1" : "";
         else if (flag !== "O" && spelled !== void 0) options[spelled] = SUBSTITUTED;
       }
     }
@@ -4011,7 +4019,7 @@ function walk(items, cwd, exported, processEnv, depth, positional = []) {
     processEnv,
     calls: [],
     openingPipe: false,
-    pipe: { before: "", prior: void 0, runs: true, negate: false, leading: false },
+    pipe: { before: "", prior: void 0, runs: true, negate: false, leading: false, statuses: [] },
     functions: /* @__PURE__ */ new Map(),
     callsLeft: MAX_CALLS,
     items,
@@ -4372,7 +4380,7 @@ function remote(arg) {
   }
   if (arg.includes("://")) return void 0;
   const match = /^((?:[^@/:[\]]+@)?(?:\[[^\]/]+\]|[^/:[\]]+)):(:)?/.exec(arg);
-  if (match === null || process.platform === "win32" && /^[A-Za-z]:[\\/]/.test(arg)) return void 0;
+  if (match === null || /^[A-Za-z]:/.test(arg)) return void 0;
   return [match[1], void 0, match[2] === void 0];
 }
 function copy(name, args, env, processEnv) {
@@ -4404,7 +4412,7 @@ function sshPipe(args, fed, receives) {
   const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("StdinNull=yes");
   return [["out", sends], ["in", receives]].filter(([, used]) => used).map(([d]) => [d, destination, options]);
 }
-function netcat(args, sends) {
+function netcat(args, sends, ncat = false) {
   const positional = [];
   const flags = /* @__PURE__ */ new Set();
   const values = /* @__PURE__ */ new Map();
@@ -4423,7 +4431,7 @@ function netcat(args, sends) {
     } else if (arg.startsWith("-") && arg.length > 1) {
       let flag;
       let value;
-      [flag, value, i] = shortOption(arg, args, i, NC_SHORT_VALUES, flags);
+      [flag, value, i] = shortOption(arg, args, i, ncat ? `${NC_SHORT_VALUES}c` : NC_SHORT_VALUES, flags);
       flags.add(flag);
       values.set(flag, (value ?? "").toLowerCase());
     } else {
@@ -4542,6 +4550,7 @@ function webCmdlet(args, sends, proxied = false) {
     if (name === "uri") uri = value;
     else if (name === "body" || name === "infile" || name === "form") out = true;
     else if ((name === "method" || name === "custommethod") && SENDING_METHODS.has(value.toUpperCase())) out = true;
+    else if (name === "unixsocket" && value !== "") return [];
     else if (name === "proxy") proxy = value !== "";
     else if (name === "noproxy" && (colon < 0 || ["$true", "1"].includes(value.toLowerCase()))) proxy ??= false;
   }
@@ -4566,7 +4575,7 @@ function parse(call, processEnv) {
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
   else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv);
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
-  else if (tool === "nc") raw = netcat(call.args, sends);
+  else if (tool === "nc") raw = netcat(call.args, sends, call.name === "ncat");
   else if (tool === "socat") raw = socat(call.args, sends);
   else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));
   else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
@@ -4841,8 +4850,20 @@ var KIND_LISTS = ADDRESS_KINDS.map(([kind, networks]) => {
   }
   return [kind, list];
 });
+function ipv4Mapped(address2) {
+  if (isIP(address2) !== 6) return address2;
+  try {
+    const host = new URL(`http://[${address2}]/`).hostname;
+    const match = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(host);
+    if (match === null) return address2;
+    const [high, low] = [parseInt(match[1], 16), parseInt(match[2], 16)];
+    return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+  } catch {
+    return address2;
+  }
+}
 function kindOf(raw) {
-  const address2 = /^::ffff:\d+\.\d+\.\d+\.\d+$/i.test(raw) ? raw.slice(7) : raw.split("%")[0];
+  const address2 = ipv4Mapped(raw.split("%")[0]);
   const family = isIP(address2) === 6 ? "ipv6" : "ipv4";
   for (const [kind, list] of KIND_LISTS) if (list.check(address2, family)) return kind;
   return "public";

@@ -10,7 +10,9 @@ import { delimiter, join, resolve } from "node:path";
 import test from "node:test";
 
 import { defaultExecFile, type ExecFileLike } from "../src/accountIdentity.ts";
-import { resolveTransfers, transferCommand, type LookupLike, type ResolveOptions, type Transfer } from "../src/transfer.ts";
+import {
+  ipv4Mapped, resolveTransfers, transferCommand, type LookupLike, type ResolveOptions, type Transfer,
+} from "../src/transfer.ts";
 
 interface Fixture {
   addresses: Record<string, string[]>;
@@ -130,6 +132,17 @@ test("a command nested too deep sends no transfer, and the turn's later calls st
   ], "/", options());
   assert.equal(found.get("c1"), undefined);
   assert.equal(found.get("c2")?.endpoints[0]?.host, "example.com");
+});
+
+test("an IPv4-mapped address is read as its IPv4 address in every form, as Python's ipaddress does", () => {
+  // Converted first, so the kind never depends on how a Node version's BlockList treats a mapped address.
+  for (const mapped of ["::ffff:10.0.0.1", "::ffff:a00:1", "0:0:0:0:0:ffff:a00:1", "::FFFF:A00:1"]) {
+    assert.equal(ipv4Mapped(mapped), "10.0.0.1", mapped);
+  }
+  assert.equal(ipv4Mapped("::ffff:0:1"), "0.0.0.1");
+  for (const other of ["fe80::1", "::1", "2001:db8::ffff:a00:1", "10.0.0.1", "example.com"]) {
+    assert.equal(ipv4Mapped(other), other, other);
+  }
 });
 
 test("transfer_command is read in place of the capped command, and its length cap still applies", async () => {

@@ -5240,6 +5240,8 @@ _TRANSFER_UNKNOWN_ENV = '\0unknown'
 _TRANSFER_ALLEXPORT = '\0allexport'
 # Set by set -e, held as allexport is: a command that fails then ends the shell.
 _TRANSFER_ERREXIT = '\0errexit'
+# Set by set -o pipefail, held as allexport is: a pipeline fails when a command in it fails.
+_TRANSFER_PIPEFAIL = '\0pipefail'
 # Stands in for a substitution's output inside a word, so no host is read from it.
 _TRANSFER_SUBSTITUTED = '\0'
 # Mark a word's unquoted { , and }, which bash may brace-expand, and turn them back once it has.
@@ -6402,7 +6404,8 @@ def _transfer_pop(frames: List[Dict], kinds: tuple) -> Optional[Dict]:
 
 def _transfer_pipeline(before: str, runs: Optional[bool], shell: Dict) -> None:
     """Start a pipeline: whether it runs, and the operator and status before it, which settle the status it leaves."""
-    shell['pipe'] = {'before': before, 'prior': shell['status'], 'runs': runs, 'negate': False, 'leading': False}
+    shell['pipe'] = {'before': before, 'prior': shell['status'], 'runs': runs, 'negate': False, 'leading': False,
+                     'statuses': []}
 
 
 def _transfer_begin(before: str, shell: Dict) -> None:
@@ -6425,6 +6428,12 @@ def _transfer_end(shell: Dict) -> None:
     if pipe['runs'] is False:
         status = pipe['prior']
     else:
+        statuses = pipe['statuses'] + [status]
+        failed = max((k for k, one in enumerate(statuses) if one == 1), default=-1)
+        # Under pipefail, a command that surely fails fails the pipeline, unless one after it has a status not known.
+        if failed >= 0 and None not in statuses[failed:] and \
+                shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0] == '1':
+            status = 1
         status = {0: 1, 1: 0}.get(status) if pipe['negate'] else status
         skipped = {'&&': 1, '||': 0}.get(pipe['before'])
         if pipe['prior'] is None and skipped is not None and status != skipped:
@@ -6434,7 +6443,9 @@ def _transfer_end(shell: Dict) -> None:
 
 def _transfer_finish(after: str, shell: Dict) -> None:
     """End a pipeline element: the pipeline ends unless a | follows, and a backgrounded list runs in a subshell."""
-    if after != '|':
+    if after == '|':
+        shell['pipe']['statuses'].append(shell['status'])  # for pipefail
+    else:
         _transfer_end(shell)
     if after == '&':
         _transfer_restore(shell, shell['start'], True)
@@ -6924,7 +6935,7 @@ def _transfer_assign(program: str, args: List[str], shell: Dict) -> None:
 _TRANSFER_SETS = ('set', 'setopt', 'unsetopt')
 
 
-_TRANSFER_SET_OPTIONS = {'allexport': _TRANSFER_ALLEXPORT, 'errexit': _TRANSFER_ERREXIT}
+_TRANSFER_SET_OPTIONS = {'allexport': _TRANSFER_ALLEXPORT, 'errexit': _TRANSFER_ERREXIT, 'pipefail': _TRANSFER_PIPEFAIL}
 _TRANSFER_SET_FLAGS = {'a': 'allexport', 'e': 'errexit'}
 
 
@@ -7083,7 +7094,8 @@ def _transfer_curl_config(text: str) -> List[str]:
 
 _TRANSFER_SHELL_FLAGS = {'a': 'allexport', 'e': 'errexit', 'n': 'noexec'}
 _TRANSFER_ZSH_SPELLINGS = {'allexport': 'allexport', 'noallexport': 'allexport', 'errexit': 'errexit',
-                           'noerrexit': 'errexit', 'exec': 'noexec', 'noexec': 'noexec'}
+                           'noerrexit': 'errexit', 'exec': 'noexec', 'noexec': 'noexec', 'pipefail': 'pipefail',
+                           'nopipefail': 'pipefail'}
 
 
 def _transfer_shell_flags(args: List[str]) -> tuple:
@@ -7105,7 +7117,7 @@ def _transfer_shell_flags(args: List[str]) -> tuple:
                 name = (args[i] if i < len(args) else '') if flag in 'oO' else _TRANSFER_SHELL_FLAGS.get(flag, '')
                 i += flag in 'oO'
                 spelled = _TRANSFER_ZSH_SPELLINGS.get(name.lower().replace('_', ''))
-                if flag != 'O' and name in _TRANSFER_SHELL_FLAGS.values():
+                if flag != 'O' and (name in _TRANSFER_SHELL_FLAGS.values() or name == 'pipefail'):
                     options[name] = '1' if arg[0] == '-' else ''
                 elif flag != 'O' and spelled:
                     options[spelled] = _TRANSFER_SUBSTITUTED  # zsh's spellings, which bash rejects
@@ -7890,8 +7902,8 @@ def _transfer_remote(arg: str) -> Optional[tuple]:
         return None
     # A bracketed host may hold an IPv6 address; a second colon after the host marks an rsync daemon.
     match = re.match(r'^((?:[^@/:\[\]]+@)?(?:\[[^\]/]+\]|[^/:\[\]]+)):(:)?', arg)
-    # A drive letter is a local path only on Windows; elsewhere scp dials host C.
-    if not match or (os.name == 'nt' and re.match(r'^[A-Za-z]:[\\/]', arg)):
+    # One letter before the colon is a drive, a local path as Windows OpenSSH reads it, with or without a slash after.
+    if not match or re.match(r'^[A-Za-z]:', arg):
         return None
     return match.group(1), None, not match.group(2)
 
@@ -7928,7 +7940,7 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
     return [(d, operands[0], options) for d, used in (('out', sends), ('in', receives)) if used]
 
 
-def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
+def _transfer_netcat(args: List[str], sends: bool, ncat: bool = False) -> List[tuple]:
     """nc's host, sent to when stdin is fed in; ncat --proxy or nc -x resolve it remotely unless ncat --proxy-dns
     local/both or nc -X 4 resolves it here; a listener reaches no host and -X without -x connects directly."""
     positional, flags, values, i = [], set(), {}, 0
@@ -7944,7 +7956,9 @@ def _transfer_netcat(args: List[str], sends: bool) -> List[tuple]:
             flags.add(name)
             values[name] = value.lower()
         elif arg.startswith('-') and len(arg) > 1:
-            flag, value, i = _transfer_short_option(arg, args, i, _TRANSFER_NC_SHORT_VALUES, flags)
+            # ncat's -c runs a command, while OpenBSD and macOS nc's -c is a switch.
+            values_flags = _TRANSFER_NC_SHORT_VALUES | ({'c'} if ncat else set())
+            flag, value, i = _transfer_short_option(arg, args, i, values_flags, flags)
             flags.add(flag)
             values[flag] = (value or '').lower()
         else:
@@ -8065,6 +8079,8 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
             out = True
         elif name in ('method', 'custommethod') and value.upper() in _TRANSFER_SENDING_METHODS:
             out = True
+        elif name == 'unixsocket' and value:
+            return []  # it reaches a local socket, not the URI's host
         elif name == 'proxy':
             proxy = bool(value)
         elif name == 'noproxy' and (not colon or value.lower() in ('$true', '1')):
@@ -8101,7 +8117,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
         args = _transfer_stdin_args(tool, args, _transfer_stdin_text(layers))
         raw = _transfer_curl(args, env) if tool == 'curl' else _transfer_wget(args, _transfer_proxied(env))
     elif tool in ('nc', 'socat'):
-        raw = _transfer_netcat(args, sends) if tool == 'nc' else _transfer_socat(args, sends)
+        raw = _transfer_netcat(args, sends, program == 'ncat') if tool == 'nc' else _transfer_socat(args, sends)
     elif tool in ('httpie', 'powershell'):
         raw = (_transfer_httpie if tool == 'httpie' else _transfer_web_cmdlet)(args, sends, _transfer_proxied(env))
     else:

