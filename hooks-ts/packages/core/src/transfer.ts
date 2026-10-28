@@ -3350,8 +3350,10 @@ function cleanHost(value: string): string {
   return host.includes(":") && isIP(bare) === 6 ? normalizeV6(bare) : "";
 }
 
-/** An IPv6 address in the compressed form the Python hooks print. */
+/** An IPv6 address in the compressed form the Python hooks print, an IPv4-mapped one as ::ffff:a.b.c.d. */
 function normalizeV6(address: string): string {
+  const v4 = ipv4Mapped(address);
+  if (v4 !== address) return `::ffff:${v4}`;
   try {
     return new URL(`http://[${address}]/`).hostname.slice(1, -1);
   } catch {

@@ -4611,6 +4611,8 @@ function cleanHost(value) {
   return host.includes(":") && isIP(bare) === 6 ? normalizeV6(bare) : "";
 }
 function normalizeV6(address2) {
+  const v4 = ipv4Mapped(address2);
+  if (v4 !== address2) return `::ffff:${v4}`;
   try {
     return new URL(`http://[${address2}]/`).hostname.slice(1, -1);
   } catch {

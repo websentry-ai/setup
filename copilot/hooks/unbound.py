@@ -8128,7 +8128,7 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     addresses = pinned.get(target) or pinned.get(('*', target[1])) or []
     if target[0] == host and not addresses:
         return None
-    return (str(addresses[0]) if addresses else target[0]), addresses
+    return (_transfer_ip_text(addresses[0]) if addresses else target[0]), addresses
 
 
 def _transfer_prefixed(name: str, options: frozenset) -> str:
@@ -8551,9 +8551,16 @@ def _transfer_clean_host(host: str) -> str:
     if re.match(r'^[a-z0-9_][a-z0-9_.-]{0,252}$', host):
         return host
     try:
-        return str(ipaddress.ip_address(host.split('%')[0])) if ':' in host else ''
+        return _transfer_ip_text(ipaddress.ip_address(host.split('%')[0])) if ':' in host else ''
     except ValueError:
         return ''
+
+
+def _transfer_ip_text(address) -> str:
+    """An address as the hooks print it: compressed, and an IPv4-mapped one as ::ffff:a.b.c.d, which Python versions
+    otherwise print differently."""
+    mapped = getattr(address, 'ipv4_mapped', None)
+    return '::ffff:' + str(mapped) if mapped else str(address)
 
 
 def _transfer_home() -> str:

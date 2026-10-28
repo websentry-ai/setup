@@ -8369,8 +8369,8 @@
     "endpoints": [
      {
       "direction": "in",
-      "host": "::ffff:a00:1",
-      "resolved_host": "::ffff:a00:1",
+      "host": "::ffff:10.0.0.1",
+      "resolved_host": "::ffff:10.0.0.1",
       "address": "private"
      }
     ]
@@ -8383,8 +8383,8 @@
     "endpoints": [
      {
       "direction": "in",
-      "host": "::ffff:a00:1",
-      "resolved_host": "::ffff:a00:1",
+      "host": "::ffff:10.0.0.1",
+      "resolved_host": "::ffff:10.0.0.1",
       "address": "private"
      }
     ]
@@ -8397,8 +8397,8 @@
     "endpoints": [
      {
       "direction": "in",
-      "host": "::ffff:7f00:1",
-      "resolved_host": "::ffff:7f00:1",
+      "host": "::ffff:127.0.0.1",
+      "resolved_host": "::ffff:127.0.0.1",
       "address": "loopback"
      }
     ]
@@ -8411,8 +8411,8 @@
     "endpoints": [
      {
       "direction": "in",
-      "host": "::ffff:808:808",
-      "resolved_host": "::ffff:808:808",
+      "host": "::ffff:8.8.8.8",
+      "resolved_host": "::ffff:8.8.8.8",
       "address": "public"
      }
     ]
@@ -8957,6 +8957,48 @@
       "host": "example.com",
       "resolved_host": "example.com",
       "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --resolve example.com:443:[::ffff:a00:1] https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "::ffff:10.0.0.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl --resolve example.com:443:::ffff:a00:1 https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "::ffff:10.0.0.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl http://[2001:db8:0:0:0:0:0:1]/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "2001:db8::1",
+      "resolved_host": "2001:db8::1",
+      "address": "public"
      }
     ]
    }
