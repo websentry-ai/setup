@@ -792,6 +792,7 @@ test("a turn that names an ssh config makes no ssh lookup", async () => {
   for (const [second, expected] of [
     ["sed -i 's/HostName 203.0.113.9/HostName 10.0.4.12/' ~/.ssh/config", "unresolved"],
     ["Add-Content $HOME\\.ssh\\config 'HostName 10.0.4.12'", "unresolved"],
+    ["Add-Content $HOME\\.SSH\\Config 'HostName 10.0.4.12'", "unresolved"],
     ["echo done", "private"],
   ] as const) {
     const calls: string[][] = [];

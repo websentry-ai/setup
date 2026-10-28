@@ -8487,7 +8487,7 @@ def _transfer_ssh_jumps(options: List[str]) -> bool:
 
 
 # The user's and the system's ssh configs, as a command names them.
-_TRANSFER_SSH_CONFIG_NAMES = re.compile(r'\.ssh(?:/|\\+)config\b|ssh_config\b')
+_TRANSFER_SSH_CONFIG_NAMES = re.compile(r'\.ssh(?:/|\\+)config\b|ssh_config\b', re.IGNORECASE)
 
 
 def _transfer_turn_text(inputs) -> str:

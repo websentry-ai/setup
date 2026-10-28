@@ -4963,7 +4963,7 @@ function sshJumps(options) {
   }
   return false;
 }
-var SSH_CONFIG_NAMES = /\.ssh(?:\/|\\+)config\b|ssh_config\b/;
+var SSH_CONFIG_NAMES = /\.ssh(?:\/|\\+)config\b|ssh_config\b/i;
 function sshConfigNamed(options, state) {
   const text = `${state.turnText}
 ${state.callText}`;
