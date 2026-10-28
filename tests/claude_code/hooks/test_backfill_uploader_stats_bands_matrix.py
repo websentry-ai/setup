@@ -1,4 +1,4 @@
-"""The size bands of skipped transcripts across many generated histories: every file over the real 50 MiB cap lands
+"""The size bands of skipped transcripts across many generated histories: every file over the real 1 GiB cap lands
 in exactly one band, sizes on and beside each band edge included, and the MDM uploader's per-profile sums equal one
 walk over every profile's files."""
 
@@ -16,7 +16,7 @@ from tests.conftest import tool_module
 mdm = tool_module("claude-code/hooks/mdm", "setup")
 setup = tool_module("claude-code/hooks", "setup")
 MiB, GiB = 1 << 20, 1 << 30
-CAP = 50 * MiB
+CAP = GiB
 # Every size the bands must place exactly: the cap itself (not over it), the first byte over, and each band edge.
 EDGES = (CAP, CAP + 1, 100 * MiB - 1, 100 * MiB, 250 * MiB - 1, 250 * MiB, 500 * MiB - 1, 500 * MiB, GiB - 1, GiB,
          8 * GiB)

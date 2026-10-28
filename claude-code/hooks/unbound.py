@@ -7,7 +7,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
@@ -80,6 +80,9 @@ POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
+# Re-reads of a transcript whose last reply has not landed yet: the gap is milliseconds, the Stop hook's timeout 60s.
+STOP_TRANSCRIPT_REREADS = 2
+STOP_TRANSCRIPT_REREAD_SECONDS = 0.25
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -673,6 +676,9 @@ def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
     mid = message.get('id')
 
     if isinstance(msg_usage, dict) and msg_usage:
+        # Tagged with the model that served it, as advisor blocks already are, so each part prices at its own rate.
+        if isinstance(message.get('model'), str) and message['model']:
+            msg_usage = dict(msg_usage, model=message['model'])
         _keep_usage(usage_by_key, mid or ('', len(usage_by_key)), msg_usage, sidechain)
 
     for index, advisor in enumerate(_advisor_usages(message)):
@@ -763,6 +769,30 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
         _record_usage(entry, message, usage_by_key)
 
 
+def _is_agent_message(text, agent_messages) -> bool:
+    """Another session's message (e.g. a subagent hand-back), confirmed by a transcript record only Claude Code writes
+    for one: the prefix alone can be typed, so it never decides on its own."""
+    if not isinstance(text, str) or not text.lstrip().startswith('<agent-message '):
+        return False
+    # The whole hand-back, not an excerpt a user quotes; records are this turn's only (parse_transcript_file).
+    text = text.strip()
+    return any(m.strip() == text or m.strip().endswith('\n' + text) for m in agent_messages)
+
+
+def _peer_text(entry: Dict) -> Optional[str]:
+    """The text of a transcript record Claude Code marks as from another session (origin kind 'peer'), else None."""
+    attachment = entry.get('attachment') if isinstance(entry.get('attachment'), dict) else {}
+    origin = entry.get('origin') or attachment.get('origin')
+    if not isinstance(origin, dict) or origin.get('kind') != 'peer':
+        return None
+    text = attachment.get('prompt') if attachment else (entry.get('message') or {}).get('content')
+    if isinstance(text, list):
+        # Content blocks are matched by their text, as the submitted prompt carries it.
+        text = '\n'.join(block['text'] for block in text
+                         if isinstance(block, dict) and isinstance(block.get('text'), str))
+    return text if isinstance(text, str) and text else None
+
+
 def _typed_user_text(entry: Dict) -> str:
     """The typed text of a transcript entry, forwarded verbatim so DLP scans what
     the user wrote. Only text blocks are prompt text: tool results, meta entries
@@ -795,14 +825,19 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'queued_prompts': [],
         'usage': None,
         'model': None,
+        'agent_messages': [],
+        'finished': False,
     }
 
     if not transcript_path or not os.path.exists(transcript_path):
+        # Waiting cannot bring a missing transcript, so a Stop does not re-read for it.
+        conversation_data['finished'] = True
         return conversation_data
 
     queue_floor = subagent_floor or user_prompt_timestamp
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     usage_by_key: Dict = {}
+    by_model: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
 
     try:
@@ -818,6 +853,10 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                         entry = progress
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
+                    peer = _peer_text(entry)
+                    # Floored at the previous Stop only: a hand-back opening the turn is written as its prompt is.
+                    if peer and not (subagent_floor and not _ts_lt(subagent_floor, entry_timestamp)):
+                        conversation_data['agent_messages'].append(peer)
 
                     if entry_type == 'queue-operation':
                         # Typing while Claude is working enqueues the prompt and consumes it
@@ -864,6 +903,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
                             # Model is captured unconditionally so it survives even on usage-less assistant entries.
                             turn_model = turn_model or message.get('model')
+                            if progress is None and not entry.get('isSidechain'):
+                                conversation_data['finished'] = message.get('stop_reason') not in (None, 'tool_use')
 
                             if include_usage:
                                 _record_usage(entry, message, usage_by_key)
@@ -872,20 +913,32 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     continue
 
     except Exception:
-        pass
+        # A read that failed fails again; re-reading it would only delay the Stop.
+        conversation_data['finished'] = True
+
+    # Filtered once the whole transcript is read: a queued hand-back's own peer record follows its queue entry.
+    conversation_data['queued_prompts'] = [q for q in conversation_data['queued_prompts']
+                                           if not _is_agent_message(q, conversation_data['agent_messages'])]
 
     if include_usage:
         try:
             _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor,
                                  subagent_ceiling)
             for msg_usage, _ in usage_by_key.values():
+                model = msg_usage.get('model')
+                part = by_model.setdefault(model if isinstance(model, str) else None, dict.fromkeys(usage, 0))
                 for k in usage:
                     usage[k] += _usage_value(msg_usage, k)
+                    part[k] += _usage_value(msg_usage, k)
         except Exception as e:
             log_error(f"usage aggregation failed for {transcript_path}: {e}", 'usage')
 
     if any(usage.values()):
         conversation_data['usage'] = {**usage, 'total_tokens': sum(usage.values())}
+        by_model = {m: part for m, part in by_model.items() if m and any(part.values())}
+        # Only a turn another model also served needs a split; one model's turn prices whole, as before.
+        if any(m != turn_model for m in by_model):
+            conversation_data['usage']['by_model'] = by_model
     if turn_model:
         conversation_data['model'] = turn_model
 
@@ -5192,7 +5245,7 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
     return str(max(copies, key=lambda c: (c.stat().st_mtime, str(c))))
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None, agent_messages: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
     prev_prompt_id = None
@@ -5222,7 +5275,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
-            if prompt:
+            if prompt and not _is_agent_message(prompt, agent_messages or ()):
                 # The prompt's own cwd beats the session cwd for resolving a
                 # repo-level skill when the agent was opened at a parent dir. Held per
                 # prompt: a turn can carry several, each submitted from its own directory.
@@ -5319,6 +5372,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
+    elif any(_is_agent_message((e.get('event') or e).get('prompt'), agent_messages or ()) for e in events):
+        # A turn another session's message started still reports its tokens and tool calls, with no user text.
+        messages.append({'role': 'user', 'content': ''})
     
 
     all_responses = list(transcript_assistant_messages or [])
@@ -5423,30 +5479,52 @@ def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
     return restored + kept if restored else kept
 
 
+def _log_event_name(log: Dict) -> Optional[str]:
+    return (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+
+
+def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach the prompts of each session's turn still in progress (from its first prompt after its latest Stop):
+    trimming them away leaves the turn's Stop nothing to send. A turn idle for a day is let go."""
+    sessions = [log.get('session_id') or (log.get('event') or {}).get('session_id') for log in logs]
+    opened, last_seen = {}, {}
+    for index, (log, session_id) in enumerate(zip(logs, sessions)):
+        name = _log_event_name(log)
+        last_seen[session_id] = log.get('timestamp')
+        if name == 'Stop':
+            opened.pop(session_id, None)
+        elif name == 'UserPromptSubmit':
+            opened.setdefault(session_id, index)
+    stale = (datetime.utcnow() - timedelta(days=1)).isoformat() + 'Z'
+    keep = {id(log) for log in kept}
+    for session_id, start in opened.items():
+        if not _ts_lt(last_seen[session_id], stale):
+            keep.update(id(logs[i]) for i in range(start, len(logs))
+                        if sessions[i] == session_id and _log_event_name(logs[i]) == 'UserPromptSubmit')
+    return [log for log in logs if id(log) in keep]
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
-    session_order = []
-    seen_sessions = set()
+    # By latest activity, not first appearance: an older terminal can still be the busy one.
+    last_seen = {}
+    for index, log in enumerate(logs):
+        if log.get('session_id'):
+            last_seen[log['session_id']] = index
 
-    for log in logs:
-        session_id = log.get('session_id')
-        if session_id and session_id not in seen_sessions:
-            session_order.append(session_id)
-            seen_sessions.add(session_id)
-
-    if len(session_order) > 1:
-        most_recent_session = session_order[-1]
+    if len(last_seen) > 1:
+        most_recent_session = max(last_seen, key=last_seen.get)
         kept_logs = [
             log for log in logs
             if log.get('session_id') == most_recent_session
-        ]
-        save_logs(_keep_latest_stop(logs, kept_logs))
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(_keep_latest_stop(logs, logs[-AUDIT_LOG_TOTAL_LIMIT:]))
+        ][-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept_logs = logs[-AUDIT_LOG_TOTAL_LIMIT:]
+    save_logs(_keep_latest_stop(logs, _keep_open_turns(logs, kept_logs)))
 
 
 def process_stop_event(event: Dict, api_key: str):
@@ -5505,17 +5583,24 @@ def process_stop_event(event: Dict, api_key: str):
 
     transcript_assistant_messages = []
     transcript_queued_prompts = []
+    transcript_agent_messages = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
-        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
-                                                subagent_floor=previous_stop,
-                                                subagent_ceiling=stop_timestamp)
+        for attempt in range(STOP_TRANSCRIPT_REREADS + 1):
+            transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
+                                                    subagent_floor=previous_stop,
+                                                    subagent_ceiling=stop_timestamp)
+            # Claude Code can fire Stop before the turn's last reply reaches the transcript.
+            if transcript_data.get('finished', True) or attempt == STOP_TRANSCRIPT_REREADS:
+                break
+            time.sleep(STOP_TRANSCRIPT_REREAD_SECONDS)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
         ]
         transcript_queued_prompts = transcript_data.get('queued_prompts') or []
+        transcript_agent_messages = transcript_data.get('agent_messages') or []
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
 
@@ -5536,6 +5621,7 @@ def process_stop_event(event: Dict, api_key: str):
         request_completed=request_completed,
         cwd=event.get('cwd'),
         queued_prompts=transcript_queued_prompts,
+        agent_messages=transcript_agent_messages,
     )
 
     if exchange:
