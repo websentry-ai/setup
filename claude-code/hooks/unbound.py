@@ -7,7 +7,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
@@ -5423,30 +5423,47 @@ def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
     return restored + kept if restored else kept
 
 
+def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach each session's turn still in progress, from its first prompt after its latest Stop: trimming
+    that prompt away leaves the turn's Stop nothing to send. A turn idle for a day is let go."""
+    sessions = [log.get('session_id') or (log.get('event') or {}).get('session_id') for log in logs]
+    opened, last_seen = {}, {}
+    for index, (log, session_id) in enumerate(zip(logs, sessions)):
+        name = (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+        last_seen[session_id] = log.get('timestamp')
+        if name == 'Stop':
+            opened.pop(session_id, None)
+        elif name == 'UserPromptSubmit':
+            opened.setdefault(session_id, index)
+    stale = (datetime.utcnow() - timedelta(days=1)).isoformat() + 'Z'
+    keep = {id(log) for log in kept}
+    for session_id, start in opened.items():
+        if not _ts_lt(last_seen[session_id], stale):
+            keep.update(id(logs[i]) for i in range(start, len(logs)) if sessions[i] == session_id)
+    return [log for log in logs if id(log) in keep]
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
-    session_order = []
-    seen_sessions = set()
+    # By latest activity, not first appearance: an older terminal can still be the busy one.
+    last_seen = {}
+    for index, log in enumerate(logs):
+        if log.get('session_id'):
+            last_seen[log['session_id']] = index
 
-    for log in logs:
-        session_id = log.get('session_id')
-        if session_id and session_id not in seen_sessions:
-            session_order.append(session_id)
-            seen_sessions.add(session_id)
-
-    if len(session_order) > 1:
-        most_recent_session = session_order[-1]
+    if len(last_seen) > 1:
+        most_recent_session = max(last_seen, key=last_seen.get)
         kept_logs = [
             log for log in logs
             if log.get('session_id') == most_recent_session
         ]
-        save_logs(_keep_latest_stop(logs, kept_logs))
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(_keep_latest_stop(logs, logs[-AUDIT_LOG_TOTAL_LIMIT:]))
+    else:
+        kept_logs = logs[-AUDIT_LOG_TOTAL_LIMIT:]
+    save_logs(_keep_latest_stop(logs, _keep_open_turns(logs, kept_logs)))
 
 
 def process_stop_event(event: Dict, api_key: str):
