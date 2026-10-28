@@ -80,8 +80,8 @@ POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
-# Re-reads of a transcript whose last reply has not landed yet: at most 1s, well inside the Stop hook's 60s timeout.
-STOP_TRANSCRIPT_REREADS = 4
+# Re-reads of a transcript whose last reply has not landed yet: the gap is milliseconds, the Stop hook's timeout 60s.
+STOP_TRANSCRIPT_REREADS = 2
 STOP_TRANSCRIPT_REREAD_SECONDS = 0.25
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
@@ -802,6 +802,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     }
 
     if not transcript_path or not os.path.exists(transcript_path):
+        # Waiting cannot bring a missing transcript, so a Stop does not re-read for it.
+        conversation_data['finished'] = True
         return conversation_data
 
     queue_floor = subagent_floor or user_prompt_timestamp
@@ -878,7 +880,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     continue
 
     except Exception:
-        pass
+        # A read that failed fails again; re-reading it would only delay the Stop.
+        conversation_data['finished'] = True
 
     if include_usage:
         try:

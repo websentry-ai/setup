@@ -76,5 +76,10 @@ class TestStopBeforeTheLastReplyLands(unittest.TestCase):
         self.assertEqual(exchange["usage"]["input_tokens"], 100)
 
 
+    def test_a_missing_transcript_is_not_waited_on(self):
+        self.transcript = self.transcript.with_name("missing.jsonl")
+        _, slept = self._stop(lambda _: None)
+        self.assertEqual(slept, 0)
+
 if __name__ == "__main__":
     unittest.main()
