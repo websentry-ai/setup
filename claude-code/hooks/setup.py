@@ -597,6 +597,20 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                     ]
                 }
             ],
+            # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+            "PostToolUseFailure": [
+                {
+                    "matcher": "Bash",
+                    "hooks": [
+                        _hook({
+                            "type": "command",
+                            "command": hook_command,
+                            "async": True,
+                            "timeout": 60
+                        })
+                    ]
+                }
+            ],
             "UserPromptSubmit": [
                 {
                     "hooks": [

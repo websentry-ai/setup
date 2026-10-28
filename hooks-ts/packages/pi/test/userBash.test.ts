@@ -14,6 +14,9 @@
 // than importing anything, so the shape is asserted against pi's rule and not against our own.
 
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 import test from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -287,6 +290,8 @@ test("HOOK-04 the recorded decision carries the typed command as its tool_input"
     assert.equal(entries.length, 1);
     assert.equal(entries[0]?.tool_name, "bash");
     assert.deepStrictEqual(entries[0]?.tool_input, { command: "echo hi" });
+    // The uncapped command rides along for transfer resolution only.
+    assert.equal((entries[0] as { transfer_command?: string } | undefined)?.transfer_command, "echo hi");
   } finally {
     await api.close();
   }
@@ -485,6 +490,56 @@ test("a denied or confirmed !cmd returns the same result as before, and is still
       f.cleanup();
       await api.close();
     }
+  }
+});
+
+test("an approved confirm's !cmd row carries its transfer, and a declined one's does not", async () => {
+  turnStore.take();
+  for (const confirmResult of [true, false]) {
+    const api = await startMockApi({ mode: "ask" });
+    const f = await keyedExtension(api);
+    try {
+      const ctx = createFakeCtx({ sessionId: "sess-ubash-4", hasUI: true, confirmResult });
+      await f.handlers.get("user_bash")?.(createFakeUserBashEvent("curl -T build.zip http://10.1.2.3/up"), ctx);
+      for (let waited = 0; turnLogBodies(api).length === 0 && waited < 3_000; waited += 20) await sleep(20);
+      const logs = turnLogBodies(api);
+      assert.equal(logs.length, 1, `confirmed ${confirmResult}: one row`);
+      const entry = logs[0]?.messages?.[1]?.tool_use?.[0] as Record<string, unknown> | undefined;
+      const upload = { direction: "out", host: "10.1.2.3", resolved_host: "10.1.2.3", address: "private" };
+      const expected = confirmResult ? { tool: "curl", endpoints: [upload] } : undefined;
+      assert.deepEqual(entry?.transfer, expected, JSON.stringify(entry));
+    } finally {
+      f.cleanup();
+      await api.close();
+    }
+  }
+});
+
+// The ssh on PATH, which resolves the -F config; without one the lookup is skipped and the test with it.
+const REAL_SSH = (process.env.PATH ?? "").split(delimiter).filter(Boolean)
+  .map((dir) => join(dir, "ssh")).find(existsSync);
+
+test("a !cmd's transfer starts in the event's folder, not the session's", { skip: REAL_SSH === undefined }, async () => {
+  turnStore.take();
+  const [ran, session] = ["10.1.1.1", "10.2.2.2"].map((address) => {
+    const dir = mkdtempSync(join(tmpdir(), "ubash-cwd-"));
+    writeFileSync(join(dir, "cfg"), `Host prod\n  HostName ${address}\n`);
+    return dir;
+  }) as [string, string];
+  const api = await startMockApi({ mode: "allow" });
+  const f = await keyedExtension(api);
+  try {
+    const ctx = createFakeCtx({ sessionId: "sess-ubash-cwd", cwd: session });
+    const event = createFakeUserBashEvent("scp -F cfg build.zip prod:/srv", { cwd: ran });
+    await f.handlers.get("user_bash")?.(event, ctx);
+    for (let waited = 0; turnLogBodies(api).length === 0 && waited < 5_000; waited += 20) await sleep(20);
+    const entry = turnLogBodies(api)[0]?.messages?.[1]?.tool_use?.[0] as Record<string, unknown> | undefined;
+    const transfer = entry?.transfer as { endpoints?: { resolved_host?: string }[] } | undefined;
+    assert.equal(transfer?.endpoints?.[0]?.resolved_host, "10.1.1.1", JSON.stringify(entry));
+  } finally {
+    f.cleanup();
+    await api.close();
+    for (const dir of [ran, session]) rmSync(dir, { recursive: true, force: true });
   }
 });
 

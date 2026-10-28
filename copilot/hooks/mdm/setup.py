@@ -12,6 +12,7 @@ import platform
 import re
 import subprocess
 import hashlib
+import inspect
 import json
 import types
 import sqlite3
@@ -879,6 +880,8 @@ def _backfill_mcp_tool_provenance(
     if hook is None:
         return {}
     try:
+        # Only MCP provenance is read here, so past shell calls get no ssh -G or DNS lookups, as calls that never ran.
+        skip_transfers = {"ran": False} if "ran" in inspect.signature(hook.map_copilot_tool).parameters else {}
         cwd = None
         for entry in entries:
             if not isinstance(entry, dict):
@@ -926,6 +929,7 @@ def _backfill_mcp_tool_provenance(
                     mcp_server_name=request.get("mcpServerName"),
                     mcp_tool_name=request.get("mcpToolName"),
                     cwd=cwd,
+                    **skip_transfers,
                 )
                 if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
                     continue

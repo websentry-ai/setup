@@ -1189,6 +1189,10 @@ class TestInstallUnderResolvedDir(unittest.TestCase):
         cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         self.assertEqual(cmd, str(hook_path))
         self.assertNotIn(str(self.home / ".claude"), cmd)
+        # A Bash call that exits non-zero arrives only as PostToolUseFailure.
+        failure = settings["hooks"]["PostToolUseFailure"][0]
+        self.assertEqual(failure["matcher"], "Bash")
+        self.assertEqual(failure["hooks"][0]["command"], str(hook_path))
 
     def test_backward_compat_no_env_uses_home_claude(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}

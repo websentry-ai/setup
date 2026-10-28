@@ -23,7 +23,7 @@ const distFile = join(distDir, "index.js");
 // only index.js.
 const metaFile = join(repoRoot, "dist", "meta", "pi.json");
 
-const MAX_BYTES = 204_800; // 200 KB: a value import of pi would blow past this by megabytes.
+const MAX_BYTES = 307_200; // 300 KB: room for the transfer reader, while a value import of pi is megabytes.
 
 interface Metafile {
   inputs: Record<string, unknown>;
