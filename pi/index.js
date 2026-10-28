@@ -6232,7 +6232,8 @@ function createExtension(overrides = {}) {
           // here for the same reason as on `tool_call`: this very call may have latched the key.
           onDecision: (entry) => {
             if (recordingActive(state)) {
-              postStandaloneTurn(entry, ctx, sessionIdOf(ctx), {
+              const cwd = typeof event?.cwd === "string" && event.cwd !== "" ? event.cwd : ctx?.cwd;
+              postStandaloneTurn(entry, { cwd }, sessionIdOf(ctx), {
                 client: state.client,
                 apiKey: state.apiKey,
                 ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry },
