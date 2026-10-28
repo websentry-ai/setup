@@ -673,6 +673,9 @@ def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
     mid = message.get('id')
 
     if isinstance(msg_usage, dict) and msg_usage:
+        # Tagged with the model that served it, as advisor blocks already are, so each part prices at its own rate.
+        if isinstance(message.get('model'), str) and message['model']:
+            msg_usage = dict(msg_usage, model=message['model'])
         _keep_usage(usage_by_key, mid or ('', len(usage_by_key)), msg_usage, sidechain)
 
     for index, advisor in enumerate(_advisor_usages(message)):
@@ -803,6 +806,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     queue_floor = subagent_floor or user_prompt_timestamp
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     usage_by_key: Dict = {}
+    by_model: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
 
     try:
@@ -879,13 +883,20 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
             _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor,
                                  subagent_ceiling)
             for msg_usage, _ in usage_by_key.values():
+                model = msg_usage.get('model')
+                part = by_model.setdefault(model if isinstance(model, str) else None, dict.fromkeys(usage, 0))
                 for k in usage:
                     usage[k] += _usage_value(msg_usage, k)
+                    part[k] += _usage_value(msg_usage, k)
         except Exception as e:
             log_error(f"usage aggregation failed for {transcript_path}: {e}", 'usage')
 
     if any(usage.values()):
         conversation_data['usage'] = {**usage, 'total_tokens': sum(usage.values())}
+        by_model = {m: part for m, part in by_model.items() if m and any(part.values())}
+        # Only a turn another model also served needs a split; one model's turn prices whole, as before.
+        if any(m != turn_model for m in by_model):
+            conversation_data['usage']['by_model'] = by_model
     if turn_model:
         conversation_data['model'] = turn_model
 
