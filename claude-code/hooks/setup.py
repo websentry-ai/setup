@@ -1510,7 +1510,7 @@ def _backfill_first_session_id(transcript_path: Path):
                     continue
                 try:
                     entry = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     continue
                 if not isinstance(entry, dict):
                     return None

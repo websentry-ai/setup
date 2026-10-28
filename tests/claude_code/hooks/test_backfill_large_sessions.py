@@ -65,7 +65,7 @@ def _streamed(up, head, max_bytes):
 
 def _prompts(pieces):
     return [e["message"]["content"] for p in pieces for e in p["entries"]
-            if e.get("type") == "user" and isinstance(e.get("message"), dict)]
+            if isinstance(e, dict) and e.get("type") == "user" and isinstance(e.get("message"), dict)]
 
 
 class SliceReaderTestCase(unittest.TestCase):
@@ -167,17 +167,37 @@ class SliceReaderTestCase(unittest.TestCase):
 
     def test_lines_that_once_broke_the_reader_are_skipped_and_the_rest_still_goes(self):
         lines = _write_transcript(self.path, [500] * 4)
+        deep = "[" * 1500 + "]" * 1500
+        try:
+            json.loads(deep)
+            kept = 2  # Python 3.12+ decodes it, so it rides along as an entry like any other line
+        except RecursionError:
+            kept = 1
         with open(self.path, "a") as f:
             f.write(json.dumps({"type": "user", "sessionId": SID, "message": "not an object"}) + "\n")
-            f.write("[" * 1500 + "]" * 1500 + "\n")  # parsed, and too deep to decode
+            f.write(deep + "\n")
             f.write(json.dumps({"type": "user", "sessionId": SID, "timestamp": _at(9),
                                 "message": {"role": "user", "content": "ask last"}}) + "\n")
         for up in UPLOADERS:
             with self.subTest(up.__name__):
                 self.assertEqual(_prompts(_streamed(up, self._head(), 20000))[-1], "ask last")
                 whole = up._backfill_collect_session(self.path)
-                self.assertEqual(len(whole["entries"]), len(lines) + 2)  # the deep line alone fails to parse
+                self.assertEqual(len(whole["entries"]), len(lines) + 1 + kept)
                 self.assertTrue(list(up._backfill_slice_session(whole, 2500)))
+
+    def test_a_line_too_deep_to_decode_before_the_session_id_still_finds_the_id(self):
+        _write_transcript(self.path, [500] * 2)
+        self.path.write_text("DEEP\n" + self.path.read_text())
+        for up in UPLOADERS:
+            loads = up.json.loads
+
+            def deep(text, *a, **k):
+                if text.strip() == "DEEP":
+                    raise RecursionError  # how a too-deep line fails on Pythons whose decoder has a depth limit
+                return loads(text, *a, **k)
+
+            with self.subTest(up.__name__), patch.object(up.json, "loads", side_effect=deep):
+                self.assertEqual(up._backfill_first_session_id(self.path), SID)
 
     def test_an_offset_past_the_end_of_the_file_sends_it_from_the_top(self):
         _write_transcript(self.path, [800] * 6)
