@@ -763,6 +763,11 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
         _record_usage(entry, message, usage_by_key)
 
 
+def _is_agent_message(text) -> bool:
+    """Another session's message (e.g. a subagent hand-back): model output, not user input."""
+    return isinstance(text, str) and text.lstrip().startswith('<agent-message ')
+
+
 def _typed_user_text(entry: Dict) -> str:
     """The typed text of a transcript entry, forwarded verbatim so DLP scans what
     the user wrote. Only text blocks are prompt text: tool results, meta entries
@@ -835,7 +840,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                         if subagent_ceiling and _ts_lt(subagent_ceiling, entry_timestamp):
                             continue
                         queued = entry.get('content')
-                        if queued:
+                        if queued and not _is_agent_message(queued):
                             conversation_data['queued_prompts'].append(queued)
 
                     elif entry_type == 'user':
@@ -911,7 +916,7 @@ def get_recent_user_prompts_for_session(
         if event.get('hook_event_name') != 'UserPromptSubmit':
             continue
         prompt = event.get('prompt')
-        if prompt:
+        if prompt and not _is_agent_message(prompt):
             # Both hooks log one submit with Claude's shared prompt_id, so a
             # repeat of the previous id is that duplicate. This list spans the
             # whole session, so identical text alone can't tell a double-log from
@@ -5222,7 +5227,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
-            if prompt:
+            if prompt and not _is_agent_message(prompt):
                 # The prompt's own cwd beats the session cwd for resolving a
                 # repo-level skill when the agent was opened at a parent dir. Held per
                 # prompt: a turn can carry several, each submitted from its own directory.
@@ -5319,6 +5324,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
+    elif any(_is_agent_message((e.get('event') or e).get('prompt')) for e in events):
+        # A turn another session's message started still reports its tokens and tool calls, with no user text.
+        messages.append({'role': 'user', 'content': ''})
     
 
     all_responses = list(transcript_assistant_messages or [])
@@ -6900,7 +6908,8 @@ def main():
             return
 
         # Handle UserPromptSubmit - check policy before processing
-        if hook_event_name == 'UserPromptSubmit':
+        # An agent message is still logged: when it starts a turn, it is that turn's boundary.
+        if hook_event_name == 'UserPromptSubmit' and not _is_agent_message(event.get('prompt')):
             # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
 
