@@ -191,8 +191,8 @@ class UploaderStatsTestCase(unittest.TestCase):
             mdm._backfill_add_stats(sums, part)
         self.assertEqual(sums["skipped_over_cap"]["by_size"], _by_size([60 << 20, 2 << 30]))
 
-    def test_the_size_cap_is_unchanged(self):
-        self.assertEqual((mdm.BACKFILL_MAX_FILE_BYTES, setup.BACKFILL_MAX_FILE_BYTES), (50 * 1024 * 1024,) * 2)
+    def test_the_size_cap_is_one_gib(self):
+        self.assertEqual((mdm.BACKFILL_MAX_FILE_BYTES, setup.BACKFILL_MAX_FILE_BYTES), (1024 ** 3,) * 2)
 
 
 if __name__ == "__main__":
