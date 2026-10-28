@@ -3893,14 +3893,19 @@ function simple(words2, item, before, shell, depth) {
     const items = script === void 0 ? read : scriptStdin(inner, lexer, read);
     const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
     if (options.noexec !== void 0 && options.noexec !== "") markUnsure(calls);
-    return replaced(argv, subshell, shell, calls.map((call) => ({
-      ...call,
-      otherUser: call.otherUser || parsed.otherUser,
-      layers: [...call.layers, layer]
-    })));
+    return maybeShadowed(known, replaced(argv, subshell, shell, calls.map((call2) => ({
+      ...call2,
+      otherUser: call2.otherUser || parsed.otherUser,
+      layers: [...call2.layers, layer]
+    }))));
   }
   if (name === void 0) return [];
-  return replaced(argv, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
+  const call = { name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] };
+  return maybeShadowed(known, replaced(argv, subshell, shell, [call]));
+}
+function maybeShadowed(known, calls) {
+  if (known !== void 0) markUnsure(calls);
+  return calls;
 }
 function replaced(argv, subshell, shell, calls) {
   replaceShell(argv, subshell, shell);
@@ -4757,8 +4762,10 @@ function readOnce(path) {
   }
 }
 function vetted(options, home, processEnv, folder) {
-  const homes = [.../* @__PURE__ */ new Set([home, processEnv.HOME || home])];
-  const userBases = homes.map((h) => join5(h, ".ssh"));
+  const envHome = processEnv.HOME || home;
+  if (platform.windows && envHome !== home) return void 0;
+  const homes = [envHome];
+  const userBases = [join5(envHome, ".ssh")];
   if (options.length % 2 !== 0) return void 0;
   const configs = [];
   const rest = [];
@@ -4948,7 +4955,7 @@ async function endpoint(raw, cwd, state, sure = true) {
   const out = { host, resolved_host: resolved, address: kind };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
 }
-async function transferOf(command2, cwd, state) {
+async function transferOf(command2, cwd, state, sure = true) {
   state.callText = command2;
   let tool;
   const endpoints = [];
@@ -4962,7 +4969,7 @@ async function transferOf(command2, cwd, state) {
     const found = parse(call, state.env);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state, call.unsure !== true);
+      const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
       if (one !== void 0 && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];
@@ -5007,7 +5014,8 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if (typeof call.decision === "string" && NEVER_RAN.has(call.decision) || call.ran === false) continue;
       if (typeof command2 !== "string" || command2.trim() === "" || typeof call.tool_use_id !== "string") continue;
-      const transfer = await transferOf(call.tool_name === "powershell" ? hashtablesEmptied(command2) : command2, cwd, state);
+      const script = call.tool_name === "powershell" ? hashtablesEmptied(command2) : command2;
+      const transfer = await transferOf(script, cwd, state, call.ran !== "maybe");
       if (transfer !== void 0) transfers.set(call.tool_use_id, transfer);
     }
   } catch {

@@ -1810,7 +1810,7 @@
       "direction": "in",
       "host": "actual.example",
       "resolved_host": "actual.example",
-      "address": "public"
+      "address": "unresolved"
      }
     ]
    }
@@ -9166,6 +9166,38 @@
       "direction": "out",
       "host": "prod",
       "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "if [ -f marker ]; then scp() { :; }; fi; scp f prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "prod",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "scp() { :; }; scp f prod:/srv",
+   "transfer": null
+  },
+  {
+   "command": "if [ -f marker ]; then curl() { :; }; fi; curl https://example.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
       "address": "unresolved"
      }
     ]

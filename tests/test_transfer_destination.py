@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '42fa474ada05a3052967ed36bf64e72070d2c0f7d9b79bea2f55551e58b58b3c'
+BLOCK_SHA256 = '83f22029980515f3a2680127360e6acfc95ae3d6c0c5c5e13658a935df870db2'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -773,6 +773,21 @@ class SshLookupTests(TransferTestCase):
         Path(self.home, 'alt_cfg').write_text('Host prod\n  HostName 10.9.8.7\n')
         self.assert_endpoints('scp -F ~/alt_cfg f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.9.8.7')])
 
+    def test_a_relative_include_is_read_under_home_only(self):
+        # ssh reads the account's ~/.ssh/config but globs its relative Include under $HOME, so only that tree counts.
+        elsewhere = tempfile.mkdtemp()
+        os.makedirs(os.path.join(elsewhere, '.ssh'))
+        Path(self.home, '.ssh', 'config').write_text('Include inc\n')
+        Path(self.home, '.ssh', 'inc').write_text('Host prod\n  HostName 10.1.1.1\n')
+        Path(elsewhere, '.ssh', 'inc').write_text('Host prod\n  HostName 10.2.2.2\n')
+        with patch.dict(os.environ, {'HOME': elsewhere}):
+            self.assert_endpoints('scp f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.2.2.2')])
+            for hook in HOOKS:
+                # Windows' ssh may expand it otherwise, so there a $HOME that differs leaves the host unresolved.
+                with self.subTest(hook=hook.__file__), patch.object(hook, '_TRANSFER_WINDOWS', True):
+                    self.assertEqual(hook._transfer('scp f prod:/tmp', self.repo, {})['endpoints'],
+                                     [_endpoint('out', 'prod', 'unresolved')])
+
     def test_a_daemon_over_an_explicit_shell_takes_no_daemon_port(self):
         # rsync -e reaches rsync://host:873/module through ssh; 873 is the daemon's port, not ssh's.
         self.assert_hosts('rsync -e ssh f rsync://prod:873/module', [('out', 'prod')])
@@ -1351,6 +1366,19 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         stop = {'hook_event_name': 'Stop', 'cwd': self.repo, 'conversation_id': 'c1',
                 'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}}
         self._check(hook.build_llm_exchange(stop, post))
+
+    def test_an_augment_call_with_an_error_of_unknown_kind_is_reported_but_not_looked_up(self):
+        # An error with no return code that isn't a denial or a launch failure may have come after the command ran.
+        augment = load_module('augment/hooks/unbound.py')
+        stop = {'hook_event_name': 'Stop', 'cwd': self.repo, 'conversation_id': 'c1',
+                'conversation': {'userPrompt': 'ship it', 'agentTextResponse': 'shipped'}}
+        post = [{'timestamp': '2026-10-22T16:40:00.9Z',
+                 'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'launch-process',
+                           'tool_input': {'command': self.COMMAND}, 'tool_output': '', 'tool_error': error}}
+                for error in ('Command timed out after 60 seconds', 'Tool call was blocked by a hook')]
+        transfers = [e.get('transfer') for e in _tool_entries(augment.build_llm_exchange(stop, post))]
+        self.assertEqual(transfers, [{'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved')]}, None])
+        self.assertEqual(self.ssh_calls(), [])
 
     def test_a_slow_lookup_never_holds_up_a_hook_with_a_short_timeout(self):
         # Augment kills its Stop hook at 10 s and Cursor's has no timeout of ours, so lookups get 3 s and the turn is

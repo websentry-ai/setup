@@ -5937,6 +5937,8 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         calls = [(program, args, env, cwd, other_user, (layer,), False)] if program else []
     if program:
         _transfer_replace(words, subshell, shell)
+    if known:
+        _transfer_unsure_calls(calls)  # a function of the same name, which may have been defined, may run instead
     return calls
 
 
@@ -6810,8 +6812,8 @@ def _transfer_match_execs(words: List[str]) -> bool:
 
 
 def _transfer_ssh_config_line(line: str, homes: List[str], bases: tuple) -> Optional[tuple]:
-    """One ssh config line read as ssh reads it: (whether it is an Include, the files it names, resolved against every
-    home and folder ssh may use); None when it could run a command or a DNS lookup, or ssh may read it differently."""
+    """One ssh config line read as ssh reads it: (whether it is an Include, the files it names, resolved against the
+    home and folder ssh uses); None when it could run a command or a DNS lookup, or ssh may read it differently."""
     import glob
     # ssh joins no lines, but a line ending in a backslash is refused too, as a reader that joins them would differ.
     odd = re.search(r'[\x00-\x08\x0a-\x1f\x7f]', line) or line.rstrip(' \t').endswith('\\')
@@ -6859,10 +6861,13 @@ def _transfer_ssh_vetted(options: List[str], cwd: Optional[str], folder: str) ->
     """ssh -G's options with -F set to a copy, in folder, of exactly the configs this read once and checked, with each
     Include pointed at the copies, so ssh reads nothing else; None when one could run a command or can't be checked."""
     import stat
-    home = _transfer_home()
-    # ssh reads ~/.ssh/config from the account's home but expands an Include's ~ and relative path with $HOME.
-    homes = list(dict.fromkeys([home, os.path.expanduser('~')]))
-    user_bases = tuple(os.path.join(h, '.ssh') for h in homes)
+    home, env_home = _transfer_home(), os.path.expanduser('~')
+    # ssh reads ~/.ssh/config from the account's home, but globs an Include's ~ and relative path, and glob expands ~
+    # with $HOME. Windows' ssh may read it otherwise, so there the two must agree.
+    if _TRANSFER_WINDOWS and env_home != home:
+        return None
+    homes = [env_home]
+    user_bases = (os.path.join(env_home, '.ssh'),)
     if len(options) % 2:
         return None
     pairs = list(zip(options[::2], options[1::2]))
@@ -7068,9 +7073,9 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
     return {k: v for k, v in endpoint.items() if v}
 
 
-def _transfer(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
+def _transfer(command: Optional[str], cwd: Optional[str], state: Dict, sure: bool = True) -> Optional[Dict]:
     """Where a shell call's transfers went: the first transfer tool it ran and each place it sent to or fetched
-    from; None when it ran no transfer. Never raises, and never takes longer than the turn's budget."""
+    from, looked up only when the call surely ran; None when it ran no transfer. Never raises or outlasts the budget."""
     try:
         if not isinstance(command, str) or not command.strip():
             return None
@@ -7081,7 +7086,7 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             for raw in (found[1] if found else []):
                 if len(endpoints) >= _TRANSFER_MAX_ENDPOINTS:
                     break
-                endpoint = _transfer_endpoint(raw, call_cwd, state, not unsure)
+                endpoint = _transfer_endpoint(raw, call_cwd, state, sure and not unsure)
                 if endpoint and endpoint not in endpoints:
                     endpoints.append(endpoint)
                     tool = tool or found[0]
@@ -7110,6 +7115,18 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
         entry['ts'] = ts
     return entry
 # --- end transfer resolution ---
+
+
+_AUGMENT_NEVER_RAN = re.compile(r'denied|blocked|rejected|cancel|not allowed|failed to launch', re.IGNORECASE)
+
+
+def _augment_call_ran(error) -> Optional[bool]:
+    """Whether an Augment launch-process call ran: True with no error or one carrying its return code, False when it
+    was denied, blocked or failed to launch, and None for any other error, which it may or may not have run past."""
+    text = str(error or '')
+    if not text or '<return-code>' in text:
+        return True
+    return False if _AUGMENT_NEVER_RAN.search(text) else None
 
 
 def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optional[str] = None) -> Optional[Dict]:
@@ -7162,9 +7179,9 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
                 call_cwd = (ev.get('tool_input') or {}).get('cwd') if isinstance(ev.get('tool_input'), dict) else None
                 start = os.path.join(cwd or '', call_cwd) if isinstance(call_cwd, str) and call_cwd else cwd
                 start = start if start and os.path.isabs(start) else None
-                # A blocked or denied call, or one that failed to launch, has an error but no return code: it never ran.
-                ran = not ev.get('tool_error') or '<return-code>' in str(ev.get('tool_error'))
-                transfer = _transfer(shaped['tool_input'].get('command'), start, transfer_state) if ran else None
+                ran = _augment_call_ran(ev.get('tool_error'))
+                transfer = _transfer(shaped['tool_input'].get('command'), start, transfer_state, ran is True) \
+                    if ran is not False else None
                 if transfer:
                     shaped['transfer'] = transfer
             assistant_tool_uses.append(_with_call_ts(shaped, log_entry.get('timestamp')))

@@ -2502,14 +2502,21 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
     // zsh's spelling of -n, which bash rejects: it may not run them.
     if (options.noexec !== undefined && options.noexec !== "") markUnsure(calls);
-    return replaced(argv, subshell, shell, calls.map((call) => ({
+    return maybeShadowed(known, replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
       layers: [...call.layers, layer],
-    })));
+    }))));
   }
   if (name === undefined) return [];
-  return replaced(argv, subshell, shell, [{ name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] }]);
+  const call: Call = { name, args, env, cwd: parsed.cwd, otherUser: parsed.otherUser, layers: [layer] };
+  return maybeShadowed(known, replaced(argv, subshell, shell, [call]));
+}
+
+/** A program's calls, which may not have run when a function of the same name may have been defined to run instead. */
+function maybeShadowed(known: unknown, calls: Call[]): Call[] {
+  if (known !== undefined) markUnsure(calls);
+  return calls;
 }
 
 /** The calls of a command, after which nothing runs when it ran through exec. */
@@ -3538,9 +3545,12 @@ function readOnce(path: string): string | undefined {
 /** ssh -G's options with -F set to a copy, in `folder`, of exactly the configs this read once and checked, with each
  *  Include pointed at the copies, so ssh reads nothing else; undefined when one could run a command or can't be checked. */
 function vetted(options: readonly string[], home: string, processEnv: Record<string, string | undefined>, folder: string): string[] | undefined {
-  // ssh reads ~/.ssh/config from the account's home but expands an Include's ~ and relative path with $HOME.
-  const homes = [...new Set([home, processEnv.HOME || home])];
-  const userBases = homes.map((h) => join(h, ".ssh"));
+  // ssh reads ~/.ssh/config from the account's home, but globs an Include's ~ and relative path, and glob expands ~
+  // with $HOME. Windows' ssh may read it otherwise, so there the two must agree.
+  const envHome = processEnv.HOME || home;
+  if (platform.windows && envHome !== home) return undefined;
+  const homes = [envHome];
+  const userBases = [join(envHome, ".ssh")];
   if (options.length % 2 !== 0) return undefined;
   const configs: string[] = [];
   const rest: string[] = [];
@@ -3771,7 +3781,9 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
 }
 
 /** Where one shell command's transfers went; undefined when it ran none. */
-async function transferOf(command: string, cwd: string | undefined, state: State): Promise<Transfer | undefined> {
+async function transferOf(
+  command: string, cwd: string | undefined, state: State, sure = true,
+): Promise<Transfer | undefined> {
   state.callText = command;
   let tool: string | undefined;
   const endpoints: TransferEndpoint[] = [];
@@ -3785,7 +3797,7 @@ async function transferOf(command: string, cwd: string | undefined, state: State
     const found = parse(call, state.env);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state, call.unsure !== true);
+      const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
       if (one !== undefined && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];
@@ -3802,7 +3814,8 @@ export interface ShellCall {
   /** The command before the audit cap, as `transferCommand` bounds it; read in place of `tool_input.command`. */
   transfer_command?: unknown;
   decision?: unknown;
-  /** `false` when the call is known not to have run, such as a confirm the person declined. */
+  /** `false` when the call is known not to have run, such as a confirm the person declined, and "maybe" when it may
+   *  not have: reported, but not looked up. */
   ran?: unknown;
 }
 
@@ -3852,7 +3865,8 @@ export async function resolveTransfers(
       if ((typeof call.decision === "string" && NEVER_RAN.has(call.decision)) || call.ran === false) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
       // A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
-      const transfer = await transferOf(call.tool_name === "powershell" ? hashtablesEmptied(command) : command, cwd, state);
+      const script = call.tool_name === "powershell" ? hashtablesEmptied(command) : command;
+      const transfer = await transferOf(script, cwd, state, call.ran !== "maybe");
       if (transfer !== undefined) transfers.set(call.tool_use_id, transfer);
     }
   } catch {

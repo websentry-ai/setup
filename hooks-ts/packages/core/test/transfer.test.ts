@@ -145,6 +145,36 @@ test("an IPv4-mapped address is read as its IPv4 address in every form, as Pytho
   }
 });
 
+test("a call that may not have run is reported but not looked up", async () => {
+  const lookups: string[] = [];
+  const found = await resolveTransfers([
+    { tool_name: "bash", tool_use_id: "c1", tool_input: { command: "curl https://example.com/a" }, ran: "maybe" },
+    { tool_name: "bash", tool_use_id: "c2", tool_input: { command: "curl https://example.com/b" } },
+  ], "/", options({ lookup: async (host) => (lookups.push(host), lookup(host)) }));
+  assert.equal(found.get("c1")?.endpoints[0]?.address, "unresolved");
+  assert.equal(found.get("c2")?.endpoints[0]?.address, "public");
+  assert.deepEqual(lookups, ["example.com"]);
+});
+
+test("a relative Include is read under $HOME only", async () => {
+  // ssh reads the account's ~/.ssh/config but globs its relative Include under $HOME, so only that tree counts.
+  const [home, elsewhere] = [mkdtempSync(join(tmpdir(), "acct-")), mkdtempSync(join(tmpdir(), "env-home-"))];
+  for (const dir of [home, elsewhere]) mkdirSync(join(dir, ".ssh"));
+  writeFileSync(join(home, ".ssh", "config"), "Include inc\n");
+  writeFileSync(join(home, ".ssh", "inc"), "Host prod\n  HostName 10.1.1.1\n");
+  writeFileSync(join(elsewhere, ".ssh", "inc"), "Host prod\n  HostName 10.2.2.2\n");
+  const extra = { home, env: { HOME: elsewhere } };
+  assert.equal((await transfer("scp f prod:/tmp", "/", extra))?.endpoints[0]?.resolved_host, "10.2.2.2");
+  const before = platform.windows;
+  platform.windows = true;
+  try {
+    // Windows' ssh may expand it otherwise, so there a $HOME that differs leaves the host unresolved.
+    assert.equal((await transfer("scp f prod:/tmp", "/", extra))?.endpoints[0]?.address, "unresolved");
+  } finally {
+    platform.windows = before;
+  }
+});
+
 test("a daemon over an explicit shell takes no daemon port", async () => {
   // rsync -e reaches rsync://host:873/module through ssh; 873 is the daemon's port, not ssh's.
   const calls: string[][] = [];
