@@ -4439,6 +4439,7 @@ function wget(args, proxied = false) {
   const urls = [];
   const flags = /* @__PURE__ */ new Set();
   const settings = /* @__PURE__ */ new Map();
+  let method = "";
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
     if (arg === "--") {
@@ -4463,12 +4464,16 @@ function wget(args, proxied = false) {
     if ((name === "-e" || name === "--execute") && value) {
       const [key = "", ...setting] = value.replace(/ /g, "").toLowerCase().split("=");
       settings.set(key.replace(/[_-]/g, ""), setting.join("="));
+      if (key.replace(/[_-]/g, "") === "method") method = setting.join("=").toUpperCase();
+    } else if (name === "--method" && value) {
+      method = value.trim().toUpperCase();
     }
   }
   if (["-h", "--help", "-V", "--version"].some((f) => flags.has(f))) return [];
+  if (flags.has("--config")) return [];
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
   const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
-  const sends = [...flags].some((f) => WGET_UPLOADS.has(f)) || ["postdata", "postfile", "bodydata", "bodyfile"].some((k) => Boolean(settings.get(k)));
+  const sends = [...flags].some((f) => WGET_UPLOADS.has(f)) || SENDING_METHODS.has(method) || ["postdata", "postfile", "bodydata", "bodyfile"].some((k) => Boolean(settings.get(k)));
   const direction = sends ? "out" : "in";
   return urls.map((url) => [direction, urlHost(url, WGET_SCHEMES), void 0, void 0, proxy]);
 }

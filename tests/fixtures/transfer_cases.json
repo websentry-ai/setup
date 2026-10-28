@@ -9708,6 +9708,56 @@
   {
    "command": "wget -qh https://8.8.8.8/a",
    "transfer": null
+  },
+  {
+   "command": "wget --config=upload.cfg https://8.8.8.8/upload",
+   "transfer": null
+  },
+  {
+   "command": "wget --config upload.cfg https://8.8.8.8/upload",
+   "transfer": null
+  },
+  {
+   "command": "wget -e method=POST https://8.8.8.8/a",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --method=PUT https://8.8.8.8/a",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "wget --method GET https://8.8.8.8/a",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

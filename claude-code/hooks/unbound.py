@@ -7968,7 +7968,7 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
 def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
     """wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a
     proxy: one the command set or an -e proxy setting, unless --no-proxy or -e use_proxy=off turns proxies off."""
-    urls, flags, settings, i = [], set(), {}, 0
+    urls, flags, settings, method, i = [], set(), {}, '', 0
     while i < len(args):
         arg, name, value, i = args[i], None, None, i + 1
         if arg == '--':
@@ -7990,12 +7990,17 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
         if name in ('-e', '--execute') and value:
             key, _, setting = value.replace(' ', '').lower().partition('=')
             settings[key.replace('_', '').replace('-', '')] = setting
+            method = setting.upper() if key.replace('_', '').replace('-', '') == 'method' else method
+        elif name == '--method' and value:
+            method = value.strip().upper()
     if flags & {'-h', '--help', '-V', '--version'}:
         return []  # it prints and exits before fetching anything
+    if '--config' in flags:
+        return []  # a config this doesn't read may change what it sends and where
     on = settings.get('useproxy', 'on') in ('on', 'yes', '1') and '--no-proxy' not in flags
     proxy = on and (proxied or any(settings.get(k) for k in ('httpproxy', 'httpsproxy', 'ftpproxy')))
     # An -e post_data, post_file, body_data or body_file setting sends as its option does.
-    sends = flags & _TRANSFER_WGET_UPLOADS or \
+    sends = flags & _TRANSFER_WGET_UPLOADS or method in _TRANSFER_SENDING_METHODS or \
         any(settings.get(k) for k in ('postdata', 'postfile', 'bodydata', 'bodyfile'))
     return [('out' if sends else 'in', _transfer_url_host(url, _TRANSFER_WGET_SCHEMES), None, None, proxy)
             for url in urls]

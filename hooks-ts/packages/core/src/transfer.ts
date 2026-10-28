@@ -3156,6 +3156,7 @@ function wget(args: string[], proxied = false): Raw[] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const settings = new Map<string, string>();
+  let method = "";
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
     if (arg === "--") {
@@ -3180,13 +3181,17 @@ function wget(args: string[], proxied = false): Raw[] {
     if ((name === "-e" || name === "--execute") && value) {
       const [key = "", ...setting] = value.replace(/ /g, "").toLowerCase().split("=");
       settings.set(key.replace(/[_-]/g, ""), setting.join("="));
+      if (key.replace(/[_-]/g, "") === "method") method = setting.join("=").toUpperCase();
+    } else if (name === "--method" && value) {
+      method = value.trim().toUpperCase();
     }
   }
   if (["-h", "--help", "-V", "--version"].some((f) => flags.has(f))) return []; // it prints and exits before fetching anything
+  if (flags.has("--config")) return []; // a config this doesn't read may change what it sends and where
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
   const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   // An -e post_data, post_file, body_data or body_file setting sends as its option does.
-  const sends = [...flags].some((f) => WGET_UPLOADS.has(f)) ||
+  const sends = [...flags].some((f) => WGET_UPLOADS.has(f)) || SENDING_METHODS.has(method) ||
     ["postdata", "postfile", "bodydata", "bodyfile"].some((k) => Boolean(settings.get(k)));
   const direction = sends ? "out" : "in";
   return urls.map((url): Raw => [direction, urlHost(url, WGET_SCHEMES), undefined, undefined, proxy]);
