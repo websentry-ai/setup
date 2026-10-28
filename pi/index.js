@@ -2640,8 +2640,9 @@ var Lexer = class _Lexer {
       if (fedWords.length > 0) fed.text = fedWords.join(" ");
     }
     const to = fd ?? (op.startsWith("<") ? 0 : 1);
-    if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
-      this.io.push([to, target === "-" ? "null" : Number(target)]);
+    if ((op === "<&" || op === ">&") && /^(\d+-?|-)$/.test(target)) {
+      this.io.push([to, target === "-" ? "null" : Number(target.replace(/-$/, ""))]);
+      if (/^\d+-$/.test(target)) this.io.push([Number(target.slice(0, -1)), "null"]);
     } else if (op.startsWith("<<")) {
       this.io.push([to, "file", fed]);
     } else {
@@ -3651,12 +3652,14 @@ function scriptStdin(text, lexer, list) {
   });
 }
 function stdinText(layers) {
-  let fed;
+  const fds = /* @__PURE__ */ new Map();
   for (const [pipedIn, , redirections] of [...layers].reverse()) {
-    if (pipedIn) fed = void 0;
-    for (const [fd, , text] of redirections) if (fd === 0) fed = text;
+    if (pipedIn) fds.set(0, void 0);
+    for (const [fd, value, text] of redirections) {
+      fds.set(fd, text ?? (typeof value === "number" ? fds.get(value) : void 0));
+    }
   }
-  return fed?.text;
+  return fds.get(0)?.text;
 }
 function stdinArgs(tool, args, text) {
   const names = tool === "curl" ? ["-K", "--config"] : ["-i", "--input-file"];

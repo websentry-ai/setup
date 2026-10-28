@@ -868,8 +868,10 @@ class Lexer {
       if (fedWords.length > 0) fed.text = fedWords.join(" ");
     }
     const to = fd ?? (op.startsWith("<") ? 0 : 1);
-    if ((op === "<&" || op === ">&") && (/^\d+$/.test(target) || target === "-")) {
-      this.io.push([to, target === "-" ? "null" : Number(target)]);
+    if ((op === "<&" || op === ">&") && /^(\d+-?|-)$/.test(target)) {
+      this.io.push([to, target === "-" ? "null" : Number(target.replace(/-$/, ""))]);
+      // <&N- moves N, which is then closed.
+      if (/^\d+-$/.test(target)) this.io.push([Number(target.slice(0, -1)), "null"]);
     } else if (op.startsWith("<<")) {
       this.io.push([to, "file", fed]);
     } else {
@@ -2204,14 +2206,17 @@ function scriptStdin(text: string, lexer: Lexer, list: Item[]): Item[] {
   });
 }
 
-/** The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it; undefined otherwise. */
+/** The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it, a <&N taking the text on
+ *  N; undefined otherwise. */
 function stdinText(layers: readonly Layer[]): string | undefined {
-  let fed: { text?: string } | undefined;
+  const fds = new Map<number, { text?: string } | undefined>();
   for (const [pipedIn, , redirections] of [...layers].reverse()) {
-    if (pipedIn) fed = undefined;
-    for (const [fd, , text] of redirections) if (fd === 0) fed = text;
+    if (pipedIn) fds.set(0, undefined);
+    for (const [fd, value, text] of redirections) {
+      fds.set(fd, text ?? (typeof value === "number" ? fds.get(value) : undefined));
+    }
   }
-  return fed?.text;
+  return fds.get(0)?.text;
 }
 
 /** curl's or wget's arguments, with a config (curl -K -) or a URL list (wget -i -) read from stdin put in place. */

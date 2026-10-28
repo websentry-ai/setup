@@ -6319,8 +6319,10 @@ class _TransferLexer:
             words = _transfer_words(text[start:end]) if op == '<<<' else []
             fed.text = ' '.join(words) if words else None
         to = fd if fd is not None else 0 if op[0] == '<' else 1
-        if op in ('<&', '>&') and (target.isdigit() or target == '-'):
-            self.io.append((to, int(target) if target.isdigit() else 'null'))
+        if op in ('<&', '>&') and re.fullmatch(r'\d+-?|-', target):
+            self.io.append((to, int(target.rstrip('-')) if target != '-' else 'null'))
+            if target[:-1].isdigit() and target.endswith('-'):
+                self.io.append((int(target[:-1]), 'null'))  # <&N- moves N, which is then closed
         elif op in ('<<', '<<-', '<<<'):
             self.io.append((to, fed))
         else:
@@ -7437,13 +7439,14 @@ def _transfer_script_stdin(lexer, items: List[tuple]) -> List[tuple]:
 
 
 def _transfer_stdin_text(layers: tuple) -> Optional[str]:
-    """The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it; None otherwise."""
-    fed = None
+    """The heredoc or here-string text a call's stdin reads, as its pipes and redirections set it, a <&N taking the text
+    on N; None otherwise."""
+    fds = {}
     for piped_in, _, redirections in reversed(layers):
-        fed = None if piped_in else fed
+        fds[0] = None if piped_in else fds.get(0)
         for fd, value in redirections:
-            fed = (value if isinstance(value, _TransferStdin) else None) if fd == 0 else fed
-    return fed.text if fed is not None else None
+            fds[fd] = value if isinstance(value, _TransferStdin) else fds.get(value) if isinstance(value, int) else None
+    return fds[0].text if fds.get(0) is not None else None
 
 
 def _transfer_stdin_args(tool: str, args: List[str], text: Optional[str]) -> List[str]:
