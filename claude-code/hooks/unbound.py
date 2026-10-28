@@ -771,8 +771,9 @@ def _is_agent_message(text, agent_messages) -> bool:
     for one: the prefix alone can be typed, so it never decides on its own."""
     if not isinstance(text, str) or not text.lstrip().startswith('<agent-message '):
         return False
+    # The whole hand-back, not an excerpt a user quotes; records are this turn's only (parse_transcript_file).
     text = text.strip()
-    return any(text in message for message in agent_messages)
+    return any(m.strip() == text or m.strip().endswith('\n' + text) for m in agent_messages)
 
 
 def _peer_text(entry: Dict) -> Optional[str]:
@@ -849,7 +850,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
                     peer = _peer_text(entry)
-                    if peer:
+                    if peer and not (queue_floor and not _ts_lt(queue_floor, entry_timestamp)):
                         conversation_data['agent_messages'].append(peer)
 
                     if entry_type == 'queue-operation':

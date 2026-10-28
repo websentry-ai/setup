@@ -53,6 +53,8 @@ class TestAgentMessageSubmit(unittest.TestCase):
         peers = ["Another Claude session sent a message:\n" + HANDBACK]
         self.assertTrue(unbound._is_agent_message("\n  " + HANDBACK, peers))
         self.assertFalse(unbound._is_agent_message(HANDBACK, []))
+        # A user quoting part of a report is still their own prompt.
+        self.assertFalse(unbound._is_agent_message(HANDBACK.split("\n")[0], peers))
         self.assertFalse(unbound._is_agent_message("explain <agent-message from=x>", peers))
 
 
@@ -142,6 +144,11 @@ class TestAgentMessageInTranscript(unittest.TestCase):
                 "message": {"role": "user", "content": [
                     {"type": "text", "text": "Another Claude session sent a message:\n" + HANDBACK}]}}
         self.assertEqual(self._queued(peer), ["queued question"])
+
+    def test_a_peer_record_from_an_earlier_turn_confirms_nothing(self):
+        attachment = {"type": "attachment", "timestamp": "2026-10-28T06:00:00Z",
+                      "attachment": {"type": "queued_command", "prompt": HANDBACK, "origin": {"kind": "peer"}}}
+        self.assertEqual(self._queued(attachment), [HANDBACK, "queued question"])
 
     def test_a_queued_prompt_typed_with_the_prefix_is_kept(self):
         self.assertEqual(self._queued(), [HANDBACK, "queued question"])
