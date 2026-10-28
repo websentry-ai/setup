@@ -4382,6 +4382,38 @@ def _transfer_backtick_end(text: str, i: int) -> int:
     return -1
 
 
+_TRANSFER_ANSI_C = {'a': '\a', 'b': '\b', 'e': '\x1b', 'E': '\x1b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t',
+                    'v': '\v', '\\': '\\', "'": "'", '"': '"', '?': '?'}
+
+
+def _transfer_ansi_c(text: str, i: int) -> Optional[tuple]:
+    """(the text of a bash $'…' word whose body starts at i, its escapes decoded, the index of its closing quote); None
+    when it isn't closed. A NUL ends the text, as in bash."""
+    out, ended = [], False
+    while i < len(text):
+        ch, i = text[i], i + 1
+        if ch == "'":
+            return ''.join(out), i - 1
+        if ch == '\\' and i < len(text):
+            escape, i = text[i], i + 1
+            digits = {'x': 2, 'u': 4, 'U': 8}.get(escape)
+            hexa = re.match(r'[0-9a-fA-F]{1,%d}' % digits, text[i:]) if digits else None
+            octal = re.match(r'[0-7]{1,3}', text[i - 1:]) if escape in '01234567' else None
+            if escape in _TRANSFER_ANSI_C:
+                ch = _TRANSFER_ANSI_C[escape]
+            elif octal:
+                ch, i = chr(int(octal.group(), 8) & 0xff), i - 1 + len(octal.group())
+            elif hexa and int(hexa.group(), 16) <= 0x10ffff:
+                ch, i = chr(int(hexa.group(), 16)), i + len(hexa.group())
+            elif escape == 'c' and i < len(text):
+                ch, i = ('\x7f' if text[i] == '?' else chr(ord(text[i]) & 0x1f)), i + 1
+            else:
+                ch = '\\' + escape
+        ended = ended or '\0' in ch
+        out += [] if ended else [ch]
+    return None
+
+
 class _TransferLexer:
     """Reads a command into items in the order they run: ('cmd', argv, operator before, operator after, redirections as
     (fd, 'file' | 'null' | fd copied)), or a '(', '$(', ')', 'func', 'case', 'arm' or 'esac' marker around them."""
@@ -4438,7 +4470,17 @@ class _TransferLexer:
             found = self._substitution()
             if found is not None:
                 return found
-        if ch in '\'"':
+        if ch == '$' and text[i + 1:i + 2] == '"':
+            self.i, self.quote, self.in_word = i + 1, '"', True  # $"…" is "…" translated, which keeps it as written
+        elif ch == '$' and text[i + 1:i + 2] == "'":
+            found = _transfer_ansi_c(text, i + 2)
+            if found is None:
+                return False
+            for c in found[0]:
+                # A character the walker uses as a mark stands for one not known.
+                self.word += _TRANSFER_SUBSTITUTED if c < '\x06' else self._literal(c)
+            self.in_word, self.i = True, found[1]
+        elif ch in '\'"':
             self.quote, self.in_word = ch, True
         elif ch == '\\' and text[i + 1:i + 2] == '\n':
             self.i += 1  # a backslash-newline continues the line
@@ -6259,10 +6301,13 @@ def _transfer_curl_remote(url: str, kind: Optional[str], noproxy: Optional[str],
     return kind not in ('socks4', 'socks5')
 
 
-def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
+def _transfer_curl(args: List[str], env: Optional[Dict] = None, state: Optional[Dict] = None) -> List[tuple]:
     """curl's URLs, sent to when their request uploads or sends data, else fetched from, each with whether a proxy
     resolves its name (it then gets the --connect-to target and no --resolve pin); pins carry past --next."""
-    endpoints, pins, configured, i = [], [], False, 0
+    # Unless its first argument is -q or --disable, curl first reads its default config, which may reroute any request.
+    skips = bool(args) and (args[0].startswith('-q') or args[0] == '--disable')
+    configured = not skips and state is not None and _transfer_curlrc_reroutes(env or {}, state)
+    endpoints, pins, i = [], [], 0
     while True:
         urls, (sends, uploads, local, config), overrides, globoff, i, (kind, noproxy), scheme = \
             _transfer_curl_request(args, i)
@@ -6288,6 +6333,72 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
                                   'rerouted' if configured else remote))
         if i >= len(args):
             return endpoints
+
+
+_TRANSFER_CURLRC_ROUTING = frozenset((
+    'connect-to resolve proxy proxy1.0 preproxy noproxy socks4 socks4a socks5 socks5-hostname url config next '
+    'unix-socket abstract-unix-socket doh-url dns-servers').split())
+
+
+def _transfer_curlrc(env: Dict) -> Optional[str]:
+    """The default config curl 8.5 reads, found as it finds one: .curlrc in $CURL_HOME, $XDG_CONFIG_HOME or $HOME, on
+    Windows also %USERPROFILE% and %APPDATA% and as _curlrc, then curlrc in .config, then the account's home; None for
+    none, and '' when where it is isn't known."""
+    def setting(key: str) -> Optional[str]:
+        return env[key] if key in env else None if _TRANSFER_CLEAN_ENV in env else os.environ.get(key)
+    places = [('CURL_HOME', '', False), ('XDG_CONFIG_HOME', '', False), ('HOME', '', False)]
+    if _TRANSFER_WINDOWS:
+        places += [('USERPROFILE', '', False), ('APPDATA', '', False), ('USERPROFILE', '\\Application Data', False)]
+    places += [('CURL_HOME', '/.config', True), ('HOME', '/.config', True)]
+    xdg = False
+    for key, append, plain in places:
+        value = setting(key)
+        xdg = xdg or (key == 'XDG_CONFIG_HOME' and value is not None)
+        if not value or (plain and xdg):
+            continue
+        if _TRANSFER_SUBSTITUTED in value:
+            return ''
+        for name in ['curlrc'] if plain else ['.curlrc', '_curlrc'] if _TRANSFER_WINDOWS else ['.curlrc']:
+            if os.path.isfile(os.path.join(value + append, name)):
+                return os.path.join(value + append, name)
+    home = _transfer_home()
+    return os.path.join(home, '.curlrc') if home and os.path.isfile(os.path.join(home, '.curlrc')) else None
+
+
+def _transfer_curlrc_reroutes(env: Dict, state: Dict) -> bool:
+    """Whether curl's default config names an option that can change where a request goes, read once a turn by option
+    names alone, never their values; true when it can't be found or read."""
+    path = _transfer_curlrc(env)
+    if path is None:
+        return False
+    if ('curlrc', path) not in state:
+        state[('curlrc', path)] = not path or _transfer_curlrc_routing(path)
+    return state[('curlrc', path)]
+
+
+def _transfer_curlrc_routing(path: str) -> bool:
+    """Whether a curl config names a routing option, as curl reads one: an option per line, -x or --name or name before
+    a space, = or :, # and blank lines skipped; true when it can't be read."""
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read(_TRANSFER_SSH_CONFIG_MAX_BYTES + 1)
+    except OSError:
+        return True
+    if len(data) > _TRANSFER_SSH_CONFIG_MAX_BYTES:
+        return True
+    for line in data.decode('utf-8', 'replace').split('\n'):
+        line = line.lstrip()
+        if not line or line[0] in '#/\r*':
+            continue
+        name = re.match(r'[^\s]*' if line[0] == '-' else r'[^\s=:]*', line).group()
+        if line[0] == '-' and not name.startswith('--'):
+            if set(name[1:]) & {'x', 'K', ':'}:
+                return True
+            continue
+        option = _transfer_curl_long('--' + name[2:] if name.startswith('--') else '--' + name)
+        if not option or option[2:] in _TRANSFER_CURLRC_ROUTING:
+            return True
+    return False
 
 
 def _transfer_curl_glob(url: str) -> Optional[List[str]]:
@@ -6787,7 +6898,8 @@ def _transfer_stdio(layers: tuple) -> tuple:
     return fds[0] in ('file', 'pipe'), fds[1] in ('file', 'pipe')
 
 
-def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, layers: tuple) -> Optional[tuple]:
+def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, layers: tuple,
+                    state: Optional[Dict] = None) -> Optional[tuple]:
     """(tool, [(direction, destination, ssh -G options or None[, curl's dial])]) for a transfer command; None for any
     other."""
     tool, (sends, keeps) = _TRANSFER_TOOLS.get(program), _transfer_stdio(layers)
@@ -6797,7 +6909,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
         raw = _transfer_ssh_pipe(args, sends, keeps)
     elif tool in ('curl', 'wget'):
         args = _transfer_stdin_args(tool, args, _transfer_stdin_text(layers))
-        raw = _transfer_curl(args, env) if tool == 'curl' else _transfer_wget(args, _transfer_proxied(env))
+        raw = _transfer_curl(args, env, state) if tool == 'curl' else _transfer_wget(args, _transfer_proxied(env))
     elif tool in ('nc', 'socat'):
         raw = _transfer_netcat(args, sends, program == 'ncat') if tool == 'nc' else _transfer_socat(args, sends)
     elif tool in ('httpie', 'powershell'):
@@ -7156,7 +7268,7 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
         tool, endpoints, state['call_text'] = None, [], command
         for program, args, env, call_cwd, other_user, layers, unsure in \
                 _transfer_walk(_TransferLexer(command).read() or [], cwd, {}, 0):
-            found = _transfer_parse(program, args, env, other_user, layers)
+            found = _transfer_parse(program, args, env, other_user, layers, state)
             for raw in (found[1] if found else []):
                 if len(endpoints) >= _TRANSFER_MAX_ENDPOINTS:
                     break

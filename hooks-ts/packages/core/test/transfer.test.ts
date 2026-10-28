@@ -156,6 +156,29 @@ test("a call that may not have run is reported but not looked up", async () => {
   assert.deepEqual(lookups, ["example.com"]);
 });
 
+test("curl's default config reroutes unless -q comes first", async () => {
+  // curl reads ~/.curlrc first unless -q leads; one naming a routing option leaves its requests unresolved.
+  const home = mkdtempSync(join(tmpdir(), "curlrc-"));
+  const kind = async (command: string, env: Record<string, string> = {}): Promise<string | undefined> =>
+    (await transfer(command, "/", { home, env: { HOME: home, ...env } }))?.endpoints[0]?.address;
+  assert.equal(await kind("curl -T f https://10.0.0.1/up"), "private");
+  writeFileSync(join(home, ".curlrc"), "# routes\nuser-agent = x\n");
+  assert.equal(await kind("curl -T f https://10.0.0.1/up"), "private");
+  const routings = ["connect-to = 10.0.0.1:443:example.com:443\n", "--proxy http://p:1\n", "-x http://p\n", "conn x\n"];
+  for (const routing of routings) {
+    writeFileSync(join(home, ".curlrc"), routing);
+    assert.equal(await kind("curl -T f https://10.0.0.1/up"), "unresolved", routing);
+    assert.equal(await kind("curl -q -T f https://10.0.0.1/up"), "private", routing);
+    assert.equal(await kind("curl --disable -T f https://10.0.0.1/up"), "private", routing);
+    assert.equal(await kind("curl -T f -q https://10.0.0.1/up"), "unresolved", routing);
+  }
+  const elsewhere = mkdtempSync(join(tmpdir(), "curl-home-"));
+  writeFileSync(join(elsewhere, ".curlrc"), "user-agent = x\n");
+  assert.equal(await kind(`CURL_HOME=${elsewhere} curl -T f https://10.0.0.1/up`), "private");
+  assert.equal(await kind("curl -T f https://10.0.0.1/up", { CURL_HOME: elsewhere }), "private");
+  assert.equal(await kind("curl -T f https://10.0.0.1/up", { XDG_CONFIG_HOME: elsewhere }), "private");
+});
+
 test("a relative Include is read under $HOME only", async () => {
   // ssh reads the account's ~/.ssh/config but globs its relative Include under $HOME, so only that tree counts.
   const [home, elsewhere] = [mkdtempSync(join(tmpdir(), "acct-")), mkdtempSync(join(tmpdir(), "env-home-"))];

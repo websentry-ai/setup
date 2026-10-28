@@ -323,6 +323,8 @@ interface State {
   /** Every call's input in the turn, and the command being read, to tell whether any names an ssh config. */
   turnText: string;
   callText: string;
+  /** Whether each curl default config read this turn names a routing option. */
+  curlrc: Map<string, boolean>;
 }
 
 type Env = Record<string, string>;
@@ -638,6 +640,42 @@ interface Item {
 }
 
 /** Reads a command the way the shell does into items, in the order they run. */
+const ANSI_C: Record<string, string> = {
+  a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
+  "\\": "\\", "'": "'", '"': '"', "?": "?",
+};
+
+/** [the text of a bash $'…' word whose body starts at i, with its escapes decoded, the index of its closing quote];
+ *  undefined when it isn't closed. A NUL ends the text, as in bash. */
+function ansiC(text: string, start: number): [string, number] | undefined {
+  let out = "";
+  let ended = false;
+  for (let i = start; i < text.length; ) {
+    let ch = text[i++] as string;
+    if (ch === "'") return [out, i - 1];
+    if (ch === "\\" && i < text.length) {
+      const escape = text[i++] as string;
+      const digits = escape === "x" ? 2 : escape === "u" ? 4 : escape === "U" ? 8 : 0;
+      const hexa = digits > 0 ? new RegExp(`^[0-9a-fA-F]{1,${digits}}`).exec(text.slice(i))?.[0] : undefined;
+      const octal = "01234567".includes(escape) ? /^[0-7]{1,3}/.exec(text.slice(i - 1))?.[0] : undefined;
+      if (Object.hasOwn(ANSI_C, escape)) {
+        ch = ANSI_C[escape] as string;
+      } else if (octal !== undefined) {
+        [ch, i] = [String.fromCharCode(parseInt(octal, 8) & 0xff), i - 1 + octal.length];
+      } else if (hexa !== undefined && parseInt(hexa, 16) <= 0x10ffff) {
+        [ch, i] = [String.fromCodePoint(parseInt(hexa, 16)), i + hexa.length];
+      } else if (escape === "c" && i < text.length) {
+        [ch, i] = [text[i] === "?" ? "\x7f" : String.fromCharCode((text[i] as string).charCodeAt(0) & 0x1f), i + 1];
+      } else {
+        ch = `\\${escape}`;
+      }
+    }
+    ended ||= ch.includes("\0");
+    if (!ended) out += ch;
+  }
+  return undefined;
+}
+
 class Lexer {
   private i = 0;
   private quote: string | undefined;
@@ -717,7 +755,16 @@ class Lexer {
       const found = this.substitution();
       if (found !== undefined) return found;
     }
-    if (ch === "'" || ch === '"') {
+    if (ch === "$" && text[i + 1] === '"') {
+      // $"…" is "…" translated, which leaves it as written.
+      [this.i, this.quote, this.inWord] = [i + 1, '"', true];
+    } else if (ch === "$" && text[i + 1] === "'") {
+      const found = ansiC(text, i + 2);
+      if (found === undefined) return false;
+      // A character the walker uses as a mark stands for one not known.
+      for (const c of found[0]) this.word += c < "\x06" ? SUBSTITUTED : this.literal(c);
+      [this.inWord, this.i] = [true, found[1]];
+    } else if (ch === "'" || ch === '"') {
       this.quote = ch;
       this.inWord = true;
     } else if (ch === "\\" && text[i + 1] === "\n") {
@@ -2764,10 +2811,14 @@ function curlRemote(url: string, kind: string | undefined, noproxy: string | und
 
 /** curl's URLs, sent to when their request uploads or sends data, else fetched from, each with whether a proxy
  *  resolves its name (it then gets the --connect-to target and no --resolve pin). */
-function curl(args: string[], env: Env = {}, processEnv: Record<string, string | undefined> = {}): Raw[] {
+function curl(
+  args: string[], env: Env = {}, processEnv: Record<string, string | undefined> = {}, state?: State,
+): Raw[] {
   const raws: Raw[] = [];
   const pins: string[] = [];
-  let configured = false;
+  // Unless its first argument is -q or --disable, curl first reads its default config, which may reroute every request.
+  const skips = args.length > 0 && ((args[0] as string).startsWith("-q") || args[0] === "--disable");
+  let configured = !skips && state !== undefined && curlrcReroutes(env, state);
   for (let i = 0; ; ) {
     const [urls, [sends, uploads, local, config], overrides, globoff, next, [kind, noproxy], scheme] =
       curlRequest(args, i);
@@ -2797,6 +2848,79 @@ function curl(args: string[], env: Env = {}, processEnv: Record<string, string |
 
 /** The URLs curl makes of one by expanding its {a,b} sets and [1-3] or [a-c] ranges, as far as they change the host;
  *  undefined for a glob curl rejects. */
+const CURLRC_ROUTING: ReadonlySet<string> = new Set(
+  `connect-to resolve proxy proxy1.0 preproxy noproxy socks4 socks4a socks5 socks5-hostname url config next
+   unix-socket abstract-unix-socket doh-url dns-servers`.split(/\s+/),
+);
+
+/** The default config curl 8.5 reads, found as it finds one: .curlrc in $CURL_HOME, $XDG_CONFIG_HOME or $HOME, on
+ *  Windows also %USERPROFILE% and %APPDATA% and as _curlrc, then curlrc in .config, then the account's home;
+ *  undefined for none, and "" when where it is isn't known. */
+function curlrc(env: Env, state: State): string | undefined {
+  const setting = (key: string): string | undefined =>
+    key in env ? env[key] : CLEAN_ENV in env ? undefined : state.env[key];
+  const places: [string, string, boolean][] = [
+    ["CURL_HOME", "", false], ["XDG_CONFIG_HOME", "", false], ["HOME", "", false],
+  ];
+  if (platform.windows) {
+    places.push(["USERPROFILE", "", false], ["APPDATA", "", false], ["USERPROFILE", "\\Application Data", false]);
+  }
+  places.push(["CURL_HOME", "/.config", true], ["HOME", "/.config", true]);
+  let xdg = false;
+  for (const [key, append, plain] of places) {
+    const value = setting(key);
+    xdg ||= key === "XDG_CONFIG_HOME" && value !== undefined;
+    if (!value || (plain && xdg)) continue;
+    if (value.includes(SUBSTITUTED)) return "";
+    for (const name of plain ? ["curlrc"] : platform.windows ? [".curlrc", "_curlrc"] : [".curlrc"]) {
+      if (regularFile(join(value + append, name))) return join(value + append, name);
+    }
+  }
+  return state.home && regularFile(join(state.home, ".curlrc")) ? join(state.home, ".curlrc") : undefined;
+}
+
+function regularFile(path: string): boolean {
+  return statSync(path, { throwIfNoEntry: false })?.isFile() ?? false;
+}
+
+/** Whether curl's default config names an option that can change where a request goes, read once a turn by option
+ *  names alone, never their values; true when it can't be found or read. */
+function curlrcReroutes(env: Env, state: State): boolean {
+  const path = curlrc(env, state);
+  if (path === undefined) return false;
+  let routes = state.curlrc.get(path);
+  if (routes === undefined) {
+    routes = path === "" || curlrcRouting(path);
+    state.curlrc.set(path, routes);
+  }
+  return routes;
+}
+
+/** Whether a curl config names a routing option, as curl reads one: an option per line, -x or --name or name before a
+ *  space, = or :, # and blank lines skipped; true when it can't be read. */
+function curlrcRouting(path: string): boolean {
+  let text: string;
+  try {
+    const data = readFileSync(path);
+    if (data.length > SSH_CONFIG_MAX_BYTES) return true;
+    text = data.toString("utf8");
+  } catch {
+    return true;
+  }
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/^\s+/, "");
+    if (line === "" || "#/\r*".includes(line[0] as string)) continue;
+    const name = (line[0] === "-" ? /^\S*/ : /^[^\s=:]*/).exec(line)?.[0] ?? "";
+    if (line[0] === "-" && !name.startsWith("--")) {
+      if ([...name.slice(1)].some((flag) => "xK:".includes(flag))) return true;
+      continue;
+    }
+    const option = curlLong(name.startsWith("--") ? name : `--${name}`);
+    if (option === "" || CURLRC_ROUTING.has(option.slice(2))) return true;
+  }
+  return false;
+}
+
 function curlGlob(url: string): string[] | undefined {
   const pieces = globPieces(url);
   if (pieces === undefined) return undefined;
@@ -3347,13 +3471,13 @@ function stdio(layers: readonly Layer[]): [boolean, boolean] {
 }
 
 /** The tool and its raw endpoints for a transfer command; undefined for any other. */
-function parse(call: Call, processEnv: Record<string, string | undefined>): [string, Raw[]] | undefined {
+function parse(call: Call, processEnv: Record<string, string | undefined>, state?: State): [string, Raw[]] | undefined {
   const tool = TOOLS[call.name];
   const [sends, keeps] = stdio(call.layers);
   let raw: Raw[];
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv);
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv, state);
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
   else if (tool === "nc") raw = netcat(call.args, sends, call.name === "ncat");
   else if (tool === "socat") raw = socat(call.args, sends);
@@ -3806,7 +3930,7 @@ async function transferOf(
     return undefined; // nested past MAX_NESTING, or unreadable: this call sends no transfer, and later calls still do
   }
   for (const call of calls) {
-    const found = parse(call, state.env);
+    const found = parse(call, state.env, state);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
       const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
@@ -3867,6 +3991,7 @@ export async function resolveTransfers(
         }
       }).join("\n"),
       callText: "",
+      curlrc: new Map(),
     };
     for (const call of calls) {
       const input = call.tool_input;

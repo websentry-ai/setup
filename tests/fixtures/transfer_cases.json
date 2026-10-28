@@ -9340,6 +9340,112 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl -q -T f $'https://example.com/upload'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q -T f $'https:\\x2f\\x2fexample.com\\x2fupload'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q -T f $'https://\\145xample.com/upload'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q -T f $'https://ex\\u0061mple.com/upload'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q -T f $\"https://example.com/upload\"",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q $'https://exa'mple.com/x",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q $'https://example.com\\0.evil/x'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "curl -q -T f \"$'https://example.com/upload'\"",
+   "transfer": null
+  },
+  {
+   "command": "curl -q -T f $'https://example.com/upload",
+   "transfer": null
   }
  ]
 }

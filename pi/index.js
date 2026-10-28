@@ -1872,6 +1872,7 @@ import {
   mkdtempSync,
   openSync,
   readdirSync,
+  readFileSync as readFileSync3,
   readSync,
   realpathSync,
   rmSync,
@@ -2423,6 +2424,49 @@ function backtickEnd(text, start) {
   for (let i = start; i < text.length; i += text[i] === "\\" ? 2 : 1) if (text[i] === "`") return i;
   return -1;
 }
+var ANSI_C = {
+  a: "\x07",
+  b: "\b",
+  e: "\x1B",
+  E: "\x1B",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "	",
+  v: "\v",
+  "\\": "\\",
+  "'": "'",
+  '"': '"',
+  "?": "?"
+};
+function ansiC(text, start) {
+  let out = "";
+  let ended = false;
+  for (let i = start; i < text.length; ) {
+    let ch = text[i++];
+    if (ch === "'") return [out, i - 1];
+    if (ch === "\\" && i < text.length) {
+      const escape = text[i++];
+      const digits = escape === "x" ? 2 : escape === "u" ? 4 : escape === "U" ? 8 : 0;
+      const hexa = digits > 0 ? new RegExp(`^[0-9a-fA-F]{1,${digits}}`).exec(text.slice(i))?.[0] : void 0;
+      const octal = "01234567".includes(escape) ? /^[0-7]{1,3}/.exec(text.slice(i - 1))?.[0] : void 0;
+      if (Object.hasOwn(ANSI_C, escape)) {
+        ch = ANSI_C[escape];
+      } else if (octal !== void 0) {
+        [ch, i] = [String.fromCharCode(parseInt(octal, 8) & 255), i - 1 + octal.length];
+      } else if (hexa !== void 0 && parseInt(hexa, 16) <= 1114111) {
+        [ch, i] = [String.fromCodePoint(parseInt(hexa, 16)), i + hexa.length];
+      } else if (escape === "c" && i < text.length) {
+        [ch, i] = [text[i] === "?" ? "\x7F" : String.fromCharCode(text[i].charCodeAt(0) & 31), i + 1];
+      } else {
+        ch = `\\${escape}`;
+      }
+    }
+    ended ||= ch.includes("\0");
+    if (!ended) out += ch;
+  }
+  return void 0;
+}
 var Lexer = class _Lexer {
   i = 0;
   quote;
@@ -2494,7 +2538,14 @@ var Lexer = class _Lexer {
       const found = this.substitution();
       if (found !== void 0) return found;
     }
-    if (ch === "'" || ch === '"') {
+    if (ch === "$" && text[i + 1] === '"') {
+      [this.i, this.quote, this.inWord] = [i + 1, '"', true];
+    } else if (ch === "$" && text[i + 1] === "'") {
+      const found = ansiC(text, i + 2);
+      if (found === void 0) return false;
+      for (const c of found[0]) this.word += c < "" ? SUBSTITUTED : this.literal(c);
+      [this.inWord, this.i] = [true, found[1]];
+    } else if (ch === "'" || ch === '"') {
       this.quote = ch;
       this.inWord = true;
     } else if (ch === "\\" && text[i + 1] === "\n") {
@@ -4106,10 +4157,11 @@ function curlRemote(url, kind, noproxy, env, processEnv) {
   if (!proxy || bypass === "*" || entries.some((entry) => entry !== "" && (host === entry || host.endsWith(`.${entry}`)))) return false;
   return proxy !== "socks4" && proxy !== "socks5";
 }
-function curl(args, env = {}, processEnv = {}) {
+function curl(args, env = {}, processEnv = {}, state) {
   const raws = [];
   const pins = [];
-  let configured = false;
+  const skips = args.length > 0 && (args[0].startsWith("-q") || args[0] === "--disable");
+  let configured = !skips && state !== void 0 && curlrcReroutes(env, state);
   for (let i = 0; ; ) {
     const [urls, [sends, uploads, local, config], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
     if (urls === void 0) return [];
@@ -4130,6 +4182,68 @@ function curl(args, env = {}, processEnv = {}) {
     if (next >= args.length) return raws;
     i = next;
   }
+}
+var CURLRC_ROUTING = new Set(
+  `connect-to resolve proxy proxy1.0 preproxy noproxy socks4 socks4a socks5 socks5-hostname url config next
+   unix-socket abstract-unix-socket doh-url dns-servers`.split(/\s+/)
+);
+function curlrc(env, state) {
+  const setting = (key) => key in env ? env[key] : CLEAN_ENV in env ? void 0 : state.env[key];
+  const places = [
+    ["CURL_HOME", "", false],
+    ["XDG_CONFIG_HOME", "", false],
+    ["HOME", "", false]
+  ];
+  if (platform.windows) {
+    places.push(["USERPROFILE", "", false], ["APPDATA", "", false], ["USERPROFILE", "\\Application Data", false]);
+  }
+  places.push(["CURL_HOME", "/.config", true], ["HOME", "/.config", true]);
+  let xdg = false;
+  for (const [key, append, plain] of places) {
+    const value = setting(key);
+    xdg ||= key === "XDG_CONFIG_HOME" && value !== void 0;
+    if (!value || plain && xdg) continue;
+    if (value.includes(SUBSTITUTED)) return "";
+    for (const name of plain ? ["curlrc"] : platform.windows ? [".curlrc", "_curlrc"] : [".curlrc"]) {
+      if (regularFile(join5(value + append, name))) return join5(value + append, name);
+    }
+  }
+  return state.home && regularFile(join5(state.home, ".curlrc")) ? join5(state.home, ".curlrc") : void 0;
+}
+function regularFile(path) {
+  return statSync(path, { throwIfNoEntry: false })?.isFile() ?? false;
+}
+function curlrcReroutes(env, state) {
+  const path = curlrc(env, state);
+  if (path === void 0) return false;
+  let routes = state.curlrc.get(path);
+  if (routes === void 0) {
+    routes = path === "" || curlrcRouting(path);
+    state.curlrc.set(path, routes);
+  }
+  return routes;
+}
+function curlrcRouting(path) {
+  let text;
+  try {
+    const data = readFileSync3(path);
+    if (data.length > SSH_CONFIG_MAX_BYTES) return true;
+    text = data.toString("utf8");
+  } catch {
+    return true;
+  }
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/^\s+/, "");
+    if (line === "" || "#/\r*".includes(line[0])) continue;
+    const name = (line[0] === "-" ? /^\S*/ : /^[^\s=:]*/).exec(line)?.[0] ?? "";
+    if (line[0] === "-" && !name.startsWith("--")) {
+      if ([...name.slice(1)].some((flag) => "xK:".includes(flag))) return true;
+      continue;
+    }
+    const option = curlLong(name.startsWith("--") ? name : `--${name}`);
+    if (option === "" || CURLRC_ROUTING.has(option.slice(2))) return true;
+  }
+  return false;
 }
 function curlGlob(url) {
   const pieces = globPieces(url);
@@ -4594,13 +4708,13 @@ function stdio(layers) {
   const fed = (fd) => fds.get(fd) === "file" || fds.get(fd) === "pipe";
   return [fed(0), fed(1)];
 }
-function parse(call, processEnv) {
+function parse(call, processEnv, state) {
   const tool = TOOLS[call.name];
   const [sends, keeps] = stdio(call.layers);
   let raw;
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
-  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv);
+  else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv, state);
   else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
   else if (tool === "nc") raw = netcat(call.args, sends, call.name === "ncat");
   else if (tool === "socat") raw = socat(call.args, sends);
@@ -4973,7 +5087,7 @@ async function transferOf(command2, cwd, state, sure = true) {
     return void 0;
   }
   for (const call of calls) {
-    const found = parse(call, state.env);
+    const found = parse(call, state.env, state);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
       const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
@@ -5013,7 +5127,8 @@ async function resolveTransfers(calls, cwd, opts = {}) {
           return "";
         }
       }).join("\n"),
-      callText: ""
+      callText: "",
+      curlrc: /* @__PURE__ */ new Map()
     };
     for (const call of calls) {
       const input = call.tool_input;
