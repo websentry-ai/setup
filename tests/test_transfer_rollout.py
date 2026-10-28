@@ -38,7 +38,11 @@ class TestCopilotBackfillLooksNothingUp(unittest.TestCase):
                        "PATH": f"{bin_dir}{os.pathsep}/usr/bin{os.pathsep}/bin"}
                 setup = load_module(module)
                 setup._BACKFILL_HOOK_MODULE = None
+                # MDM runs the hook from the source it was handed rather than from COPILOT_HOME.
+                if hasattr(setup, '_BACKFILL_HOOK_SOURCE'):
+                    setup._BACKFILL_HOOK_SOURCE = (REPO / "copilot" / "hooks" / "unbound.py").read_text()
                 with patch.dict(os.environ, env), patch("socket.getaddrinfo") as lookup:
+                    self.assertIsNotNone(setup._backfill_load_hook_module(), 'the backfill never loaded the hook')
                     setup._backfill_mcp_tool_provenance(entries)
                 self.assertFalse(log.exists(), log.read_text() if log.exists() else "")
                 lookup.assert_not_called()
