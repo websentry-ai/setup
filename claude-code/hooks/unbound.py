@@ -7,7 +7,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
@@ -80,6 +80,9 @@ POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
+# Re-reads of a transcript whose last reply has not landed yet: the gap is milliseconds, the Stop hook's timeout 60s.
+STOP_TRANSCRIPT_REREADS = 2
+STOP_TRANSCRIPT_REREAD_SECONDS = 0.25
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -798,9 +801,12 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'queued_prompts': [],
         'usage': None,
         'model': None,
+        'finished': False,
     }
 
     if not transcript_path or not os.path.exists(transcript_path):
+        # Waiting cannot bring a missing transcript, so a Stop does not re-read for it.
+        conversation_data['finished'] = True
         return conversation_data
 
     queue_floor = subagent_floor or user_prompt_timestamp
@@ -868,6 +874,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
                             # Model is captured unconditionally so it survives even on usage-less assistant entries.
                             turn_model = turn_model or message.get('model')
+                            if progress is None and not entry.get('isSidechain'):
+                                conversation_data['finished'] = message.get('stop_reason') not in (None, 'tool_use')
 
                             if include_usage:
                                 _record_usage(entry, message, usage_by_key)
@@ -876,7 +884,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     continue
 
     except Exception:
-        pass
+        # A read that failed fails again; re-reading it would only delay the Stop.
+        conversation_data['finished'] = True
 
     if include_usage:
         try:
@@ -5434,30 +5443,52 @@ def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
     return restored + kept if restored else kept
 
 
+def _log_event_name(log: Dict) -> Optional[str]:
+    return (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+
+
+def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach the prompts of each session's turn still in progress (from its first prompt after its latest Stop):
+    trimming them away leaves the turn's Stop nothing to send. A turn idle for a day is let go."""
+    sessions = [log.get('session_id') or (log.get('event') or {}).get('session_id') for log in logs]
+    opened, last_seen = {}, {}
+    for index, (log, session_id) in enumerate(zip(logs, sessions)):
+        name = _log_event_name(log)
+        last_seen[session_id] = log.get('timestamp')
+        if name == 'Stop':
+            opened.pop(session_id, None)
+        elif name == 'UserPromptSubmit':
+            opened.setdefault(session_id, index)
+    stale = (datetime.utcnow() - timedelta(days=1)).isoformat() + 'Z'
+    keep = {id(log) for log in kept}
+    for session_id, start in opened.items():
+        if not _ts_lt(last_seen[session_id], stale):
+            keep.update(id(logs[i]) for i in range(start, len(logs))
+                        if sessions[i] == session_id and _log_event_name(logs[i]) == 'UserPromptSubmit')
+    return [log for log in logs if id(log) in keep]
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
-    session_order = []
-    seen_sessions = set()
+    # By latest activity, not first appearance: an older terminal can still be the busy one.
+    last_seen = {}
+    for index, log in enumerate(logs):
+        if log.get('session_id'):
+            last_seen[log['session_id']] = index
 
-    for log in logs:
-        session_id = log.get('session_id')
-        if session_id and session_id not in seen_sessions:
-            session_order.append(session_id)
-            seen_sessions.add(session_id)
-
-    if len(session_order) > 1:
-        most_recent_session = session_order[-1]
+    if len(last_seen) > 1:
+        most_recent_session = max(last_seen, key=last_seen.get)
         kept_logs = [
             log for log in logs
             if log.get('session_id') == most_recent_session
-        ]
-        save_logs(_keep_latest_stop(logs, kept_logs))
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(_keep_latest_stop(logs, logs[-AUDIT_LOG_TOTAL_LIMIT:]))
+        ][-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept_logs = logs[-AUDIT_LOG_TOTAL_LIMIT:]
+    save_logs(_keep_latest_stop(logs, _keep_open_turns(logs, kept_logs)))
 
 
 def process_stop_event(event: Dict, api_key: str):
@@ -5519,9 +5550,14 @@ def process_stop_event(event: Dict, api_key: str):
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
-        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
-                                                subagent_floor=previous_stop,
-                                                subagent_ceiling=stop_timestamp)
+        for attempt in range(STOP_TRANSCRIPT_REREADS + 1):
+            transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
+                                                    subagent_floor=previous_stop,
+                                                    subagent_ceiling=stop_timestamp)
+            # Claude Code can fire Stop before the turn's last reply reaches the transcript.
+            if transcript_data.get('finished', True) or attempt == STOP_TRANSCRIPT_REREADS:
+                break
+            time.sleep(STOP_TRANSCRIPT_REREAD_SECONDS)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
