@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'bb3a8547345f2dce8b6ae4ff367c96ad7c44d297df2860794decd6786d985e6a'
+BLOCK_SHA256 = '4f703d422b396fbc980253890535b99553c4bb747f13c10f71c20b560fee4873'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -811,6 +811,11 @@ class SshLookupTests(TransferTestCase):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
                 with patch.dict(os.environ, {'WGETRC': str(elsewhere) + '.missing'}):
+                    self.assertIsNone(hook._transfer('wget https://10.0.0.1/a', self.repo, {}))
+                # A FIFO is never opened, as a read would wait for a writer that never comes.
+                fifo = os.path.join(tempfile.mkdtemp(), 'fifo')
+                os.mkfifo(fifo)
+                with patch.dict(os.environ, {'WGETRC': fifo}):
                     self.assertIsNone(hook._transfer('wget https://10.0.0.1/a', self.repo, {}))
                 with patch.dict(os.environ, {'WGETRC': str(elsewhere)}), \
                         patch.object(hook, '_TRANSFER_WGETRC_SYSTEM', (str(system),)):

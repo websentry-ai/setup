@@ -210,6 +210,12 @@ test("wget's default config claims nothing unless it holds only safe settings", 
   writeFileSync(elsewhere, "tries = 3\n");
   assert.equal(await kind("wget https://10.0.0.1/a", { WGETRC: elsewhere }), "private");
   assert.equal(await found("wget https://10.0.0.1/a", { WGETRC: `${elsewhere}.missing` }), undefined);
+  // A FIFO is never opened, as a read would wait for a writer that never comes.
+  if (process.platform !== "win32") {
+    const fifo = join(mkdtempSync(join(tmpdir(), "wgetrc-fifo-")), "fifo");
+    spawnSync("mkfifo", [fifo]);
+    assert.equal(await found("wget https://10.0.0.1/a", { WGETRC: fifo }), undefined);
+  }
 });
 
 test("a relative Include is read under $HOME only", async () => {

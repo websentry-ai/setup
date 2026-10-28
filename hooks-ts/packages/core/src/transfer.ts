@@ -2833,12 +2833,14 @@ function curl(
     for (const [index, written] of (local ? [] : urls).entries()) {
       // The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
       const out = sends || index < uploads;
-      // A URL with no scheme takes --proto-default's, else the one curl guesses from its host, and so its port.
-      const guess = scheme || curlGuess(written);
-      const url = guess && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${guess}://${written.trim()}` : written;
+      // A URL with no scheme takes --proto-default's, else the one curl guesses from each host the glob makes, and so
+      // that scheme's port.
+      const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return raws;
-      for (const one of expanded) {
+      for (const made of expanded) {
+        const guess = curlGuess(made);
+        const one = guess && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(made) ? `${guess}://${made.trim()}` : made;
         const remote = curlRemote(one, kind, noproxy, env, processEnv);
         const dial = curlDial(one, connects, remote ? [] : pins);
         // With its own resolver a name isn't looked up here; a pin or a literal address still holds.
@@ -2971,8 +2973,10 @@ function wgetrcUnsafe(env: Env, state: State): boolean {
   if (`${named ?? ""}${home ?? ""}`.includes(SUBSTITUTED)) return true;
   if (named && !isAbsolute(named)) return true; // relative to a folder this may not know
   const paths = platform.windows ? [] : WGETRC_SYSTEM.filter(regularFile);
+  // wget stops on a $WGETRC that isn't there, and anything but a file is never opened here.
+  if (named && !regularFile(named)) return true;
   const user = named || (home ? join(home, ".wgetrc") : "");
-  if (named || (user && regularFile(user))) paths.push(user); // a $WGETRC that isn't there makes wget stop, which counts as unsafe too
+  if (user && regularFile(user)) paths.push(user);
   return paths.some((path) => {
     let unsafe = state.curlrc.get(`wgetrc:${path}`);
     if (unsafe === undefined) {

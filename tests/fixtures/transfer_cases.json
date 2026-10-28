@@ -9786,6 +9786,26 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl -q --resolve ftp.example.com:21:10.0.0.1 --resolve www.example.com:80:10.0.0.2 -T f '{ftp,www}.example.com/up'",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "ftp.example.com",
+      "resolved_host": "10.0.0.1",
+      "address": "private"
+     },
+     {
+      "direction": "out",
+      "host": "www.example.com",
+      "resolved_host": "10.0.0.2",
+      "address": "private"
+     }
+    ]
+   }
   }
  ]
 }

@@ -4171,11 +4171,12 @@ function curl(args, env = {}, processEnv = {}, state) {
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const [index, written] of (local ? [] : urls).entries()) {
       const out = sends || index < uploads;
-      const guess = scheme || curlGuess(written);
-      const url = guess && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${guess}://${written.trim()}` : written;
+      const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return raws;
-      for (const one of expanded2) {
+      for (const made of expanded2) {
+        const guess = curlGuess(made);
+        const one = guess && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(made) ? `${guess}://${made.trim()}` : made;
         const remote2 = curlRemote(one, kind, noproxy, env, processEnv);
         const dial = curlDial(one, connects, remote2 ? [] : pins);
         const proxied = configured ? "rerouted" : remote2 || resolver;
@@ -4274,8 +4275,9 @@ function wgetrcUnsafe(env, state) {
   if (`${named ?? ""}${home ?? ""}`.includes(SUBSTITUTED)) return true;
   if (named && !isAbsolute3(named)) return true;
   const paths = platform.windows ? [] : WGETRC_SYSTEM.filter(regularFile);
+  if (named && !regularFile(named)) return true;
   const user = named || (home ? join5(home, ".wgetrc") : "");
-  if (named || user && regularFile(user)) paths.push(user);
+  if (user && regularFile(user)) paths.push(user);
   return paths.some((path) => {
     let unsafe = state.curlrc.get(`wgetrc:${path}`);
     if (unsafe === void 0) {

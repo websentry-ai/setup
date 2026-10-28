@@ -6267,13 +6267,15 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None, state: Optional[
         for index, url in enumerate([] if local else urls):
             # The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
             out = sends or index < uploads
-            # A URL with no scheme takes --proto-default's, else the one curl guesses from its host, and so its port.
-            guess = scheme or _transfer_curl_guess(url)
-            url = guess + '://' + url.strip() if guess and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', url) else url
+            # A URL with no scheme takes --proto-default's, else the one curl guesses from each host the glob makes,
+            # and so that scheme's port.
+            url = scheme + '://' + url.strip() if scheme and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', url) else url
             expanded = [url] if globoff else _transfer_curl_glob(url)
             if expanded is None:
                 return endpoints
             for one in expanded:
+                guess = _transfer_curl_guess(one)
+                one = guess + '://' + one.strip() if guess and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', one) else one
                 remote = _transfer_curl_remote(one, kind, noproxy, env or {})
                 # With its own resolver a name isn't looked up here; a pin or a literal address still holds.
                 endpoints.append(('out' if out else 'in', _transfer_url_host(one, _TRANSFER_CURL_SCHEMES), None,
@@ -6389,9 +6391,11 @@ def _transfer_wgetrc_unsafe(env: Dict, state: Dict) -> bool:
     if named and not os.path.isabs(named):
         return True  # relative to a folder this may not know
     paths = [] if _TRANSFER_WINDOWS else [p for p in _TRANSFER_WGETRC_SYSTEM if os.path.isfile(p)]
+    if named and not os.path.isfile(named):
+        return True  # wget stops on a $WGETRC that isn't there, and anything but a file is never opened here
     user = named or (os.path.join(home, '.wgetrc') if home else '')
-    if named or (user and os.path.isfile(user)):
-        paths.append(user)  # a $WGETRC that isn't there makes wget stop, which counts as unsafe too
+    if user and os.path.isfile(user):
+        paths.append(user)
     for path in paths:
         if ('wgetrc', path) not in state:
             state[('wgetrc', path)] = _transfer_wgetrc_has_unsafe(path)
