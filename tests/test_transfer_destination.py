@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '30fa404c3ee166f3599878f9355f4c70d50b7c3a75550ea6b45b97807b645489'
+BLOCK_SHA256 = 'fdc604871d017df7c6f9d16abcea7bea4da9c79f7ea6d8a51a9ba3590781ef77'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -757,6 +757,16 @@ class SshLookupTests(TransferTestCase):
     def test_sudo_around_a_command_string_still_skips_ssh_g(self):
         for command in ("sudo -u deploy sh -c 'scp f prod:/tmp'", 'sudo bash -c "tar c . | ssh prod \'tar x\'"'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved')])
+        self.assertEqual(self.ssh_calls(), [])
+
+    def test_an_ssh_host_under_sudo_is_never_looked_up_but_a_url_is(self):
+        # The other user's config may send the alias elsewhere, so DNS on it would classify the wrong host.
+        with patch('socket.getaddrinfo', side_effect=_getaddrinfo) as lookup:
+            for command in ("sudo -u deploy scp f example.com:/srv", "sudo -u deploy sh -c 'scp f example.com:/srv'",
+                            'doas rsync -a f example.com:/srv', 'sudo ssh example.com < f'):
+                self.assert_endpoints(command, [_endpoint('out', 'example.com', 'unresolved')])
+            lookup.assert_not_called()
+            self.assert_endpoints('sudo curl https://example.com/x', [_endpoint('in', 'example.com', 'public')])
         self.assertEqual(self.ssh_calls(), [])
 
     def test_a_tilde_config_path_is_expanded_as_the_shell_does(self):

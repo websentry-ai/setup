@@ -3880,8 +3880,8 @@ _TRANSFER_SSH_VALUE_FLAGS = {'ssh': frozenset('BbcDEeFIiJLlmOoPpQRSWw'), 'scp': 
 _TRANSFER_SSH_IDENTITY_OPTIONS = frozenset({'hostname', 'user', 'port', 'proxyjump', 'proxycommand'})
 # A host reached through one of these is resolved by the proxy, so it is never looked up here.
 # curl's proxy options and the kind of proxy each names; -x, --proxy and --preproxy name it by their URL's scheme.
-_TRANSFER_CURL_PROXIES = {'-x': '', '--proxy': '', '--preproxy': '', '--socks4': 'socks4', '--socks4a': 'socks4a',
-                          '--socks5': 'socks5', '--socks5-hostname': 'socks5h'}
+_TRANSFER_CURL_PROXIES = {'-x': '', '--proxy': '', '--proxy1.0': '', '--preproxy': '', '--socks4': 'socks4',
+                          '--socks4a': 'socks4a', '--socks5': 'socks5', '--socks5-hostname': 'socks5h'}
 _TRANSFER_PROXY_ENV = ('http_proxy', 'HTTP_PROXY', 'https_proxy', 'HTTPS_PROXY', 'ftp_proxy', 'FTP_PROXY', 'all_proxy',
                        'ALL_PROXY')
 _TRANSFER_SSH_CONFIG_MAX_BYTES = 256 * 1024
@@ -3910,7 +3910,39 @@ _TRANSFER_CURL_LONG_VALUES = frozenset((
     '--retry-delay --retry-max-time --sasl-authzid --service-name --socks4 --socks4a --socks5 '
     '--socks5-gssapi-service --socks5-hostname --speed-limit --speed-time --stderr --telnet-option --tftp-blksize '
     '--time-cond --tls-max --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii '
-    '--trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out').split())
+    '--trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out '
+    '--proxy1.0 --krb4 --ech --httpsig-algo --httpsig-headers --httpsig-key --httpsig-keyid --ip-tos --knownhosts '
+    '--sigalgs --ssl-sessions --upload-flags').split())
+# curl 8.5's long options without the --, the last curl that reads a prefix as the one option it starts.
+_TRANSFER_CURL_LONG_OPTIONS = frozenset((
+    'abstract-unix-socket alpn alt-svc anyauth append aws-sigv4 basic buffer ca-native cacert capath cert cert-status '
+    'cert-type ciphers clobber compressed compressed-ssh config connect-timeout connect-to continue-at cookie '
+    'cookie-jar create-dirs create-file-mode crlf crlfile curves data data-ascii data-binary data-raw data-urlencode '
+    'delegation digest disable disable-eprt disable-epsv disallow-username-in-url dns-interface dns-ipv4-addr '
+    'dns-ipv6-addr dns-servers doh-cert-status doh-insecure doh-url dump-header egd-file engine eprt epsv '
+    'etag-compare etag-save expect100-timeout fail fail-early fail-with-body false-start form form-escape form-string '
+    'ftp-account ftp-alternative-to-user ftp-create-dirs ftp-method ftp-pasv ftp-port ftp-pret ftp-skip-pasv-ip '
+    'ftp-ssl ftp-ssl-ccc ftp-ssl-ccc-mode ftp-ssl-control ftp-ssl-reqd get globoff happy-eyeballs-timeout-ms '
+    'haproxy-clientip haproxy-protocol head header help hostpubmd5 hostpubsha256 hsts http0.9 http1.0 http1.1 http2 '
+    'http2-prior-knowledge http3 http3-only ignore-content-length include insecure interface ipfs-gateway ipv4 ipv6 '
+    'json junk-session-cookies keepalive keepalive-time key key-type krb krb4 libcurl limit-rate list-only local-port '
+    'location location-trusted login-options mail-auth mail-from mail-rcpt mail-rcpt-allowfails manual max-filesize '
+    'max-redirs max-time metalink negotiate netrc netrc-file netrc-optional next noproxy npn ntlm ntlm-wb '
+    'oauth2-bearer output output-dir parallel parallel-immediate parallel-max pass path-as-is pinnedpubkey post301 '
+    'post302 post303 preproxy progress-bar progress-meter proto proto-default proto-redir proxy proxy-anyauth '
+    'proxy-basic proxy-ca-native proxy-cacert proxy-capath proxy-cert proxy-cert-type proxy-ciphers proxy-crlfile '
+    'proxy-digest proxy-header proxy-http2 proxy-insecure proxy-key proxy-key-type proxy-negotiate proxy-ntlm '
+    'proxy-pass proxy-pinnedpubkey proxy-service-name proxy-ssl-allow-beast proxy-ssl-auto-client-cert '
+    'proxy-tls13-ciphers proxy-tlsauthtype proxy-tlspassword proxy-tlsuser proxy-tlsv1 proxy-user proxy1.0 '
+    'proxytunnel pubkey quote random-file range rate raw referer remote-header-name remote-name remote-name-all '
+    'remote-time remove-on-error request request-target resolve retry retry-all-errors retry-connrefused retry-delay '
+    'retry-max-time sasl-authzid sasl-ir service-name sessionid show-error silent socks4 socks4a socks5 socks5-basic '
+    'socks5-gssapi socks5-gssapi-nec socks5-gssapi-service socks5-hostname speed-limit speed-time ssl ssl-allow-beast '
+    'ssl-auto-client-cert ssl-no-revoke ssl-reqd ssl-revoke-best-effort sslv2 sslv3 stderr styled-output '
+    'suppress-connect-headers tcp-fastopen tcp-nodelay telnet-option test-event tftp-blksize tftp-no-options '
+    'time-cond tls-max tls13-ciphers tlsauthtype tlspassword tlsuser tlsv1 tlsv1.0 tlsv1.1 tlsv1.2 tlsv1.3 '
+    'tr-encoding trace trace-ascii trace-config trace-ids trace-time unix-socket upload-file url url-query use-ascii '
+    'user user-agent variable verbose version wdebug write-out xattr').split())
 # Bodies curl sends to every URL of a request; each -T or --upload-file goes to one URL instead, in order.
 _TRANSFER_CURL_UPLOADS = frozenset({'-F', '--form', '--form-string', '--json'})
 _TRANSFER_CURL_BODIES = frozenset({'-d', '--data', '--data-ascii', '--data-binary', '--data-raw', '--data-urlencode'})
@@ -6062,6 +6094,8 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None) -> List[tuple]:
     endpoints, pins, i = [], [], 0
     while True:
         urls, (sends, uploads, local), overrides, globoff, i, (kind, noproxy), scheme = _transfer_curl_request(args, i)
+        if urls is None:
+            return []  # curl reads every option before it sends anything
         pins += [value for option, value in overrides if option == '--resolve']
         connects = [value for option, value in overrides if option == '--connect-to']
         # Through --unix-socket or --abstract-unix-socket, the request reaches a local socket, not the URL's host.
@@ -6184,9 +6218,19 @@ def _transfer_curl_dial(url: str, connects: List[str], pins: List[str]) -> Optio
     return (str(addresses[0]) if addresses else target[0]), addresses
 
 
+def _transfer_curl_long(name: str) -> str:
+    """A long option as curl up to 8.5 reads it, ignoring case: the exact name, else the one option it starts; '' when
+    it starts several, which curl rejects. A --no- or --expand- form, or a name that starts none, is kept."""
+    word = name[2:].lower()
+    if not word or word in _TRANSFER_CURL_LONG_OPTIONS or word.startswith(('no-', 'expand-')):
+        return '--' + word if word else name
+    hits = [option for option in _TRANSFER_CURL_LONG_OPTIONS if option.startswith(word)]
+    return '--' + hits[0] if len(hits) == 1 else '' if hits else name
+
+
 def _transfer_curl_request(args: List[str], i: int) -> tuple:
-    """The curl request at args[i]: URLs, (sends body, -T count, local socket), --resolve and --connect-to,
-    globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
+    """The curl request at args[i]: URLs (None when curl rejects the command), (sends body, -T count, local socket),
+    --resolve and --connect-to, globoff, next start, (proxy kind: '' off, None unnamed; --noproxy), --proto-default."""
     urls, flags, method, overrides, scheme, uploads, local = [], set(), '', [], '', 0, False
     kind, preproxy, noproxy = None, None, None
     while i < len(args):
@@ -6194,16 +6238,21 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
         if arg == '--':
             urls, i = urls + args[i:], len(args)  # every word after it is a URL, a --next too
             break
-        if arg in ('-:', '--next'):
-            break
         if arg.startswith('--'):
             # curl reads --name=value as --name value, and --expand-name as --name with variables expanded.
             arg, eq, attached = arg.partition('=')
+            arg = _transfer_curl_long(arg)
+            if not arg:
+                return None, (False, 0, False), [], False, len(args), (None, None), ''  # curl rejects the command
+            if arg == '--next':
+                break
             arg = '--' + arg[len('--expand-'):] if arg.startswith('--expand-') else arg
             if eq:
                 value = attached
             elif arg in _TRANSFER_CURL_LONG_VALUES and i < len(args):
                 value, i = args[i], i + 1
+        elif arg == '-:':
+            break
         elif arg.startswith('-') and len(arg) > 1:
             arg, value, i = _transfer_short_option(arg, args, i, _TRANSFER_CURL_SHORT_VALUES, flags)
         else:
@@ -6550,8 +6599,9 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
         raw = (_transfer_httpie if tool == 'httpie' else _transfer_web_cmdlet)(args, sends, _transfer_proxied(env))
     else:
         return None
-    # Under sudo, ssh runs as that user, with that user's config, which this can't read.
-    return tool, [(e[0], e[1], None if other_user else e[2]) + e[3:] for e in raw]
+    # Under sudo, ssh reads that user's config, which isn't known here, so the host is never looked up.
+    unknown = ['-F', _TRANSFER_SUBSTITUTED] if other_user else []
+    return tool, [(e[0], e[1], None if e[2] is None else list(e[2]) + unknown) + e[3:] for e in raw]
 
 
 def _transfer_clean_host(host: str) -> str:

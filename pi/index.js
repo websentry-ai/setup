@@ -1989,6 +1989,7 @@ var SSH_IDENTITY_OPTIONS = /* @__PURE__ */ new Set(["hostname", "user", "port", 
 var CURL_PROXIES = {
   "-x": "",
   "--proxy": "",
+  "--proxy1.0": "",
   "--preproxy": "",
   "--socks4": "socks4",
   "--socks4a": "socks4a",
@@ -2021,7 +2022,39 @@ var CURL_LONG_VALUES = new Set(
    --retry-delay --retry-max-time --sasl-authzid --service-name --socks4 --socks4a --socks5
    --socks5-gssapi-service --socks5-hostname --speed-limit --speed-time --stderr --telnet-option --tftp-blksize
    --time-cond --tls-max --tls13-ciphers --tlsauthtype --tlspassword --tlsuser --trace --trace-ascii
-   --trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out`.split(/\s+/)
+   --trace-config --unix-socket --upload-file --url --url-query --user --user-agent --variable --write-out --proxy1.0
+   --krb4 --ech --httpsig-algo --httpsig-headers --httpsig-key --httpsig-keyid --ip-tos --knownhosts --sigalgs
+   --ssl-sessions --upload-flags`.split(/\s+/)
+);
+var CURL_LONG_OPTIONS = new Set(
+  `abstract-unix-socket alpn alt-svc anyauth append aws-sigv4 basic buffer ca-native cacert capath cert cert-status
+   cert-type ciphers clobber compressed compressed-ssh config connect-timeout connect-to continue-at cookie
+   cookie-jar create-dirs create-file-mode crlf crlfile curves data data-ascii data-binary data-raw data-urlencode
+   delegation digest disable disable-eprt disable-epsv disallow-username-in-url dns-interface dns-ipv4-addr
+   dns-ipv6-addr dns-servers doh-cert-status doh-insecure doh-url dump-header egd-file engine eprt epsv etag-compare
+   etag-save expect100-timeout fail fail-early fail-with-body false-start form form-escape form-string ftp-account
+   ftp-alternative-to-user ftp-create-dirs ftp-method ftp-pasv ftp-port ftp-pret ftp-skip-pasv-ip ftp-ssl
+   ftp-ssl-ccc ftp-ssl-ccc-mode ftp-ssl-control ftp-ssl-reqd get globoff happy-eyeballs-timeout-ms haproxy-clientip
+   haproxy-protocol head header help hostpubmd5 hostpubsha256 hsts http0.9 http1.0 http1.1 http2
+   http2-prior-knowledge http3 http3-only ignore-content-length include insecure interface ipfs-gateway ipv4 ipv6
+   json junk-session-cookies keepalive keepalive-time key key-type krb krb4 libcurl limit-rate list-only local-port
+   location location-trusted login-options mail-auth mail-from mail-rcpt mail-rcpt-allowfails manual max-filesize
+   max-redirs max-time metalink negotiate netrc netrc-file netrc-optional next noproxy npn ntlm ntlm-wb
+   oauth2-bearer output output-dir parallel parallel-immediate parallel-max pass path-as-is pinnedpubkey post301
+   post302 post303 preproxy progress-bar progress-meter proto proto-default proto-redir proxy proxy-anyauth
+   proxy-basic proxy-ca-native proxy-cacert proxy-capath proxy-cert proxy-cert-type proxy-ciphers proxy-crlfile
+   proxy-digest proxy-header proxy-http2 proxy-insecure proxy-key proxy-key-type proxy-negotiate proxy-ntlm
+   proxy-pass proxy-pinnedpubkey proxy-service-name proxy-ssl-allow-beast proxy-ssl-auto-client-cert
+   proxy-tls13-ciphers proxy-tlsauthtype proxy-tlspassword proxy-tlsuser proxy-tlsv1 proxy-user proxy1.0 proxytunnel
+   pubkey quote random-file range rate raw referer remote-header-name remote-name remote-name-all remote-time
+   remove-on-error request request-target resolve retry retry-all-errors retry-connrefused retry-delay
+   retry-max-time sasl-authzid sasl-ir service-name sessionid show-error silent socks4 socks4a socks5 socks5-basic
+   socks5-gssapi socks5-gssapi-nec socks5-gssapi-service socks5-hostname speed-limit speed-time ssl ssl-allow-beast
+   ssl-auto-client-cert ssl-no-revoke ssl-reqd ssl-revoke-best-effort sslv2 sslv3 stderr styled-output
+   suppress-connect-headers tcp-fastopen tcp-nodelay telnet-option test-event tftp-blksize tftp-no-options time-cond
+   tls-max tls13-ciphers tlsauthtype tlspassword tlsuser tlsv1 tlsv1.0 tlsv1.1 tlsv1.2 tlsv1.3 tr-encoding trace
+   trace-ascii trace-config trace-ids trace-time unix-socket upload-file url url-query use-ascii user user-agent
+   variable verbose version wdebug write-out xattr`.split(/\s+/)
 );
 var CURL_UPLOADS = /* @__PURE__ */ new Set(["-F", "--form", "--form-string", "--json"]);
 var CURL_BODIES = /* @__PURE__ */ new Set(
@@ -3961,6 +3994,7 @@ function curl(args, env = {}, processEnv = {}) {
   const pins = [];
   for (let i = 0; ; ) {
     const [urls, [sends, uploads, local], overrides, globoff, next, [kind, noproxy], scheme] = curlRequest(args, i);
+    if (urls === void 0) return [];
     pins.push(...overrides.filter(([option]) => option === "--resolve").map(([, value]) => value));
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const [index, written] of (local ? [] : urls).entries()) {
@@ -4078,6 +4112,13 @@ function curlDial(url, connects, pins) {
   if (target[0] === host && addresses.length === 0) return void 0;
   return [addresses[0] ?? target[0], addresses];
 }
+function curlLong(name) {
+  const word = name.slice(2).toLowerCase();
+  if (word === "") return name;
+  if (CURL_LONG_OPTIONS.has(word) || /^(no|expand)-/.test(word)) return `--${word}`;
+  const hits = [...CURL_LONG_OPTIONS].filter((option) => option.startsWith(word));
+  return hits.length === 1 ? `--${hits[0]}` : hits.length > 1 ? "" : name;
+}
 function curlRequest(args, start) {
   const urls = [];
   const flags = /* @__PURE__ */ new Set();
@@ -4098,11 +4139,13 @@ function curlRequest(args, start) {
       break;
     }
     let value;
-    if (arg === "-:" || arg === "--next") break;
+    if (arg === "-:") break;
     if (arg.startsWith("--")) {
       const eq = arg.indexOf("=");
       if (eq >= 0) value = arg.slice(eq + 1);
-      arg = eq >= 0 ? arg.slice(0, eq) : arg;
+      arg = curlLong(eq >= 0 ? arg.slice(0, eq) : arg);
+      if (arg === "") return [void 0, [false, 0, false], [], false, args.length, [void 0, void 0], ""];
+      if (arg === "--next") break;
       if (arg.startsWith("--expand-")) arg = `--${arg.slice("--expand-".length)}`;
       if (eq < 0 && CURL_LONG_VALUES.has(arg) && i < args.length) value = args[i++];
     } else if (arg.startsWith("-") && arg.length > 1) {
@@ -4423,7 +4466,14 @@ function parse(call, processEnv) {
   else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));
   else if (tool === "powershell") raw = webCmdlet(call.args, sends, proxiedEnv(call.env, processEnv));
   else return void 0;
-  return [tool, raw.map(([d, dest, options, dial, proxied]) => [d, dest, call.otherUser ? void 0 : options, dial, proxied])];
+  const unknown = call.otherUser ? ["-F", SUBSTITUTED] : [];
+  return [tool, raw.map(([d, dest, options, dial, proxied]) => [
+    d,
+    dest,
+    options && [...options, ...unknown],
+    dial,
+    proxied
+  ])];
 }
 function cleanHost(value) {
   let host = value.trim().toLowerCase();
