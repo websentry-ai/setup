@@ -8592,7 +8592,7 @@ def _transfer_address_kind(addresses: list) -> str:
 
 def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool = True) -> Optional[Dict]:
     """One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
-    its address kind. Without lookup only a literal address is classified; a proxy or jump host's target never is."""
+    its address kind. Without lookup only a literal dialled address is classified; an ssh, proxy or jump host's target never is."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     lookup = lookup and not (len(raw) > 4 and raw[4])
@@ -8611,8 +8611,9 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         lookup = lookup and not (ssh_options is not None and _transfer_ssh_jumps(ssh_options))
         resolved, jumps = _transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and \
             lookup else ('', False)
-        # A failed or refused ssh -G leaves where a config sends the host unknown, so the host isn't looked up instead.
-        failed = ssh_options is not None and lookup and not resolved
+        # Without a successful ssh -G a config or -o HostName may send even a literal address elsewhere, so nothing is
+        # classified.
+        failed = ssh_options is not None and not (lookup and resolved)
         # Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
         resolved = host if jumps or failed else resolved or host
         address = 'unresolved' if failed else _transfer_address(resolved, state, lookup and not jumps)

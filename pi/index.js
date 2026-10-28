@@ -5084,7 +5084,7 @@ async function endpoint(raw, cwd, state, sure = true) {
   } else {
     lookup &&= !(sshOptions !== void 0 && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === void 0 || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
-    const failed = sshOptions !== void 0 && lookup && name === "";
+    const failed = sshOptions !== void 0 && !(lookup && name !== "");
     resolved = jumps || failed ? host : name || host;
     kind = failed ? "unresolved" : await address(resolved, state, lookup && !jumps);
   }

@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'd235595463f686db93f735224be5d4b783ce6319a842c0e9e6295d4ae72a915a'
+BLOCK_SHA256 = '0e5dd93f80ccefbfec22f5dd16c5c784f5eed85c1bf6219c015e2ca397954ac8'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -391,12 +391,12 @@ class CopyTests(TransferTestCase):
                           'prod'])
 
     def test_a_host_reached_through_a_jump_host_or_proxy_command_is_never_looked_up(self):
-        # The jump host or proxy resolves it, so neither ssh -G nor DNS runs here; an address as written still counts.
+        # The jump host or proxy resolves it, so neither ssh -G nor DNS runs here, and not even a literal address counts.
         for command in ('scp -J jump f prod:/tmp', 'scp -o ProxyJump=jump f prod:/tmp',
                         "scp -o 'ProxyCommand nc %h %p' f prod:/tmp", 'ssh -J jump prod cat < f',
                         'rsync -a -e "ssh -J jump" f prod:/tmp'):
             self.assert_endpoints(command, [_endpoint('out', 'prod', 'unresolved')])
-        self.assert_endpoints('scp -J jump f 10.0.4.12:/tmp', [_endpoint('out', '10.0.4.12', 'private')])
+        self.assert_endpoints('scp -J jump f 10.0.4.12:/tmp', [_endpoint('out', '10.0.4.12', 'unresolved')])
         self.assertEqual(self.ssh_calls(), [])
         # A jump host the config names, as ssh -G reports it, carries the bytes where it sends them, so neither the
         # config's HostName nor its address is reported.
@@ -406,6 +406,12 @@ class CopyTests(TransferTestCase):
         for jump in ('ProxyJump bastion', 'ProxyCommand nc %h %p'):
             Path(self.repo, 'jump_cfg').write_text(f'Host prod\n  HostName files.acme-infra.net\n  {jump}\n')
             self.assert_endpoints('scp -F jump_cfg f prod:/tmp', [_endpoint('out', 'prod', 'unresolved')])
+
+    def test_a_literal_ssh_target_ssh_g_never_read_stays_unresolved(self):
+        # A config or -o HostName may send a literal address elsewhere, so a call that may not have run classifies nothing.
+        self.assert_endpoints('test -f marker && scp -o HostName=8.8.8.8 f 10.0.0.1:/srv',
+                              [_endpoint('out', '10.0.0.1', 'unresolved')])
+        self.assert_endpoints('scp -o HostName=8.8.8.8 f 10.0.0.1:/srv', [_endpoint('out', '10.0.0.1', 'public', '8.8.8.8')])
 
     def test_rsync_reads_its_remote_shell_and_a_daemon_is_never_looked_up(self):
         for command in ('rsync -a -e "ssh -F frontend/cfg -p 2200" src prod:/dest',

@@ -3910,7 +3910,7 @@ function addressKind(found: readonly string[]): AddressKind {
 }
 
 /** One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
- *  its address kind. Without lookup only a literal address is classified; a proxy or jump host's target never is. */
+ *  its address kind. Without lookup only a literal dialled address is classified; an ssh, proxy or jump host's target never is. */
 async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = true): Promise<TransferEndpoint | undefined> {
   const [direction, rawDestination, sshOptions, dial, proxied] = raw;
   let lookup = sure && proxied !== true;
@@ -3927,8 +3927,9 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
   } else {
     lookup &&= !(sshOptions !== undefined && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === undefined || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
-    // A failed or refused ssh -G leaves where a config sends the host unknown, so the host isn't looked up instead.
-    const failed = sshOptions !== undefined && lookup && name === "";
+    // Without a successful ssh -G a config or -o HostName may send even a literal address elsewhere, so nothing is
+    // classified.
+    const failed = sshOptions !== undefined && !(lookup && name !== "");
     // Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
     resolved = jumps || failed ? host : name || host;
     kind = failed ? "unresolved" : await address(resolved, state, lookup && !jumps);

@@ -318,7 +318,10 @@ test("a host reached through a jump host or proxy command is never looked up", a
     assert.deepEqual((await transfer(command, dir, extra))?.endpoints,
       [{ direction: "out", host: "prod", resolved_host: "prod", address: "unresolved" }], command);
   }
-  assert.equal((await transfer("scp -J jump f 10.0.4.12:/tmp", dir, extra))?.endpoints[0]?.address, "private");
+  // A config or -o HostName may send a literal address elsewhere, so without ssh -G it isn't classified either.
+  for (const command of ["scp -J jump f 10.0.4.12:/tmp", "test -f marker && scp -o HostName=8.8.8.8 f 10.0.0.1:/srv"]) {
+    assert.equal((await transfer(command, dir, extra))?.endpoints[0]?.address, "unresolved", command);
+  }
   assert.deepEqual([calls, seen], [[], []]);
   // A jump host the config names, as ssh -G reports it, carries the bytes where it sends them, so neither the config's
   // HostName nor its address is reported.
