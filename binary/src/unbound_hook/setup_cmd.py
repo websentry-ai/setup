@@ -278,6 +278,9 @@ def _claude_hooks_config():
             {"type": "command", "command": cmd("PreToolUse"), "timeout": 15000}]}],
         "PostToolUse": [{"matcher": "*", "hooks": [
             {"type": "command", "command": cmd("PostToolUse"), "async": True, "timeout": 60}]}],
+        # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+        "PostToolUseFailure": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": cmd("PostToolUseFailure"), "async": True, "timeout": 60}]}],
         "UserPromptSubmit": [{"hooks": [
             {"type": "command", "command": cmd("UserPromptSubmit"), "timeout": 60}]}],
         "Stop": [{"hooks": [
@@ -287,6 +290,16 @@ def _claude_hooks_config():
         "SessionEnd": [{"hooks": [
             {"type": "command", "command": cmd("SessionEnd"), "async": True, "timeout": 60}]}],
     }
+
+
+# Events a release added; an install from before it lacks them, so for a release they are written but not
+# required, or every such device would read as tampered.
+_CLAUDE_EVENTS_ADDED = ("PostToolUseFailure",)
+
+
+def _claude_detected_hooks():
+    """The Claude Code hooks an install must already hold to read as persisted."""
+    return {event: entries for event, entries in _claude_hooks_config().items() if event not in _CLAUDE_EVENTS_ADDED}
 
 
 def _codex_hooks_config(hook_command):
@@ -1025,7 +1038,7 @@ def _setup_claude_code(opts):
     # None (unknown) without looking: in skip mode managed-settings.json is the
     # admin's file, and unknown leaves the backend's tamper state untouched.
     state = None if skip_settings else _detect_state(
-        m.get_managed_settings_dir() / "managed-settings.json", _claude_hooks_config())
+        m.get_managed_settings_dir() / "managed-settings.json", _claude_detected_hooks())
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
         return ("deferred", "managed settings update failed")
     if skip_settings:
