@@ -287,13 +287,13 @@ class RunBackfillTestCase(unittest.TestCase):
         self.assertEqual(usage.call_count, 2)  # once per transcript, not once per slice
         self.assertTrue((self.home / ".claude" / "hooks" / ".unbound_last_backfill").exists())
 
-    def _mdm_run(self, sessions, slices_this_run):
+    def _mdm_run(self, sessions, slices_this_run, run_as_user=lambda u, fn, *a, **k: fn(*a, **k)):
         """One MDM run that has time for slices_this_run batches or slices, then reaches its soft stop."""
         budget = iter([True] * slices_this_run + [False] * 100)
         with ExitStack() as stack:
             for ctx in self._patches(mdm, sessions):
                 stack.enter_context(ctx)
-            stack.enter_context(patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)))
+            stack.enter_context(patch.object(mdm, "_run_as_user", side_effect=run_as_user))
             stack.enter_context(patch.object(mdm._BackfillRun, "has_time_for_a_batch",
                                              side_effect=lambda: next(budget)))
             mdm.run_backfill("key", "https://backend", [("alice", self.home)])
@@ -390,6 +390,31 @@ class RunBackfillTestCase(unittest.TestCase):
                                                  side_effect=lambda: next(budget)))
                 mdm.run_backfill("key", "https://backend", [("alice", self.home)])
         self.assertFalse(set(self._bases(sessions)) & set(sent_bases))
+
+    def _newer_session(self):
+        newer = self.home / ".claude" / "projects" / "p" / "newer.jsonl"
+        newer.write_text(json.dumps({"type": "user", "sessionId": "newer"}) + "\n")
+        for path, age in ((self.big, 120), (newer, 60)):
+            os.utime(path, (time.time() - age, time.time() - age))
+
+    def test_a_big_file_whose_slices_cannot_be_read_is_skipped_and_newer_history_still_goes(self):
+        self._newer_session()
+        sessions = []
+        with patch.object(mdm, "_backfill_read_slice", return_value=None):
+            self._mdm_run(sessions, 100)
+        self.assertIn("newer", [s["session_id"] for s in sessions])
+        self.assertIsInstance(self._state(), float)
+
+    def test_a_failed_privilege_drop_mid_file_stops_the_run_without_moving_past_the_file(self):
+        self._newer_session()
+        sessions = []
+
+        def drop_fails_for_slices(user, fn, *a, **k):
+            return None if fn is mdm._backfill_read_slice_or_false else fn(*a, **k)
+
+        self._mdm_run(sessions, 100, run_as_user=drop_fails_for_slices)
+        self.assertNotIn("newer", [s["session_id"] for s in sessions])
+        self.assertFalse((self.home / ".claude" / "hooks" / ".unbound_last_backfill").exists())
 
     def test_mdm_starts_a_replaced_file_over(self):
         sessions = []
