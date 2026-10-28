@@ -2880,7 +2880,7 @@ const CURL_RESOLVERS: ReadonlySet<string> = new Set(
  *  undefined for none, and "" when where it is isn't known. */
 function curlrc(env: Env, state: State): string | undefined {
   const setting = (key: string): string | undefined =>
-    key in env ? env[key] : CLEAN_ENV in env ? undefined : state.env[key];
+    key in env ? env[key] : UNKNOWN_ENV in env ? SUBSTITUTED : CLEAN_ENV in env ? undefined : state.env[key];
   const places: [string, string, boolean][] = [
     ["CURL_HOME", "", false], ["XDG_CONFIG_HOME", "", false], ["HOME", "", false],
   ];
@@ -2967,7 +2967,7 @@ const WGETRC_SYSTEM = ["/etc/wgetrc", "/usr/local/etc/wgetrc", "/opt/homebrew/et
  *  safe settings, read once a turn by setting names alone; true when where it is isn't known or it can't be read. */
 function wgetrcUnsafe(env: Env, state: State): boolean {
   const setting = (key: string): string | undefined =>
-    key in env ? env[key] : CLEAN_ENV in env ? undefined : state.env[key];
+    key in env ? env[key] : UNKNOWN_ENV in env ? SUBSTITUTED : CLEAN_ENV in env ? undefined : state.env[key];
   const named = setting("WGETRC");
   const home = setting("HOME") || state.home;
   if (`${named ?? ""}${home ?? ""}`.includes(SUBSTITUTED)) return true;

@@ -6371,7 +6371,9 @@ def _transfer_curlrc(env: Dict) -> Optional[str]:
     Windows also %USERPROFILE% and %APPDATA% and as _curlrc, then curlrc in .config, then the account's home; None for
     none, and '' when where it is isn't known."""
     def setting(key: str) -> Optional[str]:
-        return env[key] if key in env else None if _TRANSFER_CLEAN_ENV in env else os.environ.get(key)
+        if key in env or _TRANSFER_UNKNOWN_ENV in env:  # after source or eval any variable may have changed
+            return env.get(key, _TRANSFER_SUBSTITUTED)
+        return None if _TRANSFER_CLEAN_ENV in env else os.environ.get(key)
     places = [('CURL_HOME', '', False), ('XDG_CONFIG_HOME', '', False), ('HOME', '', False)]
     if _TRANSFER_WINDOWS:
         places += [('USERPROFILE', '', False), ('APPDATA', '', False), ('USERPROFILE', '\\Application Data', False)]
@@ -6452,7 +6454,9 @@ def _transfer_wgetrc_unsafe(env: Dict, state: Dict) -> bool:
     """Whether a wgetrc wget reads on its own, the system one and then $WGETRC or ~/.wgetrc, sets anything outside the
     safe settings, read once a turn by setting names alone; true when where it is isn't known or it can't be read."""
     def setting(key: str) -> Optional[str]:
-        return env[key] if key in env else None if _TRANSFER_CLEAN_ENV in env else os.environ.get(key)
+        if key in env or _TRANSFER_UNKNOWN_ENV in env:  # after source or eval any variable may have changed
+            return env.get(key, _TRANSFER_SUBSTITUTED)
+        return None if _TRANSFER_CLEAN_ENV in env else os.environ.get(key)
     named, home = setting('WGETRC'), setting('HOME') or _transfer_home()
     if _TRANSFER_SUBSTITUTED in (named or '') + (home or ''):
         return True

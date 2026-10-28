@@ -4202,7 +4202,7 @@ var CURL_RESOLVERS = /* @__PURE__ */ new Set(
   ["--doh-url", "--dns-servers", "--dns-interface", "--dns-ipv4-addr", "--dns-ipv6-addr"]
 );
 function curlrc(env, state) {
-  const setting = (key) => key in env ? env[key] : CLEAN_ENV in env ? void 0 : state.env[key];
+  const setting = (key) => key in env ? env[key] : UNKNOWN_ENV in env ? SUBSTITUTED : CLEAN_ENV in env ? void 0 : state.env[key];
   const places = [
     ["CURL_HOME", "", false],
     ["XDG_CONFIG_HOME", "", false],
@@ -4269,7 +4269,7 @@ function curlGuess(url) {
 var WGETRC_SAFE = new Set("tries timeout dnstimeout connecttimeout readtimeout waitretry wait randomwait retryconnrefused verbose quiet progress showprogress dotstyle dotbytes dotsperline dotspacing serverresponse continue timestamping noclobber passiveftp robots checkcertificate cacertificate cadirectory limitrate adjustextension contentdisposition iri localencoding remoteencoding useragent cache dirstruct cutdirs logfile".split(" "));
 var WGETRC_SYSTEM = ["/etc/wgetrc", "/usr/local/etc/wgetrc", "/opt/homebrew/etc/wgetrc"];
 function wgetrcUnsafe(env, state) {
-  const setting = (key) => key in env ? env[key] : CLEAN_ENV in env ? void 0 : state.env[key];
+  const setting = (key) => key in env ? env[key] : UNKNOWN_ENV in env ? SUBSTITUTED : CLEAN_ENV in env ? void 0 : state.env[key];
   const named = setting("WGETRC");
   const home = setting("HOME") || state.home;
   if (`${named ?? ""}${home ?? ""}`.includes(SUBSTITUTED)) return true;

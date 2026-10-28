@@ -5877,7 +5877,7 @@
    }
   },
   {
-   "command": "f() { cd /tmp; }; eval 'f() { cd /; }'; f && curl https://example.com/x",
+   "command": "f() { cd /tmp; }; eval 'f() { cd /; }'; f && curl -q https://example.com/x",
    "transfer": {
     "tool": "curl",
     "endpoints": [
@@ -5891,7 +5891,7 @@
    }
   },
   {
-   "command": "f() { cd /tmp; }; source x.sh; f && curl https://example.com/x",
+   "command": "f() { cd /tmp; }; source x.sh; f && curl -q https://example.com/x",
    "transfer": {
     "tool": "curl",
     "endpoints": [
@@ -8916,7 +8916,7 @@
    "transfer": null
   },
   {
-   "command": "eval x; false | true || curl -T s https://8.8.8.8/up",
+   "command": "eval x; false | true || curl -q -T s https://8.8.8.8/up",
    "transfer": {
     "tool": "curl",
     "endpoints": [
@@ -8930,7 +8930,7 @@
    }
   },
   {
-   "command": "eval x; false | true || curl -T s https://example.com/up",
+   "command": "eval x; false | true || curl -q -T s https://example.com/up",
    "transfer": {
     "tool": "curl",
     "endpoints": [
@@ -8948,7 +8948,7 @@
    "transfer": null
   },
   {
-   "command": "eval x; false | false || curl -T s https://example.com/up",
+   "command": "eval x; false | false || curl -q -T s https://example.com/up",
    "transfer": {
     "tool": "curl",
     "endpoints": [
@@ -9802,6 +9802,42 @@
       "direction": "out",
       "host": "www.example.com",
       "resolved_host": "10.0.0.2",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "source ./env.sh; curl -T f https://10.0.0.1/up",
+   "transfer": null
+  },
+  {
+   "command": "source ./env.sh; curl -q -T f https://10.0.0.1/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "10.0.0.1",
+      "resolved_host": "10.0.0.1",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "eval \"$SETUP\"; wget https://10.0.0.1/a",
+   "transfer": null
+  },
+  {
+   "command": "eval \"$SETUP\"; wget --no-config https://10.0.0.1/a",
+   "transfer": {
+    "tool": "wget",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "10.0.0.1",
+      "resolved_host": "10.0.0.1",
       "address": "private"
      }
     ]
