@@ -4171,7 +4171,8 @@ function curl(args, env = {}, processEnv = {}, state) {
     const connects = overrides.filter(([option]) => option === "--connect-to").map(([, value]) => value);
     for (const [index, written] of (local ? [] : urls).entries()) {
       const out = sends || index < uploads;
-      const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
+      const guess = scheme || curlGuess(written);
+      const url = guess && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${guess}://${written.trim()}` : written;
       const expanded2 = globoff ? [url] : curlGlob(url);
       if (expanded2 === void 0) return raws;
       for (const one of expanded2) {
@@ -4259,6 +4260,44 @@ function curlrcHasUnsafe(path) {
     if (!CURLRC_SAFE.has(option.startsWith("no-") ? option.slice(3) : option)) return true;
   }
   return false;
+}
+function curlGuess(url) {
+  const host = (url.trim().split(/[/?#]/)[0] ?? "").split("@").pop()?.toLowerCase() ?? "";
+  return ["ftp", "dict", "ldap", "imap", "smtp", "pop3"].find((name) => host.startsWith(`${name}.`)) ?? "";
+}
+var WGETRC_SAFE = new Set("tries timeout dnstimeout connecttimeout readtimeout waitretry wait randomwait retryconnrefused verbose quiet progress showprogress dotstyle dotbytes dotsperline dotspacing serverresponse continue timestamping noclobber passiveftp robots checkcertificate cacertificate cadirectory limitrate adjustextension contentdisposition iri localencoding remoteencoding useragent cache dirstruct cutdirs logfile".split(" "));
+var WGETRC_SYSTEM = ["/etc/wgetrc", "/usr/local/etc/wgetrc", "/opt/homebrew/etc/wgetrc"];
+function wgetrcUnsafe(env, state) {
+  const setting = (key) => key in env ? env[key] : CLEAN_ENV in env ? void 0 : state.env[key];
+  const named = setting("WGETRC");
+  const home = setting("HOME") || state.home;
+  if (`${named ?? ""}${home ?? ""}`.includes(SUBSTITUTED)) return true;
+  if (named && !isAbsolute3(named)) return true;
+  const paths = platform.windows ? [] : WGETRC_SYSTEM.filter(regularFile);
+  const user = named || (home ? join5(home, ".wgetrc") : "");
+  if (named || user && regularFile(user)) paths.push(user);
+  return paths.some((path) => {
+    let unsafe = state.curlrc.get(`wgetrc:${path}`);
+    if (unsafe === void 0) {
+      unsafe = wgetrcHasUnsafe(path);
+      state.curlrc.set(`wgetrc:${path}`, unsafe);
+    }
+    return unsafe;
+  });
+}
+function wgetrcHasUnsafe(path) {
+  let text;
+  try {
+    const data = readFileSync3(path);
+    if (data.length > SSH_CONFIG_MAX_BYTES) return true;
+    text = data.toString("utf8");
+  } catch {
+    return true;
+  }
+  return text.split("\n").some((raw) => {
+    const line = raw.trim();
+    return line !== "" && !line.startsWith("#") && !WGETRC_SAFE.has((/^[^\s=]*/.exec(line)?.[0] ?? "").toLowerCase().replace(/[_-]/g, ""));
+  });
 }
 function curlGlob(url) {
   const pieces = globPieces(url);
@@ -4435,7 +4474,7 @@ function curlRequest(args, start) {
   const marks = [Boolean(sends), uploads, local, config, resolver];
   return [urls, marks, overrides, globoff, i, [kind ?? preproxy, noproxy], scheme];
 }
-function wget(args, proxied = false) {
+function wget(args, proxied = false, env = {}, state) {
   const urls = [];
   const flags = /* @__PURE__ */ new Set();
   const settings = /* @__PURE__ */ new Map();
@@ -4471,6 +4510,7 @@ function wget(args, proxied = false) {
   }
   if (["-h", "--help", "-V", "--version"].some((f) => flags.has(f))) return [];
   if (flags.has("--config")) return [];
+  if (!flags.has("--no-config") && state !== void 0 && wgetrcUnsafe(env, state)) return [];
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
   const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   const sends = [...flags].some((f) => WGET_UPLOADS.has(f)) || SENDING_METHODS.has(method) || ["postdata", "postfile", "bodydata", "bodyfile"].some((k) => Boolean(settings.get(k)));
@@ -4748,7 +4788,7 @@ function parse(call, processEnv, state) {
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
   else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv, state);
-  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv), call.env, state);
   else if (tool === "nc") raw = netcat(call.args, sends, call.name === "ncat");
   else if (tool === "socat") raw = socat(call.args, sends);
   else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));

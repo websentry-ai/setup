@@ -323,7 +323,7 @@ interface State {
   /** Every call's input in the turn, and the command being read, to tell whether any names an ssh config. */
   turnText: string;
   callText: string;
-  /** Whether each curl default config read this turn names a routing option. */
+  /** Whether each curl or wget default config read this turn names an unsafe setting, wget's keyed wgetrc:<path>. */
   curlrc: Map<string, boolean>;
 }
 
@@ -2833,8 +2833,9 @@ function curl(
     for (const [index, written] of (local ? [] : urls).entries()) {
       // The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
       const out = sends || index < uploads;
-      // A URL with no scheme takes --proto-default's, and so that scheme's port.
-      const url = scheme && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${scheme}://${written.trim()}` : written;
+      // A URL with no scheme takes --proto-default's, else the one curl guesses from its host, and so its port.
+      const guess = scheme || curlGuess(written);
+      const url = guess && !/^\s*[a-z][a-z0-9+.-]*:\/\//i.test(written) ? `${guess}://${written.trim()}` : written;
       const expanded = globoff ? [url] : curlGlob(url);
       if (expanded === undefined) return raws;
       for (const one of expanded) {
@@ -2942,6 +2943,62 @@ function curlrcHasUnsafe(path: string): boolean {
     if (!CURLRC_SAFE.has(option.startsWith("no-") ? option.slice(3) : option)) return true;
   }
   return false;
+}
+
+/** The scheme curl guesses for a URL without one: that of a host starting ftp., dict., ldap., imap., smtp. or pop3.;
+ *  "" for any other, which curl reads as http. */
+function curlGuess(url: string): string {
+  const host = (url.trim().split(/[/?#]/)[0] ?? "").split("@").pop()?.toLowerCase() ?? "";
+  return ["ftp", "dict", "ldap", "imap", "smtp", "pop3"].find((name) => host.startsWith(`${name}.`)) ?? "";
+}
+
+/** wgetrc settings, without - or _, that can't change where wget connects, what it sends or which URLs it fetches; a
+ *  default wgetrc with any other may change any of that. */
+const WGETRC_SAFE: ReadonlySet<string> = new Set((
+  "tries timeout dnstimeout connecttimeout readtimeout waitretry wait randomwait retryconnrefused verbose quiet " +
+  "progress showprogress dotstyle dotbytes dotsperline dotspacing serverresponse continue timestamping noclobber " +
+  "passiveftp robots checkcertificate cacertificate cadirectory limitrate adjustextension contentdisposition iri " +
+  "localencoding remoteencoding useragent cache dirstruct cutdirs logfile").split(" "));
+const WGETRC_SYSTEM = ["/etc/wgetrc", "/usr/local/etc/wgetrc", "/opt/homebrew/etc/wgetrc"];
+
+/** Whether a wgetrc wget reads on its own, the system one and then $WGETRC or ~/.wgetrc, sets anything outside the
+ *  safe settings, read once a turn by setting names alone; true when where it is isn't known or it can't be read. */
+function wgetrcUnsafe(env: Env, state: State): boolean {
+  const setting = (key: string): string | undefined =>
+    key in env ? env[key] : CLEAN_ENV in env ? undefined : state.env[key];
+  const named = setting("WGETRC");
+  const home = setting("HOME") || state.home;
+  if (`${named ?? ""}${home ?? ""}`.includes(SUBSTITUTED)) return true;
+  if (named && !isAbsolute(named)) return true; // relative to a folder this may not know
+  const paths = platform.windows ? [] : WGETRC_SYSTEM.filter(regularFile);
+  const user = named || (home ? join(home, ".wgetrc") : "");
+  if (named || (user && regularFile(user))) paths.push(user); // a $WGETRC that isn't there makes wget stop, which counts as unsafe too
+  return paths.some((path) => {
+    let unsafe = state.curlrc.get(`wgetrc:${path}`);
+    if (unsafe === undefined) {
+      unsafe = wgetrcHasUnsafe(path);
+      state.curlrc.set(`wgetrc:${path}`, unsafe);
+    }
+    return unsafe;
+  });
+}
+
+/** Whether a wgetrc sets anything outside the safe settings, as wget reads one: name = value per line, # and blank
+ *  lines skipped, - and _ in the name ignored; true when it can't be read. */
+function wgetrcHasUnsafe(path: string): boolean {
+  let text: string;
+  try {
+    const data = readFileSync(path);
+    if (data.length > SSH_CONFIG_MAX_BYTES) return true;
+    text = data.toString("utf8");
+  } catch {
+    return true;
+  }
+  return text.split("\n").some((raw) => {
+    const line = raw.trim();
+    return line !== "" && !line.startsWith("#") &&
+      !WGETRC_SAFE.has((/^[^\s=]*/.exec(line)?.[0] ?? "").toLowerCase().replace(/[_-]/g, ""));
+  });
 }
 
 function curlGlob(url: string): string[] | undefined {
@@ -3152,7 +3209,7 @@ function curlRequest(
 
 /** wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a proxy:
  *  one the command set or an -e proxy setting, unless --no-proxy or -e use_proxy=off turns proxies off. */
-function wget(args: string[], proxied = false): Raw[] {
+function wget(args: string[], proxied = false, env: Env = {}, state?: State): Raw[] {
   const urls: string[] = [];
   const flags = new Set<string>();
   const settings = new Map<string, string>();
@@ -3188,6 +3245,7 @@ function wget(args: string[], proxied = false): Raw[] {
   }
   if (["-h", "--help", "-V", "--version"].some((f) => flags.has(f))) return []; // it prints and exits before fetching anything
   if (flags.has("--config")) return []; // a config this doesn't read may change what it sends and where
+  if (!flags.has("--no-config") && state !== undefined && wgetrcUnsafe(env, state)) return [];
   const on = ["on", "yes", "1"].includes(settings.get("useproxy") ?? "on") && !flags.has("--no-proxy");
   const proxy = on && (proxied || ["httpproxy", "httpsproxy", "ftpproxy"].some((k) => Boolean(settings.get(k))));
   // An -e post_data, post_file, body_data or body_file setting sends as its option does.
@@ -3521,7 +3579,7 @@ function parse(call: Call, processEnv: Record<string, string | undefined>, state
   if (tool === "scp" || tool === "sftp" || tool === "rsync") raw = copy(tool, call.args, call.env, processEnv);
   else if (tool === "ssh") raw = sshPipe(call.args, sends, keeps);
   else if (tool === "curl") raw = curl(stdinArgs(tool, call.args, stdinText(call.layers)), call.env, processEnv, state);
-  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv));
+  else if (tool === "wget") raw = wget(stdinArgs(tool, call.args, stdinText(call.layers)), proxiedEnv(call.env, processEnv), call.env, state);
   else if (tool === "nc") raw = netcat(call.args, sends, call.name === "ncat");
   else if (tool === "socat") raw = socat(call.args, sends);
   else if (tool === "httpie") raw = httpie(call.args, sends, proxiedEnv(call.env, processEnv));

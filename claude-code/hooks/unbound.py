@@ -7680,8 +7680,9 @@ def _transfer_curl(args: List[str], env: Optional[Dict] = None, state: Optional[
         for index, url in enumerate([] if local else urls):
             # The Nth -T uploads to the Nth URL; a URL past them is fetched unless the request sends a body.
             out = sends or index < uploads
-            # A URL with no scheme takes --proto-default's, and so that scheme's port.
-            url = scheme + '://' + url.strip() if scheme and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', url) else url
+            # A URL with no scheme takes --proto-default's, else the one curl guesses from its host, and so its port.
+            guess = scheme or _transfer_curl_guess(url)
+            url = guess + '://' + url.strip() if guess and not re.match(r'\s*[A-Za-z][A-Za-z0-9+.-]*://', url) else url
             expanded = [url] if globoff else _transfer_curl_glob(url)
             if expanded is None:
                 return endpoints
@@ -7770,6 +7771,64 @@ def _transfer_curlrc_has_unsafe(path: str) -> bool:
         option = _transfer_curl_long('--' + name[2:] if name.startswith('--') else '--' + name)[2:]
         if (option[3:] if option.startswith('no-') else option) not in _TRANSFER_CURLRC_SAFE:
             return True
+    return False
+
+
+def _transfer_curl_guess(url: str) -> str:
+    """The scheme curl guesses for a URL without one: that of a host starting ftp., dict., ldap., imap., smtp. or
+    pop3.; '' for any other, which curl reads as http."""
+    host = re.split(r'[/?#]', url.strip(), maxsplit=1)[0].rsplit('@', 1)[-1].lower()
+    return next((name for name in ('ftp', 'dict', 'ldap', 'imap', 'smtp', 'pop3') if host.startswith(name + '.')), '')
+
+
+# wgetrc settings, without - or _, that can't change where wget connects, what it sends or which URLs it fetches; a
+# default wgetrc with any other may change any of that.
+_TRANSFER_WGETRC_SAFE = frozenset((
+    'tries timeout dnstimeout connecttimeout readtimeout waitretry wait randomwait retryconnrefused verbose quiet '
+    'progress showprogress dotstyle dotbytes dotsperline dotspacing serverresponse continue timestamping noclobber '
+    'passiveftp robots checkcertificate cacertificate cadirectory limitrate adjustextension contentdisposition iri '
+    'localencoding remoteencoding useragent cache dirstruct cutdirs logfile').split())
+_TRANSFER_WGETRC_SYSTEM = ('/etc/wgetrc', '/usr/local/etc/wgetrc', '/opt/homebrew/etc/wgetrc')
+
+
+def _transfer_wgetrc_unsafe(env: Dict, state: Dict) -> bool:
+    """Whether a wgetrc wget reads on its own, the system one and then $WGETRC or ~/.wgetrc, sets anything outside the
+    safe settings, read once a turn by setting names alone; true when where it is isn't known or it can't be read."""
+    def setting(key: str) -> Optional[str]:
+        return env[key] if key in env else None if _TRANSFER_CLEAN_ENV in env else os.environ.get(key)
+    named, home = setting('WGETRC'), setting('HOME') or _transfer_home()
+    if _TRANSFER_SUBSTITUTED in (named or '') + (home or ''):
+        return True
+    if named and not os.path.isabs(named):
+        return True  # relative to a folder this may not know
+    paths = [] if _TRANSFER_WINDOWS else [p for p in _TRANSFER_WGETRC_SYSTEM if os.path.isfile(p)]
+    user = named or (os.path.join(home, '.wgetrc') if home else '')
+    if named or (user and os.path.isfile(user)):
+        paths.append(user)  # a $WGETRC that isn't there makes wget stop, which counts as unsafe too
+    for path in paths:
+        if ('wgetrc', path) not in state:
+            state[('wgetrc', path)] = _transfer_wgetrc_has_unsafe(path)
+        if state[('wgetrc', path)]:
+            return True
+    return False
+
+
+def _transfer_wgetrc_has_unsafe(path: str) -> bool:
+    """Whether a wgetrc sets anything outside the safe settings, as wget reads one: name = value per line, # and blank
+    lines skipped, - and _ in the name ignored; true when it can't be read."""
+    try:
+        with open(path, 'rb') as handle:
+            data = handle.read(_TRANSFER_SSH_CONFIG_MAX_BYTES + 1)
+    except OSError:
+        return True
+    if len(data) > _TRANSFER_SSH_CONFIG_MAX_BYTES:
+        return True
+    for line in data.decode('utf-8', 'replace').split('\n'):
+        line = line.strip()
+        if line and not line.startswith('#'):
+            name = re.match(r'[^\s=]*', line).group().lower().replace('-', '').replace('_', '')
+            if name not in _TRANSFER_WGETRC_SAFE:
+                return True
     return False
 
 
@@ -7965,7 +8024,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
         (kind if kind is not None else preproxy, noproxy), scheme
 
 
-def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
+def _transfer_wget(args: List[str], proxied: bool = False, env: Optional[Dict] = None,
+                   state: Optional[Dict] = None) -> List[tuple]:
     """wget's URLs: sent to when it posts data or a file; else fetched from. Each carries whether it goes through a
     proxy: one the command set or an -e proxy setting, unless --no-proxy or -e use_proxy=off turns proxies off."""
     urls, flags, settings, method, i = [], set(), {}, '', 0
@@ -7997,6 +8057,8 @@ def _transfer_wget(args: List[str], proxied: bool = False) -> List[tuple]:
         return []  # it prints and exits before fetching anything
     if '--config' in flags:
         return []  # a config this doesn't read may change what it sends and where
+    if '--no-config' not in flags and state is not None and _transfer_wgetrc_unsafe(env or {}, state):
+        return []
     on = settings.get('useproxy', 'on') in ('on', 'yes', '1') and '--no-proxy' not in flags
     proxy = on and (proxied or any(settings.get(k) for k in ('httpproxy', 'httpsproxy', 'ftpproxy')))
     # An -e post_data, post_file, body_data or body_file setting sends as its option does.
@@ -8306,7 +8368,7 @@ def _transfer_parse(program: str, args: List[str], env: Dict, other_user: bool, 
         raw = _transfer_ssh_pipe(args, sends, keeps)
     elif tool in ('curl', 'wget'):
         args = _transfer_stdin_args(tool, args, _transfer_stdin_text(layers))
-        raw = _transfer_curl(args, env, state) if tool == 'curl' else _transfer_wget(args, _transfer_proxied(env))
+        raw = _transfer_curl(args, env, state) if tool == 'curl' else _transfer_wget(args, _transfer_proxied(env), env, state)
     elif tool in ('nc', 'socat'):
         raw = _transfer_netcat(args, sends, program == 'ncat') if tool == 'nc' else _transfer_socat(args, sends)
     elif tool in ('httpie', 'powershell'):

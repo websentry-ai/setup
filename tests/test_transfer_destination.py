@@ -30,7 +30,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'be8d03b168d5077cd5d9c2676316925e6e982fe276a06d315df426b2e81e24f3'
+BLOCK_SHA256 = 'bb3a8547345f2dce8b6ae4ff367c96ad7c44d297df2860794decd6786d985e6a'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -149,7 +149,8 @@ class TransferTestCase(unittest.TestCase):
         env = {'PATH': bin_dir + os.pathsep + os.environ.get('PATH', ''), 'HOME': self.home,
                'FAKE_SSH_LOG': self.ssh_log, 'FAKE_SSH_SLEEP': '0'}
         for patcher in [patch.dict(os.environ, env), patch('socket.getaddrinfo', _getaddrinfo)] + \
-                [patch.object(hook, '_transfer_home', lambda home=self.home: home) for hook in HOOKS]:
+                [patch.object(hook, '_transfer_home', lambda home=self.home: home) for hook in HOOKS] + \
+                [patch.object(hook, '_TRANSFER_WGETRC_SYSTEM', ()) for hook in HOOKS]:
             patcher.start()
             self.addCleanup(patcher.stop)
         # A proxy or curl config folder this machine's shell sets would change what is looked up; the dict patch above
@@ -782,6 +783,38 @@ class SshLookupTests(TransferTestCase):
     def test_a_tilde_config_path_is_expanded_as_the_shell_does(self):
         Path(self.home, 'alt_cfg').write_text('Host prod\n  HostName 10.9.8.7\n')
         self.assert_endpoints('scp -F ~/alt_cfg f prod:/tmp', [_endpoint('out', 'prod', 'private', '10.9.8.7')])
+
+    def test_wgets_default_config_claims_nothing_unless_it_holds_only_safe_settings(self):
+        # wget reads the system wgetrc and then $WGETRC or ~/.wgetrc unless --no-config is given; one with any setting
+        # beyond the safe ones may change the destination, direction or URLs, so that call reports no transfer.
+        fetched = [_endpoint('in', '10.0.0.1', 'private')]
+        wgetrc = Path(self.home, '.wgetrc')
+        self.assert_endpoints('wget https://10.0.0.1/a', fetched)  # no wgetrc
+        for safe in ('# tuning\ntries = 3\n', 'user_agent = x\nDNS-Timeout=5\n'):
+            wgetrc.write_text(safe)
+            with self.subTest(safe=safe):
+                self.assert_endpoints('wget https://10.0.0.1/a', fetched)
+        for unsafe in ('method = POST\n', 'post_file = x\n', 'http_proxy = http://p:1/\n', 'future_setting = 1\n'):
+            wgetrc.write_text(unsafe)
+            for hook in HOOKS:
+                with self.subTest(unsafe=unsafe, hook=hook.__file__):
+                    self.assertIsNone(hook._transfer('wget https://10.0.0.1/a', self.repo, {}))
+            with self.subTest(unsafe=unsafe):
+                self.assert_endpoints('wget --no-config https://10.0.0.1/a', fetched)
+        # $WGETRC replaces ~/.wgetrc and one that isn't there stops wget; the system wgetrc is read as well.
+        elsewhere = Path(tempfile.mkdtemp(), 'rc')
+        elsewhere.write_text('tries = 3\n')
+        with patch.dict(os.environ, {'WGETRC': str(elsewhere)}):
+            self.assert_endpoints('wget https://10.0.0.1/a', fetched)
+        system = Path(tempfile.mkdtemp(), 'wgetrc')
+        system.write_text('method = POST\n')
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                with patch.dict(os.environ, {'WGETRC': str(elsewhere) + '.missing'}):
+                    self.assertIsNone(hook._transfer('wget https://10.0.0.1/a', self.repo, {}))
+                with patch.dict(os.environ, {'WGETRC': str(elsewhere)}), \
+                        patch.object(hook, '_TRANSFER_WGETRC_SYSTEM', (str(system),)):
+                    self.assertIsNone(hook._transfer('wget https://10.0.0.1/a', self.repo, {}))
 
     def test_curls_default_config_claims_nothing_unless_it_holds_only_safe_options(self):
         # curl reads ~/.curlrc first unless -q leads; one with any option beyond the safe ones may change the

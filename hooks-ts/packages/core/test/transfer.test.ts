@@ -187,6 +187,31 @@ test("curl's default config claims nothing unless it holds only safe options", a
   assert.equal(await kind("curl -T f https://10.0.0.1/up", { XDG_CONFIG_HOME: elsewhere }), "private");
 });
 
+test("wget's default config claims nothing unless it holds only safe settings", async () => {
+  // wget reads the system wgetrc and then $WGETRC or ~/.wgetrc unless --no-config is given; one with any setting beyond
+  // the safe ones may change the destination, direction or URLs, so that call reports no transfer.
+  const home = mkdtempSync(join(tmpdir(), "wgetrc-"));
+  const found = async (command: string, env: Record<string, string> = {}): Promise<Transfer | undefined> =>
+    await transfer(command, "/", { home, env: { HOME: home, ...env } });
+  const kind = async (command: string, env: Record<string, string> = {}): Promise<string | undefined> =>
+    (await found(command, env))?.endpoints[0]?.address;
+  assert.equal(await kind("wget https://10.0.0.1/a"), "private");
+  for (const safe of ["# tuning\ntries = 3\n", "user_agent = x\nDNS-Timeout=5\n"]) {
+    writeFileSync(join(home, ".wgetrc"), safe);
+    assert.equal(await kind("wget https://10.0.0.1/a"), "private", safe);
+  }
+  for (const unsafe of ["method = POST\n", "post_file = x\n", "http_proxy = http://p:1/\n", "future_setting = 1\n"]) {
+    writeFileSync(join(home, ".wgetrc"), unsafe);
+    assert.equal(await found("wget https://10.0.0.1/a"), undefined, unsafe);
+    assert.equal(await kind("wget --no-config https://10.0.0.1/a"), "private", unsafe);
+  }
+  // $WGETRC replaces ~/.wgetrc and one that isn't there stops wget.
+  const elsewhere = join(mkdtempSync(join(tmpdir(), "wgetrc-env-")), "rc");
+  writeFileSync(elsewhere, "tries = 3\n");
+  assert.equal(await kind("wget https://10.0.0.1/a", { WGETRC: elsewhere }), "private");
+  assert.equal(await found("wget https://10.0.0.1/a", { WGETRC: `${elsewhere}.missing` }), undefined);
+});
+
 test("a relative Include is read under $HOME only", async () => {
   // ssh reads the account's ~/.ssh/config but globs its relative Include under $HOME, so only that tree counts.
   const [home, elsewhere] = [mkdtempSync(join(tmpdir(), "acct-")), mkdtempSync(join(tmpdir(), "env-home-"))];
