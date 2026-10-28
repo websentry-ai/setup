@@ -141,6 +141,8 @@ export interface DecisionEntry {
   tool_input?: Record<string, unknown>;
   /** The shell command before the audit cap, for transfer resolution only; never sent. */
   transfer_command?: string;
+  /** For a confirm, the person's answer once known: true when they approved it, so the call ran. Never sent. */
+  confirmed?: boolean;
 }
 
 /**

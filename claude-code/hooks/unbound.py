@@ -6433,10 +6433,11 @@ def _transfer_end(shell: Dict) -> None:
         status = pipe['prior']
     else:
         # Under pipefail the pipeline leaves its last non-zero status: one command that surely fails fails it, and
-        # otherwise one whose status isn't known leaves it unknown.
-        statuses = pipe['statuses'] + [status]
-        if shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0] == '1':
-            status = 1 if 1 in statuses else None if None in statuses else status
+        # otherwise one whose status isn't known leaves it unknown. When pipefail itself isn't known, the two readings
+        # must agree.
+        statuses, pipefail = pipe['statuses'] + [status], shell['vars'].get(_TRANSFER_PIPEFAIL, ('', True))[0]
+        failing = 1 if 1 in statuses else None if None in statuses else status
+        status = status if not pipefail else failing if pipefail == '1' or failing == status else None
         status = {0: 1, 1: 0}.get(status) if pipe['negate'] else status
         skipped = {'&&': 1, '||': 0}.get(pipe['before'])
         if pipe['prior'] is None and skipped is not None and status != skipped:
@@ -7864,6 +7865,8 @@ def _transfer_ssh_args(program: str, args: List[str], switches: Optional[set] = 
                 switches.add('StdinNull=' + setting)
         if value and flag[1:] in identity_flags and (flag != '-o' or option in _TRANSFER_SSH_IDENTITY_OPTIONS):
             passthrough += ['-p' if flag == '-P' else flag, value]
+        if flag in ('-Q', '-O'):
+            switches.add(flag + '=' + (value or '').strip().lower())  # ssh's query, or its master-control command
         if flag == '-S' and program != 'ssh' and _transfer_program_name(value or '') != 'ssh':
             passthrough += list(_TRANSFER_CONFIG_UNKNOWN)  # scp's or sftp's own program may connect anywhere
     return operands, passthrough
@@ -7940,7 +7943,10 @@ def _transfer_ssh_pipe(args: List[str], sends: bool, receives: bool) -> List[tup
     it, and a first -o StdinNull=yes keep stdin unread; ForkAfterAuthentication=yes still sends it."""
     switches = set()
     operands, options = _transfer_ssh_args('ssh', args, switches)
-    if not operands or 'StdinNull=bad' in switches:
+    # -G, -V and -Q only print, and -O check, exit, stop, forward or cancel only controls a master connection.
+    controls = {'-O=' + command for command in ('check', 'exit', 'stop', 'forward', 'cancel')}
+    if not operands or 'StdinNull=bad' in switches or switches & ({'-G', '-V'} | controls) or \
+            any(switch.startswith('-Q=') for switch in switches):
         return []
     sends = sends and not switches & {'-n', '-f', 'StdinNull=yes'}
     return [(d, operands[0], options) for d, used in (('out', sends), ('in', receives)) if used]

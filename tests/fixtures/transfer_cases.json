@@ -8854,6 +8854,112 @@
      }
     ]
    }
+  },
+  {
+   "command": "ssh -G prod | grep hostname",
+   "transfer": null
+  },
+  {
+   "command": "ssh -V",
+   "transfer": null
+  },
+  {
+   "command": "ssh -Q cipher",
+   "transfer": null
+  },
+  {
+   "command": "ssh -Q cipher prod > out",
+   "transfer": null
+  },
+  {
+   "command": "ssh -O check prod > out",
+   "transfer": null
+  },
+  {
+   "command": "ssh -O exit prod < f",
+   "transfer": null
+  },
+  {
+   "command": "ssh -O proxy prod < f",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ssh prod cat f",
+   "transfer": null
+  },
+  {
+   "command": "ssh prod cat f > out",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "ssh -G prod > out",
+   "transfer": null
+  },
+  {
+   "command": "eval x; false | true || curl -T s https://8.8.8.8/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "eval x; false | true || curl -T s https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "eval x; true | true || curl -T s https://example.com/up",
+   "transfer": null
+  },
+  {
+   "command": "eval x; false | false || curl -T s https://example.com/up",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
   }
  ]
 }

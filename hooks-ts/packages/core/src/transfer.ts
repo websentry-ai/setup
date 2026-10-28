@@ -1590,11 +1590,12 @@ function end(shell: Shell): void {
     status = pipe.prior;
   } else {
     // Under pipefail the pipeline leaves its last non-zero status: one command that surely fails fails it, and
-    // otherwise one whose status isn't known leaves it unknown.
+    // otherwise one whose status isn't known leaves it unknown. When pipefail itself isn't known, the two readings must
+    // agree.
     const statuses = [...pipe.statuses, status];
-    if (shell.vars[PIPEFAIL]?.[0] === "1") {
-      status = statuses.includes(1) ? 1 : statuses.includes(undefined) ? undefined : status;
-    }
+    const pipefail = shell.vars[PIPEFAIL]?.[0] ?? "";
+    const failing = statuses.includes(1) ? 1 : statuses.includes(undefined) ? undefined : status;
+    if (pipefail !== "") status = pipefail === "1" || failing === status ? failing : undefined;
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : undefined;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : undefined;
     if (pipe.prior === undefined && skipped !== undefined && status !== skipped) status = undefined;
@@ -3046,6 +3047,8 @@ function sshArgs(name: string, args: string[], switches = new Set<string>()): [s
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
     }
+    // ssh's query, or its master-control command.
+    if (flag === "-Q" || flag === "-O") switches.add(`${flag}=${(value ?? "").trim().toLowerCase()}`);
     // scp's or sftp's own program may connect anywhere.
     if (flag === "-S" && name !== "ssh" && programName(value ?? "") !== "ssh") passthrough.push(...CONFIG_UNKNOWN);
   }
@@ -3124,7 +3127,11 @@ function sshPipe(args: string[], fed: boolean, receives: boolean): Raw[] {
   const switches = new Set<string>();
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
-  if (destination === undefined || switches.has("StdinNull=bad")) return [];
+  // -G, -V and -Q only print, and -O check, exit, stop, forward or cancel only controls a master connection.
+  const controls = ["check", "exit", "stop", "forward", "cancel"].map((command) => `-O=${command}`);
+  const inspects = switches.has("-G") || switches.has("-V") || controls.some((c) => switches.has(c)) ||
+    [...switches].some((switch_) => switch_.startsWith("-Q="));
+  if (destination === undefined || switches.has("StdinNull=bad") || inspects) return [];
   const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("StdinNull=yes");
   return ([["out", sends], ["in", receives]] as const).filter(([, used]) => used).map(([d]): Raw => [d, destination, options]);
 }

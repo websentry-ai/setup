@@ -220,6 +220,7 @@ export interface StandaloneTurnEntry {
   decision: string;
   tool_input?: Record<string, unknown>;
   transfer_command?: string;
+  confirmed?: boolean;
 }
 
 /**
@@ -255,8 +256,8 @@ export function postStandaloneTurn(
       call.tool_input = { ...input };
     }
     if (typeof entry.transfer_command === "string") call.transfer_command = entry.transfer_command;
-    // Posted before its confirm is answered, so a `confirm` here is not known to have run.
-    if (call.decision === "confirm") call.ran = false;
+    // A confirm the person hasn't approved, declined or posted before an answer, is not known to have run.
+    if (call.decision === "confirm" && entry.confirmed !== true) call.ran = false;
     const record: TurnRecord = { tool_calls: [call], results: [], started_at: now };
     if (typeof sessionId === "string" && sessionId !== "") {
       record.session_id = sessionId;

@@ -3136,9 +3136,9 @@ function end(shell) {
     status = pipe.prior;
   } else {
     const statuses = [...pipe.statuses, status];
-    if (shell.vars[PIPEFAIL]?.[0] === "1") {
-      status = statuses.includes(1) ? 1 : statuses.includes(void 0) ? void 0 : status;
-    }
+    const pipefail = shell.vars[PIPEFAIL]?.[0] ?? "";
+    const failing = statuses.includes(1) ? 1 : statuses.includes(void 0) ? void 0 : status;
+    if (pipefail !== "") status = pipefail === "1" || failing === status ? failing : void 0;
     if (pipe.negate) status = status === 0 ? 1 : status === 1 ? 0 : void 0;
     const skipped = pipe.before === "&&" ? 1 : pipe.before === "||" ? 0 : void 0;
     if (pipe.prior === void 0 && skipped !== void 0 && status !== skipped) status = void 0;
@@ -4349,6 +4349,7 @@ function sshArgs(name, args, switches = /* @__PURE__ */ new Set()) {
     if (value && identityFlags.includes(flag.slice(1)) && (flag !== "-o" || SSH_IDENTITY_OPTIONS.has(option))) {
       passthrough.push(flag === "-P" ? "-p" : flag, value);
     }
+    if (flag === "-Q" || flag === "-O") switches.add(`${flag}=${(value ?? "").trim().toLowerCase()}`);
     if (flag === "-S" && name !== "ssh" && programName(value ?? "") !== "ssh") passthrough.push(...CONFIG_UNKNOWN);
   }
   return [operands, passthrough];
@@ -4412,7 +4413,9 @@ function sshPipe(args, fed, receives) {
   const switches = /* @__PURE__ */ new Set();
   const [operands, options] = sshArgs("ssh", args, switches);
   const destination = operands[0];
-  if (destination === void 0 || switches.has("StdinNull=bad")) return [];
+  const controls = ["check", "exit", "stop", "forward", "cancel"].map((command2) => `-O=${command2}`);
+  const inspects = switches.has("-G") || switches.has("-V") || controls.some((c) => switches.has(c)) || [...switches].some((switch_) => switch_.startsWith("-Q="));
+  if (destination === void 0 || switches.has("StdinNull=bad") || inspects) return [];
   const sends = fed && !switches.has("-n") && !switches.has("-f") && !switches.has("StdinNull=yes");
   return [["out", sends], ["in", receives]].filter(([, used]) => used).map(([d]) => [d, destination, options]);
 }
@@ -5096,7 +5099,7 @@ function postStandaloneTurn(entry, ctx, sessionId, deps) {
       call.tool_input = { ...input };
     }
     if (typeof entry.transfer_command === "string") call.transfer_command = entry.transfer_command;
-    if (call.decision === "confirm") call.ran = false;
+    if (call.decision === "confirm" && entry.confirmed !== true) call.ran = false;
     const record = { tool_calls: [call], results: [], started_at: now };
     if (typeof sessionId === "string" && sessionId !== "") {
       record.session_id = sessionId;
@@ -5838,7 +5841,7 @@ async function decideUserBash(event, ctx, deps) {
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
-    noteDecision(deps, {
+    const entry = {
       tool_name: "bash",
       tool_use_id: toolUseId,
       decision: outcome.kind,
@@ -5846,7 +5849,8 @@ async function decideUserBash(event, ctx, deps) {
       // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
       tool_input: auditToolInput({}, command2),
       ...typeof command2 === "string" && command2 !== "" ? { transfer_command: transferCommand(command2) } : {}
-    });
+    };
+    if (outcome.kind !== "confirm") noteDecision(deps, entry);
     switch (outcome.kind) {
       case "allow":
         return void 0;
@@ -5856,10 +5860,14 @@ async function decideUserBash(event, ctx, deps) {
         return denyBashResult(reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason);
       }
       case "confirm": {
-        if (!ctx.hasUI) return denyBashResult(NO_UI_REASON);
+        if (!ctx.hasUI) {
+          noteDecision(deps, { ...entry, confirmed: false });
+          return denyBashResult(NO_UI_REASON);
+        }
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
         notifySafe(ctx, reason, "warning");
         const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
+        noteDecision(deps, { ...entry, confirmed: accepted === true });
         return accepted ? void 0 : denyBashResult(DECLINED_REASON);
       }
       case "unavailable":

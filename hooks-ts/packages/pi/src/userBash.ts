@@ -45,7 +45,7 @@ import type { CheckHooks } from "../../core/src/policy.ts";
 import { transferCommand } from "../../core/src/transfer.ts";
 import { denyBashResult } from "./bashResult.ts";
 import { noteDecision } from "./decide.ts";
-import type { DecideCtx, DecideDeps } from "./decide.ts";
+import type { DecideCtx, DecideDeps, DecisionEntry } from "./decide.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 
 /** The structural slice of `UserBashEvent` this adapter reads. */
@@ -104,12 +104,12 @@ export async function decideUserBash(
       deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
     // A typed `!cmd` is a real tool call in the audit trail. `index.ts` posts this entry as its own
-    // one-call turn log, immediately (`postStandaloneTurn`): pi fires no `agent_end` for a `!cmd`, and
-    // merging it into the shared record mis-attributed it to the NEXT turn's prompt. Emitted before
-    // the confirm, like `decide.ts`, so the row records what the policy said rather than the answer.
-    // `noteDecision` swallows its own failures, which matters more here than anywhere: a throw out of
-    // this function means the command silently never runs (§A1.2).
-    noteDecision(deps, {
+    // one-call turn log (`postStandaloneTurn`): pi fires no `agent_end` for a `!cmd`, and merging it
+    // into the shared record mis-attributed it to the NEXT turn's prompt. The row records what the
+    // policy said; a confirm's is posted once the person answers, so an approved command's transfer
+    // is resolved and a declined one's is not. `noteDecision` swallows its own failures, which matters
+    // more here than anywhere: a throw out of this function means the command silently never runs (§A1.2).
+    const entry: DecisionEntry = {
       tool_name: "bash",
       tool_use_id: toolUseId,
       decision: outcome.kind,
@@ -117,7 +117,8 @@ export async function decideUserBash(
       // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
       tool_input: auditToolInput({}, command),
       ...(typeof command === "string" && command !== "" ? { transfer_command: transferCommand(command) } : {}),
-    });
+    };
+    if (outcome.kind !== "confirm") noteDecision(deps, entry);
 
     switch (outcome.kind) {
       case "allow":
@@ -130,13 +131,17 @@ export async function decideUserBash(
       }
 
       case "confirm": {
-        if (!ctx.hasUI) return denyBashResult(NO_UI_REASON);
+        if (!ctx.hasUI) {
+          noteDecision(deps, { ...entry, confirmed: false });
+          return denyBashResult(NO_UI_REASON);
+        }
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
         // See `decide.ts`: the notice carries the reason, the dialog asks the question. On this path
         // the notice matters more still — it is what survives `!!`, which keeps the rendered output
         // out of the model's context.
         notifySafe(ctx, reason, "warning");
         const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
+        noteDecision(deps, { ...entry, confirmed: accepted === true });
         return accepted ? undefined : denyBashResult(DECLINED_REASON);
       }
 

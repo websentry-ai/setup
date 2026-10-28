@@ -490,6 +490,27 @@ test("a denied or confirmed !cmd returns the same result as before, and is still
   }
 });
 
+test("an approved confirm's !cmd row carries its transfer, and a declined one's does not", async () => {
+  turnStore.take();
+  for (const confirmResult of [true, false]) {
+    const api = await startMockApi({ mode: "ask" });
+    const f = await keyedExtension(api);
+    try {
+      const ctx = createFakeCtx({ sessionId: "sess-ubash-4", hasUI: true, confirmResult });
+      await f.handlers.get("user_bash")?.(createFakeUserBashEvent("curl -T build.zip http://10.1.2.3/up"), ctx);
+      for (let waited = 0; turnLogBodies(api).length === 0 && waited < 3_000; waited += 20) await sleep(20);
+      const logs = turnLogBodies(api);
+      assert.equal(logs.length, 1, `confirmed ${confirmResult}: one row`);
+      const entry = logs[0]?.messages?.[1]?.tool_use?.[0] as Record<string, unknown> | undefined;
+      const upload = { direction: "out", host: "10.1.2.3", resolved_host: "10.1.2.3", address: "private" };
+      assert.deepEqual(entry?.transfer, confirmResult ? { tool: "curl", endpoints: [upload] } : undefined, JSON.stringify(entry));
+    } finally {
+      f.cleanup();
+      await api.close();
+    }
+  }
+});
+
 test("no key: a !cmd posts nothing at all", async () => {
   const api = await startMockApi({ mode: "allow" });
   const home = createFakeHome({});
