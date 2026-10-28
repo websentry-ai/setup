@@ -2861,6 +2861,8 @@ const CURLRC_SAFE: ReadonlySet<string> = new Set(
    speed-limit speed-time expect100-timeout`.split(/\s+/),
 );
 const CURLRC_SAFE_SHORT = "AsSv#mfiwRYy";
+/** Options that make curl print help, its manual or its version and exit before any transfer. */
+const CURL_INFO: ReadonlySet<string> = new Set(["-h", "--help", "-M", "--manual", "-V", "--version"]);
 /** Options whose value picks where a request goes, besides the proxies; a variable expanded into one leaves that unknown. */
 const CURL_ROUTES: ReadonlySet<string> = new Set(
   ["--url", "--resolve", "--connect-to", "--preproxy", "--noproxy", "--proto-default", "--unix-socket", "--abstract-unix-socket"],
@@ -3123,6 +3125,9 @@ function curlRequest(
     }
     flags.add(arg);
     for (const flag of CURL_UNDOES[arg] ?? []) flags.delete(flag);
+    if ([...flags].some((flag) => CURL_INFO.has(flag))) {
+      return [undefined, [false, 0, false, false, false], [], false, args.length, [undefined, undefined], ""]; // it only prints
+    }
     routed ||= expand && value !== undefined && value.includes("{{") && (CURL_ROUTES.has(arg) || Object.hasOwn(CURL_PROXIES, arg));
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();

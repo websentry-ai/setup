@@ -4192,6 +4192,7 @@ var CURLRC_SAFE = new Set(
    speed-limit speed-time expect100-timeout`.split(/\s+/)
 );
 var CURLRC_SAFE_SHORT = "AsSv#mfiwRYy";
+var CURL_INFO = /* @__PURE__ */ new Set(["-h", "--help", "-M", "--manual", "-V", "--version"]);
 var CURL_ROUTES = /* @__PURE__ */ new Set(
   ["--url", "--resolve", "--connect-to", "--preproxy", "--noproxy", "--proto-default", "--unix-socket", "--abstract-unix-socket"]
 );
@@ -4412,6 +4413,9 @@ function curlRequest(args, start) {
     }
     flags.add(arg);
     for (const flag of CURL_UNDOES[arg] ?? []) flags.delete(flag);
+    if ([...flags].some((flag) => CURL_INFO.has(flag))) {
+      return [void 0, [false, 0, false, false, false], [], false, args.length, [void 0, void 0], ""];
+    }
     routed ||= expand && value !== void 0 && value.includes("{{") && (CURL_ROUTES.has(arg) || Object.hasOwn(CURL_PROXIES, arg));
     if (arg === "--url" && value) urls.push(value);
     else if ((arg === "-X" || arg === "--request") && value) method = value.toUpperCase();

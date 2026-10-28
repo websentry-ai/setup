@@ -9616,6 +9616,44 @@
      }
     ]
    }
+  },
+  {
+   "command": "curl --help all",
+   "transfer": null
+  },
+  {
+   "command": "curl -h https://8.8.8.8/a",
+   "transfer": null
+  },
+  {
+   "command": "curl https://8.8.8.8/a --version",
+   "transfer": null
+  },
+  {
+   "command": "curl -sV https://8.8.8.8/a",
+   "transfer": null
+  },
+  {
+   "command": "curl --manual https://8.8.8.8/a",
+   "transfer": null
+  },
+  {
+   "command": "curl --hel all",
+   "transfer": null
+  },
+  {
+   "command": "curl -q https://8.8.8.8/a -- --help",
+   "transfer": {
+    "tool": "curl",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "8.8.8.8",
+      "resolved_host": "8.8.8.8",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

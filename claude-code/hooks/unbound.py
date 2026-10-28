@@ -7880,6 +7880,8 @@ def _transfer_curl_long(name: str) -> str:
     return _transfer_prefixed('--' + word, _TRANSFER_CURL_LONG_OPTIONS)
 
 
+# Options that make curl print help, its manual or its version and exit before any transfer.
+_TRANSFER_CURL_INFO = frozenset({'-h', '--help', '-M', '--manual', '-V', '--version'})
 # Options whose value picks where a request goes, besides the proxies; a variable expanded into one leaves that unknown.
 _TRANSFER_CURL_ROUTES = frozenset({'--url', '--resolve', '--connect-to', '--preproxy', '--noproxy', '--proto-default',
                                    '--unix-socket', '--abstract-unix-socket'})
@@ -7919,6 +7921,8 @@ def _transfer_curl_request(args: List[str], i: int) -> tuple:
             continue
         flags.add(arg)
         flags -= _TRANSFER_CURL_UNDOES.get(arg, set())
+        if flags & _TRANSFER_CURL_INFO:
+            return None, (False, 0, False, False, False), [], False, len(args), (None, None), ''  # it only prints
         routed = routed or bool(expand and value and '{{' in value and
                                 (arg in _TRANSFER_CURL_ROUTES or arg in _TRANSFER_CURL_PROXIES))
         if arg == '--url' and value:
