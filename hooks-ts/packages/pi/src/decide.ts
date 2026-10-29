@@ -37,6 +37,7 @@ import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
 import type { McpCallInfo } from "../../core/src/types.ts";
 import type { PolicyOutcome } from "../../core/src/verdict.ts";
 import { policyState } from "../../core/src/policyState.ts";
+import { transferCommand } from "../../core/src/transfer.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
@@ -57,6 +58,8 @@ export interface DecideCtx extends UiCtx {
 
 export interface DecideDeps {
   checker: PolicyChecker;
+  /** Told when the person declines a confirm, so the recorded call is known never to have run. */
+  onDeclined?: (toolUseId: string) => void;
   apiKey: string;
   entrypoint: string;
   /** Injectable clock, so a 300 s cache-TTL test runs in milliseconds. Defaults to `Date.now`. */
@@ -136,6 +139,10 @@ export interface DecisionEntry {
   decision: string;
   /** Already allowlisted and capped by `auditToolInput`. Absent is allowed; raw input is not. */
   tool_input?: Record<string, unknown>;
+  /** The shell command before the audit cap, for transfer resolution only; never sent. */
+  transfer_command?: string;
+  /** For a confirm, the person's answer once known: true when they approved it, so the call ran. Never sent. */
+  confirmed?: boolean;
 }
 
 /**
@@ -206,6 +213,8 @@ export async function decideToolCall(
     // construction rather than by a comment — and computed here, because this is the last scope that
     // has the live input at all.
     const auditInput = auditToolInput(toolInput, command);
+    // The audit copy cuts a long command in the middle; transfers resolve from the command that runs.
+    const fullCommand = shell && command !== "" ? { transfer_command: transferCommand(command) } : {};
 
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
@@ -283,9 +292,13 @@ export async function decideToolCall(
       tool_use_id: event.toolCallId,
       decision: outcome.kind,
       tool_input: auditInput,
+      ...fullCommand,
     });
 
-    return await applyOutcome(outcome, ctx);
+    const result = await applyOutcome(outcome, ctx);
+    // A blocked confirm was declined: the decision recorded above can't say so, and the call never ran.
+    if (outcome.kind === "confirm" && result !== undefined) noteSafe(() => deps.onDeclined?.(event.toolCallId));
+    return result;
   } catch {
     // Belt and braces: `index.ts` catches too, but an internal fault must allow, never block.
     return undefined;

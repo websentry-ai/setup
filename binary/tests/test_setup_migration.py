@@ -101,6 +101,8 @@ def test_setup_full_run_configures_everything(env):
             {"type": "command", "command": _cmd("claude-code", "PreToolUse"), "timeout": 15000}]}],
         "PostToolUse": [{"matcher": "*", "hooks": [
             {"type": "command", "command": _cmd("claude-code", "PostToolUse"), "async": True, "timeout": 60}]}],
+        "PostToolUseFailure": [{"matcher": "Bash", "hooks": [
+            {"type": "command", "command": _cmd("claude-code", "PostToolUseFailure"), "async": True, "timeout": 60}]}],
         "UserPromptSubmit": [{"hooks": [
             {"type": "command", "command": _cmd("claude-code", "UserPromptSubmit"), "timeout": 60}]}],
         "Stop": [{"hooks": [
@@ -271,6 +273,28 @@ def test_setup_is_idempotent(env):
     first = (env["tmp"] / "managed-claude" / "managed-settings.json").read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").read_text() == first
+
+
+def test_claude_code_registers_post_tool_use_failure_once(env):
+    # The hook reads a failed Bash call from this event; a rerun keeps exactly one entry.
+    ours = [{"matcher": "Bash", "hooks": [
+        {"type": "command", "command": _cmd("claude-code", "PostToolUseFailure"), "async": True, "timeout": 60}]}]
+    for _ in range(2):
+        assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+        settings = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+        assert settings["hooks"]["PostToolUseFailure"] == ours
+
+
+def test_a_claude_code_install_from_before_post_tool_use_failure_is_not_tampered(env):
+    # An install written before the event was added still holds every hook it then wrote.
+    path = env["tmp"] / "managed-claude" / "managed-settings.json"
+    path.parent.mkdir(parents=True)
+    older = {k: v for k, v in setup_cmd._claude_hooks_config().items() if k != "PostToolUseFailure"}
+    path.write_text(json.dumps({"hooks": older}))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    states = [k.get("install_state") for a, k in env["notified"] if a[1] == "claude-code"]
+    assert states == ["persisted"]
+    assert "PostToolUseFailure" in json.loads(path.read_text())["hooks"]
 
 
 def test_augment_rerun_adds_user_context_to_an_existing_install(env):

@@ -23,6 +23,14 @@
         ]
       }
     ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "python3 /unbound/unbound.py", "timeout": 60, "async": true }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

@@ -36,6 +36,7 @@
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
+import { resolveTransfers, type Transfer } from "../../core/src/transfer.ts";
 import { buildTurnLogBody, shouldPostTurn } from "../../core/src/turnLog.ts";
 import type { TurnRecord, TurnStore, TurnToolCall } from "../../core/src/turn.ts";
 
@@ -152,18 +153,23 @@ function dispatchTurnLog(
 ): void {
   try {
     const completedAtMs = (deps.now ?? Date.now)();
-    const body = buildTurnLogBody(record, {
-      cwd,
-      completedAtMs,
-      assistantText,
-      ...(deps.apiKey === undefined ? {} : { apiKey: deps.apiKey }),
-      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
-    });
     const dispatchedAtMs = completedAtMs;
+    const post = (transfers: ReadonlyMap<string, Transfer>): Promise<boolean> =>
+      deps.client.postTurnLog(
+        buildTurnLogBody(record, {
+          cwd,
+          completedAtMs,
+          assistantText,
+          ...(deps.apiKey === undefined ? {} : { apiKey: deps.apiKey }),
+          ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
+          transfers,
+        }),
+      );
 
-    // The whole point of the file: dispatched, not awaited.
-    void deps.client
-      .postTurnLog(body)
+    // The whole point of the file: dispatched, not awaited. Transfer lookups ride the same detached chain.
+    void resolveTransfers(record.tool_calls ?? [], cwd)
+      .catch(() => new Map<string, Transfer>())
+      .then(post)
       .then((ok) => {
         if (ok) return;
         deps.telemetry?.reportTurnLogFailure({
@@ -213,6 +219,8 @@ export interface StandaloneTurnEntry {
   tool_use_id: string;
   decision: string;
   tool_input?: Record<string, unknown>;
+  transfer_command?: string;
+  confirmed?: boolean;
 }
 
 /**
@@ -247,6 +255,9 @@ export function postStandaloneTurn(
     if (input !== null && typeof input === "object" && !Array.isArray(input)) {
       call.tool_input = { ...input };
     }
+    if (typeof entry.transfer_command === "string") call.transfer_command = entry.transfer_command;
+    // A confirm the person hasn't approved, declined or posted before an answer, is not known to have run.
+    if (call.decision === "confirm" && entry.confirmed !== true) call.ran = false;
     const record: TurnRecord = { tool_calls: [call], results: [], started_at: now };
     if (typeof sessionId === "string" && sessionId !== "") {
       record.session_id = sessionId;

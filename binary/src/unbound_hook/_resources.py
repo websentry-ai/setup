@@ -38,8 +38,8 @@ TOOLS = tuple(TOOL_HOOK_SOURCES)
 # themselves dispatch on the stdin payload; these lists drive what `setup`
 # writes and what the CLI-boundary tests cover.
 TOOL_EVENTS = {
-    "claude-code": ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop",
-                    "SessionStart", "SessionEnd"),
+    "claude-code": ("PreToolUse", "PostToolUse", "PostToolUseFailure", "UserPromptSubmit",
+                    "Stop", "SessionStart", "SessionEnd"),
     "codex": ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop",
               "SessionStart"),
     "copilot": ("SessionStart", "UserPromptSubmit", "PreToolUse",

@@ -111,6 +111,13 @@ export interface TurnToolCall {
    * them by. Absent means the id was not knowable when the call was recorded.
    */
   session_id?: string;
+  /**
+   * Only ever `false`: the call is known not to have run (a declined confirm, or a `!cmd` posted before its
+   * confirm was answered). Never sent; it keeps transfer lookups off calls that never ran.
+   */
+  ran?: false;
+  /** The shell command before the audit cap, bounded by `transferCommand`, so transfers resolve from what ran. Never sent. */
+  transfer_command?: string;
 }
 
 export interface TurnResult {
@@ -165,6 +172,8 @@ export interface TurnStore {
   recordPrompt(text: string, sessionId: string, now?: number): void;
   recordToolCall(entry: Omit<TurnToolCall, "ts">, sessionId: string, now?: number): void;
   recordResult(entry: TurnResult): void;
+  /** Mark a recorded call as never having run, such as a confirm the person declined. Never throws. */
+  markNotRun(toolUseId: string): void;
   /**
    * The record, plus an empty store — so a retried `agent_end` cannot re-post it (§F3). The store is
    * emptied even when the answer is `undefined`: a record that is not postable is still consumed,
@@ -481,11 +490,20 @@ export function createTurnStore(): TurnStore {
         if (input !== null && typeof input === "object" && !Array.isArray(input)) {
           stored.tool_input = { ...input };
         }
+        if (typeof entry.transfer_command === "string") stored.transfer_command = entry.transfer_command;
         // Stamped at record time, from the id this call was actually made under — not read back off
         // the record, which may carry an older session's id or none at all.
         const incoming = idOf(sessionId);
         if (incoming !== undefined) stored.session_id = incoming;
         record.tool_calls.push(stored);
+      } catch {
+        // ditto
+      }
+    },
+
+    markNotRun(toolUseId: string): void {
+      try {
+        for (const call of record.tool_calls) if (call.tool_use_id === toolUseId) call.ran = false;
       } catch {
         // ditto
       }

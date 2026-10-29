@@ -41,6 +41,7 @@
 // `unbound_app_label` either: the route already labels this `pi`, which is what makes
 // `metadata.source = 'hooks'` true (`add_gateway_metrics_task.py:676-677`).
 
+import type { Transfer } from "./transfer.ts";
 import { redactSecrets } from "./config.ts";
 import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
@@ -75,6 +76,10 @@ export interface TurnLogToolUse {
    */
   tool_input: Record<string, unknown>;
   tool_response: ToolResponse;
+  /** When the call was recorded, ISO 8601 UTC to the second; absent when the record holds no usable time. */
+  ts?: string;
+  /** Where a shell call sent to or fetched from, resolved locally as hosts and address kinds only; absent when none. */
+  transfer?: Transfer;
 }
 
 export interface TurnLogMessage {
@@ -132,6 +137,8 @@ export interface TurnLogOptions {
   apiKey?: string;
   /** The process's settled account identity; attached as `account_identity` when present. */
   accountIdentity?: AccountIdentity;
+  /** Each shell call's transfer, keyed by `tool_use_id`. */
+  transfers?: ReadonlyMap<string, Transfer>;
 }
 
 /**
@@ -267,6 +274,16 @@ function toolResponseFor(record: TurnRecord, toolUseId: string, apiKey?: string)
   return response;
 }
 
+/** A record time as ISO 8601 UTC to the second, such as 2026-10-22T16:40:00Z; undefined when unusable. */
+function isoSeconds(ms: unknown): string | undefined {
+  if (typeof ms !== "number" || !Number.isFinite(ms)) return undefined;
+  try {
+    return new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Assemble the §B3 body. Total: a malformed record produces a minimal body rather than a throw,
  * because the only caller is a handler on pi's run-settlement path.
@@ -300,19 +317,23 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
         ? Math.floor(safe.tool_calls_truncated)
         : undefined;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
-    toolUse = calls.map((call) => ({
-      type: TURNLOG_TOOL_USE_TYPE,
-      tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
-      tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // `call`-derived, and still never `event.input`-derived: what the record holds was already
-      // allowlisted and capped by `auditToolInput` — header decision 2.
-      tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
-      tool_response: toolResponseFor(
-        safe,
-        typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-        opts?.apiKey,
-      ),
-    }));
+    toolUse = calls.map((call) => {
+      const toolUseId = typeof call?.tool_use_id === "string" ? call.tool_use_id : "";
+      const entry: TurnLogToolUse = {
+        type: TURNLOG_TOOL_USE_TYPE,
+        tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
+        tool_use_id: toolUseId,
+        // `call`-derived, and still never `event.input`-derived: what the record holds was already
+        // allowlisted and capped by `auditToolInput` — header decision 2.
+        tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
+        tool_response: toolResponseFor(safe, toolUseId, opts?.apiKey),
+      };
+      const ts = isoSeconds(call?.ts);
+      if (ts !== undefined) entry.ts = ts;
+      const transfer = toolUseId === "" ? undefined : opts?.transfers?.get(toolUseId);
+      if (transfer !== undefined) entry.transfer = transfer;
+      return entry;
+    });
   } catch {
     // Fall through with the defaults above: a degraded row beats a thrown handler.
   }
