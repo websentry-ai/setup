@@ -1368,16 +1368,16 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
     # user_notice when the gateway sends one (a skill instruction's admin
     # message), else the same text.
     additional_context = api_response.get('additionalContext', '')
+    system_message = api_response.get('user_notice') or additional_context
+    response = {}
     if additional_context:
-        return {
-            'hookSpecificOutput': {
-                'hookEventName': 'UserPromptSubmit',
-                'additionalContext': additional_context,
-            },
-            'systemMessage': api_response.get('user_notice') or additional_context,
+        response['hookSpecificOutput'] = {
+            'hookEventName': 'UserPromptSubmit',
+            'additionalContext': additional_context,
         }
-
-    return {}
+    if system_message:
+        response['systemMessage'] = system_message
+    return response
 
 
 _HOOK_SCRIPT_RUNTIMES = {
@@ -3049,6 +3049,9 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     cwd = event.get('cwd')
     if isinstance(cwd, str) and cwd:
         metadata['cwd'] = cwd
+    session_context = _rollout_session_context(event.get('transcript_path'))
+    if session_context:
+        metadata['session_context'] = session_context
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'codex',
@@ -7726,6 +7729,35 @@ def _codex_same_totals(left: Dict, right: Dict) -> bool:
     if not left or not right:
         return False
     return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
+
+
+def _rollout_session_context(transcript_path) -> Optional[Dict]:
+    """Context size at the newest token_count; None if compacted since or unmeasurable."""
+    if not isinstance(transcript_path, str) or not transcript_path or transcript_path == 'undefined':
+        return None
+    try:
+        for raw in reversed(_skill_policy_transcript_tail(transcript_path)):
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue  # blank, or a tail cut mid-line
+            if not isinstance(entry, dict):
+                continue
+            payload = entry.get('payload') if isinstance(entry.get('payload'), dict) else {}
+            if entry.get('type') == 'compacted' or payload.get('type') == 'context_compacted':
+                return None
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            # A rate-limit re-emit repeats the last request's usage, still its size (openai/codex#14489).
+            last = (payload.get('info') or {}).get('last_token_usage')
+            if not isinstance(last, dict):
+                continue
+            tokens = sum(_codex_token(last, f) for f in ('input_tokens', 'output_tokens'))  # cached is inside input
+            if tokens:
+                return {'context_tokens': tokens}
+        return None
+    except Exception:
+        return None
 
 
 def _codex_all_totals(transcript_path: str, until: Optional[str] = None) -> List[Dict]:
