@@ -1177,7 +1177,7 @@ class TestInstallUnderResolvedDir(unittest.TestCase):
 
     def test_settings_and_hook_command_under_config_dir(self):
         with patch.object(Path, "home", staticmethod(lambda: self.home)), \
-             patch.object(setup, "download_file", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+             patch.object(setup, "download_file", lambda url, dest, *_: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
             self.assertTrue(setup.setup_hooks(config_dir=self.config_dir))
             self.assertTrue(setup.configure_claude_settings(config_dir=self.config_dir))
 
@@ -1198,7 +1198,7 @@ class TestInstallUnderResolvedDir(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
         with patch.dict(os.environ, env, clear=True), \
              patch.object(Path, "home", staticmethod(lambda: self.home)), \
-             patch.object(setup, "download_file", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+             patch.object(setup, "download_file", lambda url, dest, *_: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
             config_dir = setup._resolve_claude_config_dir(["x"])
             self.assertTrue(setup.setup_hooks(config_dir=config_dir))
             self.assertTrue(setup.configure_claude_settings(config_dir=config_dir))

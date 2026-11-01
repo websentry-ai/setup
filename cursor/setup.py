@@ -3,6 +3,7 @@
 import os
 import sys
 import platform
+import shutil
 import subprocess
 import urllib.parse
 import time
@@ -272,21 +273,38 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         print(f"❌ Failed to run callback server: {e}")
         return None
 
-def download_file(url: str, dest_path: Path) -> bool:
+def download_file(url: str, dest_path: Path, gateway_url: Optional[str] = None) -> bool:
+    # Fetch beside dest_path and swap in whole: a hook firing mid-download, or a
+    # dropped connection, must never leave the live file partly written.
+    tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
+            stale.unlink()
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", str(dest_path), url],
+            ["curl", "-fsSL", "-o", str(tmp_path), url],
             capture_output=True,
             timeout=30
         )
-        if result.returncode == 0:
-            debug_print(f"File downloaded successfully: {dest_path}")
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if result.returncode != 0:
+            return False
+        if gateway_url:
+            rewrite_gateway_url_in_file(tmp_path, gateway_url)
+        if dest_path.exists():
+            shutil.copymode(dest_path, tmp_path)
+        os.replace(tmp_path, dest_path)
+        debug_print(f"File downloaded successfully: {dest_path}")
+        return True
+    except (subprocess.TimeoutExpired, OSError) as e:
         print(f"❌ Failed to download {url}: {e}")
         return False
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
@@ -361,10 +379,9 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     print("✅ hooks.json downloaded")
 
     print("📥 Downloading unbound.py script...")
-    if not download_file(SCRIPT_URL, script_path):
+    if not download_file(SCRIPT_URL, script_path, gateway_url):
         return False
     print("✅ unbound.py downloaded")
-    rewrite_gateway_url_in_file(script_path, gateway_url)
 
     try:
         current_mode = script_path.stat().st_mode

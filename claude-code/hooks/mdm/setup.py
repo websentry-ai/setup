@@ -1102,21 +1102,38 @@ def get_managed_settings_dir() -> Path:
         raise OSError(f"Unsupported operating system: {system}")
 
 
-def download_file(url: str, dest_path: Path) -> bool:
+def download_file(url: str, dest_path: Path, gateway_url: Optional[str] = None) -> bool:
+    # Fetch beside dest_path and swap in whole: a hook firing mid-download, or a
+    # dropped connection, must never leave the live file partly written.
+    tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
+            stale.unlink()
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", str(dest_path), url],
+            ["curl", "-fsSL", "-o", str(tmp_path), url],
             capture_output=True,
             timeout=30
         )
-        if result.returncode == 0:
-            debug_print(f"File downloaded successfully: {dest_path}")
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if result.returncode != 0:
+            return False
+        if gateway_url:
+            rewrite_gateway_url_in_file(tmp_path, gateway_url)
+        if dest_path.exists():
+            shutil.copymode(dest_path, tmp_path)
+        os.replace(tmp_path, dest_path)
+        debug_print(f"File downloaded successfully: {dest_path}")
+        return True
+    except (subprocess.TimeoutExpired, OSError) as e:
         print(f"Failed to download {url}: {e}")
         return False
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
@@ -1165,11 +1182,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         debug_print(f"Created managed settings directory: {managed_dir}")
 
         # Download unbound.py script
-        if not download_file(SCRIPT_URL, script_path):
+        if not download_file(SCRIPT_URL, script_path, gateway_url):
             print("Failed to download unbound.py")
             return False
         debug_print(f"Downloaded hook script: {script_path}")
-        rewrite_gateway_url_in_file(script_path, gateway_url)
 
         # Make script executable on Unix systems
         if system in ["darwin", "linux"]:
