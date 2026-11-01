@@ -943,7 +943,7 @@ def download_file(url: str, dest_path: Path, gateway_url: Optional[str] = None) 
         os.replace(tmp_path, dest_path)
         debug_print(f"File downloaded successfully: {dest_path}")
         return True
-    except (subprocess.TimeoutExpired, OSError) as e:
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
         print(f"Failed to download {url}: {e}")
         return False
     finally:
@@ -958,13 +958,11 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
     """Replace the hardcoded default gateway URL inside a downloaded unbound.py."""
     if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
         return
-    try:
-        text = path.read_text(encoding="utf-8")
-        new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
-        if new_text != text:
-            path.write_text(new_text, encoding="utf-8")
-    except Exception as e:
-        debug_print(f"Could not rewrite gateway URL in {path}: {e}")
+    # Raises on failure: download_file must never swap in a half-rewritten hook.
+    text = path.read_text(encoding="utf-8")
+    new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+    if new_text != text:
+        path.write_text(new_text, encoding="utf-8")
 
 
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:

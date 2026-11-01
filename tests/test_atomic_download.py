@@ -73,3 +73,18 @@ def test_successful_download_swaps_in_whole_and_keeps_mode(installer, live_hook,
     assert live_hook.read_bytes() == expected
     assert live_hook.stat().st_mode & 0o777 == 0o755
     assert sorted(p.name for p in live_hook.parent.iterdir()) == ["unbound.py"]
+
+
+@pytest.mark.parametrize("installer", [i for i in INSTALLERS if i != "copilot/hooks/mdm/setup.py"])
+def test_failed_gateway_rewrite_keeps_the_live_hook(installer, live_hook, monkeypatch):
+    mod = load_module(installer)
+    monkeypatch.setattr(mod.subprocess, "run", _fake_curl(f'GATEWAY = "{mod.DEFAULT_GATEWAY_URL}"\n'.encode(), 0))
+
+    def disk_full(self, data, *_args, **_kwargs):
+        Path.write_bytes(self, data.encode()[:5])
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(Path, "write_text", disk_full)
+
+    assert mod.download_file("https://example.invalid/unbound.py", live_hook, "https://gw.acme.internal") is False
+    assert live_hook.read_bytes() == OLD
+    assert sorted(p.name for p in live_hook.parent.iterdir()) == ["unbound.py"]
