@@ -37,7 +37,9 @@ def live_hook(tmp_path):
     hook.parent.mkdir()
     hook.write_bytes(OLD)
     os.chmod(hook, 0o755)
-    (hook.parent / "unbound.py.999.tmp").write_bytes(b"left by a killed run")
+    stale = hook.parent / "unbound.py.999.tmp"
+    stale.write_bytes(b"left by a killed run")
+    os.utime(stale, (0, 0))
     return hook
 
 
@@ -88,3 +90,26 @@ def test_failed_gateway_rewrite_keeps_the_live_hook(installer, live_hook, monkey
     assert mod.download_file("https://example.invalid/unbound.py", live_hook, "https://gw.acme.internal") is False
     assert live_hook.read_bytes() == OLD
     assert sorted(p.name for p in live_hook.parent.iterdir()) == ["unbound.py"]
+
+
+@pytest.mark.parametrize("installer", INSTALLERS)
+def test_a_concurrent_runs_fresh_temp_is_left_alone(installer, live_hook, monkeypatch):
+    mod = load_module(installer)
+    in_flight = live_hook.parent / "unbound.py.4242.tmp"
+    in_flight.write_bytes(b"another installer, mid-download")
+    monkeypatch.setattr(mod.subprocess, "run", _fake_curl(b"x = 1\n", 0))
+
+    assert mod.download_file("https://example.invalid/unbound.py", live_hook) is True
+    assert in_flight.read_bytes() == b"another installer, mid-download"
+
+
+@pytest.mark.parametrize("installer", [i for i in INSTALLERS if i != "copilot/hooks/mdm/setup.py"])
+def test_a_gateway_url_cannot_break_out_of_its_string(installer, live_hook, monkeypatch):
+    mod = load_module(installer)
+    monkeypatch.setattr(mod.subprocess, "run", _fake_curl(f'GATEWAY = "{mod.DEFAULT_GATEWAY_URL}"\n'.encode(), 0))
+    hostile = 'https://gw.example"; import os; os.system("id"); x = "'
+
+    assert mod.download_file("https://example.invalid/unbound.py", live_hook, hostile) is True
+    scope = {}
+    exec(compile(live_hook.read_text(), str(live_hook), "exec"), scope)
+    assert scope == {"__builtins__": scope["__builtins__"], "GATEWAY": hostile}

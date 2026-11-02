@@ -697,8 +697,14 @@ def download_file(url: str, dest_path: Path) -> bool:
     tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Only temps a killed run left behind: a live download is never older than
+        # curl's 30s timeout, and must not lose its file to a concurrent run.
         for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
-            stale.unlink()
+            try:
+                if time.time() - stale.stat().st_mtime > 300:
+                    stale.unlink()
+            except FileNotFoundError:
+                pass
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
             ["curl", "-fsSL", "-o", str(tmp_path), url],
@@ -726,7 +732,7 @@ def download_file(url: str, dest_path: Path) -> bool:
 def _apply_gateway_url(text: str, gateway_url: str) -> str:
     if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
         return text
-    return text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+    return text.replace(f'"{DEFAULT_GATEWAY_URL}"', json.dumps(gateway_url))
 
 
 def _fetch_hook_script(gateway_url: str) -> Optional[str]:

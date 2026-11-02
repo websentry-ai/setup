@@ -297,8 +297,14 @@ def download_file(url: str, dest_path: Path, gateway_url: Optional[str] = None) 
     tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Only temps a killed run left behind: a live download is never older than
+        # curl's 30s timeout, and must not lose its file to a concurrent run.
         for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
-            stale.unlink()
+            try:
+                if time.time() - stale.stat().st_mtime > 300:
+                    stale.unlink()
+            except FileNotFoundError:
+                pass
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
             ["curl", "-fsSL", "-o", str(tmp_path), url],
@@ -361,7 +367,7 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         return
     # Raises on failure: download_file must never swap in a half-rewritten hook.
     text = path.read_text(encoding="utf-8")
-    new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+    new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', json.dumps(gateway_url))
     if new_text != text:
         path.write_text(new_text, encoding="utf-8")
 
