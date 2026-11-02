@@ -312,18 +312,18 @@ const WINDOWS_TUNNEL = new RegExp(
   "vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|" +
   "pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \\((ikev2|l2tp|sstp|pptp)\\)|" +
   "cloudflare warp|nordlynx|check point|sonicwall", "i");
-const WINDOWS_VM = /vethernet \((wsl|default switch)|host-only|vmnet|docker/i;
+const WINDOWS_VM = /vethernet \((wsl|default switch|nat|internal)|host-only|vmnet|docker/i;
 const WINDOWS_POINT_TO_POINT = /wan miniport|teredo|isatap|ip-https/i;
 /** The route to one address, its next hop, interface alias and description, and the source address, tab-separated. */
 const WINDOWS_ROUTE = (address: string): string =>
   `$s = @(Find-NetRoute -RemoteIPAddress '${address}' -ErrorAction Stop); $r = $s[-1]; ` +
   "$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; " +
   "($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9";
-/** Set where the agent runs on a server, in a container, a cloud workspace or CI: a route there describes that
+/** Set where the agent runs on a server, in a container, WSL, a cloud workspace or CI: a route there describes that
  *  machine's network, not the person's. */
 const REMOTE_ENV: readonly string[] = [
   "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "CODESPACES", "GITPOD_WORKSPACE_ID", "CODER", "CLOUD_SHELL",
-  "REMOTE_CONTAINERS", "KUBERNETES_SERVICE_HOST", "CI", "CLAUDE_CODE_REMOTE",
+  "REMOTE_CONTAINERS", "KUBERNETES_SERVICE_HOST", "CI", "CLAUDE_CODE_REMOTE", "WSL_DISTRO_NAME",
 ];
 const CONTAINER_FILES: readonly string[] = ["/.dockerenv", "/run/.containerenv"];
 

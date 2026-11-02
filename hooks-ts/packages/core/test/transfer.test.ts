@@ -1091,6 +1091,7 @@ test("macOS, Linux and Windows routes are read as vpn, local, routed or machine"
     // As a Windows VM in the cloud reports its own network card.
     ["win32", "0.0.0.0\tEthernet\tMicrosoft Hyper-V Network Adapter\t10.20.30.7\r\n", "local"],
     ["win32", "10.0.0.1\tEthernet\tMicrosoft Hyper-V Network Adapter\t10.0.0.7\r\n", "routed"],
+    ["win32", "0.0.0.0\tvEthernet (nat)\tHyper-V Virtual Ethernet Adapter #2\t172.20.0.1\r\n", "machine"],
     // A Hyper-V external switch carries the laptop's own Wi-Fi.
     ["win32", "192.168.1.1\tvEthernet (External Switch)\tHyper-V Virtual Ethernet Adapter\t192.168.1.5\r\n", "routed"],
     ["win32", "0.0.0.0\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t10.20.30.40\r\n", "machine"],
@@ -1135,7 +1136,7 @@ test("only a private or CGNAT address that surely ran is routed, once per turn",
 test("nothing is routed on a server, in a container or in CI", async () => {
   const out = macRoute("en0", "");
   for (const name of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "CODESPACES", "GITPOD_WORKSPACE_ID", "CODER",
-    "CLOUD_SHELL", "REMOTE_CONTAINERS", "KUBERNETES_SERVICE_HOST", "CI", "CLAUDE_CODE_REMOTE"]) {
+    "CLOUD_SHELL", "REMOTE_CONTAINERS", "KUBERNETES_SERVICE_HOST", "CI", "CLAUDE_CODE_REMOTE", "WSL_DISTRO_NAME"]) {
     const found = await transfer("curl -T f http://10.20.30.40/up", "/",
       { execFile: fakeRoute(out), platform: "darwin", containerFiles: [], env: { [name]: "1" } });
     assert.equal(found?.endpoints[0]?.route, undefined, name);

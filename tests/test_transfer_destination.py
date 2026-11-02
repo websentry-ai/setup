@@ -31,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '024ed7607d974b6b26ca3f8c3462c06c9508c9cd635d27293599ecbbf7c7e573'
+BLOCK_SHA256 = '59639fe4d6c257d8d7648b0a15e126ca9739be8be0e24ecfc41b7701f8e47eb0'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -716,6 +716,8 @@ class RouteTests(TransferTestCase):
              'local'),
             (dict(hop='10.0.0.1', alias='Ethernet', description='Microsoft Hyper-V Network Adapter', source='10.0.0.7'),
              'routed'),
+            (dict(hop='0.0.0.0', alias='vEthernet (nat)', description='Hyper-V Virtual Ethernet Adapter #2',
+                  source='172.20.0.1'), 'machine'),
             # A Hyper-V external switch carries the laptop's own Wi-Fi.
             (dict(hop='192.168.1.1', alias='vEthernet (External Switch)', description='Hyper-V Virtual Ethernet Adapter',
                   source='192.168.1.5'), 'routed'),

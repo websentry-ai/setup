@@ -4129,7 +4129,7 @@ _TRANSFER_WINDOWS_TUNNEL = re.compile(
     r'vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|'
     r'pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \((ikev2|l2tp|sstp|pptp)\)|'
     r'cloudflare warp|nordlynx|check point|sonicwall', re.IGNORECASE)
-_TRANSFER_WINDOWS_VM = re.compile(r'vethernet \((wsl|default switch)|host-only|vmnet|docker', re.IGNORECASE)
+_TRANSFER_WINDOWS_VM = re.compile(r'vethernet \((wsl|default switch|nat|internal)|host-only|vmnet|docker', re.IGNORECASE)
 _TRANSFER_WINDOWS_POINT_TO_POINT = re.compile(r'wan miniport|teredo|isatap|ip-https', re.IGNORECASE)
 _TRANSFER_WINDOWS_POWERSHELL = ('System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 # The route to one address, its next hop, interface alias and description, and the source address, tab-separated.
@@ -4137,10 +4137,11 @@ _TRANSFER_WINDOWS_ROUTE = (
     "$s = @(Find-NetRoute -RemoteIPAddress '{}' -ErrorAction Stop); $r = $s[-1]; "
     '$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; '
     '($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9')
-# Set where the agent runs on a server, in a container, a cloud workspace or CI: a route there describes that
+# Set where the agent runs on a server, in a container, WSL, a cloud workspace or CI: a route there describes that
 # machine's network, not the person's.
 _TRANSFER_REMOTE_ENV = ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY', 'CODESPACES', 'GITPOD_WORKSPACE_ID', 'CODER',
-                        'CLOUD_SHELL', 'REMOTE_CONTAINERS', 'KUBERNETES_SERVICE_HOST', 'CI', 'CLAUDE_CODE_REMOTE')
+                        'CLOUD_SHELL', 'REMOTE_CONTAINERS', 'KUBERNETES_SERVICE_HOST', 'CI', 'CLAUDE_CODE_REMOTE',
+                        'WSL_DISTRO_NAME')
 _TRANSFER_CONTAINER_FILES = ('/.dockerenv', '/run/.containerenv')
 
 

@@ -2179,7 +2179,7 @@ var WINDOWS_TUNNEL = new RegExp(
   "vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \\((ikev2|l2tp|sstp|pptp)\\)|cloudflare warp|nordlynx|check point|sonicwall",
   "i"
 );
-var WINDOWS_VM = /vethernet \((wsl|default switch)|host-only|vmnet|docker/i;
+var WINDOWS_VM = /vethernet \((wsl|default switch|nat|internal)|host-only|vmnet|docker/i;
 var WINDOWS_POINT_TO_POINT = /wan miniport|teredo|isatap|ip-https/i;
 var WINDOWS_ROUTE = (address) => `$s = @(Find-NetRoute -RemoteIPAddress '${address}' -ErrorAction Stop); $r = $s[-1]; $a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; ($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9`;
 var REMOTE_ENV = [
@@ -2193,7 +2193,8 @@ var REMOTE_ENV = [
   "REMOTE_CONTAINERS",
   "KUBERNETES_SERVICE_HOST",
   "CI",
-  "CLAUDE_CODE_REMOTE"
+  "CLAUDE_CODE_REMOTE",
+  "WSL_DISTRO_NAME"
 ];
 var CONTAINER_FILES = ["/.dockerenv", "/run/.containerenv"];
 var ADDRESS_KINDS = [
