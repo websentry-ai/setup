@@ -32,7 +32,9 @@ _CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Pat
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
+# Claude Code's shells: Bash everywhere, and its PowerShell tool, on by default on Windows.
+SHELL_TOOL_NAMES = ('Bash', 'PowerShell')
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'PowerShell', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
 MCP_TOOL_PREFIX = 'mcp__'
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
@@ -999,8 +1001,8 @@ def extract_command_for_pretool(event: Dict) -> str:
     tool_input = event.get('tool_input') or {}
     tool_name = event.get('tool_name', '')
 
-    # Bash: command field
-    if tool_name == 'Bash' and 'command' in tool_input:
+    # Bash and the PowerShell tool: command field
+    if tool_name in SHELL_TOOL_NAMES and 'command' in tool_input:
         return tool_input['command']
     # MCP tools: stringify the input
     if tool_name.startswith(MCP_TOOL_PREFIX):
@@ -4693,7 +4695,7 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
         path = tool_input.get('file_path') or tool_input.get('path')
         if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
-    elif tool_name == 'Bash':
+    elif tool_name in SHELL_TOOL_NAMES:
         command = tool_input.get('command')
         if isinstance(command, str):
             candidates.extend(
@@ -4733,7 +4735,7 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
 
 # Write tools, git write subcommands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated.
 _REPO_GATE_WRITE_TOOLS = frozenset(_WRITE_TOOLS)
-_REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
+_REPO_GATE_SHELL_TOOLS = frozenset(SHELL_TOOL_NAMES)
 _REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
 REPO_GATE_BLOCK_CONTEXT = (
     'This action was blocked by an organization repository-scope policy. Do not '
@@ -8884,7 +8886,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse' or (hook_event_name == 'PostToolUseFailure' and
-                                                  event.get('tool_name') == 'Bash'):
+                                                  event.get('tool_name') in SHELL_TOOL_NAMES):
             # Claude reports a command that exits non-zero as PostToolUseFailure; it still ran, so it is read the same.
             failed = hook_event_name == 'PostToolUseFailure'
             tool_name = event.get('tool_name')
@@ -8909,8 +8911,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'tool_use_id': resolve_tool_use_id(event),
                 'project': tool_project
             }, log_entry.get('timestamp'))
-            if tool_name == 'Bash' and isinstance(tool_input, dict):
-                transfer = _transfer(tool_input.get('command'), transfer_dir, transfer_state)
+            if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
+                command = tool_input.get('command')
+                # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
+                transfer = _transfer(_transfer_hashtables_emptied(command) if tool_name == 'PowerShell' and
+                                     isinstance(command, str) else command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
                     transfer_dir = None if failed else _transfer_next_cwd(tool_input.get('command'), transfer_dir)
