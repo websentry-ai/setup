@@ -113,3 +113,18 @@ def test_a_gateway_url_cannot_break_out_of_its_string(installer, live_hook, monk
     scope = {}
     exec(compile(live_hook.read_text(), str(live_hook), "exec"), scope)
     assert scope == {"__builtins__": scope["__builtins__"], "GATEWAY": hostile}
+
+
+def test_copilot_mdm_per_user_write_keeps_the_live_hook_on_failure(live_hook, monkeypatch):
+    mod = load_module("copilot/hooks/mdm/setup.py")
+    real_replace = os.replace
+    monkeypatch.setattr(mod.os, "replace", lambda *_a: (_ for _ in ()).throw(OSError(28, "No space left")))
+    with pytest.raises(OSError):
+        mod._write_file(live_hook, "except (Va", 0o755)
+    assert live_hook.read_bytes() == OLD
+    assert not list(live_hook.parent.glob(f"unbound.py.{os.getpid()}.tmp"))
+
+    monkeypatch.setattr(mod.os, "replace", real_replace)
+    mod._write_file(live_hook, "x = 1\n", 0o755)
+    assert live_hook.read_text() == "x = 1\n"
+    assert live_hook.stat().st_mode & 0o777 == 0o755

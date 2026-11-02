@@ -750,17 +750,31 @@ def _fetch_hook_script(gateway_url: str) -> Optional[str]:
 
 
 def _write_file(path: Path, data: str, mode: int) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
-    fd = os.open(str(path), flags, mode)
+    # Write beside path and swap in whole, so a hook firing mid-write never runs a partial script.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        f = os.fdopen(fd, 'w', encoding='utf-8')
-    except Exception:
-        os.close(fd)
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(tmp), flags, mode)
+    try:
+        try:
+            f = os.fdopen(fd, 'w', encoding='utf-8')
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
+            if os.name == "posix":
+                os.fchmod(f.fileno(), mode)
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         raise
-    with f:
-        if os.name == "posix":
-            os.fchmod(f.fileno(), mode)
-        f.write(data)
 
 
 def _copilot_hooks_config(script_path: Path) -> Dict:
