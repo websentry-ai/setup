@@ -1069,6 +1069,10 @@ test("macOS, Linux and Windows routes are read as vpn, local, routed or machine"
     ["darwin", macRoute("bridge100", ""), "machine"],
     ["darwin", macRoute("utun0", "HOST,LOCAL,"), "machine"],
     ["darwin", macRoute("", "GATEWAY,"), undefined],
+    ["darwin", macRoute("ppp0", ""), undefined], // an L2TP VPN or a dial-up uplink
+    ["linux", "10.20.30.40 dev wireguard0 src 10.66.0.2 uid 1000", "vpn"],
+    ["linux", "10.20.30.40 dev ppp0 src 100.70.1.2 uid 1000", undefined],
+    ["linux", "10.20.30.40 dev tap0 src 10.20.0.1 uid 1000", undefined],
     ["linux", "10.20.30.40 dev tailscale0 table 52 src 100.101.1.2 uid 1000 \\    cache", "vpn"],
     ["linux", "10.20.30.40 via 10.8.0.1 dev tun0 src 10.8.0.6 uid 1000 \\    cache", "vpn"],
     ["linux", "10.20.30.40 dev wlp2s0 src 10.20.30.5 uid 1000 \\    cache", "local"],
@@ -1082,6 +1086,13 @@ test("macOS, Linux and Windows routes are read as vpn, local, routed or machine"
     ["win32", "0.0.0.0\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t10.20.30.5\r\n", "local"],
     ["win32", "192.168.1.1\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t192.168.1.5\r\n", "routed"],
     ["win32", "0.0.0.0\tvEthernet (WSL)\tHyper-V Virtual Ethernet Adapter\t10.20.0.1\r\n", "machine"],
+    ["win32", "0.0.0.0\tLocal Area Connection* 2\tWAN Miniport (IKEv2)\t10.20.1.9\r\n", "vpn"],
+    ["win32", "0.0.0.0\tLocal Area Connection* 5\tWAN Miniport (PPPOE)\t100.70.1.2\r\n", undefined],
+    // As a Windows VM in the cloud reports its own network card.
+    ["win32", "0.0.0.0\tEthernet\tMicrosoft Hyper-V Network Adapter\t10.20.30.7\r\n", "local"],
+    ["win32", "10.0.0.1\tEthernet\tMicrosoft Hyper-V Network Adapter\t10.0.0.7\r\n", "routed"],
+    // A Hyper-V external switch carries the laptop's own Wi-Fi.
+    ["win32", "192.168.1.1\tvEthernet (External Switch)\tHyper-V Virtual Ethernet Adapter\t192.168.1.5\r\n", "routed"],
     ["win32", "0.0.0.0\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t10.20.30.40\r\n", "machine"],
     ["win32", "\r\n", undefined],
   ];
@@ -1097,7 +1108,7 @@ test("each platform runs its own lookup on the address only", () => {
   assert.deepEqual(routeArgv("fd12:3456:789a::1", "linux"), ["ip", "-o", "route", "get", "fd12:3456:789a::1"]);
   const windows = routeArgv("10.20.30.40", "win32");
   assert.deepEqual(windows.slice(0, 4), ["powershell", "-NoProfile", "-NonInteractive", "-Command"]);
-  assert.ok(windows[4]?.includes("-RemoteIPAddress 10.20.30.40 "));
+  assert.ok(windows[4]?.includes("-RemoteIPAddress '10.20.30.40' "));
   assert.ok(!windows[4]?.includes('"')); // nothing for Windows' command-line quoting to undo
 });
 
@@ -1145,7 +1156,23 @@ test("an IPv6 scope never reaches the lookup, and PowerShell starts from its sys
     lookup: async (host) => (host === "scoped.example" ? ["fd12:3456:789a::1%x;calc"] : []),
   });
   const [run] = calls;
-  assert.equal(run?.[0], join("C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
-  assert.ok(run?.at(-1)?.includes("-RemoteIPAddress fd12:3456:789a::1 "), JSON.stringify(run));
+  assert.equal(run?.[0], "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  assert.ok(run?.at(-1)?.includes("-RemoteIPAddress 'fd12:3456:789a::1' "), JSON.stringify(run));
   assert.ok(!run?.at(-1)?.includes("calc"));
+});
+
+test("route lookups leave the hosts their share of the turn", async () => {
+  const calls: string[][] = [];
+  let reads = 0;
+  // The turn starts at 0, and 6 of its 10 seconds are gone by the lookup.
+  const found = await transfer("curl -T f http://10.20.30.40/up", "/", {
+    execFile: fakeRoute(macRoute("en0", ""), calls), platform: "darwin", containerFiles: [], now: () => (reads++ === 0 ? 0 : 6_000),
+  });
+  assert.equal(found?.endpoints[0]?.route, undefined);
+  assert.deepEqual(calls, []);
+  // A shorter budget still routes within its first half.
+  const short = await transfer("curl -T f http://10.20.30.40/up", "/", {
+    execFile: fakeRoute(macRoute("en0", ""), calls), platform: "darwin", containerFiles: [], budgetMs: 3_000, now: () => 0,
+  });
+  assert.equal(short?.endpoints[0]?.route, "local");
 });

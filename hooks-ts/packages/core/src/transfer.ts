@@ -11,7 +11,7 @@ import { BlockList, isIP } from "node:net";
 import { homedir, tmpdir, userInfo } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, normalize, sep } from "node:path";
 
-import { defaultExecFile, type ExecFileLike } from "./accountIdentity.ts";
+import { defaultExecFile, probeToolPath, type ExecFileLike } from "./accountIdentity.ts";
 
 export type AddressKind = "private" | "public" | "loopback" | "link_local" | "cgnat" | "unresolved";
 /** How this machine reaches a private address: through a tunnel, on its own network, through a gateway, or itself or a
@@ -300,19 +300,23 @@ const PS_ALIASES: Record<string, string> = {
   iv: "informationvariable", ov: "outvariable", ob: "outbuffer", pv: "pipelinevariable", cm: "custommethod",
   sv: "sessionvariable", rhv: "responseheadersvariable",
 };
-/** Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, and a bridge to a VM or container stays on this
- *  machine. macOS's bridge0 is a Thunderbolt link to another computer; its VM bridges start at bridge100. */
-const TUNNEL = /^(utun|ipsec|ppp|tun|tap|wg|tailscale|zt|cscotun|gpd|vti|nordlynx)/;
+/** Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, a bridge to a VM or container stays on this
+ *  machine, and a point-to-point link may be either a VPN or the internet uplink, so it gets no route. macOS's bridge0
+ *  is a Thunderbolt link to another computer; its VM bridges start at bridge100. */
+const TUNNEL = /^(utun|ipsec|tun|wg|wireguard|tailscale|zt|cscotun|gpd|vti|nordlynx)/;
 const VM_BRIDGE = /^(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)/;
-/** The same for a Windows adapter's alias and description. */
+const POINT_TO_POINT = /^(ppp|tap)/;
+/** The same for a Windows adapter's alias and description. A guest VM's own network card is a Hyper-V adapter too, so
+ *  only adapters that stay on this machine count as one. */
 const WINDOWS_TUNNEL = new RegExp(
-  "vpn|tunnel|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|" +
-  "pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport|cloudflare warp|nordlynx|check point|" +
-  "sonicwall", "i");
-const WINDOWS_VM = /hyper-v|vethernet|virtualbox|vmware|docker|wsl/i;
+  "vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|" +
+  "pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \\((ikev2|l2tp|sstp|pptp)\\)|" +
+  "cloudflare warp|nordlynx|check point|sonicwall", "i");
+const WINDOWS_VM = /vethernet \((wsl|default switch)|host-only|vmnet|docker/i;
+const WINDOWS_POINT_TO_POINT = /wan miniport|teredo|isatap|ip-https/i;
 /** The route to one address, its next hop, interface alias and description, and the source address, tab-separated. */
 const WINDOWS_ROUTE = (address: string): string =>
-  `$s = @(Find-NetRoute -RemoteIPAddress ${address} -ErrorAction Stop); $r = $s[-1]; ` +
+  `$s = @(Find-NetRoute -RemoteIPAddress '${address}' -ErrorAction Stop); $r = $s[-1]; ` +
   "$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; " +
   "($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9";
 /** Set where the agent runs on a server, in a container, a cloud workspace or CI: a route there describes that
@@ -354,6 +358,7 @@ interface State {
   env: Record<string, string | undefined>;
   now: () => number;
   deadline: number;
+  budgetMs: number;
   home: string;
   sshHosts: Map<string, [string, boolean]>;
   addresses: Map<string, readonly string[]>;
@@ -375,13 +380,14 @@ type Raw = [
   proxied?: boolean | "rerouted",
 ];
 
-/** Run one allowlisted lookup within its timeout and the turn's budget; undefined when refused, slow or failing. ssh -G
- *  is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked. */
-async function run(argv: string[], state: State): Promise<string | undefined> {
+/** Run one allowlisted lookup within its timeout and the turn's budget, less keepMs; undefined when refused, slow or
+ *  failing. ssh -G is checked here, and reads only the vetted copy of its configs made here, so no call reaches it
+ *  unchecked. */
+async function run(argv: string[], state: State, keepMs = 0): Promise<string | undefined> {
   let folder: string | undefined;
   try {
     if (!ALLOWED_RUNS.some((p) => p.every((part, i) => argv[i] === part))) return undefined;
-    const remaining = state.deadline - state.now();
+    const remaining = state.deadline - state.now() - keepMs;
     if (remaining <= 0) return undefined;
     let [file, ...args] = argv;
     if (file === undefined) return undefined;
@@ -393,9 +399,7 @@ async function run(argv: string[], state: State): Promise<string | undefined> {
       args = ["-G", ...options, ...argv.slice(end)];
     }
     // Windows looks in the working folder before PATH, so PowerShell starts from its fixed system folder.
-    if (file === "powershell" && state.platform === "win32") {
-      file = join(state.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    }
+    if (file === "powershell" && state.platform === "win32") file = probeToolPath("powershell", state.env);
     return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
   } catch {
     return undefined;
@@ -4075,6 +4079,7 @@ export function routeKind(out: string, address: string, platform: string): Route
     const names = `${alias} ${description}`;
     if (sameAddress(source, address) || WINDOWS_VM.test(names)) return "machine";
     if (WINDOWS_TUNNEL.test(names)) return "vpn";
+    if (WINDOWS_POINT_TO_POINT.test(names)) return undefined;
     return hop === "0.0.0.0" || hop === "::" ? "local" : "routed";
   }
   if (platform === "darwin") {
@@ -4093,6 +4098,7 @@ export function routeKind(out: string, address: string, platform: string): Route
   if (iface === "") return undefined;
   if (own || VM_BRIDGE.test(iface)) return "machine";
   if (TUNNEL.test(iface)) return "vpn";
+  if (POINT_TO_POINT.test(iface)) return undefined;
   return gateway ? "routed" : "local";
 }
 
@@ -4106,7 +4112,8 @@ async function route(found: readonly string[], state: State): Promise<Route | un
   const address = ipv4Mapped((found[0] as string).split("%")[0] as string);
   if (isIP(address) === 0) return undefined;
   if (!state.routes.has(address)) {
-    const out = await run(routeArgv(address, state.platform), state);
+    // Route lookups use at most half the turn's budget, leaving the rest to the hosts' own lookups.
+    const out = await run(routeArgv(address, state.platform), state, state.budgetMs / 2);
     state.routes.set(address, out === undefined ? undefined : routeKind(out, address, state.platform));
   }
   return state.routes.get(address);
@@ -4206,6 +4213,7 @@ export async function resolveTransfers(
       env: opts.env ?? process.env,
       now,
       deadline: now() + (opts.budgetMs ?? TURN_BUDGET_MS),
+      budgetMs: opts.budgetMs ?? TURN_BUDGET_MS,
       home: opts.home ?? accountHome(),
       sshHosts: new Map(),
       addresses: new Map(),

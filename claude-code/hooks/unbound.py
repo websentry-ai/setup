@@ -5493,19 +5493,24 @@ _TRANSFER_ADDRESS_KINDS = (
     ('link_local', ('169.254.0.0/16', 'fe80::/10')),
     ('cgnat', ('100.64.0.0/10',)),
 )
-# Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, and a bridge to a VM or container stays on this
-# machine. macOS's bridge0 is a Thunderbolt link to another computer; its VM bridges start at bridge100.
-_TRANSFER_TUNNEL = re.compile(r'(utun|ipsec|ppp|tun|tap|wg|tailscale|zt|cscotun|gpd|vti|nordlynx)')
+# Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, a bridge to a VM or container stays on this machine,
+# and a point-to-point link may be either a VPN or the internet uplink, so it gets no route. macOS's bridge0 is a
+# Thunderbolt link to another computer; its VM bridges start at bridge100.
+_TRANSFER_TUNNEL = re.compile(r'(utun|ipsec|tun|wg|wireguard|tailscale|zt|cscotun|gpd|vti|nordlynx)')
 _TRANSFER_VM_BRIDGE = re.compile(r'(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)')
-# The same for a Windows adapter's alias and description.
+_TRANSFER_POINT_TO_POINT = re.compile(r'(ppp|tap)')
+# The same for a Windows adapter's alias and description. A guest VM's own network card is a Hyper-V adapter too, so
+# only adapters that stay on this machine count as one.
 _TRANSFER_WINDOWS_TUNNEL = re.compile(
-    r'vpn|tunnel|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|'
-    r'pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport|cloudflare warp|nordlynx|check point|'
-    r'sonicwall', re.IGNORECASE)
-_TRANSFER_WINDOWS_VM = re.compile(r'hyper-v|vethernet|virtualbox|vmware|docker|wsl', re.IGNORECASE)
+    r'vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|'
+    r'pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \((ikev2|l2tp|sstp|pptp)\)|'
+    r'cloudflare warp|nordlynx|check point|sonicwall', re.IGNORECASE)
+_TRANSFER_WINDOWS_VM = re.compile(r'vethernet \((wsl|default switch)|host-only|vmnet|docker', re.IGNORECASE)
+_TRANSFER_WINDOWS_POINT_TO_POINT = re.compile(r'wan miniport|teredo|isatap|ip-https', re.IGNORECASE)
+_TRANSFER_WINDOWS_POWERSHELL = ('System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
 # The route to one address, its next hop, interface alias and description, and the source address, tab-separated.
 _TRANSFER_WINDOWS_ROUTE = (
-    '$s = @(Find-NetRoute -RemoteIPAddress {} -ErrorAction Stop); $r = $s[-1]; '
+    "$s = @(Find-NetRoute -RemoteIPAddress '{}' -ErrorAction Stop); $r = $s[-1]; "
     '$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; '
     '($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9')
 # Set where the agent runs on a server, in a container, a cloud workspace or CI: a route there describes that
@@ -5530,16 +5535,17 @@ def _transfer_executable(name: str) -> Optional[str]:
     return None
 
 
-def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[str]:
-    """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing. ssh -G
-    is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked."""
+def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict, keep: float = 0) -> Optional[str]:
+    """Run one allowlisted lookup within its timeout and the turn's budget, less keep seconds; None when refused, slow
+    or failing. ssh -G is checked here, and reads only the vetted copy of its configs made here, so no call reaches it
+    unchecked."""
     import shutil
     import tempfile
     folder = None
     try:
         if not any(tuple(argv[:len(p)]) == p for p in _TRANSFER_ALLOWED_RUNS):
             return None
-        remaining = _transfer_deadline(state) - time.monotonic()
+        remaining = _transfer_deadline(state) - time.monotonic() - keep
         if remaining <= 0:
             return None
         if argv[:2] == ['ssh', '-G']:
@@ -5548,7 +5554,9 @@ def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[
             if options is None:
                 return None
             argv = argv[:2] + options + argv[end:]
-        program = _transfer_executable(argv[0])
+        # Windows would run a powershell.exe planted in a PATH folder ahead of System32's.
+        program = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', *_TRANSFER_WINDOWS_POWERSHELL) \
+            if argv[0] == 'powershell' and os.name == 'nt' else _transfer_executable(argv[0])
         if program is None:
             return None
         result = subprocess.run([program] + argv[1:], cwd=folder, capture_output=True,
@@ -8805,6 +8813,8 @@ def _transfer_route_kind(out: str, address, platform: str) -> str:
             return 'machine'
         if _TRANSFER_WINDOWS_TUNNEL.search(names):
             return 'vpn'
+        if _TRANSFER_WINDOWS_POINT_TO_POINT.search(names):
+            return ''
         return 'local' if hop in ('0.0.0.0', '::') else 'routed'
     if platform == 'darwin':
         fields = {key.strip(): value.strip() for key, _, value in (line.partition(':') for line in out.splitlines())}
@@ -8822,6 +8832,8 @@ def _transfer_route_kind(out: str, address, platform: str) -> str:
         return 'machine'
     if _TRANSFER_TUNNEL.match(interface):
         return 'vpn'
+    if _TRANSFER_POINT_TO_POINT.match(interface):
+        return ''
     return 'routed' if gateway else 'local'
 
 
@@ -8837,7 +8849,9 @@ def _transfer_route(addresses: list, state: Dict) -> str:
     key = ('route', str(address))
     if key not in state:
         platform = _transfer_platform()
-        out = _transfer_run(_transfer_route_argv(address, platform), None, state)
+        # Route lookups use at most half the turn's budget, leaving the rest to the hosts' own lookups.
+        out = _transfer_run(_transfer_route_argv(address, platform), None, state,
+                            state.get('budget', _TRANSFER_TURN_BUDGET) / 2)
         state[key] = _transfer_route_kind(out, address, platform) if out else ''
     return state[key]
 

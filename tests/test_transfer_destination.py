@@ -31,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '4ce8858207329363762912d52eb260ce9e7ede0d16f9ec45f67614a3f09e3c23'
+BLOCK_SHA256 = '024ed7607d974b6b26ca3f8c3462c06c9508c9cd635d27293599ecbbf7c7e573'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -667,6 +667,7 @@ class RouteTests(TransferTestCase):
             (dict(interface='bridge0', flags=''), 'local'),  # a Thunderbolt link to another computer
             (dict(interface='bridge100', flags=''), 'machine'),
             (dict(interface='utun0', flags='HOST,LOCAL,'), 'machine'),
+            (dict(interface='ppp0', flags=''), ''),  # an L2TP VPN or a dial-up uplink
             (dict(interface='', flags='GATEWAY,'), ''),
         ]
         for fields, route in cases:
@@ -678,6 +679,9 @@ class RouteTests(TransferTestCase):
             ('10.20.30.40 dev tailscale0 table 52 src 100.101.1.2 uid 1000 \\    cache', 'vpn'),
             ('10.20.30.40 via 10.8.0.1 dev tun0 src 10.8.0.6 uid 1000 \\    cache', 'vpn'),
             ('10.20.30.40 dev wg0 src 10.66.0.2 uid 1000', 'vpn'),
+            ('10.20.30.40 dev wireguard0 src 10.66.0.2 uid 1000', 'vpn'),
+            ('10.20.30.40 dev ppp0 src 100.70.1.2 uid 1000', ''),
+            ('10.20.30.40 dev tap0 src 10.20.0.1 uid 1000', ''),
             ('10.20.30.40 dev wlp2s0 src 10.20.30.5 uid 1000 \\    cache', 'local'),
             ('10.20.30.40 via 192.168.1.1 dev eth0 src 192.168.1.5 uid 1000 \\    cache', 'routed'),
             ('10.20.30.40 dev docker0 src 10.20.0.1 uid 1000', 'machine'),
@@ -703,6 +707,18 @@ class RouteTests(TransferTestCase):
                   source='192.168.1.5'), 'routed'),
             (dict(hop='0.0.0.0', alias='vEthernet (WSL)', description='Hyper-V Virtual Ethernet Adapter',
                   source='10.20.0.1'), 'machine'),
+            (dict(hop='0.0.0.0', alias='Local Area Connection* 2', description='WAN Miniport (IKEv2)',
+                  source='10.20.1.9'), 'vpn'),
+            (dict(hop='0.0.0.0', alias='Local Area Connection* 5', description='WAN Miniport (PPPOE)',
+                  source='100.70.1.2'), ''),
+            # As a Windows VM in the cloud reports its own network card.
+            (dict(hop='0.0.0.0', alias='Ethernet', description='Microsoft Hyper-V Network Adapter', source='10.20.30.7'),
+             'local'),
+            (dict(hop='10.0.0.1', alias='Ethernet', description='Microsoft Hyper-V Network Adapter', source='10.0.0.7'),
+             'routed'),
+            # A Hyper-V external switch carries the laptop's own Wi-Fi.
+            (dict(hop='192.168.1.1', alias='vEthernet (External Switch)', description='Hyper-V Virtual Ethernet Adapter',
+                  source='192.168.1.5'), 'routed'),
             (dict(hop='0.0.0.0', alias='Wi-Fi', description='Intel(R) Wi-Fi 6 AX201 160MHz', source='10.20.30.40'),
              'machine'),
         ]
@@ -721,7 +737,7 @@ class RouteTests(TransferTestCase):
                 self.assertEqual(hook._transfer_route_argv(v6, 'linux'), ['ip', '-o', 'route', 'get', 'fd12:3456:789a::1'])
                 windows = hook._transfer_route_argv(v4, 'windows')
                 self.assertEqual(windows[:4], ['powershell', '-NoProfile', '-NonInteractive', '-Command'])
-                self.assertIn('-RemoteIPAddress 10.20.30.40 ', windows[4])
+                self.assertIn("-RemoteIPAddress '10.20.30.40' ", windows[4])
                 self.assertNotIn('"', windows[4])  # nothing for Windows' command-line quoting to undo
 
     def test_only_a_private_or_cgnat_address_that_surely_ran_is_routed(self):
@@ -766,8 +782,27 @@ class RouteTests(TransferTestCase):
                 Path(self.route_log).write_text('')
                 hook._transfer_route([scoped], {})
                 (script,) = [run[-1] for run in self.routes_run()]
-                self.assertIn('-RemoteIPAddress fd12:3456:789a::1 ', script)
+                self.assertIn("-RemoteIPAddress 'fd12:3456:789a::1' ", script)
                 self.assertNotIn('calc', script)
+
+    def test_route_lookups_leave_the_hosts_their_share_of_the_turn(self):
+        address = ipaddress.ip_address('10.20.30.40')
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'FAKE_ROUTE_OUT': 'x'}):
+                Path(self.route_log).write_text('')
+                hook._transfer_route([address], {'deadline': time.monotonic() + hook._TRANSFER_TURN_BUDGET / 2 - 0.5})
+                self.assertEqual(self.routes_run(), [])
+                # A hook that gives its lookups a shorter budget still routes within its first half.
+                hook._transfer_route([address], {'budget': 3.0})
+                self.assertEqual(len(self.routes_run()), 1)
+
+    def test_windows_runs_powershell_from_its_system_folder(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'SystemRoot': r'D:\Win'}), \
+                    patch.object(hook.os, 'name', 'nt'), patch.object(hook.subprocess, 'run') as run:
+                hook._transfer_run(hook._transfer_route_argv(ipaddress.ip_address('10.20.30.40'), 'windows'), None, {})
+                self.assertEqual(run.call_args.args[0][0],
+                                 os.path.join(r'D:\Win', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
 
     def test_an_address_is_routed_once_per_turn_and_a_failed_lookup_sends_nothing(self):
         for hook in HOOKS:

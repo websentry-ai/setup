@@ -2172,14 +2172,16 @@ var PS_ALIASES = {
   sv: "sessionvariable",
   rhv: "responseheadersvariable"
 };
-var TUNNEL = /^(utun|ipsec|ppp|tun|tap|wg|tailscale|zt|cscotun|gpd|vti|nordlynx)/;
+var TUNNEL = /^(utun|ipsec|tun|wg|wireguard|tailscale|zt|cscotun|gpd|vti|nordlynx)/;
 var VM_BRIDGE = /^(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)/;
+var POINT_TO_POINT = /^(ppp|tap)/;
 var WINDOWS_TUNNEL = new RegExp(
-  "vpn|tunnel|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport|cloudflare warp|nordlynx|check point|sonicwall",
+  "vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \\((ikev2|l2tp|sstp|pptp)\\)|cloudflare warp|nordlynx|check point|sonicwall",
   "i"
 );
-var WINDOWS_VM = /hyper-v|vethernet|virtualbox|vmware|docker|wsl/i;
-var WINDOWS_ROUTE = (address) => `$s = @(Find-NetRoute -RemoteIPAddress ${address} -ErrorAction Stop); $r = $s[-1]; $a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; ($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9`;
+var WINDOWS_VM = /vethernet \((wsl|default switch)|host-only|vmnet|docker/i;
+var WINDOWS_POINT_TO_POINT = /wan miniport|teredo|isatap|ip-https/i;
+var WINDOWS_ROUTE = (address) => `$s = @(Find-NetRoute -RemoteIPAddress '${address}' -ErrorAction Stop); $r = $s[-1]; $a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; ($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9`;
 var REMOTE_ENV = [
   "SSH_CONNECTION",
   "SSH_CLIENT",
@@ -2200,11 +2202,11 @@ var ADDRESS_KINDS = [
   ["link_local", ["169.254.0.0/16", "fe80::/10"]],
   ["cgnat", ["100.64.0.0/10"]]
 ];
-async function run(argv, state) {
+async function run(argv, state, keepMs = 0) {
   let folder;
   try {
     if (!ALLOWED_RUNS.some((p) => p.every((part, i) => argv[i] === part))) return void 0;
-    const remaining = state.deadline - state.now();
+    const remaining = state.deadline - state.now() - keepMs;
     if (remaining <= 0) return void 0;
     let [file, ...args] = argv;
     if (file === void 0) return void 0;
@@ -2215,9 +2217,7 @@ async function run(argv, state) {
       if (options === void 0) return void 0;
       args = ["-G", ...options, ...argv.slice(end2)];
     }
-    if (file === "powershell" && state.platform === "win32") {
-      file = join5(state.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-    }
+    if (file === "powershell" && state.platform === "win32") file = probeToolPath("powershell", state.env);
     return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
   } catch {
     return void 0;
@@ -5192,6 +5192,7 @@ function routeKind(out, address, platform2) {
     const names = `${alias} ${description}`;
     if (sameAddress(source, address) || WINDOWS_VM.test(names)) return "machine";
     if (WINDOWS_TUNNEL.test(names)) return "vpn";
+    if (WINDOWS_POINT_TO_POINT.test(names)) return void 0;
     return hop === "0.0.0.0" || hop === "::" ? "local" : "routed";
   }
   if (platform2 === "darwin") {
@@ -5210,6 +5211,7 @@ function routeKind(out, address, platform2) {
   if (iface === "") return void 0;
   if (own || VM_BRIDGE.test(iface)) return "machine";
   if (TUNNEL.test(iface)) return "vpn";
+  if (POINT_TO_POINT.test(iface)) return void 0;
   return gateway ? "routed" : "local";
 }
 async function route(found, state) {
@@ -5219,7 +5221,7 @@ async function route(found, state) {
   const address = ipv4Mapped(found[0].split("%")[0]);
   if (isIP(address) === 0) return void 0;
   if (!state.routes.has(address)) {
-    const out = await run(routeArgv(address, state.platform), state);
+    const out = await run(routeArgv(address, state.platform), state, state.budgetMs / 2);
     state.routes.set(address, out === void 0 ? void 0 : routeKind(out, address, state.platform));
   }
   return state.routes.get(address);
@@ -5287,6 +5289,7 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       env: opts.env ?? process.env,
       now,
       deadline: now() + (opts.budgetMs ?? TURN_BUDGET_MS),
+      budgetMs: opts.budgetMs ?? TURN_BUDGET_MS,
       home: opts.home ?? accountHome(),
       sshHosts: /* @__PURE__ */ new Map(),
       addresses: /* @__PURE__ */ new Map(),
