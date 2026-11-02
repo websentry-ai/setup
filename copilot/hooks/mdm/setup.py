@@ -692,26 +692,47 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
 
 
 def download_file(url: str, dest_path: Path) -> bool:
+    # Fetch beside dest_path and swap in whole: a hook firing mid-download, or a
+    # dropped connection, must never leave the live file partly written.
+    tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Only temps a killed run left behind: a live download is never older than
+        # curl's 30s timeout, and must not lose its file to a concurrent run.
+        for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
+            try:
+                if time.time() - stale.stat().st_mtime > 300:
+                    stale.unlink()
+            except FileNotFoundError:
+                pass
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", str(dest_path), url],
+            ["curl", "-fsSL", "-o", str(tmp_path), url],
             capture_output=True,
             timeout=30
         )
-        if result.returncode == 0:
-            debug_print(f"File downloaded successfully: {dest_path}")
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if result.returncode != 0:
+            return False
+        if dest_path.exists():
+            shutil.copymode(dest_path, tmp_path)
+        os.replace(tmp_path, dest_path)
+        debug_print(f"File downloaded successfully: {dest_path}")
+        return True
+    except (subprocess.TimeoutExpired, OSError) as e:
         print(f"Failed to download {url}: {e}")
         return False
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def _apply_gateway_url(text: str, gateway_url: str) -> str:
     if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
         return text
-    return text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+    return text.replace(f'"{DEFAULT_GATEWAY_URL}"', json.dumps(gateway_url))
 
 
 def _fetch_hook_script(gateway_url: str) -> Optional[str]:
@@ -729,17 +750,31 @@ def _fetch_hook_script(gateway_url: str) -> Optional[str]:
 
 
 def _write_file(path: Path, data: str, mode: int) -> None:
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
-    fd = os.open(str(path), flags, mode)
+    # Write beside path and swap in whole, so a hook firing mid-write never runs a partial script.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
-        f = os.fdopen(fd, 'w', encoding='utf-8')
-    except Exception:
-        os.close(fd)
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(tmp), flags, mode)
+    try:
+        try:
+            f = os.fdopen(fd, 'w', encoding='utf-8')
+        except Exception:
+            os.close(fd)
+            raise
+        with f:
+            if os.name == "posix":
+                os.fchmod(f.fileno(), mode)
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         raise
-    with f:
-        if os.name == "posix":
-            os.fchmod(f.fileno(), mode)
-        f.write(data)
 
 
 def _copilot_hooks_config(script_path: Path) -> Dict:
