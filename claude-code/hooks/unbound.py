@@ -4383,9 +4383,14 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
 _WRITE_TOOLS = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
 _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 
-# Absolute Unix or Windows paths inside a shell command; the left boundary stops a relative
+# Absolute Unix or Windows paths inside a shell command, a quoted one whole; the left boundary stops a relative
 # token like tests/webapp/ reading as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+|[A-Za-z]:[\\/][^\s"\';|&<>()]*)')
+_ABS_PATH_RE = re.compile(r'"((?:/|[A-Za-z]:[\\/])[^"]*)"|\'((?:/|[A-Za-z]:[\\/])[^\']*)\'|'
+                          r'(?:^|[\s=(])(/[^\s"\';|&<>()]+|[A-Za-z]:[\\/][^\s"\';|&<>()]*)')
+
+
+def _abs_paths(command: str) -> List[str]:
+    return [next(group for group in m.groups() if group) for m in _ABS_PATH_RE.finditer(command)]
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -4407,9 +4412,10 @@ def _is_system_checkout_path(path: str) -> bool:
         )
     except Exception:
         return False
-# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
-# the persistent shell's working directory across the turn's Bash calls.
-_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+# `cd <target>` occurrences, and PowerShell's Set-Location and its aliases — absolute, ~-rooted, or relative,
+# a quoted target whole — used to track the persistent shell's working directory across the turn's shell calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)(?:cd|chdir|pushd|set-location|sl|push-location)'
+                           r'\s+(?:-(?:literal)?path\s+)?(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&]+))', re.IGNORECASE)
 
 # `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
@@ -4545,12 +4551,12 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
     try:
         target = None
         for m in _CD_TARGET_RE.finditer(command):
-            target = m.group(2)
+            target = next(group for group in m.groups() if group)
         if not target:
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
+        if target.startswith('/') or re.match(r'[A-Za-z]:[\\/]', target):
             return os.path.normpath(target)
         if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
             return shell_dir
@@ -4571,6 +4577,8 @@ _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
 _REDIRECT_RE = re.compile(r'(?<!>)>>?(?:&(?!(?:\d+|-)(?:[\s;&|)`]|$)))?(?![&>])\s*([^\s;&|)`]*)')
 # A redirect into one of these touches no file.
 _DEVICE_REDIRECT_TARGETS = frozenset({'/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'})
+# PowerShell discards output into $null, and Windows into NUL.
+_POWERSHELL_DEVICE_REDIRECT_TARGETS = frozenset({'$null', 'nul'})
 
 # Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
@@ -4626,10 +4634,10 @@ def _segment_words(segment):
     return words
 
 
-def _segment_writes(words):
+def _segment_writes(words, powershell=False):
     """Whether a segment's command word plus its flags mutate the working tree."""
     name = os.path.basename(words[0])
-    if name in _SHELL_WRITE_COMMANDS or name.lower() in _POWERSHELL_WRITE_COMMANDS:
+    if name in _SHELL_WRITE_COMMANDS or powershell and name.lower() in _POWERSHELL_WRITE_COMMANDS:
         return True
     if name in _SHELL_INPLACE_COMMANDS:
         return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
@@ -4668,17 +4676,18 @@ def _is_git_write_command(command):
         return False
 
 
-def _is_shell_write_command(command):
+def _is_shell_write_command(command, powershell=False):
     """Whether `command` mutates the working tree: a write command word in any segment, or a redirect into a file. False on any error."""
     try:
         if not isinstance(command, str) or not command:
             return False
         masked = _mask_quoted_runs(command)
-        if any(m.group(1) not in _DEVICE_REDIRECT_TARGETS for m in _REDIRECT_RE.finditer(masked)):
+        devices = _DEVICE_REDIRECT_TARGETS | _POWERSHELL_DEVICE_REDIRECT_TARGETS if powershell else _DEVICE_REDIRECT_TARGETS
+        if any((m.group(1).lower() if powershell else m.group(1)) not in devices for m in _REDIRECT_RE.finditer(masked)):
             return True
         for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
             words = _segment_words(segment)
-            if words and _segment_writes(words):
+            if words and _segment_writes(words, powershell):
                 return True
         return False
     except Exception:
@@ -4702,10 +4711,10 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
         if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
     elif tool_name in SHELL_TOOL_NAMES:
-        command = tool_input.get('command')
-        if isinstance(command, str):
+        command = _shell_command(tool_name, tool_input)
+        if command:
             candidates.extend(
-                p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
+                p for p in _abs_paths(command) if not _is_system_checkout_path(p)
             )
             candidates.extend(_git_path_opt_targets(command, shell_dir))
             shell_dir = _next_shell_dir(command, shell_dir)
@@ -4750,18 +4759,19 @@ REPO_GATE_BLOCK_CONTEXT = (
 )
 
 
-def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
-    """The shell command a Bash call carries, in this hook's payload shape."""
-    if not isinstance(tool_input, dict):
+def _shell_command(tool_name: Optional[str], tool_input: Optional[Dict]) -> Optional[str]:
+    """The command a shell call carries; a PowerShell one with its @{ } hashtables emptied, as a ; in one separates
+    its entries, not commands."""
+    command = tool_input.get('command') if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
         return None
-    command = tool_input.get('command')
-    return command if isinstance(command, str) else None
+    return _transfer_hashtables_emptied(command) if tool_name == 'PowerShell' else command
 
 
 def _repo_gate_applies(tool_name, command):
     """Whether this call is in the gate's scope: a write tool always, a shell call only when it runs a git write or writes a file."""
     if tool_name in _REPO_GATE_SHELL_TOOLS:
-        return _is_git_write_command(command) or _is_shell_write_command(command)
+        return _is_git_write_command(command) or _is_shell_write_command(command, tool_name == 'PowerShell')
     return tool_name in _REPO_GATE_WRITE_TOOLS
 
 
@@ -4910,7 +4920,7 @@ def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
     try:
         tool_name = event.get('tool_name') or ''
         tool_input = event.get('tool_input')
-        if not _repo_gate_applies(tool_name, _repo_gate_command(tool_input)):
+        if not _repo_gate_applies(tool_name, _shell_command(tool_name, tool_input)):
             return None
         block_policies = _repo_gate_block_policies(get_repo_policies())
         if not block_policies:
@@ -8918,13 +8928,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'project': tool_project
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
-                command = tool_input.get('command')
-                # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
-                transfer = _transfer(_transfer_hashtables_emptied(command) if tool_name == 'PowerShell' and
-                                     isinstance(command, str) else command, transfer_dir, transfer_state)
+                command = _shell_command(tool_name, tool_input)
+                transfer = _transfer(command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
-                    transfer_dir = None if failed else _transfer_next_cwd(tool_input.get('command'), transfer_dir)
+                    transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
                 turn_seeded = True
                 if transfer:
                     tool_use_entry['transfer'] = transfer
