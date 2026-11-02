@@ -1868,6 +1868,7 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   mkdtempSync,
   openSync,
@@ -1882,7 +1883,12 @@ import {
 import { BlockList, isIP } from "node:net";
 import { homedir, tmpdir as tmpdir2, userInfo } from "node:os";
 import { basename, delimiter, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, normalize, sep } from "node:path";
-var ALLOWED_RUNS = [["ssh", "-G"]];
+var ALLOWED_RUNS = [
+  ["ssh", "-G"],
+  ["route", "-n", "get"],
+  ["ip", "-o", "route", "get"],
+  ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+];
 var RUN_TIMEOUT_MS = 5e3;
 var DNS_TIMEOUT_MS = 1500;
 var TURN_BUDGET_MS = 1e4;
@@ -2166,6 +2172,28 @@ var PS_ALIASES = {
   sv: "sessionvariable",
   rhv: "responseheadersvariable"
 };
+var TUNNEL = /^(utun|ipsec|ppp|tun|tap|wg|tailscale|zt|cscotun|gpd|vti|nordlynx)/;
+var VM_BRIDGE = /^(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)/;
+var WINDOWS_TUNNEL = new RegExp(
+  "vpn|tunnel|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport|cloudflare warp|nordlynx|check point|sonicwall",
+  "i"
+);
+var WINDOWS_VM = /hyper-v|vethernet|virtualbox|vmware|docker|wsl/i;
+var WINDOWS_ROUTE = (address) => `$s = @(Find-NetRoute -RemoteIPAddress ${address} -ErrorAction Stop); $r = $s[-1]; $a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; ($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9`;
+var REMOTE_ENV = [
+  "SSH_CONNECTION",
+  "SSH_CLIENT",
+  "SSH_TTY",
+  "CODESPACES",
+  "GITPOD_WORKSPACE_ID",
+  "CODER",
+  "CLOUD_SHELL",
+  "REMOTE_CONTAINERS",
+  "KUBERNETES_SERVICE_HOST",
+  "CI",
+  "CLAUDE_CODE_REMOTE"
+];
+var CONTAINER_FILES = ["/.dockerenv", "/run/.containerenv"];
 var ADDRESS_KINDS = [
   ["loopback", ["127.0.0.0/8", "0.0.0.0/32", "::1/128", "::/128"]],
   ["private", ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "fc00::/7"]],
@@ -4399,9 +4427,9 @@ function curlDial(url, connects, pins) {
     }
   }
   const named = pinned.get(`${target[0]} ${target[1]}`) ?? [];
-  const addresses = named.length > 0 ? named : pinned.get(`* ${target[1]}`) ?? [];
-  if (target[0] === host && addresses.length === 0) return void 0;
-  return [addresses[0] ?? target[0], addresses];
+  const addresses2 = named.length > 0 ? named : pinned.get(`* ${target[1]}`) ?? [];
+  if (target[0] === host && addresses2.length === 0) return void 0;
+  return [addresses2[0] ?? target[0], addresses2];
 }
 function prefixed(name, options) {
   const word = name.slice(2);
@@ -4662,21 +4690,21 @@ function netcat(args, sends, ncat = false) {
   return [[sends ? "out" : "", positional[0], void 0, void 0, remote2]];
 }
 function socat(args, sends) {
-  const addresses = [];
+  const addresses2 = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
     if (SOCAT_VALUE_OPTIONS.has(arg)) i++;
-    else if (arg === "-" || !arg.startsWith("-")) addresses.push(arg);
+    else if (arg === "-" || !arg.startsWith("-")) addresses2.push(arg);
   }
   const out = [];
-  for (const address2 of addresses.slice(0, 2)) {
-    const target = socatTarget(address2);
+  for (const address of addresses2.slice(0, 2)) {
+    const target = socatTarget(address);
     if (target !== void 0) out.push([sends ? "out" : "", target[0], void 0, void 0, target[1]]);
   }
   return out;
 }
-function socatTarget(address2) {
-  const [body = "", ...options] = address2.split(/,(?![^[]*\])/);
+function socatTarget(address) {
+  const [body = "", ...options] = address.split(/,(?![^[]*\])/);
   const [first = "", ...fields] = body.split(/:(?![^[]*\])/);
   const kind = first.toLowerCase();
   const optionNames = new Set(options.map((option) => option.split("=")[0].trim().toLowerCase()));
@@ -4816,13 +4844,13 @@ function cleanHost(value) {
   const bare = host.split("%")[0];
   return host.includes(":") && isIP(bare) === 6 ? normalizeV6(bare) : "";
 }
-function normalizeV6(address2) {
-  const v4 = ipv4Mapped(address2);
-  if (v4 !== address2) return `::ffff:${v4}`;
+function normalizeV6(address) {
+  const v4 = ipv4Mapped(address);
+  if (v4 !== address) return `::ffff:${v4}`;
   try {
-    return new URL(`http://[${address2}]/`).hostname.slice(1, -1);
+    return new URL(`http://[${address}]/`).hostname.slice(1, -1);
   } catch {
-    return address2;
+    return address;
   }
 }
 function expandHome(path, home = homedir()) {
@@ -5069,27 +5097,27 @@ async function sshHostname(destination, options, cwd, state) {
 var KIND_LISTS = ADDRESS_KINDS.map(([kind, networks]) => {
   const list = new BlockList();
   for (const network of networks) {
-    const [address2 = "", prefix = ""] = network.split("/");
-    list.addSubnet(address2, Number(prefix), address2.includes(":") ? "ipv6" : "ipv4");
+    const [address = "", prefix = ""] = network.split("/");
+    list.addSubnet(address, Number(prefix), address.includes(":") ? "ipv6" : "ipv4");
   }
   return [kind, list];
 });
-function ipv4Mapped(address2) {
-  if (isIP(address2) !== 6) return address2;
+function ipv4Mapped(address) {
+  if (isIP(address) !== 6) return address;
   try {
-    const host = new URL(`http://[${address2}]/`).hostname;
+    const host = new URL(`http://[${address}]/`).hostname;
     const match = /^\[::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})\]$/.exec(host);
-    if (match === null) return address2;
+    if (match === null) return address;
     const [high, low] = [parseInt(match[1], 16), parseInt(match[2], 16)];
     return [high >> 8, high & 255, low >> 8, low & 255].join(".");
   } catch {
-    return address2;
+    return address;
   }
 }
 function kindOf(raw) {
-  const address2 = ipv4Mapped(raw.split("%")[0]);
-  const family = isIP(address2) === 6 ? "ipv6" : "ipv4";
-  for (const [kind, list] of KIND_LISTS) if (list.check(address2, family)) return kind;
+  const address = ipv4Mapped(raw.split("%")[0]);
+  const family = isIP(address) === 6 ? "ipv6" : "ipv4";
+  for (const [kind, list] of KIND_LISTS) if (list.check(address, family)) return kind;
   return "public";
 }
 var hungLookups = 0;
@@ -5118,19 +5146,79 @@ async function resolveAddresses(host, timeoutMs, state) {
     clearTimeout(timer);
   }
 }
-async function address(host, state, lookup = true) {
-  if (isIP(host) !== 0) return addressKind([host]);
-  if (!lookup) return "unresolved";
+async function addresses(host, state, lookup = true) {
+  if (isIP(host) !== 0) return [host];
+  if (!lookup) return [];
   const cached = state.addresses.get(host);
   if (cached !== void 0) return cached;
   const remaining = state.deadline - state.now();
-  const kind = addressKind(remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : []);
-  state.addresses.set(host, kind);
-  return kind;
+  const found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
+  state.addresses.set(host, found);
+  return found;
 }
 function addressKind(found) {
   const kinds = found.map(kindOf);
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : kinds[0];
+}
+function sameAddress(a, b) {
+  const canonical = (x) => {
+    const bare = ipv4Mapped(x.split("%")[0]);
+    if (isIP(bare) === 0) return void 0;
+    try {
+      return isIP(bare) === 6 ? new URL(`http://[${bare}]/`).hostname : bare;
+    } catch {
+      return void 0;
+    }
+  };
+  const left = canonical(a);
+  return left !== void 0 && left === canonical(b);
+}
+function routeArgv(address, platform2) {
+  if (platform2 === "win32") return ["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_ROUTE(address)];
+  if (platform2 === "darwin") return ["route", "-n", "get", ...isIP(address) === 6 ? ["-inet6"] : [], address];
+  return ["ip", "-o", "route", "get", address];
+}
+function routeKind(out, address, platform2) {
+  let iface;
+  let own;
+  let gateway;
+  if (platform2 === "win32") {
+    const parts = out.trim().split("	");
+    if (parts.length !== 4 || parts[0] === "") return void 0;
+    const [hop = "", alias = "", description = "", source = ""] = parts;
+    const names = `${alias} ${description}`;
+    if (sameAddress(source, address) || WINDOWS_VM.test(names)) return "machine";
+    if (WINDOWS_TUNNEL.test(names)) return "vpn";
+    return hop === "0.0.0.0" || hop === "::" ? "local" : "routed";
+  }
+  if (platform2 === "darwin") {
+    const fields = new Map(out.split(/\r?\n/).map((line) => {
+      const at = line.indexOf(":");
+      return at < 0 ? [line.trim(), ""] : [line.slice(0, at).trim(), line.slice(at + 1).trim()];
+    }));
+    const flags = (fields.get("flags") ?? "").replace(/^<|>$/g, "").split(",");
+    [iface, own, gateway] = [fields.get("interface") ?? "", flags.includes("LOCAL"), flags.includes("GATEWAY")];
+  } else {
+    const words2 = out.split(/\s+/).filter((w) => w !== "");
+    if (words2.length === 0 || ["unreachable", "blackhole", "prohibit", "throw"].includes(words2[0])) return void 0;
+    const dev = words2.slice(0, -1).indexOf("dev");
+    [iface, own, gateway] = [dev < 0 ? "" : words2[dev + 1], words2[0] === "local", words2.includes("via")];
+  }
+  if (iface === "") return void 0;
+  if (own || VM_BRIDGE.test(iface)) return "machine";
+  if (TUNNEL.test(iface)) return "vpn";
+  return gateway ? "routed" : "local";
+}
+async function route(found, state) {
+  if (found.length === 0 || REMOTE_ENV.some((name) => state.env[name]) || state.containerFiles.some((f) => existsSync(f))) {
+    return void 0;
+  }
+  const address = ipv4Mapped(found[0].split("%")[0]);
+  if (!state.routes.has(address)) {
+    const out = await run(routeArgv(address, state.platform), state);
+    state.routes.set(address, out === void 0 ? void 0 : routeKind(out, address, state.platform));
+  }
+  return state.routes.get(address);
 }
 async function endpoint(raw, cwd, state, sure = true) {
   const [direction, rawDestination, sshOptions, dial, proxied] = raw;
@@ -5139,20 +5227,22 @@ async function endpoint(raw, cwd, state, sure = true) {
   const host = cleanHost(destination.includes("://") ? urlHost(destination, SSH_URL_SCHEMES) : destination.split("@").pop() ?? "");
   if (host === "") return void 0;
   let resolved;
-  let kind;
+  let found = [];
   if (proxied === "rerouted") {
-    [resolved, kind] = [host, "unresolved"];
+    resolved = host;
   } else if (dial !== void 0) {
     resolved = dial[0];
-    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
+    found = dial[1].length > 0 ? dial[1] : await addresses(dial[0], state, lookup);
   } else {
     lookup &&= !(sshOptions !== void 0 && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === void 0 || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
     const failed = sshOptions !== void 0 && !(lookup && name !== "");
     resolved = jumps || failed ? host : name || host;
-    kind = failed || jumps ? "unresolved" : await address(resolved, state, lookup);
+    if (!(failed || jumps)) found = await addresses(resolved, state, lookup);
   }
-  const out = { host, resolved_host: resolved, address: kind };
+  const kind = addressKind(found);
+  const via = lookup && (kind === "private" || kind === "cgnat") ? await route(found, state) : void 0;
+  const out = { host, resolved_host: resolved, address: kind, ...via === void 0 ? {} : { route: via } };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
 }
 async function transferOf(command2, cwd, state, sure = true) {
@@ -5196,6 +5286,9 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       home: opts.home ?? accountHome(),
       sshHosts: /* @__PURE__ */ new Map(),
       addresses: /* @__PURE__ */ new Map(),
+      routes: /* @__PURE__ */ new Map(),
+      platform: opts.platform ?? process.platform,
+      containerFiles: opts.containerFiles ?? CONTAINER_FILES,
       // Every call's input, so a turn that names an ssh config makes no ssh lookups.
       turnText: calls.map((call) => {
         try {

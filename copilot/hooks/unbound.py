@@ -5588,10 +5588,11 @@ def _extract_patch_target_path(args):
 
 
 # KEEP IN SYNC: transfer resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
-# --- Transfer resolution: where each shell transfer went, as host and address kind only, fail-open ---
+# --- Transfer resolution: where each shell transfer went, as host, address kind and route only, fail-open ---
 
 # Only these commands are ever run; everything else is refused. DNS is a resolver call, not a command.
-_TRANSFER_ALLOWED_RUNS = (('ssh', '-G'),)
+_TRANSFER_ALLOWED_RUNS = (('ssh', '-G'), ('route', '-n', 'get'), ('ip', '-o', 'route', 'get'),
+                          ('powershell', '-NoProfile', '-NonInteractive', '-Command'))
 _TRANSFER_RUN_TIMEOUT = 5
 _TRANSFER_DNS_TIMEOUT = 1.5
 # Wall-clock budget for all lookups in one turn, so a slow lookup never delays the agent.
@@ -5834,6 +5835,26 @@ _TRANSFER_ADDRESS_KINDS = (
     ('link_local', ('169.254.0.0/16', 'fe80::/10')),
     ('cgnat', ('100.64.0.0/10',)),
 )
+# Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, and a bridge to a VM or container stays on this
+# machine. macOS's bridge0 is a Thunderbolt link to another computer; its VM bridges start at bridge100.
+_TRANSFER_TUNNEL = re.compile(r'(utun|ipsec|ppp|tun|tap|wg|tailscale|zt|cscotun|gpd|vti|nordlynx)')
+_TRANSFER_VM_BRIDGE = re.compile(r'(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)')
+# The same for a Windows adapter's alias and description.
+_TRANSFER_WINDOWS_TUNNEL = re.compile(
+    r'vpn|tunnel|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|'
+    r'pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport|cloudflare warp|nordlynx|check point|'
+    r'sonicwall', re.IGNORECASE)
+_TRANSFER_WINDOWS_VM = re.compile(r'hyper-v|vethernet|virtualbox|vmware|docker|wsl', re.IGNORECASE)
+# The route to one address, its next hop, interface alias and description, and the source address, tab-separated.
+_TRANSFER_WINDOWS_ROUTE = (
+    '$s = @(Find-NetRoute -RemoteIPAddress {} -ErrorAction Stop); $r = $s[-1]; '
+    '$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; '
+    '($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9')
+# Set where the agent runs on a server, in a container, a cloud workspace or CI: a route there describes that
+# machine's network, not the person's.
+_TRANSFER_REMOTE_ENV = ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY', 'CODESPACES', 'GITPOD_WORKSPACE_ID', 'CODER',
+                        'CLOUD_SHELL', 'REMOTE_CONTAINERS', 'KUBERNETES_SERVICE_HOST', 'CI', 'CLAUDE_CODE_REMOTE')
+_TRANSFER_CONTAINER_FILES = ('/.dockerenv', '/run/.containerenv')
 
 
 def _transfer_deadline(state: Dict) -> float:
@@ -9073,21 +9094,20 @@ def _transfer_resolve(host: str, timeout: float) -> list:
     return [] if worker.is_alive() else list(found)
 
 
-def _transfer_address(host: str, state: Dict, lookup: bool = True) -> str:
-    """The kind of address a host resolves to, looked up once per turn: public when any address is public, else
-    the first address's kind; unresolved when the lookup fails, the turn's budget is spent, or lookup is off."""
+def _transfer_addresses(host: str, state: Dict, lookup: bool = True) -> list:
+    """The host's addresses, looked up once per turn; a literal address is its own. [] when the lookup fails, the
+    turn's budget is spent, or lookup is off."""
     import ipaddress
     try:
-        return _transfer_address_kind([ipaddress.ip_address(host)])
+        return [ipaddress.ip_address(host)]
     except ValueError:
         pass
     if not lookup:
-        return 'unresolved'  # whatever an earlier call found: this one may not have run, or a proxy reaches the host
+        return []  # whatever an earlier call found: this one may not have run, or a proxy reaches the host
     key = ('address', host)
     if key not in state:
         remaining = _transfer_deadline(state) - time.monotonic()
-        state[key] = _transfer_address_kind(
-            _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else [])
+        state[key] = _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else []
     return state[key]
 
 
@@ -9097,9 +9117,75 @@ def _transfer_address_kind(addresses: list) -> str:
     return 'unresolved' if not kinds else 'public' if 'public' in kinds else kinds[0]
 
 
+def _transfer_platform() -> str:
+    return 'windows' if os.name == 'nt' else 'darwin' if sys.platform == 'darwin' else 'linux'
+
+
+def _transfer_route_argv(address, platform: str) -> List[str]:
+    if platform == 'windows':
+        return ['powershell', '-NoProfile', '-NonInteractive', '-Command', _TRANSFER_WINDOWS_ROUTE.format(address)]
+    if platform == 'darwin':
+        return ['route', '-n', 'get'] + (['-inet6'] if address.version == 6 else []) + [str(address)]
+    return ['ip', '-o', 'route', 'get', str(address)]
+
+
+def _transfer_route_kind(out: str, address, platform: str) -> str:
+    """vpn through a tunnel, local on this machine's own network, routed through a gateway, or machine for this
+    machine itself or a VM or container on it, read from the route lookup's output; empty when it can't be read."""
+    import ipaddress
+    if platform == 'windows':
+        parts = out.strip().split('\t')
+        if len(parts) != 4 or not parts[0]:
+            return ''
+        hop, names, source = parts[0], parts[1] + ' ' + parts[2], parts[3]
+        try:
+            if ipaddress.ip_address(source.split('%')[0]) == address:
+                return 'machine'
+        except ValueError:
+            pass
+        if _TRANSFER_WINDOWS_VM.search(names):
+            return 'machine'
+        if _TRANSFER_WINDOWS_TUNNEL.search(names):
+            return 'vpn'
+        return 'local' if hop in ('0.0.0.0', '::') else 'routed'
+    if platform == 'darwin':
+        fields = {key.strip(): value.strip() for key, _, value in (line.partition(':') for line in out.splitlines())}
+        interface, flags = fields.get('interface', ''), fields.get('flags', '').strip('<>').split(',')
+        own, gateway = 'LOCAL' in flags, 'GATEWAY' in flags
+    else:
+        words = out.split()
+        if not words or words[0] in ('unreachable', 'blackhole', 'prohibit', 'throw'):
+            return ''
+        interface = words[words.index('dev') + 1] if 'dev' in words[:-1] else ''
+        own, gateway = words[0] == 'local', 'via' in words
+    if not interface:
+        return ''
+    if own or _TRANSFER_VM_BRIDGE.match(interface):
+        return 'machine'
+    if _TRANSFER_TUNNEL.match(interface):
+        return 'vpn'
+    return 'routed' if gateway else 'local'
+
+
+def _transfer_route(addresses: list, state: Dict) -> str:
+    """How this machine reaches the first of a private host's addresses, looked up once per turn; empty when unknown
+    or when the agent runs on a server, in a container or in CI."""
+    if not addresses or any(os.environ.get(name) for name in _TRANSFER_REMOTE_ENV) or \
+            any(os.path.exists(path) for path in _TRANSFER_CONTAINER_FILES):
+        return ''
+    address = getattr(addresses[0], 'ipv4_mapped', None) or addresses[0]
+    key = ('route', str(address))
+    if key not in state:
+        platform = _transfer_platform()
+        out = _transfer_run(_transfer_route_argv(address, platform), None, state)
+        state[key] = _transfer_route_kind(out, address, platform) if out else ''
+    return state[key]
+
+
 def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool = True) -> Optional[Dict]:
-    """One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
-    its address kind. Without lookup only a literal dialled address is classified; an ssh, proxy or jump host's target never is."""
+    """One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial),
+    its address kind and, for a private one, how this machine routes to it. Without lookup only a literal dialled
+    address is classified and none is routed; an ssh, proxy or jump host's target never is."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     lookup = lookup and not (len(raw) > 4 and raw[4])
@@ -9109,11 +9195,12 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
     host = _transfer_clean_host(host)
     if not host:
         return None
+    found = []
     if len(raw) > 4 and raw[4] == 'rerouted':
-        resolved, address = host, 'unresolved'  # a config this didn't read may send it anywhere
+        resolved = host  # a config this didn't read may send it anywhere
     elif dial:
         resolved = dial[0]
-        address = _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state, lookup)
+        found = dial[1] or _transfer_addresses(dial[0], state, lookup)
     else:
         lookup = lookup and not (ssh_options is not None and _transfer_ssh_jumps(ssh_options))
         resolved, jumps = _transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and \
@@ -9123,8 +9210,10 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         failed = ssh_options is not None and not (lookup and resolved)
         # Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
         resolved = host if jumps or failed else resolved or host
-        address = 'unresolved' if failed or jumps else _transfer_address(resolved, state, lookup)
-    endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
+        found = [] if failed or jumps else _transfer_addresses(resolved, state, lookup)
+    address = _transfer_address_kind(found)
+    endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address,
+                'route': _transfer_route(found, state) if lookup and address in ('private', 'cgnat') else ''}
     return {k: v for k, v in endpoint.items() if v}
 
 

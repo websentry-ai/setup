@@ -1,10 +1,10 @@
-// Transfer resolution: where each shell transfer went, as host and address kind only, in parity with the Python
+// Transfer resolution: where each shell transfer went, as host, address kind and route only, in parity with the Python
 // hooks' transfer block. No `throw` escapes: a failed or slow lookup leaves the address `unresolved`, and every
 // lookup has a deadline within one turn budget, so the turn log is never held up long.
 
 import { lookup as dnsLookup } from "node:dns/promises";
 import {
-  closeSync, constants, fstatSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
+  closeSync, constants, existsSync, fstatSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, realpathSync, rmSync, statSync,
   writeFileSync,
 } from "node:fs";
 import { BlockList, isIP } from "node:net";
@@ -14,6 +14,9 @@ import { basename, delimiter, dirname, isAbsolute, join, normalize, sep } from "
 import { defaultExecFile, type ExecFileLike } from "./accountIdentity.ts";
 
 export type AddressKind = "private" | "public" | "loopback" | "link_local" | "cgnat" | "unresolved";
+/** How this machine reaches a private address: through a tunnel, on its own network, through a gateway, or itself or a
+ *  VM or container on it. */
+export type Route = "vpn" | "local" | "routed" | "machine";
 
 export interface TransferEndpoint {
   /** Absent when the tool doesn't say which way data moved, such as a bare `nc host port`. */
@@ -23,6 +26,8 @@ export interface TransferEndpoint {
   /** The host after ssh's own lookup of a nickname; the same as `host` otherwise. */
   resolved_host: string;
   address: AddressKind;
+  /** For a private or CGNAT address that surely ran, when the lookup could tell. */
+  route?: Route;
 }
 
 export interface Transfer {
@@ -31,7 +36,10 @@ export interface Transfer {
 }
 
 /** Only these lookups are ever run; anything else is refused before it starts. DNS is a resolver call. */
-const ALLOWED_RUNS: readonly (readonly string[])[] = [["ssh", "-G"]];
+const ALLOWED_RUNS: readonly (readonly string[])[] = [
+  ["ssh", "-G"], ["route", "-n", "get"], ["ip", "-o", "route", "get"],
+  ["powershell", "-NoProfile", "-NonInteractive", "-Command"],
+];
 const RUN_TIMEOUT_MS = 5_000;
 const DNS_TIMEOUT_MS = 1_500;
 const TURN_BUDGET_MS = 10_000;
@@ -292,6 +300,29 @@ const PS_ALIASES: Record<string, string> = {
   iv: "informationvariable", ov: "outvariable", ob: "outbuffer", pv: "pipelinevariable", cm: "custommethod",
   sv: "sessionvariable", rhv: "responseheadersvariable",
 };
+/** Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, and a bridge to a VM or container stays on this
+ *  machine. macOS's bridge0 is a Thunderbolt link to another computer; its VM bridges start at bridge100. */
+const TUNNEL = /^(utun|ipsec|ppp|tun|tap|wg|tailscale|zt|cscotun|gpd|vti|nordlynx)/;
+const VM_BRIDGE = /^(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)/;
+/** The same for a Windows adapter's alias and description. */
+const WINDOWS_TUNNEL = new RegExp(
+  "vpn|tunnel|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|" +
+  "pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport|cloudflare warp|nordlynx|check point|" +
+  "sonicwall", "i");
+const WINDOWS_VM = /hyper-v|vethernet|virtualbox|vmware|docker|wsl/i;
+/** The route to one address, its next hop, interface alias and description, and the source address, tab-separated. */
+const WINDOWS_ROUTE = (address: string): string =>
+  `$s = @(Find-NetRoute -RemoteIPAddress ${address} -ErrorAction Stop); $r = $s[-1]; ` +
+  "$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; " +
+  "($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9";
+/** Set where the agent runs on a server, in a container, a cloud workspace or CI: a route there describes that
+ *  machine's network, not the person's. */
+const REMOTE_ENV: readonly string[] = [
+  "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "CODESPACES", "GITPOD_WORKSPACE_ID", "CODER", "CLOUD_SHELL",
+  "REMOTE_CONTAINERS", "KUBERNETES_SERVICE_HOST", "CI", "CLAUDE_CODE_REMOTE",
+];
+const CONTAINER_FILES: readonly string[] = ["/.dockerenv", "/run/.containerenv"];
+
 /** Address kinds, checked in order; any other address is public. */
 const ADDRESS_KINDS: readonly [AddressKind, readonly string[]][] = [
   ["loopback", ["127.0.0.0/8", "0.0.0.0/32", "::1/128", "::/128"]],
@@ -311,6 +342,10 @@ export interface ResolveOptions {
   budgetMs?: number;
   /** The home folder whose ~/.ssh/config ssh reads, for a test; the account's own by default. */
   home?: string;
+  /** `process.platform` by default, for a test. */
+  platform?: string;
+  /** The files whose presence means a container, for a test. */
+  containerFiles?: readonly string[];
 }
 
 interface State {
@@ -321,7 +356,10 @@ interface State {
   deadline: number;
   home: string;
   sshHosts: Map<string, [string, boolean]>;
-  addresses: Map<string, AddressKind>;
+  addresses: Map<string, readonly string[]>;
+  routes: Map<string, Route | undefined>;
+  platform: string;
+  containerFiles: readonly string[];
   /** Every call's input in the turn, and the command being read, to tell whether any names an ssh config. */
   turnText: string;
   callText: string;
@@ -3980,18 +4018,18 @@ async function resolveAddresses(host: string, timeoutMs: number, state: State): 
   }
 }
 
-/** The kind of address a host resolves to, looked up once per turn: public when any address is public, else the
- *  first address's kind; unresolved when the lookup fails or the turn's budget is spent. */
-async function address(host: string, state: State, lookup = true): Promise<AddressKind> {
-  if (isIP(host) !== 0) return addressKind([host]);
+/** The host's addresses, looked up once per turn; a literal address is its own. [] when the lookup fails, the turn's
+ *  budget is spent, or lookup is off. */
+async function addresses(host: string, state: State, lookup = true): Promise<readonly string[]> {
+  if (isIP(host) !== 0) return [host];
   // Whatever an earlier call found: this one may not have run, or a proxy reaches the host.
-  if (!lookup) return "unresolved";
+  if (!lookup) return [];
   const cached = state.addresses.get(host);
   if (cached !== undefined) return cached;
   const remaining = state.deadline - state.now();
-  const kind = addressKind(remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : []);
-  state.addresses.set(host, kind);
-  return kind;
+  const found = remaining > 0 ? await resolveAddresses(host, Math.min(DNS_TIMEOUT_MS, remaining), state) : [];
+  state.addresses.set(host, found);
+  return found;
 }
 
 /** public when any address is public, else the first address's kind; unresolved when there is none. */
@@ -4000,8 +4038,77 @@ function addressKind(found: readonly string[]): AddressKind {
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : (kinds[0] as AddressKind);
 }
 
-/** One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
- *  its address kind. Without lookup only a literal dialled address is classified; an ssh, proxy or jump host's target never is. */
+/** Whether two strings are the same IP address, however each is written. */
+function sameAddress(a: string, b: string): boolean {
+  const canonical = (x: string): string | undefined => {
+    const bare = ipv4Mapped(x.split("%")[0] as string);
+    if (isIP(bare) === 0) return undefined;
+    try {
+      return isIP(bare) === 6 ? new URL(`http://[${bare}]/`).hostname : bare;
+    } catch {
+      return undefined;
+    }
+  };
+  const left = canonical(a);
+  return left !== undefined && left === canonical(b);
+}
+
+export function routeArgv(address: string, platform: string): string[] {
+  if (platform === "win32") return ["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_ROUTE(address)];
+  if (platform === "darwin") return ["route", "-n", "get", ...(isIP(address) === 6 ? ["-inet6"] : []), address];
+  return ["ip", "-o", "route", "get", address];
+}
+
+/** The route read from the lookup's output on platform; undefined when it can't be read. */
+export function routeKind(out: string, address: string, platform: string): Route | undefined {
+  let iface: string;
+  let own: boolean;
+  let gateway: boolean;
+  if (platform === "win32") {
+    const parts = out.trim().split("\t");
+    if (parts.length !== 4 || parts[0] === "") return undefined;
+    const [hop = "", alias = "", description = "", source = ""] = parts;
+    const names = `${alias} ${description}`;
+    if (sameAddress(source, address) || WINDOWS_VM.test(names)) return "machine";
+    if (WINDOWS_TUNNEL.test(names)) return "vpn";
+    return hop === "0.0.0.0" || hop === "::" ? "local" : "routed";
+  }
+  if (platform === "darwin") {
+    const fields = new Map(out.split(/\r?\n/).map((line) => {
+      const at = line.indexOf(":");
+      return at < 0 ? [line.trim(), ""] : [line.slice(0, at).trim(), line.slice(at + 1).trim()];
+    }));
+    const flags = (fields.get("flags") ?? "").replace(/^<|>$/g, "").split(",");
+    [iface, own, gateway] = [fields.get("interface") ?? "", flags.includes("LOCAL"), flags.includes("GATEWAY")];
+  } else {
+    const words = out.split(/\s+/).filter((w) => w !== "");
+    if (words.length === 0 || ["unreachable", "blackhole", "prohibit", "throw"].includes(words[0] as string)) return undefined;
+    const dev = words.slice(0, -1).indexOf("dev");
+    [iface, own, gateway] = [dev < 0 ? "" : (words[dev + 1] as string), words[0] === "local", words.includes("via")];
+  }
+  if (iface === "") return undefined;
+  if (own || VM_BRIDGE.test(iface)) return "machine";
+  if (TUNNEL.test(iface)) return "vpn";
+  return gateway ? "routed" : "local";
+}
+
+/** How this machine reaches the first of a private host's addresses, looked up once per turn; undefined when unknown
+ *  or when the agent runs on a server, in a container or in CI. */
+async function route(found: readonly string[], state: State): Promise<Route | undefined> {
+  if (found.length === 0 || REMOTE_ENV.some((name) => state.env[name]) || state.containerFiles.some((f) => existsSync(f))) {
+    return undefined;
+  }
+  const address = ipv4Mapped((found[0] as string).split("%")[0] as string);
+  if (!state.routes.has(address)) {
+    const out = await run(routeArgv(address, state.platform), state);
+    state.routes.set(address, out === undefined ? undefined : routeKind(out, address, state.platform));
+  }
+  return state.routes.get(address);
+}
+
+/** One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial), its
+ *  address kind and, for a private one, how this machine routes to it. Without lookup only a literal dialled address is
+ *  classified and none is routed; an ssh, proxy or jump host's target never is. */
 async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = true): Promise<TransferEndpoint | undefined> {
   const [direction, rawDestination, sshOptions, dial, proxied] = raw;
   let lookup = sure && proxied !== true;
@@ -4009,12 +4116,12 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
   const host = cleanHost(destination.includes("://") ? urlHost(destination, SSH_URL_SCHEMES) : (destination.split("@").pop() ?? ""));
   if (host === "") return undefined;
   let resolved: string;
-  let kind: AddressKind;
+  let found: readonly string[] = [];
   if (proxied === "rerouted") {
-    [resolved, kind] = [host, "unresolved"]; // a config this didn't read may send it anywhere
+    resolved = host; // a config this didn't read may send it anywhere
   } else if (dial !== undefined) {
     resolved = dial[0];
-    kind = dial[1].length > 0 ? addressKind(dial[1]) : await address(dial[0], state, lookup);
+    found = dial[1].length > 0 ? dial[1] : await addresses(dial[0], state, lookup);
   } else {
     lookup &&= !(sshOptions !== undefined && sshJumps(sshOptions));
     const [name, jumps] = sshOptions === undefined || !lookup ? ["", false] : await sshHostname(destination, sshOptions, cwd, state);
@@ -4023,9 +4130,11 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
     const failed = sshOptions !== undefined && !(lookup && name !== "");
     // Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
     resolved = jumps || failed ? host : name || host;
-    kind = failed || jumps ? "unresolved" : await address(resolved, state, lookup);
+    if (!(failed || jumps)) found = await addresses(resolved, state, lookup);
   }
-  const out: TransferEndpoint = { host, resolved_host: resolved, address: kind };
+  const kind = addressKind(found);
+  const via = lookup && (kind === "private" || kind === "cgnat") ? await route(found, state) : undefined;
+  const out: TransferEndpoint = { host, resolved_host: resolved, address: kind, ...(via === undefined ? {} : { route: via }) };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
 }
 
@@ -4094,6 +4203,9 @@ export async function resolveTransfers(
       home: opts.home ?? accountHome(),
       sshHosts: new Map(),
       addresses: new Map(),
+      routes: new Map(),
+      platform: opts.platform ?? process.platform,
+      containerFiles: opts.containerFiles ?? CONTAINER_FILES,
       // Every call's input, so a turn that names an ssh config makes no ssh lookups.
       turnText: calls.map((call) => {
         try {
