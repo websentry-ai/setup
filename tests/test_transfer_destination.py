@@ -31,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '703e226865e465d6998c50a9d608482be1ccbc41ad5dcecb6f58f7551d03e322'
+BLOCK_SHA256 = '4ce8858207329363762912d52eb260ce9e7ede0d16f9ec45f67614a3f09e3c23'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -758,6 +758,17 @@ class RouteTests(TransferTestCase):
                 self.assertNotIn('route', hook._transfer('curl -T f http://10.20.30.40/up', self.repo, {})['endpoints'][0])
         self.assertEqual(self.routes_run(), [])
 
+    def test_an_ipv6_scope_never_reaches_the_lookup(self):
+        scoped = ipaddress.ip_address('fd12:3456:789a::1%x;calc')
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'FAKE_ROUTE_OUT': ''}), \
+                    patch.object(hook, '_transfer_platform', lambda: 'windows'):
+                Path(self.route_log).write_text('')
+                hook._transfer_route([scoped], {})
+                (script,) = [run[-1] for run in self.routes_run()]
+                self.assertIn('-RemoteIPAddress fd12:3456:789a::1 ', script)
+                self.assertNotIn('calc', script)
+
     def test_an_address_is_routed_once_per_turn_and_a_failed_lookup_sends_nothing(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
@@ -895,7 +906,8 @@ class SshLookupTests(TransferTestCase):
             Path(self.repo, 'swap').write_text(f'Match exec "touch {sentinel}"\n  HostName 10.6.6.6\n')
             return real_run(argv, *args, **kwargs)
 
-        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH']}
+        # CI turns this machine's route lookup off; only ssh -G is under test.
+        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH'], 'CI': '1'}
         for hook in HOOKS:
             Path(self.repo, 'swap').write_text('Host prod\n  HostName 10.0.4.12\n')
             with self.subTest(hook=hook.__file__), patch.dict(os.environ, env), \

@@ -1137,3 +1137,15 @@ test("nothing is routed on a server, in a container or in CI", async () => {
   assert.equal(found?.endpoints[0]?.route, undefined);
   assert.deepEqual(calls, []);
 });
+
+test("an IPv6 scope never reaches the lookup, and PowerShell starts from its system folder", async () => {
+  const calls: string[][] = [];
+  await transfer("curl -T f https://scoped.example/up", "/", {
+    execFile: fakeRoute("", calls), platform: "win32", containerFiles: [], env: { SystemRoot: "C:\\Windows" },
+    lookup: async (host) => (host === "scoped.example" ? ["fd12:3456:789a::1%x;calc"] : []),
+  });
+  const [run] = calls;
+  assert.equal(run?.[0], join("C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe"));
+  assert.ok(run?.at(-1)?.includes("-RemoteIPAddress fd12:3456:789a::1 "), JSON.stringify(run));
+  assert.ok(!run?.at(-1)?.includes("calc"));
+});

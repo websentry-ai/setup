@@ -7452,10 +7452,12 @@ def _transfer_route_kind(out: str, address, platform: str) -> str:
 def _transfer_route(addresses: list, state: Dict) -> str:
     """How this machine reaches the first of a private host's addresses, looked up once per turn; empty when unknown
     or when the agent runs on a server, in a container or in CI."""
+    import ipaddress
     if not addresses or any(os.environ.get(name) for name in _TRANSFER_REMOTE_ENV) or \
             any(os.path.exists(path) for path in _TRANSFER_CONTAINER_FILES):
         return ''
-    address = getattr(addresses[0], 'ipv4_mapped', None) or addresses[0]
+    # Without its IPv6 scope, which may hold any text and would otherwise reach PowerShell's script.
+    address = ipaddress.ip_address(str(getattr(addresses[0], 'ipv4_mapped', None) or addresses[0]).split('%')[0])
     key = ('route', str(address))
     if key not in state:
         platform = _transfer_platform()

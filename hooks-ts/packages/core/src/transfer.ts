@@ -392,6 +392,10 @@ async function run(argv: string[], state: State): Promise<string | undefined> {
       if (options === undefined) return undefined;
       args = ["-G", ...options, ...argv.slice(end)];
     }
+    // Windows looks in the working folder before PATH, so PowerShell starts from its fixed system folder.
+    if (file === "powershell" && state.platform === "win32") {
+      file = join(state.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    }
     return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
   } catch {
     return undefined;
@@ -4098,7 +4102,9 @@ async function route(found: readonly string[], state: State): Promise<Route | un
   if (found.length === 0 || REMOTE_ENV.some((name) => state.env[name]) || state.containerFiles.some((f) => existsSync(f))) {
     return undefined;
   }
+  // Without its IPv6 scope, which may hold any text and would otherwise reach PowerShell's script.
   const address = ipv4Mapped((found[0] as string).split("%")[0] as string);
+  if (isIP(address) === 0) return undefined;
   if (!state.routes.has(address)) {
     const out = await run(routeArgv(address, state.platform), state);
     state.routes.set(address, out === undefined ? undefined : routeKind(out, address, state.platform));

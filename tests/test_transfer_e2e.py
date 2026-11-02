@@ -42,8 +42,11 @@ TURN_LOG_PATHS = {
 KEY = 'test-key'
 SECRET = 'SECRET-ROW-123'
 COMMAND = 'scp -F backup.conf customers.sql backup:/srv'
+# Inside a container the hook sends no route, as it would describe the container's network.
+IN_CONTAINER = any(os.path.exists(path) for path in ('/.dockerenv', '/run/.containerenv'))
 EXPECTED = {'tool': 'scp', 'endpoints': [
-    {'direction': 'out', 'host': 'backup', 'resolved_host': '10.0.4.12', 'address': 'private', 'route': 'vpn'}]}
+    {'direction': 'out', 'host': 'backup', 'resolved_host': '10.0.4.12', 'address': 'private',
+     **({} if IN_CONTAINER else {'route': 'vpn'})}]}
 # This machine's route lookups, macOS's and Linux's, each answering that 10.0.4.12 is reached through a tunnel.
 FAKE_ROUTES = {
     'route': '   route to: 10.0.4.12\ndestination: 10.0.0.0\n  interface: utun4\n      flags: <UP,DONE,STATIC>\n',

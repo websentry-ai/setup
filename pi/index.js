@@ -2215,6 +2215,9 @@ async function run(argv, state) {
       if (options === void 0) return void 0;
       args = ["-G", ...options, ...argv.slice(end2)];
     }
+    if (file === "powershell" && state.platform === "win32") {
+      file = join5(state.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    }
     return await state.run(file, args, { timeoutMs: Math.min(RUN_TIMEOUT_MS, remaining), maxBytes: MAX_OUTPUT_BYTES });
   } catch {
     return void 0;
@@ -5214,6 +5217,7 @@ async function route(found, state) {
     return void 0;
   }
   const address = ipv4Mapped(found[0].split("%")[0]);
+  if (isIP(address) === 0) return void 0;
   if (!state.routes.has(address)) {
     const out = await run(routeArgv(address, state.platform), state);
     state.routes.set(address, out === void 0 ? void 0 : routeKind(out, address, state.platform));
