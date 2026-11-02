@@ -4383,9 +4383,9 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
 _WRITE_TOOLS = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
 _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 
-# Absolute paths inside a Bash command; the left boundary stops a relative
+# Absolute Unix or Windows paths inside a shell command; the left boundary stops a relative
 # token like tests/webapp/ reading as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+|[A-Za-z]:[\\/][^\s"\';|&<>()]*)')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -4579,6 +4579,12 @@ _SHELL_WRITE_COMMANDS = frozenset({
     'touch', 'mkdir',                       # create
     'tee', 'truncate', 'patch',             # rewrite contents
 })
+# PowerShell's own writes and their common aliases, matched case-insensitively as PowerShell does.
+_POWERSHELL_WRITE_COMMANDS = frozenset({
+    'set-content', 'add-content', 'clear-content', 'out-file', 'new-item', 'remove-item', 'copy-item',
+    'move-item', 'rename-item', 'sc', 'ac', 'ni', 'ri', 'del', 'erase', 'rd', 'cpi', 'copy', 'mi', 'move',
+    'rni', 'ren',
+})
 # A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
 _SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
 _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
@@ -4623,7 +4629,7 @@ def _segment_words(segment):
 def _segment_writes(words):
     """Whether a segment's command word plus its flags mutate the working tree."""
     name = os.path.basename(words[0])
-    if name in _SHELL_WRITE_COMMANDS:
+    if name in _SHELL_WRITE_COMMANDS or name.lower() in _POWERSHELL_WRITE_COMMANDS:
         return True
     if name in _SHELL_INPLACE_COMMANDS:
         return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])

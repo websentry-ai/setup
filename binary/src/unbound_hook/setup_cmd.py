@@ -278,8 +278,8 @@ def _claude_hooks_config():
             {"type": "command", "command": cmd("PreToolUse"), "timeout": 15000}]}],
         "PostToolUse": [{"matcher": "*", "hooks": [
             {"type": "command", "command": cmd("PostToolUse"), "async": True, "timeout": 60}]}],
-        # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
-        "PostToolUseFailure": [{"matcher": "Bash", "hooks": [
+        # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
+        "PostToolUseFailure": [{"matcher": "Bash|PowerShell", "hooks": [
             {"type": "command", "command": cmd("PostToolUseFailure"), "async": True, "timeout": 60}]}],
         "UserPromptSubmit": [{"hooks": [
             {"type": "command", "command": cmd("UserPromptSubmit"), "timeout": 60}]}],

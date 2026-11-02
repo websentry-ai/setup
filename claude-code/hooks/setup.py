@@ -617,10 +617,10 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                     ]
                 }
             ],
-            # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+            # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
             "PostToolUseFailure": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|PowerShell",
                     "hooks": [
                         _hook({
                             "type": "command",
@@ -694,13 +694,14 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                         # scalar would be iterated and raise, aborting the
                         # merge and leaving our hook unregistered.
                         existing_hooks = existing_item.get("hooks")
-                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
-                            if not isinstance(hook, dict):
-                                continue
-                            existing_cmd = hook.get("command", "")
-                            if _command_targets_hook(existing_cmd, script_path):
-                                our_hook_exists = True
-                                break
+                        hooks = [h for h in existing_hooks if isinstance(h, dict)] if isinstance(existing_hooks, list) else []
+                        ours = [_command_targets_hook(h.get("command", ""), script_path) for h in hooks]
+                        if any(ours):
+                            our_hook_exists = True
+                            # An install from before a matcher widened keeps the old one; an entry holding only
+                            # our hook takes the new matcher, and one shared with the user's hooks is left alone.
+                            if all(ours) and "matcher" in new_config[0]:
+                                existing_item["matcher"] = new_config[0]["matcher"]
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)

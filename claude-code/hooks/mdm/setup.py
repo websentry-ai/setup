@@ -1279,10 +1279,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
                     ]
                 }
             ],
-            # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+            # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
             "PostToolUseFailure": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|PowerShell",
                     "hooks": [
                         _hook({
                             "type": "command",
