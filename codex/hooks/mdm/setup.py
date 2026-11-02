@@ -859,34 +859,55 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
-def download_file(url: str, dest_path: Path) -> bool:
+def download_file(url: str, dest_path: Path, gateway_url: Optional[str] = None) -> bool:
+    # Fetch beside dest_path and swap in whole: a hook firing mid-download, or a
+    # dropped connection, must never leave the live file partly written.
+    tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Only temps a killed run left behind: a live download is never older than
+        # curl's 30s timeout, and must not lose its file to a concurrent run.
+        for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
+            try:
+                if time.time() - stale.stat().st_mtime > 300:
+                    stale.unlink()
+            except FileNotFoundError:
+                pass
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", str(dest_path), url],
+            ["curl", "-fsSL", "-o", str(tmp_path), url],
             capture_output=True,
             timeout=30
         )
-        if result.returncode == 0:
-            debug_print(f"File downloaded successfully: {dest_path}")
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if result.returncode != 0:
+            return False
+        if gateway_url:
+            rewrite_gateway_url_in_file(tmp_path, gateway_url)
+        if dest_path.exists():
+            shutil.copymode(dest_path, tmp_path)
+        os.replace(tmp_path, dest_path)
+        debug_print(f"File downloaded successfully: {dest_path}")
+        return True
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
         print(f"Failed to download {url}: {e}")
         return False
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
     """Replace the hardcoded default gateway URL inside a downloaded unbound.py."""
     if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
         return
-    try:
-        text = path.read_text(encoding="utf-8")
-        new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
-        if new_text != text:
-            path.write_text(new_text, encoding="utf-8")
-    except Exception as e:
-        debug_print(f"Could not rewrite gateway URL in {path}: {e}")
+    # Raises on failure: download_file must never swap in a half-rewritten hook.
+    text = path.read_text(encoding="utf-8")
+    new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', json.dumps(gateway_url))
+    if new_text != text:
+        path.write_text(new_text, encoding="utf-8")
 
 
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
@@ -907,11 +928,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         debug_print(f"Created managed settings directory: {managed_dir}")
 
         # Download unbound.py script
-        if not download_file(SCRIPT_URL, script_path):
+        if not download_file(SCRIPT_URL, script_path, gateway_url):
             print("Failed to download unbound.py")
             return False
         debug_print(f"Downloaded hook script: {script_path}")
-        rewrite_gateway_url_in_file(script_path, gateway_url)
 
         # Make script executable on Unix systems
         if system in ["darwin", "linux"]:
@@ -1045,9 +1065,8 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
         hook_command = str(script_path)
 
     def _install():
-        if not download_file(SCRIPT_URL, script_path):
+        if not download_file(SCRIPT_URL, script_path, gateway_url):
             return False
-        rewrite_gateway_url_in_file(script_path, gateway_url)
         try:
             current_mode = script_path.stat().st_mode
             os.chmod(script_path, current_mode | 0o111)

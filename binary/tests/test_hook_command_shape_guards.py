@@ -216,7 +216,7 @@ def test_the_python_mdm_codex_merge_survives_bad_shapes(codex_mdm, tmp_path,
 
     # The install privilege-drops; run the inner work as the current user.
     monkeypatch.setattr(codex_mdm, "_run_as_user", lambda username, fn, *a: fn())
-    monkeypatch.setattr(codex_mdm, "download_file", lambda url, path: True)
+    monkeypatch.setattr(codex_mdm, "download_file", lambda url, path, *_: True)
     monkeypatch.setattr(codex_mdm, "rewrite_gateway_url_in_file",
                         lambda *a, **k: None)
     (home / ".codex" / "hooks" / "unbound.py").write_text("# hook\n")
@@ -321,7 +321,7 @@ def test_the_augment_mdm_install_survives_a_scalar_hooks_value(augment_mdm,
         {"matcher": "foreign", "hooks": 1},   # the shape that aborted the write
     ]}}))
 
-    def fake_download(url, path):
+    def fake_download(url, path, *_):
         # A real download leaves the file there; the writer checks for it.
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text("# hook\n")

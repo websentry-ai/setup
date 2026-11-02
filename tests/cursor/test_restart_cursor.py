@@ -96,7 +96,7 @@ class TestSetupDoesNotDependOnCursorBeingInstalled(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         enterprise = Path(tmp.name) / "ProgramData" / "Cursor"
 
-        def fake_download(url, dest):
+        def fake_download(url, dest, *_):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text('{"version":1,"hooks":{"preToolUse":[{"command":"./hooks/unbound.py"}]}}')
             return True
