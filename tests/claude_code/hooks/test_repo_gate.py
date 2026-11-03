@@ -1150,9 +1150,11 @@ class TestPowerShellTool(RepoGateCase):
             exchange = unbound.build_llm_exchange(events, cwd=str(self.in_scope))
             return [use['project'] for message in exchange['messages'] for use in message.get('tool_use') or []]
 
-        for verb in ('Set-Location', 'sl', 'Set-Location -Path'):
+        for verb in ('Set-Location', 'sl', 'Set-Location -Path', 'Set-Location -PassThru',
+                     'Set-Location -ErrorAction Stop', 'Set-Location -LiteralPath:'):
             with self.subTest(verb=verb):
-                self.assertEqual(projects(('PowerShell', f'{verb} ../widgets'), ('PowerShell', 'git status')),
+                target = '../widgets' if verb.endswith(':') else ' ../widgets'
+                self.assertEqual(projects(('PowerShell', f'{verb}{target}'), ('PowerShell', 'git status')),
                                  ['acme/widgets', 'acme/widgets'])
         # sl is not a bash cd.
         self.assertEqual(projects(('Bash', 'sl ../widgets'), ('Bash', 'git status')),

@@ -4410,10 +4410,31 @@ def _is_system_checkout_path(path: str) -> bool:
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
-# PowerShell's own location verbs, case-insensitive, with an optional -Path or -LiteralPath.
+# PowerShell's own location verbs, case-insensitive, and the rest of the statement as their arguments.
 _POWERSHELL_CD_TARGET_RE = re.compile(
-    r'(?:^|[;&|\n]\s*)(?:cd|chdir|pushd|set-location|sl|push-location)\s+(?:-(?:literal)?path[:\s]\s*)?'
-    r'(["\']?)([^\s"\';|&]+)\1', re.IGNORECASE)
+    r'(?:^|[;&|\n]\s*)(?:cd|chdir|pushd|set-location|sl|push-location)\s+([^;&|\n]*)', re.IGNORECASE)
+# PowerShell's common parameters that take a value; any other -Name before the folder is a switch.
+_POWERSHELL_VALUED_PARAMETERS = frozenset({
+    '-erroraction', '-ea', '-warningaction', '-wa', '-informationaction', '-infa', '-errorvariable', '-ev',
+    '-outvariable', '-ov', '-pipelinevariable', '-pv', '-stackname',
+})
+
+
+def _powershell_cd_target(arguments: str) -> Optional[str]:
+    """The folder a PowerShell location verb's arguments name, past its switches and valued common parameters."""
+    words = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', arguments)
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word[:1] in '"\'':
+            return word[1:-1] or None
+        if not word.startswith('-'):
+            return word
+        name, colon, value = word.partition(':')
+        if colon and name.lower() in ('-path', '-literalpath'):
+            return value.strip('"\'') or None
+        i += 2 if name.lower() in _POWERSHELL_VALUED_PARAMETERS and not colon else 1
+    return None
 
 # `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
@@ -4549,7 +4570,7 @@ def _next_shell_dir(command: str, shell_dir: Optional[str], powershell: bool = F
     try:
         target = None
         for m in (_POWERSHELL_CD_TARGET_RE if powershell else _CD_TARGET_RE).finditer(command):
-            target = m.group(2)
+            target = _powershell_cd_target(m.group(1)) if powershell else m.group(2)
         if not target:
             return shell_dir
         if target.startswith('~'):
