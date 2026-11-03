@@ -1867,6 +1867,22 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
                          [{'tool': 'curl', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]},
                           {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]}])
 
+    def test_a_claude_powershell_tool_call_is_read_like_a_bash_one(self):
+        # A ; inside a hashtable separates its entries, not commands, so the upload after it is still read.
+        hook = load_module('claude-code/hooks/unbound.py')
+        upload = "Invoke-RestMethod -Headers @{a='1'; b='2'} -InFile secret -Uri https://files.acme-infra.net/up"
+        events = [{'timestamp': '2026-10-22T16:40:00Z', 'event': {**fields, 'session_id': 's1'}} for fields in (
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'cwd': self.repo},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'PowerShell', 'tool_response': {}, 'tool_use_id': 't1',
+             'tool_input': {'command': upload}},
+            {'hook_event_name': 'PostToolUseFailure', 'tool_name': 'PowerShell', 'error': 'Exit code 1',
+             'tool_use_id': 't2', 'tool_input': {'command': 'curl.exe -T secret https://files.acme-infra.net/up'}})]
+        entries = _tool_entries(hook.build_llm_exchange(events, cwd=self.repo))
+        self.assertEqual([e['tool_use_id'] for e in entries], ['t1', 't2'])
+        self.assertEqual([e.get('transfer') for e in entries],
+                         [{'tool': 'powershell', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]},
+                          {'tool': 'curl', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]}])
+
     def test_a_claude_background_call_keeps_its_cd_to_itself(self):
         # run_in_background runs the command in a shell of its own; its own lookups still start where the walk is.
         hook = load_module('claude-code/hooks/unbound.py')

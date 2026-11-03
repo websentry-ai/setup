@@ -32,7 +32,9 @@ _CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Pat
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
+# Claude Code's shells: Bash everywhere, and its PowerShell tool, on by default on Windows.
+SHELL_TOOL_NAMES = ('Bash', 'PowerShell')
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'PowerShell', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
 MCP_TOOL_PREFIX = 'mcp__'
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
@@ -999,8 +1001,8 @@ def extract_command_for_pretool(event: Dict) -> str:
     tool_input = event.get('tool_input') or {}
     tool_name = event.get('tool_name', '')
 
-    # Bash: command field
-    if tool_name == 'Bash' and 'command' in tool_input:
+    # Bash and the PowerShell tool: command field
+    if tool_name in SHELL_TOOL_NAMES and 'command' in tool_input:
         return tool_input['command']
     # MCP tools: stringify the input
     if tool_name.startswith(MCP_TOOL_PREFIX):
@@ -4408,6 +4410,31 @@ def _is_system_checkout_path(path: str) -> bool:
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+# PowerShell's own location verbs, case-insensitive, and the rest of the statement as their arguments.
+_POWERSHELL_CD_TARGET_RE = re.compile(
+    r'(?:^|[;&|\n]\s*)(?:cd|chdir|pushd|set-location|sl|push-location)\s+([^;&|\n]*)', re.IGNORECASE)
+# PowerShell's common parameters that take a value; any other -Name before the folder is a switch.
+_POWERSHELL_VALUED_PARAMETERS = frozenset({
+    '-erroraction', '-ea', '-warningaction', '-wa', '-informationaction', '-infa', '-errorvariable', '-ev',
+    '-outvariable', '-ov', '-pipelinevariable', '-pv', '-stackname',
+})
+
+
+def _powershell_cd_target(arguments: str) -> Optional[str]:
+    """The folder a PowerShell location verb's arguments name, past its switches and valued common parameters."""
+    words = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', arguments)
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word[:1] in '"\'':
+            return word[1:-1] or None
+        if not word.startswith('-'):
+            return word
+        name, colon, value = word.partition(':')
+        if colon and name.lower() in ('-path', '-literalpath'):
+            return value.strip('"\'') or None
+        i += 2 if name.lower() in _POWERSHELL_VALUED_PARAMETERS and not colon else 1
+    return None
 
 # `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
@@ -4437,7 +4464,7 @@ def _merge_cwds(first, second):
     return out[:8]
 
 
-def _git_path_opt_targets(command, shell_dir):
+def _git_path_opt_targets(command, shell_dir, powershell=False):
     """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
     targets = []
     try:
@@ -4463,7 +4490,7 @@ def _git_path_opt_targets(command, shell_dir):
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
-            moved = [_next_shell_dir(segment, c) for c in cwds]
+            moved = [_next_shell_dir(segment, c, powershell) for c in cwds]
             if separator == '&&':
                 # Next runs only if this one succeeded, so its cd took effect —
                 # but this segment may instead have failed, which a later || reaches.
@@ -4538,17 +4565,17 @@ def _git_worktree_roots(path: str) -> List[str]:
         return []
 
 
-def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
-    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
+def _next_shell_dir(command: str, shell_dir: Optional[str], powershell: bool = False) -> Optional[str]:
+    """Follow the last `cd` in `command`, or for PowerShell its Set-Location; unchanged on none or any error."""
     try:
         target = None
-        for m in _CD_TARGET_RE.finditer(command):
-            target = m.group(2)
+        for m in (_POWERSHELL_CD_TARGET_RE if powershell else _CD_TARGET_RE).finditer(command):
+            target = _powershell_cd_target(m.group(1)) if powershell else m.group(2)
         if not target:
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
+        if target.startswith('/') or powershell and re.match(r'[A-Za-z]:[\\/]', target):
             return os.path.normpath(target)
         if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
             return shell_dir
@@ -4693,14 +4720,14 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
         path = tool_input.get('file_path') or tool_input.get('path')
         if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
-    elif tool_name == 'Bash':
+    elif tool_name in SHELL_TOOL_NAMES:
         command = tool_input.get('command')
         if isinstance(command, str):
             candidates.extend(
                 p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
             )
-            candidates.extend(_git_path_opt_targets(command, shell_dir))
-            shell_dir = _next_shell_dir(command, shell_dir)
+            candidates.extend(_git_path_opt_targets(command, shell_dir, tool_name == 'PowerShell'))
+            shell_dir = _next_shell_dir(command, shell_dir, tool_name == 'PowerShell')
             if not candidates and shell_dir:
                 candidates.append(shell_dir)
     return candidates, shell_dir
@@ -8990,7 +9017,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse' or (hook_event_name == 'PostToolUseFailure' and
-                                                  event.get('tool_name') == 'Bash'):
+                                                  event.get('tool_name') in SHELL_TOOL_NAMES):
             # Claude reports a command that exits non-zero as PostToolUseFailure; it still ran, so it is read the same.
             failed = hook_event_name == 'PostToolUseFailure'
             tool_name = event.get('tool_name')
@@ -9005,7 +9032,15 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             # Attribute this tool call to the repo it worked in (file path /
             # Bash cwd tracking); rides on the tool_use entry so the backend
             # can store per-call project on each analytics row.
-            tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
+            # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands, so attribution and the
+            # transfer read it emptied; the logged input stays as sent.
+            command = tool_input.get('command') if isinstance(tool_input, dict) else None
+            if tool_name == 'PowerShell' and isinstance(command, str):
+                command = _transfer_hashtables_emptied(command)
+                tool_project, shell_dir = _project_for_tool_use(
+                    tool_name, {**tool_input, 'command': command}, shell_dir, root_projects)
+            else:
+                tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
 
             tool_use_entry = _with_call_ts({
                 'type': 'PostToolUse',
@@ -9015,11 +9050,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'tool_use_id': resolve_tool_use_id(event),
                 'project': tool_project
             }, log_entry.get('timestamp'))
-            if tool_name == 'Bash' and isinstance(tool_input, dict):
-                transfer = _transfer(tool_input.get('command'), transfer_dir, transfer_state)
+            if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
+                transfer = _transfer(command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
-                    transfer_dir = None if failed else _transfer_next_cwd(tool_input.get('command'), transfer_dir)
+                    transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
                 turn_seeded = True
                 if transfer:
                     tool_use_entry['transfer'] = transfer
