@@ -1126,3 +1126,17 @@ class TestPowerShellTool(RepoGateCase):
         (body, _key), _ = send.call_args
         self.assertEqual((body['pre_tool_use_data']['tool_name'], body['pre_tool_use_data']['command']),
                          ('PowerShell', command))
+
+    def test_a_cd_inside_a_hashtable_does_not_move_the_calls_project(self):
+        # The ; inside @{ } separates the hashtable's entries, so the cd there never runs.
+        events = [{'event': {**fields, 'session_id': 'S1'}} for fields in (
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'cwd': str(self.in_scope)},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'PowerShell', 'tool_response': {},
+             'tool_input': {'command': "iwr -Body @{a=1; cd ../widgets; b=2} -Uri https://example.com"}},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash', 'tool_response': {},
+             'tool_input': {'command': 'git status'}})]
+        exchange = unbound.build_llm_exchange(events, cwd=str(self.in_scope))
+        uses = [use for message in exchange['messages'] for use in message.get('tool_use') or []]
+        self.assertEqual([use['project'] for use in uses], ['unboundsec/setup', 'unboundsec/setup'])
+        # The logged input is the command as sent.
+        self.assertIn('cd ../widgets', uses[0]['tool_input']['command'])

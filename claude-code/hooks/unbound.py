@@ -8901,7 +8901,15 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             # Attribute this tool call to the repo it worked in (file path /
             # Bash cwd tracking); rides on the tool_use entry so the backend
             # can store per-call project on each analytics row.
-            tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
+            # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands, so attribution and the
+            # transfer read it emptied; the logged input stays as sent.
+            command = tool_input.get('command') if isinstance(tool_input, dict) else None
+            if tool_name == 'PowerShell' and isinstance(command, str):
+                command = _transfer_hashtables_emptied(command)
+                tool_project, shell_dir = _project_for_tool_use(
+                    tool_name, {**tool_input, 'command': command}, shell_dir, root_projects)
+            else:
+                tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
 
             tool_use_entry = _with_call_ts({
                 'type': 'PostToolUse',
@@ -8912,10 +8920,6 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'project': tool_project
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
-                command = tool_input.get('command')
-                # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
-                if tool_name == 'PowerShell' and isinstance(command, str):
-                    command = _transfer_hashtables_emptied(command)
                 transfer = _transfer(command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
