@@ -660,6 +660,8 @@ test("the handler survives a ctx that raises and a store that raises", async () 
 
 test("a shell call's transfer and call time ride on its tool_use entry", async () => {
   const api = await startMockApi();
+  const ci = process.env.CI;
+  process.env.CI = "1"; // turns this machine's route lookup off, so the entry doesn't depend on its network
   try {
     const store = createTurnStore();
     store.recordPrompt("ship it", "sess-transfer", 1_000);
@@ -679,6 +681,8 @@ test("a shell call's transfer and call time ride on its tool_use entry", async (
       endpoints: [{ direction: "out", host: "10.1.2.3", resolved_host: "10.1.2.3", address: "private" }],
     });
   } finally {
+    if (ci === undefined) delete process.env.CI;
+    else process.env.CI = ci;
     await api.close();
   }
 });

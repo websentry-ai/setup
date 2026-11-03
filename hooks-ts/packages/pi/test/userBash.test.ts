@@ -493,8 +493,14 @@ test("a denied or confirmed !cmd returns the same result as before, and is still
   }
 });
 
-test("an approved confirm's !cmd row carries its transfer, and a declined one's does not", async () => {
+test("an approved confirm's !cmd row carries its transfer, and a declined one's does not", async (t) => {
   turnStore.take();
+  const ci = process.env.CI;
+  process.env.CI = "1"; // turns this machine's route lookup off, so the row doesn't depend on its network
+  t.after(() => {
+    if (ci === undefined) delete process.env.CI;
+    else process.env.CI = ci;
+  });
   for (const confirmResult of [true, false]) {
     const api = await startMockApi({ mode: "ask" });
     const f = await keyedExtension(api);

@@ -11,7 +11,7 @@ import test from "node:test";
 
 import { defaultExecFile, type ExecFileLike } from "../src/accountIdentity.ts";
 import {
-  ipv4Mapped, platform, resolveTransfers, transferCommand, type LookupLike, type ResolveOptions, type Transfer,
+  ipv4Mapped, platform, resolveTransfers, routeArgv, routeKind, transferCommand, type LookupLike, type ResolveOptions, type Transfer,
 } from "../src/transfer.ts";
 
 interface Fixture {
@@ -376,7 +376,8 @@ test("ssh reads the copy that was checked, not the file as it is later", { skip:
     writeFileSync(join(folder, "swap"), `Match exec "touch ${sentinel}"\n  HostName 10.6.6.6\n`);
     return defaultExecFile(file, args, opts);
   };
-  const found = await transfer("scp -F swap f prod:/tmp", folder, { execFile: swapThenRun, env: { PATH: process.env.PATH } });
+  // CI turns this machine's route lookup off; only ssh -G is under test.
+  const found = await transfer("scp -F swap f prod:/tmp", folder, { execFile: swapThenRun, env: { PATH: process.env.PATH, CI: "1" } });
   assert.deepEqual(found?.endpoints, [{ direction: "out", host: "prod", resolved_host: "10.0.4.12", address: "private" }]);
   assert.ok(!existsSync(sentinel));
 });
@@ -396,7 +397,7 @@ test("ssh -G runs through a fake ssh on PATH, with the options that change the h
   try {
     const found = await resolveTransfers(
       [{ tool_name: "bash", tool_use_id: "c1", tool_input: { command: "scp -P 2222 -o HostName=10.9.9.9 -o ProxyJump=none f prod:/tmp" } }],
-      "/", { lookup, home: EMPTY_HOME, env: {} },
+      "/", { lookup, home: EMPTY_HOME, env: { CI: "1" } }, // CI turns this machine's route lookup off
     );
     assert.deepEqual(found.get("c1"), {
       tool: "scp",
@@ -499,12 +500,13 @@ test("Match criteria are read as ssh reads them", async () => {
   const calls: string[][] = [];
   writeFileSync(join(dir, "host"), "Match host exec-prod\n  HostName 10.1.1.1\n");
   await transfer("scp -F host f prod:/tmp", dir, { execFile: fakeSsh(calls) });
-  assert.equal(calls.length, 1);
+  const ssh = (): number => calls.filter((c) => c[0] === "ssh").length;
+  assert.equal(ssh(), 1);
   for (const config of ["Match exec=true\n", 'Match !exec "true"\n', 'Match canonical exec "true"\n']) {
     writeFileSync(join(dir, "run"), config);
     await transfer("scp -F run f prod:/tmp", dir, { execFile: fakeSsh(calls) });
   }
-  assert.equal(calls.length, 1);
+  assert.equal(ssh(), 1);
 });
 
 test("a failed or refused ssh -G never falls back to looking up the host as written", async () => {
@@ -553,7 +555,7 @@ test("a hanging lookup is cut off, the turn ends on time, and a spent budget run
   assert.deepEqual([calls.length, lookups], [0, 0]);
 });
 
-test("only ssh -G is ever run, a call that never ran is not resolved, and errors return what resolved", async () => {
+test("only ssh -G and a route lookup are ever run, a call that never ran is not resolved, and errors return what resolved", async () => {
   const calls: string[][] = [];
   const found = await resolveTransfers(
     [
@@ -565,7 +567,9 @@ test("only ssh -G is ever run, a call that never ran is not resolved, and errors
     "/", options({ execFile: fakeSsh(calls) }),
   );
   assert.deepEqual([...found.keys()], ["a"]);
-  assert.ok(calls.length > 0 && calls.every((c) => c[0] === "ssh" && c[1] === "-G"), JSON.stringify(calls));
+  // prod is 10.0.4.12, so its route is looked up too.
+  assert.ok(calls.length > 0 && calls.every((c) => c[0] === "ssh" && c[1] === "-G" ||
+    JSON.stringify(c.slice(0, -1)) === JSON.stringify(routeArgv("10.0.4.12", process.platform).slice(0, -1))), JSON.stringify(calls));
   const throwing = await resolveTransfers([{ tool_name: "bash", tool_use_id: "x", tool_input: { command: "curl https://example.com" } }], "/",
     options({ lookup: () => { throw new Error("boom"); } }));
   assert.equal(throwing.get("x")?.endpoints[0]?.address, "unresolved");
@@ -835,7 +839,7 @@ test("a turn that names an ssh config makes no ssh lookup", async () => {
       { tool_name: "bash", tool_use_id: "c2", tool_input: { command: second } },
     ], "/", options({ execFile: fakeSsh(calls) }));
     assert.equal(found.get("c1")?.endpoints[0]?.address, expected, second);
-    assert.equal(calls.length, expected === "private" ? 1 : 0, second);
+    assert.equal(calls.filter((c) => c[0] === "ssh").length, expected === "private" ? 1 : 0, second);
   }
 });
 
@@ -1041,3 +1045,135 @@ test("folders, wrappers and exports carry to the commands after them", async () 
 function sleep(ms: number): Promise<void> {
   return new Promise((done) => setTimeout(done, ms));
 }
+
+/** ssh -G as fakeSsh answers it, and every route lookup printing `out`. */
+function fakeRoute(out: string | undefined, calls: string[][] = []): ExecFileLike {
+  const ssh = fakeSsh(calls);
+  return async (file, args, opts) => (file === "ssh" ? ssh(file, args, opts) : (calls.push([file, ...args]), out));
+}
+
+async function routeOf(out: string | undefined, platform: string, command = "curl -T f https://files.acme-infra.net/up") {
+  return (await transfer(command, "/", { execFile: fakeRoute(out), platform, containerFiles: [] }))?.endpoints[0]?.route;
+}
+
+const macRoute = (iface: string, flags: string): string =>
+  `   route to: 10.20.30.40\ndestination: 10.20.30.40\n  interface: ${iface}\n      flags: <UP,${flags}DONE>\n`;
+
+test("macOS, Linux and Windows routes are read as vpn, local, routed or machine", async () => {
+  const cases: [string, string, string | undefined][] = [
+    ["darwin", macRoute("utun4", "GATEWAY,"), "vpn"],
+    ["darwin", macRoute("ipsec0", ""), "vpn"],
+    ["darwin", macRoute("en0", ""), "local"],
+    ["darwin", macRoute("en0", "GATEWAY,"), "routed"],
+    ["darwin", macRoute("bridge0", ""), "local"], // a Thunderbolt link to another computer
+    ["darwin", macRoute("bridge100", ""), "machine"],
+    ["darwin", macRoute("utun0", "HOST,LOCAL,"), "machine"],
+    ["darwin", macRoute("", "GATEWAY,"), undefined],
+    ["darwin", macRoute("ppp0", ""), undefined], // an L2TP VPN or a dial-up uplink
+    ["linux", "10.20.30.40 dev wireguard0 src 10.66.0.2 uid 1000", "vpn"],
+    ["linux", "10.20.30.40 dev ppp0 src 100.70.1.2 uid 1000", undefined],
+    ["linux", "10.20.30.40 dev tap0 src 10.20.0.1 uid 1000", undefined],
+    ["linux", "10.20.30.40 dev tailscale0 table 52 src 100.101.1.2 uid 1000 \\    cache", "vpn"],
+    ["linux", "10.20.30.40 via 10.8.0.1 dev tun0 src 10.8.0.6 uid 1000 \\    cache", "vpn"],
+    ["linux", "10.20.30.40 dev wlp2s0 src 10.20.30.5 uid 1000 \\    cache", "local"],
+    ["linux", "10.20.30.40 via 192.168.1.1 dev eth0 src 192.168.1.5 uid 1000 \\    cache", "routed"],
+    ["linux", "10.20.30.40 dev docker0 src 10.20.0.1 uid 1000", "machine"],
+    ["linux", "local 10.20.30.40 dev lo table local src 10.20.30.40 uid 1000", "machine"],
+    ["linux", "unreachable 10.20.30.40 uid 1000", undefined],
+    ["linux", "garbage", undefined],
+    ["win32", "0.0.0.0\tEthernet 3\tCisco AnyConnect Secure Mobility Client Virtual Miniport Adapter for Windows x64\t10.20.1.9\r\n", "vpn"],
+    ["win32", "10.20.0.1\tEthernet 2\tPANGP Virtual Ethernet Adapter Secure\t10.20.1.9\r\n", "vpn"],
+    ["win32", "0.0.0.0\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t10.20.30.5\r\n", "local"],
+    ["win32", "192.168.1.1\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t192.168.1.5\r\n", "routed"],
+    ["win32", "0.0.0.0\tvEthernet (WSL)\tHyper-V Virtual Ethernet Adapter\t10.20.0.1\r\n", "machine"],
+    ["win32", "0.0.0.0\tLocal Area Connection* 2\tWAN Miniport (IKEv2)\t10.20.1.9\r\n", "vpn"],
+    ["win32", "0.0.0.0\tLocal Area Connection* 5\tWAN Miniport (PPPOE)\t100.70.1.2\r\n", undefined],
+    // As a Windows VM in the cloud reports its own network card.
+    ["win32", "0.0.0.0\tEthernet\tMicrosoft Hyper-V Network Adapter\t10.20.30.7\r\n", "local"],
+    ["win32", "10.0.0.1\tEthernet\tMicrosoft Hyper-V Network Adapter\t10.0.0.7\r\n", "routed"],
+    ["win32", "0.0.0.0\tvEthernet (nat)\tHyper-V Virtual Ethernet Adapter #2\t172.20.0.1\r\n", "machine"],
+    // A Hyper-V external switch carries the laptop's own Wi-Fi.
+    ["win32", "192.168.1.1\tvEthernet (External Switch)\tHyper-V Virtual Ethernet Adapter\t192.168.1.5\r\n", "routed"],
+    ["win32", "0.0.0.0\tWi-Fi\tIntel(R) Wi-Fi 6 AX201 160MHz\t10.20.30.40\r\n", "machine"],
+    ["win32", "\r\n", undefined],
+  ];
+  for (const [platform, out, expected] of cases) {
+    assert.equal(routeKind(out, "10.20.30.40", platform), expected, `${platform}: ${out}`);
+    assert.equal(await routeOf(out, platform), expected, `${platform}: ${out}`);
+  }
+});
+
+test("each platform runs its own lookup on the address only", () => {
+  assert.deepEqual(routeArgv("10.20.30.40", "darwin"), ["route", "-n", "get", "10.20.30.40"]);
+  assert.deepEqual(routeArgv("fd12:3456:789a::1", "darwin"), ["route", "-n", "get", "-inet6", "fd12:3456:789a::1"]);
+  assert.deepEqual(routeArgv("fd12:3456:789a::1", "linux"), ["ip", "-o", "route", "get", "fd12:3456:789a::1"]);
+  const windows = routeArgv("10.20.30.40", "win32");
+  assert.deepEqual(windows.slice(0, 4), ["powershell", "-NoProfile", "-NonInteractive", "-Command"]);
+  assert.ok(windows[4]?.includes("-RemoteIPAddress '10.20.30.40' "));
+  assert.ok(!windows[4]?.includes('"')); // nothing for Windows' command-line quoting to undo
+});
+
+test("only a private or CGNAT address that surely ran is routed, once per turn", async () => {
+  const out = macRoute("en0", "");
+  assert.equal(await routeOf(out, "darwin", "curl -T f https://vpn.acme.internal/up"), "local");
+  assert.equal(await routeOf(out, "darwin", "curl -T f https://cgnat.example/up"), "local");
+  for (const command of ["curl -T f https://example.com/up", "curl -T f https://split.example/up",
+    "curl -T f http://localhost:8080/up", "curl -T f https://metadata.example/up", "curl -T f https://nowhere.invalid/up",
+    "curl -x proxy.example:8080 -T f http://10.20.30.40/up", "scp -J jump.example f prod:/tmp"]) {
+    assert.equal(await routeOf(out, "darwin", command), undefined, command);
+  }
+  const calls: string[][] = [];
+  const found = await resolveTransfers([
+    { tool_name: "bash", tool_use_id: "a", tool_input: { command: "curl -T a http://10.20.30.40/a" } },
+    { tool_name: "bash", tool_use_id: "b", tool_input: { command: "scp b 10.20.30.40:/b" } },
+    { tool_name: "bash", tool_use_id: "c", ran: "maybe", tool_input: { command: "curl -T c http://10.9.9.9/c" } },
+  ], "/", options({ execFile: fakeRoute(out, calls), platform: "darwin", containerFiles: [] }));
+  assert.equal(found.get("a")?.endpoints[0]?.route, "local");
+  assert.equal(found.get("c")?.endpoints[0]?.route, undefined);
+  assert.deepEqual(calls.filter((c) => c[0] === "route"), [["route", "-n", "get", "10.20.30.40"]]);
+});
+
+test("nothing is routed on a server, in a container or in CI", async () => {
+  const out = macRoute("en0", "");
+  for (const name of ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "CODESPACES", "GITPOD_WORKSPACE_ID", "CODER",
+    "CLOUD_SHELL", "REMOTE_CONTAINERS", "KUBERNETES_SERVICE_HOST", "CI", "CLAUDE_CODE_REMOTE", "WSL_DISTRO_NAME"]) {
+    const found = await transfer("curl -T f http://10.20.30.40/up", "/",
+      { execFile: fakeRoute(out), platform: "darwin", containerFiles: [], env: { [name]: "1" } });
+    assert.equal(found?.endpoints[0]?.route, undefined, name);
+  }
+  const marker = join(mkdtempSync(join(tmpdir(), "transfer-container-")), ".dockerenv");
+  writeFileSync(marker, "");
+  const calls: string[][] = [];
+  const found = await transfer("curl -T f http://10.20.30.40/up", "/",
+    { execFile: fakeRoute(out, calls), platform: "darwin", containerFiles: [marker] });
+  assert.equal(found?.endpoints[0]?.route, undefined);
+  assert.deepEqual(calls, []);
+});
+
+test("an IPv6 scope never reaches the lookup, and PowerShell starts from its system folder", async () => {
+  const calls: string[][] = [];
+  await transfer("curl -T f https://scoped.example/up", "/", {
+    execFile: fakeRoute("", calls), platform: "win32", containerFiles: [], env: { SystemRoot: "C:\\Windows" },
+    lookup: async (host) => (host === "scoped.example" ? ["fd12:3456:789a::1%x;calc"] : []),
+  });
+  const [run] = calls;
+  assert.equal(run?.[0], "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+  assert.ok(run?.at(-1)?.includes("-RemoteIPAddress 'fd12:3456:789a::1' "), JSON.stringify(run));
+  assert.ok(!run?.at(-1)?.includes("calc"));
+});
+
+test("route lookups leave the hosts their share of the turn", async () => {
+  const calls: string[][] = [];
+  let reads = 0;
+  // The turn starts at 0, and 6 of its 10 seconds are gone by the lookup.
+  const found = await transfer("curl -T f http://10.20.30.40/up", "/", {
+    execFile: fakeRoute(macRoute("en0", ""), calls), platform: "darwin", containerFiles: [], now: () => (reads++ === 0 ? 0 : 6_000),
+  });
+  assert.equal(found?.endpoints[0]?.route, undefined);
+  assert.deepEqual(calls, []);
+  // A shorter budget still routes within its first half.
+  const short = await transfer("curl -T f http://10.20.30.40/up", "/", {
+    execFile: fakeRoute(macRoute("en0", ""), calls), platform: "darwin", containerFiles: [], budgetMs: 3_000, now: () => 0,
+  });
+  assert.equal(short?.endpoints[0]?.route, "local");
+});
