@@ -8832,6 +8832,57 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
+def _powershell_hashtable_commands(text: str) -> List[str]:
+    """The ( ) and $( ) expressions inside a PowerShell command's @{ } hashtables, which run while each is built; a
+    single-quoted string expands none, and in a double-quoted one only $( ) runs."""
+    commands, i, quote = [], 0, None
+    while i < len(text):
+        if not quote and text.startswith('@{', i):
+            end = _transfer_hashtable_end(text, i + 2)
+            body, j, inner = text[i + 2:end - 1], 0, None
+            while j < len(body):
+                ch = body[j]
+                if inner == "'":
+                    inner = None if ch == "'" else inner
+                elif inner is None and ch == "'":
+                    inner = "'"
+                elif ch == '"':
+                    inner = None if inner == '"' else '"'
+                elif ch == '(' and (inner is None or body[j - 1:j] == '$'):
+                    close = _powershell_paren_end(body, j + 1)
+                    commands.append(body[j + 1:close - 1])
+                    commands.extend(_powershell_hashtable_commands(body[j + 1:close - 1]))
+                    j = close
+                    continue
+                j += 1
+            i = end
+            continue
+        ch = text[i]
+        quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
+        i += 1
+    return commands
+
+
+def _powershell_paren_end(text: str, i: int) -> int:
+    """The index after the ) that closes a ( whose contents start at i, past single-quoted strings."""
+    depth, quote = 1, False
+    while i < len(text) and depth:
+        if text[i] == "'":
+            quote = not quote
+        elif not quote:
+            depth += 1 if text[i] == '(' else -1 if text[i] == ')' else 0
+        i += 1
+    return i
+
+
+def _merged_transfer(first: Optional[Dict], second: Optional[Dict]) -> Optional[Dict]:
+    """Both transfers' places, the first's tool leading; None when neither found one."""
+    if not first or not second:
+        return first or second
+    extra = [endpoint for endpoint in second['endpoints'] if endpoint not in first['endpoints']]
+    return {'tool': first['tool'], 'endpoints': (first['endpoints'] + extra)[:_TRANSFER_MAX_ENDPOINTS]}
+
+
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None, agent_messages: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
@@ -8921,6 +8972,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
                 transfer = _transfer(command, transfer_dir, transfer_state)
+                # Emptying a hashtable drops what runs inside it, so each such expression is read on its own.
+                if tool_name == 'PowerShell' and isinstance(tool_input.get('command'), str):
+                    for inner in _powershell_hashtable_commands(tool_input['command']):
+                        transfer = _merged_transfer(transfer, _transfer(
+                            _transfer_hashtables_emptied(inner), transfer_dir, transfer_state))
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
                     transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
