@@ -4412,10 +4412,17 @@ def _is_system_checkout_path(path: str) -> bool:
         )
     except Exception:
         return False
-# `cd <target>` occurrences, and PowerShell's Set-Location and its aliases — absolute, ~-rooted, or relative,
-# a quoted target whole — used to track the persistent shell's working directory across the turn's shell calls.
-_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)(?:cd|chdir|pushd|set-location|sl|push-location)'
-                           r'\s+(?:-(?:literal)?path\s+)?(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&]+))', re.IGNORECASE)
+# `cd <target>` occurrences — absolute, ~-rooted, or relative, a quoted target whole — and, for PowerShell, its
+# Set-Location aliases; used to track the persistent shell's working directory across the turn's shell calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)(?:cd|pushd)\s+([^;&|\n]*)')
+_POWERSHELL_CD_TARGET_RE = re.compile(
+    r'(?:^|[;&|\n]\s*)(?:cd|chdir|pushd|set-location|sl|push-location)\s+([^;&|\n]*)', re.IGNORECASE)
+_CD_WORD_RE = re.compile(r'"([^"]*)"|\'([^\']*)\'|(\S+)')
+# PowerShell's common parameters that take a value; any other -Name before the folder is a switch.
+_POWERSHELL_VALUED_PARAMETERS = frozenset({
+    '-erroraction', '-ea', '-warningaction', '-wa', '-informationaction', '-infa', '-errorvariable', '-ev',
+    '-outvariable', '-ov', '-pipelinevariable', '-pv', '-stackname',
+})
 
 # `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
@@ -4432,7 +4439,7 @@ def _shell_segments(command):
         out.append((command[last:m.start()].strip(), m.group(0).strip()))
         last = m.end()
     out.append((command[last:].strip(), ''))
-    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    # Stripped: the cd patterns anchor on ^ or a separator, so a leading space hides the cd.
     return out
 
 
@@ -4445,7 +4452,7 @@ def _merge_cwds(first, second):
     return out[:8]
 
 
-def _git_path_opt_targets(command, shell_dir):
+def _git_path_opt_targets(command, shell_dir, powershell=False):
     """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
     targets = []
     try:
@@ -4456,14 +4463,14 @@ def _git_path_opt_targets(command, shell_dir):
         for segment, separator in _shell_segments(command):
             words = _segment_words(segment)
             # git only: `grep -C 3` is context lines, not a directory.
-            if words and os.path.basename(words[0]) == 'git':
+            if words and _command_name(words[0], powershell) == 'git':
                 for match in _GIT_PATH_OPT_RE.finditer(segment):
                     raw = match.group(1) or match.group(2) or match.group(3)
                     if not raw:
                         continue
                     for cwd in cwds:
                         target = os.path.expanduser(raw) if raw.startswith('~') else raw
-                        if not target.startswith('/'):
+                        if not target.startswith('/') and not re.match(r'[A-Za-z]:[\\/]', target):
                             if not cwd:
                                 continue
                             target = os.path.join(cwd, target)
@@ -4471,7 +4478,7 @@ def _git_path_opt_targets(command, shell_dir):
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
-            moved = [_next_shell_dir(segment, c) for c in cwds]
+            moved = [_next_shell_dir(segment, c, powershell) for c in cwds]
             if separator == '&&':
                 # Next runs only if this one succeeded, so its cd took effect —
                 # but this segment may instead have failed, which a later || reaches.
@@ -4546,12 +4553,26 @@ def _git_worktree_roots(path: str) -> List[str]:
         return []
 
 
-def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
+def _cd_target(arguments: str, powershell: bool) -> Optional[str]:
+    """The folder a cd's arguments name, past its switches; `-` alone is the previous folder."""
+    # (word, whether it was quoted); a quoted word is never a switch.
+    words = [(m.group(3), False) if m.group(3) is not None else (m.group(1) if m.group(1) is not None else m.group(2), True)
+             for m in _CD_WORD_RE.finditer(arguments)]
+    i = 0
+    while i < len(words):
+        word, quoted = words[i]
+        if quoted or word == '-' or not word.startswith('-'):
+            return word
+        i += 2 if powershell and word.lower() in _POWERSHELL_VALUED_PARAMETERS else 1
+    return None
+
+
+def _next_shell_dir(command: str, shell_dir: Optional[str], powershell: bool = False) -> Optional[str]:
     """Follow the last `cd` in `command`; unchanged on no cd or any error."""
     try:
         target = None
-        for m in _CD_TARGET_RE.finditer(command):
-            target = next(group for group in m.groups() if group)
+        for m in (_POWERSHELL_CD_TARGET_RE if powershell else _CD_TARGET_RE).finditer(command):
+            target = _cd_target(m.group(1), powershell)
         if not target:
             return shell_dir
         if target.startswith('~'):
@@ -4590,9 +4611,11 @@ _SHELL_WRITE_COMMANDS = frozenset({
 # PowerShell's own writes and their common aliases, matched case-insensitively as PowerShell does.
 _POWERSHELL_WRITE_COMMANDS = frozenset({
     'set-content', 'add-content', 'clear-content', 'out-file', 'new-item', 'remove-item', 'copy-item',
-    'move-item', 'rename-item', 'sc', 'ac', 'ni', 'ri', 'del', 'erase', 'rd', 'cpi', 'copy', 'mi', 'move',
-    'rni', 'ren',
+    'move-item', 'rename-item', 'tee-object', 'export-csv', 'export-clixml', 'expand-archive', 'compress-archive',
+    'sc', 'ac', 'clc', 'ni', 'md', 'ri', 'del', 'erase', 'rd', 'cpi', 'copy', 'mi', 'move', 'rni', 'ren',
 })
+# Web cmdlets write a file only with -OutFile.
+_POWERSHELL_DOWNLOADS = frozenset({'invoke-webrequest', 'iwr', 'invoke-restmethod', 'irm'})
 # A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
 _SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
 _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
@@ -4634,11 +4657,21 @@ def _segment_words(segment):
     return words
 
 
+def _command_name(word, powershell=False):
+    """A command word's program; PowerShell's is case-insensitive and may end in .exe."""
+    if not powershell:
+        return os.path.basename(word)
+    name = re.split(r'[\\/]', word)[-1].lower()
+    return name[:-4] if name.endswith('.exe') else name
+
+
 def _segment_writes(words, powershell=False):
     """Whether a segment's command word plus its flags mutate the working tree."""
-    name = os.path.basename(words[0])
-    if name in _SHELL_WRITE_COMMANDS or powershell and name.lower() in _POWERSHELL_WRITE_COMMANDS:
+    name = _command_name(words[0], powershell)
+    if name in _SHELL_WRITE_COMMANDS or powershell and name in _POWERSHELL_WRITE_COMMANDS:
         return True
+    if powershell and name in _POWERSHELL_DOWNLOADS:
+        return any(w.lower().startswith('-outf') for w in words[1:])
     if name in _SHELL_INPLACE_COMMANDS:
         return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
     if name == 'dd':
@@ -4657,14 +4690,14 @@ def _git_subcommand(words):
     return None
 
 
-def _is_git_write_command(command):
+def _is_git_write_command(command, powershell=False):
     """Whether any segment runs a git subcommand that changes the repository; False on any error."""
     try:
-        if not isinstance(command, str) or 'git' not in command:
+        if not isinstance(command, str) or 'git' not in (command.lower() if powershell else command):
             return False
         for segment, _ in _shell_segments(command):  # unmasked, so a quoted option value resolves
             words = _segment_words(segment)
-            if not words or os.path.basename(words[0]) != 'git':
+            if not words or _command_name(words[0], powershell) != 'git':
                 continue
             subcommand = _git_subcommand(words)
             if subcommand in _GIT_WRITE_SUBCOMMANDS:
@@ -4716,8 +4749,8 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
             candidates.extend(
                 p for p in _abs_paths(command) if not _is_system_checkout_path(p)
             )
-            candidates.extend(_git_path_opt_targets(command, shell_dir))
-            shell_dir = _next_shell_dir(command, shell_dir)
+            candidates.extend(_git_path_opt_targets(command, shell_dir, tool_name == 'PowerShell'))
+            shell_dir = _next_shell_dir(command, shell_dir, tool_name == 'PowerShell')
             if not candidates and shell_dir:
                 candidates.append(shell_dir)
     return candidates, shell_dir
@@ -4771,7 +4804,8 @@ def _shell_command(tool_name: Optional[str], tool_input: Optional[Dict]) -> Opti
 def _repo_gate_applies(tool_name, command):
     """Whether this call is in the gate's scope: a write tool always, a shell call only when it runs a git write or writes a file."""
     if tool_name in _REPO_GATE_SHELL_TOOLS:
-        return _is_git_write_command(command) or _is_shell_write_command(command, tool_name == 'PowerShell')
+        powershell = tool_name == 'PowerShell'
+        return _is_git_write_command(command, powershell) or _is_shell_write_command(command, powershell)
     return tool_name in _REPO_GATE_WRITE_TOOLS
 
 
@@ -4793,12 +4827,14 @@ def _repo_gate_scope_allows(policy: Dict, org: str, repo: str) -> bool:
     return org == policy['github_org'].strip().lower()
 
 
-def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict], root_projects: Dict[str, tuple]) -> Optional[str]:
-    """First candidate outside every scope; a git failure propagates to fail open."""
-    for candidate in candidates:
-        root = _find_git_root(candidate)
-        if not root:
-            continue
+def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict], root_projects: Dict[str, tuple],
+                              fallback: Optional[str] = None) -> Optional[str]:
+    """First candidate outside every scope, then fallback when no candidate is in a repo; a git failure propagates
+    to fail open."""
+    roots = [root for root in map(_find_git_root, candidates) if root]
+    if not roots and fallback:
+        roots = [root for root in [_find_git_root(fallback)] if root]
+    for root in roots:
         if root not in root_projects:
             root_projects[root] = _get_git_origin_org_repo(root)
         org, repo = root_projects[root]
@@ -4926,10 +4962,12 @@ def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
         if not block_policies:
             return None
 
-        candidates, _ = _tool_use_path_candidates(
+        candidates, shell_dir = _tool_use_path_candidates(
             tool_name, event.get('tool_input'), event.get('cwd')
         )
-        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        # A shell call's paths may all lie outside any repo, such as one in a commit message; it still runs in its folder.
+        repo = _repo_gate_violating_repo(candidates, block_policies, {},
+                                         shell_dir if tool_name in _REPO_GATE_SHELL_TOOLS else None)
         gate = {'decision': 'deny', 'repo': repo} if repo else None
         if gate and get_unbound_attribution_enabled():
             gate['trace_id'] = str(uuid.uuid4())
