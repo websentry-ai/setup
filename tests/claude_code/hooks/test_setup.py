@@ -1210,6 +1210,23 @@ class TestInstallUnderResolvedDir(unittest.TestCase):
         self.assertEqual(failures, [theirs, {"matcher": "Bash|PowerShell",
                                              "hooks": [{"type": "command", "command": str(hook_path)}]}])
 
+    def test_an_upgrade_moves_our_hook_out_of_a_failure_group_shared_with_the_users(self):
+        # The user's hook keeps its Bash matcher; ours gets a group of its own, so a failed Bash call is logged once.
+        hook_path = self.config_dir / "hooks" / "unbound.py"
+        theirs = {"type": "command", "command": "/usr/local/bin/their-hook"}
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        (self.config_dir / "settings.json").write_text(json.dumps({"hooks": {"PostToolUseFailure": [
+            {"matcher": "Bash", "hooks": [theirs, {"type": "command", "command": str(hook_path)}]}]}}))
+        with patch.object(Path, "home", staticmethod(lambda: self.home)), \
+             patch.object(setup, "download_file", lambda url, dest, *_: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+            self.assertTrue(setup.setup_hooks(config_dir=self.config_dir))
+            self.assertTrue(setup.configure_claude_settings(config_dir=self.config_dir))
+
+        failures = json.loads((self.config_dir / "settings.json").read_text())["hooks"]["PostToolUseFailure"]
+        self.assertEqual(failures[0], {"matcher": "Bash", "hooks": [theirs]})
+        self.assertEqual([(g["matcher"], [h["command"] for h in g["hooks"]]) for g in failures[1:]],
+                         [("Bash|PowerShell", [str(hook_path)])])
+
     def test_backward_compat_no_env_uses_home_claude(self):
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
         with patch.dict(os.environ, env, clear=True), \

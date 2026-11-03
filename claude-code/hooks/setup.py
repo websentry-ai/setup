@@ -696,12 +696,16 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                         existing_hooks = existing_item.get("hooks")
                         hooks = [h for h in existing_hooks if isinstance(h, dict)] if isinstance(existing_hooks, list) else []
                         ours = [_command_targets_hook(h.get("command", ""), script_path) for h in hooks]
-                        if any(ours):
+                        matcher = new_config[0].get("matcher")
+                        if any(ours) and (all(ours) or matcher is None or existing_item.get("matcher") == matcher):
                             our_hook_exists = True
-                            # An install from before a matcher widened keeps the old one; an entry holding only
-                            # our hook takes the new matcher, and one shared with the user's hooks is left alone.
-                            if all(ours) and "matcher" in new_config[0]:
-                                existing_item["matcher"] = new_config[0]["matcher"]
+                            # An install from before a matcher widened keeps the old one; ours takes the new one.
+                            if matcher is not None:
+                                existing_item["matcher"] = matcher
+                        elif any(ours):
+                            # A group shared with the user's hooks keeps their matcher; ours moves to its own group.
+                            existing_item["hooks"] = [h for h in existing_hooks if not (
+                                isinstance(h, dict) and _command_targets_hook(h.get("command", ""), script_path))]
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)

@@ -8833,17 +8833,18 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 
 
 def _powershell_hashtable_values(text: str) -> List[str]:
-    """Each value in a PowerShell command's @{ } hashtables, nested ones included, a script block's body unwrapped:
-    a value is a statement PowerShell runs while the hashtable is built."""
+    """Each value in a PowerShell command's @{ } hashtables, nested ones included: a statement PowerShell runs while
+    the hashtable is built. A script block runs only when called with & or ., so a stored one is left out."""
     values, i, quote = [], 0, None
     while i < len(text):
         if not quote and text.startswith('@{', i):
             end = _transfer_hashtable_end(text, i + 2)
             for entry in _powershell_hashtable_entries(text[i + 2:end - 1]):
-                value = entry.partition('=')[2].strip()
-                block = re.match(r'^[&.]?\s*\{(.*)\}$', value, re.DOTALL)
-                if value:
-                    values.append(block.group(1) if block else value)
+                # A backtick at a line's end continues the statement on the next line.
+                value = re.sub(r'`\r?\n', ' ', entry.partition('=')[2]).strip()
+                block = re.match(r'^([&.]?)\s*\{(.*)\}$', value, re.DOTALL)
+                if value and not (block and not block.group(1)):
+                    values.append(block.group(2) if block else value)
                     values.extend(_powershell_hashtable_values(value))
             i = end
             continue
@@ -8854,14 +8855,16 @@ def _powershell_hashtable_values(text: str) -> List[str]:
 
 
 def _powershell_hashtable_entries(body: str) -> List[str]:
-    """A hashtable's body split at the ; and line breaks between entries, past quotes, backtick escapes and brackets."""
+    """A hashtable's body split at the ; and line breaks between entries, past quotes, backtick escapes and brackets;
+    a backtick escapes the next character anywhere but in a single-quoted string."""
     entries, start, depth, quote, i = [], 0, 0, None, 0
     while i < len(body):
         ch = body[i]
+        if ch == '`' and quote != "'":
+            i += 2
+            continue
         if quote:
-            if ch == '`' and quote == '"':
-                i += 1
-            elif ch == quote:
+            if ch == quote:
                 quote = None
         elif ch in '\'"':
             quote = ch
