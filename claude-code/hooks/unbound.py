@@ -8832,7 +8832,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
-def _powershell_hashtable_values(text: str) -> List[str]:
+def _powershell_hashtable_values(text: str, depth: int = 0) -> List[str]:
     """Each value in a PowerShell command's @{ } hashtables, nested ones included: a statement PowerShell runs while
     the hashtable is built. A script block runs only when called with & or ., so a stored one is left out."""
     values, i, quote = [], 0, None
@@ -8845,7 +8845,8 @@ def _powershell_hashtable_values(text: str) -> List[str]:
                 block = re.match(r'^([&.]?)\s*\{(.*)\}$', value, re.DOTALL)
                 if value and not (block and not block.group(1)):
                     values.append(block.group(2) if block else value)
-                    values.extend(_powershell_hashtable_values(value))
+                    if depth < _TRANSFER_MAX_DEPTH:
+                        values.extend(_powershell_hashtable_values(value, depth + 1))
             i = end
             continue
         ch = text[i]
@@ -8861,7 +8862,7 @@ def _powershell_hashtable_entries(body: str) -> List[str]:
     while i < len(body):
         ch = body[i]
         if ch == '`' and quote != "'":
-            i += 2
+            i += 3 if body.startswith('\r\n', i + 1) else 2
             continue
         if quote:
             if ch == quote:
@@ -8979,9 +8980,12 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 transfer = _transfer(command, transfer_dir, transfer_state)
                 # Emptying a hashtable drops the statements its values run, so each value is read on its own.
                 if tool_name == 'PowerShell' and isinstance(tool_input.get('command'), str):
-                    for inner in _powershell_hashtable_values(tool_input['command']):
-                        transfer = _merged_transfer(transfer, _transfer(
-                            _transfer_hashtables_emptied(inner), transfer_dir, transfer_state))
+                    try:
+                        for inner in _powershell_hashtable_values(tool_input['command']):
+                            transfer = _merged_transfer(transfer, _transfer(
+                                _transfer_hashtables_emptied(inner), transfer_dir, transfer_state))
+                    except Exception:
+                        pass  # what the call itself sent is kept
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
                     transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
