@@ -1140,3 +1140,20 @@ class TestPowerShellTool(RepoGateCase):
         self.assertEqual([use['project'] for use in uses], ['unboundsec/setup', 'unboundsec/setup'])
         # The logged input is the command as sent.
         self.assertIn('cd ../widgets', uses[0]['tool_input']['command'])
+
+    def test_set_location_moves_the_calls_project_for_powershell_only(self):
+        def projects(*calls):
+            events = [{'event': {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'session_id': 'S1',
+                                 'cwd': str(self.in_scope)}}]
+            events += [{'event': {'hook_event_name': 'PostToolUse', 'tool_name': tool, 'tool_response': {},
+                                  'session_id': 'S1', 'tool_input': {'command': command}}} for tool, command in calls]
+            exchange = unbound.build_llm_exchange(events, cwd=str(self.in_scope))
+            return [use['project'] for message in exchange['messages'] for use in message.get('tool_use') or []]
+
+        for verb in ('Set-Location', 'sl', 'Set-Location -Path'):
+            with self.subTest(verb=verb):
+                self.assertEqual(projects(('PowerShell', f'{verb} ../widgets'), ('PowerShell', 'git status')),
+                                 ['acme/widgets', 'acme/widgets'])
+        # sl is not a bash cd.
+        self.assertEqual(projects(('Bash', 'sl ../widgets'), ('Bash', 'git status')),
+                         ['unboundsec/setup', 'unboundsec/setup'])

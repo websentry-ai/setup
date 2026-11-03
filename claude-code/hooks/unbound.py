@@ -4410,6 +4410,10 @@ def _is_system_checkout_path(path: str) -> bool:
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+# PowerShell's own location verbs, case-insensitive, with an optional -Path or -LiteralPath.
+_POWERSHELL_CD_TARGET_RE = re.compile(
+    r'(?:^|[;&|\n]\s*)(?:cd|chdir|pushd|set-location|sl|push-location)\s+(?:-(?:literal)?path[:\s]\s*)?'
+    r'(["\']?)([^\s"\';|&]+)\1', re.IGNORECASE)
 
 # `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
@@ -4439,7 +4443,7 @@ def _merge_cwds(first, second):
     return out[:8]
 
 
-def _git_path_opt_targets(command, shell_dir):
+def _git_path_opt_targets(command, shell_dir, powershell=False):
     """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
     targets = []
     try:
@@ -4465,7 +4469,7 @@ def _git_path_opt_targets(command, shell_dir):
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
-            moved = [_next_shell_dir(segment, c) for c in cwds]
+            moved = [_next_shell_dir(segment, c, powershell) for c in cwds]
             if separator == '&&':
                 # Next runs only if this one succeeded, so its cd took effect —
                 # but this segment may instead have failed, which a later || reaches.
@@ -4540,17 +4544,17 @@ def _git_worktree_roots(path: str) -> List[str]:
         return []
 
 
-def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
-    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
+def _next_shell_dir(command: str, shell_dir: Optional[str], powershell: bool = False) -> Optional[str]:
+    """Follow the last `cd` in `command`, or for PowerShell its Set-Location; unchanged on none or any error."""
     try:
         target = None
-        for m in _CD_TARGET_RE.finditer(command):
+        for m in (_POWERSHELL_CD_TARGET_RE if powershell else _CD_TARGET_RE).finditer(command):
             target = m.group(2)
         if not target:
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
+        if target.startswith('/') or powershell and re.match(r'[A-Za-z]:[\\/]', target):
             return os.path.normpath(target)
         if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
             return shell_dir
@@ -4701,8 +4705,8 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
             candidates.extend(
                 p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
             )
-            candidates.extend(_git_path_opt_targets(command, shell_dir))
-            shell_dir = _next_shell_dir(command, shell_dir)
+            candidates.extend(_git_path_opt_targets(command, shell_dir, tool_name == 'PowerShell'))
+            shell_dir = _next_shell_dir(command, shell_dir, tool_name == 'PowerShell')
             if not candidates and shell_dir:
                 candidates.append(shell_dir)
     return candidates, shell_dir
