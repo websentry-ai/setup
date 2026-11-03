@@ -8832,47 +8832,49 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
-def _powershell_hashtable_commands(text: str) -> List[str]:
-    """The ( ) and $( ) expressions inside a PowerShell command's @{ } hashtables, which run while each is built; a
-    single-quoted string expands none, and in a double-quoted one only $( ) runs."""
-    commands, i, quote = [], 0, None
+def _powershell_hashtable_values(text: str) -> List[str]:
+    """Each value in a PowerShell command's @{ } hashtables, nested ones included, a script block's body unwrapped:
+    a value is a statement PowerShell runs while the hashtable is built."""
+    values, i, quote = [], 0, None
     while i < len(text):
         if not quote and text.startswith('@{', i):
             end = _transfer_hashtable_end(text, i + 2)
-            body, j, inner = text[i + 2:end - 1], 0, None
-            while j < len(body):
-                ch = body[j]
-                if inner == "'":
-                    inner = None if ch == "'" else inner
-                elif inner is None and ch == "'":
-                    inner = "'"
-                elif ch == '"':
-                    inner = None if inner == '"' else '"'
-                elif ch == '(' and (inner is None or body[j - 1:j] == '$'):
-                    close = _powershell_paren_end(body, j + 1)
-                    commands.append(body[j + 1:close - 1])
-                    commands.extend(_powershell_hashtable_commands(body[j + 1:close - 1]))
-                    j = close
-                    continue
-                j += 1
+            for entry in _powershell_hashtable_entries(text[i + 2:end - 1]):
+                value = entry.partition('=')[2].strip()
+                block = re.match(r'^[&.]?\s*\{(.*)\}$', value, re.DOTALL)
+                if value:
+                    values.append(block.group(1) if block else value)
+                    values.extend(_powershell_hashtable_values(value))
             i = end
             continue
         ch = text[i]
         quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
         i += 1
-    return commands
+    return values
 
 
-def _powershell_paren_end(text: str, i: int) -> int:
-    """The index after the ) that closes a ( whose contents start at i, past single-quoted strings."""
-    depth, quote = 1, False
-    while i < len(text) and depth:
-        if text[i] == "'":
-            quote = not quote
-        elif not quote:
-            depth += 1 if text[i] == '(' else -1 if text[i] == ')' else 0
+def _powershell_hashtable_entries(body: str) -> List[str]:
+    """A hashtable's body split at the ; and line breaks between entries, past quotes, backtick escapes and brackets."""
+    entries, start, depth, quote, i = [], 0, 0, None, 0
+    while i < len(body):
+        ch = body[i]
+        if quote:
+            if ch == '`' and quote == '"':
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in '\'"':
+            quote = ch
+        elif ch in '({[':
+            depth += 1
+        elif ch in ')}]':
+            depth -= 1
+        elif ch in ';\n' and depth == 0:
+            entries.append(body[start:i])
+            start = i + 1
         i += 1
-    return i
+    entries.append(body[start:])
+    return entries
 
 
 def _merged_transfer(first: Optional[Dict], second: Optional[Dict]) -> Optional[Dict]:
@@ -8972,9 +8974,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
                 transfer = _transfer(command, transfer_dir, transfer_state)
-                # Emptying a hashtable drops what runs inside it, so each such expression is read on its own.
+                # Emptying a hashtable drops the statements its values run, so each value is read on its own.
                 if tool_name == 'PowerShell' and isinstance(tool_input.get('command'), str):
-                    for inner in _powershell_hashtable_commands(tool_input['command']):
+                    for inner in _powershell_hashtable_values(tool_input['command']):
                         transfer = _merged_transfer(transfer, _transfer(
                             _transfer_hashtables_emptied(inner), transfer_dir, transfer_state))
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
