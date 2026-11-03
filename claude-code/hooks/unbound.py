@@ -8832,63 +8832,6 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
-def _powershell_hashtable_values(text: str, depth: int = 0) -> List[str]:
-    """Each value in a PowerShell command's @{ } hashtables, nested ones included: a statement PowerShell runs while
-    the hashtable is built. A script block runs only when called with & or ., so a stored one is left out."""
-    values, i, quote = [], 0, None
-    while i < len(text):
-        if not quote and text.startswith('@{', i):
-            end = _transfer_hashtable_end(text, i + 2)
-            for entry in _powershell_hashtable_entries(text[i + 2:end - 1]):
-                # A backtick at a line's end continues the statement on the next line.
-                value = re.sub(r'`\r?\n', ' ', entry.partition('=')[2]).strip()
-                block = re.match(r'^([&.]?)\s*\{(.*)\}$', value, re.DOTALL)
-                if value and not (block and not block.group(1)):
-                    values.append(block.group(2) if block else value)
-                    if depth < _TRANSFER_MAX_DEPTH:
-                        values.extend(_powershell_hashtable_values(value, depth + 1))
-            i = end
-            continue
-        ch = text[i]
-        quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
-        i += 1
-    return values
-
-
-def _powershell_hashtable_entries(body: str) -> List[str]:
-    """A hashtable's body split at the ; and line breaks between entries, past quotes, backtick escapes and brackets;
-    a backtick escapes the next character anywhere but in a single-quoted string."""
-    entries, start, depth, quote, i = [], 0, 0, None, 0
-    while i < len(body):
-        ch = body[i]
-        if ch == '`' and quote != "'":
-            i += 3 if body.startswith('\r\n', i + 1) else 2
-            continue
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in '\'"':
-            quote = ch
-        elif ch in '({[':
-            depth += 1
-        elif ch in ')}]':
-            depth -= 1
-        elif ch in ';\n' and depth == 0:
-            entries.append(body[start:i])
-            start = i + 1
-        i += 1
-    entries.append(body[start:])
-    return entries
-
-
-def _merged_transfer(first: Optional[Dict], second: Optional[Dict]) -> Optional[Dict]:
-    """Both transfers' places, the first's tool leading; None when neither found one."""
-    if not first or not second:
-        return first or second
-    extra = [endpoint for endpoint in second['endpoints'] if endpoint not in first['endpoints']]
-    return {'tool': first['tool'], 'endpoints': (first['endpoints'] + extra)[:_TRANSFER_MAX_ENDPOINTS]}
-
-
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None, agent_messages: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
@@ -8978,14 +8921,6 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
                 transfer = _transfer(command, transfer_dir, transfer_state)
-                # Emptying a hashtable drops the statements its values run, so each value is read on its own.
-                if tool_name == 'PowerShell' and isinstance(tool_input.get('command'), str):
-                    try:
-                        for inner in _powershell_hashtable_values(tool_input['command']):
-                            transfer = _merged_transfer(transfer, _transfer(
-                                _transfer_hashtables_emptied(inner), transfer_dir, transfer_state))
-                    except Exception:
-                        pass  # what the call itself sent is kept
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
                     transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
