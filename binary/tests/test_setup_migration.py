@@ -101,7 +101,7 @@ def test_setup_full_run_configures_everything(env):
             {"type": "command", "command": _cmd("claude-code", "PreToolUse"), "timeout": 15000}]}],
         "PostToolUse": [{"matcher": "*", "hooks": [
             {"type": "command", "command": _cmd("claude-code", "PostToolUse"), "async": True, "timeout": 60}]}],
-        "PostToolUseFailure": [{"matcher": "Bash", "hooks": [
+        "PostToolUseFailure": [{"matcher": "Bash|PowerShell", "hooks": [
             {"type": "command", "command": _cmd("claude-code", "PostToolUseFailure"), "async": True, "timeout": 60}]}],
         "UserPromptSubmit": [{"hooks": [
             {"type": "command", "command": _cmd("claude-code", "UserPromptSubmit"), "timeout": 60}]}],
@@ -276,8 +276,8 @@ def test_setup_is_idempotent(env):
 
 
 def test_claude_code_registers_post_tool_use_failure_once(env):
-    # The hook reads a failed Bash call from this event; a rerun keeps exactly one entry.
-    ours = [{"matcher": "Bash", "hooks": [
+    # The hook reads a failed shell call from this event; a rerun keeps exactly one entry.
+    ours = [{"matcher": "Bash|PowerShell", "hooks": [
         {"type": "command", "command": _cmd("claude-code", "PostToolUseFailure"), "async": True, "timeout": 60}]}]
     for _ in range(2):
         assert setup_cmd.run(["--api-key", "admin-key"]) == 0

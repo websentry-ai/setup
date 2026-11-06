@@ -297,7 +297,7 @@ class CallersOutsideTheBackfillTestCase(unittest.TestCase):
         self.home.mkdir()
 
     def _install(self):
-        def download(url, dest):
+        def download(url, dest, *_):
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text("# hook\n")
             return True

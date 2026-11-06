@@ -455,21 +455,44 @@ def remove_gateway_artifacts(config_dir: Path = None) -> None:
             debug_print(f"Failed to remove {key_helper_path}: {e}")
 
 
-def download_file(url: str, dest_path: Path) -> bool:
+def download_file(url: str, dest_path: Path, gateway_url: Optional[str] = None) -> bool:
+    # Fetch beside dest_path and swap in whole: a hook firing mid-download, or a
+    # dropped connection, must never leave the live file partly written.
+    tmp_path = dest_path.with_name(f"{dest_path.name}.{os.getpid()}.tmp")
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        # Only temps a killed run left behind: a live download is never older than
+        # curl's 30s timeout, and must not lose its file to a concurrent run.
+        for stale in dest_path.parent.glob(f"{dest_path.name}.*.tmp"):
+            try:
+                if time.time() - stale.stat().st_mtime > 300:
+                    stale.unlink()
+            except FileNotFoundError:
+                pass
         debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", str(dest_path), url],
+            ["curl", "-fsSL", "-o", str(tmp_path), url],
             capture_output=True,
             timeout=30
         )
-        if result.returncode == 0:
-            debug_print(f"File downloaded successfully: {dest_path}")
-        return result.returncode == 0
-    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        if result.returncode != 0:
+            return False
+        if gateway_url:
+            rewrite_gateway_url_in_file(tmp_path, gateway_url)
+        if dest_path.exists():
+            shutil.copymode(dest_path, tmp_path)
+        os.replace(tmp_path, dest_path)
+        debug_print(f"File downloaded successfully: {dest_path}")
+        return True
+    except (subprocess.TimeoutExpired, OSError, ValueError) as e:
         print(f"❌ Failed to download {url}: {e}")
         return False
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except OSError:
+            pass
 
 
 def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
@@ -477,13 +500,11 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
     so tenant deployments don't depend on the env var being set at runtime."""
     if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
         return
-    try:
-        text = path.read_text(encoding="utf-8")
-        new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
-        if new_text != text:
-            path.write_text(new_text, encoding="utf-8")
-    except Exception as e:
-        debug_print(f"Could not rewrite gateway URL in {path}: {e}")
+    # Raises on failure: download_file must never swap in a half-rewritten hook.
+    text = path.read_text(encoding="utf-8")
+    new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', json.dumps(gateway_url))
+    if new_text != text:
+        path.write_text(new_text, encoding="utf-8")
 
 
 def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, config_dir: Path = None):
@@ -492,10 +513,9 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, config_dir: Path = None)
     script_path = hooks_dir / "unbound.py"
 
     # print("\n📥 Downloading unbound.py script...")
-    if not download_file(SCRIPT_URL, script_path):
+    if not download_file(SCRIPT_URL, script_path, gateway_url):
         return False
     # print("✅ unbound.py downloaded")
-    rewrite_gateway_url_in_file(script_path, gateway_url)
     
     try:
         current_mode = script_path.stat().st_mode
@@ -597,10 +617,10 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                     ]
                 }
             ],
-            # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+            # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
             "PostToolUseFailure": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|PowerShell",
                     "hooks": [
                         _hook({
                             "type": "command",
@@ -674,13 +694,18 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                         # scalar would be iterated and raise, aborting the
                         # merge and leaving our hook unregistered.
                         existing_hooks = existing_item.get("hooks")
-                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
-                            if not isinstance(hook, dict):
-                                continue
-                            existing_cmd = hook.get("command", "")
-                            if _command_targets_hook(existing_cmd, script_path):
-                                our_hook_exists = True
-                                break
+                        hooks = [h for h in existing_hooks if isinstance(h, dict)] if isinstance(existing_hooks, list) else []
+                        ours = [_command_targets_hook(h.get("command", ""), script_path) for h in hooks]
+                        matcher = new_config[0].get("matcher")
+                        if any(ours) and (all(ours) or matcher is None or existing_item.get("matcher") == matcher):
+                            our_hook_exists = True
+                            # An install from before a matcher widened keeps the old one; ours takes the new one.
+                            if matcher is not None:
+                                existing_item["matcher"] = matcher
+                        elif any(ours):
+                            # A group shared with the user's hooks keeps their matcher; ours moves to its own group.
+                            existing_item["hooks"] = [h for h in existing_hooks if not (
+                                isinstance(h, dict) and _command_targets_hook(h.get("command", ""), script_path))]
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)

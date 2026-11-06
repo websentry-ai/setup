@@ -75,7 +75,7 @@ def test_setting_on_the_first_line_of_the_cloud_cache_turns_it_on(codex):
 
 def test_mdm_keeps_foreign_hooks_and_replaces_ours(tmp_path, monkeypatch):
     monkeypatch.setattr(mdm, "get_managed_settings_dir", lambda: tmp_path)
-    monkeypatch.setattr(mdm, "download_file", lambda _u, dest: Path(dest).write_text("#") or True)
+    monkeypatch.setattr(mdm, "download_file", lambda _u, dest, *_: Path(dest).write_text("#") or True)
     ours = str(tmp_path / "hooks" / "unbound.py")
     foreign = {"hooks": [{"type": "command", "command": "/usr/local/bin/audit"}]}
     (tmp_path / "hooks.json").write_text(json.dumps({"version": 2, "hooks": {"Stop": [
@@ -102,7 +102,7 @@ def test_quoted_key_turns_it_on(codex):
 
 def test_mdm_keeps_a_foreign_handler_that_shares_a_group_with_ours(tmp_path, monkeypatch):
     monkeypatch.setattr(mdm, "get_managed_settings_dir", lambda: tmp_path)
-    monkeypatch.setattr(mdm, "download_file", lambda _u, dest: Path(dest).write_text("#") or True)
+    monkeypatch.setattr(mdm, "download_file", lambda _u, dest, *_: Path(dest).write_text("#") or True)
     audit = {"type": "command", "command": "/usr/local/bin/audit"}
     ours = {"type": "command", "command": f'"{tmp_path / "hooks" / "unbound.py"}"'}
     (tmp_path / "hooks.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [audit, ours]}]}}))

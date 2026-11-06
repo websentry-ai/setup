@@ -42,8 +42,16 @@ TURN_LOG_PATHS = {
 KEY = 'test-key'
 SECRET = 'SECRET-ROW-123'
 COMMAND = 'scp -F backup.conf customers.sql backup:/srv'
+# Inside a container the hook sends no route, as it would describe the container's network.
+IN_CONTAINER = any(os.path.exists(path) for path in ('/.dockerenv', '/run/.containerenv'))
 EXPECTED = {'tool': 'scp', 'endpoints': [
-    {'direction': 'out', 'host': 'backup', 'resolved_host': '10.0.4.12', 'address': 'private'}]}
+    {'direction': 'out', 'host': 'backup', 'resolved_host': '10.0.4.12', 'address': 'private',
+     **({} if IN_CONTAINER else {'route': 'vpn'})}]}
+# This machine's route lookups, macOS's and Linux's, each answering that 10.0.4.12 is reached through a tunnel.
+FAKE_ROUTES = {
+    'route': '   route to: 10.0.4.12\ndestination: 10.0.0.0\n  interface: utun4\n      flags: <UP,DONE,STATIC>\n',
+    'ip': '10.0.4.12 dev wg0 src 10.66.0.2 uid 501 \\    cache\n',
+}
 SSH_CONFIG = 'Host backup\n  HostName 10.0.4.12\n'
 # Every proxy points at a closed port, so anything but the capture server fails instead of leaving the machine.
 DEAD = 'http://127.0.0.1:9'
@@ -125,14 +133,19 @@ def sandbox(tmp_path):
     (home / '.unbound' / 'config.json').write_text(json.dumps({'api_key': KEY}))
     (project / 'backup.conf').write_text(SSH_CONFIG)
     (project / 'customers.sql').write_text(SECRET + '\n')
-    return {'root': tmp_path, 'home': home, 'project': project, 'tmp': tmp}
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    for name, out in FAKE_ROUTES.items():
+        (bin_dir / name).write_text("#!/bin/sh\nprintf '%s' '" + out + "'\n")
+        (bin_dir / name).chmod(0o755)
+    return {'root': tmp_path, 'home': home, 'project': project, 'tmp': tmp, 'bin': bin_dir}
 
 
 def hook_env(sandbox, gateway):
     env = {
         'HOME': str(sandbox['home']),
         'USER': os.environ.get('USER', 'tester'),
-        'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
+        'PATH': str(sandbox['bin']) + ':/usr/bin:/bin:/usr/sbin:/sbin',
         'TMPDIR': str(sandbox['tmp']),
         'UNBOUND_GATEWAY_URL': gateway.url,
         'NO_PROXY': '127.0.0.1,localhost',

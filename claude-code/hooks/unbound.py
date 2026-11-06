@@ -32,7 +32,9 @@ _CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Pat
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
+# Claude Code's shells: Bash everywhere, and its PowerShell tool, on by default on Windows.
+SHELL_TOOL_NAMES = ('Bash', 'PowerShell')
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'PowerShell', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
 MCP_TOOL_PREFIX = 'mcp__'
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
@@ -999,8 +1001,8 @@ def extract_command_for_pretool(event: Dict) -> str:
     tool_input = event.get('tool_input') or {}
     tool_name = event.get('tool_name', '')
 
-    # Bash: command field
-    if tool_name == 'Bash' and 'command' in tool_input:
+    # Bash and the PowerShell tool: command field
+    if tool_name in SHELL_TOOL_NAMES and 'command' in tool_input:
         return tool_input['command']
     # MCP tools: stringify the input
     if tool_name.startswith(MCP_TOOL_PREFIX):
@@ -4423,6 +4425,31 @@ def _is_system_checkout_path(path: str) -> bool:
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+# PowerShell's own location verbs, case-insensitive, and the rest of the statement as their arguments.
+_POWERSHELL_CD_TARGET_RE = re.compile(
+    r'(?:^|[;&|\n]\s*)(?:cd|chdir|pushd|set-location|sl|push-location)\s+([^;&|\n]*)', re.IGNORECASE)
+# PowerShell's common parameters that take a value; any other -Name before the folder is a switch.
+_POWERSHELL_VALUED_PARAMETERS = frozenset({
+    '-erroraction', '-ea', '-warningaction', '-wa', '-informationaction', '-infa', '-errorvariable', '-ev',
+    '-outvariable', '-ov', '-pipelinevariable', '-pv', '-stackname',
+})
+
+
+def _powershell_cd_target(arguments: str) -> Optional[str]:
+    """The folder a PowerShell location verb's arguments name, past its switches and valued common parameters."""
+    words = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', arguments)
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word[:1] in '"\'':
+            return word[1:-1] or None
+        if not word.startswith('-'):
+            return word
+        name, colon, value = word.partition(':')
+        if colon and name.lower() in ('-path', '-literalpath'):
+            return value.strip('"\'') or None
+        i += 2 if name.lower() in _POWERSHELL_VALUED_PARAMETERS and not colon else 1
+    return None
 
 # `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
@@ -4452,7 +4479,7 @@ def _merge_cwds(first, second):
     return out[:8]
 
 
-def _git_path_opt_targets(command, shell_dir):
+def _git_path_opt_targets(command, shell_dir, powershell=False):
     """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
     targets = []
     try:
@@ -4478,7 +4505,7 @@ def _git_path_opt_targets(command, shell_dir):
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
-            moved = [_next_shell_dir(segment, c) for c in cwds]
+            moved = [_next_shell_dir(segment, c, powershell) for c in cwds]
             if separator == '&&':
                 # Next runs only if this one succeeded, so its cd took effect —
                 # but this segment may instead have failed, which a later || reaches.
@@ -4553,17 +4580,17 @@ def _git_worktree_roots(path: str) -> List[str]:
         return []
 
 
-def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
-    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
+def _next_shell_dir(command: str, shell_dir: Optional[str], powershell: bool = False) -> Optional[str]:
+    """Follow the last `cd` in `command`, or for PowerShell its Set-Location; unchanged on none or any error."""
     try:
         target = None
-        for m in _CD_TARGET_RE.finditer(command):
-            target = m.group(2)
+        for m in (_POWERSHELL_CD_TARGET_RE if powershell else _CD_TARGET_RE).finditer(command):
+            target = _powershell_cd_target(m.group(1)) if powershell else m.group(2)
         if not target:
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
+        if target.startswith('/') or powershell and re.match(r'[A-Za-z]:[\\/]', target):
             return os.path.normpath(target)
         if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
             return shell_dir
@@ -4708,14 +4735,14 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
         path = tool_input.get('file_path') or tool_input.get('path')
         if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
-    elif tool_name == 'Bash':
+    elif tool_name in SHELL_TOOL_NAMES:
         command = tool_input.get('command')
         if isinstance(command, str):
             candidates.extend(
                 p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
             )
-            candidates.extend(_git_path_opt_targets(command, shell_dir))
-            shell_dir = _next_shell_dir(command, shell_dir)
+            candidates.extend(_git_path_opt_targets(command, shell_dir, tool_name == 'PowerShell'))
+            shell_dir = _next_shell_dir(command, shell_dir, tool_name == 'PowerShell')
             if not candidates and shell_dir:
                 candidates.append(shell_dir)
     return candidates, shell_dir
@@ -5257,10 +5284,11 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
 
 
 # KEEP IN SYNC: transfer resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
-# --- Transfer resolution: where each shell transfer went, as host and address kind only, fail-open ---
+# --- Transfer resolution: where each shell transfer went, as host, address kind and route only, fail-open ---
 
 # Only these commands are ever run; everything else is refused. DNS is a resolver call, not a command.
-_TRANSFER_ALLOWED_RUNS = (('ssh', '-G'),)
+_TRANSFER_ALLOWED_RUNS = (('ssh', '-G'), ('route', '-n', 'get'), ('ip', '-o', 'route', 'get'),
+                          ('powershell', '-NoProfile', '-NonInteractive', '-Command'))
 _TRANSFER_RUN_TIMEOUT = 5
 _TRANSFER_DNS_TIMEOUT = 1.5
 # Wall-clock budget for all lookups in one turn, so a slow lookup never delays the agent.
@@ -5503,6 +5531,32 @@ _TRANSFER_ADDRESS_KINDS = (
     ('link_local', ('169.254.0.0/16', 'fe80::/10')),
     ('cgnat', ('100.64.0.0/10',)),
 )
+# Interfaces, for macOS's route and Linux's ip: a tunnel is a VPN, a bridge to a VM or container stays on this machine,
+# and a point-to-point link may be either a VPN or the internet uplink, so it gets no route. macOS's bridge0 is a
+# Thunderbolt link to another computer; its VM bridges start at bridge100.
+_TRANSFER_TUNNEL = re.compile(r'(utun|ipsec|tun|wg|wireguard|tailscale|zt|cscotun|gpd|vti|nordlynx)')
+_TRANSFER_VM_BRIDGE = re.compile(r'(bridge1\d\d|vmenet|vmnet|vboxnet|docker|br-|veth|virbr|lxcbr|lxdbr|cni|podman|incusbr)')
+_TRANSFER_POINT_TO_POINT = re.compile(r'(ppp|tap)')
+# The same for a Windows adapter's alias and description. A guest VM's own network card is a Hyper-V adapter too, so
+# only adapters that stay on this machine count as one.
+_TRANSFER_WINDOWS_TUNNEL = re.compile(
+    r'vpn|wintun|wireguard|tailscale|zerotier|anyconnect|globalprotect|pangp|fortinet|forticlient|juniper|'
+    r'pulse secure|ivanti|zscaler|netskope|openvpn|tap-windows|wan miniport \((ikev2|l2tp|sstp|pptp)\)|'
+    r'cloudflare warp|nordlynx|check point|sonicwall', re.IGNORECASE)
+_TRANSFER_WINDOWS_VM = re.compile(r'vethernet \((wsl|default switch|nat|internal)|host-only|vmnet|docker', re.IGNORECASE)
+_TRANSFER_WINDOWS_POINT_TO_POINT = re.compile(r'wan miniport|teredo|isatap|ip-https', re.IGNORECASE)
+_TRANSFER_WINDOWS_POWERSHELL = ('System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+# The route to one address, its next hop, interface alias and description, and the source address, tab-separated.
+_TRANSFER_WINDOWS_ROUTE = (
+    "$s = @(Find-NetRoute -RemoteIPAddress '{}' -ErrorAction Stop); $r = $s[-1]; "
+    '$a = Get-NetAdapter -InterfaceIndex $r.InterfaceIndex -IncludeHidden -ErrorAction SilentlyContinue; '
+    '($r.NextHop, $r.InterfaceAlias, $a.InterfaceDescription, $s[0].IPAddress) -join [char]9')
+# Set where the agent runs on a server, in a container, WSL, a cloud workspace or CI: a route there describes that
+# machine's network, not the person's.
+_TRANSFER_REMOTE_ENV = ('SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY', 'CODESPACES', 'GITPOD_WORKSPACE_ID', 'CODER',
+                        'CLOUD_SHELL', 'REMOTE_CONTAINERS', 'KUBERNETES_SERVICE_HOST', 'CI', 'CLAUDE_CODE_REMOTE',
+                        'WSL_DISTRO_NAME')
+_TRANSFER_CONTAINER_FILES = ('/.dockerenv', '/run/.containerenv')
 
 
 def _transfer_deadline(state: Dict) -> float:
@@ -5520,16 +5574,17 @@ def _transfer_executable(name: str) -> Optional[str]:
     return None
 
 
-def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[str]:
-    """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing. ssh -G
-    is checked here, and reads only the vetted copy of its configs made here, so no call reaches it unchecked."""
+def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict, keep: float = 0) -> Optional[str]:
+    """Run one allowlisted lookup within its timeout and the turn's budget, less keep seconds; None when refused, slow
+    or failing. ssh -G is checked here, and reads only the vetted copy of its configs made here, so no call reaches it
+    unchecked."""
     import shutil
     import tempfile
     folder = None
     try:
         if not any(tuple(argv[:len(p)]) == p for p in _TRANSFER_ALLOWED_RUNS):
             return None
-        remaining = _transfer_deadline(state) - time.monotonic()
+        remaining = _transfer_deadline(state) - time.monotonic() - keep
         if remaining <= 0:
             return None
         if argv[:2] == ['ssh', '-G']:
@@ -5538,7 +5593,9 @@ def _transfer_run(argv: List[str], cwd: Optional[str], state: Dict) -> Optional[
             if options is None:
                 return None
             argv = argv[:2] + options + argv[end:]
-        program = _transfer_executable(argv[0])
+        # Windows would run a powershell.exe planted in a PATH folder ahead of System32's.
+        program = os.path.join(os.environ.get('SystemRoot') or r'C:\Windows', *_TRANSFER_WINDOWS_POWERSHELL) \
+            if argv[0] == 'powershell' and os.name == 'nt' else _transfer_executable(argv[0])
         if program is None:
             return None
         result = subprocess.run([program] + argv[1:], cwd=folder, capture_output=True,
@@ -8742,21 +8799,20 @@ def _transfer_resolve(host: str, timeout: float) -> list:
     return [] if worker.is_alive() else list(found)
 
 
-def _transfer_address(host: str, state: Dict, lookup: bool = True) -> str:
-    """The kind of address a host resolves to, looked up once per turn: public when any address is public, else
-    the first address's kind; unresolved when the lookup fails, the turn's budget is spent, or lookup is off."""
+def _transfer_addresses(host: str, state: Dict, lookup: bool = True) -> list:
+    """The host's addresses, looked up once per turn; a literal address is its own. [] when the lookup fails, the
+    turn's budget is spent, or lookup is off."""
     import ipaddress
     try:
-        return _transfer_address_kind([ipaddress.ip_address(host)])
+        return [ipaddress.ip_address(host)]
     except ValueError:
         pass
     if not lookup:
-        return 'unresolved'  # whatever an earlier call found: this one may not have run, or a proxy reaches the host
+        return []  # whatever an earlier call found: this one may not have run, or a proxy reaches the host
     key = ('address', host)
     if key not in state:
         remaining = _transfer_deadline(state) - time.monotonic()
-        state[key] = _transfer_address_kind(
-            _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else [])
+        state[key] = _transfer_resolve(host, min(_TRANSFER_DNS_TIMEOUT, remaining)) if remaining > 0 else []
     return state[key]
 
 
@@ -8766,9 +8822,83 @@ def _transfer_address_kind(addresses: list) -> str:
     return 'unresolved' if not kinds else 'public' if 'public' in kinds else kinds[0]
 
 
+def _transfer_platform() -> str:
+    return 'windows' if os.name == 'nt' else 'darwin' if sys.platform == 'darwin' else 'linux'
+
+
+def _transfer_route_argv(address, platform: str) -> List[str]:
+    if platform == 'windows':
+        return ['powershell', '-NoProfile', '-NonInteractive', '-Command', _TRANSFER_WINDOWS_ROUTE.format(address)]
+    if platform == 'darwin':
+        return ['route', '-n', 'get'] + (['-inet6'] if address.version == 6 else []) + [str(address)]
+    return ['ip', '-o', 'route', 'get', str(address)]
+
+
+def _transfer_route_kind(out: str, address, platform: str) -> str:
+    """vpn through a tunnel, local on this machine's own network, routed through a gateway, or machine for this
+    machine itself or a VM or container on it, read from the route lookup's output; empty when it can't be read."""
+    import ipaddress
+    if platform == 'windows':
+        parts = out.strip().split('\t')
+        if len(parts) != 4 or not parts[0]:
+            return ''
+        hop, names, source = parts[0], parts[1] + ' ' + parts[2], parts[3]
+        try:
+            if ipaddress.ip_address(source.split('%')[0]) == address:
+                return 'machine'
+        except ValueError:
+            pass
+        if _TRANSFER_WINDOWS_VM.search(names):
+            return 'machine'
+        if _TRANSFER_WINDOWS_TUNNEL.search(names):
+            return 'vpn'
+        if _TRANSFER_WINDOWS_POINT_TO_POINT.search(names):
+            return ''
+        return 'local' if hop in ('0.0.0.0', '::') else 'routed'
+    if platform == 'darwin':
+        fields = {key.strip(): value.strip() for key, _, value in (line.partition(':') for line in out.splitlines())}
+        interface, flags = fields.get('interface', ''), fields.get('flags', '').strip('<>').split(',')
+        own, gateway = 'LOCAL' in flags, 'GATEWAY' in flags
+    else:
+        words = out.split()
+        if not words or words[0] in ('unreachable', 'blackhole', 'prohibit', 'throw'):
+            return ''
+        interface = words[words.index('dev') + 1] if 'dev' in words[:-1] else ''
+        own, gateway = words[0] == 'local', 'via' in words
+    if not interface:
+        return ''
+    if own or _TRANSFER_VM_BRIDGE.match(interface):
+        return 'machine'
+    if _TRANSFER_TUNNEL.match(interface):
+        return 'vpn'
+    if _TRANSFER_POINT_TO_POINT.match(interface):
+        return ''
+    return 'routed' if gateway else 'local'
+
+
+def _transfer_route(addresses: list, state: Dict) -> str:
+    """How this machine reaches the first of a private host's addresses, looked up once per turn; empty when unknown
+    or when the agent runs on a server, in a container or in CI."""
+    import ipaddress
+    if not addresses or any(os.environ.get(name) for name in _TRANSFER_REMOTE_ENV) or \
+            any(os.path.exists(path) for path in _TRANSFER_CONTAINER_FILES):
+        return ''
+    # Without its IPv6 scope, which may hold any text and would otherwise reach PowerShell's script.
+    address = ipaddress.ip_address(str(getattr(addresses[0], 'ipv4_mapped', None) or addresses[0]).split('%')[0])
+    key = ('route', str(address))
+    if key not in state:
+        platform = _transfer_platform()
+        # Route lookups use at most half the turn's budget, leaving the rest to the hosts' own lookups.
+        out = _transfer_run(_transfer_route_argv(address, platform), None, state,
+                            state.get('budget', _TRANSFER_TURN_BUDGET) / 2)
+        state[key] = _transfer_route_kind(out, address, platform) if out else ''
+    return state[key]
+
+
 def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool = True) -> Optional[Dict]:
-    """One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial) and
-    its address kind. Without lookup only a literal dialled address is classified; an ssh, proxy or jump host's target never is."""
+    """One place a transfer reached: host as written without login, the host it connects to (ssh -G or curl's dial),
+    its address kind and, for a private one, how this machine routes to it. Without lookup only a literal dialled
+    address is classified and none is routed; an ssh, proxy or jump host's target never is."""
     direction, destination, ssh_options = raw[:3]
     dial = raw[3] if len(raw) > 3 else None
     lookup = lookup and not (len(raw) > 4 and raw[4])
@@ -8778,11 +8908,12 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
     host = _transfer_clean_host(host)
     if not host:
         return None
+    found = []
     if len(raw) > 4 and raw[4] == 'rerouted':
-        resolved, address = host, 'unresolved'  # a config this didn't read may send it anywhere
+        resolved = host  # a config this didn't read may send it anywhere
     elif dial:
         resolved = dial[0]
-        address = _transfer_address_kind(dial[1]) if dial[1] else _transfer_address(dial[0], state, lookup)
+        found = dial[1] or _transfer_addresses(dial[0], state, lookup)
     else:
         lookup = lookup and not (ssh_options is not None and _transfer_ssh_jumps(ssh_options))
         resolved, jumps = _transfer_ssh_hostname(destination, ssh_options, cwd, state) if ssh_options is not None and \
@@ -8792,8 +8923,10 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         failed = ssh_options is not None and not (lookup and resolved)
         # Through a jump host or proxy command the bytes go where it sends them, not to the config's HostName.
         resolved = host if jumps or failed else resolved or host
-        address = 'unresolved' if failed or jumps else _transfer_address(resolved, state, lookup)
-    endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address}
+        found = [] if failed or jumps else _transfer_addresses(resolved, state, lookup)
+    address = _transfer_address_kind(found)
+    endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address,
+                'route': _transfer_route(found, state) if lookup and address in ('private', 'cgnat') else ''}
     return {k: v for k, v in endpoint.items() if v}
 
 
@@ -8895,7 +9028,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse' or (hook_event_name == 'PostToolUseFailure' and
-                                                  event.get('tool_name') == 'Bash'):
+                                                  event.get('tool_name') in SHELL_TOOL_NAMES):
             # Claude reports a command that exits non-zero as PostToolUseFailure; it still ran, so it is read the same.
             failed = hook_event_name == 'PostToolUseFailure'
             tool_name = event.get('tool_name')
@@ -8910,7 +9043,15 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             # Attribute this tool call to the repo it worked in (file path /
             # Bash cwd tracking); rides on the tool_use entry so the backend
             # can store per-call project on each analytics row.
-            tool_project, tool_branch, shell_dir = _repo_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
+            # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands, so attribution and the
+            # transfer read it emptied; the logged input stays as sent.
+            command = tool_input.get('command') if isinstance(tool_input, dict) else None
+            if tool_name == 'PowerShell' and isinstance(command, str):
+                command = _transfer_hashtables_emptied(command)
+                tool_project, tool_branch, shell_dir = _repo_for_tool_use(
+                    tool_name, {**tool_input, 'command': command}, shell_dir, root_projects)
+            else:
+                tool_project, tool_branch, shell_dir = _repo_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
 
             tool_use_entry = _with_call_ts({
                 'type': 'PostToolUse',
@@ -8921,11 +9062,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'project': tool_project,
                 'git_branch': tool_branch
             }, log_entry.get('timestamp'))
-            if tool_name == 'Bash' and isinstance(tool_input, dict):
-                transfer = _transfer(tool_input.get('command'), transfer_dir, transfer_state)
+            if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
+                transfer = _transfer(command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
-                    transfer_dir = None if failed else _transfer_next_cwd(tool_input.get('command'), transfer_dir)
+                    transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
                 turn_seeded = True
                 if transfer:
                     tool_use_entry['transfer'] = transfer
