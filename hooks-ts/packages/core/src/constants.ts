@@ -81,10 +81,10 @@ export const TURNLOG_PATH = "/v1/hooks/pi";
  *
  * `add_gateway_metrics_task.py:565-577` runs `check_valid_record` and returns early on
  * `"Model Not found"` — silently, with no row created. The `add_new_model` path that would register
- * an unknown id runs only for proxy requests (`:555-557`), and hook telemetry is not one. So sending
+ * an unknown id runs only for AI tool requests (`:555-557`), and hook telemetry is not one. So sending
  * a real id such as `openrouter/openai/gpt-4.1-nano` usually means **the turn is never recorded at
  * all**. `'auto'` is the fallback every Python hook uses (`unbound.py:4983`) and is listed in
- * `PROXY_FALLBACK_MODEL_NAMES` (`proxy_service.py:62`).
+ * `AI_TOOL_FALLBACK_MODEL_NAMES` (`ai_tool_provider_service.py:64`).
  *
  * The real model id is still available server-side on the proxy path, and on `agent_end`'s messages
  * for anyone who later wants it — losing it here costs analytics nothing and buys every row.
