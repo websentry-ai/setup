@@ -357,7 +357,8 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_token'] = api_key
+        config['device_id'] = api_key
+        config.pop('device_token', None)
         config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
@@ -911,7 +912,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_ID stays while any of them holds a hook.
 OTHER_HOOK_DIRS = (
     "~/.claude", "~/.cursor", "~/.copilot", "~/.augment",
     "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
@@ -920,7 +921,7 @@ OTHER_HOOK_DIRS = (
 )
 
 
-def device_token_in_use() -> bool:
+def device_id_in_use() -> bool:
     dirs = (Path(os.path.expandvars(os.path.expanduser(d))) for d in OTHER_HOOK_DIRS)
     # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
     return any(p.is_absolute() and (p / "hooks" / "unbound.py").exists() for p in dirs)
@@ -986,14 +987,16 @@ def main():
     # Remove leftover hooks setup env var and artifacts
     try:
         remove_env_var("UNBOUND_CODEX_API_KEY")
+        remove_env_var("UNBOUND_DEVICE_TOKEN")
     except Exception:
         pass
     remove_hooks_unbound_script()
     remove_hooks_from_codex_config()
     disable_codex_hooks_feature()
-    if not device_token_in_use():
+    if not device_id_in_use():
         try:
             remove_env_var("UNBOUND_DEVICE_TOKEN")
+            remove_env_var("UNBOUND_DEVICE_ID")
         except Exception:
             pass
 

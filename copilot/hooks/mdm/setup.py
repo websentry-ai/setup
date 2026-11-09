@@ -677,7 +677,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_token'] = api_key
+        config['device_id'] = api_key
+        config.pop('device_token', None)
         config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
@@ -2486,11 +2487,12 @@ def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) ->
 def remove_legacy_key_env() -> None:
     try:
         _remove_env_var_for_all_users("UNBOUND_COPILOT_API_KEY")
+        _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN")
     except Exception:
         pass
 
 
-# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_ID stays while any of them holds a hook.
 OTHER_HOOK_DIRS = (
     "~/.claude", "~/.codex", "~/.cursor", "~/.augment",
     "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
@@ -2499,7 +2501,7 @@ OTHER_HOOK_DIRS = (
 )
 
 
-def device_token_in_use(home_dir: Optional[Path]) -> bool:
+def device_id_in_use(home_dir: Optional[Path]) -> bool:
     for d in OTHER_HOOK_DIRS:
         if d.startswith("~"):
             if home_dir is None:
@@ -2582,9 +2584,10 @@ def clear_setup() -> bool:
         teardown_failed = True
         print("Failed to clear Copilot telemetry settings")
 
-    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
+    _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_id_in_use)
+    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_ID", keep=device_id_in_use):
         teardown_failed = True
-        print("Failed to clear UNBOUND_DEVICE_TOKEN")
+        print("Failed to clear UNBOUND_DEVICE_ID")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -2683,11 +2686,11 @@ def main():
 
     print("\nSetting environment variables system-wide...")
     # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-    env_ok, _ = set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
+    env_ok, _ = set_env_var_system_wide("UNBOUND_DEVICE_ID", api_key)
     if not env_ok:
-        print("Failed to set UNBOUND_DEVICE_TOKEN")
+        print("Failed to set UNBOUND_DEVICE_ID")
         return False
-    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
+    debug_print("UNBOUND_DEVICE_ID set successfully")
     remove_legacy_key_env()
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)

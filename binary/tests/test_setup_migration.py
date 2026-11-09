@@ -1903,8 +1903,8 @@ def test_clear_command_removes_the_shared_token(env, monkeypatch):
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     removed = []
     for m in env["modules"].values():
-        monkeypatch.setattr(m, "device_token_in_use", lambda home_dir: True, raising=False)
+        monkeypatch.setattr(m, "device_id_in_use", lambda home_dir: True, raising=False)
         monkeypatch.setattr(m, "remove_env_var_from_user",
                             lambda u, h, name: removed.append(name) or "cleared")
     assert clear_cmd.run([]) == 0
-    assert "UNBOUND_DEVICE_TOKEN" in removed
+    assert "UNBOUND_DEVICE_ID" in removed

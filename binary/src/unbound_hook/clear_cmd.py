@@ -52,8 +52,9 @@ def run(argv) -> int:
         failures.append("migration")
 
     # Each tool's clear keeps the shared token while another tool's hook remains; all are gone now.
-    if not m0._remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN"):
-        failures.append("UNBOUND_DEVICE_TOKEN")
+    m0._remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN")
+    if not m0._remove_env_var_for_all_users("UNBOUND_DEVICE_ID"):
+        failures.append("UNBOUND_DEVICE_ID")
 
     if failures:
         print(f"\nClear finished with failure(s): {', '.join(failures)}", file=sys.stderr)
