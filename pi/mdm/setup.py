@@ -1408,8 +1408,7 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
         existing = existing.strip() if isinstance(existing, str) else ""
         if (not existing or existing == api_key
                 or config.get(MDM_KEY_PROVENANCE_FIELD) == _key_provenance(existing)):
-            config["device_id"] = api_key
-            config.pop("device_token", None)
+            config["device_token"] = api_key
             config["api_key"] = api_key  # read by older CLIs and hooks
             config[MDM_KEY_PROVENANCE_FIELD] = _key_provenance(api_key)
         if urls:

@@ -667,8 +667,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_id'] = api_key
-        config.pop('device_token', None)
+        config['device_token'] = api_key
         config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
@@ -1688,7 +1687,7 @@ def remove_legacy_key_env() -> None:
         pass
 
 
-# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_ID stays while any of them holds a hook.
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
 OTHER_HOOK_DIRS = (
     "~/.claude", "~/.cursor", "~/.copilot", "~/.augment",
     "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
@@ -1697,7 +1696,7 @@ OTHER_HOOK_DIRS = (
 )
 
 
-def device_id_in_use(home_dir: Optional[Path]) -> bool:
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
     for d in OTHER_HOOK_DIRS:
         if d.startswith("~"):
             if home_dir is None:
@@ -1770,10 +1769,9 @@ def clear_setup() -> bool:
         teardown_failed = True
         print(f"Failed to clear managed hooks in {managed_dir}")
 
-    removed = [_remove_env_var_for_all_users(name, keep=device_id_in_use) for name in ("UNBOUND_DEVICE_TOKEN", "UNBOUND_DEVICE_ID")]
-    if not all(removed):
+    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
         teardown_failed = True
-        print("Failed to clear UNBOUND_DEVICE_ID or UNBOUND_DEVICE_TOKEN")
+        print("Failed to clear UNBOUND_DEVICE_TOKEN")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -2472,13 +2470,6 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = set_env_var_system_wide("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        print("Failed to set UNBOUND_DEVICE_ID")
-        return False
-    debug_print("UNBOUND_DEVICE_ID set successfully")
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:

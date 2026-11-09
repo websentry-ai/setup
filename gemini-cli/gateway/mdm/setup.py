@@ -548,8 +548,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_id'] = api_key
-        config.pop('device_token', None)
+        config['device_token'] = api_key
         config['api_key'] = api_key  # read by older CLIs and hooks
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o600)

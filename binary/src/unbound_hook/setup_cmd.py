@@ -1023,11 +1023,6 @@ def _setup_claude_code(opts):
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         m.remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_ID")
     m.remove_legacy_key_env()
 
     for username, home_dir in m.get_all_user_homes():
@@ -1066,9 +1061,8 @@ def _setup_claude_code(opts):
 def _setup_augment(opts):
     """Mirrors augment mdm/setup.py main() step-for-step, minus downloads.
     Augment uses system-managed /etc/augment (get_managed_settings_dir), like
-    claude-code; the notify tool_type is 'augment_code' and the env var is
-    UNBOUND_DEVICE_ID (both verbatim from augment's setup.py). Augment
-    does NOT support backfill. One substitution from main(): user-level hook
+    claude-code; the notify tool_type is 'augment_code' (verbatim from
+    augment's setup.py). Augment does NOT support backfill. One substitution from main(): user-level hook
     removal is gated on the managed write returning True rather than on
     verify_managed_hooks_installed() — the latter checks for the downloaded
     /etc/augment/hooks/unbound.py the binary path never writes."""
@@ -1083,11 +1077,6 @@ def _setup_augment(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_ID")
     m.remove_legacy_key_env()
 
     # Write the per-user unbound config now (needed by the managed hook). User
@@ -1130,11 +1119,6 @@ def _setup_codex(opts):
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_ID")
 
     # A user-level hook runs only after its user trusts it, so ours goes in codex's system
     # hooks.json instead, which codex runs as a managed hook. The per-user copy is removed
@@ -1340,11 +1324,6 @@ def _setup_cursor(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, env_changed, message = m.set_env_var("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        return ("deferred", f"failed to set UNBOUND_DEVICE_ID: {message}")
     m.remove_legacy_key_env()
 
     for username, home_dir in m.get_all_user_homes():
@@ -1364,7 +1343,7 @@ def _setup_cursor(opts):
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("cursor")),
                             install_mode="binary")
-    if env_changed or hooks_changed:
+    if hooks_changed:
         m.restart_cursor()
     return ("configured", None)
 
@@ -1429,11 +1408,6 @@ def _setup_copilot(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_ID")
     m.remove_legacy_key_env()
 
     user_homes = m.get_all_user_homes()

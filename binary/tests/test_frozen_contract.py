@@ -36,7 +36,6 @@ def frozen_module(tmp_path, monkeypatch, request):
     tool = request.param
     monkeypatch.setenv("UNBOUND_HOOK_FROZEN", "1")
     monkeypatch.delenv(API_KEY_ENV[tool], raising=False)
-    monkeypatch.delenv("UNBOUND_DEVICE_ID", raising=False)
     monkeypatch.delenv("UNBOUND_DEVICE_TOKEN", raising=False)
     monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
     spec = importlib.util.spec_from_file_location(
@@ -112,7 +111,7 @@ def test_frozen_skills_sync_exec_contract(frozen_module, monkeypatch, tool):
     cmd, kwargs = calls[0]
     assert cmd == [m.sys.executable, "sync-skills", tool]
     env = kwargs.get("env") or {}
-    assert env.get("UNBOUND_DEVICE_ID") == "contract-key"
+    assert env.get("UNBOUND_DEVICE_TOKEN") == "contract-key"
     assert "contract-key" not in cmd, "key must travel via env, never argv"
 
 

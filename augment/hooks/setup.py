@@ -415,8 +415,7 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_id'] = api_key
-        config.pop('device_token', None)
+        config['device_token'] = api_key
         config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
@@ -727,7 +726,7 @@ def remove_legacy_key_env() -> None:
         pass
 
 
-# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_ID stays while any of them holds a hook.
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
 OTHER_HOOK_DIRS = (
     "~/.claude", "~/.codex", "~/.cursor", "~/.copilot",
     "/Library/Application Support/ClaudeCode", "/etc/claude-code", "%ProgramFiles%/ClaudeCode",
@@ -736,7 +735,7 @@ OTHER_HOOK_DIRS = (
 )
 
 
-def device_id_in_use() -> bool:
+def device_token_in_use() -> bool:
     dirs = (Path(os.path.expandvars(os.path.expanduser(d))) for d in OTHER_HOOK_DIRS)
     # A relative path is another OS's entry (/etc on Windows, an unexpanded %VAR% elsewhere).
     return any(p.is_absolute() and (p / "hooks" / "unbound.py").exists() for p in dirs)
@@ -757,14 +756,13 @@ def clear_setup() -> bool:
     elif status not in ("cleared", "not_found"):
         print("Failed to clear API_KEY")
         any_failed = True
-    if not device_id_in_use():
-        for name in ("UNBOUND_DEVICE_TOKEN", "UNBOUND_DEVICE_ID"):
-            status, _ = remove_env_var(name)
-            if status == "cleared":
-                any_cleared = True
-            elif status != "not_found":
-                print(f"Failed to clear {name}")
-                any_failed = True
+    if not device_token_in_use():
+        status, _ = remove_env_var("UNBOUND_DEVICE_TOKEN")
+        if status == "cleared":
+            any_cleared = True
+        elif status != "not_found":
+            print("Failed to clear UNBOUND_DEVICE_TOKEN")
+            any_failed = True
 
     _r = _clear_path(Path.home() / ".augment" / "hooks" / "unbound.py", "Augment unbound.py hook")
     if _r == "cleared":
@@ -1090,13 +1088,6 @@ def main():
 
     debug_print("API key received from callback")
 
-    debug_print("Setting UNBOUND_DEVICE_ID environment variable...")
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-    success, message = set_env_var("UNBOUND_DEVICE_ID", api_key)
-    if not success:
-        print(f"❌ Failed to set environment variable: {message}")
-        return False
-    debug_print("UNBOUND_DEVICE_ID set successfully")
     remove_legacy_key_env()
 
     _install_state = detect_install_state()

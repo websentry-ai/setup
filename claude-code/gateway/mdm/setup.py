@@ -810,8 +810,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_id'] = api_key
-        config.pop('device_token', None)
+        config['device_token'] = api_key
         config['api_key'] = api_key  # read by older CLIs and hooks
         if gateway_url:
             # Recorded so teardown can recognise a custom endpoint as ours later; without
@@ -1252,7 +1251,7 @@ def _stdout_never_raises() -> None:
             pass
 
 
-# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_ID stays while any of them holds a hook.
+# Other Unbound tools' hook dirs; the shared UNBOUND_DEVICE_TOKEN stays while any of them holds a hook.
 OTHER_HOOK_DIRS = (
     "~/.codex", "~/.cursor", "~/.copilot", "~/.augment",
     "/etc/codex", "%ProgramData%/OpenAI/Codex", "/Library/Application Support/Cursor", "/etc/cursor",
@@ -1260,7 +1259,7 @@ OTHER_HOOK_DIRS = (
 )
 
 
-def device_id_in_use(home_dir: Optional[Path]) -> bool:
+def device_token_in_use(home_dir: Optional[Path]) -> bool:
     for d in OTHER_HOOK_DIRS:
         if d.startswith("~"):
             if home_dir is None:
@@ -1357,13 +1356,12 @@ def main():
     # Remove leftover hooks setup env var
     user_homes = get_all_user_homes()
     # Windows holds one machine-wide token, so it stays while any user still has a hook.
-    keep_machine_id = platform.system().lower() == "windows" and any(
-        device_id_in_use(home_dir) for _, home_dir in user_homes)
+    keep_machine_token = platform.system().lower() == "windows" and any(
+        device_token_in_use(home_dir) for _, home_dir in user_homes)
     for username, home_dir in user_homes:
         remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY")
-        if not keep_machine_id and not device_id_in_use(home_dir):
+        if not keep_machine_token and not device_token_in_use(home_dir):
             remove_env_var_from_user(username, home_dir, "UNBOUND_DEVICE_TOKEN")
-            remove_env_var_from_user(username, home_dir, "UNBOUND_DEVICE_ID")
 
     success, env_changed = set_env_var_system_wide("UNBOUND_API_KEY", claude_api_key)
     if not success:

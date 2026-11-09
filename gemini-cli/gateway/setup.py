@@ -355,8 +355,7 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
                     config = json.loads(f.read())
             except (json.JSONDecodeError, OSError):
                 config = {}
-        config['device_id'] = api_key
-        config.pop('device_token', None)
+        config['device_token'] = api_key
         config['api_key'] = api_key  # read by older CLIs and hooks
         if urls:
             config.update({k: v for k, v in urls.items() if v})
