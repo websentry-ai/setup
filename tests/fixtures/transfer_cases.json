@@ -9794,6 +9794,196 @@
      }
     ]
    }
+  },
+  {
+   "command": "sshpass -p hunter2 scp build.zip prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -phunter2 rsync -a ./dist prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -e ssh prod \"tar x -C /srv\" < site.tar",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -ep scp prod:/var/log/app.log .",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -v -f ~/.pw -P assword: sftp prod:/etc/hosts ./hosts",
+   "transfer": {
+    "tool": "sftp",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -d3 scp build.zip example.com:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "timeout 30 sshpass -p hunter2 -- scp build.zip prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -p hunter2 ls /srv",
+   "transfer": null
+  },
+  {
+   "command": "powershell -NoProfile -Command \"$r = Invoke-RestMethod -Uri https://example.com/api -Method Post -Body $b; $r.id\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'try { iwr https://files.acme-infra.net/a.zip -OutFile a.zip } catch { exit 1 } finally { Write-Host done }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'Get-ChildItem *.zip | ForEach-Object { iwr https://example.com/up -InFile $_.FullName -Method Put }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '[string]$global:page = irm https://example.com/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'Invoke-RestMethod -Headers @{A=\"x\"; B=\"y\"} -Uri https://example.com/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$p = @{Uri=\"https://example.com/x\"}; Invoke-RestMethod @p'",
+   "transfer": null
+  },
+  {
+   "command": "powershell -Command 'Write-Host \"${env:TEMP}\"; if ($ok) { irm https://example.com/x }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

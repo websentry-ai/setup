@@ -38,13 +38,15 @@ export interface Transfer {
 /** Only these lookups are ever run; anything else is refused before it starts. DNS is a resolver call. */
 const ALLOWED_RUNS: readonly (readonly string[])[] = [
   ["ssh", "-G"], ["route", "-n", "get"], ["ip", "-o", "route", "get"],
-  ["powershell", "-NoProfile", "-NonInteractive", "-Command"],
+  ["powershell", "-NoProfile", "-NonInteractive", "-Command"], ["scutil", "--dns"],
 ];
 const RUN_TIMEOUT_MS = 5_000;
 const DNS_TIMEOUT_MS = 1_500;
 const TURN_BUDGET_MS = 10_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_ENDPOINTS = 10;
+/** How many search suffixes a name without a dot is tried with, as many as resolv.conf takes. */
+const MAX_SEARCH_DOMAINS = 6;
 /** How deep substitutions and `sh -c` strings are followed. */
 const MAX_DEPTH = 8;
 /** How many function calls are followed in one command, so a recursive function stays cheap. */
@@ -72,6 +74,7 @@ const WRAPPERS: Record<string, { short: string; long: readonly string[]; operand
   command: { short: "", long: [], operands: 0 },
   builtin: { short: "", long: [], operands: 0 },
   nohup: { short: "", long: [], operands: 0 },
+  sshpass: { short: "fdpP", long: [], operands: 0 },
 };
 /** Where `-C`/`--chdir` or `-D` moves a wrapped command. */
 const WRAPPER_CHDIR: Record<string, readonly string[]> = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
@@ -350,6 +353,8 @@ export interface ResolveOptions {
   platform?: string;
   /** The files whose presence means a container, for a test. */
   containerFiles?: readonly string[];
+  /** Where Linux keeps its resolver's search suffixes, for a test. */
+  resolvConf?: string;
 }
 
 interface State {
@@ -370,6 +375,10 @@ interface State {
   callText: string;
   /** Whether each curl or wget default config read this turn names an unsafe setting, wget's keyed wgetrc:<path>. */
   curlrc: Map<string, boolean>;
+  resolvConf: string;
+  /** The resolver's search suffixes once read, and the full name each name without a dot was completed to. */
+  search?: readonly string[];
+  completed: Map<string, string>;
 }
 
 type Env = Record<string, string>;
@@ -1430,6 +1439,7 @@ function wrapperOption(wrapper: string, token: string, argv: string[], start: nu
     for (let j = 1; j < token.length; j++) {
       const flag = token[j] as string;
       if (wrapper === "env" && flag === "i") out.env = { [CLEAN_ENV]: "" };
+      if (wrapper === "sshpass" && flag === "e") break; // the rest of the word, if any, names the password's variable
       if (!spec.short.includes(flag)) continue;
       name = `-${flag}`;
       value = token.slice(j + 1);
@@ -2375,25 +2385,51 @@ function shellString(name: string, args: string[]): string | undefined {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i] as string;
       const flag = arg.startsWith("-") || arg.startsWith("/") ? arg.slice(1).toLowerCase() : "";
-      if (flag === "c" || (flag.length >= 3 && "command".startsWith(flag))) return hashtablesEmptied(args.slice(i + 1).join(" "));
+      if (flag === "c" || (flag.length >= 3 && "command".startsWith(flag))) return powershellText(args.slice(i + 1).join(" "));
     }
   }
   return undefined;
 }
 
-/** A PowerShell command with each @{ } hashtable made empty: a ; in one separates its entries, not commands, and what
- *  it holds names no host the cmdlet reaches. */
-function hashtablesEmptied(text: string): string {
+/** A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it. */
+const PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)/y;
+
+/** A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
+ *  entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
+ *  as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
+ *  assigns from is read. */
+function powershellText(text: string): string {
   let out = "";
   let quote: string | undefined;
+  let starts = true;
   for (let i = 0; i < text.length; ) {
+    PS_ASSIGNMENT.lastIndex = i;
+    const found = starts ? PS_ASSIGNMENT.exec(text) : null;
+    starts = false;
+    if (found) {
+      i = PS_ASSIGNMENT.lastIndex;
+      continue;
+    }
     if (quote === undefined && text.startsWith("@{", i)) {
       out += "@{}";
       i = hashtableEnd(text, i + 2);
       continue;
     }
+    if (quote === undefined && text.startsWith("${", i)) {
+      const end = text.indexOf("}", i) + 1 || text.length; // a ${name} variable
+      out += text.slice(i, end);
+      i = end;
+      continue;
+    }
     const ch = text[i] as string;
+    if (quote === undefined && (ch === "{" || ch === "}")) {
+      out += ch === "{" ? "{\n" : "\n}";
+      starts = ch === "{";
+      i++;
+      continue;
+    }
     quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
+    starts = quote === undefined && (ch === ";" || ch === "\n");
     out += ch;
     i++;
   }
@@ -3584,6 +3620,7 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
       positional.push(...args.slice(i)); // PowerShell's end of parameters: every word after it is an argument
       break;
     }
+    if (arg.startsWith("@")) return []; // a splatted hashtable or array may bind any parameter
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
       continue;
@@ -4040,6 +4077,63 @@ async function addresses(host: string, state: State, lookup = true): Promise<rea
   return found;
 }
 
+/** Windows' suffix search list when one is set, else its primary suffix and then each adapter's own, one per line. */
+const WINDOWS_SEARCH = [
+  "$p = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters'",
+  "function v($k, $n) { (Get-ItemProperty -LiteralPath $k -Name $n -ErrorAction SilentlyContinue).$n }",
+  "$l = @((v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient' 'SearchList'), (v $p 'SearchList')) | ? { $_ } | select -First 1",
+  "if ($l) { $l -split '[ ,]' } else { $d = v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\System\\DNSClient' 'PrimaryDnsSuffix'",
+  "if (-not $d) { $d = @((v $p 'NV Domain'), (v $p 'Domain')) | ? { $_ } | select -First 1 }; $d",
+  "Get-ChildItem -LiteralPath \"$p\\Interfaces\" -ErrorAction SilentlyContinue | % { @((v $_.PSPath 'Domain'), (v $_.PSPath 'DhcpDomain')) | ? { $_ } | select -First 1 } }",
+].join("; ");
+
+/** The suffixes this machine's resolver tries after a name without a dot, in order, read once per turn by `stop`:
+ *  scutil's on macOS, whose VPN resolvers add their own, resolv.conf's elsewhere and the registry's on Windows; []
+ *  when unknown. */
+async function searchDomains(state: State, stop: number): Promise<readonly string[]> {
+  if (state.search !== undefined) return state.search;
+  state.search = [];
+  try {
+    let found: string[];
+    if (state.platform === "win32") {
+      found = ((await run(["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SEARCH], state, state.deadline - stop)) ?? "")
+        .split(/[\s,]+/);
+    } else if (state.platform === "darwin") {
+      const out = ((await run(["scutil", "--dns"], state, state.deadline - stop)) ?? "").split("\nDNS configuration (for scoped")[0] ?? "";
+      found = [...out.matchAll(/^\s*search domain\[\d+\]\s*:\s*(\S+)/gm)].map((match) => match[1] as string);
+    } else {
+      const lines = readFileSync(state.resolvConf, "utf8").slice(0, 64 * 1024).split("\n").map((line) => line.trim().split(/\s+/));
+      // The last search or domain line wins, as the resolver reads them.
+      found = lines.reverse().find((words) => words[0] === "search" || words[0] === "domain")?.slice(1) ?? [];
+    }
+    const names = found.map((name) => cleanHost(name.replace(/^\.+|\.+$/g, ""))).filter((name) => name !== "");
+    state.search = [...new Set(names)].slice(0, MAX_SEARCH_DOMAINS);
+  } catch {
+    // Unknown suffixes leave every name as written.
+  }
+  return state.search;
+}
+
+/** The full name the resolver completed a name without a dot with: the first search suffix whose name resolves to one
+ *  of the same addresses, all tried within one DNS timeout; the name itself when none does or it has a dot. */
+async function completed(host: string, found: readonly string[], state: State): Promise<string> {
+  if (isIP(host) !== 0 || host.includes(".") || found.length === 0) return host;
+  const known = state.completed.get(host);
+  if (known !== undefined) return known;
+  state.completed.set(host, host);
+  const stop = Math.min(state.now() + DNS_TIMEOUT_MS, state.deadline);
+  for (const suffix of await searchDomains(state, stop)) {
+    const remaining = stop - state.now();
+    if (remaining <= 0) break;
+    const answer = await resolveAddresses(`${host}.${suffix}`, remaining, state);
+    if (answer.some((a) => found.some((b) => sameAddress(a, b)))) {
+      state.completed.set(host, `${host}.${suffix}`);
+      break;
+    }
+  }
+  return state.completed.get(host) ?? host;
+}
+
 /** public when any address is public, else the first address's kind; unresolved when there is none. */
 function addressKind(found: readonly string[]): AddressKind {
   const kinds = found.map(kindOf);
@@ -4146,6 +4240,10 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
     if (!(failed || jumps)) found = await addresses(resolved, state, lookup);
   }
   const kind = addressKind(found);
+  // A name without a dot is recorded by the full name the resolver completed it with, unless it is this machine.
+  if (lookup && found.length > 0 && !(dial !== undefined && dial[1].length > 0) && kind !== "loopback") {
+    resolved = await completed(resolved, found, state);
+  }
   const via = lookup && (kind === "private" || kind === "cgnat") ? await route(found, state) : undefined;
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind, ...(via === undefined ? {} : { route: via }) };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
@@ -4231,6 +4329,8 @@ export async function resolveTransfers(
       }).join("\n"),
       callText: "",
       curlrc: new Map(),
+      resolvConf: opts.resolvConf ?? "/etc/resolv.conf",
+      completed: new Map(),
     };
     for (const call of calls) {
       const input = call.tool_input;
@@ -4240,8 +4340,8 @@ export async function resolveTransfers(
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if ((typeof call.decision === "string" && NEVER_RAN.has(call.decision)) || call.ran === false) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
-      // A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
-      const script = call.tool_name === "powershell" ? hashtablesEmptied(command) : command;
+      // A PowerShell tool's command is read in PowerShell's own shape.
+      const script = call.tool_name === "powershell" ? powershellText(command) : command;
       const transfer = await transferOf(script, cwd, state, call.ran !== "maybe");
       if (transfer !== undefined) transfers.set(call.tool_use_id, transfer);
     }

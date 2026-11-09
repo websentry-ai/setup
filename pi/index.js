@@ -1887,13 +1887,15 @@ var ALLOWED_RUNS = [
   ["ssh", "-G"],
   ["route", "-n", "get"],
   ["ip", "-o", "route", "get"],
-  ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+  ["powershell", "-NoProfile", "-NonInteractive", "-Command"],
+  ["scutil", "--dns"]
 ];
 var RUN_TIMEOUT_MS = 5e3;
 var DNS_TIMEOUT_MS = 1500;
 var TURN_BUDGET_MS = 1e4;
 var MAX_OUTPUT_BYTES = 64 * 1024;
 var MAX_ENDPOINTS = 10;
+var MAX_SEARCH_DOMAINS = 6;
 var MAX_DEPTH = 8;
 var MAX_CALLS = 32;
 var MAX_WORDS = 64;
@@ -1915,7 +1917,8 @@ var WRAPPERS = {
   exec: { short: "a", long: [], operands: 0 },
   command: { short: "", long: [], operands: 0 },
   builtin: { short: "", long: [], operands: 0 },
-  nohup: { short: "", long: [], operands: 0 }
+  nohup: { short: "", long: [], operands: 0 },
+  sshpass: { short: "fdpP", long: [], operands: 0 }
 };
 var WRAPPER_CHDIR = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
 var KEYWORDS = new Set(
@@ -3127,6 +3130,7 @@ function wrapperOption(wrapper, token, argv, start, out) {
     for (let j = 1; j < token.length; j++) {
       const flag = token[j];
       if (wrapper === "env" && flag === "i") out.env = { [CLEAN_ENV]: "" };
+      if (wrapper === "sshpass" && flag === "e") break;
       if (!spec.short.includes(flag)) continue;
       name = `-${flag}`;
       value = token.slice(j + 1);
@@ -3791,22 +3795,44 @@ function shellString(name, args) {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
       const flag = arg.startsWith("-") || arg.startsWith("/") ? arg.slice(1).toLowerCase() : "";
-      if (flag === "c" || flag.length >= 3 && "command".startsWith(flag)) return hashtablesEmptied(args.slice(i + 1).join(" "));
+      if (flag === "c" || flag.length >= 3 && "command".startsWith(flag)) return powershellText(args.slice(i + 1).join(" "));
     }
   }
   return void 0;
 }
-function hashtablesEmptied(text) {
+var PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)/y;
+function powershellText(text) {
   let out = "";
   let quote;
+  let starts = true;
   for (let i = 0; i < text.length; ) {
+    PS_ASSIGNMENT.lastIndex = i;
+    const found = starts ? PS_ASSIGNMENT.exec(text) : null;
+    starts = false;
+    if (found) {
+      i = PS_ASSIGNMENT.lastIndex;
+      continue;
+    }
     if (quote === void 0 && text.startsWith("@{", i)) {
       out += "@{}";
       i = hashtableEnd(text, i + 2);
       continue;
     }
+    if (quote === void 0 && text.startsWith("${", i)) {
+      const end2 = text.indexOf("}", i) + 1 || text.length;
+      out += text.slice(i, end2);
+      i = end2;
+      continue;
+    }
     const ch = text[i];
+    if (quote === void 0 && (ch === "{" || ch === "}")) {
+      out += ch === "{" ? "{\n" : "\n}";
+      starts = ch === "{";
+      i++;
+      continue;
+    }
     quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
+    starts = quote === void 0 && (ch === ";" || ch === "\n");
     out += ch;
     i++;
   }
@@ -4784,6 +4810,7 @@ function webCmdlet(args, sends, proxied = false) {
       positional.push(...args.slice(i));
       break;
     }
+    if (arg.startsWith("@")) return [];
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
       continue;
@@ -5160,6 +5187,51 @@ async function addresses(host, state, lookup = true) {
   state.addresses.set(host, found);
   return found;
 }
+var WINDOWS_SEARCH = [
+  "$p = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters'",
+  "function v($k, $n) { (Get-ItemProperty -LiteralPath $k -Name $n -ErrorAction SilentlyContinue).$n }",
+  "$l = @((v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient' 'SearchList'), (v $p 'SearchList')) | ? { $_ } | select -First 1",
+  "if ($l) { $l -split '[ ,]' } else { $d = v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\System\\DNSClient' 'PrimaryDnsSuffix'",
+  "if (-not $d) { $d = @((v $p 'NV Domain'), (v $p 'Domain')) | ? { $_ } | select -First 1 }; $d",
+  `Get-ChildItem -LiteralPath "$p\\Interfaces" -ErrorAction SilentlyContinue | % { @((v $_.PSPath 'Domain'), (v $_.PSPath 'DhcpDomain')) | ? { $_ } | select -First 1 } }`
+].join("; ");
+async function searchDomains(state, stop) {
+  if (state.search !== void 0) return state.search;
+  state.search = [];
+  try {
+    let found;
+    if (state.platform === "win32") {
+      found = (await run(["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SEARCH], state, state.deadline - stop) ?? "").split(/[\s,]+/);
+    } else if (state.platform === "darwin") {
+      const out = (await run(["scutil", "--dns"], state, state.deadline - stop) ?? "").split("\nDNS configuration (for scoped")[0] ?? "";
+      found = [...out.matchAll(/^\s*search domain\[\d+\]\s*:\s*(\S+)/gm)].map((match) => match[1]);
+    } else {
+      const lines = readFileSync3(state.resolvConf, "utf8").slice(0, 64 * 1024).split("\n").map((line) => line.trim().split(/\s+/));
+      found = lines.reverse().find((words2) => words2[0] === "search" || words2[0] === "domain")?.slice(1) ?? [];
+    }
+    const names = found.map((name) => cleanHost(name.replace(/^\.+|\.+$/g, ""))).filter((name) => name !== "");
+    state.search = [...new Set(names)].slice(0, MAX_SEARCH_DOMAINS);
+  } catch {
+  }
+  return state.search;
+}
+async function completed(host, found, state) {
+  if (isIP(host) !== 0 || host.includes(".") || found.length === 0) return host;
+  const known = state.completed.get(host);
+  if (known !== void 0) return known;
+  state.completed.set(host, host);
+  const stop = Math.min(state.now() + DNS_TIMEOUT_MS, state.deadline);
+  for (const suffix of await searchDomains(state, stop)) {
+    const remaining = stop - state.now();
+    if (remaining <= 0) break;
+    const answer = await resolveAddresses(`${host}.${suffix}`, remaining, state);
+    if (answer.some((a) => found.some((b) => sameAddress(a, b)))) {
+      state.completed.set(host, `${host}.${suffix}`);
+      break;
+    }
+  }
+  return state.completed.get(host) ?? host;
+}
 function addressKind(found) {
   const kinds = found.map(kindOf);
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : kinds[0];
@@ -5248,6 +5320,9 @@ async function endpoint(raw, cwd, state, sure = true) {
     if (!(failed || jumps)) found = await addresses(resolved, state, lookup);
   }
   const kind = addressKind(found);
+  if (lookup && found.length > 0 && !(dial !== void 0 && dial[1].length > 0) && kind !== "loopback") {
+    resolved = await completed(resolved, found, state);
+  }
   const via = lookup && (kind === "private" || kind === "cgnat") ? await route(found, state) : void 0;
   const out = { host, resolved_host: resolved, address: kind, ...via === void 0 ? {} : { route: via } };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
@@ -5308,7 +5383,9 @@ async function resolveTransfers(calls, cwd, opts = {}) {
         }
       }).join("\n"),
       callText: "",
-      curlrc: /* @__PURE__ */ new Map()
+      curlrc: /* @__PURE__ */ new Map(),
+      resolvConf: opts.resolvConf ?? "/etc/resolv.conf",
+      completed: /* @__PURE__ */ new Map()
     };
     for (const call of calls) {
       const input = call.tool_input;
@@ -5316,7 +5393,7 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if (typeof call.decision === "string" && NEVER_RAN.has(call.decision) || call.ran === false) continue;
       if (typeof command2 !== "string" || command2.trim() === "" || typeof call.tool_use_id !== "string") continue;
-      const script = call.tool_name === "powershell" ? hashtablesEmptied(command2) : command2;
+      const script = call.tool_name === "powershell" ? powershellText(command2) : command2;
       const transfer = await transferOf(script, cwd, state, call.ran !== "maybe");
       if (transfer !== void 0) transfers.set(call.tool_use_id, transfer);
     }

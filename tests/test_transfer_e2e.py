@@ -271,7 +271,7 @@ def run_cursor(sandbox, env, command=COMMAND):
     fire('cursor', {**base, 'hook_event_name': 'stop', 'status': 'completed', 'loop_count': 0}, env, project)
 
 
-def run_copilot(sandbox, env, command=COMMAND):
+def run_copilot(sandbox, env, command=COMMAND, tool='bash'):
     session, project = str(uuid.uuid4()), str(sandbox['project'])
     events = sandbox['home'] / '.copilot' / 'session-state' / session / 'events.jsonl'
     base = {'session_id': session, 'cwd': project, 'transcript_path': str(events)}
@@ -282,7 +282,7 @@ def run_copilot(sandbox, env, command=COMMAND):
     ])
     fire('copilot', {**base, 'hook_event_name': 'UserPromptSubmit', 'prompt': prompt, 'timestamp': stamp()},
          env, project)
-    call = {'tool_name': 'bash', 'tool_input': {'command': command, 'description': 'Copy the dump'}}
+    call = {'tool_name': tool, 'tool_input': {'command': command, 'description': 'Copy the dump'}}
     fire('copilot', {**base, **call, 'hook_event_name': 'PreToolUse'}, env, project)
     fire('copilot', {**base, **call, 'hook_event_name': 'PostToolUse', 'tool_response': {'output': ''}}, env, project)
     arguments = {'command': command, 'description': 'Copy the dump'}
@@ -290,9 +290,9 @@ def run_copilot(sandbox, env, command=COMMAND):
         for line in [
             {'type': 'assistant.message', 'id': 'e2', 'timestamp': stamp(1), 'data': {
                 'content': '', 'model': 'claude-sonnet-4.5',
-                'toolRequests': [{'toolCallId': 'call_e2e', 'name': 'bash', 'arguments': arguments}]}},
+                'toolRequests': [{'toolCallId': 'call_e2e', 'name': tool, 'arguments': arguments}]}},
             {'type': 'tool.execution_start', 'id': 'e3', 'timestamp': stamp(1),
-             'data': {'toolCallId': 'call_e2e', 'toolName': 'bash', 'arguments': arguments}},
+             'data': {'toolCallId': 'call_e2e', 'toolName': tool, 'arguments': arguments}},
             {'type': 'tool.execution_complete', 'id': 'e4', 'timestamp': stamp(2),
              'data': {'toolCallId': 'call_e2e', 'success': True, 'result': {'content': '<exited with exit code 0>'}}},
             {'type': 'assistant.message', 'id': 'e5', 'timestamp': stamp(3),
@@ -441,3 +441,44 @@ def test_claude_never_sends_what_curlrc_holds(sandbox, gateway):
     assert len(calls) == 1, json.dumps(tool_entries(body), indent=2)
     assert 'transfer' not in calls[0], json.dumps(calls[0], indent=2)
     assert_private(gateway, 'hunter2', base64.b64encode(b'admin:hunter2').decode())
+
+
+# PowerShell shapes the Copilot CLI's PowerShell tool runs, each reaching the backup host's literal address.
+POWERSHELL_SHAPES = {
+    '$r = Invoke-RestMethod -Uri https://10.0.4.12/api -Method Post -Body $body; $r.id': 'out',
+    'try { Invoke-WebRequest -Uri https://10.0.4.12/a.zip -OutFile a.zip } catch { exit 1 }': 'in',
+    'Invoke-RestMethod -Headers @{Authorization="Bearer $t"; Accept="application/json"} -Uri https://10.0.4.12/api':
+        'in',
+    'Get-ChildItem *.sql | ForEach-Object { iwr https://10.0.4.12/up -InFile $_.FullName -Method Put }': 'out',
+}
+
+
+@pytest.mark.parametrize('script', sorted(POWERSHELL_SHAPES))
+def test_copilot_powershell_web_calls_send_where_they_went(script, sandbox, gateway):
+    run_copilot(sandbox, hook_env(sandbox, gateway), command=script, tool='powershell')
+    body = turn_log(gateway, 'copilot')
+    calls = [entry for entry in tool_entries(body) if command_of(entry) == script]
+    assert len(calls) == 1, json.dumps(tool_entries(body), indent=2)
+    # The hook's environment sets a proxy, which the cmdlet may go through, so the address is not routed.
+    endpoint = {'direction': POWERSHELL_SHAPES[script], 'host': '10.0.4.12', 'resolved_host': '10.0.4.12',
+                'address': 'private'}
+    assert calls[0].get('transfer') == {'tool': 'powershell', 'endpoints': [endpoint]}, json.dumps(calls[0], indent=2)
+    assert_private(gateway)
+
+
+# Not a real password; it only has to sit where sshpass takes one.
+SSHPASS_PASSWORD = 'hunter2-' + 'Zq8xLm'
+
+
+@pytest.mark.parametrize('tool', ['claude-code', 'copilot'])
+@pytest.mark.parametrize('options', ['-p ' + SSHPASS_PASSWORD, '-p' + SSHPASS_PASSWORD, '-e', '-f pw.txt', '-d 3'])
+def test_an_sshpass_copy_sends_where_it_went_and_never_its_password(tool, options, sandbox, gateway):
+    command = 'sshpass %s %s' % (options, COMMAND)
+    RUNS[tool](sandbox, hook_env(sandbox, gateway), command=command)
+    body = turn_log(gateway, tool)
+    calls = [entry for entry in tool_entries(body) if command_of(entry) == command]
+    assert len(calls) == 1, json.dumps(tool_entries(body), indent=2)
+    assert calls[0].get('transfer') == EXPECTED, json.dumps(calls[0], indent=2)
+    # The command is logged as the agent ran it; nothing the hook resolved carries the password.
+    assert SSHPASS_PASSWORD not in json.dumps(calls[0]['transfer'])
+    assert_private(gateway)
