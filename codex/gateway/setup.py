@@ -987,7 +987,6 @@ def main():
     # Remove leftover hooks setup env var and artifacts
     try:
         remove_env_var("UNBOUND_CODEX_API_KEY")
-        remove_env_var("UNBOUND_DEVICE_TOKEN")
     except Exception:
         pass
     remove_hooks_unbound_script()

@@ -4008,6 +4008,7 @@ def _dispatch_skills_sync(api_key: str) -> None:
             'stdout': subprocess.DEVNULL,
             'stderr': subprocess.DEVNULL,
             'close_fds': True,
+            # Send-only device key: it can only post telemetry, so the _ID name is deliberate.
             'env': {**os.environ, 'UNBOUND_DEVICE_ID': api_key},
         }
         if os.name == 'nt':

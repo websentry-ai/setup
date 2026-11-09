@@ -50,6 +50,7 @@ SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'codex'
+# Send-only device key: it can only post telemetry, so the _ID name is deliberate.
 SKILL_POLICY_API_KEY_ENV = 'UNBOUND_DEVICE_ID'
 CODEX_SELECTED_SKILL_KIND = 'skills.selected_skill_instructions'
 CODEX_SELECTED_SKILL_NAME_RE = re.compile(r'<name>\s*([^<\s][^<]*?)\s*</name>')

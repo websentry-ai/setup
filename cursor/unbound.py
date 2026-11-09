@@ -92,6 +92,7 @@ SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'cursor'
+# Send-only device key: it can only post telemetry, so the _ID name is deliberate.
 SKILL_POLICY_API_KEY_ENV = 'UNBOUND_DEVICE_ID'
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"

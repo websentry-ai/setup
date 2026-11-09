@@ -1649,10 +1649,10 @@ def clear_setup() -> bool:
         teardown_failed = True
         print(f"Failed to clear managed hooks in {managed_dir}")
 
-    _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_id_in_use)
-    if not _remove_env_var_for_all_users("UNBOUND_DEVICE_ID", keep=device_id_in_use):
+    removed = [_remove_env_var_for_all_users(name, keep=device_id_in_use) for name in ("UNBOUND_DEVICE_TOKEN", "UNBOUND_DEVICE_ID")]
+    if not all(removed):
         teardown_failed = True
-        print("Failed to clear UNBOUND_DEVICE_ID")
+        print("Failed to clear UNBOUND_DEVICE_ID or UNBOUND_DEVICE_TOKEN")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

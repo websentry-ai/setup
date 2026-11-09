@@ -758,13 +758,13 @@ def clear_setup() -> bool:
         print("Failed to clear API_KEY")
         any_failed = True
     if not device_id_in_use():
-        remove_env_var("UNBOUND_DEVICE_TOKEN")
-        status, _ = remove_env_var("UNBOUND_DEVICE_ID")
-        if status == "cleared":
-            any_cleared = True
-        elif status != "not_found":
-            print("Failed to clear UNBOUND_DEVICE_ID")
-            any_failed = True
+        for name in ("UNBOUND_DEVICE_TOKEN", "UNBOUND_DEVICE_ID"):
+            status, _ = remove_env_var(name)
+            if status == "cleared":
+                any_cleared = True
+            elif status != "not_found":
+                print(f"Failed to clear {name}")
+                any_failed = True
 
     _r = _clear_path(Path.home() / ".augment" / "hooks" / "unbound.py", "Augment unbound.py hook")
     if _r == "cleared":
