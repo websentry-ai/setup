@@ -745,7 +745,8 @@ class TestMdmBackfillBatches(unittest.TestCase):
         upload_at(100.0)
         self.assertEqual(requests[2], ("POST", 30))
         upload_at(485.0, put_took=74.0)
-        self.assertEqual(requests[2], ("POST", 21))
+        # 91s to the kill less the slack: 17s an attempt puts the call's 4 x 17 + 20 subprocess budget inside it.
+        self.assertEqual(requests[2], ("POST", 17))
 
     def test_a_chunk_whose_link_request_used_its_time_stops_the_batch_as_more_not_failed(self):
         mdm = self.mdm

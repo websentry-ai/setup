@@ -1617,7 +1617,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
             debug_print("S3 PUT not started: the link request used the chunk's time")
             return False
         put_started = time.time()
-        code, _ = _backfill_http_request(
+        code, put_answer = _backfill_http_request(
             upload_url,
             method='PUT',
             headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
@@ -1627,10 +1627,12 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         if 200 <= code < 300:
             break
         debug_print(f"S3 PUT failed: HTTP {code}")
-        if 0 <= code < 500 or (code < 0 and time.time() - put_started >= put_cap - 1):
+        timed_out_at_s3 = code == 408 or (code == 400 and b'RequestTimeout' in put_answer)
+        if (0 <= code < 500 and not timed_out_at_s3) or (code < 0 and time.time() - put_started >= put_cap - 1):
             # Refused, or still moving when the cap cut it: another attempt would end the same way.
             return False
-        # A stall, another transport failure or a 5xx: the next attempt asks for a fresh link.
+        # A stall (S3 calls it out itself after ~20s of silence), another transport failure or a 5xx:
+        # the next attempt asks for a fresh link.
     else:
         return False
 

@@ -298,6 +298,25 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
                                                       put_seconds=lambda cap: cap)
         assert (landed, links, puts, confirmed) == (False, 1, ["https://s3/put-1"], [])
 
+    def test_a_put_s3_itself_timed_out_is_sent_again(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        clock = [1000.0]
+        answers = iter([(400, b"<Error><Code>RequestTimeout</Code></Error>"), (408, b""), (200, b"")])
+        calls = []
+
+        def http(url, method, headers, body=None, timeout=30):
+            calls.append(method)
+            if url.endswith("/upload-url/"):
+                return 200, json.dumps({"upload_url": "https://s3/put", "object_key": "k"}).encode()
+            return next(answers) if method == "PUT" else (200, b"{}")
+
+        monkeypatch.setattr(module, "_backfill_http_request", http)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0], raising=False)
+        assert module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}]) is True
+        assert calls.count("PUT") == 3
+
     def test_a_refused_put_is_not_sent_again(self, relpath, monkeypatch):
         landed, _, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [403, 200])
         assert (landed, puts, confirmed) == (False, ["https://s3/put-1"], [])
