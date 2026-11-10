@@ -37,7 +37,7 @@ BACKFILL_STATE_FILE = '.unbound_last_backfill'
 BACKFILL_PUT_STALL_SECONDS = 60
 BACKFILL_PUT_STALL_BYTES_PER_SECOND = 1024
 BACKFILL_PUT_ATTEMPTS = 3
-BACKFILL_PUT_MAX_SECONDS = 600  # total cap on one PUT attempt
+BACKFILL_PUT_MAX_SECONDS = 300  # total cap on one PUT attempt
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -2146,6 +2146,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
             debug_print("upload-url response missing fields")
             return False
 
+        put_started = time.time()
         code, _ = _backfill_http_request(
             upload_url,
             method='PUT',
@@ -2156,9 +2157,10 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         if 200 <= code < 300:
             break
         debug_print(f"S3 PUT failed: HTTP {code}")
-        if 0 <= code < 500:
+        if 0 <= code < 500 or (code < 0 and time.time() - put_started >= BACKFILL_PUT_MAX_SECONDS - 1):
+            # Refused, or still moving when the cap cut it: another attempt would end the same way.
             return False
-        # A stall, a timeout or a 5xx: the next attempt asks for a fresh link.
+        # A stall, another transport failure or a 5xx: the next attempt asks for a fresh link.
     else:
         return False
 

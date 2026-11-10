@@ -190,8 +190,9 @@ class TestEveryForceRequestReader:
                           code=500) == (None, None)
 
 
-def _link_then_put(put_codes):
-    """A fake _backfill_http_request: every upload-url call hands out a new link, PUTs answer put_codes in turn."""
+def _link_then_put(put_codes, clock, put_seconds):
+    """A fake _backfill_http_request: every upload-url call hands out a new link, PUTs answer put_codes in turn
+    and take put_seconds(their cap) on the clock."""
     calls, codes = [], iter(put_codes)
 
     def http(url, method, headers, body=None, timeout=30):
@@ -199,7 +200,10 @@ def _link_then_put(put_codes):
         if url.endswith("/upload-url/"):
             link = sum(1 for c in calls if c[1].endswith("/upload-url/"))
             return 200, json.dumps({"upload_url": "https://s3/put-%d" % link, "object_key": "key-%d" % link}).encode()
-        return (next(codes) if method == "PUT" else 200), b"{}"
+        if method != "PUT":
+            return 200, b"{}"
+        clock[0] += put_seconds(timeout)
+        return next(codes), b"{}"
     return calls, http
 
 
@@ -217,16 +221,20 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
         return result, run.call_args[0][0], run.call_args[1]["timeout"]
 
     @staticmethod
-    def _upload(module, monkeypatch, put_codes):
-        calls, http = _link_then_put(put_codes)
+    def _upload(module, monkeypatch, put_codes, put_seconds=lambda cap: 60):
+        """(landed, links asked for, PUT urls, object keys confirmed); a failed PUT stalls out after 60s by default."""
+        clock = [1000.0]
+        calls, http = _link_then_put(put_codes, clock, put_seconds)
         monkeypatch.setattr(module, "_backfill_http_request", http)
         monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
-        # Only the managed claude-code installer has a run clock; a long test session must not read as a spent one.
-        monkeypatch.setattr(module, "_SCRIPT_START", module.time.time(), raising=False)
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        # Only the managed claude-code installer has a run clock.
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0], raising=False)
         landed = module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}])
+        links = sum(1 for _, url, _ in calls if url.endswith("/upload-url/"))
         puts = [url for method, url, _ in calls if method == "PUT"]
         confirmed = [json.loads(body)["object_key"] for _, url, body in calls if url.endswith("/from-s3/")]
-        return landed, puts, confirmed
+        return landed, links, puts, confirmed
 
     def test_a_put_is_cut_when_it_stalls_and_is_never_re_sent_by_curl(self, relpath):
         module = load_module(relpath)
@@ -252,18 +260,24 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
         assert self._curl(module, "PUT", 500, stdout=b"denied\n403")[0] == (403, b"denied")
 
     def test_a_stalled_put_is_sent_again_on_a_fresh_link(self, relpath, monkeypatch):
-        landed, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 503, 200])
-        assert landed
+        landed, links, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 503, 200])
+        assert landed and links == 3
         assert puts == ["https://s3/put-1", "https://s3/put-2", "https://s3/put-3"]
         assert confirmed == ["key-3"]
 
+    def test_a_put_that_ran_to_its_cap_is_not_sent_again(self, relpath, monkeypatch):
+        # Still moving but too slow for the cap: a second attempt would fail the same way.
+        landed, links, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 200],
+                                                      put_seconds=lambda cap: cap)
+        assert (landed, links, puts, confirmed) == (False, 1, ["https://s3/put-1"], [])
+
     def test_a_refused_put_is_not_sent_again(self, relpath, monkeypatch):
-        landed, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [403, 200])
+        landed, _, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [403, 200])
         assert (landed, puts, confirmed) == (False, ["https://s3/put-1"], [])
 
     def test_a_put_that_keeps_stalling_is_given_up_after_a_few_attempts(self, relpath, monkeypatch):
         module = load_module(relpath)
-        landed, puts, confirmed = self._upload(module, monkeypatch, [-28] * 10)
+        landed, _, puts, confirmed = self._upload(module, monkeypatch, [-28] * 10)
         assert (landed, len(puts), confirmed) == (False, module.BACKFILL_PUT_ATTEMPTS, [])
 
 
