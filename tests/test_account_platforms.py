@@ -165,8 +165,9 @@ class AccountPlatformTests(unittest.TestCase):
         with open(self.run_log) as log:
             return [json.loads(line)['argv'] for line in log if line.strip()]
 
-    def resolve(self, hook, command, state=None, cwd=None):
-        return hook._accounts(command, cwd or self.repo, state if state is not None else {})
+    def resolve(self, hook, command, state=None, cwd=None, persistent=False):
+        return hook._accounts(command, cwd or self.repo, state if state is not None else {},
+                              persistent=persistent)
 
     def each(self, command, state=None):
         return [(path, self.resolve(hook, command, {} if state is None else dict(state)))
@@ -181,12 +182,24 @@ class AccountPlatformTests(unittest.TestCase):
         self.assertEqual(self.runs(), [])
 
     def test_an_exported_profile_decides_even_though_the_hook_never_had_it_set(self):
+        """Only where the shell persists: a hook whose every call is a new process cannot carry it."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            self.resolve(hook, 'export AWS_PROFILE=home', state, persistent=True)
+            resolved = self.resolve(hook, 'aws s3 ls', state, persistent=True)
+            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
+        self.assertEqual(self.runs(), [])
+
+    def test_an_exported_profile_does_not_carry_where_the_shell_does_not_persist(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
             state = {}
             self.resolve(hook, 'export AWS_PROFILE=home', state)
             resolved = self.resolve(hook, 'aws s3 ls', state)
-            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
-        self.assertEqual(self.runs(), [])
+            self.assertEqual(resolved['accounts'][0]['account_id'], '111111111111', path)
+
+    def test_a_cloud_call_after_a_source_resolves_nothing(self):
+        for path, resolved in self.each('source ./.env; aws s3 ls --profile home'):
+            self.assertIsNone(resolved, path)
 
     def test_an_inline_profile_decides_the_call_it_prefixes(self):
         for path, resolved in self.each('AWS_PROFILE=home aws s3 ls'):
