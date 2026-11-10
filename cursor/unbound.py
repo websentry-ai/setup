@@ -7513,7 +7513,8 @@ _ACCOUNT_MAX_VALUE = 255
 # them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
 _ACCOUNT_REMEMBERED = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
-    'GIT_COMMITTER_EMAIL', 'GH_HOST', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+    'GIT_COMMITTER_EMAIL', 'GH_HOST', 'GH_CONFIG_DIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
+    'GITHUB_ENTERPRISE_TOKEN',
 })
 # Fixed for every run: git must not page, prompt or take a lock on our account.
 _ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
@@ -7526,9 +7527,10 @@ _ACCOUNT_GIT_COMMITS = frozenset({'commit', 'merge', 'rebase', 'cherry-pick', 'r
 # git's own options before the subcommand that take a value, so the subcommand is found at the right word.
 _ACCOUNT_GIT_VALUE_OPTIONS = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path',
                                         '--config-env', '--super-prefix'})
-# `git push` options that take a value, so the remote is not read out of one.
-_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--repo', '--receive-pack', '--exec', '-o', '--push-option',
-                                         '--signed', '--force-with-lease', '--recurse-submodules'})
+# `git push` options whose value is a separate word, so the remote is not read out of one. The ones whose
+# value is optional (`--force-with-lease`, `--signed`, `--recurse-submodules`) are deliberately absent: bare,
+# the word after them is the remote, and their `=` form is a single token the switch branch already skips.
+_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--repo', '--receive-pack', '--exec', '-o', '--push-option'})
 
 
 def _account_deadline(state: Dict) -> float:
@@ -7684,8 +7686,14 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
                 overrides[name.strip().lower()] = setting
             i += 2
             continue
-        if len(pair) == 2 and pair[0] == '--config-env':
-            i += 1
+        if pair[0] == '--config-env':
+            setting = pair[1] if len(pair) == 2 else value
+            name, _, variable = (setting or '').partition('=')
+            if name and _:
+                held = _account_setting(variable, env)
+                if held:
+                    overrides[name.strip().lower()] = held
+            i += 1 if len(pair) == 2 else 2
             continue
         for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
             if arg == option and value is not None:
@@ -7801,7 +7809,8 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     if not host:
         return [], None
 
-    login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state, ('gh-user', host))
+    login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
+                                ('gh-user', host, _account_env_key(env)))
     return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command'}] if login else []), None
 
 
@@ -7809,7 +7818,8 @@ _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
 _ACCOUNT_TRIGGERS = re.compile(
-    r'(?<![\w.-])(%s)(?![\w.-])|(?<![A-Z_])(%s)(?![A-Z_])'
+    r'(?<![\w.-])(%s)(?![\w.-])|(?<![A-Z_])(%s)(?![A-Z_])|(?<![\w.-])(source|eval)(?![\w.-])'
+    r'|(?:^|[;&|(]\s*)\.\s'
     % ('|'.join(sorted(_ACCOUNT_HANDLERS)), '|'.join(sorted(_ACCOUNT_REMEMBERED))))
 
 
