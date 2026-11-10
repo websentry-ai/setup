@@ -3800,17 +3800,25 @@ function shellString(name, args) {
   }
   return void 0;
 }
-var PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)/y;
+var PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
+var PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
 function powershellText(text) {
   let out = "";
   let quote;
   let starts = true;
+  let depth = 0;
   for (let i = 0; i < text.length; ) {
     PS_ASSIGNMENT.lastIndex = i;
+    PS_JUMP.lastIndex = i;
     const found = starts ? PS_ASSIGNMENT.exec(text) : null;
+    const jump2 = starts && depth > 0 ? PS_JUMP.exec(text) : null;
     starts = false;
     if (found) {
-      i = PS_ASSIGNMENT.lastIndex;
+      i = found[1] !== void 0 ? hashtableEnd(text, PS_ASSIGNMENT.lastIndex) : PS_ASSIGNMENT.lastIndex;
+      continue;
+    }
+    if (jump2) {
+      i = PS_JUMP.lastIndex;
       continue;
     }
     if (quote === void 0 && text.startsWith("@{", i)) {
@@ -3827,12 +3835,13 @@ function powershellText(text) {
     const ch = text[i];
     if (quote === void 0 && (ch === "{" || ch === "}")) {
       out += ch === "{" ? "{\n" : "\n}";
+      depth = ch === "{" ? depth + 1 : Math.max(depth - 1, 0);
       starts = ch === "{";
       i++;
       continue;
     }
     quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
-    starts = quote === void 0 && (ch === ";" || ch === "\n");
+    starts = quote === void 0 && (ch === ";" || ch === "\n" || ch === "(");
     out += ch;
     i++;
   }
@@ -4803,6 +4812,7 @@ function webCmdlet(args, sends, proxied = false) {
   let uri = "";
   let out = sends;
   let proxy;
+  let splat = false;
   const positional = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
@@ -4810,7 +4820,10 @@ function webCmdlet(args, sends, proxied = false) {
       positional.push(...args.slice(i));
       break;
     }
-    if (arg.startsWith("@")) return [];
+    if (arg.startsWith("@")) {
+      splat = true;
+      continue;
+    }
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
       continue;
@@ -4834,7 +4847,8 @@ function webCmdlet(args, sends, proxied = false) {
   }
   if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
-  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
+  const direction = out ? "out" : splat ? "" : "in";
+  return uri ? [[direction, urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
 }
 function stdio(layers) {
   const fds = /* @__PURE__ */ new Map([[0, "null"], [1, "null"], [2, "null"]]);

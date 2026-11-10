@@ -7315,22 +7315,32 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
     return None
 
 
-# A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it.
+# A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it, and
+# the { of a script block it assigns.
 _TRANSFER_PS_ASSIGNMENT = re.compile(
-    r'[ \t]*(?:\[[\w.,\[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)')
+    r'[ \t]*(?:\[[\w.,\[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)'
+    r'([ \t\r\n]*\{)?')
+# A statement's leading exit, return, throw, break or continue, in any case.
+_TRANSFER_PS_JUMP = re.compile(r'[ \t]*(?:exit|return|throw|break|continue)(?![\w-])', re.IGNORECASE | re.ASCII)
 
 
 def _transfer_powershell_text(text: str) -> str:
     """A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
     entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
     as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
-    assigns from is read."""
-    out, i, quote, starts = [], 0, None, True
+    assigns from is read, in parentheses as well. A script block a statement assigns is only stored, so none of it is
+    read; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is
+    still read."""
+    out, i, quote, starts, depth = [], 0, None, True, 0
     while i < len(text):
         found = _TRANSFER_PS_ASSIGNMENT.match(text, i) if starts else None
+        jump = _TRANSFER_PS_JUMP.match(text, i) if starts and depth else None
         starts = False
         if found:
-            i = found.end()
+            i = _transfer_hashtable_end(text, found.end()) if found.group(1) else found.end()
+            continue
+        if jump:
+            i = jump.end()  # what follows it, such as the pipeline a return passes on, still runs
             continue
         if not quote and text.startswith('@{', i):
             out.append('@{}')
@@ -7344,17 +7354,19 @@ def _transfer_powershell_text(text: str) -> str:
         ch = text[i]
         if not quote and ch in '{}':
             out.append('{\n' if ch == '{' else '\n}')
+            depth = depth + 1 if ch == '{' else max(depth - 1, 0)
             starts, i = ch == '{', i + 1
             continue
         quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
-        starts = not quote and ch in ';\n'
+        starts = not quote and ch in ';\n('
         out.append(ch)
         i += 1
     return ''.join(out)
 
 
 def _transfer_hashtable_end(text: str, i: int) -> int:
-    """The index after the } that closes a PowerShell @{ whose contents start at i, past quotes and nested braces."""
+    """The index after the } that closes a PowerShell @{ or { whose contents start at i, past quotes and nested
+    braces."""
     depth, quote = 1, None
     while i < len(text) and depth:
         ch = text[i]
@@ -8456,15 +8468,17 @@ def _transfer_ps_parameter(name: str) -> str:
 
 def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) -> List[tuple]:
     """Invoke-WebRequest's or Invoke-RestMethod's URI: sent to with a body, file, form, piped input or sending
-    method; else fetched from. It goes through a proxy with -Proxy, or one the command set unless -NoProxy."""
-    uri, out, positional, proxy, named, i = '', sends, [], None, set(), 0
+    method; else fetched from, unless a splat may hold one, which leaves it unknown. It goes through a proxy with
+    -Proxy, or one the command set unless -NoProxy."""
+    uri, out, positional, proxy, named, splat, i = '', sends, [], None, set(), False, 0
     while i < len(args):
         arg, i = args[i], i + 1
         if arg == '--':
             positional.extend(args[i:])  # PowerShell's end of parameters: every word after it is an argument
             break
         if arg.startswith('@'):
-            return []  # a splatted hashtable or array may bind any parameter
+            splat = True  # a splatted hashtable or array may bind any parameter not named here
+            continue
         if not re.match(r'^-[A-Za-z]', arg):
             positional.append(arg)
             continue
@@ -8493,8 +8507,8 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
         return []  # -Proxy and -NoProxy, whatever its value, are in different parameter sets: PowerShell rejects them
     uri = uri or (positional[0] if positional else '')
     proxy = proxied if proxy is None else proxy
-    return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri \
-        else []
+    direction = 'out' if out else '' if splat else 'in'  # a splat may hold a body or sending method
+    return [(direction, _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri else []
 
 
 def _transfer_stdio(layers: tuple) -> tuple:

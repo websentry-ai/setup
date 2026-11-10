@@ -31,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'c57a86993c39cd7bee2ed15ee27f4e9490576f1011763f8eebba400f33034274'
+BLOCK_SHA256 = '3515d4274ae2794a3f53b92c4ec532590672b2e8a9078190aed249847355b63a'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -646,7 +646,8 @@ class SshpassTests(TransferTestCase):
 
 class PowerShellShapeTests(TransferTestCase):
     """PowerShell's own statements are read before the shell reader: a statement's `$x =`, script blocks and
-    hashtables, so the web cmdlet inside them is found; a splat binds what isn't known, so it names no host."""
+    hashtables, so the web cmdlet inside them is found; a splat binds what isn't known, so it names no host unless the
+    URL is named beside it."""
 
     CASES = {
         '$r = Invoke-RestMethod -Uri https://example.com/api; $r.items': 'in',
@@ -666,6 +667,8 @@ class PowerShellShapeTests(TransferTestCase):
         'Invoke-WebRequest https://example.com/x -OutFile out.txt': 'in',
         'Invoke-WebRequest -Uri https://example.com/x `\n  -OutFile x.zip': 'in',
         'curl.exe -sS -T a.zip https://example.com/up': 'out',
+        '($r = irm https://example.com/api).Content': 'in',
+        'Invoke-RestMethod -Uri https://example.com/api -Method Post -InFile secret @headers': 'out',
     }
 
     def test_each_shape_is_found_in_a_powershell_command(self):

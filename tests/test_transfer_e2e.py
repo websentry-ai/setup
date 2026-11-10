@@ -450,6 +450,8 @@ POWERSHELL_SHAPES = {
     'Invoke-RestMethod -Headers @{Authorization="Bearer $t"; Accept="application/json"} -Uri https://10.0.4.12/api':
         'in',
     'Get-ChildItem *.sql | ForEach-Object { iwr https://10.0.4.12/up -InFile $_.FullName -Method Put }': 'out',
+    '($resp = Invoke-RestMethod -Uri https://10.0.4.12/api -Method Post -Body $body).id': 'out',
+    '$x=@{}; Invoke-RestMethod -Uri https://10.0.4.12/up -Method Post -InFile .env @x': 'out',
 }
 
 
@@ -463,6 +465,25 @@ def test_copilot_powershell_web_calls_send_where_they_went(script, sandbox, gate
     endpoint = {'direction': POWERSHELL_SHAPES[script], 'host': '10.0.4.12', 'resolved_host': '10.0.4.12',
                 'address': 'private'}
     assert calls[0].get('transfer') == {'tool': 'powershell', 'endpoints': [endpoint]}, json.dumps(calls[0], indent=2)
+    assert_private(gateway)
+
+
+# A script block stored in a variable never runs, and an exit in a catch block may not, so the call after it is read.
+POWERSHELL_BLOCKS = {
+    '$upload = { iwr https://10.0.4.12/up -InFile customers.sql -Method Put }': [],
+    'try { irm https://10.0.4.12/a } catch { exit 1 }; irm https://10.0.4.13/b -Method Post -Body $b':
+        [('in', '10.0.4.12'), ('out', '10.0.4.13')],
+}
+
+
+@pytest.mark.parametrize('script', sorted(POWERSHELL_BLOCKS))
+def test_copilot_powershell_reads_a_script_block_only_where_it_may_run(script, sandbox, gateway):
+    run_copilot(sandbox, hook_env(sandbox, gateway), command=script, tool='powershell')
+    body = turn_log(gateway, 'copilot')
+    calls = [entry for entry in tool_entries(body) if command_of(entry) == script]
+    assert len(calls) == 1, json.dumps(tool_entries(body), indent=2)
+    endpoints = [(e['direction'], e['host']) for e in (calls[0].get('transfer') or {}).get('endpoints', [])]
+    assert endpoints == POWERSHELL_BLOCKS[script], json.dumps(calls[0], indent=2)
     assert_private(gateway)
 
 

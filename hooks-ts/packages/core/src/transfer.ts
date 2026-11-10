@@ -2391,23 +2391,35 @@ function shellString(name: string, args: string[]): string | undefined {
   return undefined;
 }
 
-/** A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it. */
-const PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)/y;
+/** A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it, and
+ *  the { of a script block it assigns. */
+const PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
+/** A statement's leading exit, return, throw, break or continue, in any case. */
+const PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
 
 /** A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
  *  entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
  *  as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
- *  assigns from is read. */
+ *  assigns from is read, in parentheses as well. A script block a statement assigns is only stored, so none of it is
+ *  read; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is
+ *  still read. */
 function powershellText(text: string): string {
   let out = "";
   let quote: string | undefined;
   let starts = true;
+  let depth = 0;
   for (let i = 0; i < text.length; ) {
     PS_ASSIGNMENT.lastIndex = i;
+    PS_JUMP.lastIndex = i;
     const found = starts ? PS_ASSIGNMENT.exec(text) : null;
+    const jump = starts && depth > 0 ? PS_JUMP.exec(text) : null;
     starts = false;
     if (found) {
-      i = PS_ASSIGNMENT.lastIndex;
+      i = found[1] !== undefined ? hashtableEnd(text, PS_ASSIGNMENT.lastIndex) : PS_ASSIGNMENT.lastIndex;
+      continue;
+    }
+    if (jump) {
+      i = PS_JUMP.lastIndex; // what follows it, such as the pipeline a return passes on, still runs
       continue;
     }
     if (quote === undefined && text.startsWith("@{", i)) {
@@ -2424,19 +2436,21 @@ function powershellText(text: string): string {
     const ch = text[i] as string;
     if (quote === undefined && (ch === "{" || ch === "}")) {
       out += ch === "{" ? "{\n" : "\n}";
+      depth = ch === "{" ? depth + 1 : Math.max(depth - 1, 0);
       starts = ch === "{";
       i++;
       continue;
     }
     quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
-    starts = quote === undefined && (ch === ";" || ch === "\n");
+    starts = quote === undefined && (ch === ";" || ch === "\n" || ch === "(");
     out += ch;
     i++;
   }
   return out;
 }
 
-/** The index after the } that closes a PowerShell @{ whose contents start at `start`, past quotes and nested braces. */
+/** The index after the } that closes a PowerShell @{ or { whose contents start at `start`, past quotes and nested
+ *  braces. */
 function hashtableEnd(text: string, start: number): number {
   let depth = 1;
   let quote: string | undefined;
@@ -3613,6 +3627,7 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   let uri = "";
   let out = sends;
   let proxy: boolean | undefined;
+  let splat = false;
   const positional: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
@@ -3620,7 +3635,10 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
       positional.push(...args.slice(i)); // PowerShell's end of parameters: every word after it is an argument
       break;
     }
-    if (arg.startsWith("@")) return []; // a splatted hashtable or array may bind any parameter
+    if (arg.startsWith("@")) {
+      splat = true; // a splatted hashtable or array may bind any parameter not named here
+      continue;
+    }
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
       continue;
@@ -3647,8 +3665,9 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   // -Proxy and -NoProxy, whatever its value, are in different parameter sets: PowerShell rejects them.
   if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
+  const direction = out ? "out" : splat ? "" : "in"; // a splat may hold a body or sending method
   // It goes through a proxy with -Proxy, or one the command set unless -NoProxy.
-  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), undefined, undefined, proxy ?? proxied]] : [];
+  return uri ? [[direction, urlHost(uri, POWERSHELL_SCHEMES), undefined, undefined, proxy ?? proxied]] : [];
 }
 
 /** Whether a call's stdin is fed from a file or pipe, and whether its stdout goes to one, from the pipes and
