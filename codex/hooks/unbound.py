@@ -7569,19 +7569,46 @@ _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'symbolic-ref', '--short', 'HEAD'),
     ('gh', 'config', 'get'),
+    ('aws', 'sts', 'get-caller-identity'),
+    ('az', 'account', 'show'),
+    ('kubectl', 'config', 'view'),
 )
+# Options that turn one of the allowed lookups into a credential dump. The allow-list is a prefix match, so
+# `kubectl config view` would otherwise accept `--raw`, which prints the kubeconfig's keys in full.
+_ACCOUNT_REFUSED_OPTIONS = frozenset({'--raw', '--flatten', '--show-secrets', '--include-secrets',
+                                      '--export-credentials', '--decrypt', '--show-password'})
 _ACCOUNT_RUN_TIMEOUT = 5
 # Wall-clock budget for every account lookup in one turn, so a slow one never delays the agent.
 _ACCOUNT_TURN_BUDGET = 10.0
 # Accounts kept for one call; two is the real maximum today (a login and a committer identity).
 _ACCOUNT_MAX = 4
 _ACCOUNT_MAX_VALUE = 255
+# A human name carries spaces — an Azure subscription is called "Acme Production" — so it has its own reader.
+_ACCOUNT_MAX_NAME = 120
 # Variables an `export` earlier in the turn still decides. The hook is a fresh process per event and never inherits
 # them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
 _ACCOUNT_REMEMBERED = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
     'GIT_COMMITTER_EMAIL', 'GH_HOST', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+    'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_ACCESS_KEY_ID', 'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
+# A configuration file longer than this is not one of the small files we read, and is skipped rather than parsed.
+_ACCOUNT_MAX_FILE_BYTES = 512 * 1024
+# The twelve digits of an AWS account, wherever it is written.
+_ACCOUNT_AWS_ID = re.compile(r'^\d{12}$')
+_ACCOUNT_ROLE_ARN = re.compile(r'^arn:[a-z0-9-]*:[a-z0-9-]*::?(\d{12}):')
+# `<account>.dkr.ecr.<region>.amazonaws.com` names the AWS account in the hostname, with no credential involved.
+_ACCOUNT_ECR_HOST = re.compile(r'^(\d{12})\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?$')
+# docker subcommands that reach a registry; everything else stays on the machine.
+_ACCOUNT_DOCKER_REGISTRY = frozenset({'push', 'pull', 'login'})
+# What a registry-less image name is published to.
+_ACCOUNT_DOCKER_DEFAULT = 'docker.io'
+# docker's own options that take a value, so the image is not read out of one.
+_ACCOUNT_DOCKER_VALUE_OPTIONS = frozenset({'--context', '-H', '--host', '--config', '--log-level', '--tlscacert',
+                                           '--tlscert', '--tlskey', '--platform', '-u', '--username', '-p',
+                                           '--password'})
+# Separates the fields asked of kubectl in one go, because none of them may contain it.
+_ACCOUNT_KUBE_SEPARATOR = '|'
 # Fixed for every run: git must not page, prompt or take a lock on our account.
 _ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
                     'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'CLICOLOR': '0', 'NO_COLOR': '1'}
@@ -7608,6 +7635,8 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
     """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing."""
     try:
         if not any(tuple(argv[:len(p)]) == p for p in _ACCOUNT_ALLOWED_RUNS):
+            return None
+        if any(arg.split('=', 1)[0] in _ACCOUNT_REFUSED_OPTIONS for arg in argv):
             return None
         remaining = _account_deadline(state) - time.monotonic()
         if remaining <= 0:
@@ -7643,6 +7672,16 @@ def _account_value(value: Any) -> Optional[str]:
     if not word or any(ch.isspace() or ord(ch) < 32 for ch in word):
         return None
     return word
+
+
+def _account_name(value: Any) -> Optional[str]:
+    """A human name as it was reported, spaces and all; None when it names nothing or carries a control character."""
+    if not isinstance(value, str):
+        return None
+    name = ' '.join(value.split())[:_ACCOUNT_MAX_NAME]
+    if not name or any(ord(ch) < 32 for ch in name):
+        return None
+    return name
 
 
 def _account_setting(name: str, env: Dict) -> Optional[str]:
@@ -7697,21 +7736,6 @@ def _account_repo_of(url: str) -> Optional[str]:
     return _account_value('%s/%s' % (owner, name))
 
 
-def _account_git_subcommand(args: List[str]) -> tuple:
-    """(the git subcommand, the arguments after it); ('', []) when the call names none."""
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg in _ACCOUNT_GIT_VALUE_OPTIONS:
-            i += 2
-            continue
-        if arg.startswith('-'):
-            i += 1
-            continue
-        return arg, args[i + 1:]
-    return '', []
-
-
 def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
                         key: tuple) -> Optional[str]:
     """The first line one allowlisted lookup printed, asked once per distinct question in a turn."""
@@ -7721,6 +7745,71 @@ def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: D
         return _account_value(lines[0]) if lines else None
 
     return _account_once(state, key, resolve)
+
+
+def _account_output(argv: List[str], cwd: Optional[str], env: Dict, state: Dict, key: tuple) -> Optional[str]:
+    """Everything one allowlisted lookup printed, asked once per distinct question in a turn."""
+    return _account_once(state, key, lambda: _account_run(argv, cwd, env, state))
+
+
+def _account_home(env: Dict) -> Optional[str]:
+    """The folder a CLI reads its configuration from, which `$HOME` does change, unlike the one ssh reads."""
+    for name in (('USERPROFILE', 'HOME') if os.name == 'nt' else ('HOME',)):
+        found = _account_setting(name, env)
+        if found and os.path.isabs(found):
+            return found
+    try:
+        return _transfer_home()
+    except Exception:
+        return None
+
+
+def _account_file(path: Optional[str]) -> Optional[str]:
+    """A configuration file's text, past the UTF-8 BOM Azure writes; None when it is missing, large or unreadable."""
+    try:
+        if not path or not os.path.isfile(path):
+            return None
+        with open(path, 'rb') as handle:
+            raw = handle.read(_ACCOUNT_MAX_FILE_BYTES + 1)
+        if len(raw) > _ACCOUNT_MAX_FILE_BYTES:
+            return None
+        return raw.decode('utf-8-sig', errors='replace')
+    except Exception:
+        return None
+
+
+def _account_flag_raw(args: List[str], names: tuple) -> Optional[str]:
+    """The word a call gives one of these options, written either as two words or with an equals sign."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in names and i + 1 < len(args):
+            return args[i + 1]
+        for name in names:
+            if arg.startswith(name + '='):
+                return arg.split('=', 1)[1]
+        i += 1
+    return None
+
+
+def _account_flag(args: List[str], names: tuple) -> Optional[str]:
+    """What a call names with one of these options, as a single-word identity value."""
+    return _account_value(_account_flag_raw(args, names))
+
+
+def _account_subcommand(args: List[str], value_options: frozenset) -> tuple:
+    """(the first word that is neither an option nor an option's value, the words after it); ('', []) when none."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in value_options:
+            i += 2
+            continue
+        if arg.startswith('-'):
+            i += 1
+            continue
+        return arg, args[i + 1:]
+    return '', []
 
 
 def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
@@ -7752,7 +7841,7 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
 
 def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the accounts a git call acted as, the repository a push reached); both empty for a purely local call."""
-    subcommand, after = _account_git_subcommand(args)
+    subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
     if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
         return [], None
     repo = None
@@ -7805,7 +7894,196 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command'}] if login else []), None
 
 
-_ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
+def _account_aws_profile(args: List[str], env: Dict) -> Optional[str]:
+    """The profile an aws call uses, in the CLI's own order: --profile, then AWS_PROFILE, else default."""
+    named = _account_flag(args, ('--profile',))
+    if named:
+        return named
+    # Access keys set for the call sign it in as whoever owns them, which cannot be read offline.
+    if _account_setting('AWS_ACCESS_KEY_ID', env):
+        return None
+    return _account_setting('AWS_PROFILE', env) or _account_setting('AWS_DEFAULT_PROFILE', env) or 'default'
+
+
+def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
+    """(the account ~/.aws/config gives this profile, whether that file settled it). A profile the file does not
+    contain settles as unknown, because falling back to the default would name the wrong account with confidence."""
+    def resolve():
+        import configparser
+        path = _account_setting('AWS_CONFIG_FILE', env) or os.path.join(_account_home(env) or '', '.aws', 'config')
+        text = _account_file(path)
+        if text is None:
+            return None, False
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read_string(text)
+        except Exception:
+            return None, False
+        section = 'default' if profile == 'default' else 'profile %s' % profile
+        if not parser.has_section(section):
+            return None, True
+        for key in ('sso_account_id', 'aws_account_id'):
+            if parser.has_option(section, key):
+                found = _account_value(parser.get(section, key))
+                if found and _ACCOUNT_AWS_ID.match(found):
+                    return found, True
+        if parser.has_option(section, 'role_arn'):
+            match = _ACCOUNT_ROLE_ARN.match((parser.get(section, 'role_arn') or '').strip())
+            if match:
+                return match.group(1), True
+        # The profile is there but names no account — static keys, say — so the CLI is the only way to know.
+        return None, False
+
+    return _account_once(state, ('aws-file', profile), resolve)
+
+
+def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the AWS account a call acted as, no repository); the file answers in about a millisecond, the CLI in 1,327."""
+    profile = _account_aws_profile(args, env)
+    if not profile:
+        return [], None
+    account, settled = _account_aws_file(profile, env, state)
+    source = 'file'
+    if account is None and not settled:
+        found = _account_first_line(
+            ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text', '--profile', profile],
+            cwd, env, state, ('aws-sts', profile))
+        account, source = (found if found and _ACCOUNT_AWS_ID.match(found) else None), 'command'
+    if not account:
+        return [], None
+    return [{'platform': 'aws', 'account_id': account, 'profile': profile, 'source': source}], None
+
+
+def _account_azure_entry(named: Optional[str], env: Dict, state: Dict) -> tuple:
+    """(the subscription azureProfile.json names, whether that file settled it). The file begins with a UTF-8 BOM."""
+    def resolve():
+        text = _account_file(os.path.join(_account_home(env) or '', '.azure', 'azureProfile.json'))
+        if text is None:
+            return None, False
+        try:
+            data = json.loads(text)
+        except Exception:
+            return None, False
+        subscriptions = data.get('subscriptions') if isinstance(data, dict) else None
+        if not isinstance(subscriptions, list):
+            return None, False
+        wanted = (named or '').lower()
+        for entry in subscriptions:
+            if not isinstance(entry, dict):
+                continue
+            if wanted:
+                if wanted not in (str(entry.get('id') or '').lower(), str(entry.get('name') or '').lower()):
+                    continue
+            elif not entry.get('isDefault'):
+                continue
+            return entry, True
+        # Named but absent, or no default marked: unknown rather than the first subscription in the file.
+        return None, True
+
+    return _account_once(state, ('azure-file', named or ''), resolve)
+
+
+def _account_azure_fields(entry: Dict) -> Optional[Dict]:
+    """One subscription's identity fields, however it was read; None when it names no subscription."""
+    subscription = _account_value(entry.get('id'))
+    if not subscription:
+        return None
+    account = {'platform': 'azure', 'subscription_id': subscription}
+    name = _account_name(entry.get('name'))
+    if name:
+        account['subscription_name'] = name
+    for field, key in (('tenant_id', 'tenantId'), ('tenant_domain', 'tenantDefaultDomain')):
+        value = _account_value(entry.get(key))
+        if value:
+            account[field] = value
+    return account
+
+
+def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the Azure subscription a call acted as, no repository); no environment variable picks it, only --subscription."""
+    named = _account_name(_account_flag_raw(args, ('--subscription',)))
+    entry, settled = _account_azure_entry(named, env, state)
+    source = 'file'
+    if entry is None and not settled:
+        argv = ['az', 'account', 'show', '-o', 'json'] + (['--subscription', named] if named else [])
+        output = _account_output(argv, cwd, env, state, ('azure-show', named or ''))
+        try:
+            entry, source = (json.loads(output) if output else None), 'command'
+        except Exception:
+            entry = None
+    if not isinstance(entry, dict):
+        return [], None
+    account = _account_azure_fields(entry)
+    if not account:
+        return [], None
+    account['source'] = source
+    return [account], None
+
+
+def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser for
+    it, so kubectl reads it; the jsonpath names three fields, so no credential is ever in the output."""
+    context = _account_flag(args, ('--context',))
+    kubeconfig = _account_flag(args, ('--kubeconfig',)) or _account_setting('KUBECONFIG', env) or ''
+    # Exactly the two fields kept, so no credential from the `users` block is ever in the output to begin with.
+    fields = _ACCOUNT_KUBE_SEPARATOR.join(
+        '{%s}' % path for path in ('.clusters[0].cluster.server', '.clusters[0].name'))
+    argv = ['kubectl', 'config', 'view', '--minify', '-o', 'jsonpath=' + fields]
+    if context:
+        argv += ['--context', context]
+    if kubeconfig:
+        argv += ['--kubeconfig', kubeconfig]
+    output = _account_output(argv, cwd, env, state, ('kube-view', context or '', kubeconfig))
+    parts = (output or '').strip().split(_ACCOUNT_KUBE_SEPARATOR)
+    server = _account_value(parts[0]) if parts else None
+    if not server:
+        return [], None
+    account = {'platform': 'kubernetes', 'server': server, 'source': 'command'}
+    cluster = _account_value(parts[1]) if len(parts) > 1 else None
+    if cluster:
+        account['cluster'] = cluster
+    if context:
+        account['context'] = context
+    return [account], None
+
+
+def _account_docker_registry(image: str) -> str:
+    """The registry an image name points at, which is docker.io when the name carries no host."""
+    head = image.split('/')[0] if '/' in image else ''
+    # A first segment is a registry only when it looks like a host: a dot, a port, or localhost.
+    if head and ('.' in head or ':' in head or head == 'localhost'):
+        return head.lower()
+    return _ACCOUNT_DOCKER_DEFAULT
+
+
+def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the registry a docker call reached, and the AWS account an ECR hostname names outright, no repository).
+
+    No credential helper is run: a Mac with the login inline in `auths` has no helper to ask, and `auths[].auth`
+    is the base64 of a username and password. The hostname is the stronger signal anyway and costs nothing."""
+    subcommand, after = _account_subcommand(args, _ACCOUNT_DOCKER_VALUE_OPTIONS)
+    if subcommand not in _ACCOUNT_DOCKER_REGISTRY:
+        return [], None
+    target, _ = _account_subcommand(after, _ACCOUNT_DOCKER_VALUE_OPTIONS)
+    if not target:
+        return [], None
+    registry = _account_docker_registry(target) if subcommand != 'login' else _account_value(target)
+    if not registry:
+        return [], None
+    accounts = [{'platform': 'docker', 'registry': registry, 'source': 'hostname'}]
+    match = _ACCOUNT_ECR_HOST.match(registry)
+    if match:
+        accounts.append({'platform': 'aws', 'account_id': match.group(1), 'source': 'hostname'})
+    return accounts, None
+
+
+_ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws,
+                     'az': _account_azure, 'kubectl': _account_kubernetes, 'docker': _account_docker}
+# A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
+# A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
+_ACCOUNT_TRIGGERS = re.compile(
+    r'(?<![\w.-])(%s)(?![\w.-])|(?<![A-Z_])(%s)(?![A-Z_])'
+    % ('|'.join(sorted(_ACCOUNT_HANDLERS)), '|'.join(sorted(_ACCOUNT_REMEMBERED))))
 
 
 def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
@@ -7814,7 +8092,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
     try:
         if not isinstance(command, str) or not command.strip():
             return None
-        if not any(name in command for name in _ACCOUNT_HANDLERS):
+        if not _ACCOUNT_TRIGGERS.search(command):
             return None
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd,
                                dict(state.get('account_env') or {}), 0)
