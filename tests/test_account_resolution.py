@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b2aae92352e32ea4370db43756cd4b11ddf33cf73d1917d686135022b076055e'
+BLOCK_SHA256 = 'b6eb3447ad6cb2e5505315e91590fb3a9ca9c41527b34667d2fb02c8507f0603'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -39,6 +39,11 @@ with open(os.environ['FAKE_RUN_LOG'], 'a') as log:
 answers = json.loads(os.environ.get('FAKE_GIT_ANSWERS') or '{{}}')
 if args[:2] == ['config', '--get']:
     name = args[2]
+    count = int(os.environ.get('GIT_CONFIG_COUNT') or 0)
+    for n in range(count):
+        if os.environ.get('GIT_CONFIG_KEY_%d' % n) == name:
+            print(os.environ.get('GIT_CONFIG_VALUE_%d' % n, ''))
+            sys.exit(0)
     # A global config file named in the environment wins, exactly as git's own precedence does.
     override = os.environ.get('GIT_CONFIG_GLOBAL')
     if override and os.path.exists(override):
@@ -269,6 +274,21 @@ class AccountResolutionTests(unittest.TestCase):
     def test_an_override_we_cannot_read_leaves_the_identity_unknown(self):
         for path, resolved in self.each('git --config-env=user.email=MISSING commit -m wip'):
             self.assertIsNone(resolved, path)
+
+    def test_a_named_repository_is_not_resolved_against_this_folders_remote(self):
+        """gh resolves an explicit `OWNER/REPO` against its own host, not whatever this checkout points at."""
+        answers = __import__('json').loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.origin.url'] = 'git@github.acme.com:acme/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': __import__('json').dumps(answers)}):
+            for path, resolved in self.each('gh pr view -R acme/app'):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_gits_environment_configuration_steers_the_lookup(self):
+        """`GIT_CONFIG_COUNT` with indexed pairs is how git takes configuration from the environment."""
+        for path, resolved in self.each(
+                'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email GIT_CONFIG_VALUE_0=env@acme.com '
+                'git commit -m wip'):
+            self.assertEqual(resolved['accounts'][0]['email'], 'env@acme.com', path)
 
     def test_the_checkouts_remote_outranks_gh_host(self):
         """gh reads the repository's own remote before falling back to GH_HOST."""
