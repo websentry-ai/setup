@@ -460,11 +460,21 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
+def _config_has_key(home_dir: Optional[Path] = None) -> bool:
+    try:
+        cfg = json.loads(((home_dir or Path.home()) / ".unbound" / "config.json").read_text(encoding="utf-8"))
+        return bool(cfg.get("api_key") or cfg.get("device_token"))
+    except Exception:
+        return False
+
+
 # Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
 def remove_legacy_key_env() -> None:
     try:
         remove_env_var("UNBOUND_COPILOT_API_KEY")
-        remove_env_var("UNBOUND_DEVICE_TOKEN")
+        # The env copy goes only once config.json holds the key, so a failed config write never strands the hooks.
+        if _config_has_key():
+            remove_env_var("UNBOUND_DEVICE_TOKEN")
     except Exception:
         pass
 

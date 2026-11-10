@@ -101,12 +101,31 @@ def test_setup_writes_both_config_fields(home, tool):
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))
-def test_setup_removes_its_legacy_key_and_the_device_token_env(home, monkeypatch, tool):
+def test_setup_drops_the_device_token_env_only_once_config_holds_the_key(home, monkeypatch, tool):
     setup = _load(SETUPS[tool], f"token_setup_{tool.replace('-', '_')}")
     removed = []
     monkeypatch.setattr(setup, "remove_env_var", lambda name, *a: removed.append(name) or ("cleared", ""))
     setup.remove_legacy_key_env()
+    assert removed == [LEGACY[tool]]
+    removed.clear()
+    _write_config(home, {"device_token": "k"})
+    setup.remove_legacy_key_env()
     assert removed == [LEGACY[tool], "UNBOUND_DEVICE_TOKEN"]
+
+
+@pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
+def test_mdm_drops_the_device_token_env_only_for_users_whose_config_holds_the_key(home, tmp_path, monkeypatch, tool):
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_drop_{tool.replace('-', '_')}")
+    with_key, without = tmp_path / "a", tmp_path / "b"
+    for h in (with_key, without):
+        (h / ".unbound").mkdir(parents=True)
+    (with_key / ".unbound" / "config.json").write_text(json.dumps({"api_key": "k"}))
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [("a", with_key), ("b", without)])
+    removed = []
+    monkeypatch.setattr(mdm, "remove_env_var_from_user", lambda user, home_dir, name, *a: removed.append((user, name)) or "cleared")
+    mdm.remove_legacy_key_env()
+    assert ("a", "UNBOUND_DEVICE_TOKEN") in removed and ("b", "UNBOUND_DEVICE_TOKEN") not in removed
 
 
 def test_no_installer_exports_the_device_token():
