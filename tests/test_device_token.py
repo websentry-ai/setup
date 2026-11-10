@@ -174,6 +174,21 @@ def test_windows_machine_token_stays_while_any_user_still_needs_it(home, tmp_pat
     assert removed == ["UNBOUND_DEVICE_TOKEN"]
 
 
+@pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
+def test_windows_machine_token_is_never_removed_by_legacy_cleanup(home, tmp_path, monkeypatch, tool):
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_{tool.replace('-', '_')}")
+    remover = "remove_env_var_on_windows" if tool == "cursor" else "remove_env_var_on_windows_machine"
+    removed = []
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(mdm, remover, lambda name, *a: removed.append(name) or "cleared")
+    alice = tmp_path / "alice"
+    (alice / ".unbound").mkdir(parents=True)
+    (alice / ".unbound" / "config.json").write_text('{"api_key": "k"}')
+    monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [("alice", alice)])
+    mdm.remove_legacy_key_env()
+    assert "UNBOUND_DEVICE_TOKEN" not in removed
+
+
 def test_every_config_writer_also_writes_device_token():
     # Readers move to device_token once api_key writes stop, so every writer must already set it.
     files = subprocess.run(["git", "grep", "-lE", r"config\[['\"]api_key['\"]\] = api_key", "--", "*.py"],
