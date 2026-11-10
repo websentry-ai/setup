@@ -259,6 +259,19 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
         assert self._curl(module, "PUT", 500, returncode=28, stdout=b"")[0] == (-28, b"")
         assert self._curl(module, "PUT", 500, stdout=b"denied\n403")[0] == (403, b"denied")
 
+    def test_a_timed_out_request_logs_neither_the_key_nor_the_upload_link(self, relpath, monkeypatch, capsys):
+        from unittest.mock import patch
+        module = load_module(relpath)
+        monkeypatch.setattr(module, "DEBUG", True)
+        argv = ["curl", "-H", "Authorization: Bearer secret-key", "https://s3/put?X-Amz-Signature=signed"]
+        with patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired(argv, 520)):
+            result = module._backfill_http_request(
+                "https://s3/put?X-Amz-Signature=signed", "PUT", {"Authorization": "Bearer secret-key"}, timeout=500)
+        logged = "".join(capsys.readouterr())
+        assert result == (-28, b"")
+        assert "timed out after 520s" in logged
+        assert "secret-key" not in logged and "X-Amz-Signature" not in logged
+
     def test_a_stalled_put_is_sent_again_on_a_fresh_link(self, relpath, monkeypatch):
         landed, links, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 503, 200])
         assert landed and links == 3

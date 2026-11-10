@@ -2051,7 +2051,8 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     try:
         result = subprocess.run(cmd, input=body, capture_output=True, timeout=process_timeout)
     except subprocess.TimeoutExpired as e:
-        debug_print(f"HTTP request failed: {e}")
+        # Not str(e): it carries the whole curl command, auth header and upload link included.
+        debug_print(f"{method} request timed out after {e.timeout}s")
         return -28, b''  # curl's own timeout exit, negated
     except OSError as e:
         debug_print(f"HTTP request failed: {e}")
