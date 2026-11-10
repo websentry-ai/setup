@@ -7503,7 +7503,8 @@ _ACCOUNT_GIT_VALUE_OPTIONS = frozenset({'-C', '-c', '--git-dir', '--work-tree', 
 # `git push` options whose value is a separate word, so the remote is not read out of one. The ones whose
 # value is optional (`--force-with-lease`, `--signed`, `--recurse-submodules`) are deliberately absent: bare,
 # the word after them is the remote, and their `=` form is a single token the switch branch already skips.
-_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--repo', '--receive-pack', '--exec', '-o', '--push-option'})
+# `--repo` is absent for the opposite reason: its value names where the push goes, so it IS the remote.
+_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--push-option'})
 
 
 def _account_deadline(state: Dict) -> float:
@@ -7522,6 +7523,10 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             return None
         if argv[:1] == ['git'] and not isinstance(cwd, str):
             return None
+        for name in _ACCOUNT_CONFIG_STEERING:
+            value = (env or {}).get(name)
+            if isinstance(value, str) and _TRANSFER_SUBSTITUTED in value:
+                return None
         program = _transfer_executable(argv[0])
         if program is None:
             return None
@@ -7545,9 +7550,22 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         return None
 
 
+# The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
+# makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
+_ACCOUNT_CONFIG_STEERING = frozenset({
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE',
+    'KUBECONFIG', 'HOME', 'USERPROFILE',
+})
+
+
 def _account_env_key(env: Dict) -> tuple:
-    """The settings that can change a lookup's answer, so a memo never answers a different question."""
-    return tuple(sorted((name, (env or {}).get(name)) for name in _ACCOUNT_REMEMBERED if (env or {}).get(name)))
+    """The settings that can change a lookup's answer, so a memo never answers a different question.
+
+    A name the shell unset is part of the question too: `unset GIT_CONFIG_GLOBAL` must not share an answer
+    with a call that never had it."""
+    present = tuple(sorted((name, (env or {}).get(name))
+                           for name in _ACCOUNT_REMEMBERED if name in (env or {})))
+    return present + (('', _TRANSFER_UNKNOWN_ENV),) if _account_beyond_reading(env) else present
 
 
 def _account_once(state: Dict, key: tuple, resolve) -> Any:
@@ -7668,9 +7686,9 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
             setting = pair[1] if len(pair) == 2 else value
             name, _, variable = (setting or '').partition('=')
             if name and _:
-                held = _account_setting(variable, env)
-                if held:
-                    overrides[name.strip().lower()] = held
+                held, known = _account_known(variable, env)
+                # An override we cannot read still overrides, so the setting is unknown rather than the file's.
+                overrides[name.strip().lower()] = held if known else _TRANSFER_SUBSTITUTED
             i += 1 if len(pair) == 2 else 2
             continue
         for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
@@ -7696,9 +7714,11 @@ def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: D
 def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
                         overrides: Optional[Dict] = None) -> Optional[str]:
     """One git configuration value: a `-c` override first, else read by git so its own precedence decides."""
-    override = _account_value((overrides or {}).get(name.lower()))
-    if override:
-        return override
+    override = (overrides or {}).get(name.lower())
+    if override == _TRANSFER_SUBSTITUTED:
+        return None  # overridden to something we cannot read, so the file's value no longer applies
+    if name.lower() in (overrides or {}):
+        return _account_value(override)
     return _account_first_line(['git', 'config', '--get', name], cwd, env, state,
                                ('git-config', name, cwd, _account_env_key(env)))
 
@@ -7706,6 +7726,12 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
 def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
                          overrides: Dict) -> Optional[str]:
     """The remote a push reaches, in git's own order: the command, pushRemote, pushDefault, the branch's remote."""
+    # `git push --repo <repository>` names where the push goes, so its value IS the remote.
+    for at, arg in enumerate(after):
+        if arg == '--repo' and at + 1 < len(after):
+            return _account_value(after[at + 1])
+        if arg.startswith('--repo='):
+            return _account_value(arg.split('=', 1)[1])
     i = 0
     while i < len(after):
         arg = after[i]
@@ -7777,7 +7803,7 @@ def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
     if repo and repo.count('/') == 2:
         # gh's own `HOST/OWNER/REPO` form, which names the host outright.
         return _account_value(repo.split('/')[0])
-    return _account_setting('GH_HOST', env)
+    return None
 
 
 def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
@@ -7794,7 +7820,8 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         value, known = _account_known(name, env)
         if value or not known:
             return [], None
-    host = _account_gh_host(args, env) or _account_gh_remote_host(cwd, env, state) or 'github.com'
+    host = (_account_gh_host(args, env) or _account_gh_remote_host(cwd, env, state)
+            or _account_setting('GH_HOST', env) or 'github.com')
     if not host:
         return [], None
 

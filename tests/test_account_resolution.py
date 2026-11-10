@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'e7036d1846244a5acba90b51bcd8be7714ccf640c2015cc4399855fa9973ef24'
+BLOCK_SHA256 = 'b2aae92352e32ea4370db43756cd4b11ddf33cf73d1917d686135022b076055e'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -253,6 +253,42 @@ class AccountResolutionTests(unittest.TestCase):
             for path, resolved in self.each('gh pr list'):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
                 self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
+
+    def test_push_repo_names_where_the_push_goes(self):
+        """`git push --repo <repository>` names the destination, so its value is the remote."""
+        for path, resolved in self.each('git push --repo personal'):
+            self.assertEqual(resolved['pushed_repo'], 'jdoe-dev/app', path)
+            self.assertEqual(resolved['pushed_remote'], 'personal', path)
+
+    def test_a_config_steering_variable_we_cannot_read_refuses_the_lookup(self):
+        """A substituted `GIT_CONFIG_GLOBAL` would make git answer from the default file instead."""
+        for path, resolved in self.each('GIT_CONFIG_GLOBAL=$(mktemp) git commit -m wip'):
+            self.assertIsNone(resolved, path)
+        self.assertEqual(self.runs(), [])
+
+    def test_an_override_we_cannot_read_leaves_the_identity_unknown(self):
+        for path, resolved in self.each('git --config-env=user.email=MISSING commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_the_checkouts_remote_outranks_gh_host(self):
+        """gh reads the repository's own remote before falling back to GH_HOST."""
+        answers = __import__('json').loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.origin.url'] = 'git@github.acme.com:acme/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': __import__('json').dumps(answers),
+                                     'GH_HOST': 'github.com'}):
+            for path, resolved in self.each('gh pr list'):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+
+    def test_an_unset_variable_is_part_of_the_question_a_memo_answers(self):
+        """`unset GIT_CONFIG_GLOBAL` must not share an answer with a call that never had it."""
+        hook = HOOKS[0]
+        state = {}
+        self.resolve(hook, 'git commit -m one', state)
+        self.resolve(hook, 'unset GIT_CONFIG_GLOBAL; git commit -m two', state)
+        # Asked again rather than answered from the first call's memo. (Each call reads committer.email
+        # then user.email, so one lookup per call is two commands.)
+        asked = [call for call in self.runs() if call[-1] == 'user.email']
+        self.assertEqual(len(asked), 2, self.runs())
 
     def test_the_committer_email_setting_comes_before_user_email(self):
         """git gives `committer.email` precedence over `user.email`."""
