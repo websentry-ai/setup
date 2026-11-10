@@ -9372,6 +9372,9 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             value = (env or {}).get(name)
             if isinstance(value, str) and _TRANSFER_SUBSTITUTED in value:
                 return None
+        if argv[0] in _ACCOUNT_CONFIG_EXECUTORS and any(
+                name in (env or {}) for name in _ACCOUNT_CONFIG_LOCATIONS):
+            return None
         program = _transfer_executable(argv[0])
         if program is None:
             return None
@@ -9396,6 +9399,12 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         return None
 
 
+# A cloud CLI runs what its configuration names: an AWS `credential_process`, an Azure extension path. A call
+# that chooses where that configuration lives would make us run its code, so the CLI is not run at all; the
+# configuration file is still read and parsed here, which executes nothing.
+_ACCOUNT_CONFIG_EXECUTORS = frozenset({'aws', 'az', 'kubectl', 'docker'})
+_ACCOUNT_CONFIG_LOCATIONS = frozenset({'HOME', 'USERPROFILE', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE',
+                                       'AZURE_CONFIG_DIR', 'KUBECONFIG', 'DOCKER_CONFIG'})
 # The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
@@ -9506,46 +9515,6 @@ def _account_repo_of(url: str) -> Optional[str]:
     if name.endswith('.git'):
         name = name[:-4]
     return _account_value('%s/%s' % (owner, name))
-
-
-def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
-    """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
-
-    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file."""
-    folder, passed, overrides = cwd, dict(env or {}), {}
-    i = 0
-    while i < len(args):
-        if not args[i].startswith('-') and args[i - 1] not in _ACCOUNT_GIT_VALUE_OPTIONS:
-            break  # the subcommand; everything after it is the subcommand's own option surface
-        arg, value = args[i], args[i + 1] if i + 1 < len(args) else None
-        pair = arg.split('=', 1)
-        if arg == '-C' and value is not None:
-            # A relative one needs a folder to resolve against; with none, every lookup here is refused anyway.
-            folder = value if os.path.isabs(value) else os.path.join(folder, value) if folder else None
-            i += 2
-            continue
-        if arg == '-c' and value is not None:
-            name, _, setting = value.partition('=')
-            if name and _:
-                overrides[name.strip().lower()] = setting
-            i += 2
-            continue
-        if pair[0] == '--config-env':
-            setting = pair[1] if len(pair) == 2 else value
-            name, _, variable = (setting or '').partition('=')
-            if name and _:
-                held, known = _account_known(variable, env)
-                # An override we cannot read still overrides, so the setting is unknown rather than the file's.
-                overrides[name.strip().lower()] = held if known else _TRANSFER_SUBSTITUTED
-            i += 1 if len(pair) == 2 else 2
-            continue
-        for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
-            if arg == option and value is not None:
-                passed[name] = value
-            elif pair[0] == option and len(pair) == 2:
-                passed[name] = pair[1]
-        i += 2 if arg in _ACCOUNT_GIT_VALUE_OPTIONS else 1
-    return folder, passed, overrides
 
 
 def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
@@ -9795,13 +9764,18 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 
 def _account_aws_profile(args: List[str], env: Dict) -> Optional[str]:
     """The profile an aws call uses, in the CLI's own order: --profile, then AWS_PROFILE, else default."""
-    named = _account_flag(args, ('--profile',))
-    if named:
-        return named
-    # Access keys set for the call sign it in as whoever owns them, which cannot be read offline.
-    if _account_setting('AWS_ACCESS_KEY_ID', env):
-        return None
-    return _account_setting('AWS_PROFILE', env) or _account_setting('AWS_DEFAULT_PROFILE', env) or 'default'
+    raw = _account_flag_raw(args, ('--profile',))
+    if raw is not None:
+        # None when the value cannot be read, which leaves the account unknown rather than the default one.
+        return _account_value(raw)
+    for name in ('AWS_ACCESS_KEY_ID', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE'):
+        value, known = _account_known(name, env)
+        if not known:
+            return None
+        if value:
+            # Access keys sign the call in as whoever owns them, which cannot be read offline.
+            return None if name == 'AWS_ACCESS_KEY_ID' else value
+    return 'default'
 
 
 def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
@@ -9941,6 +9915,9 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
     context = _account_flag(args, ('--context',))
     kubeconfig = _account_flag(args, ('--kubeconfig',)) or _account_setting('KUBECONFIG', env) or ''
+    if os.pathsep in kubeconfig:
+        # A list of files is not one path; kubectl reads the variable itself and merges them.
+        kubeconfig = ''
     # Exactly the two fields kept, so no credential from the `users` block is ever in the output to begin with.
     fields = _ACCOUNT_KUBE_SEPARATOR.join(
         '{%s}' % path for path in ('.clusters[0].cluster.server', '.clusters[0].name'))

@@ -188,6 +188,30 @@ class AccountPlatformTests(unittest.TestCase):
             resolved = self.resolve(hook, 'aws s3 ls', state)
             self.assertEqual(resolved['accounts'][0]['account_id'], '111111111111', path)
 
+    def test_a_call_that_chooses_the_config_location_never_runs_the_cli(self):
+        """An AWS config can name a `credential_process`, so running the CLI under one the call chose would
+        run its code. The file is still read; the CLI is not."""
+        for path, resolved in self.each('AWS_CONFIG_FILE=./planted aws s3 ls --profile p'):
+            self.assertIsNone(resolved, path)
+        self.assertEqual([argv for argv in self.runs() if argv[0] == 'aws'], [])
+
+    def test_an_unreadable_profile_leaves_the_account_unknown_not_default(self):
+        """Falling through to `default` would name the organisation's main account with full confidence."""
+        for command in ('AWS_PROFILE=$(cat .p) aws s3 ls', 'aws --profile $(cat .p) s3 ls',
+                        'AWS_ACCESS_KEY_ID=$(cat .k) aws s3 ls'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+
+    def test_a_kubeconfig_list_is_left_to_kubectl(self):
+        """`KUBECONFIG=a:b` is valid for kubectl and invalid as one `--kubeconfig` path."""
+        os.environ['KUBECONFIG'] = os.pathsep.join(('/tmp/one.kc', '/tmp/two.kc'))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            open(self.run_log, 'w').close()
+            self.resolve(hook, 'kubectl get pods')
+            asked = [argv for argv in self.runs() if argv[0] == 'kubectl']
+            self.assertEqual(len(asked), 1, path)
+            self.assertNotIn('--kubeconfig', asked[0], path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
@@ -211,16 +235,12 @@ class AccountPlatformTests(unittest.TestCase):
                              '00000000-0000-0000-0000-000000000003', path)
         self.assertEqual(self.runs(), [])
 
-    def test_two_azure_calls_with_different_config_directories_each_ask(self):
-        """The memo keys on the environment, or the second call reuses the first directory's subscription."""
-        first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            open(self.run_log, 'w').close()
-            state = {}
-            self.resolve(hook, 'AZURE_CONFIG_DIR=%s az group list' % first, state)
-            self.resolve(hook, 'AZURE_CONFIG_DIR=%s az group list' % second, state)
-            asked = [argv for argv in self.runs() if argv[:2] == ['az', 'account']]
-            self.assertEqual(len(asked), 2, path)
+    def test_an_azure_config_directory_with_no_profile_resolves_nothing(self):
+        """The CLI is not run under a directory the call chose, so an empty one leaves the subscription unknown
+        rather than falling back to the home profile."""
+        for path, resolved in self.each('AZURE_CONFIG_DIR=%s az group list' % tempfile.mkdtemp()):
+            self.assertIsNone(resolved, path)
+        self.assertEqual([argv for argv in self.runs() if argv[0] == 'az'], [])
 
     def test_a_docker_image_push_reaches_the_same_registry_as_a_push(self):
         """docker's management form: `docker image push` is the same call as `docker push`."""
