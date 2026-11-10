@@ -9364,9 +9364,20 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     repo, known = _account_option(args, ('-R', '--repo'))
     if repo or not known:
         return repo, known
-    for arg in args:
-        # A positional URL names the repository, and its host, as plainly as the option does.
-        if '://' in arg and _account_host_of(arg):
+    for at, arg in enumerate(args):
+        # Only a true positional: the word after an option is that option's value, and a `--body` URL is
+        # the text of a comment, not the repository the call acts on.
+        if at and args[at - 1].startswith('-'):
+            continue
+        if '://' in arg:
+            if _account_host_of(arg):
+                return _account_value(arg), True
+            continue
+        parts = arg.split('/')
+        # gh's own operands: `OWNER/REPO`, and `HOST/OWNER/REPO` where the first part is a host.
+        if len(parts) == 2 and all(parts) and '.' not in parts[0]:
+            return _account_value(arg), True
+        if len(parts) == 3 and all(parts) and '.' in parts[0]:
             return _account_value(arg), True
     return _account_known('GH_REPO', env)
 

@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '941e29197ee91b078115635b47d8f87edf8eebc228fc5ec12b6ce45f86335cfe'
+BLOCK_SHA256 = '6397904affa6bb90dcfb9853ad430dcad036781ef2c8d66bdc3973c33b65c8ef'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -540,6 +540,20 @@ class AccountResolutionTests(unittest.TestCase):
             state = {'deadline': 1.0}
             self.assertEqual(hook._account_deadline(state), 1.0, path)
             self.assertNotIn('account_deadline', state, path)
+
+    def test_a_url_an_option_carries_is_not_the_repository(self):
+        """`--body https://...` is the text of a comment, not where the call acts."""
+        for path, resolved in self.each('gh issue create --title bug --body https://github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+        for path, resolved in self.each('gh pr comment 12 --body https://ci.acme.dev/run/1'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_a_positional_repository_operand_names_its_host(self):
+        """`gh repo clone HOST/OWNER/REPO` and `OWNER/REPO` are gh's own operands."""
+        for path, resolved in self.each('gh repo clone github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+        for path, resolved in self.each('gh repo view acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
