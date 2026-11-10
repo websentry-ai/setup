@@ -274,6 +274,18 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
         assert "timed out after 520s" in logged
         assert "secret-key" not in logged and "X-Amz-Signature" not in logged
 
+    def test_slow_failed_attempts_share_one_budget_where_there_is_no_run_clock(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        if hasattr(module, "_backfill_put_budget_seconds"):
+            pytest.skip("the managed claude-code installer clips each attempt to its run clock instead")
+        # Two 140s attempts leave 20s of the chunk's 300s, under the floor: no third link, no third PUT.
+        landed, links, puts, confirmed = self._upload(module, monkeypatch, [503, 503, 200], lambda cap: 140)
+        assert (landed, links, len(puts), confirmed) == (False, 2, 2, [])
+        # The second attempt is capped at what the first left, not at a fresh 300s.
+        caps = []
+        self._upload(module, monkeypatch, [503, 200], lambda cap: caps.append(cap) or 140)
+        assert caps == [300, 160]
+
     def test_a_stalled_put_is_sent_again_on_a_fresh_link(self, relpath, monkeypatch):
         landed, links, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 503, 200])
         assert landed and links == 3
