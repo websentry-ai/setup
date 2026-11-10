@@ -278,8 +278,8 @@ def _claude_hooks_config():
             {"type": "command", "command": cmd("PreToolUse"), "timeout": 15000}]}],
         "PostToolUse": [{"matcher": "*", "hooks": [
             {"type": "command", "command": cmd("PostToolUse"), "async": True, "timeout": 60}]}],
-        # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
-        "PostToolUseFailure": [{"matcher": "Bash", "hooks": [
+        # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
+        "PostToolUseFailure": [{"matcher": "Bash|PowerShell", "hooks": [
             {"type": "command", "command": cmd("PostToolUseFailure"), "async": True, "timeout": 60}]}],
         "UserPromptSubmit": [{"hooks": [
             {"type": "command", "command": cmd("UserPromptSubmit"), "timeout": 60}]}],
@@ -1023,19 +1023,14 @@ def _setup_claude_code(opts):
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         m.remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_TOKEN")
-    m.remove_legacy_key_env()
-
+    config_ok = True
     for username, home_dir in m.get_all_user_homes():
         m.remove_gateway_artifacts_for_user(username, home_dir)
         m.remove_user_level_hooks_for_user(username, home_dir)
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+    m.remove_legacy_key_env()
 
     skip_settings = opts["skip_managed_settings"]
     # None (unknown) without looking: in skip mode managed-settings.json is the
@@ -1050,6 +1045,9 @@ def _setup_claude_code(opts):
         _print_remote_policy_hooks()
     else:
         _remove_stale_managed_script(m.get_managed_settings_dir())
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "claude-code", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1066,9 +1064,8 @@ def _setup_claude_code(opts):
 def _setup_augment(opts):
     """Mirrors augment mdm/setup.py main() step-for-step, minus downloads.
     Augment uses system-managed /etc/augment (get_managed_settings_dir), like
-    claude-code; the notify tool_type is 'augment_code' and the env var is
-    UNBOUND_DEVICE_TOKEN (both verbatim from augment's setup.py). Augment
-    does NOT support backfill. One substitution from main(): user-level hook
+    claude-code; the notify tool_type is 'augment_code' (verbatim from
+    augment's setup.py). Augment does NOT support backfill. One substitution from main(): user-level hook
     removal is gated on the managed write returning True rather than on
     verify_managed_hooks_installed() — the latter checks for the downloaded
     /etc/augment/hooks/unbound.py the binary path never writes."""
@@ -1083,21 +1080,16 @@ def _setup_augment(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_TOKEN")
-    m.remove_legacy_key_env()
-
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
     # augment main()'s ordering).
+    config_ok = True
     user_homes = m.get_all_user_homes()
     for username, home_dir in user_homes:
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+    m.remove_legacy_key_env()
 
     state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
     if not _write_augment_managed_settings(m):
@@ -1108,6 +1100,9 @@ def _setup_augment(opts):
     # succeeded, so managed hooks don't fire twice.
     for username, home_dir in user_homes:
         m.remove_user_level_hooks_for_user(username, home_dir)
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "augment_code", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1130,11 +1125,6 @@ def _setup_codex(opts):
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_TOKEN")
 
     # A user-level hook runs only after its user trusts it, so ours goes in codex's system
     # hooks.json instead, which codex runs as a managed hook. The per-user copy is removed
@@ -1143,15 +1133,19 @@ def _setup_codex(opts):
     state = _codex_detect_state(m, user_homes)
     if not _write_codex_system_hooks(m):
         return ("deferred", "codex system hooks.json write failed")
+    config_ok = True
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         _strip_codex_user_hooks(m, username, home_dir)
     # After the new hooks are in place: an older codex hook reads only the per-tool var.
     m.remove_legacy_key_env()
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1340,18 +1334,15 @@ def _setup_cursor(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, env_changed, message = m.set_env_var("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        return ("deferred", f"failed to set UNBOUND_DEVICE_TOKEN: {message}")
-    m.remove_legacy_key_env()
-
+    config_ok = True
     for username, home_dir in m.get_all_user_homes():
         if m.write_unbound_config_for_user(
                 username, home_dir, api_key,
                 urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
             m.remove_user_level_hooks(username, home_dir)
+        else:
+            config_ok = False
+    m.remove_legacy_key_env()
 
     state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"],
                           relative_ok=True)
@@ -1360,11 +1351,14 @@ def _setup_cursor(opts):
         return ("deferred", "enterprise hooks.json write failed")
     _remove_stale_managed_script(m.get_enterprise_hooks_dir())
 
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
+
     m.notify_setup_complete(api_key, "cursor", backend_url=base,
                             install_state=state, serial_number=device_id,
                             hook_hash=m.hook_script_hash(hook_source_path("cursor")),
                             install_mode="binary")
-    if env_changed or hooks_changed:
+    if hooks_changed:
         m.restart_cursor()
     return ("configured", None)
 
@@ -1429,22 +1423,16 @@ def _setup_copilot(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = m.set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        return ("deferred", "failed to set UNBOUND_DEVICE_TOKEN")
-    m.remove_legacy_key_env()
-
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
     installed = 0
+    config_ok = True
     for username, home_dir in user_homes:
         if home_dir is None:
             continue  # no home to hold a config or a registration
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
         # Earlier versions configured the exporter here, per user, in VS Code
         # settings. The managed file written below outranks those, so they are only
         # taken back out.
@@ -1460,6 +1448,7 @@ def _setup_copilot(opts):
                 or (_as_user(m, username, _writable_dir, registration.parent) is False
                     and _as_user(m, username, _copilot_current, registration) is False)):
             state = "tampered"
+    m.remove_legacy_key_env()
 
     # Machine-wide, so once for the device rather than once per user. Called
     # explicitly: this command drives the vendored module's named functions rather
@@ -1473,6 +1462,9 @@ def _setup_copilot(opts):
                                     install_state=state, serial_number=device_id,
                                     install_mode="binary")
         return ("deferred", "hook install failed for all users")
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "copilot", backend_url=base,
                             install_state=state, serial_number=device_id,

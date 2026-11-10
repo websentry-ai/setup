@@ -617,10 +617,10 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                     ]
                 }
             ],
-            # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+            # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
             "PostToolUseFailure": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|PowerShell",
                     "hooks": [
                         _hook({
                             "type": "command",
@@ -694,13 +694,18 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
                         # scalar would be iterated and raise, aborting the
                         # merge and leaving our hook unregistered.
                         existing_hooks = existing_item.get("hooks")
-                        for hook in existing_hooks if isinstance(existing_hooks, list) else []:
-                            if not isinstance(hook, dict):
-                                continue
-                            existing_cmd = hook.get("command", "")
-                            if _command_targets_hook(existing_cmd, script_path):
-                                our_hook_exists = True
-                                break
+                        hooks = [h for h in existing_hooks if isinstance(h, dict)] if isinstance(existing_hooks, list) else []
+                        ours = [_command_targets_hook(h.get("command", ""), script_path) for h in hooks]
+                        matcher = new_config[0].get("matcher")
+                        if any(ours) and (all(ours) or matcher is None or existing_item.get("matcher") == matcher):
+                            our_hook_exists = True
+                            # An install from before a matcher widened keeps the old one; ours takes the new one.
+                            if matcher is not None:
+                                existing_item["matcher"] = matcher
+                        elif any(ours):
+                            # A group shared with the user's hooks keeps their matcher; ours moves to its own group.
+                            existing_item["hooks"] = [h for h in existing_hooks if not (
+                                isinstance(h, dict) and _command_targets_hook(h.get("command", ""), script_path))]
                 
                 if not our_hook_exists:
                     settings["hooks"][event].extend(new_config)
@@ -798,10 +803,21 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
+def _config_has_key(home_dir: Optional[Path] = None) -> bool:
+    try:
+        cfg = json.loads(((home_dir or Path.home()) / ".unbound" / "config.json").read_text(encoding="utf-8"))
+        return bool(cfg.get("api_key") or cfg.get("device_token"))
+    except Exception:
+        return False
+
+
 # Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
 def remove_legacy_key_env() -> None:
     try:
         remove_env_var("UNBOUND_CLAUDE_API_KEY")
+        # The env copy goes only once config.json holds the key, so a failed config write never strands the hooks.
+        if _config_has_key():
+            remove_env_var("UNBOUND_DEVICE_TOKEN")
     except Exception:
         pass
 
@@ -2237,19 +2253,13 @@ def main():
             pass
     remove_gateway_artifacts(config_dir)
 
-    debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-    success, message = set_env_var("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        print(f"❌ Failed to set environment variable: {message}")
-        return False
-    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
-    remove_legacy_key_env()
-
     _install_state = detect_install_state(config_dir)
     _device_id = get_device_identifier()
 
-    write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None})
+    if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
+        print("\n❌ Could not write ~/.unbound/config.json")
+        return False
+    remove_legacy_key_env()
 
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url, config_dir=config_dir):

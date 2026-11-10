@@ -297,7 +297,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator', 'All Users']:
+                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default User', 'Administrator', 'All Users']:
                             user_homes.append((user_dir.name, user_dir))
                             debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
@@ -890,7 +890,7 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
             os.close(fd)
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -927,8 +927,10 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
             f.write(json.dumps(config, indent=2))
         return True
 
-    if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
+    if _run_as_user(username, _write) is None:
         debug_print(f"Could not write config for {username}")
+        return False
+    return True
 
 
 def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
@@ -1279,10 +1281,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
                     ]
                 }
             ],
-            # Claude reports a tool call that failed here instead, such as a Bash command that exits non-zero.
+            # Claude reports a shell call that failed here instead, such as a command that exits non-zero.
             "PostToolUseFailure": [
                 {
-                    "matcher": "Bash",
+                    "matcher": "Bash|PowerShell",
                     "hooks": [
                         _hook({
                             "type": "command",
@@ -1567,10 +1569,20 @@ def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) ->
     return ok
 
 
+def _config_has_key(home_dir: Optional[Path] = None) -> bool:
+    try:
+        cfg = json.loads(((home_dir or Path.home()) / ".unbound" / "config.json").read_text(encoding="utf-8"))
+        return bool(cfg.get("api_key") or cfg.get("device_token"))
+    except Exception:
+        return False
+
+
 # Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
 def remove_legacy_key_env() -> None:
     try:
         _remove_env_var_for_all_users("UNBOUND_CLAUDE_API_KEY")
+        # Env copy goes only once config.json holds the key; the Default profile gets one too, so later Windows profiles inherit it.
+        _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=lambda home_dir: home_dir is not None and not _config_has_key(home_dir))
     except Exception:
         pass
 
@@ -3230,15 +3242,6 @@ def main():
         remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
                                  _unbound_base_url_matcher(username, home_dir))
 
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-
-    success, _ = set_env_var_system_wide("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        print("Failed to set UNBOUND_DEVICE_TOKEN")
-        return False
-    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
-    remove_legacy_key_env()
-
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
@@ -3246,10 +3249,12 @@ def main():
 
     # Remove gateway artifacts, strip leftover user-level Unbound hooks
     # (so managed hooks don't fire twice), and write unbound config.
+    config_ok = True
     for username, home_dir in get_all_user_homes():
         remove_gateway_artifacts_for_user(username, home_dir)
         remove_user_level_hooks_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+        config_ok = write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}) and config_ok
+    remove_legacy_key_env()
 
     state = detect_install_state(skip_settings=skip_managed_settings)
 
@@ -3263,6 +3268,10 @@ def main():
             print(f"Created managed hooks in {managed_dir}")
     else:
         print("Failed to configure managed hooks")
+        return False
+
+    if not config_ok:
+        print("Could not write ~/.unbound/config.json for every user")
         return False
 
     print("\n" + "=" * 60)

@@ -497,10 +497,21 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
+def _config_has_key(home_dir: Optional[Path] = None) -> bool:
+    try:
+        cfg = json.loads(((home_dir or Path.home()) / ".unbound" / "config.json").read_text(encoding="utf-8"))
+        return bool(cfg.get("api_key") or cfg.get("device_token"))
+    except Exception:
+        return False
+
+
 # Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
 def remove_legacy_key_env() -> None:
     try:
         remove_env_var("UNBOUND_CURSOR_API_KEY")
+        # The env copy goes only once config.json holds the key, so a failed config write never strands the hooks.
+        if _config_has_key():
+            remove_env_var("UNBOUND_DEVICE_TOKEN")
     except Exception:
         pass
 
@@ -793,17 +804,9 @@ def main():
     _device_id = get_device_identifier()
 
     if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
-        print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
-
-    debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-    success, message = set_env_var("UNBOUND_DEVICE_TOKEN", api_key)
-    if not success:
-        print(f"❌ Failed to set environment variable: {message}")
+        print("\n❌ Could not write ~/.unbound/config.json")
         return False
 
-    print(f"✅ Environment variable set")
-    debug_print("UNBOUND_DEVICE_TOKEN set successfully")
     remove_legacy_key_env()
 
     debug_print("Setting up hooks...")

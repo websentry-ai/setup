@@ -1,6 +1,7 @@
 """Every hook records where each shell transfer went (tool, host as written, host ssh resolves it to, address kind),
 checked on all five Python hooks with a fake `ssh` on PATH, a patched resolver and each hook's exchange builder."""
 import hashlib
+import ipaddress
 import json
 import os
 import shutil
@@ -30,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b1ef7808ee309808975aafdd6a71d9434d5b52ee737f611f2392037e54abd67b'
+BLOCK_SHA256 = '59639fe4d6c257d8d7648b0a15e126ca9739be8be0e24ecfc41b7701f8e47eb0'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -104,6 +105,15 @@ print('port ' + overrides.get('port', port))
 for key in ('proxyjump', 'proxycommand'):
     print(key + ' ' + overrides.get(key, 'none'))  # as some ssh versions print it for a host with neither
 '''
+# route, ip and powershell stand-in: prints FAKE_ROUTE_OUT and logs its arguments; fails when that is unset.
+FAKE_ROUTE = '''#!{python}
+import json, os, sys
+with open(os.environ['FAKE_ROUTE_LOG'], 'a') as log:
+    log.write(json.dumps([os.path.basename(sys.argv[0])] + sys.argv[1:]) + '\\n')
+if os.environ.get('FAKE_ROUTE_OUT') is None:
+    sys.exit(1)
+sys.stdout.write(os.environ['FAKE_ROUTE_OUT'])
+'''
 
 
 def _getaddrinfo(host, *args, **kwargs):
@@ -147,17 +157,26 @@ class TransferTestCase(unittest.TestCase):
         ssh.chmod(0o755)
         self.ssh_log = os.path.join(bin_dir, 'calls.jsonl')
         Path(self.ssh_log).touch()
+        for name in ('route', 'ip', 'powershell'):
+            Path(bin_dir, name).write_text(FAKE_ROUTE.format(python=sys.executable))
+            Path(bin_dir, name).chmod(0o755)
+        self.route_log = os.path.join(bin_dir, 'routes.jsonl')
+        Path(self.route_log).touch()
         env = {'PATH': bin_dir + os.pathsep + os.environ.get('PATH', ''), 'HOME': self.home,
-               'FAKE_SSH_LOG': self.ssh_log, 'FAKE_SSH_SLEEP': '0'}
+               'FAKE_SSH_LOG': self.ssh_log, 'FAKE_SSH_SLEEP': '0', 'FAKE_ROUTE_LOG': self.route_log}
         for patcher in [patch.dict(os.environ, env), patch('socket.getaddrinfo', _getaddrinfo)] + \
                 [patch.object(hook, '_transfer_home', lambda home=self.home: home) for hook in HOOKS] + \
-                [patch.object(hook, '_TRANSFER_WGETRC_SYSTEM', ()) for hook in HOOKS]:
+                [patch.object(hook, '_TRANSFER_WGETRC_SYSTEM', ()) for hook in HOOKS] + \
+                [patch.object(hook, '_TRANSFER_CONTAINER_FILES', ()) for hook in HOOKS]:
             patcher.start()
             self.addCleanup(patcher.stop)
         # A proxy or curl config folder this machine's shell sets would change what is looked up; the dict patch above
         # puts it back.
         for key in [k for k in os.environ if k.lower() in ('http_proxy', 'https_proxy', 'ftp_proxy', 'all_proxy',
                                                            'no_proxy', 'curl_home', 'xdg_config_home')]:
+            del os.environ[key]
+        # CI and an ssh session each turn route lookups off; the tests that need them on run in neither.
+        for key in [k for k in os.environ if k in HOOKS[0]._TRANSFER_REMOTE_ENV]:
             del os.environ[key]
 
     def ssh_calls(self):
@@ -619,6 +638,186 @@ class AddressTests(TransferTestCase):
                 self.assertEqual(lookup.call_count, 1)
 
 
+MAC_ROUTE = '   route to: {ip}\ndestination: {ip}\n  interface: {interface}\n      flags: <UP,{flags}DONE>\n'
+WINDOWS_ROUTE = '{hop}\t{alias}\t{description}\t{source}\r\n'
+
+
+class RouteTests(TransferTestCase):
+    """For a private address, each hook sends only how this machine reaches it: vpn, local, routed or machine."""
+
+    def route(self, out, platform, command='curl -T f https://files.acme-infra.net/up'):
+        """The route each hook sends for command when the lookup prints out on platform."""
+        got = []
+        for hook in HOOKS:
+            with patch.dict(os.environ, {'FAKE_ROUTE_OUT': out}), \
+                    patch.object(hook, '_transfer_platform', lambda platform=platform: platform):
+                got.append(hook._transfer(command, self.repo, {})['endpoints'][0].get('route', ''))
+        self.assertEqual(len(set(got)), 1, got)
+        return got[0]
+
+    def routes_run(self):
+        return [json.loads(line) for line in Path(self.route_log).read_text().splitlines()]
+
+    def test_macos_routes(self):
+        cases = [
+            (dict(interface='utun4', flags='GATEWAY,'), 'vpn'),
+            (dict(interface='ipsec0', flags=''), 'vpn'),
+            (dict(interface='en0', flags=''), 'local'),
+            (dict(interface='en0', flags='GATEWAY,'), 'routed'),
+            (dict(interface='bridge0', flags=''), 'local'),  # a Thunderbolt link to another computer
+            (dict(interface='bridge100', flags=''), 'machine'),
+            (dict(interface='utun0', flags='HOST,LOCAL,'), 'machine'),
+            (dict(interface='ppp0', flags=''), ''),  # an L2TP VPN or a dial-up uplink
+            (dict(interface='', flags='GATEWAY,'), ''),
+        ]
+        for fields, route in cases:
+            with self.subTest(**fields):
+                self.assertEqual(self.route(MAC_ROUTE.format(ip='10.20.30.40', **fields), 'darwin'), route)
+
+    def test_linux_routes(self):
+        cases = [
+            ('10.20.30.40 dev tailscale0 table 52 src 100.101.1.2 uid 1000 \\    cache', 'vpn'),
+            ('10.20.30.40 via 10.8.0.1 dev tun0 src 10.8.0.6 uid 1000 \\    cache', 'vpn'),
+            ('10.20.30.40 dev wg0 src 10.66.0.2 uid 1000', 'vpn'),
+            ('10.20.30.40 dev wireguard0 src 10.66.0.2 uid 1000', 'vpn'),
+            ('10.20.30.40 dev ppp0 src 100.70.1.2 uid 1000', ''),
+            ('10.20.30.40 dev tap0 src 10.20.0.1 uid 1000', ''),
+            ('10.20.30.40 dev wlp2s0 src 10.20.30.5 uid 1000 \\    cache', 'local'),
+            ('10.20.30.40 via 192.168.1.1 dev eth0 src 192.168.1.5 uid 1000 \\    cache', 'routed'),
+            ('10.20.30.40 dev docker0 src 10.20.0.1 uid 1000', 'machine'),
+            ('10.20.30.40 dev br-1a2b3c src 10.20.0.1 uid 1000', 'machine'),
+            ('local 10.20.30.40 dev lo table local src 10.20.30.40 uid 1000', 'machine'),
+            ('unreachable 10.20.30.40 uid 1000', ''),
+            ('garbage', ''),
+        ]
+        for out, route in cases:
+            with self.subTest(out=out):
+                self.assertEqual(self.route(out, 'linux'), route)
+
+    def test_windows_routes(self):
+        cases = [
+            (dict(hop='0.0.0.0', alias='Ethernet 3', description='Cisco AnyConnect Secure Mobility Client Virtual '
+                  'Miniport Adapter for Windows x64', source='10.20.1.9'), 'vpn'),
+            (dict(hop='0.0.0.0', alias='Tailscale', description='Tailscale Tunnel', source='100.90.1.2'), 'vpn'),
+            (dict(hop='10.20.0.1', alias='Ethernet 2', description='PANGP Virtual Ethernet Adapter Secure',
+                  source='10.20.1.9'), 'vpn'),
+            (dict(hop='0.0.0.0', alias='Wi-Fi', description='Intel(R) Wi-Fi 6 AX201 160MHz', source='10.20.30.5'),
+             'local'),
+            (dict(hop='192.168.1.1', alias='Wi-Fi', description='Intel(R) Wi-Fi 6 AX201 160MHz',
+                  source='192.168.1.5'), 'routed'),
+            (dict(hop='0.0.0.0', alias='vEthernet (WSL)', description='Hyper-V Virtual Ethernet Adapter',
+                  source='10.20.0.1'), 'machine'),
+            (dict(hop='0.0.0.0', alias='Local Area Connection* 2', description='WAN Miniport (IKEv2)',
+                  source='10.20.1.9'), 'vpn'),
+            (dict(hop='0.0.0.0', alias='Local Area Connection* 5', description='WAN Miniport (PPPOE)',
+                  source='100.70.1.2'), ''),
+            # As a Windows VM in the cloud reports its own network card.
+            (dict(hop='0.0.0.0', alias='Ethernet', description='Microsoft Hyper-V Network Adapter', source='10.20.30.7'),
+             'local'),
+            (dict(hop='10.0.0.1', alias='Ethernet', description='Microsoft Hyper-V Network Adapter', source='10.0.0.7'),
+             'routed'),
+            (dict(hop='0.0.0.0', alias='vEthernet (nat)', description='Hyper-V Virtual Ethernet Adapter #2',
+                  source='172.20.0.1'), 'machine'),
+            # A Hyper-V external switch carries the laptop's own Wi-Fi.
+            (dict(hop='192.168.1.1', alias='vEthernet (External Switch)', description='Hyper-V Virtual Ethernet Adapter',
+                  source='192.168.1.5'), 'routed'),
+            (dict(hop='0.0.0.0', alias='Wi-Fi', description='Intel(R) Wi-Fi 6 AX201 160MHz', source='10.20.30.40'),
+             'machine'),
+        ]
+        for fields, route in cases:
+            with self.subTest(**fields):
+                self.assertEqual(self.route(WINDOWS_ROUTE.format(**fields), 'windows'), route)
+        self.assertEqual(self.route('\r\n', 'windows'), '')
+
+    def test_each_platform_runs_its_own_lookup_on_the_address_only(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                v4, v6 = ipaddress.ip_address('10.20.30.40'), ipaddress.ip_address('fd12:3456:789a::1')
+                self.assertEqual(hook._transfer_route_argv(v4, 'darwin'), ['route', '-n', 'get', '10.20.30.40'])
+                self.assertEqual(hook._transfer_route_argv(v6, 'darwin'),
+                                 ['route', '-n', 'get', '-inet6', 'fd12:3456:789a::1'])
+                self.assertEqual(hook._transfer_route_argv(v6, 'linux'), ['ip', '-o', 'route', 'get', 'fd12:3456:789a::1'])
+                windows = hook._transfer_route_argv(v4, 'windows')
+                self.assertEqual(windows[:4], ['powershell', '-NoProfile', '-NonInteractive', '-Command'])
+                self.assertIn("-RemoteIPAddress '10.20.30.40' ", windows[4])
+                self.assertNotIn('"', windows[4])  # nothing for Windows' command-line quoting to undo
+
+    def test_only_a_private_or_cgnat_address_that_surely_ran_is_routed(self):
+        out = MAC_ROUTE.format(ip='x', interface='en0', flags='')
+        self.assertEqual(self.route(out, 'darwin', 'curl -T f https://vpn.acme.internal/up'), 'local')
+        self.assertEqual(self.route(out, 'darwin', 'curl -T f https://cgnat.example/up'), 'local')
+        for command in ('curl -T f https://example.com/up', 'curl -T f https://split.example/up',
+                        'curl -T f http://localhost:8080/up', 'curl -T f https://metadata.example/up',
+                        'curl -T f https://nowhere.invalid/up', 'curl -x proxy.example:8080 -T f http://10.20.30.40/up',
+                        'scp -J jump.example f prod:/tmp'):
+            with self.subTest(command=command):
+                self.assertEqual(self.route(out, 'darwin', command), '')
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'FAKE_ROUTE_OUT': out}):
+                transfer = hook._transfer('curl -T f https://files.acme-infra.net/up', self.repo, {}, sure=False)
+                self.assertNotIn('route', transfer['endpoints'][0])
+        # The proxied and the unsure call's 10.20.30.40 never reached a lookup.
+        self.assertEqual({run[-1] for run in self.routes_run()}, {'fd12:3456:789a::1', '100.64.10.1'})
+
+    def test_an_ssh_nickname_is_routed_to_the_address_ssh_resolves_it_to(self):
+        self.route(MAC_ROUTE.format(ip='x', interface='utun4', flags=''), 'darwin', 'scp dump.sql prod:/backup')
+        self.assertEqual({run[-1] for run in self.routes_run()}, {'10.0.4.12'})
+
+    def test_nothing_is_routed_on_a_server_in_a_container_or_in_ci(self):
+        out = MAC_ROUTE.format(ip='x', interface='en0', flags='')
+        for key in HOOKS[0]._TRANSFER_REMOTE_ENV:
+            with self.subTest(key=key), patch.dict(os.environ, {key: '1'}):
+                self.assertEqual(self.route(out, 'darwin'), '')
+        marker = Path(self.home, '.dockerenv')
+        marker.touch()
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.object(hook, '_TRANSFER_CONTAINER_FILES', (str(marker),)), \
+                    patch.dict(os.environ, {'FAKE_ROUTE_OUT': out}):
+                self.assertNotIn('route', hook._transfer('curl -T f http://10.20.30.40/up', self.repo, {})['endpoints'][0])
+        self.assertEqual(self.routes_run(), [])
+
+    def test_an_ipv6_scope_never_reaches_the_lookup(self):
+        scoped = ipaddress.ip_address('fd12:3456:789a::1%x;calc')
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'FAKE_ROUTE_OUT': ''}), \
+                    patch.object(hook, '_transfer_platform', lambda: 'windows'):
+                Path(self.route_log).write_text('')
+                hook._transfer_route([scoped], {})
+                (script,) = [run[-1] for run in self.routes_run()]
+                self.assertIn("-RemoteIPAddress 'fd12:3456:789a::1' ", script)
+                self.assertNotIn('calc', script)
+
+    def test_route_lookups_leave_the_hosts_their_share_of_the_turn(self):
+        address = ipaddress.ip_address('10.20.30.40')
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'FAKE_ROUTE_OUT': 'x'}):
+                Path(self.route_log).write_text('')
+                hook._transfer_route([address], {'deadline': time.monotonic() + hook._TRANSFER_TURN_BUDGET / 2 - 0.5})
+                self.assertEqual(self.routes_run(), [])
+                # A hook that gives its lookups a shorter budget still routes within its first half.
+                hook._transfer_route([address], {'budget': 3.0})
+                self.assertEqual(len(self.routes_run()), 1)
+
+    def test_windows_runs_powershell_from_its_system_folder(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.dict(os.environ, {'SystemRoot': r'D:\Win'}), \
+                    patch.object(hook.os, 'name', 'nt'), patch.object(hook.subprocess, 'run') as run:
+                hook._transfer_run(hook._transfer_route_argv(ipaddress.ip_address('10.20.30.40'), 'windows'), None, {})
+                self.assertEqual(run.call_args.args[0][0],
+                                 os.path.join(r'D:\Win', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+
+    def test_an_address_is_routed_once_per_turn_and_a_failed_lookup_sends_nothing(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                Path(self.route_log).write_text('')
+                state = {}
+                hook._transfer('curl -T a http://10.20.30.40/a', self.repo, state)
+                endpoints = hook._transfer('curl -T b https://files.acme-infra.net/b && scp c 10.20.30.40:/c', self.repo,
+                                           state)['endpoints']
+                self.assertEqual(len(self.routes_run()), 1)
+                self.assertTrue(all('route' not in e for e in endpoints))  # the stand-in fails without FAKE_ROUTE_OUT
+
+
 class LoginsNeverLeaveTests(TransferTestCase):
     def test_no_login_password_or_token_reaches_the_field(self):
         for command in (f'curl https://jdoe:{FAKE_TOKEN}@example.com/x',
@@ -744,7 +943,8 @@ class SshLookupTests(TransferTestCase):
             Path(self.repo, 'swap').write_text(f'Match exec "touch {sentinel}"\n  HostName 10.6.6.6\n')
             return real_run(argv, *args, **kwargs)
 
-        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH']}
+        # CI turns this machine's route lookup off; only ssh -G is under test.
+        env = {'PATH': os.path.dirname(REAL_SSH) + os.pathsep + os.environ['PATH'], 'CI': '1'}
         for hook in HOOKS:
             Path(self.repo, 'swap').write_text('Host prod\n  HostName 10.0.4.12\n')
             with self.subTest(hook=hook.__file__), patch.dict(os.environ, env), \
@@ -897,8 +1097,12 @@ class SshLookupTests(TransferTestCase):
                                 'rsync -a f prod:/x', 'nc example.com 80 < f', 'sftp prod'):
                     hook._transfer(command, self.repo, {})
                 self.assertTrue(run.call_args_list)
-                self.assertTrue(all(os.path.isabs(call.args[0][0]) and os.path.basename(call.args[0][0]) == 'ssh' and
-                                    call.args[0][1] == '-G' for call in run.call_args_list))
+                # prod is 10.0.4.12, so its route is looked up too.
+                self.assertTrue(all(os.path.isabs(call.args[0][0]) and (
+                    os.path.basename(call.args[0][0]) == 'ssh' and call.args[0][1] == '-G' or
+                    os.path.basename(call.args[0][0]) == 'route' and call.args[0][1:] == ['-n', 'get', '10.0.4.12'] or
+                    os.path.basename(call.args[0][0]) == 'ip' and call.args[0][1:] == ['-o', 'route', 'get', '10.0.4.12'])
+                    for call in run.call_args_list))
                 self.assertIsNone(hook._transfer_run(['curl', 'https://example.com'], None, {}))
                 self.assertIsNone(hook._transfer_run(['git', 'remote', 'get-url', 'origin'], None, {}))
 
@@ -1662,6 +1866,22 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         self.assertEqual([e.get('transfer') for e in entries],
                          [{'tool': 'curl', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]},
                           {'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'unresolved', 'prod')]}])
+
+    def test_a_claude_powershell_tool_call_is_read_like_a_bash_one(self):
+        # A ; inside a hashtable separates its entries, not commands, so the upload after it is still read.
+        hook = load_module('claude-code/hooks/unbound.py')
+        upload = "Invoke-RestMethod -Headers @{a='1'; b='2'} -InFile secret -Uri https://files.acme-infra.net/up"
+        events = [{'timestamp': '2026-10-22T16:40:00Z', 'event': {**fields, 'session_id': 's1'}} for fields in (
+            {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'cwd': self.repo},
+            {'hook_event_name': 'PostToolUse', 'tool_name': 'PowerShell', 'tool_response': {}, 'tool_use_id': 't1',
+             'tool_input': {'command': upload}},
+            {'hook_event_name': 'PostToolUseFailure', 'tool_name': 'PowerShell', 'error': 'Exit code 1',
+             'tool_use_id': 't2', 'tool_input': {'command': 'curl.exe -T secret https://files.acme-infra.net/up'}})]
+        entries = _tool_entries(hook.build_llm_exchange(events, cwd=self.repo))
+        self.assertEqual([e['tool_use_id'] for e in entries], ['t1', 't2'])
+        self.assertEqual([e.get('transfer') for e in entries],
+                         [{'tool': 'powershell', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]},
+                          {'tool': 'curl', 'endpoints': [_endpoint('out', 'files.acme-infra.net', 'private')]}])
 
     def test_a_claude_background_call_keeps_its_cd_to_itself(self):
         # run_in_background runs the command in a shell of its own; its own lookups still start where the walk is.
