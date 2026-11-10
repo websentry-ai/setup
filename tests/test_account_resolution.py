@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'bd50963bd0462f425da93ccf1c9a0e09eef98ad04bfe716414c5c80b1144c3cb'
+BLOCK_SHA256 = '8ce57191c60393f16fb7184aa00f8693d28918ae2da985f4a56836de26f031cb'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -466,6 +466,30 @@ class AccountResolutionTests(unittest.TestCase):
         Path(other, '.gitconfig').write_text('[user]\n    email = home@acme.com\n')
         for path, resolved in self.each('HOME=%s git commit -m wip' % other):
             self.assertEqual(resolved['accounts'][0]['email'], 'home@acme.com', path)
+
+    def test_a_config_path_with_a_space_still_steers_the_lookup(self):
+        """A path is not an identity: `GIT_CONFIG_GLOBAL=/Work Config/gitconfig` is one value, spaces and all."""
+        folder = Path(tempfile.mkdtemp(), 'Work Config')
+        folder.mkdir()
+        config = Path(folder, 'gitconfig')
+        config.write_text('[user]\n    email = spaced@acme.com\n')
+        for path, resolved in self.each("GIT_CONFIG_GLOBAL='%s' git commit -m wip" % config):
+            self.assertEqual(resolved['accounts'][0]['email'], 'spaced@acme.com', path)
+
+    def test_a_cleared_environment_does_not_reuse_an_earlier_answer(self):
+        """The memo keys on the cleared marker, or the `env -i` call answers with the identity before it."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            first = self.resolve(hook, 'git commit -m one', state)
+            second = self.resolve(hook, 'env -i git commit -m two', state)
+            self.assertEqual(first['accounts'][0]['email'], 'jdoe@gmail.com', path)
+            self.assertIsNone(second, path)
+
+    def test_a_push_to_a_url_records_that_url_as_the_destination(self):
+        """`git push https://github.com/acme/app.git` names where it went; nothing is a remote there."""
+        for path, resolved in self.each('git push https://github.com/acme/app.git main'):
+            self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
+            self.assertNotIn('pushed_remote', resolved, path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""

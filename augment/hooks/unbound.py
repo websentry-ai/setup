@@ -7491,6 +7491,10 @@ _ACCOUNT_MAX = 4
 _ACCOUNT_MAX_VALUE = 255
 # A human name carries spaces — an Azure subscription is called "Acme Production" — so it has its own reader.
 _ACCOUNT_MAX_NAME = 120
+
+
+# A path or configuration value, which is longer than an identity and may hold spaces.
+_ACCOUNT_MAX_PATH = 512
 # Variables an `export` earlier in the turn still decides. The hook is a fresh process per event and never inherits
 # them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
 _ACCOUNT_REMEMBERED = frozenset({
@@ -7572,7 +7576,9 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         for name, value in (env or {}).items():
             if name not in _ACCOUNT_REMEMBERED and not name.startswith(_ACCOUNT_INDEXED_CONFIG):
                 continue
-            if _account_value(value):
+            # A path or a configuration value may hold spaces; only an identity has to be one word.
+            kept = _account_value(value) if name in _ACCOUNT_IDENTITY_VALUES else _account_path(value)
+            if kept:
                 passed[name] = value
             else:
                 # The command's shell unset it, so the hook's own value must not reach the child either.
@@ -7604,6 +7610,11 @@ _ACCOUNT_CONFIG_STEERING = frozenset({
 # git reads `GIT_CONFIG_COUNT` settings from indexed pairs, so they travel with it rather than being named one
 # by one in the table above.
 _ACCOUNT_INDEXED_CONFIG = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+# The remembered names whose value names a person rather than a place, so it is one word by definition.
+_ACCOUNT_IDENTITY_VALUES = frozenset({
+    'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'GH_HOST', 'GH_TOKEN', 'GITHUB_TOKEN',
+    'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+})
 
 
 def _account_env_key(env: Dict) -> tuple:
@@ -7613,7 +7624,10 @@ def _account_env_key(env: Dict) -> tuple:
     name the shell unset: `unset GIT_CONFIG_GLOBAL` must not share an answer with a call that never had it."""
     present = tuple(sorted((name, value) for name, value in (env or {}).items()
                            if name in _ACCOUNT_REMEMBERED or name.startswith(_ACCOUNT_INDEXED_CONFIG)))
-    return present + (('', _TRANSFER_UNKNOWN_ENV),) if _account_beyond_reading(env) else present
+    for marker in (_TRANSFER_UNKNOWN_ENV, _TRANSFER_CLEAN_ENV):
+        if marker in (env or {}) or (marker is _TRANSFER_UNKNOWN_ENV and _account_beyond_reading(env)):
+            present += (('', marker),)
+    return present
 
 
 def _account_once(state: Dict, key: tuple, resolve) -> Any:
@@ -7642,6 +7656,16 @@ def _account_name(value: Any) -> Optional[str]:
     if not name or any(ord(ch) < 32 for ch in name):
         return None
     return name
+
+
+def _account_path(value: Any) -> Optional[str]:
+    """One configuration value as it was given, spaces and all; None when it names nothing or cannot be read."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()[:_ACCOUNT_MAX_PATH]
+    if not text or any(ord(ch) < 32 for ch in text):
+        return None
+    return text
 
 
 def _account_beyond_reading(env: Dict) -> bool:
@@ -7874,11 +7898,17 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     rewired = any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
         remote = _account_push_remote(after, cwd, env, state, overrides)
-        url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
-                                  ('git-push-url', remote, cwd, _account_env_key(env)))
-        # The URL says where the push went, which is a destination and not an account; the trailing slash git
-        # returns for a bare host would otherwise make two spellings of one repository.
-        repo = _account_repo_of(url) if url else None
+        # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
+        # remote in that case, so none is recorded.
+        repo = _account_repo_of(remote) if remote else None
+        if repo:
+            remote = None
+        else:
+            url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
+                                      ('git-push-url', remote, cwd, _account_env_key(env)))
+            # The URL says where the push went, which is a destination and not an account; the trailing slash
+            # git returns for a bare host would otherwise make two spellings of one repository.
+            repo = _account_repo_of(url) if url else None
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
     pushed = (repo, remote) if repo else None
