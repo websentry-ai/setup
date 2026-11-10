@@ -7629,15 +7629,23 @@ def _account_beyond_reading(env: Dict) -> bool:
     return _TRANSFER_UNKNOWN_ENV in (env or {})
 
 
-def _account_setting(name: str, env: Dict) -> Optional[str]:
-    """What a variable is worth for this call: what the command's shell has, else the hook's own environment."""
-    value = (env or {}).get(name)
-    if value == _TRANSFER_SUBSTITUTED:
-        return None
+def _account_known(name: str, env: Dict) -> tuple:
+    """(the variable's value, whether it is knowable at all).
+
+    A substitution anywhere in it — `ghp_$(cat token)` as much as `$(cat token)` — means it is set to something
+    this process cannot see, and a source or eval may have set it to anything. Neither is the same as unset, so
+    the hook's own value must not stand in for either."""
+    raw = (env or {}).get(name)
+    if isinstance(raw, str) and _TRANSFER_SUBSTITUTED in raw:
+        return None, False
     if name not in (env or {}) and _account_beyond_reading(env):
-        # A source or eval may have set it to anything, so the hook's own value no longer stands in.
-        return None
-    return _account_value(value) or _account_value(os.environ.get(name))
+        return None, False
+    return _account_value(raw) or _account_value(os.environ.get(name)), True
+
+
+def _account_setting(name: str, env: Dict) -> Optional[str]:
+    """What a variable is worth for this call, or None when it is unset or beyond reading."""
+    return _account_known(name, env)[0]
 
 
 def _account_exports(shell: Dict, state: Dict) -> None:
@@ -7698,6 +7706,8 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
     folder, passed, overrides = cwd, dict(env or {}), {}
     i = 0
     while i < len(args):
+        if not args[i].startswith('-') and args[i - 1] not in _ACCOUNT_GIT_VALUE_OPTIONS:
+            break  # the subcommand; everything after it is the subcommand's own option surface
         arg, value = args[i], args[i + 1] if i + 1 < len(args) else None
         pair = arg.split('=', 1)
         if arg == '-C' and value is not None:
@@ -7855,8 +7865,10 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         repo = _account_repo_of(url) if url else None
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
-    email = _account_setting('GIT_COMMITTER_EMAIL', env) \
-        or _account_git_config('user.email', cwd, env, state, overrides)
+    email, known = _account_known('GIT_COMMITTER_EMAIL', env)
+    if not known:
+        return [], None
+    email = email or _account_git_config('user.email', cwd, env, state, overrides)
     return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), (
         (repo, remote) if repo else None)
 
@@ -7885,16 +7897,24 @@ def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
     if repo and repo.count('/') == 2:
         # gh's own `HOST/OWNER/REPO` form, which names the host outright.
         return _account_value(repo.split('/')[0])
-    return _account_setting('GH_HOST', env) or 'github.com'
+    return _account_setting('GH_HOST', env)
+
+
+def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """The host the checkout's own remote points at, which gh reads before falling back to dotcom."""
+    url = _account_first_line(['git', 'config', '--get', 'remote.origin.url'], cwd, env, state,
+                              ('gh-remote-host', cwd, _account_env_key(env)))
+    return _account_host_of(url) if url else None
 
 
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the GitHub account a gh call acted as, no repository); empty when a token in the environment signs it in."""
-    # A substituted value is one the walk could not read, not an absent one, so it still signs the call in.
-    if any(_account_setting(name, env) or (env or {}).get(name) == _TRANSFER_SUBSTITUTED
-           for name in _ACCOUNT_GH_TOKENS):
-        return [], None
-    host = _account_gh_host(args, env)
+    # A value the walk could not read is not an absent one: it still signs the call in as whoever owns it.
+    for name in _ACCOUNT_GH_TOKENS:
+        value, known = _account_known(name, env)
+        if value or not known:
+            return [], None
+    host = _account_gh_host(args, env) or _account_gh_remote_host(cwd, env, state) or 'github.com'
     if not host:
         return [], None
 
