@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '937be34fff6a27a5fdb7cc01f4aa6a07d5c101b556b842438e6b389ae82e583f'
+BLOCK_SHA256 = 'da9dd1ea1be7a685ef28b59f7ac454fe0c7c430b40ab026d31d31e7a35555049'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -216,6 +216,19 @@ class AccountResolutionTests(unittest.TestCase):
             with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps({**answers, setting: 'chosen'})}):
                 for path, resolved in self.each('git push'):
                     self.assertEqual(resolved['pushed_repo'], 'acme/chosen', '%s via %s' % (path, setting))
+
+    def test_an_explicitly_unset_variable_does_not_fall_back_to_the_hooks_own(self):
+        """`env -u` and `unset` leave the shell without it, which is not the same as never having had it."""
+        with patch.dict(os.environ, {'GIT_COMMITTER_EMAIL': 'hook@example.com'}):
+            for path, resolved in self.each('env -u GIT_COMMITTER_EMAIL git commit -m wip'):
+                self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_nothing_is_looked_up_from_a_folder_we_do_not_know(self):
+        """git reads its configuration from the folder it runs in, so an unknown folder resolves nothing."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            resolved = hook._accounts('git commit -m wip', None, {})
+            self.assertIsNone(resolved, path)
+        self.assertEqual(self.runs(), [])
 
     def test_a_subcommands_own_option_is_not_read_as_gits(self):
         """`git commit -C <commit>` reuses that commit's message; it is not git's global `-C <dir>`."""
