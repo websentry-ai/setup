@@ -9030,6 +9030,11 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         return None
 
 
+def _account_env_key(env: Dict) -> tuple:
+    """The settings that can change a lookup's answer, so a memo never answers a different question."""
+    return tuple(sorted((name, (env or {}).get(name)) for name in _ACCOUNT_REMEMBERED if (env or {}).get(name)))
+
+
 def _account_once(state: Dict, key: tuple, resolve) -> Any:
     """One lookup per distinct question in a turn, so twenty calls to the same host resolve it once."""
     memo = state.setdefault('account_memo', {})
@@ -9115,6 +9120,38 @@ def _account_git_subcommand(args: List[str]) -> tuple:
     return '', []
 
 
+def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
+    """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
+
+    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file;
+    skipping them to find the subcommand is not the same as honouring them."""
+    folder, passed, overrides = cwd, dict(env or {}), {}
+    i = 0
+    while i < len(args):
+        arg, value = args[i], args[i + 1] if i + 1 < len(args) else None
+        pair = arg.split('=', 1)
+        if arg == '-C' and value is not None:
+            folder = value if os.path.isabs(value) else os.path.join(folder or '', value)
+            i += 2
+            continue
+        if arg == '-c' and value is not None:
+            name, _, setting = value.partition('=')
+            if name and _:
+                overrides[name.strip().lower()] = setting
+            i += 2
+            continue
+        if len(pair) == 2 and pair[0] == '--config-env':
+            i += 1
+            continue
+        for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
+            if arg == option and value is not None:
+                passed[name] = value
+            elif pair[0] == option and len(pair) == 2:
+                passed[name] = pair[1]
+        i += 2 if arg in _ACCOUNT_GIT_VALUE_OPTIONS else 1
+    return folder, passed, overrides
+
+
 def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
                         key: tuple) -> Optional[str]:
     """The first line one allowlisted lookup printed, asked once per distinct question in a turn."""
@@ -9126,12 +9163,18 @@ def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: D
     return _account_once(state, key, resolve)
 
 
-def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
-    """One git configuration value, read by git itself so its own precedence decides; None when unset."""
-    return _account_first_line(['git', 'config', '--get', name], cwd, env, state, ('git-config', name, cwd))
+def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
+                        overrides: Optional[Dict] = None) -> Optional[str]:
+    """One git configuration value: a `-c` override first, else read by git so its own precedence decides."""
+    override = _account_value((overrides or {}).get(name.lower()))
+    if override:
+        return override
+    return _account_first_line(['git', 'config', '--get', name], cwd, env, state,
+                               ('git-config', name, cwd, _account_env_key(env)))
 
 
-def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
+                         overrides: Dict) -> Optional[str]:
     """The remote a push reaches, in git's own order: the command, pushRemote, pushDefault, the branch's remote."""
     i = 0
     while i < len(after):
@@ -9143,11 +9186,12 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
             i += 1
             continue
         return _account_value(arg)
-    branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state, ('git-branch', cwd))
+    branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state,
+                                 ('git-branch', cwd, _account_env_key(env)))
     for name in (('branch.%s.pushRemote' % branch) if branch else None, 'remote.pushDefault',
                  ('branch.%s.remote' % branch) if branch else None):
         if name:
-            found = _account_git_config(name, cwd, env, state)
+            found = _account_git_config(name, cwd, env, state, overrides)
             if found:
                 return found
     return 'origin'
@@ -9158,17 +9202,19 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     subcommand, after = _account_git_subcommand(args)
     if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
         return [], None
+    cwd, env, overrides = _account_git_context(args, cwd, env)
     repo = None
     if subcommand == 'push':
-        remote = _account_push_remote(after, cwd, env, state)
+        remote = _account_push_remote(after, cwd, env, state, overrides)
         url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
-                                  ('git-push-url', remote, cwd))
+                                  ('git-push-url', remote, cwd, _account_env_key(env)))
         # The URL says where the push went, which is a destination and not an account; the trailing slash git
         # returns for a bare host would otherwise make two spellings of one repository.
         repo = _account_repo_of(url) if url else None
-    # The committer identity, which is a separate fact from the login that pushed and may disagree with it.
-    email = _account_setting('GIT_COMMITTER_EMAIL', env) or _account_setting('GIT_AUTHOR_EMAIL', env) \
-        or _account_git_config('user.email', cwd, env, state)
+    # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
+    # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
+    email = _account_setting('GIT_COMMITTER_EMAIL', env) \
+        or _account_git_config('user.email', cwd, env, state, overrides)
     return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), repo
 
 
@@ -9189,16 +9235,21 @@ def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
             repo, i = arg.split('=', 1)[1], i + 1
             continue
         i += 1
-    if repo and ('://' in repo or repo.count('/') > 1):
+    if repo and '://' in repo:
         host = _account_host_of(repo)
         if host:
             return host
+    if repo and repo.count('/') == 2:
+        # gh's own `HOST/OWNER/REPO` form, which names the host outright.
+        return _account_value(repo.split('/')[0])
     return _account_setting('GH_HOST', env) or 'github.com'
 
 
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the GitHub account a gh call acted as, no repository); empty when a token in the environment signs it in."""
-    if any(_account_setting(name, env) for name in _ACCOUNT_GH_TOKENS):
+    # A substituted value is one the walk could not read, not an absent one, so it still signs the call in.
+    if any(_account_setting(name, env) or (env or {}).get(name) == _TRANSFER_SUBSTITUTED
+           for name in _ACCOUNT_GH_TOKENS):
         return [], None
     host = _account_gh_host(args, env)
     if not host:
@@ -9209,6 +9260,11 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 
 
 _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
+# A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
+# A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
+_ACCOUNT_TRIGGERS = re.compile(
+    r'(?<![\w.-])(%s)(?![\w.-])|(?<![A-Z_])(%s)(?![A-Z_])'
+    % ('|'.join(sorted(_ACCOUNT_HANDLERS)), '|'.join(sorted(_ACCOUNT_REMEMBERED))))
 
 
 def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
@@ -9217,7 +9273,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
     try:
         if not isinstance(command, str) or not command.strip():
             return None
-        if not any(name in command for name in _ACCOUNT_HANDLERS):
+        if not _ACCOUNT_TRIGGERS.search(command):
             return None
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd,
                                dict(state.get('account_env') or {}), 0)
@@ -9340,13 +9396,16 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
                 transfer = _transfer(command, transfer_dir, transfer_state)
+                # Resolved from where the command STARTED, like the transfer above: _accounts replays the
+                # call's own cd, so the folder it ended in would move it a second time.
+                accounts = _accounts(command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
                     transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
                 turn_seeded = True
                 if transfer:
                     tool_use_entry['transfer'] = transfer
-                _with_accounts(tool_use_entry, _accounts(command, transfer_dir, transfer_state))
+                _with_accounts(tool_use_entry, accounts)
             # Lift the invoked skill to stable keys so the backend reads one
             # field regardless of how a tool spells its skill input.
             if tool_name == SKILL_TOOL_NAME and isinstance(tool_input, dict):
