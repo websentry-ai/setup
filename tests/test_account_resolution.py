@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b6eb3447ad6cb2e5505315e91590fb3a9ca9c41527b34667d2fb02c8507f0603'
+BLOCK_SHA256 = '2a026894c688ae2782aac1095253f80e1e029f2e716018bc51886f1838e88d78'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -429,6 +429,33 @@ class AccountResolutionTests(unittest.TestCase):
         for path, resolved in self.each('GH_TOKEN=$(cat ~/.work-token) gh pr create'):
             self.assertIsNone(resolved, path)
         self.assertEqual(self.runs(), [])
+
+    def test_a_command_that_cleared_its_environment_does_not_inherit_ours(self):
+        """`env -i` means the child sees nothing this process holds, so our own committer must not stand in."""
+        os.environ['GIT_COMMITTER_EMAIL'] = 'hook@unbound.test'
+        for path, resolved in self.each('env -i git commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_two_calls_with_different_indexed_config_resolve_separately(self):
+        """git's `GIT_CONFIG_COUNT` pairs travel with the lookup, so the memo has to key on them too."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            first = self.resolve(hook, 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email '
+                                       'GIT_CONFIG_VALUE_0=a@acme.com git commit -m one', state)
+            second = self.resolve(hook, 'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email '
+                                        'GIT_CONFIG_VALUE_0=b@acme.com git commit -m two', state)
+            self.assertEqual(first['accounts'][0]['email'], 'a@acme.com', path)
+            self.assertEqual(second['accounts'][0]['email'], 'b@acme.com', path)
+
+    def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
+        """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            self.assertIsNone(hook._accounts('gh pr list', None, {}), path)
+        self.assertEqual(self.runs(), [])
+        # A call that names its repository never consults the checkout, so that one still resolves.
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            resolved = hook._accounts('gh pr view -R acme/app', None, {})
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
 
     # -- through the turn log, where the folder is tracked across calls -------
 

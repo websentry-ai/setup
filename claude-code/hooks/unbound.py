@@ -9038,7 +9038,8 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             else:
                 # The command's shell unset it, so the hook's own value must not reach the child either.
                 dropped.append(name)
-        child = {key: value for key, value in os.environ.items() if key not in dropped}
+        child = {} if _TRANSFER_CLEAN_ENV in (env or {}) else {
+            key: value for key, value in os.environ.items() if key not in dropped}
         result = subprocess.run([program] + argv[1:], cwd=cwd if isinstance(cwd, str) else None,
                                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                 env={**child, **passed, **_ACCOUNT_RUN_ENV},
@@ -9062,10 +9063,10 @@ _ACCOUNT_INDEXED_CONFIG = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 def _account_env_key(env: Dict) -> tuple:
     """The settings that can change a lookup's answer, so a memo never answers a different question.
 
-    A name the shell unset is part of the question too: `unset GIT_CONFIG_GLOBAL` must not share an answer
-    with a call that never had it."""
-    present = tuple(sorted((name, (env or {}).get(name))
-                           for name in _ACCOUNT_REMEMBERED if name in (env or {})))
+    Every name the lookup forwards is part of it, the indexed `GIT_CONFIG_KEY_n` pairs included, and so is a
+    name the shell unset: `unset GIT_CONFIG_GLOBAL` must not share an answer with a call that never had it."""
+    present = tuple(sorted((name, value) for name, value in (env or {}).items()
+                           if name in _ACCOUNT_REMEMBERED or name.startswith(_ACCOUNT_INDEXED_CONFIG)))
     return present + (('', _TRANSFER_UNKNOWN_ENV),) if _account_beyond_reading(env) else present
 
 
@@ -9104,6 +9105,9 @@ def _account_known(name: str, env: Dict) -> tuple:
     if name in (env or {}):
         # Present and empty means the command's shell unset it, which is not the same as never having had it.
         return _account_value(raw), True
+    if _TRANSFER_CLEAN_ENV in (env or {}):
+        # `env -i` cleared the environment, so the child sees nothing this process holds.
+        return None, True
     if _account_beyond_reading(env):
         return None, False
     return _account_value(os.environ.get(name)), True
@@ -9324,7 +9328,12 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     # A repository the command names is resolved against gh's own host, not against whatever this folder
     # happens to point at; only a call that names none falls back to the checkout's remote.
     names_repo = any(arg in ('-R', '--repo') or arg.startswith(('-R=', '--repo=')) for arg in args)
-    host = _account_gh_host(args, env) or (
+    named = _account_gh_host(args, env)
+    if named is None and not names_repo and not isinstance(cwd, str):
+        # gh reads the checkout's remote before GH_HOST, and an unknown folder cannot be read, so every
+        # remaining answer would be a guess at an enterprise host.
+        return [], None
+    host = named or (
         None if names_repo else _account_gh_remote_host(cwd, env, state)
     ) or _account_setting('GH_HOST', env) or 'github.com'
     if not host:
