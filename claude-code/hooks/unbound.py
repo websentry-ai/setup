@@ -9067,7 +9067,8 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             else:
                 # The command's shell unset it, so the hook's own value must not reach the child either.
                 dropped.append(name)
-        child = {key: value for key, value in os.environ.items() if key not in dropped}
+        child = {} if _TRANSFER_CLEAN_ENV in (env or {}) else {
+            key: value for key, value in os.environ.items() if key not in dropped}
         result = subprocess.run([program] + argv[1:], cwd=cwd if isinstance(cwd, str) else None,
                                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                 env={**child, **passed, **_ACCOUNT_RUN_ENV},
@@ -9091,10 +9092,10 @@ _ACCOUNT_INDEXED_CONFIG = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 def _account_env_key(env: Dict) -> tuple:
     """The settings that can change a lookup's answer, so a memo never answers a different question.
 
-    A name the shell unset is part of the question too: `unset GIT_CONFIG_GLOBAL` must not share an answer
-    with a call that never had it."""
-    present = tuple(sorted((name, (env or {}).get(name))
-                           for name in _ACCOUNT_REMEMBERED if name in (env or {})))
+    Every name the lookup forwards is part of it, the indexed `GIT_CONFIG_KEY_n` pairs included, and so is a
+    name the shell unset: `unset GIT_CONFIG_GLOBAL` must not share an answer with a call that never had it."""
+    present = tuple(sorted((name, value) for name, value in (env or {}).items()
+                           if name in _ACCOUNT_REMEMBERED or name.startswith(_ACCOUNT_INDEXED_CONFIG)))
     return present + (('', _TRANSFER_UNKNOWN_ENV),) if _account_beyond_reading(env) else present
 
 
@@ -9143,6 +9144,9 @@ def _account_known(name: str, env: Dict) -> tuple:
     if name in (env or {}):
         # Present and empty means the command's shell unset it, which is not the same as never having had it.
         return _account_value(raw), True
+    if _TRANSFER_CLEAN_ENV in (env or {}):
+        # `env -i` cleared the environment, so the child sees nothing this process holds.
+        return None, True
     if _account_beyond_reading(env):
         return None, False
     return _account_value(os.environ.get(name)), True
@@ -9183,6 +9187,46 @@ def _account_repo_of(url: str) -> Optional[str]:
     if name.endswith('.git'):
         name = name[:-4]
     return _account_value('%s/%s' % (owner, name))
+
+
+def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
+    """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
+
+    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file."""
+    folder, passed, overrides = cwd, dict(env or {}), {}
+    i = 0
+    while i < len(args):
+        if not args[i].startswith('-') and args[i - 1] not in _ACCOUNT_GIT_VALUE_OPTIONS:
+            break  # the subcommand; everything after it is the subcommand's own option surface
+        arg, value = args[i], args[i + 1] if i + 1 < len(args) else None
+        pair = arg.split('=', 1)
+        if arg == '-C' and value is not None:
+            # A relative one needs a folder to resolve against; with none, every lookup here is refused anyway.
+            folder = value if os.path.isabs(value) else os.path.join(folder, value) if folder else None
+            i += 2
+            continue
+        if arg == '-c' and value is not None:
+            name, _, setting = value.partition('=')
+            if name and _:
+                overrides[name.strip().lower()] = setting
+            i += 2
+            continue
+        if pair[0] == '--config-env':
+            setting = pair[1] if len(pair) == 2 else value
+            name, _, variable = (setting or '').partition('=')
+            if name and _:
+                held, known = _account_known(variable, env)
+                # An override we cannot read still overrides, so the setting is unknown rather than the file's.
+                overrides[name.strip().lower()] = held if known else _TRANSFER_SUBSTITUTED
+            i += 1 if len(pair) == 2 else 2
+            continue
+        for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
+            if arg == option and value is not None:
+                passed[name] = value
+            elif pair[0] == option and len(pair) == 2:
+                passed[name] = pair[1]
+        i += 2 if arg in _ACCOUNT_GIT_VALUE_OPTIONS else 1
+    return folder, passed, overrides
 
 
 def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
@@ -9360,13 +9404,14 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         repo = _account_repo_of(url) if url else None
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
+    pushed = (repo, remote) if repo else None
     email, known = _account_known('GIT_COMMITTER_EMAIL', env)
     if not known:
-        return [], None
+        # Who committed is a separate fact from where the push went; one unknown does not unsettle the other.
+        return [], pushed
     for setting in ('committer.email', 'user.email'):
         email = email or _account_git_config(setting, cwd, env, state, overrides)
-    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), (
-        (repo, remote) if repo else None)
+    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), pushed
 
 
 def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
@@ -9413,7 +9458,12 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     # A repository the command names is resolved against gh's own host, not against whatever this folder
     # happens to point at; only a call that names none falls back to the checkout's remote.
     names_repo = any(arg in ('-R', '--repo') or arg.startswith(('-R=', '--repo=')) for arg in args)
-    host = _account_gh_host(args, env) or (
+    named = _account_gh_host(args, env)
+    if named is None and not names_repo and not isinstance(cwd, str):
+        # gh reads the checkout's remote before GH_HOST, and an unknown folder cannot be read, so every
+        # remaining answer would be a guess at an enterprise host.
+        return [], None
+    host = named or (
         None if names_repo else _account_gh_remote_host(cwd, env, state)
     ) or _account_setting('GH_HOST', env) or 'github.com'
     if not host:
