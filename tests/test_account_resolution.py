@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'ad344bfded747ee346a324117fc7749f8be83c1026f1a4314c0d6395f8e8bb30'
+BLOCK_SHA256 = '97ff772f5e7b95c36d2e17403bd47e3ddca43362310e8946b0ae179c24c115cd'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -490,6 +490,23 @@ class AccountResolutionTests(unittest.TestCase):
         for path, resolved in self.each('git push https://github.com/acme/app.git main'):
             self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
             self.assertNotIn('pushed_remote', resolved, path)
+
+    def test_a_committer_override_we_cannot_read_is_not_the_configured_address(self):
+        """git commits as the value it was given, so `user.email` is not the answer when we cannot read it."""
+        for path, resolved in self.each('git -c committer.email=$(cat .who) commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_push_remote_we_cannot_read_is_never_origin(self):
+        """A configured remote we cannot read leaves the destination unknown; `origin` was never reached."""
+        for path, resolved in self.each('git -c branch.main.pushRemote=$(cat .r) push'):
+            self.assertNotIn('pushed_repo', resolved or {}, path)
+            self.assertNotIn('pushed_remote', resolved or {}, path)
+
+    def test_the_repository_named_in_the_environment_decides_the_host(self):
+        """gh reads `GH_REPO` exactly as it reads `--repo`, so it answers before the checkout's remote."""
+        for path, resolved in self.each('GH_REPO=github.acme.com/acme/app gh pr list'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+            self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""

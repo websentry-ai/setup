@@ -7489,7 +7489,7 @@ _ACCOUNT_MAX_PATH = 512
 _ACCOUNT_REMEMBERED = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
     'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME', 'HOME', 'USERPROFILE',
-    'GH_HOST', 'GH_CONFIG_DIR', 'GH_TOKEN',
+    'GH_HOST', 'GH_REPO', 'GH_CONFIG_DIR', 'GH_TOKEN',
     'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
     'GITHUB_ENTERPRISE_TOKEN',
 })
@@ -7644,6 +7644,26 @@ def _account_setting(name: str, env: Dict) -> Optional[str]:
     return _account_known(name, env)[0]
 
 
+def _account_option(args: List[str], names: tuple, reader=None) -> tuple:
+    """(what a call names with one of these options, whether it is readable); (None, True) when it names none."""
+    raw = None
+    i = 0
+    while i < len(args) and raw is None:
+        arg = args[i]
+        if arg in names and i + 1 < len(args):
+            raw = args[i + 1]
+            break
+        for name in names:
+            if arg.startswith(name + '='):
+                raw = arg.split('=', 1)[1]
+                break
+        i += 1
+    if raw is None:
+        return None, True
+    value = (reader or _account_value)(raw)
+    return (value, True) if value else (None, False)
+
+
 def _account_host_of(url: str) -> Optional[str]:
     """The host a git remote URL names, for an https, ssh or scp-style address; None when it names none."""
     text = url.strip().rstrip('/')
@@ -7744,25 +7764,26 @@ def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: D
 
 def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
                         overrides: Optional[Dict] = None) -> Optional[str]:
-    """One git configuration value: a `-c` override first, else read by git so its own precedence decides."""
-    override = (overrides or {}).get(name.lower())
-    if override == _TRANSFER_SUBSTITUTED:
-        return None  # overridden to something we cannot read, so the file's value no longer applies
+    """(one git configuration value, whether it is readable); a `-c` override wins, else git's own precedence."""
     if name.lower() in (overrides or {}):
-        return _account_value(override)
+        # Overridden to something we cannot read: the file's value no longer applies, so git's is unknown.
+        override = (overrides or {}).get(name.lower())
+        value = None if override == _TRANSFER_SUBSTITUTED else _account_value(override)
+        return (value, True) if value else (None, False)
     return _account_first_line(['git', 'config', '--get', name], cwd, env, state,
-                               ('git-config', name, cwd, _account_env_key(env)))
+                               ('git-config', name, cwd, _account_env_key(env))), True
 
 
 def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
                          overrides: Dict) -> Optional[str]:
-    """The remote a push reaches, in git's own order: the command, pushRemote, pushDefault, the branch's remote."""
+    """(the remote a push reaches, whether it is readable); git's order: the command, pushRemote, pushDefault,
+    then the branch's remote."""
     # `git push --repo <repository>` names where the push goes, so its value IS the remote.
-    for at, arg in enumerate(after):
-        if arg == '--repo' and at + 1 < len(after):
-            return _account_value(after[at + 1])
-        if arg.startswith('--repo='):
-            return _account_value(arg.split('=', 1)[1])
+    named, known = _account_option(after, ('--repo',))
+    if not known:
+        return None, False
+    if named:
+        return named, True
     i = 0
     while i < len(after):
         arg = after[i]
@@ -7772,16 +7793,19 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
         if arg.startswith('-'):
             i += 1
             continue
-        return _account_value(arg)
+        value = _account_value(arg)
+        return (value, True) if value else (None, False)
     branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state,
                                  ('git-branch', cwd, _account_env_key(env)))
     for name in (('branch.%s.pushRemote' % branch) if branch else None, 'remote.pushDefault',
                  ('branch.%s.remote' % branch) if branch else None):
         if name:
-            found = _account_git_config(name, cwd, env, state, overrides)
+            found, readable = _account_git_config(name, cwd, env, state, overrides)
+            if not readable:
+                return None, False
             if found:
-                return found
-    return 'origin'
+                return found, True
+    return 'origin', True
 
 
 def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
@@ -7793,11 +7817,13 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     repo, remote = None, None
     rewired = any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
-        remote = _account_push_remote(after, cwd, env, state, overrides)
+        remote, reachable = _account_push_remote(after, cwd, env, state, overrides)
         # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
         # remote in that case, so none is recorded.
         repo = _account_repo_of(remote) if remote else None
-        if repo:
+        if not reachable:
+            repo, remote = None, None
+        elif repo:
             remote = None
         else:
             url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
@@ -7813,35 +7839,38 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         # Who committed is a separate fact from where the push went; one unknown does not unsettle the other.
         return [], pushed
     for setting in ('committer.email', 'user.email'):
-        email = email or _account_git_config(setting, cwd, env, state, overrides)
+        if email:
+            break
+        email, readable = _account_git_config(setting, cwd, env, state, overrides)
+        if not readable:
+            # git commits as the value we cannot read, so who committed is unknown rather than `user.email`.
+            return [], pushed
     return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), pushed
 
 
-def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
-    """The host a gh call talks to, in gh's own order: --hostname, then the repo it names, then GH_HOST, then dotcom."""
-    i = 0
-    repo = None
-    while i < len(after):
-        arg = after[i]
-        if arg in ('--hostname', '-h') and i + 1 < len(after):
-            return _account_value(after[i + 1])
-        if arg.startswith('--hostname='):
-            return _account_value(arg.split('=', 1)[1])
-        if arg in ('-R', '--repo') and i + 1 < len(after):
-            repo, i = after[i + 1], i + 2
-            continue
-        if arg.startswith('--repo='):
-            repo, i = arg.split('=', 1)[1], i + 1
-            continue
-        i += 1
+def _account_gh_repo(args: List[str], env: Dict) -> tuple:
+    """(the repository a gh call names, whether it is readable); gh reads `GH_REPO` exactly as it reads `--repo`."""
+    repo, known = _account_option(args, ('-R', '--repo'))
+    if repo or not known:
+        return repo, known
+    return _account_known('GH_REPO', env)
+
+
+def _account_gh_host(args: List[str], env: Dict) -> tuple:
+    """(the host a gh call talks to, whether what it names can be read); gh's order is `--hostname`, then the
+    repository it names."""
+    host, known = _account_option(args, ('--hostname', '-h'))
+    if host or not known:
+        return host, known
+    repo, known = _account_gh_repo(args, env)
+    if not known:
+        return None, False
     if repo and '://' in repo:
-        host = _account_host_of(repo)
-        if host:
-            return host
+        return _account_host_of(repo), True
     if repo and repo.count('/') == 2:
         # gh's own `HOST/OWNER/REPO` form, which names the host outright.
-        return _account_value(repo.split('/')[0])
-    return None
+        return _account_value(repo.split('/')[0]), True
+    return None, True
 
 
 def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
@@ -7860,15 +7889,20 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
             return [], None
     # A repository the command names is resolved against gh's own host, not against whatever this folder
     # happens to point at; only a call that names none falls back to the checkout's remote.
-    names_repo = any(arg in ('-R', '--repo') or arg.startswith(('-R=', '--repo=')) for arg in args)
-    named = _account_gh_host(args, env)
-    if named is None and not names_repo and not isinstance(cwd, str):
+    repo_named, readable = _account_gh_repo(args, env)
+    named, known = _account_gh_host(args, env)
+    if not readable or not known:
+        return [], None
+    if named is None and repo_named is None and not isinstance(cwd, str):
         # gh reads the checkout's remote before GH_HOST, and an unknown folder cannot be read, so every
         # remaining answer would be a guess at an enterprise host.
         return [], None
+    fallback, fallback_known = _account_known('GH_HOST', env)
+    if not fallback_known:
+        return [], None
     host = named or (
-        None if names_repo else _account_gh_remote_host(cwd, env, state)
-    ) or _account_setting('GH_HOST', env) or 'github.com'
+        None if repo_named else _account_gh_remote_host(cwd, env, state)
+    ) or fallback or 'github.com'
     if not host:
         return [], None
 
