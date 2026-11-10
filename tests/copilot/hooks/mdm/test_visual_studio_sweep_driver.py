@@ -225,11 +225,11 @@ class InstallerOrderingAndSeeding(unittest.TestCase):
         self.source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
 
     def test_the_sweep_runs_before_the_re_walk(self):
-        # The re-walk is bounded by session count, not time, and onboard.py allows one
-        # installer 600s. Visual Studio's only delivery must not queue behind it.
+        # The re-walk can use the installer's whole time allowance. Visual Studio's only
+        # delivery must not queue behind it.
         # The call sites, not the definitions: run_backfill is defined first either way.
         self.assertLess(self.source.index("run_visual_studio_sweep(api_key, base_url"),
-                        self.source.index("run_backfill(api_key, base_url"))
+                        self.source.index("_run_backfill_until_soft_stop(api_key, base_url"))
 
     def test_the_sweep_seeds_only_when_the_installer_was_asked_to(self):
         # A month of history needs --backfill here exactly as it does for the re-walk.

@@ -330,6 +330,81 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
 MDM_BACKFILLERS = [s for s in BACKFILLERS if "/mdm/" in s]
 
 
+SOFT_STOPPERS = [s for s in MDM_BACKFILLERS if _has(s, "_run_backfill_until_soft_stop")]
+
+
+def test_the_soft_stopper_inventory_is_codex_and_copilot():
+    assert SOFT_STOPPERS == ["codex/hooks/mdm/setup.py", "copilot/hooks/mdm/setup.py"]
+
+
+@pytest.mark.parametrize("relpath", SOFT_STOPPERS)
+class TestAScriptRunStopsItselfBeforeTheWatchdog:
+    """WEB-6527: these installers had no run clock, so a slow history ran until onboard's 720s watchdog killed
+    the tool and reported its setup as failed. Run as a script they now stop themselves; the packaged binary,
+    which has no watchdog, is left unbounded."""
+
+    @staticmethod
+    def _run(module, monkeypatch, capsys, runner_name, chunk_seconds):
+        """(chunks sent, homes whose cutoff was saved, output) for four one-session chunks."""
+        from pathlib import Path
+        clock = [1000.0]
+        sessions = [{"session_id": "s%d" % n, "entries": [{"text": "x" * 120}]} for n in range(4)]
+        sent, cutoffs = [], []
+
+        def run_as_user(username, fn, *args, **kwargs):
+            if fn is module._backfill_collect_sessions:
+                return sessions, False, False
+            if fn is module._backfill_write_cutoff:
+                cutoffs.append(username)
+            return None
+
+        def upload(api_key, backend_url, chunk, *args, **kwargs):
+            sent.append([s["session_id"] for s in chunk])
+            clock[0] += chunk_seconds
+            return True
+
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0])
+        monkeypatch.setattr(module, "BACKFILL_CHUNK_BYTES", 200)
+        monkeypatch.setattr(module, "_run_as_user", run_as_user)
+        monkeypatch.setattr(module, "_backfill_force_config", lambda *a: (None, None))
+        monkeypatch.setattr(module, "_backfill_upload_chunk", upload)
+        getattr(module, runner_name)("key", "https://backend", [("alice", Path("/home/alice"))])
+        return sent, cutoffs, capsys.readouterr().out
+
+    def test_the_script_stops_before_a_chunk_that_no_longer_fits_and_keeps_its_cutoff(
+            self, relpath, monkeypatch, capsys):
+        module = load_module(relpath)
+        sent, cutoffs, out = self._run(module, monkeypatch, capsys, "_run_backfill_until_soft_stop", 200)
+        # 200s a chunk against a 600s stop less 40s for from-s3: the fourth would start with none left.
+        assert sent == [["s0"], ["s1"], ["s2"]]
+        assert cutoffs == []
+        assert "Queued 3 past sessions. More history remains" in out and "failed" not in out
+        assert module._backfill_stop_at is None
+
+    def test_the_packaged_binary_path_is_left_unbounded(self, relpath, monkeypatch, capsys):
+        module = load_module(relpath)
+        sent, cutoffs, out = self._run(module, monkeypatch, capsys, "run_backfill", 200)
+        assert sent == [["s0"], ["s1"], ["s2"], ["s3"]]
+        assert cutoffs == ["alice"]
+        assert "queued 4 past sessions" in out
+
+    def test_a_put_is_capped_by_the_time_left_before_the_stop(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        clock, caps = [1000.0], []
+        calls, http = _link_then_put([200], clock, lambda cap: caps.append(cap) or 10)
+        monkeypatch.setattr(module, "_backfill_http_request", http)
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_backfill_stop_at", clock[0] + 140)
+        assert module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}]) is True
+        assert caps == [100]
+        # With under the floor left no link is asked for, and it reads as a stop, not a failed upload.
+        del calls[:]
+        monkeypatch.setattr(module, "_backfill_stop_at", clock[0] + 60)
+        assert module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}]) is None
+        assert calls == []
+
+
 class TestCollectorShapeMatchesEveryUnpacker:
     """The managed collector is unpacked by the installer AND by the packaged
     `unbound-hook backfill --dry-run`. Both must agree on how many values it

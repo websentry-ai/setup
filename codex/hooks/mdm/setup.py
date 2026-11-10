@@ -39,6 +39,11 @@ BACKFILL_PUT_STALL_BYTES_PER_SECOND = 1024
 BACKFILL_PUT_ATTEMPTS = 3
 BACKFILL_PUT_MAX_SECONDS = 300  # one chunk's PUT attempts share this, so retries cannot stack past a watchdog
 BACKFILL_PUT_MIN_SECONDS = 45  # with less than this left of it, no further attempt starts
+# Run as a script (onboard's 720s per-tool watchdog), the backfill stops itself here; the packaged binary sets no stop.
+_SCRIPT_START = time.time()
+BACKFILL_SOFT_STOP_SECONDS = 600
+BACKFILL_FROM_S3_RESERVE_SECONDS = 40
+_backfill_stop_at: Optional[float] = None
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -2114,8 +2119,24 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
+def _backfill_run_seconds_left() -> float:
+    # What a PUT may still take before the soft stop, leaving from-s3 its turn; unbounded when no stop is set.
+    if _backfill_stop_at is None:
+        return float('inf')
+    return _backfill_stop_at - time.time() - BACKFILL_FROM_S3_RESERVE_SECONDS
+
+
+def _backfill_out_of_run_time() -> bool:
+    return _backfill_run_seconds_left() < BACKFILL_PUT_MIN_SECONDS
+
+
+class _BackfillOutOfTime(Exception):
+    """A chunk was left unsent because it would not fit before the soft stop; carries the sessions sent so far."""
+
+
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False) -> bool:
+                           force: bool = False) -> Optional[bool]:
+    # None when the run's soft stop left no time for the PUT: a stop, not a failed upload.
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
@@ -2131,12 +2152,12 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     chunk_started = time.time()
 
     def put_seconds_left() -> int:
-        return int(BACKFILL_PUT_MAX_SECONDS - (time.time() - chunk_started))
+        return int(min(BACKFILL_PUT_MAX_SECONDS - (time.time() - chunk_started), _backfill_run_seconds_left()))
 
     for _ in range(BACKFILL_PUT_ATTEMPTS):
         if put_seconds_left() < BACKFILL_PUT_MIN_SECONDS:
             debug_print("S3 PUT not retried: the chunk's time is used up")
-            return False
+            return None if _backfill_out_of_run_time() else False
         code, body = _backfill_http_request(
             f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
             method='POST',
@@ -2163,7 +2184,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         put_cap = put_seconds_left()
         if put_cap < BACKFILL_PUT_MIN_SECONDS:
             debug_print("S3 PUT not started: the link request used the chunk's time")
-            return False
+            return None if _backfill_out_of_run_time() else False
         put_started = time.time()
         code, put_answer = _backfill_http_request(
             upload_url,
@@ -2212,8 +2233,13 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         nonlocal current_chunk, current_size, chunks_total, chunks_sent
         if not current_chunk:
             return
+        if _backfill_out_of_run_time():
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
+        landed = _backfill_upload_chunk(api_key, backend_url, current_chunk, forced)
+        if landed is None:
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
+        if landed:
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))
@@ -2235,6 +2261,16 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
     _flush()
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
+
+
+def _run_backfill_until_soft_stop(*run_backfill_args) -> None:
+    """main()'s backfill: it stops itself before onboard's per-tool watchdog would kill the installer."""
+    global _backfill_stop_at
+    _backfill_stop_at = _SCRIPT_START + BACKFILL_SOFT_STOP_SECONDS
+    try:
+        run_backfill(*run_backfill_args)
+    finally:
+        _backfill_stop_at = None
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
@@ -2287,14 +2323,23 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Found {total} past sessions. Uploading (this may take a few minutes)...")
         sessions_sent = 0
         chunks_failed = 0
+        out_of_time = False
         for batch, forced in ((forced_sessions, True), (sessions, False)):
             if not batch:
                 continue
-            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            try:
+                sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            except _BackfillOutOfTime as stop:
+                sessions_sent += stop.args[0]
+                out_of_time = True
+                break
             sessions_sent += sent
             chunks_failed += failed
 
-        if sessions_sent == 0:
+        if out_of_time:
+            # The cutoff stays where it was, so the next run starts this history again.
+            print(f"[backfill] Queued {sessions_sent} past sessions. More history remains for the next run.")
+        elif sessions_sent == 0:
             print(f"[backfill] No sessions queued (all {chunks_failed} uploads failed).")
         elif chunks_failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({chunks_failed} chunks failed).")
@@ -2575,7 +2620,7 @@ def main():
                               hook_hash=hook_script_hash(_installed_hook_script()), install_mode="mdm")
 
     if success and backfill_mode:
-        run_backfill(api_key, base_url, get_all_user_homes())
+        _run_backfill_until_soft_stop(api_key, base_url, get_all_user_homes())
 
     return success
 
