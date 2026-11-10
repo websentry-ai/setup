@@ -7872,13 +7872,14 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         repo = _account_repo_of(url) if url else None
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
+    pushed = (repo, remote) if repo else None
     email, known = _account_known('GIT_COMMITTER_EMAIL', env)
     if not known:
-        return [], None
+        # Who committed is a separate fact from where the push went; one unknown does not unsettle the other.
+        return [], pushed
     for setting in ('committer.email', 'user.email'):
         email = email or _account_git_config(setting, cwd, env, state, overrides)
-    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), (
-        (repo, remote) if repo else None)
+    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), pushed
 
 
 def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:

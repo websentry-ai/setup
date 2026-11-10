@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '2a026894c688ae2782aac1095253f80e1e029f2e716018bc51886f1838e88d78'
+BLOCK_SHA256 = 'feef6a37ba6e5680245a26541d278210597d9559fc944db76a3afe0d5b040674'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -446,6 +446,12 @@ class AccountResolutionTests(unittest.TestCase):
                                         'GIT_CONFIG_VALUE_0=b@acme.com git commit -m two', state)
             self.assertEqual(first['accounts'][0]['email'], 'a@acme.com', path)
             self.assertEqual(second['accounts'][0]['email'], 'b@acme.com', path)
+
+    def test_an_unknown_committer_still_records_where_the_push_went(self):
+        """Who committed and where the push went are two facts; one unknown does not unsettle the other."""
+        for path, resolved in self.each('GIT_COMMITTER_EMAIL=$(cat .email) git push origin main'):
+            self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
+            self.assertNotIn('accounts', resolved, path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
