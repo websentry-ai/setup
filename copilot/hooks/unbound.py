@@ -9361,6 +9361,8 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         remaining = _account_deadline(state) - time.monotonic()
         if remaining <= 0:
             return None
+        if argv[:1] == ['git'] and not isinstance(cwd, str):
+            return None
         program = _transfer_executable(argv[0])
         if program is None:
             return None
@@ -9423,9 +9425,12 @@ def _account_known(name: str, env: Dict) -> tuple:
     raw = (env or {}).get(name)
     if isinstance(raw, str) and _TRANSFER_SUBSTITUTED in raw:
         return None, False
-    if name not in (env or {}) and _account_beyond_reading(env):
+    if name in (env or {}):
+        # Present and empty means the command's shell unset it, which is not the same as never having had it.
+        return _account_value(raw), True
+    if _account_beyond_reading(env):
         return None, False
-    return _account_value(raw) or _account_value(os.environ.get(name)), True
+    return _account_value(os.environ.get(name)), True
 
 
 def _account_setting(name: str, env: Dict) -> Optional[str]:
