@@ -1522,7 +1522,10 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     except ValueError:
         debug_print(f"HTTP request failed: curl exit {result.returncode}")
         return transport_failure, b''
-    return code or transport_failure, out[:sep]
+    # An interim status such as 100 from a transfer that then died is the transport failure, not an answer.
+    if result.returncode != 0 and code < 200:
+        return transport_failure, b''
+    return code, out[:sep]
 
 
 def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[float], Optional[int]]:

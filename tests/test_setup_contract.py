@@ -257,6 +257,8 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
         module = load_module(relpath)
         assert self._curl(module, "PUT", 500, returncode=28, stdout=b"\n000")[0] == (-28, b"")
         assert self._curl(module, "PUT", 500, returncode=28, stdout=b"")[0] == (-28, b"")
+        # curl reports the interim 100 Continue when the upload stalls after it; that is still a stall.
+        assert self._curl(module, "PUT", 500, returncode=28, stdout=b"\n100")[0] == (-28, b"")
         assert self._curl(module, "PUT", 500, stdout=b"denied\n403")[0] == (403, b"denied")
 
     def test_a_timed_out_request_logs_neither_the_key_nor_the_upload_link(self, relpath, monkeypatch, capsys):
