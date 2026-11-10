@@ -685,6 +685,56 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertEqual(cursor, b1_mtime)
         self.assertIn("Some uploads failed", out)
 
+    def test_a_chunk_that_no_longer_fits_stops_the_batch_as_more_and_keeps_the_previous_cursor(self):
+        """WEB-6527: time is checked before every chunk, not once per batch, so a batch that outlives
+        the soft stop ends there instead of being killed mid-upload; it is not a failed upload."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("b1", 5, 6000), ("b2", 4, 6000), ("b3", 4, 6000), ("b4", 4, 6000)])
+        b1 = home / ".claude" / "projects" / "p" / "b1.jsonl"
+        mdm._backfill_write_progress(home, b1.stat().st_mtime, None, str(b1))
+        calls = []
+
+        def slow_chunk(api_key, backend_url, sessions, forced=False):
+            calls.append([s["session_id"] for s in sessions])
+            mdm._SCRIPT_START -= mdm.BACKFILL_SOFT_STOP_SECONDS
+            return True
+
+        with patch.object(mdm, "_SCRIPT_START", time.time()), \
+             patch.object(mdm, "_backfill_upload_chunk", side_effect=slow_chunk), \
+             patch.object(mdm, "BACKFILL_CHUNK_BYTES", 10000):
+            out = _drain_real_home(self, home, batch_bytes=30000, real_send=True)
+        self.assertEqual(calls, [["b2"]])
+        self.assertEqual(mdm._backfill_read_state(home)["cursor"], b1.stat().st_mtime)
+        self.assertIn("Queued 1 sessions in 1 batches. More history remains", out)
+        self.assertNotIn("Some uploads failed", out)
+
+    def test_a_put_gets_the_time_left_before_the_soft_stop_and_none_starts_without_it(self):
+        mdm = self.mdm
+        clock, requests = [0.0], []
+
+        def http(url, method, headers, body=None, timeout=30):
+            requests.append((method, timeout))
+            if method == "PUT":
+                clock[0] += 20
+            return 200, json.dumps({"upload_url": "https://s3/put", "object_key": "k"}).encode()
+
+        def upload_at(now):
+            clock[0] = now
+            del requests[:]
+            with patch.object(mdm, "_backfill_http_request", side_effect=http), \
+                 patch.object(mdm, "_SCRIPT_START", 0.0), \
+                 patch.object(mdm.time, "time", side_effect=lambda: clock[0]), \
+                 patch.object(mdm.time, "sleep") as sleep:
+                landed = mdm._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}])
+            return landed, requests[1:2], sleep.call_args
+
+        # 500s left: the PUT may take all of it but the 40s kept for from-s3, then rests as long as it took.
+        self.assertEqual(upload_at(100.0), (True, [("PUT", 460)], unittest.mock.call(20)))
+        # 95s left once the PUT lands: the rest is cut to what still leaves the next chunk its 45s floor.
+        self.assertEqual(upload_at(485.0), (True, [("PUT", 75)], unittest.mock.call(10)))
+        # Under the floor no link is asked for and nothing is sent.
+        self.assertEqual(upload_at(520.0), (False, [], None))
+
     def test_uploads_do_not_wait_for_100_continue(self):
         """curl's Expect: 100-continue wait on a stalled server surfaced as "HTTP 100"."""
         mdm = self.mdm

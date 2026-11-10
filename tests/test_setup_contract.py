@@ -190,6 +190,83 @@ class TestEveryForceRequestReader:
                           code=500) == (None, None)
 
 
+def _link_then_put(put_codes):
+    """A fake _backfill_http_request: every upload-url call hands out a new link, PUTs answer put_codes in turn."""
+    calls, codes = [], iter(put_codes)
+
+    def http(url, method, headers, body=None, timeout=30):
+        calls.append((method, url, body))
+        if url.endswith("/upload-url/"):
+            link = sum(1 for c in calls if c[1].endswith("/upload-url/"))
+            return 200, json.dumps({"upload_url": "https://s3/put-%d" % link, "object_key": "key-%d" % link}).encode()
+        return (next(codes) if method == "PUT" else 200), b"{}"
+    return calls, http
+
+
+@pytest.mark.parametrize("relpath", BACKFILLERS)
+class TestEveryBackfillUploadSurvivesASlowUplink:
+    """WEB-6527: a chunk that needed over 30s was timed out four times by curl and dropped without a word. Each
+    installer carries its own copy of the upload, so each is held to the same behaviour."""
+
+    @staticmethod
+    def _curl(module, method, timeout, returncode=0, stdout=b"\n200"):
+        from unittest.mock import patch
+        with patch.object(module.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], returncode, stdout, b"")
+            result = module._backfill_http_request("https://host/x", method, {}, body=b"{}", timeout=timeout)
+        return result, run.call_args[0][0], run.call_args[1]["timeout"]
+
+    @staticmethod
+    def _upload(module, monkeypatch, put_codes):
+        calls, http = _link_then_put(put_codes)
+        monkeypatch.setattr(module, "_backfill_http_request", http)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+        # Only the managed claude-code installer has a run clock; a long test session must not read as a spent one.
+        monkeypatch.setattr(module, "_SCRIPT_START", module.time.time(), raising=False)
+        landed = module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}])
+        puts = [url for method, url, _ in calls if method == "PUT"]
+        confirmed = [json.loads(body)["object_key"] for _, url, body in calls if url.endswith("/from-s3/")]
+        return landed, puts, confirmed
+
+    def test_a_put_is_cut_when_it_stalls_and_is_never_re_sent_by_curl(self, relpath):
+        module = load_module(relpath)
+        _, argv, process_timeout = self._curl(module, "PUT", timeout=500)
+        flags = dict(zip(argv, argv[1:]))
+        assert flags["--max-time"] == "500" and flags["--retry"] == "0"
+        assert flags["--speed-time"] == str(module.BACKFILL_PUT_STALL_SECONDS) == "60"
+        assert flags["--speed-limit"] == str(module.BACKFILL_PUT_STALL_BYTES_PER_SECOND)
+        assert process_timeout == 520
+
+    def test_every_other_request_keeps_its_flags(self, relpath):
+        module = load_module(relpath)
+        result, argv, process_timeout = self._curl(module, "POST", timeout=30)
+        assert argv[:13] == ["curl", "-sS", "-X", "POST", "-w", "\n%{http_code}", "--max-time", "30",
+                             "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+        assert "--speed-time" not in argv
+        assert (result, process_timeout) == ((200, b""), 140)
+
+    def test_a_curl_failure_reads_as_a_negative_code_and_an_http_error_as_itself(self, relpath):
+        module = load_module(relpath)
+        assert self._curl(module, "PUT", 500, returncode=28, stdout=b"\n000")[0] == (-28, b"")
+        assert self._curl(module, "PUT", 500, returncode=28, stdout=b"")[0] == (-28, b"")
+        assert self._curl(module, "PUT", 500, stdout=b"denied\n403")[0] == (403, b"denied")
+
+    def test_a_stalled_put_is_sent_again_on_a_fresh_link(self, relpath, monkeypatch):
+        landed, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 503, 200])
+        assert landed
+        assert puts == ["https://s3/put-1", "https://s3/put-2", "https://s3/put-3"]
+        assert confirmed == ["key-3"]
+
+    def test_a_refused_put_is_not_sent_again(self, relpath, monkeypatch):
+        landed, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [403, 200])
+        assert (landed, puts, confirmed) == (False, ["https://s3/put-1"], [])
+
+    def test_a_put_that_keeps_stalling_is_given_up_after_a_few_attempts(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        landed, puts, confirmed = self._upload(module, monkeypatch, [-28] * 10)
+        assert (landed, len(puts), confirmed) == (False, module.BACKFILL_PUT_ATTEMPTS, [])
+
+
 MDM_BACKFILLERS = [s for s in BACKFILLERS if "/mdm/" in s]
 
 

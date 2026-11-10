@@ -438,6 +438,7 @@ class UnlinkedProfileProgressTestCase(unittest.TestCase):
                 mock.patch.object(mdm, "BACKFILL_MAX_BATCHES_PER_HOME", 1), \
                 mock.patch.object(mdm.platform, "system", return_value=system), \
                 mock.patch("time.time", return_value=self.NOW), \
+                mock.patch.object(mdm, "_SCRIPT_START", self.NOW), \
                 redirect_stdout(io.StringIO()):
             mdm.run_backfill("key", "https://backend", [("alice", home)])
         state = (home / ".claude" / "hooks" / mdm.BACKFILL_STATE_FILE).read_text()
