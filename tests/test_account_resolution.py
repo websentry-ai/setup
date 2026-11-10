@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '692580bac1d819016e7c0125ac77305968d1dba4192ee8ffac13c873164ce844'
+BLOCK_SHA256 = '0aa093a93d2ff49b203707ddfee526204c03f8dfdf853223f3c290293593c23e'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -151,6 +151,13 @@ class AccountResolutionTests(unittest.TestCase):
     def test_a_push_carries_the_named_remotes_repository_and_not_origins(self):
         for path, resolved in self.each('git push personal main'):
             self.assertEqual(resolved['pushed_repo'], 'jdoe-dev/app', path)
+
+    def test_the_push_names_the_remote_it_reached_so_other_actions_are_not_stamped_with_it(self):
+        """A chained `git fetch upstream && git push personal` must not record the fetch against the push."""
+        for path, resolved in self.each('git push personal main'):
+            self.assertEqual(resolved['pushed_remote'], 'personal', path)
+        for path, resolved in self.each('git push'):
+            self.assertEqual(resolved['pushed_remote'], 'origin', path)
 
     def test_the_push_url_loses_the_trailing_slash_git_returns(self):
         for path, resolved in self.each('git push personal main'):

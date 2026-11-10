@@ -9306,7 +9306,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
         return [], None
     cwd, env, overrides = _account_git_context(args, cwd, env)
-    repo = None
+    repo, remote = None, None
     rewired = any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
         remote = _account_push_remote(after, cwd, env, state, overrides)
@@ -9319,7 +9319,8 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
     email = _account_setting('GIT_COMMITTER_EMAIL', env) \
         or _account_git_config('user.email', cwd, env, state, overrides)
-    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), repo
+    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), (
+        (repo, remote) if repo else None)
 
 
 def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
@@ -9574,18 +9575,21 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict,
             # that user's configuration and not the hook's, and one past a source or eval resolves nothing.
             if handler is None or unsure or other_user or _account_beyond_reading(env):
                 continue
-            accounts, repo = handler(args, env, call_cwd, state)
+            accounts, reached = handler(args, env, call_cwd, state)
             for account in accounts:
                 if account not in found and len(found) < _ACCOUNT_MAX:
                     found.append(account)
-            pushed = pushed or repo
+            pushed = pushed or reached
         if persistent:
             _account_exports(shell, state)
         resolved = {}
         if found:
             resolved['accounts'] = found
         if pushed:
-            resolved['pushed_repo'] = pushed
+            # The remote rides with it, so the backend applies it to that push and not to the call's other actions.
+            resolved['pushed_repo'], pushed_remote = pushed
+            if pushed_remote:
+                resolved['pushed_remote'] = pushed_remote
         return resolved or None
     except Exception:
         return None
