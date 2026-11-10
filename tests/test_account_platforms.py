@@ -212,6 +212,39 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(len(asked), 1, path)
             self.assertNotIn('--kubeconfig', asked[0], path)
 
+    def test_a_selector_we_cannot_read_never_resolves_the_default(self):
+        """A profile, subscription, context or image we cannot read says nothing about which account ran."""
+        for command in ('aws s3 ls --profile $(cat .p)',
+                        'az group list --subscription $(cat .s)',
+                        'kubectl --context $(cat .c) get pods',
+                        'kubectl --kubeconfig $(cat .k) get pods',
+                        'docker push $(cat .img)'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+
+    def test_a_relative_home_is_not_our_own_home(self):
+        """`HOME=./sandbox` points at a folder we do not own, so the ambient config must not answer for it."""
+        for path, resolved in self.each('HOME=./sandbox aws s3 ls --profile home'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_home_with_a_space_still_selects_its_own_config(self):
+        """A home is a path, so it may hold spaces."""
+        home = Path(tempfile.mkdtemp(), 'My Home')
+        aws = Path(home, '.aws')
+        aws.mkdir(parents=True)
+        Path(aws, 'config').write_text('[profile home]\nsso_account_id = 555555555555\n')
+        for path, resolved in self.each("HOME='%s' aws s3 ls --profile home" % home):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
+
+    def test_the_endpoint_a_call_names_is_the_cluster_it_reached(self):
+        """`kubectl --server` names the endpoint outright, and `--cluster` picks one this lookup cannot ask for."""
+        for path, resolved in self.each('kubectl --server https://eks.example.com get pods'):
+            self.assertEqual(resolved['accounts'],
+                             [{'platform': 'kubernetes', 'server': 'https://eks.example.com',
+                               'source': 'command'}], path)
+        for path, resolved in self.each('kubectl --cluster other get pods'):
+            self.assertIsNone(resolved, path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

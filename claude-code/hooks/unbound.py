@@ -9170,7 +9170,7 @@ def _account_beyond_reading(env: Dict) -> bool:
     return _TRANSFER_UNKNOWN_ENV in (env or {})
 
 
-def _account_known(name: str, env: Dict) -> tuple:
+def _account_known(name: str, env: Dict, reader=None) -> tuple:
     """(the variable's value, whether it is knowable at all).
 
     A substitution anywhere in it — `ghp_$(cat token)` as much as `$(cat token)` — means it is set to something
@@ -9179,15 +9179,16 @@ def _account_known(name: str, env: Dict) -> tuple:
     raw = (env or {}).get(name)
     if isinstance(raw, str) and _TRANSFER_SUBSTITUTED in raw:
         return None, False
+    read = reader or _account_value
     if name in (env or {}):
         # Present and empty means the command's shell unset it, which is not the same as never having had it.
-        return _account_value(raw), True
+        return read(raw), True
     if _TRANSFER_CLEAN_ENV in (env or {}):
         # `env -i` cleared the environment, so the child sees nothing this process holds.
         return None, True
     if _account_beyond_reading(env):
         return None, False
-    return _account_value(os.environ.get(name)), True
+    return read(os.environ.get(name)), True
 
 
 def _account_setting(name: str, env: Dict) -> Optional[str]:
@@ -9286,9 +9287,12 @@ def _account_output(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
 def _account_home(env: Dict) -> Optional[str]:
     """The folder a CLI reads its configuration from, which `$HOME` does change, unlike the one ssh reads."""
     for name in (('USERPROFILE', 'HOME') if os.name == 'nt' else ('HOME',)):
-        found = _account_setting(name, env)
-        if found and os.path.isabs(found):
-            return found
+        found, known = _account_known(name, env, _account_path)
+        if not known:
+            return None
+        if found:
+            # Relative to a folder we do not own, so where the call actually looked is unknown.
+            return found if os.path.isabs(found) else None
     try:
         return _transfer_home()
     except Exception:
@@ -9321,6 +9325,15 @@ def _account_flag_raw(args: List[str], names: tuple) -> Optional[str]:
                 return arg.split('=', 1)[1]
         i += 1
     return None
+
+
+def _account_option(args: List[str], names: tuple, reader=None) -> tuple:
+    """(what a call names with one of these options, whether it is readable); (None, True) when it names none."""
+    raw = _account_flag_raw(args, names)
+    if raw is None:
+        return None, True
+    value = (reader or _account_value)(raw)
+    return (value, True) if value else (None, False)
 
 
 def _account_flag(args: List[str], names: tuple) -> Optional[str]:
@@ -9607,7 +9620,9 @@ def _account_azure_fields(entry: Dict) -> Optional[Dict]:
 
 def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the Azure subscription a call acted as, no repository); no environment variable picks it, only --subscription."""
-    named = _account_name(_account_flag_raw(args, ('--subscription',)))
+    named, known = _account_option(args, ('--subscription',), _account_name)
+    if not known:
+        return [], None
     entry, settled = _account_azure_entry(named, env, state)
     source = 'file'
     if entry is None and not settled:
@@ -9629,8 +9644,20 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
-    context = _account_flag(args, ('--context',))
-    kubeconfig = _account_flag(args, ('--kubeconfig',)) or _account_setting('KUBECONFIG', env) or ''
+    context, known = _account_option(args, ('--context',))
+    chosen, named = _account_option(args, ('--kubeconfig',), _account_path)
+    cluster_named, cluster_known = _account_option(args, ('--cluster',))
+    if not known or not named or not cluster_known or cluster_named:
+        # A selector we cannot read, or one that picks a cluster this lookup cannot ask for, leaves the
+        # endpoint unknown rather than the current context's.
+        return [], None
+    server, server_known = _account_option(args, ('--server', '-s'))
+    if not server_known:
+        return [], None
+    if server:
+        # The endpoint the call names IS the cluster it reached; nothing has to be read to know that.
+        return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
+    kubeconfig = chosen or _account_setting('KUBECONFIG', env) or ''
     if os.pathsep in kubeconfig:
         # A list of files is not one path; kubectl reads the variable itself and merges them.
         kubeconfig = ''
@@ -9677,7 +9704,8 @@ def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict)
     if subcommand not in _ACCOUNT_DOCKER_REGISTRY:
         return [], None
     target, _ = _account_subcommand(after, _ACCOUNT_DOCKER_VALUE_OPTIONS)
-    if not target:
+    if not target or _account_value(target) is None:
+        # An image name we cannot read says nothing about the registry, least of all that it is the default one.
         return [], None
     registry = _account_docker_registry(target) if subcommand != 'login' else _account_value(target)
     if not registry:
