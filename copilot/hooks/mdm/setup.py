@@ -687,7 +687,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
             f.write(json.dumps(config, indent=2))
         return True
 
-    if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
+    if _run_as_user(username, _write) is None:
         debug_print(f"Could not write config for {username}")
         return False
     return True
