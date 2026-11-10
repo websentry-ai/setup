@@ -58,6 +58,9 @@ BACKFILL_PUT_ATTEMPTS = 3
 # A PUT is capped by the time left before the soft stop, less from-s3's turn; under the floor none starts.
 BACKFILL_FROM_S3_RESERVE_SECONDS = 40
 BACKFILL_PUT_MIN_SECONDS = 45
+# from-s3 is sized to end this long before the hard deadline, and never given less than the floor per attempt.
+BACKFILL_FROM_S3_SLACK_SECONDS = 10
+BACKFILL_FROM_S3_MIN_SECONDS = 5
 
 
 def normalize_url(value: str) -> str:
@@ -2685,8 +2688,15 @@ def _backfill_has_time_for_a_chunk() -> bool:
     return _backfill_put_budget_seconds() >= BACKFILL_PUT_MIN_SECONDS
 
 
+def _backfill_from_s3_timeout_seconds() -> int:
+    # Per attempt, so curl's four attempts and their waits end before the hard deadline.
+    seconds_left = BACKFILL_DEADLINE_SECONDS - (time.time() - _SCRIPT_START) - BACKFILL_FROM_S3_SLACK_SECONDS
+    return int(max(BACKFILL_FROM_S3_MIN_SECONDS, min(30, (seconds_left - 6) / 4)))
+
+
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False) -> bool:
+                           force: bool = False) -> Optional[bool]:
+    # None when the chunk ran out of time before its PUT could start: a stop, not a failed upload.
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if _backfill_uploader_stats is not None:
         payload['uploader_stats'] = _backfill_uploader_stats
@@ -2704,7 +2714,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     for _ in range(BACKFILL_PUT_ATTEMPTS):
         if not _backfill_has_time_for_a_chunk():
             debug_print("S3 PUT not started: too close to the soft stop")
-            return False
+            return None
         code, body = _backfill_http_request(
             f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
             method='POST',
@@ -2731,7 +2741,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         put_cap = _backfill_put_budget_seconds()
         if put_cap < BACKFILL_PUT_MIN_SECONDS:
             debug_print("S3 PUT not started: the link request used the time left")
-            return False
+            return None
         put_started = time.time()
         code, _ = _backfill_http_request(
             upload_url,
@@ -2755,7 +2765,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         method='POST',
         headers=auth_headers,
         body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
-        timeout=30,
+        timeout=_backfill_from_s3_timeout_seconds(),
     )
     if code < 200 or code >= 300:
         debug_print(f"from-s3 request failed: HTTP {code}")
@@ -2792,8 +2802,11 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
             return
         if not _backfill_has_time_for_a_chunk():
             raise _BackfillOutOfTime(len(sessions_sent_ids))
+        landed = _backfill_upload_chunk(api_key, backend_url, current_chunk, forced)
+        if landed is None:
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
+        if landed:
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))

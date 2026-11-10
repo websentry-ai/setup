@@ -710,19 +710,19 @@ class TestMdmBackfillBatches(unittest.TestCase):
 
     def test_a_put_gets_the_time_left_before_the_soft_stop_and_none_starts_without_it(self):
         mdm = self.mdm
-        clock, requests, link_seconds = [0.0], [], [0.0]
+        clock, requests, link_seconds, put_seconds = [0.0], [], [0.0], [20.0]
 
         def http(url, method, headers, body=None, timeout=30):
             requests.append((method, timeout))
             if method == "PUT":
-                clock[0] += 20
+                clock[0] += put_seconds[0]
             elif url.endswith("/upload-url/"):
                 clock[0] += link_seconds[0]
             return 200, json.dumps({"upload_url": "https://s3/put", "object_key": "k"}).encode()
 
-        def upload_at(now, link_took=0.0):
+        def upload_at(now, link_took=0.0, put_took=20.0):
             clock[0] = now
-            link_seconds[0] = link_took
+            link_seconds[0], put_seconds[0] = link_took, put_took
             del requests[:]
             with patch.object(mdm, "_backfill_http_request", side_effect=http), \
                  patch.object(mdm, "_SCRIPT_START", 0.0), \
@@ -735,12 +735,32 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertEqual(upload_at(100.0), (True, [("PUT", 460)], unittest.mock.call(20)))
         # 95s left once the PUT lands: the rest is cut to what still leaves the next chunk its 45s floor.
         self.assertEqual(upload_at(485.0), (True, [("PUT", 75)], unittest.mock.call(10)))
-        # Under the floor no link is asked for and nothing is sent.
-        self.assertEqual(upload_at(520.0), (False, [], None))
+        # Under the floor no link is asked for and nothing is sent: None, a stop rather than a failed upload.
+        self.assertEqual(upload_at(520.0), (None, [], None))
         # A link request that retried for 60s comes out of the PUT's time, not on top of it.
         self.assertEqual(upload_at(100.0, link_took=60.0), (True, [("PUT", 400)], unittest.mock.call(20)))
         # And when it leaves less than the floor, the link is dropped and nothing is sent.
-        self.assertEqual(upload_at(485.0, link_took=60.0), (False, [], None))
+        self.assertEqual(upload_at(485.0, link_took=60.0), (None, [], None))
+        # from-s3 gets 30s an attempt with time in hand, and less when its four attempts must end before the kill.
+        upload_at(100.0)
+        self.assertEqual(requests[2], ("POST", 30))
+        upload_at(485.0, put_took=74.0)
+        self.assertEqual(requests[2], ("POST", 21))
+
+    def test_a_chunk_whose_link_request_used_its_time_stops_the_batch_as_more_not_failed(self):
+        mdm = self.mdm
+        clock = [485.0]
+
+        def http(url, method, headers, body=None, timeout=30):
+            self.assertNotEqual(method, "PUT")
+            clock[0] += 60
+            return 200, json.dumps({"upload_url": "https://s3/put", "object_key": "k"}).encode()
+
+        run = mdm._BackfillRun("key", "https://backend", None, (None, None), 0.0)
+        with patch.object(mdm, "_backfill_http_request", side_effect=http), \
+             patch.object(mdm, "_SCRIPT_START", 0.0), \
+             patch.object(mdm.time, "time", side_effect=lambda: clock[0]):
+            self.assertEqual(run.upload([{"session_id": "s", "entries": [{"n": 1}]}], False), (0, 0, True))
 
     def test_uploads_do_not_wait_for_100_continue(self):
         """curl's Expect: 100-continue wait on a stalled server surfaced as "HTTP 100"."""
