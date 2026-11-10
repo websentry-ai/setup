@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.conftest import load_module
+from tests.test_transfer_destination import _entries
 
 HOOK_PATHS = [
     'claude-code/hooks/unbound.py',
@@ -23,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '03b7f46705222c1bba59475fbae38ee4684847336a6170170975faf9847f13af'
+BLOCK_SHA256 = 'd85c59689094587aa6f21038c8e18f8a66d40895dcdd92b8991ef1444808ee1e'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -50,7 +51,8 @@ if args[:2] == ['config', '--get']:
         sys.exit(0)
     sys.exit(1)
 if args[:3] == ['remote', 'get-url', '--push']:
-    url = answers.get('remote.' + args[3])
+    # Keyed by folder as well as remote, so a `-C` that is ignored answers for the wrong checkout.
+    url = answers.get('remote.' + args[3] + '@' + os.getcwd(), answers.get('remote.' + args[3]))
     if url is None:
         sys.exit(2)
     print(url)
@@ -114,10 +116,14 @@ class AccountResolutionTests(unittest.TestCase):
                                                    'GIT_COMMITTER_EMAIL', 'GIT_AUTHOR_EMAIL')]:
             del os.environ[key]
 
+    def _run_entries(self):
+        """Every command the hook ran, with the folder it ran in and the git environment it was given."""
+        with open(self.run_log) as log:
+            return [json.loads(line) for line in log if line.strip()]
+
     def runs(self):
         """Every command the hook actually ran, as argv lists."""
-        with open(self.run_log) as log:
-            return [json.loads(line)['argv'] for line in log if line.strip()]
+        return [entry['argv'] for entry in self._run_entries()]
 
     def resolve(self, hook, command, state=None, cwd=None):
         return hook._accounts(command, cwd or self.repo, state if state is not None else {})
@@ -223,6 +229,85 @@ class AccountResolutionTests(unittest.TestCase):
     def test_an_inline_assignment_decides_the_call_it_prefixes(self):
         for path, resolved in self.each('GIT_COMMITTER_EMAIL=ci@acme.com git commit -m wip'):
             self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
+
+    # -- git's own options decide which checkout and which configuration ------
+
+    def test_a_c_option_resolves_the_checkout_it_names(self):
+        """`git -C other push` reaches the other checkout's remote, not the one the call started in."""
+        other = os.path.realpath(tempfile.mkdtemp())
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.personal@' + other] = 'git@github.com:acme/other-app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git -C %s push personal main' % other):
+                self.assertEqual(resolved['pushed_repo'], 'acme/other-app', path)
+
+    def test_a_c_config_override_beats_the_configured_identity(self):
+        for path, resolved in self.each('git -c user.email=ci@acme.com commit -m wip'):
+            self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
+        # The override answers it outright, so git is never asked for user.email.
+        self.assertNotIn(['git', 'config', '--get', 'user.email'], self.runs())
+
+    def test_the_author_email_does_not_stand_in_for_the_committer(self):
+        """`GIT_AUTHOR_EMAIL` sets the author; git still commits as `user.email`."""
+        for path, resolved in self.each('GIT_AUTHOR_EMAIL=external@example.com git commit -m wip'):
+            self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_two_calls_with_different_config_files_resolve_separately(self):
+        """The memo keys on the environment, or the second call reuses the first one's identity."""
+        work = Path(self.home, 'work.gitconfig')
+        work.write_text('[user]\n    email = jdoe@acme.com\n')
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            first = self.resolve(hook, 'git commit -m one', state)
+            second = self.resolve(hook, 'GIT_CONFIG_GLOBAL=%s git commit -m two' % work, state)
+            self.assertEqual(first['accounts'][0]['email'], 'jdoe@gmail.com', path)
+            self.assertEqual(second['accounts'][0]['email'], 'jdoe@acme.com', path)
+
+    def test_an_export_of_a_remembered_variable_alone_is_still_read(self):
+        """The command names no program, so the pre-filter has to let it through anyway."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            self.resolve(hook, 'export GIT_COMMITTER_EMAIL=ci@acme.com', state)
+            resolved = self.resolve(hook, 'git commit -m wip', state)
+            self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
+
+    def test_a_host_qualified_repository_names_its_own_host(self):
+        """gh accepts `HOST/OWNER/REPO`, which named no host and fell through to dotcom."""
+        for path, resolved in self.each('gh pr view --repo github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+            self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
+
+    def test_a_token_the_walk_could_not_read_is_still_a_token(self):
+        """`GH_TOKEN=$(...)` signs the call in as whoever owns it, which cannot be read offline."""
+        for path, resolved in self.each('GH_TOKEN=$(cat ~/.work-token) gh pr create'):
+            self.assertIsNone(resolved, path)
+        self.assertEqual(self.runs(), [])
+
+    # -- through the turn log, where the folder is tracked across calls -------
+
+    def test_a_call_is_resolved_from_the_folder_it_started_in(self):
+        """A `cd` earlier in the same call must move the lookup once, not twice.
+
+        The hook tracks where the persistent shell is; resolving from the folder the call ENDED in
+        replayed the call's own `cd` a second time and reached `child/child`.
+        """
+        hook = load_module('claude-code/hooks/unbound.py')
+        child = os.path.join(self.repo, 'child')
+        os.makedirs(child, exist_ok=True)
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.personal@' + os.path.realpath(child)] = 'git@github.com:acme/child-app.git'
+        events = [
+            {'timestamp': '2026-10-22T16:39:58.000001Z',
+             'event': {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'session_id': 's1',
+                       'cwd': self.repo}},
+            {'timestamp': '2026-10-22T16:40:00.250000Z',
+             'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash',
+                       'tool_input': {'command': 'cd child && git push personal main'}, 'tool_response': {}}},
+        ]
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            entries = [e for e in _entries(hook.build_llm_exchange(events, cwd=self.repo))
+                       if 'tool_use_id' in e]
+        self.assertEqual([e.get('pushed_repo') for e in entries], ['acme/child-app'])
 
     # -- cost and safety -------------------------------------------------------
 
