@@ -3240,8 +3240,6 @@ def main():
         remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
                                  _unbound_base_url_matcher(username, home_dir))
 
-    remove_legacy_key_env()
-
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
@@ -3253,6 +3251,7 @@ def main():
         remove_gateway_artifacts_for_user(username, home_dir)
         remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+    remove_legacy_key_env()
 
     state = detect_install_state(skip_settings=skip_managed_settings)
 

@@ -1812,7 +1812,9 @@ def main():
     remove_gateway_artifacts()
 
 
-    write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None})
+    if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
+        print("\n❌ Could not write ~/.unbound/config.json")
+        return False
 
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):

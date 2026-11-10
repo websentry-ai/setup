@@ -2253,12 +2253,13 @@ def main():
             pass
     remove_gateway_artifacts(config_dir)
 
-    remove_legacy_key_env()
-
     _install_state = detect_install_state(config_dir)
     _device_id = get_device_identifier()
 
-    write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None})
+    if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
+        print("\n❌ Could not write ~/.unbound/config.json")
+        return False
+    remove_legacy_key_env()
 
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url, config_dir=config_dir):

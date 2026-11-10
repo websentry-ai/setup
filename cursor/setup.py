@@ -804,7 +804,8 @@ def main():
     _device_id = get_device_identifier()
 
     if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
-        print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
+        print("\n❌ Could not write ~/.unbound/config.json")
+        return False
 
     remove_legacy_key_env()
 

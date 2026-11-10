@@ -1343,8 +1343,6 @@ def main():
         return False
     print("✅ API key received")
 
-    remove_legacy_key_env()
-
     url_ok, _, url_message = set_env_var("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print(f"❌ Failed to set UNBOUND_BACKEND_URL: {url_message}")
@@ -1362,6 +1360,7 @@ def main():
             print(f"⚠️  Skipping hook removal for {username}: config write failed")
     if config_count > 0:
         print(f"✅ Config written for {config_count} user(s)")
+    remove_legacy_key_env()
 
     state = detect_install_state()
 

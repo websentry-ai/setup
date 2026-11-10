@@ -240,3 +240,8 @@ def test_gateway_mdm_decides_windows_machine_token_once(home, tmp_path, monkeypa
     monkeypatch.setattr(gw_mdm.sys, "argv", ["setup.py", "--api-key", "admin"])
     assert not gw_mdm.main()
     assert ("UNBOUND_DEVICE_TOKEN" in removed) is (not bob_hooked)
+
+
+def test_user_setups_fail_when_the_config_write_fails():
+    unchecked = [f.name for f in SETUPS.values() if re.search(r"^\s+write_unbound_config\(", f.read_text(), re.M)]
+    assert unchecked == []

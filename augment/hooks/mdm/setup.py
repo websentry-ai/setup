@@ -1564,7 +1564,6 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
-    remove_legacy_key_env()
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
@@ -1577,6 +1576,7 @@ def main():
     user_homes = get_all_user_homes()
     for username, home_dir in user_homes:
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+    remove_legacy_key_env()
 
     state = detect_install_state()
 

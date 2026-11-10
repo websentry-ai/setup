@@ -1023,14 +1023,13 @@ def _setup_claude_code(opts):
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         m.remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
-    m.remove_legacy_key_env()
-
     for username, home_dir in m.get_all_user_homes():
         m.remove_gateway_artifacts_for_user(username, home_dir)
         m.remove_user_level_hooks_for_user(username, home_dir)
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+    m.remove_legacy_key_env()
 
     skip_settings = opts["skip_managed_settings"]
     # None (unknown) without looking: in skip mode managed-settings.json is the
@@ -1077,8 +1076,6 @@ def _setup_augment(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    m.remove_legacy_key_env()
-
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
     # augment main()'s ordering).
@@ -1087,6 +1084,7 @@ def _setup_augment(opts):
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+    m.remove_legacy_key_env()
 
     state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
     if not _write_augment_managed_settings(m):
@@ -1324,13 +1322,12 @@ def _setup_cursor(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    m.remove_legacy_key_env()
-
     for username, home_dir in m.get_all_user_homes():
         if m.write_unbound_config_for_user(
                 username, home_dir, api_key,
                 urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
             m.remove_user_level_hooks(username, home_dir)
+    m.remove_legacy_key_env()
 
     state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"],
                           relative_ok=True)
@@ -1408,8 +1405,6 @@ def _setup_copilot(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
-    m.remove_legacy_key_env()
-
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
     installed = 0
@@ -1434,6 +1429,7 @@ def _setup_copilot(opts):
                 or (_as_user(m, username, _writable_dir, registration.parent) is False
                     and _as_user(m, username, _copilot_current, registration) is False)):
             state = "tampered"
+    m.remove_legacy_key_env()
 
     # Machine-wide, so once for the device rather than once per user. Called
     # explicitly: this command drives the vendored module's named functions rather

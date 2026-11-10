@@ -2692,7 +2692,6 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
-    remove_legacy_key_env()
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
@@ -2720,6 +2719,7 @@ def main():
             clear_otel_export_for_user(username, home_dir)
         if install_hooks_for_user(username, home_dir, script_text):
             installed_count += 1
+    remove_legacy_key_env()
 
     # Machine-wide, so once for the device rather than once per user. Never fatal:
     # the hooks are the enforcement plane and must not be rolled back because a
