@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '0aa093a93d2ff49b203707ddfee526204c03f8dfdf853223f3c290293593c23e'
+BLOCK_SHA256 = 'fa72d4839898f74a1e495796f48c9622064878f0ce60a1e257326ce2736fe00c'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -216,6 +216,38 @@ class AccountResolutionTests(unittest.TestCase):
             with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps({**answers, setting: 'chosen'})}):
                 for path, resolved in self.each('git push'):
                     self.assertEqual(resolved['pushed_repo'], 'acme/chosen', '%s via %s' % (path, setting))
+
+    def test_an_optional_value_flag_does_not_swallow_the_remote(self):
+        """`--force-with-lease` takes an optional value, so bare the next word is the remote."""
+        for flag in ('--force-with-lease', '--signed'):
+            for path, resolved in self.each('git push %s personal main' % flag):
+                self.assertEqual(resolved['pushed_repo'], 'jdoe-dev/app', '%s via %s' % (path, flag))
+        # Its `=` form is one token, so the remote still follows.
+        for path, resolved in self.each('git push --force-with-lease=main personal main'):
+            self.assertEqual(resolved['pushed_repo'], 'jdoe-dev/app', path)
+
+    def test_a_config_env_override_is_honoured(self):
+        """`--config-env=user.email=VAR` names a configuration value held in a variable."""
+        for path, resolved in self.each('VAR=ci@acme.com git --config-env=user.email=VAR commit -m wip'):
+            self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
+
+    def test_a_standalone_source_marks_the_rest_of_the_turn_unknown(self):
+        """It names no program and no variable, so the trigger has to see the builtin itself."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            self.resolve(hook, 'source ./.env', state, persistent=True)
+            self.assertIsNone(self.resolve(hook, 'gh pr list', state, persistent=True), path)
+            self.assertIsNone(self.resolve(hook, 'git commit -m wip', state, persistent=True), path)
+
+    def test_two_calls_with_different_gh_config_dirs_resolve_separately(self):
+        other = Path(self.home, 'other-gh')
+        (other / 'gh').mkdir(parents=True)
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            self.resolve(hook, 'gh pr list', state, persistent=True)
+            self.resolve(hook, 'GH_CONFIG_DIR=%s gh pr list' % other, state, persistent=True)
+        asked = [call for call in self.runs() if call[:3] == ['gh', 'config', 'get']]
+        self.assertEqual(len(asked), 2 * len(HOOKS), asked)
 
     def test_a_push_naming_no_remote_and_no_setting_uses_origin(self):
         for path, resolved in self.each('git push'):
