@@ -710,16 +710,19 @@ class TestMdmBackfillBatches(unittest.TestCase):
 
     def test_a_put_gets_the_time_left_before_the_soft_stop_and_none_starts_without_it(self):
         mdm = self.mdm
-        clock, requests = [0.0], []
+        clock, requests, link_seconds = [0.0], [], [0.0]
 
         def http(url, method, headers, body=None, timeout=30):
             requests.append((method, timeout))
             if method == "PUT":
                 clock[0] += 20
+            elif url.endswith("/upload-url/"):
+                clock[0] += link_seconds[0]
             return 200, json.dumps({"upload_url": "https://s3/put", "object_key": "k"}).encode()
 
-        def upload_at(now):
+        def upload_at(now, link_took=0.0):
             clock[0] = now
+            link_seconds[0] = link_took
             del requests[:]
             with patch.object(mdm, "_backfill_http_request", side_effect=http), \
                  patch.object(mdm, "_SCRIPT_START", 0.0), \
@@ -734,6 +737,10 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertEqual(upload_at(485.0), (True, [("PUT", 75)], unittest.mock.call(10)))
         # Under the floor no link is asked for and nothing is sent.
         self.assertEqual(upload_at(520.0), (False, [], None))
+        # A link request that retried for 60s comes out of the PUT's time, not on top of it.
+        self.assertEqual(upload_at(100.0, link_took=60.0), (True, [("PUT", 400)], unittest.mock.call(20)))
+        # And when it leaves less than the floor, the link is dropped and nothing is sent.
+        self.assertEqual(upload_at(485.0, link_took=60.0), (False, [], None))
 
     def test_uploads_do_not_wait_for_100_continue(self):
         """curl's Expect: 100-continue wait on a stalled server surfaced as "HTTP 100"."""

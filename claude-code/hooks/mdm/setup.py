@@ -2702,8 +2702,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     })
 
     for _ in range(BACKFILL_PUT_ATTEMPTS):
-        put_cap = _backfill_put_budget_seconds()
-        if put_cap < BACKFILL_PUT_MIN_SECONDS:
+        if not _backfill_has_time_for_a_chunk():
             debug_print("S3 PUT not started: too close to the soft stop")
             return False
         code, body = _backfill_http_request(
@@ -2728,6 +2727,11 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
             debug_print("upload-url response missing fields")
             return False
 
+        # Measured after the link request, whose own retries can use up to two minutes.
+        put_cap = _backfill_put_budget_seconds()
+        if put_cap < BACKFILL_PUT_MIN_SECONDS:
+            debug_print("S3 PUT not started: the link request used the time left")
+            return False
         put_started = time.time()
         code, _ = _backfill_http_request(
             upload_url,
