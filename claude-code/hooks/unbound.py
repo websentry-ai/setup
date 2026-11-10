@@ -9009,7 +9009,10 @@ _ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--pu
 
 
 def _account_deadline(state: Dict) -> float:
-    """When this turn's account lookups must stop; a caller may seed a shorter budget in state."""
+    """When this turn's account lookups must stop, shared with the transfer walk so the hook has one limit."""
+    shared = state.get('deadline')
+    if isinstance(shared, (int, float)):
+        return shared
     return state.setdefault('account_deadline',
                             time.monotonic() + state.get('budget', _ACCOUNT_TURN_BUDGET))
 
@@ -9154,6 +9157,10 @@ def _account_option(args: List[str], names: tuple, reader=None) -> tuple:
             if arg.startswith(name + '='):
                 raw = arg.split('=', 1)[1]
                 break
+            if len(name) == 2 and name[0] == '-' and name[1] != '-' and arg.startswith(name) and len(arg) > 2:
+                # A one-letter option takes its value attached as well: `-Racme/app`.
+                raw = arg[2:]
+                break
         i += 1
     if raw is None:
         return None, True
@@ -9259,9 +9266,16 @@ def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: D
     return _account_once(state, key, resolve)
 
 
+def _account_includes(overrides: Optional[Dict]) -> bool:
+    """Whether the call adds configuration files of its own, which this lookup cannot load the way git does."""
+    return any(key.startswith(('include.', 'includeif.')) for key in (overrides or {}))
+
+
 def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
                         overrides: Optional[Dict] = None) -> Optional[str]:
     """(one git configuration value, whether it is readable); a `-c` override wins, else git's own precedence."""
+    if _account_includes(overrides):
+        return None, False
     if name.lower() in (overrides or {}):
         # Overridden to something we cannot read: the file's value no longer applies, so git's is unknown.
         override = (overrides or {}).get(name.lower())
@@ -9312,7 +9326,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         return [], None
     cwd, env, overrides = _account_git_context(args, cwd, env)
     repo, remote = None, None
-    rewired = any(key.startswith(('url.', 'remote.')) for key in overrides)
+    rewired = _account_includes(overrides) or any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
         remote, reachable = _account_push_remote(after, cwd, env, state, overrides)
         # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
@@ -9350,13 +9364,17 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     repo, known = _account_option(args, ('-R', '--repo'))
     if repo or not known:
         return repo, known
+    for arg in args:
+        # A positional URL names the repository, and its host, as plainly as the option does.
+        if '://' in arg and _account_host_of(arg):
+            return _account_value(arg), True
     return _account_known('GH_REPO', env)
 
 
 def _account_gh_host(args: List[str], env: Dict) -> tuple:
     """(the host a gh call talks to, whether what it names can be read); gh's order is `--hostname`, then the
     repository it names."""
-    host, known = _account_option(args, ('--hostname', '-h'))
+    host, known = _account_option(args, ('--hostname',))
     if host or not known:
         return host, known
     repo, known = _account_gh_repo(args, env)
@@ -9426,7 +9444,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
-        found, pushed = [], None
+        found, pushes = [], []
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             handler = _ACCOUNT_HANDLERS.get(program)
             # A call that only may have run tells us nothing about who ran it, one run as another user resolves
@@ -9437,15 +9455,19 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             for account in accounts:
                 if account not in found and len(found) < _ACCOUNT_MAX:
                     found.append(account)
-            pushed = pushed or reached
+            if reached and reached not in pushes:
+                pushes.append(reached)
         resolved = {}
         if found:
             resolved['accounts'] = found
-        if pushed:
-            # The remote rides with it, so the backend applies it to that push and not to the call's other actions.
-            resolved['pushed_repo'], pushed_remote = pushed
+        if pushes:
+            # The remote rides with each one, so the backend applies it to that push and not to the call's other
+            # actions. The first is named on its own, and a command that pushed more than once lists them all.
+            resolved['pushed_repo'], pushed_remote = pushes[0]
             if pushed_remote:
                 resolved['pushed_remote'] = pushed_remote
+            if len(pushes) > 1:
+                resolved['pushed'] = [{'repo': repo, 'remote': remote} for repo, remote in pushes]
         return resolved or None
     except Exception:
         return None

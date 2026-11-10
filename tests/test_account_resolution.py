@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '97ff772f5e7b95c36d2e17403bd47e3ddca43362310e8946b0ae179c24c115cd'
+BLOCK_SHA256 = '941e29197ee91b078115635b47d8f87edf8eebc228fc5ec12b6ce45f86335cfe'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -507,6 +507,39 @@ class AccountResolutionTests(unittest.TestCase):
         for path, resolved in self.each('GH_REPO=github.acme.com/acme/app gh pr list'):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
             self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
+
+    def test_every_push_in_one_command_is_a_destination(self):
+        """A mirror pushes twice; keeping only the first drops the repository the second one reached.
+
+        Sequenced with `;`, so the second push surely runs and is not skipped for being uncertain.
+        """
+        for path, resolved in self.each('git push origin main; git push personal main'):
+            self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
+            self.assertEqual(resolved['pushed'], [{'repo': 'acme/app', 'remote': 'origin'},
+                                                  {'repo': 'jdoe-dev/app', 'remote': 'personal'}], path)
+
+    def test_a_repository_named_as_a_positional_url_decides_the_host(self):
+        """`gh pr view https://github.acme.com/...` names the enterprise host as plainly as `--repo` does."""
+        for path, resolved in self.each('gh pr view https://github.acme.com/acme/app/pull/1'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+
+    def test_a_repository_attached_to_its_option_is_still_a_repository(self):
+        """gh accepts `-Rowner/repo` with no space, so it names a repository and the checkout is not consulted."""
+        for path, resolved in self.each('gh pr view -Rgithub.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+        self.assertNotIn(['git', 'config', '--get', 'remote.origin.url'], self.runs())
+
+    def test_a_call_that_adds_its_own_config_files_resolves_nothing(self):
+        """git loads what an include names; this lookup cannot, so the committer it would use is unknown."""
+        for path, resolved in self.each('git -c include.path=/tmp/extra.gitconfig commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_the_lookups_share_the_turn_budget_rather_than_starting_a_second(self):
+        """A hook killed at ten seconds cannot afford two independent budgets."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {'deadline': 1.0}
+            self.assertEqual(hook._account_deadline(state), 1.0, path)
+            self.assertNotIn('account_deadline', state, path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
