@@ -245,6 +245,39 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('kubectl --cluster other get pods'):
             self.assertIsNone(resolved, path)
 
+    def test_an_option_in_the_command_being_run_is_not_this_call_s(self):
+        """`kubectl exec … -- curl -s host` names curl's option, not a cluster endpoint."""
+        for path, resolved in self.each('kubectl exec deploy/api -- curl -s localhost:8080/health'):
+            self.assertNotEqual((resolved or {}).get('accounts', [{}])[0].get('server'),
+                                'localhost:8080/health', path)
+
+    def test_a_config_file_path_with_a_space_is_read_not_ignored(self):
+        """A path is not an identity, so the home profile must not answer in its place."""
+        folder = Path(tempfile.mkdtemp(), 'My Config')
+        folder.mkdir()
+        Path(folder, 'config').write_text('[profile home]\nsso_account_id = 222222222222\n')
+        for path, resolved in self.each("AWS_CONFIG_FILE='%s' aws s3 ls --profile home" % Path(folder, 'config')):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '222222222222', path)
+
+    def test_a_relative_config_file_is_not_read_against_our_own_folder(self):
+        for path, resolved in self.each('AWS_CONFIG_FILE=config aws s3 ls --profile home'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_home_set_to_nothing_is_not_the_password_database_home(self):
+        """`HOME=` was set to nothing on purpose; answering from the passwd home defeats that."""
+        for path, resolved in self.each('HOME= aws s3 ls --profile home'):
+            self.assertIsNone(resolved, path)
+
+    def test_the_default_profile_variable_wins_as_botocore_reads_it(self):
+        """botocore reads AWS_DEFAULT_PROFILE before AWS_PROFILE, so that is the account the CLI used."""
+        for path, resolved in self.each('AWS_DEFAULT_PROFILE=home AWS_PROFILE=other aws s3 ls'):
+            self.assertEqual(resolved['accounts'][0]['profile'], 'home', path)
+
+    def test_a_kubeconfig_named_on_the_command_still_resolves_the_cluster(self):
+        """A kubeconfig names no code to run, so naming one does not stop the lookup."""
+        for path, resolved in self.each('KUBECONFIG=/tmp/one.kc kubectl get pods'):
+            self.assertEqual(resolved['accounts'][0]['platform'], 'kubernetes', path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

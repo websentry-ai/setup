@@ -7601,8 +7601,9 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
 # that chooses where that configuration lives would make us run its code, so the CLI is not run at all; the
 # configuration file is still read and parsed here, which executes nothing.
 _ACCOUNT_CONFIG_EXECUTORS = frozenset({'aws', 'az', 'kubectl', 'docker'})
+# KUBECONFIG is not here: `kubectl config view` prints the file and never runs its `exec` credential plugin.
 _ACCOUNT_CONFIG_LOCATIONS = frozenset({'HOME', 'USERPROFILE', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE',
-                                       'AZURE_CONFIG_DIR', 'KUBECONFIG', 'DOCKER_CONFIG'})
+                                       'AZURE_CONFIG_DIR', 'DOCKER_CONFIG'})
 # The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
@@ -7708,6 +7709,9 @@ def _account_option(args: List[str], names: tuple, reader=None) -> tuple:
     i = 0
     while i < len(args) and raw is None:
         arg = args[i]
+        if arg == '--':
+            # Everything after this belongs to the command being run, not to the one naming the option.
+            break
         if arg in names and i + 1 < len(args):
             raw = args[i + 1]
             break
@@ -7819,6 +7823,9 @@ def _account_home(env: Dict) -> Optional[str]:
     for name in (('USERPROFILE', 'HOME') if os.name == 'nt' else ('HOME',)):
         found, known = _account_known(name, env, _account_path)
         if not known:
+            return None
+        if name in (env or {}) and not found:
+            # Set to nothing on purpose, which is not the same as the home the password database names.
             return None
         if found:
             # Relative to a folder we do not own, so where the call actually looked is unknown.
@@ -8037,12 +8044,13 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 
 
 def _account_aws_profile(args: List[str], env: Dict) -> Optional[str]:
-    """The profile an aws call uses, in the CLI's own order: --profile, then AWS_PROFILE, else default."""
+    """The profile an aws call uses, in botocore's own order: --profile, AWS_DEFAULT_PROFILE, AWS_PROFILE,
+    else default."""
     raw = _account_flag_raw(args, ('--profile',))
     if raw is not None:
         # None when the value cannot be read, which leaves the account unknown rather than the default one.
         return _account_value(raw)
-    for name in ('AWS_ACCESS_KEY_ID', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE'):
+    for name in ('AWS_ACCESS_KEY_ID', 'AWS_DEFAULT_PROFILE', 'AWS_PROFILE'):
         value, known = _account_known(name, env)
         if not known:
             return None
@@ -8057,8 +8065,9 @@ def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
     contain settles as unknown, because falling back to the default would name the wrong account with confidence."""
     def resolve():
         import configparser
-        named, known = _account_known('AWS_CONFIG_FILE', env)
-        if not known:
+        named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
+        if not known or (named and not os.path.isabs(named)):
+            # Relative to a folder we do not own, so which file the call read is unknown.
             return None, False
         home = _account_home(env)
         path = named or (os.path.join(home, '.aws', 'config') if home else None)
@@ -8107,7 +8116,7 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
 
 def _account_azure_dir(env: Dict) -> Optional[str]:
     """The folder the Azure CLI reads its profile from, which `AZURE_CONFIG_DIR` moves off the home folder."""
-    found, known = _account_known('AZURE_CONFIG_DIR', env)
+    found, known = _account_known('AZURE_CONFIG_DIR', env, _account_path)
     if not known:
         return None
     if found:
