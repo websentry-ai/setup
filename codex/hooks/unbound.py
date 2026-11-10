@@ -7560,6 +7560,294 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
+# KEEP IN SYNC: account resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
+# --- Account resolution: which account each platform command acted as, identity fields only, fail-open ---
+
+# Only these commands are ever run; everything else is refused. All are local, and none of them prints a credential.
+_ACCOUNT_ALLOWED_RUNS = (
+    ('git', 'config', '--get'),
+    ('git', 'remote', 'get-url', '--push'),
+    ('git', 'symbolic-ref', '--short', 'HEAD'),
+    ('gh', 'config', 'get'),
+)
+_ACCOUNT_RUN_TIMEOUT = 5
+# Wall-clock budget for every account lookup in one turn, so a slow one never delays the agent.
+_ACCOUNT_TURN_BUDGET = 10.0
+# Accounts kept for one call; two is the real maximum today (a login and a committer identity).
+_ACCOUNT_MAX = 4
+_ACCOUNT_MAX_VALUE = 255
+# Variables an `export` earlier in the turn still decides. The hook is a fresh process per event and never inherits
+# them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
+_ACCOUNT_REMEMBERED = frozenset({
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
+    'GIT_COMMITTER_EMAIL', 'GH_HOST', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+})
+# Fixed for every run: git must not page, prompt or take a lock on our account.
+_ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
+                    'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'CLICOLOR': '0', 'NO_COLOR': '1'}
+# A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
+_ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
+# git subcommands that reach a remote, and those that write a commit the committer identity goes into.
+_ACCOUNT_GIT_REMOTE = frozenset({'push', 'fetch', 'pull', 'clone', 'ls-remote', 'archive'})
+_ACCOUNT_GIT_COMMITS = frozenset({'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'commit-tree'})
+# git's own options before the subcommand that take a value, so the subcommand is found at the right word.
+_ACCOUNT_GIT_VALUE_OPTIONS = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path',
+                                        '--config-env', '--super-prefix'})
+# `git push` options that take a value, so the remote is not read out of one.
+_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--repo', '--receive-pack', '--exec', '-o', '--push-option',
+                                         '--signed', '--force-with-lease', '--recurse-submodules'})
+
+
+def _account_deadline(state: Dict) -> float:
+    """When this turn's account lookups must stop; a caller may seed a shorter budget in state."""
+    return state.setdefault('account_deadline',
+                            time.monotonic() + state.get('budget', _ACCOUNT_TURN_BUDGET))
+
+
+def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing."""
+    try:
+        if not any(tuple(argv[:len(p)]) == p for p in _ACCOUNT_ALLOWED_RUNS):
+            return None
+        remaining = _account_deadline(state) - time.monotonic()
+        if remaining <= 0:
+            return None
+        program = _transfer_executable(argv[0])
+        if program is None:
+            return None
+        # Only the remembered names are carried from the command text, so nothing else it set can steer the run.
+        passed = {name: value for name, value in (env or {}).items()
+                  if name in _ACCOUNT_REMEMBERED and _account_value(value)}
+        result = subprocess.run([program] + argv[1:], cwd=cwd if isinstance(cwd, str) else None,
+                                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                env={**os.environ, **passed, **_ACCOUNT_RUN_ENV},
+                                timeout=min(_ACCOUNT_RUN_TIMEOUT, remaining))
+        return result.stdout if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _account_once(state: Dict, key: tuple, resolve) -> Any:
+    """One lookup per distinct question in a turn, so twenty calls to the same host resolve it once."""
+    memo = state.setdefault('account_memo', {})
+    if key not in memo:
+        memo[key] = resolve()
+    return memo[key]
+
+
+def _account_value(value: Any) -> Optional[str]:
+    """One identity value, bounded and refused when it is not a single word; None when it names nothing."""
+    if not isinstance(value, str):
+        return None
+    word = value.strip()[:_ACCOUNT_MAX_VALUE]
+    if not word or any(ch.isspace() or ord(ch) < 32 for ch in word):
+        return None
+    return word
+
+
+def _account_setting(name: str, env: Dict) -> Optional[str]:
+    """What a variable is worth for this call: what the command's shell has, else the hook's own environment."""
+    value = (env or {}).get(name)
+    if value == _TRANSFER_SUBSTITUTED:
+        return None
+    return _account_value(value) or _account_value(os.environ.get(name))
+
+
+def _account_exports(shell: Dict, state: Dict) -> None:
+    """Remember what this call exported, so a later call in the same turn resolves against it as the shell would."""
+    try:
+        carried = {}
+        for name, value in _transfer_exported(shell).items():
+            if name in _ACCOUNT_REMEMBERED and value != _TRANSFER_SUBSTITUTED and _account_value(value):
+                carried[name] = value.strip()
+        state['account_env'] = carried
+    except Exception:
+        pass
+
+
+def _account_host_of(url: str) -> Optional[str]:
+    """The host a git remote URL names, for an https, ssh or scp-style address; None when it names none."""
+    text = url.strip().rstrip('/')
+    if not text:
+        return None
+    if '://' in text:
+        host = _transfer_url_host(text, frozenset({'https', 'http', 'ssh', 'git', 'ftp', 'ftps'}))
+        return _account_value((host or '').split('@')[-1].split(':')[0])
+    if ':' in text and not text.startswith('/'):
+        # scp-style `[user@]host:path`, which has no scheme and whose colon separates the path.
+        return _account_value(text.split(':', 1)[0].split('@')[-1])
+    return None
+
+
+def _account_repo_of(url: str) -> Optional[str]:
+    """The `owner/repo` a git remote URL points at, with any `.git` suffix and login dropped; None when unreadable."""
+    text = url.strip().rstrip('/')
+    if '://' in text:
+        path = _transfer_url_split(text).path
+    elif ':' in text and not text.startswith('/'):
+        path = text.split(':', 1)[1]
+    else:
+        return None
+    parts = [part for part in path.split('/') if part]
+    if len(parts) < 2:
+        return None
+    owner, name = parts[-2], parts[-1]
+    if name.endswith('.git'):
+        name = name[:-4]
+    return _account_value('%s/%s' % (owner, name))
+
+
+def _account_git_subcommand(args: List[str]) -> tuple:
+    """(the git subcommand, the arguments after it); ('', []) when the call names none."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _ACCOUNT_GIT_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith('-'):
+            i += 1
+            continue
+        return arg, args[i + 1:]
+    return '', []
+
+
+def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
+                        key: tuple) -> Optional[str]:
+    """The first line one allowlisted lookup printed, asked once per distinct question in a turn."""
+    def resolve():
+        output = _account_run(argv, cwd, env, state)
+        lines = (output or '').splitlines()
+        return _account_value(lines[0]) if lines else None
+
+    return _account_once(state, key, resolve)
+
+
+def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """One git configuration value, read by git itself so its own precedence decides; None when unset."""
+    return _account_first_line(['git', 'config', '--get', name], cwd, env, state, ('git-config', name, cwd))
+
+
+def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """The remote a push reaches, in git's own order: the command, pushRemote, pushDefault, the branch's remote."""
+    i = 0
+    while i < len(after):
+        arg = after[i]
+        if arg in _ACCOUNT_PUSH_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith('-'):
+            i += 1
+            continue
+        return _account_value(arg)
+    branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state, ('git-branch', cwd))
+    for name in (('branch.%s.pushRemote' % branch) if branch else None, 'remote.pushDefault',
+                 ('branch.%s.remote' % branch) if branch else None):
+        if name:
+            found = _account_git_config(name, cwd, env, state)
+            if found:
+                return found
+    return 'origin'
+
+
+def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the accounts a git call acted as, the repository a push reached); both empty for a purely local call."""
+    subcommand, after = _account_git_subcommand(args)
+    if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
+        return [], None
+    repo = None
+    if subcommand == 'push':
+        remote = _account_push_remote(after, cwd, env, state)
+        url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
+                                  ('git-push-url', remote, cwd))
+        # The URL says where the push went, which is a destination and not an account; the trailing slash git
+        # returns for a bare host would otherwise make two spellings of one repository.
+        repo = _account_repo_of(url) if url else None
+    # The committer identity, which is a separate fact from the login that pushed and may disagree with it.
+    email = _account_setting('GIT_COMMITTER_EMAIL', env) or _account_setting('GIT_AUTHOR_EMAIL', env) \
+        or _account_git_config('user.email', cwd, env, state)
+    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), repo
+
+
+def _account_gh_host(after: List[str], env: Dict) -> Optional[str]:
+    """The host a gh call talks to, in gh's own order: --hostname, then the repo it names, then GH_HOST, then dotcom."""
+    i = 0
+    repo = None
+    while i < len(after):
+        arg = after[i]
+        if arg in ('--hostname', '-h') and i + 1 < len(after):
+            return _account_value(after[i + 1])
+        if arg.startswith('--hostname='):
+            return _account_value(arg.split('=', 1)[1])
+        if arg in ('-R', '--repo') and i + 1 < len(after):
+            repo, i = after[i + 1], i + 2
+            continue
+        if arg.startswith('--repo='):
+            repo, i = arg.split('=', 1)[1], i + 1
+            continue
+        i += 1
+    if repo and ('://' in repo or repo.count('/') > 1):
+        host = _account_host_of(repo)
+        if host:
+            return host
+    return _account_setting('GH_HOST', env) or 'github.com'
+
+
+def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the GitHub account a gh call acted as, no repository); empty when a token in the environment signs it in."""
+    if any(_account_setting(name, env) for name in _ACCOUNT_GH_TOKENS):
+        return [], None
+    host = _account_gh_host(args, env)
+    if not host:
+        return [], None
+
+    login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state, ('gh-user', host))
+    return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command'}] if login else []), None
+
+
+_ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
+
+
+def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
+    """The accounts a shell call acted as, and the repository a push reached; None when it names no platform.
+    Never raises and never outlasts the turn's budget."""
+    try:
+        if not isinstance(command, str) or not command.strip():
+            return None
+        if not any(name in command for name in _ACCOUNT_HANDLERS):
+            return None
+        shell = _transfer_shell(_TransferLexer(command).read() or [], cwd,
+                               dict(state.get('account_env') or {}), 0)
+        found, pushed = [], None
+        for program, args, env, call_cwd, _other_user, _layers, unsure in shell['calls']:
+            handler = _ACCOUNT_HANDLERS.get(program)
+            # A call that only may have run tells us nothing about who ran it.
+            if handler is None or unsure:
+                continue
+            accounts, repo = handler(args, env, call_cwd, state)
+            for account in accounts:
+                if account not in found and len(found) < _ACCOUNT_MAX:
+                    found.append(account)
+            pushed = pushed or repo
+        _account_exports(shell, state)
+        resolved = {}
+        if found:
+            resolved['accounts'] = found
+        if pushed:
+            resolved['pushed_repo'] = pushed
+        return resolved or None
+    except Exception:
+        return None
+
+
+def _with_accounts(entry: Dict, resolved: Optional[Dict]) -> Dict:
+    """The tool_use entry with the accounts its call acted as, and the repository a push reached."""
+    if resolved:
+        entry.update(resolved)
+    return entry
+# --- end account resolution ---
+
+
 # How Codex reports an exec_command that never ran: blocked by a hook, rejected by the user, or denied by the sandbox.
 _CODEX_NOT_RUN_OUTPUTS = ('Command blocked by PreToolUse hook', 'Tool call blocked by PreToolUse hook',
                           'exec command rejected by user', 'rejected by user', 'Command denied by sandbox')
@@ -7639,6 +7927,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
             # Codex currently only has exec_command (Bash). Other function names
             # are handled generically as fallback for future Codex tool support.
             transfer = None
+            accounts = None
             if name == 'exec_command':
                 tool_name = 'Bash'
                 command = args.get('cmd', '')
@@ -7667,6 +7956,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 # A call with no output, or one blocked or rejected before it ran, is not looked up.
                 ran = call_id in function_outputs and not str(output).startswith(_CODEX_NOT_RUN_OUTPUTS)
                 transfer = _transfer(command, start, transfer_state) if ran else None
+                accounts = _accounts(command, start, transfer_state) if ran else None
                 # Parse exec_command output format to extract clean stdout and exit_code
                 stdout = output
                 exit_code = 0
@@ -7703,6 +7993,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
             }, call_data.get('timestamp'))
             if transfer:
                 tool_use['transfer'] = transfer
+            _with_accounts(tool_use, accounts)
             tool_uses.append(tool_use)
 
     except Exception:
