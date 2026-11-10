@@ -387,6 +387,20 @@ class TestAScriptRunStopsItselfBeforeTheWatchdog:
         assert "Queued 3 past sessions. More history remains" in out and "failed" not in out
         assert module._backfill_stop_at is None
 
+    def test_a_run_already_out_of_time_starts_no_backfill_work_at_all(self, relpath, monkeypatch, capsys):
+        from pathlib import Path
+        module = load_module(relpath)
+        clock, touched = [1000.0], []
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0] - 590)
+        monkeypatch.setattr(module, "_run_as_user", lambda *a, **k: touched.append("walk"))
+        monkeypatch.setattr(module, "_backfill_force_config", lambda *a: touched.append("config") or (None, None))
+        with module._backfill_soft_stop(module.BACKFILL_SOFT_STOP_SECONDS):
+            module.run_backfill("key", "https://backend", [("alice", Path("/home/alice"))])
+        # Neither the config request (up to a minute of retries) nor the transcript walk is begun.
+        assert touched == []
+        assert "no time left in this run" in capsys.readouterr().out
+
     def test_the_packaged_binary_path_is_left_unbounded(self, relpath, monkeypatch, capsys):
         module = load_module(relpath)
         sent, cutoffs, out = self._run(module, monkeypatch, capsys, False, 200)

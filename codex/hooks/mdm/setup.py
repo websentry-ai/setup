@@ -2289,6 +2289,10 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
             return
+        if _backfill_out_of_run_time():
+            # Before the config request and the walk, which are not free either.
+            print("[backfill] Skipped — no time left in this run; history is sent on the next run.")
+            return
 
         started_at = time.time()
         # Fetched once, before privileges are dropped: one call per device, not per profile.
