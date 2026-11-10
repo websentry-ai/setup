@@ -7720,8 +7720,7 @@ def _account_git_subcommand(args: List[str]) -> tuple:
 def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
     """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
 
-    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file;
-    skipping them to find the subcommand is not the same as honouring them."""
+    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file."""
     folder, passed, overrides = cwd, dict(env or {}), {}
     i = 0
     while i < len(args):
