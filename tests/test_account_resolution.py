@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'feef6a37ba6e5680245a26541d278210597d9559fc944db76a3afe0d5b040674'
+BLOCK_SHA256 = '298b22d41890a910deb42d029f37f49316911c07cf700fb1c0a2a979e45a032c'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -48,6 +48,13 @@ if args[:2] == ['config', '--get']:
     override = os.environ.get('GIT_CONFIG_GLOBAL')
     if override and os.path.exists(override):
         for line in open(override):
+            if line.strip().startswith(name.split('.')[-1] + ' ='):
+                print(line.split('=', 1)[1].strip())
+                sys.exit(0)
+    # And `$HOME/.gitconfig` after it, which is where git looks when no file is named.
+    home = os.path.join(os.environ.get('HOME') or '', '.gitconfig')
+    if os.path.exists(home):
+        for line in open(home):
             if line.strip().startswith(name.split('.')[-1] + ' ='):
                 print(line.split('=', 1)[1].strip())
                 sys.exit(0)
@@ -452,6 +459,13 @@ class AccountResolutionTests(unittest.TestCase):
         for path, resolved in self.each('GIT_COMMITTER_EMAIL=$(cat .email) git push origin main'):
             self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
             self.assertNotIn('accounts', resolved, path)
+
+    def test_a_home_the_call_chooses_decides_which_config_is_read(self):
+        """git reads `$HOME/.gitconfig`, so a `HOME` the call sets has to reach the lookup and its memo."""
+        other = tempfile.mkdtemp()
+        Path(other, '.gitconfig').write_text('[user]\n    email = home@acme.com\n')
+        for path, resolved in self.each('HOME=%s git commit -m wip' % other):
+            self.assertEqual(resolved['accounts'][0]['email'], 'home@acme.com', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
