@@ -1372,6 +1372,10 @@ def main():
         return False
     debug_print("Hooks setup complete")
 
+    if config_count < len(user_homes):
+        print("Could not write ~/.unbound/config.json for every user")
+        return False
+
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)

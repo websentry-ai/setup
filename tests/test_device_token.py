@@ -245,3 +245,14 @@ def test_gateway_mdm_decides_windows_machine_token_once(home, tmp_path, monkeypa
 def test_user_setups_fail_when_the_config_write_fails():
     unchecked = [f.name for f in SETUPS.values() if re.search(r"^\s+write_unbound_config\(", f.read_text(), re.M)]
     assert unchecked == []
+
+
+@pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
+def test_mdm_config_writer_reports_a_failed_write(home, tmp_path, monkeypatch, tool):
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_write_{tool.replace('-', '_')}")
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(mdm, "_repair_user_ownership", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(mdm, "_run_as_user", lambda *a, **k: None)
+    assert mdm.write_unbound_config_for_user("u", tmp_path, "k") is False
+    monkeypatch.setattr(mdm, "_run_as_user", lambda user, fn: fn())
+    assert mdm.write_unbound_config_for_user("u", tmp_path, "k") is True

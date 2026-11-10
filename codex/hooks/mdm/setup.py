@@ -640,7 +640,7 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
             os.close(fd)
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -679,6 +679,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
 
     if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
         debug_print(f"Could not write config for {username}")
+        return False
+    return True
 
 
 def _read_config_lines(config_path: Path):
@@ -2496,10 +2498,11 @@ def main():
 
     print("\nConfiguring Codex user hooks...")
     installed = 0
+    config_ok = True
     user_homes = get_all_user_homes()
     for username, home_dir in user_homes:
         remove_gateway_artifacts_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+        config_ok = write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}) and config_ok
         enable_codex_hooks_feature_for_user(username, home_dir)
         if system_wide:
             remove_user_level_hooks_for_user(username, home_dir)  # codex would run a leftover copy twice
@@ -2508,7 +2511,7 @@ def main():
             print(f"Registered codex hooks for {username}")
             installed += 1
 
-    success = bool(user_homes) and installed == len(user_homes)
+    success = bool(user_homes) and installed == len(user_homes) and config_ok
     if not user_homes:
         print("No user home directories found")
     elif success:

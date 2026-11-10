@@ -650,7 +650,7 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
             os.close(fd)
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -689,6 +689,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
 
     if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
         debug_print(f"Could not write config for {username}")
+        return False
+    return True
 
 
 def download_file(url: str, dest_path: Path) -> bool:
@@ -2709,8 +2711,9 @@ def main():
     print("\nInstalling Copilot hooks for all users...")
     user_homes = get_all_user_homes()
     installed_count = 0
+    config_ok = True
     for username, home_dir in user_homes:
-        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+        config_ok = write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}) and config_ok
         # Never fatal: the hooks are the enforcement plane and must not be rolled
         # back because an editor's settings file could not be merged.
         # Earlier versions configured the exporter here, per user, in VS Code settings.
@@ -2729,7 +2732,7 @@ def main():
     else:
         print("⚠️  Could not configure Copilot telemetry export; hooks still active")
 
-    success = bool(user_homes) and installed_count == len(user_homes)
+    success = bool(user_homes) and installed_count == len(user_homes) and config_ok
     if not user_homes:
         print("No user home directories found")
     elif success:

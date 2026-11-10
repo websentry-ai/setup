@@ -890,7 +890,7 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
             os.close(fd)
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -929,6 +929,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
 
     if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
         debug_print(f"Could not write config for {username}")
+        return False
+    return True
 
 
 def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
@@ -3247,10 +3249,11 @@ def main():
 
     # Remove gateway artifacts, strip leftover user-level Unbound hooks
     # (so managed hooks don't fire twice), and write unbound config.
+    config_ok = True
     for username, home_dir in get_all_user_homes():
         remove_gateway_artifacts_for_user(username, home_dir)
         remove_user_level_hooks_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+        config_ok = write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}) and config_ok
     remove_legacy_key_env()
 
     state = detect_install_state(skip_settings=skip_managed_settings)
@@ -3265,6 +3268,10 @@ def main():
             print(f"Created managed hooks in {managed_dir}")
     else:
         print("Failed to configure managed hooks")
+        return False
+
+    if not config_ok:
+        print("Could not write ~/.unbound/config.json for every user")
         return False
 
     print("\n" + "=" * 60)

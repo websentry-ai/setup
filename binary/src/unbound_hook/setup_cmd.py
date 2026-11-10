@@ -1023,12 +1023,13 @@ def _setup_claude_code(opts):
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         m.remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
+    config_ok = True
     for username, home_dir in m.get_all_user_homes():
         m.remove_gateway_artifacts_for_user(username, home_dir)
         m.remove_user_level_hooks_for_user(username, home_dir)
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
     m.remove_legacy_key_env()
 
     skip_settings = opts["skip_managed_settings"]
@@ -1044,6 +1045,9 @@ def _setup_claude_code(opts):
         _print_remote_policy_hooks()
     else:
         _remove_stale_managed_script(m.get_managed_settings_dir())
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "claude-code", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1079,11 +1083,12 @@ def _setup_augment(opts):
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
     # augment main()'s ordering).
+    config_ok = True
     user_homes = m.get_all_user_homes()
     for username, home_dir in user_homes:
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
     m.remove_legacy_key_env()
 
     state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
@@ -1095,6 +1100,9 @@ def _setup_augment(opts):
     # succeeded, so managed hooks don't fire twice.
     for username, home_dir in user_homes:
         m.remove_user_level_hooks_for_user(username, home_dir)
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "augment_code", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1125,15 +1133,19 @@ def _setup_codex(opts):
     state = _codex_detect_state(m, user_homes)
     if not _write_codex_system_hooks(m):
         return ("deferred", "codex system hooks.json write failed")
+    config_ok = True
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         _strip_codex_user_hooks(m, username, home_dir)
     # After the new hooks are in place: an older codex hook reads only the per-tool var.
     m.remove_legacy_key_env()
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1322,11 +1334,14 @@ def _setup_cursor(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
 
+    config_ok = True
     for username, home_dir in m.get_all_user_homes():
         if m.write_unbound_config_for_user(
                 username, home_dir, api_key,
                 urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
             m.remove_user_level_hooks(username, home_dir)
+        else:
+            config_ok = False
     m.remove_legacy_key_env()
 
     state = _detect_state(m.get_enterprise_hooks_dir() / "hooks.json", _cursor_hooks_json()["hooks"],
@@ -1335,6 +1350,9 @@ def _setup_cursor(opts):
     if not hooks_ok:
         return ("deferred", "enterprise hooks.json write failed")
     _remove_stale_managed_script(m.get_enterprise_hooks_dir())
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "cursor", backend_url=base,
                             install_state=state, serial_number=device_id,
@@ -1408,12 +1426,13 @@ def _setup_copilot(opts):
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
     installed = 0
+    config_ok = True
     for username, home_dir in user_homes:
         if home_dir is None:
             continue  # no home to hold a config or a registration
-        m.write_unbound_config_for_user(
+        config_ok = m.write_unbound_config_for_user(
             username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
         # Earlier versions configured the exporter here, per user, in VS Code
         # settings. The managed file written below outranks those, so they are only
         # taken back out.
@@ -1443,6 +1462,9 @@ def _setup_copilot(opts):
                                     install_state=state, serial_number=device_id,
                                     install_mode="binary")
         return ("deferred", "hook install failed for all users")
+
+    if not config_ok:
+        return ("deferred", "config.json write failed for some users")
 
     m.notify_setup_complete(api_key, "copilot", backend_url=base,
                             install_state=state, serial_number=device_id,
