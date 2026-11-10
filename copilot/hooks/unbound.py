@@ -9310,7 +9310,8 @@ _ACCOUNT_REMEMBERED = frozenset({
     'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME', 'GH_HOST', 'GH_CONFIG_DIR', 'GH_TOKEN',
     'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
     'GITHUB_ENTERPRISE_TOKEN',
-    'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_ACCESS_KEY_ID', 'KUBECONFIG', 'HOME', 'USERPROFILE',
+    'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_ACCESS_KEY_ID', 'AZURE_CONFIG_DIR',
+    'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
 # A configuration file longer than this is not one of the small files we read, and is skipped rather than parsed.
 _ACCOUNT_MAX_FILE_BYTES = 512 * 1024
@@ -9321,6 +9322,8 @@ _ACCOUNT_ROLE_ARN = re.compile(r'^arn:[a-z0-9-]*:[a-z0-9-]*::?(\d{12}):')
 _ACCOUNT_ECR_HOST = re.compile(r'^(\d{12})\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(?:\.cn)?$')
 # docker subcommands that reach a registry; everything else stays on the machine.
 _ACCOUNT_DOCKER_REGISTRY = frozenset({'push', 'pull', 'login'})
+# docker's management form: `docker image push` names the same call as `docker push`.
+_ACCOUNT_DOCKER_GROUPS = frozenset({'image'})
 # What a registry-less image name is published to.
 _ACCOUNT_DOCKER_DEFAULT = 'docker.io'
 # docker's own options that take a value, so the image is not read out of one.
@@ -9397,7 +9400,8 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_WORK_TREE',
-    'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'KUBECONFIG', 'HOME', 'USERPROFILE',
+    'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR', 'KUBECONFIG', 'HOME',
+    'USERPROFILE',
 })
 # git reads `GIT_CONFIG_COUNT` settings from indexed pairs, so they travel with it rather than being named one
 # by one in the table above.
@@ -9805,7 +9809,11 @@ def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
     contain settles as unknown, because falling back to the default would name the wrong account with confidence."""
     def resolve():
         import configparser
-        path = _account_setting('AWS_CONFIG_FILE', env) or os.path.join(_account_home(env) or '', '.aws', 'config')
+        named, known = _account_known('AWS_CONFIG_FILE', env)
+        if not known:
+            return None, False
+        home = _account_home(env)
+        path = named or (os.path.join(home, '.aws', 'config') if home else None)
         text = _account_file(path)
         if text is None:
             return None, False
@@ -9849,10 +9857,23 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     return [{'platform': 'aws', 'account_id': account, 'profile': profile, 'source': source}], None
 
 
+def _account_azure_dir(env: Dict) -> Optional[str]:
+    """The folder the Azure CLI reads its profile from, which `AZURE_CONFIG_DIR` moves off the home folder."""
+    found, known = _account_known('AZURE_CONFIG_DIR', env)
+    if not known:
+        return None
+    if found:
+        # A relative setting is resolved against a folder this process does not own, so the CLI is asked instead.
+        return found if os.path.isabs(found) else None
+    home = _account_home(env)
+    return os.path.join(home, '.azure') if home else None
+
+
 def _account_azure_entry(named: Optional[str], env: Dict, state: Dict) -> tuple:
     """(the subscription azureProfile.json names, whether that file settled it). The file begins with a UTF-8 BOM."""
     def resolve():
-        text = _account_file(os.path.join(_account_home(env) or '', '.azure', 'azureProfile.json'))
+        folder = _account_azure_dir(env)
+        text = _account_file(os.path.join(folder, 'azureProfile.json') if folder else None)
         if text is None:
             return None, False
         try:
@@ -9901,7 +9922,7 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     source = 'file'
     if entry is None and not settled:
         argv = ['az', 'account', 'show', '-o', 'json'] + (['--subscription', named] if named else [])
-        output = _account_output(argv, cwd, env, state, ('azure-show', named or ''))
+        output = _account_output(argv, cwd, env, state, ('azure-show', named or '', _account_env_key(env)))
         try:
             entry, source = (json.loads(output) if output else None), 'command'
         except Exception:
@@ -9958,6 +9979,8 @@ def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict)
     No credential helper is run, and the stored login is never read; the hostname is the stronger signal and is
     already in the command."""
     subcommand, after = _account_subcommand(args, _ACCOUNT_DOCKER_VALUE_OPTIONS)
+    if subcommand in _ACCOUNT_DOCKER_GROUPS:
+        subcommand, after = _account_subcommand(after, _ACCOUNT_DOCKER_VALUE_OPTIONS)
     if subcommand not in _ACCOUNT_DOCKER_REGISTRY:
         return [], None
     target, _ = _account_subcommand(after, _ACCOUNT_DOCKER_VALUE_OPTIONS)

@@ -188,10 +188,46 @@ class AccountPlatformTests(unittest.TestCase):
             resolved = self.resolve(hook, 'aws s3 ls', state)
             self.assertEqual(resolved['accounts'][0]['account_id'], '111111111111', path)
 
-    def test_an_inline_profile_decides_the_call_it_prefixes(self):
-        """Which is the case that matters: the assignment is part of the command being resolved."""
-        for path, resolved in self.each('AWS_PROFILE=home aws s3 ls'):
-            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
+    def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
+        """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
+        for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
+            self.assertIsNone(resolved, path)
+        self.assertEqual(self.runs(), [])
+
+    def test_a_config_file_that_cannot_be_read_resolves_nothing(self):
+        for path, resolved in self.each('AWS_CONFIG_FILE=$(cat .where) aws s3 ls --profile home'):
+            self.assertIsNone(resolved, path)
+        self.assertEqual(self.runs(), [])
+
+    def test_azure_reads_the_profile_its_config_directory_names(self):
+        """The CLI honours `AZURE_CONFIG_DIR`, so the home folder's profile is the wrong subscription."""
+        folder = Path(tempfile.mkdtemp(), 'azure')
+        folder.mkdir()
+        Path(folder, 'azureProfile.json').write_bytes(b'\xef\xbb\xbf' + json.dumps(
+            {'subscriptions': [{'id': '00000000-0000-0000-0000-000000000003', 'name': 'Other Tenant',
+                                'isDefault': True}]}).encode('utf-8'))
+        for path, resolved in self.each('AZURE_CONFIG_DIR=%s az group list' % folder):
+            self.assertEqual(resolved['accounts'][0]['subscription_id'],
+                             '00000000-0000-0000-0000-000000000003', path)
+        self.assertEqual(self.runs(), [])
+
+    def test_two_azure_calls_with_different_config_directories_each_ask(self):
+        """The memo keys on the environment, or the second call reuses the first directory's subscription."""
+        first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            open(self.run_log, 'w').close()
+            state = {}
+            self.resolve(hook, 'AZURE_CONFIG_DIR=%s az group list' % first, state)
+            self.resolve(hook, 'AZURE_CONFIG_DIR=%s az group list' % second, state)
+            asked = [argv for argv in self.runs() if argv[:2] == ['az', 'account']]
+            self.assertEqual(len(asked), 2, path)
+
+    def test_a_docker_image_push_reaches_the_same_registry_as_a_push(self):
+        """docker's management form: `docker image push` is the same call as `docker push`."""
+        for path, resolved in self.each('docker image push %s/app:v1' % ECR_HOST):
+            self.assertEqual(resolved['accounts'], [
+                {'platform': 'docker', 'registry': ECR_HOST, 'source': 'hostname'},
+                {'platform': 'aws', 'account_id': '210987654321', 'source': 'hostname'}], path)
 
     def test_a_cloud_call_after_a_source_resolves_nothing(self):
         for path, resolved in self.each('source ./.env; aws s3 ls --profile home'):
