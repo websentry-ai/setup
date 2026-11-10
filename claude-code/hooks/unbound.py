@@ -9053,10 +9053,18 @@ def _account_value(value: Any) -> Optional[str]:
     return word
 
 
+def _account_beyond_reading(env: Dict) -> bool:
+    """Whether this call's environment is past reading at all, as it is after a `source` or an `eval`."""
+    return _TRANSFER_UNKNOWN_ENV in (env or {})
+
+
 def _account_setting(name: str, env: Dict) -> Optional[str]:
     """What a variable is worth for this call: what the command's shell has, else the hook's own environment."""
     value = (env or {}).get(name)
     if value == _TRANSFER_SUBSTITUTED:
+        return None
+    if name not in (env or {}) and _account_beyond_reading(env):
+        # A source or eval may have set it to anything, so the hook's own value no longer stands in.
         return None
     return _account_value(value) or _account_value(os.environ.get(name))
 
@@ -9066,8 +9074,15 @@ def _account_exports(shell: Dict, state: Dict) -> None:
     try:
         carried = {}
         for name, value in _transfer_exported(shell).items():
-            if name in _ACCOUNT_REMEMBERED and value != _TRANSFER_SUBSTITUTED and _account_value(value):
+            if name not in _ACCOUNT_REMEMBERED:
+                continue
+            if value == _TRANSFER_SUBSTITUTED:
+                # Dropping it would read as "no token set", which credits the call to the stored login.
+                carried[name] = _TRANSFER_SUBSTITUTED
+            elif _account_value(value):
                 carried[name] = value.strip()
+        if _TRANSFER_UNKNOWN_ENV in shell.get('vars', {}):
+            carried[_TRANSFER_UNKNOWN_ENV] = ''
         state['account_env'] = carried
     except Exception:
         pass
@@ -9203,7 +9218,8 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         return [], None
     cwd, env, overrides = _account_git_context(args, cwd, env)
     repo = None
-    if subcommand == 'push':
+    rewired = any(key.startswith(('url.', 'remote.')) for key in overrides)
+    if subcommand == 'push' and not rewired:
         remote = _account_push_remote(after, cwd, env, state, overrides)
         url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
                                   ('git-push-url', remote, cwd, _account_env_key(env)))
@@ -9266,7 +9282,8 @@ _ACCOUNT_TRIGGERS = re.compile(
     % ('|'.join(sorted(_ACCOUNT_HANDLERS)), '|'.join(sorted(_ACCOUNT_REMEMBERED))))
 
 
-def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
+def _accounts(command: Optional[str], cwd: Optional[str], state: Dict,
+              persistent: bool = False) -> Optional[Dict]:
     """The accounts a shell call acted as, and the repository a push reached; None when it names no platform.
     Never raises and never outlasts the turn's budget."""
     try:
@@ -9274,20 +9291,22 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
             return None
-        shell = _transfer_shell(_TransferLexer(command).read() or [], cwd,
-                               dict(state.get('account_env') or {}), 0)
+        seeded = dict(state.get('account_env') or {}) if persistent else {}
+        shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, seeded, 0)
         found, pushed = [], None
-        for program, args, env, call_cwd, _other_user, _layers, unsure in shell['calls']:
+        for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             handler = _ACCOUNT_HANDLERS.get(program)
-            # A call that only may have run tells us nothing about who ran it.
-            if handler is None or unsure:
+            # A call that only may have run tells us nothing about who ran it, one run as another user resolves
+            # that user's configuration and not the hook's, and one past a source or eval resolves nothing.
+            if handler is None or unsure or other_user or _account_beyond_reading(env):
                 continue
             accounts, repo = handler(args, env, call_cwd, state)
             for account in accounts:
                 if account not in found and len(found) < _ACCOUNT_MAX:
                     found.append(account)
             pushed = pushed or repo
-        _account_exports(shell, state)
+        if persistent:
+            _account_exports(shell, state)
         resolved = {}
         if found:
             resolved['accounts'] = found
@@ -9397,7 +9416,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 transfer = _transfer(command, transfer_dir, transfer_state)
                 # Resolved from where the command STARTED, like the transfer above: _accounts replays the
                 # call's own cd, so the folder it ended in would move it a second time.
-                accounts = _accounts(command, transfer_dir, transfer_state)
+                accounts = _accounts(command, transfer_dir, transfer_state,
+                                     persistent=tool_input.get('run_in_background') is not True)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:
                     transfer_dir = None if failed else _transfer_next_cwd(command, transfer_dir)
