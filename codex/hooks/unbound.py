@@ -7589,7 +7589,8 @@ _ACCOUNT_MAX_NAME = 120
 # them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
 _ACCOUNT_REMEMBERED = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
-    'GIT_COMMITTER_EMAIL', 'GH_HOST', 'GH_CONFIG_DIR', 'GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
+    'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME', 'GH_HOST', 'GH_CONFIG_DIR', 'GH_TOKEN',
+    'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
     'GITHUB_ENTERPRISE_TOKEN',
     'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_ACCESS_KEY_ID', 'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
@@ -7656,7 +7657,7 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         # Only the remembered names are carried from the command text, so nothing else it set can steer the run.
         passed, dropped = {}, []
         for name, value in (env or {}).items():
-            if name not in _ACCOUNT_REMEMBERED:
+            if name not in _ACCOUNT_REMEMBERED and not name.startswith(_ACCOUNT_INDEXED_CONFIG):
                 continue
             if _account_value(value):
                 passed[name] = value
@@ -7676,9 +7677,12 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
 # The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
-    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE',
-    'KUBECONFIG', 'HOME', 'USERPROFILE',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_WORK_TREE',
+    'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
+# git reads `GIT_CONFIG_COUNT` settings from indexed pairs, so they travel with it rather than being named one
+# by one in the table above.
+_ACCOUNT_INDEXED_CONFIG = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
 
 
 def _account_env_key(env: Dict) -> tuple:
@@ -8003,8 +8007,12 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
         value, known = _account_known(name, env)
         if value or not known:
             return [], None
-    host = (_account_gh_host(args, env) or _account_gh_remote_host(cwd, env, state)
-            or _account_setting('GH_HOST', env) or 'github.com')
+    # A repository the command names is resolved against gh's own host, not against whatever this folder
+    # happens to point at; only a call that names none falls back to the checkout's remote.
+    names_repo = any(arg in ('-R', '--repo') or arg.startswith(('-R=', '--repo=')) for arg in args)
+    host = _account_gh_host(args, env) or (
+        None if names_repo else _account_gh_remote_host(cwd, env, state)
+    ) or _account_setting('GH_HOST', env) or 'github.com'
     if not host:
         return [], None
 
