@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'da9dd1ea1be7a685ef28b59f7ac454fe0c7c430b40ab026d31d31e7a35555049'
+BLOCK_SHA256 = 'e7036d1846244a5acba90b51bcd8be7714ccf640c2015cc4399855fa9973ef24'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -125,9 +125,8 @@ class AccountResolutionTests(unittest.TestCase):
         """Every command the hook actually ran, as argv lists."""
         return [entry['argv'] for entry in self._run_entries()]
 
-    def resolve(self, hook, command, state=None, cwd=None, persistent=False):
-        return hook._accounts(command, cwd or self.repo, state if state is not None else {},
-                              persistent=persistent)
+    def resolve(self, hook, command, state=None, cwd=None):
+        return hook._accounts(command, cwd or self.repo, state if state is not None else {})
 
     def each(self, command, state=None, cwd=None):
         """The same call resolved by every hook, so a divergence between them fails here."""
@@ -255,6 +254,21 @@ class AccountResolutionTests(unittest.TestCase):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
                 self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
 
+    def test_the_committer_email_setting_comes_before_user_email(self):
+        """git gives `committer.email` precedence over `user.email`."""
+        answers = {'user.email': 'base@example.com', 'committer.email': 'actual@example.com', 'branch': 'main'}
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': __import__('json').dumps(answers)}):
+            for path, resolved in self.each('git commit -m wip'):
+                self.assertEqual(resolved['accounts'][0]['email'], 'actual@example.com', path)
+
+    def test_a_variable_the_shell_unset_does_not_reach_the_lookup(self):
+        """Removing it from the child's environment, not just from our own reading of it."""
+        other = Path(self.home, 'hook.gitconfig')
+        other.write_text('[user]\n    email = hook@example.com\n')
+        with patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': str(other)}):
+            for path, resolved in self.each('unset GIT_CONFIG_GLOBAL; git commit -m wip'):
+                self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
     def test_an_optional_value_flag_does_not_swallow_the_remote(self):
         """`--force-with-lease` takes an optional value, so bare the next word is the remote."""
         for flag in ('--force-with-lease', '--signed'):
@@ -269,40 +283,27 @@ class AccountResolutionTests(unittest.TestCase):
         for path, resolved in self.each('VAR=ci@acme.com git --config-env=user.email=VAR commit -m wip'):
             self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
 
-    def test_a_standalone_source_marks_the_rest_of_the_turn_unknown(self):
-        """It names no program and no variable, so the trigger has to see the builtin itself."""
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            state = {}
-            self.resolve(hook, 'source ./.env', state, persistent=True)
-            self.assertIsNone(self.resolve(hook, 'gh pr list', state, persistent=True), path)
-            self.assertIsNone(self.resolve(hook, 'git commit -m wip', state, persistent=True), path)
-
-    def test_two_calls_with_different_gh_config_dirs_resolve_separately(self):
-        other = Path(self.home, 'other-gh')
-        (other / 'gh').mkdir(parents=True)
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            state = {}
-            self.resolve(hook, 'gh pr list', state, persistent=True)
-            self.resolve(hook, 'GH_CONFIG_DIR=%s gh pr list' % other, state, persistent=True)
-        asked = [call for call in self.runs() if call[:3] == ['gh', 'config', 'get']]
-        self.assertEqual(len(asked), 2 * len(HOOKS), asked)
-
     def test_a_push_naming_no_remote_and_no_setting_uses_origin(self):
         for path, resolved in self.each('git push'):
             self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
 
     # -- an export earlier in the turn still decides ---------------------------
 
-    def test_an_export_in_an_earlier_call_is_honoured_by_a_later_one(self):
+    def test_an_export_in_an_earlier_call_does_not_decide_a_later_one(self):
+        """These agents run each command in a fresh shell, so no export survives into the next call.
+
+        The hook COMPUTES where the next command starts rather than asking the shell, which is what you do
+        when the shell does not persist — so a carried export would attribute the call to an identity git
+        never used.
+        """
         other = Path(self.home, 'work.gitconfig')
         other.write_text('[user]\n    email = jdoe@acme.com\n')
         for path, hook in zip(HOOK_PATHS, HOOKS):
             state = {}
-            self.resolve(hook, 'export GIT_CONFIG_GLOBAL=%s' % other, state, persistent=True)
-            for _ in range(3):
-                self.resolve(hook, 'git status', state, persistent=True)
-            resolved = self.resolve(hook, 'git commit -m wip', state, persistent=True)
-            self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@acme.com', path)
+            self.resolve(hook, 'export GIT_CONFIG_GLOBAL=%s' % other, state)
+            self.resolve(hook, 'export GIT_COMMITTER_EMAIL=ci@acme.com', state)
+            resolved = self.resolve(hook, 'git commit -m wip', state)
+            self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
 
     def test_an_inline_assignment_decides_the_call_it_prefixes(self):
         for path, resolved in self.each('GIT_COMMITTER_EMAIL=ci@acme.com git commit -m wip'):
@@ -340,29 +341,6 @@ class AccountResolutionTests(unittest.TestCase):
             second = self.resolve(hook, 'GIT_CONFIG_GLOBAL=%s git commit -m two' % work, state)
             self.assertEqual(first['accounts'][0]['email'], 'jdoe@gmail.com', path)
             self.assertEqual(second['accounts'][0]['email'], 'jdoe@acme.com', path)
-
-    def test_an_export_of_a_remembered_variable_alone_is_still_read(self):
-        """The command names no program, so the pre-filter has to let it through anyway."""
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            state = {}
-            self.resolve(hook, 'export GIT_COMMITTER_EMAIL=ci@acme.com', state, persistent=True)
-            resolved = self.resolve(hook, 'git commit -m wip', state, persistent=True)
-            self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
-
-    def test_an_export_does_not_carry_where_the_shell_does_not_persist(self):
-        """Codex and Augment start a new process per call, so one call's export cannot decide the next."""
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            state = {}
-            self.resolve(hook, 'export GIT_COMMITTER_EMAIL=ci@acme.com', state)
-            resolved = self.resolve(hook, 'git commit -m wip', state)
-            self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
-
-    def test_a_token_exported_from_a_substitution_leaves_the_login_unknown(self):
-        """Carrying nothing for it would read as "no token set" and credit the call to the stored login."""
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            state = {}
-            self.resolve(hook, 'export GH_TOKEN=$(cat ~/.work-token)', state, persistent=True)
-            self.assertIsNone(self.resolve(hook, 'gh pr list', state, persistent=True), path)
 
     def test_nothing_is_resolved_after_a_source_or_an_eval(self):
         """The sourced text may have set the committer or a token to anything.
