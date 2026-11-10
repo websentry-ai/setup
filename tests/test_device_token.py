@@ -175,18 +175,15 @@ def test_windows_machine_token_stays_while_any_user_still_needs_it(home, tmp_pat
 
 
 @pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
-def test_windows_machine_token_is_never_removed_by_legacy_cleanup(home, tmp_path, monkeypatch, tool):
+def test_windows_default_profile_is_enumerated_for_config(tool, tmp_path, monkeypatch):
     mdm = _load(MDM_SETUPS[tool], f"token_mdm_{tool.replace('-', '_')}")
-    remover = "remove_env_var_on_windows" if tool == "cursor" else "remove_env_var_on_windows_machine"
-    removed = []
+    for name in ("Alice", "Default", "Public", "Default User"):
+        (tmp_path / "Users" / name).mkdir(parents=True)
     monkeypatch.setattr(mdm.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(mdm, remover, lambda name, *a: removed.append(name) or "cleared")
-    alice = tmp_path / "alice"
-    (alice / ".unbound").mkdir(parents=True)
-    (alice / ".unbound" / "config.json").write_text('{"api_key": "k"}')
-    monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [("alice", alice)])
-    mdm.remove_legacy_key_env()
-    assert "UNBOUND_DEVICE_TOKEN" not in removed
+    monkeypatch.setenv("SystemDrive", str(tmp_path))
+    monkeypatch.setattr(mdm, "Path", lambda *a: __import__("pathlib").Path(str(a[0]).replace("\\", "/")))
+    names = {n for n, _ in mdm.get_all_user_homes()}
+    assert names == {"Alice", "Default"}
 
 
 def test_every_config_writer_also_writes_device_token():

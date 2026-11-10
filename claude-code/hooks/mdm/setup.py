@@ -297,7 +297,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator', 'All Users']:
+                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default User', 'Administrator', 'All Users']:
                             user_homes.append((user_dir.name, user_dir))
                             debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
@@ -1581,8 +1581,8 @@ def _config_has_key(home_dir: Optional[Path] = None) -> bool:
 def remove_legacy_key_env() -> None:
     try:
         _remove_env_var_for_all_users("UNBOUND_CLAUDE_API_KEY")
-        # Env copy goes only once config.json holds the key; the Windows machine value stays so later profiles keep a credential.
-        _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=lambda home_dir: home_dir is None or not _config_has_key(home_dir))
+        # Env copy goes only once config.json holds the key; the Default profile gets one too, so later Windows profiles inherit it.
+        _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=lambda home_dir: home_dir is not None and not _config_has_key(home_dir))
     except Exception:
         pass
 
