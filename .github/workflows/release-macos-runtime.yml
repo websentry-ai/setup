@@ -63,9 +63,9 @@ concurrency:
 
 jobs:
   release:
-    # macos-14 = Apple Silicon GitHub-hosted runner (with Rosetta, so the
+    # macos-15 = Apple Silicon GitHub-hosted runner (with Rosetta, so the
     # smoke test can execute the x86_64 slice too).
-    runs-on: macos-14
+    runs-on: macos-15
     environment: release
     timeout-minutes: 180 # must exceed the 2h notary --wait (WEB-4802) plus build/sign/test time
 
@@ -288,7 +288,7 @@ jobs:
             echo "::error::pinned interpreter is $actual_py but discovery.lock says PYTHON_VERSION=$LOCK_PYTHON"
             exit 1
           fi
-          # ccache for Nuitka's C compile step; macos-14 ships clang but not
+          # ccache for Nuitka's C compile step; macos-15 ships clang but not
           # ccache. Nuitka finds it on PATH and keeps its object cache under
           # NUITKA_CACHE_DIR (restored above).
           # TODO(WEB-4804): pin ccache before promoting Nuitka past the
