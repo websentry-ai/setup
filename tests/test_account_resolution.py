@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '2619daafd06654a99e54a2017dbf0d2ba0dd6f75c2fd7bfc246938d98c07c10f'
+BLOCK_SHA256 = 'c11b1b1a2dcf2063e5633526a42bf068f087d24a2f0d9a575fb9924b7bb5ae86'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -490,6 +490,56 @@ class AccountResolutionTests(unittest.TestCase):
         for path, resolved in self.each('git push https://github.com/acme/app.git main'):
             self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
             self.assertNotIn('pushed_remote', resolved, path)
+
+    def test_a_committer_override_we_cannot_read_is_not_the_configured_address(self):
+        """git commits as the value it was given, so `user.email` is not the answer when we cannot read it."""
+        for path, resolved in self.each('git -c committer.email=$(cat .who) commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_push_remote_we_cannot_read_is_never_origin(self):
+        """A configured remote we cannot read leaves the destination unknown; `origin` was never reached."""
+        for path, resolved in self.each('git -c branch.main.pushRemote=$(cat .r) push'):
+            self.assertNotIn('pushed_repo', resolved or {}, path)
+            self.assertNotIn('pushed_remote', resolved or {}, path)
+
+    def test_the_repository_named_in_the_environment_decides_the_host(self):
+        """gh reads `GH_REPO` exactly as it reads `--repo`, so it answers before the checkout's remote."""
+        for path, resolved in self.each('GH_REPO=github.acme.com/acme/app gh pr list'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+            self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
+
+    def test_every_push_in_one_command_is_a_destination(self):
+        """A mirror pushes twice; keeping only the first drops the repository the second one reached.
+
+        Sequenced with `;`, so the second push surely runs and is not skipped for being uncertain.
+        """
+        for path, resolved in self.each('git push origin main; git push personal main'):
+            self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
+            self.assertEqual(resolved['pushed'], [{'repo': 'acme/app', 'remote': 'origin'},
+                                                  {'repo': 'jdoe-dev/app', 'remote': 'personal'}], path)
+
+    def test_a_repository_named_as_a_positional_url_decides_the_host(self):
+        """`gh pr view https://github.acme.com/...` names the enterprise host as plainly as `--repo` does."""
+        for path, resolved in self.each('gh pr view https://github.acme.com/acme/app/pull/1'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+
+    def test_a_repository_attached_to_its_option_is_still_a_repository(self):
+        """gh accepts `-Rowner/repo` with no space, so it names a repository and the checkout is not consulted."""
+        for path, resolved in self.each('gh pr view -Rgithub.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+        self.assertNotIn(['git', 'config', '--get', 'remote.origin.url'], self.runs())
+
+    def test_a_call_that_adds_its_own_config_files_resolves_nothing(self):
+        """git loads what an include names; this lookup cannot, so the committer it would use is unknown."""
+        for path, resolved in self.each('git -c include.path=/tmp/extra.gitconfig commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_the_lookups_share_the_turn_budget_rather_than_starting_a_second(self):
+        """A hook killed at ten seconds cannot afford two independent budgets."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {'deadline': 1.0}
+            self.assertEqual(hook._account_deadline(state), 1.0, path)
+            self.assertNotIn('account_deadline', state, path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
