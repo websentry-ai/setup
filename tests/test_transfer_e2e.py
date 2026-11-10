@@ -468,9 +468,12 @@ def test_copilot_powershell_web_calls_send_where_they_went(script, sandbox, gate
     assert_private(gateway)
 
 
-# A script block stored in a variable never runs, and an exit in a catch block may not, so the call after it is read.
+# A script block only stored may never run, so where it sends has no direction until the command runs it; an exit in a
+# catch block may not run, so the call after it is read; and a comment is not read.
 POWERSHELL_BLOCKS = {
-    '$upload = { iwr https://10.0.4.12/up -InFile customers.sql -Method Put }': [],
+    '$upload = { iwr https://10.0.4.12/up -InFile customers.sql -Method Put }': [('', '10.0.4.12')],
+    '$upload = { iwr https://10.0.4.12/up -InFile customers.sql -Method Put }; & $upload': [('out', '10.0.4.12')],
+    'irm https://10.0.4.12/a  # later: { irm https://10.0.4.13/b -InFile s }': [('in', '10.0.4.12')],
     'try { irm https://10.0.4.12/a } catch { exit 1 }; irm https://10.0.4.13/b -Method Post -Body $b':
         [('in', '10.0.4.12'), ('out', '10.0.4.13')],
 }
@@ -482,7 +485,7 @@ def test_copilot_powershell_reads_a_script_block_only_where_it_may_run(script, s
     body = turn_log(gateway, 'copilot')
     calls = [entry for entry in tool_entries(body) if command_of(entry) == script]
     assert len(calls) == 1, json.dumps(tool_entries(body), indent=2)
-    endpoints = [(e['direction'], e['host']) for e in (calls[0].get('transfer') or {}).get('endpoints', [])]
+    endpoints = [(e.get('direction', ''), e['host']) for e in (calls[0].get('transfer') or {}).get('endpoints', [])]
     assert endpoints == POWERSHELL_BLOCKS[script], json.dumps(calls[0], indent=2)
     assert_private(gateway)
 

@@ -1930,6 +1930,7 @@ var DECLARES = ["declare", "typeset", "local", "readonly"];
 var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
 var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
+var PS_STORED = "\0stored";
 var UNKNOWN_ENV = "\0unknown";
 var ALLEXPORT = "\0allexport";
 var ERREXIT = "\0errexit";
@@ -3787,6 +3788,7 @@ function curlConfig(text) {
   return args;
 }
 function shellString(name, args) {
+  if (name === PS_STORED) return args[0] === void 0 ? void 0 : powershellText(args[0]);
   if (SHELLS.has(name)) {
     const [i, letters] = shellFlags(args);
     return letters.has("c") && i < args.length ? args[i] : void 0;
@@ -3802,7 +3804,9 @@ function shellString(name, args) {
 }
 var PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
 var PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
-function powershellText(text) {
+var PS_VARIABLE = /\$(\{[^}]*\}|[\w:?]+)/g;
+function powershellText(command2) {
+  const text = psUncommented(command2);
   let out = "";
   let quote;
   let starts = true;
@@ -3813,8 +3817,19 @@ function powershellText(text) {
     const found = starts ? PS_ASSIGNMENT.exec(text) : null;
     const jump2 = starts && depth > 0 ? PS_JUMP.exec(text) : null;
     starts = false;
+    if (found && found[1] !== void 0) {
+      const after = PS_ASSIGNMENT.lastIndex;
+      const end2 = hashtableEnd(text, after);
+      if (psNamedLater(found[0], text, end2)) {
+        i = after - 1;
+      } else {
+        out += `${PS_STORED} '${text.slice(after - 1, end2).replace(/'/g, "'\\''")}'`;
+        i = end2;
+      }
+      continue;
+    }
     if (found) {
-      i = found[1] !== void 0 ? hashtableEnd(text, PS_ASSIGNMENT.lastIndex) : PS_ASSIGNMENT.lastIndex;
+      i = PS_ASSIGNMENT.lastIndex;
       continue;
     }
     if (jump2) {
@@ -3846,6 +3861,30 @@ function powershellText(text) {
     i++;
   }
   return out;
+}
+function psUncommented(text) {
+  let out = "";
+  let quote;
+  for (let i = 0; i < text.length; ) {
+    const word = quote === void 0 && (out === "" || " 	\r\n;|&(){}".includes(out[out.length - 1]));
+    if (word && (text.startsWith("<#", i) || text[i] === "#")) {
+      const block = text.startsWith("<#", i);
+      const end2 = block ? text.indexOf("#>", i + 2) : text.indexOf("\n", i);
+      i = end2 < 0 ? text.length : block ? end2 + 2 : end2;
+      out += " ";
+      continue;
+    }
+    const ch = text[i];
+    quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+function psNamedLater(assignment, text, end2) {
+  const name = (written) => (written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop().toLowerCase();
+  const first = [...assignment.matchAll(PS_VARIABLE)][0]?.[1];
+  return first !== void 0 && [...text.slice(end2).matchAll(PS_VARIABLE)].some((m) => name(m[1]) === name(first));
 }
 function hashtableEnd(text, start) {
   let depth = 1;
@@ -4009,9 +4048,10 @@ function simple(words2, item, before, shell, depth) {
     for (const [option, value] of Object.entries(options)) {
       if (option !== "noexec") nested[SET_OPTIONS[option]] = value;
     }
+    if (name === PS_STORED) nested[PS_STORED] = "";
     const items = script === void 0 ? read : scriptStdin(inner, lexer, read);
     const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
-    if (options.noexec !== void 0 && options.noexec !== "") markUnsure(calls);
+    if (options.noexec !== void 0 && options.noexec !== "" || name === PS_STORED) markUnsure(calls);
     return maybeShadowed(known, replaced(argv, subshell, shell, calls.map((call2) => ({
       ...call2,
       otherUser: call2.otherUser || parsed.otherUser,
@@ -5355,7 +5395,8 @@ async function transferOf(command2, cwd, state, sure = true) {
     const found = parse(call, state.env, state);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
+      const read = PS_STORED in call.env ? ["", raw[1], raw[2], raw[3], raw[4]] : raw;
+      const one = await endpoint(read, call.cwd, state, sure && call.unsure !== true);
       if (one !== void 0 && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];

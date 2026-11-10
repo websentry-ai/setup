@@ -90,6 +90,9 @@ const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh",
 const POWERSHELLS: ReadonlySet<string> = new Set(["powershell", "pwsh"]);
 /** Set in a command's env by `env -i`: nothing is inherited from the hook's environment. */
 const CLEAN_ENV = "\0clean";
+/** The program a PowerShell script block that is only stored is read through, and set in the env of what it runs: where
+ *  that goes has no direction, as it may never run. A NUL never reaches a real command line, so no command names it. */
+const PS_STORED = "\0stored";
 /** Set after eval or source, whose text may set any variable: one not set since then is unknown. */
 const UNKNOWN_ENV = "\0unknown";
 /** Set by set -a: "1" on, "" off, and a substitution when it may be either; plain assignments are then exported. */
@@ -2375,8 +2378,10 @@ function curlConfig(text: string): string[] {
   return args;
 }
 
-/** The command string `sh -c` or `powershell -Command` runs; undefined for any other command. */
+/** The command string `sh -c` or `powershell -Command` runs, or a stored PowerShell script block; undefined for any
+ *  other command. */
 function shellString(name: string, args: string[]): string | undefined {
+  if (name === PS_STORED) return args[0] === undefined ? undefined : powershellText(args[0]);
   if (SHELLS.has(name)) {
     const [i, letters] = shellFlags(args);
     return letters.has("c") && i < args.length ? args[i] : undefined;
@@ -2396,14 +2401,18 @@ function shellString(name: string, args: string[]): string | undefined {
 const PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
 /** A statement's leading exit, return, throw, break or continue, in any case. */
 const PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
+/** A PowerShell variable as written: $name, $scope:name or ${name}. */
+const PS_VARIABLE = /\$(\{[^}]*\}|[\w:?]+)/g;
 
 /** A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
  *  entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
  *  as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
- *  assigns from is read, in parentheses as well. A script block a statement assigns is only stored, so none of it is
- *  read; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is
- *  still read. */
-function powershellText(text: string): string {
+ *  assigns from is read, in parentheses as well. Its comments are dropped first. A script block a statement assigns is
+ *  only stored, so it is read apart, where it goes having no direction, unless the command names the variable again, as
+ *  to run it; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows
+ *  it is still read. */
+function powershellText(command: string): string {
+  const text = psUncommented(command);
   let out = "";
   let quote: string | undefined;
   let starts = true;
@@ -2414,8 +2423,19 @@ function powershellText(text: string): string {
     const found = starts ? PS_ASSIGNMENT.exec(text) : null;
     const jump = starts && depth > 0 ? PS_JUMP.exec(text) : null;
     starts = false;
+    if (found && found[1] !== undefined) {
+      const after = PS_ASSIGNMENT.lastIndex;
+      const end = hashtableEnd(text, after);
+      if (psNamedLater(found[0], text, end)) {
+        i = after - 1; // its { is read next, as a block that runs
+      } else {
+        out += `${PS_STORED} '${text.slice(after - 1, end).replace(/'/g, "'\\''")}'`;
+        i = end;
+      }
+      continue;
+    }
     if (found) {
-      i = found[1] !== undefined ? hashtableEnd(text, PS_ASSIGNMENT.lastIndex) : PS_ASSIGNMENT.lastIndex;
+      i = PS_ASSIGNMENT.lastIndex;
       continue;
     }
     if (jump) {
@@ -2447,6 +2467,37 @@ function powershellText(text: string): string {
     i++;
   }
   return out;
+}
+
+/** PowerShell text with each comment made a space: a <# #> block whole and a # to the end of its line, each only where
+ *  a word starts outside quotes, so a URL's #fragment or a quoted # stays. */
+function psUncommented(text: string): string {
+  let out = "";
+  let quote: string | undefined;
+  for (let i = 0; i < text.length; ) {
+    const word = quote === undefined && (out === "" || " \t\r\n;|&(){}".includes(out[out.length - 1] as string));
+    if (word && (text.startsWith("<#", i) || text[i] === "#")) {
+      const block = text.startsWith("<#", i);
+      const end = block ? text.indexOf("#>", i + 2) : text.indexOf("\n", i);
+      i = end < 0 ? text.length : block ? end + 2 : end;
+      out += " ";
+      continue;
+    }
+    const ch = text[i] as string;
+    quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** Whether the variable an assignment sets is named again in text from end, in any scope or case, as when the script
+ *  block stored in it is run. */
+function psNamedLater(assignment: string, text: string, end: number): boolean {
+  const name = (written: string): string =>
+    ((written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop() as string).toLowerCase();
+  const first = [...assignment.matchAll(PS_VARIABLE)][0]?.[1];
+  return first !== undefined && [...text.slice(end).matchAll(PS_VARIABLE)].some((m) => name(m[1] as string) === name(first));
 }
 
 /** The index after the } that closes a PowerShell @{ or { whose contents start at `start`, past quotes and nested
@@ -2646,10 +2697,11 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     for (const [option, value] of Object.entries(options)) {
       if (option !== "noexec") nested[SET_OPTIONS[option] as string] = value;
     }
+    if (name === PS_STORED) nested[PS_STORED] = "";
     const items = script === undefined ? read : scriptStdin(inner, lexer, read);
     const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
-    // zsh's spelling of -n, which bash rejects: it may not run them.
-    if (options.noexec !== undefined && options.noexec !== "") markUnsure(calls);
+    // zsh's spelling of -n, which bash rejects, or a script block only stored: it may not run them.
+    if ((options.noexec !== undefined && options.noexec !== "") || name === PS_STORED) markUnsure(calls);
     return maybeShadowed(known, replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
@@ -4285,7 +4337,9 @@ async function transferOf(
     const found = parse(call, state.env, state);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
+      // A script block only stored may never run: no direction.
+      const read: Raw = PS_STORED in call.env ? ["", raw[1], raw[2], raw[3], raw[4]] : raw;
+      const one = await endpoint(read, call.cwd, state, sure && call.unsure !== true);
       if (one !== undefined && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];

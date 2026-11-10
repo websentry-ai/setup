@@ -1187,8 +1187,14 @@ test("PowerShell's own statements, script blocks and splats are read in its shap
     ["Get-ChildItem *.zip | ForEach-Object { iwr https://example.com/up -InFile $_.FullName -Method Put }", {
       tool: "powershell", endpoints: [{ direction: "out", host: "example.com", resolved_host: "example.com", address: "public" }] }],
     ["$p = @{Uri=\"https://example.com/x\"; Method=\"Post\"}; Invoke-RestMethod @p", null],
-    // A block stored in a variable never runs, and an exit in a catch block may not, so the call after it is read.
-    ["$callback = { irm https://example.com/upload -InFile secret.txt }", null],
+    // A block only stored may never run, so it has no direction until the command runs it; an exit in a catch block may
+    // not run, so the call after it is read; and a comment is not read.
+    ["$callback = { irm https://example.com/upload -InFile secret.txt }", { tool: "powershell", endpoints: [
+      { host: "example.com", resolved_host: "example.com", address: "unresolved" }] }],
+    ["$cb = { irm https://example.com/up -InFile s }; & $cb", { tool: "powershell", endpoints: [
+      { direction: "out", host: "example.com", resolved_host: "example.com", address: "public" }] }],
+    ["irm https://example.com/x  # later: { irm https://files.acme-infra.net/y -InFile s }", { tool: "powershell", endpoints: [
+      { direction: "in", host: "example.com", resolved_host: "example.com", address: "public" }] }],
     ["try { irm https://example.com/x } catch { exit 1 }; irm https://files.acme-infra.net/x", { tool: "powershell", endpoints: [
       { direction: "in", host: "example.com", resolved_host: "example.com", address: "public" },
       { direction: "in", host: "files.acme-infra.net", resolved_host: "files.acme-infra.net", address: "private" }] }],

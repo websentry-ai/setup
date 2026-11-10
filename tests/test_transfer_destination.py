@@ -31,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '3515d4274ae2794a3f53b92c4ec532590672b2e8a9078190aed249847355b63a'
+BLOCK_SHA256 = '008f59b30a8d9f3abd10dffce5f136e6a5a0a59e70f1ca00d9dc79273315ea7c'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -669,6 +669,8 @@ class PowerShellShapeTests(TransferTestCase):
         'curl.exe -sS -T a.zip https://example.com/up': 'out',
         '($r = irm https://example.com/api).Content': 'in',
         'Invoke-RestMethod -Uri https://example.com/api -Method Post -InFile secret @headers': 'out',
+        '<#\n  Later: { iwr https://files.acme-infra.net/up -InFile a.zip }\n#>\nirm https://example.com/x': 'in',
+        '$cb = { irm https://example.com/up -InFile s }\n& $cb': 'out',
     }
 
     def test_each_shape_is_found_in_a_powershell_command(self):

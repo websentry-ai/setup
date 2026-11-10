@@ -3853,6 +3853,9 @@ _TRANSFER_SHELLS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash'})
 _TRANSFER_POWERSHELLS = frozenset({'powershell', 'pwsh'})
 # Set in a command's env by `env -i`: nothing is inherited from the hook's environment.
 _TRANSFER_CLEAN_ENV = '\0clean'
+# The program a PowerShell script block that is only stored is read through, and set in the env of what it runs: where
+# that goes has no direction, as it may never run. A NUL never reaches a real command line, so no command names it.
+_TRANSFER_PS_STORED = '\0stored'
 # Set after eval or source, whose text may set any variable: one not set since then is unknown.
 _TRANSFER_UNKNOWN_ENV = '\0unknown'
 # Set by set -a: '1' on, '' off, and a substitution when it may be either; plain assignments are then exported.
@@ -5833,7 +5836,10 @@ def _transfer_shell_flags(args: List[str]) -> tuple:
 
 
 def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
-    """The command string `sh -c` or `powershell -Command` runs; None for any other command."""
+    """The command string `sh -c` or `powershell -Command` runs, or a stored PowerShell script block; None for any other
+    command."""
+    if program == _TRANSFER_PS_STORED:
+        return _transfer_powershell_text(args[0]) if args else None
     if program in _TRANSFER_SHELLS:
         i, letters = _transfer_shell_flags(args)[:2]
         return args[i] if 'c' in letters and i < len(args) else None
@@ -5852,22 +5858,34 @@ _TRANSFER_PS_ASSIGNMENT = re.compile(
     r'([ \t\r\n]*\{)?')
 # A statement's leading exit, return, throw, break or continue, in any case.
 _TRANSFER_PS_JUMP = re.compile(r'[ \t]*(?:exit|return|throw|break|continue)(?![\w-])', re.IGNORECASE | re.ASCII)
+# A PowerShell variable as written: $name, $scope:name or ${name}.
+_TRANSFER_PS_VARIABLE = re.compile(r'\$(\{[^}]*\}|[\w:?]+)')
 
 
 def _transfer_powershell_text(text: str) -> str:
     """A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
     entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
     as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
-    assigns from is read, in parentheses as well. A script block a statement assigns is only stored, so none of it is
-    read; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is
-    still read."""
+    assigns from is read, in parentheses as well. Its comments are dropped first. A script block a statement assigns is
+    only stored, so it is read apart, where it goes having no direction, unless the command names the variable again, as
+    to run it; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows
+    it is still read."""
+    text = _transfer_ps_uncommented(text)
     out, i, quote, starts, depth = [], 0, None, True, 0
     while i < len(text):
         found = _TRANSFER_PS_ASSIGNMENT.match(text, i) if starts else None
         jump = _TRANSFER_PS_JUMP.match(text, i) if starts and depth else None
         starts = False
+        if found and found.group(1):
+            end = _transfer_hashtable_end(text, found.end())
+            if _transfer_ps_named_later(found.group(0), text, end):
+                i = found.end() - 1  # its { is read next, as a block that runs
+            else:
+                out.append(_TRANSFER_PS_STORED + " '" + text[found.end() - 1:end].replace("'", "'\\''") + "'")
+                i = end
+            continue
         if found:
-            i = _transfer_hashtable_end(text, found.end()) if found.group(1) else found.end()
+            i = found.end()
             continue
         if jump:
             i = jump.end()  # what follows it, such as the pipeline a return passes on, still runs
@@ -5892,6 +5910,34 @@ def _transfer_powershell_text(text: str) -> str:
         out.append(ch)
         i += 1
     return ''.join(out)
+
+
+def _transfer_ps_uncommented(text: str) -> str:
+    """PowerShell text with each comment made a space: a <# #> block whole and a # to the end of its line, each only
+    where a word starts outside quotes, so a URL's #fragment or a quoted # stays."""
+    out, i, quote = [], 0, None
+    while i < len(text):
+        word = not quote and (not out or out[-1] in ' \t\r\n;|&(){}')
+        if word and text.startswith(('<#', '#'), i):
+            block = text.startswith('<#', i)
+            end = text.find('#>', i + 2) if block else text.find('\n', i)
+            i = len(text) if end < 0 else end + 2 if block else end
+            out.append(' ')
+            continue
+        ch = text[i]
+        quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _transfer_ps_named_later(assignment: str, text: str, end: int) -> bool:
+    """Whether the variable an assignment sets is named again in text from end, in any scope or case, as when the
+    script block stored in it is run."""
+    first = _TRANSFER_PS_VARIABLE.search(assignment)
+    names = [(var[1:-1] if var[:1] == '{' else var).rsplit(':', 1)[-1].lower()
+             for var in [first.group(1) if first else ''] + _TRANSFER_PS_VARIABLE.findall(text, end)]
+    return bool(first) and names[0] in names[1:]
 
 
 def _transfer_hashtable_end(text: str, i: int) -> int:
@@ -6080,9 +6126,12 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         options = _transfer_shell_flags(args)[2] if program in _TRANSFER_SHELLS else {}
         nested = {k: v for k, v in env.items() if k not in _TRANSFER_SET_OPTIONS.values()}
         nested.update((_TRANSFER_SET_OPTIONS[name], value) for name, value in options.items() if name != 'noexec')
+        if program == _TRANSFER_PS_STORED:
+            nested[_TRANSFER_PS_STORED] = ''
         calls = [] if options.get('noexec') == '1' else _transfer_walk(items, cwd, nested, depth + 1, positional)
-        if options.get('noexec'):
-            _transfer_unsure_calls(calls)  # zsh's spelling of -n, which bash rejects: it may not run them
+        if options.get('noexec') or program == _TRANSFER_PS_STORED:
+            # zsh's spelling of -n, which bash rejects, or a script block only stored: it may not run them.
+            _transfer_unsure_calls(calls)
         calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) + call[6:] for call in calls]
     else:
         calls = [(program, args, env, cwd, other_user, (layer,), False)] if program else []
@@ -7593,6 +7642,8 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             for raw in (found[1] if found else []):
                 if len(endpoints) >= _TRANSFER_MAX_ENDPOINTS:
                     break
+                if _TRANSFER_PS_STORED in env:
+                    raw = ('',) + tuple(raw[1:])  # a script block only stored may never run: no direction
                 endpoint = _transfer_endpoint(raw, call_cwd, state, sure and not unsure)
                 if endpoint and endpoint not in endpoints:
                     endpoints.append(endpoint)
