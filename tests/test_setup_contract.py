@@ -392,7 +392,8 @@ class TestAScriptRunStopsItselfBeforeTheWatchdog:
         module = load_module(relpath)
         clock, touched = [1000.0], []
         monkeypatch.setattr(module.time, "time", lambda: clock[0])
-        monkeypatch.setattr(module, "_SCRIPT_START", clock[0] - 590)
+        # 200s before the stop: enough for one PUT, not for the config request and walk ahead of it.
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0] - 400)
         monkeypatch.setattr(module, "_run_as_user", lambda *a, **k: touched.append("walk"))
         monkeypatch.setattr(module, "_backfill_force_config", lambda *a: touched.append("config") or (None, None))
         with module._backfill_soft_stop(module.BACKFILL_SOFT_STOP_SECONDS):

@@ -50,6 +50,8 @@ _SCRIPT_START = time.time()
 BACKFILL_SOFT_STOP_SECONDS = 600
 SWEEP_ONLY_SOFT_STOP_SECONDS = 480  # without --backfill onboard's watchdog is 600s, not 720s
 BACKFILL_FROM_S3_RESERVE_SECONDS = 40
+# What a re-walk needs before its first chunk: the config request's retries (about 66s) and the walk itself.
+BACKFILL_START_MARGIN_SECONDS = 120
 _backfill_stop_at: Optional[float] = None
 # Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
 # the hook already wrote.
@@ -1897,8 +1899,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
             return
-        if _backfill_out_of_run_time():
-            # Before the config request and the walk, which are not free either.
+        if _backfill_run_seconds_left() < BACKFILL_PUT_MIN_SECONDS + BACKFILL_START_MARGIN_SECONDS:
+            # The config request and the walk come before the first chunk and are not free either.
             print("[backfill] Skipped — no time left in this run; history is sent on the next run.")
             return
 
