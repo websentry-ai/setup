@@ -19,6 +19,7 @@ import sqlite3
 from datetime import datetime
 import tempfile
 import urllib.parse
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Tuple, List, Optional, Dict
 try:
@@ -47,6 +48,7 @@ BACKFILL_PUT_MIN_SECONDS = 45  # with less than this left of it, no further atte
 # Run as a script (onboard's 720s per-tool watchdog), the backfill stops itself here; the packaged binary sets no stop.
 _SCRIPT_START = time.time()
 BACKFILL_SOFT_STOP_SECONDS = 600
+SWEEP_ONLY_SOFT_STOP_SECONDS = 480  # without --backfill onboard's watchdog is 600s, not 720s
 BACKFILL_FROM_S3_RESERVE_SECONDS = 40
 _backfill_stop_at: Optional[float] = None
 # Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
@@ -1862,12 +1864,13 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids - dropped), chunks_sent, chunks_total - chunks_sent
 
 
-def _run_backfill_until_soft_stop(*run_backfill_args) -> None:
-    """main()'s backfill: it stops itself before onboard's per-tool watchdog would kill the installer."""
+@contextmanager
+def _backfill_soft_stop(soft_stop_seconds: int):
+    """For main()'s uploads: they stop themselves before onboard's per-tool watchdog would kill the installer."""
     global _backfill_stop_at
-    _backfill_stop_at = _SCRIPT_START + BACKFILL_SOFT_STOP_SECONDS
+    _backfill_stop_at = _SCRIPT_START + soft_stop_seconds
     try:
-        run_backfill(*run_backfill_args)
+        yield
     finally:
         _backfill_stop_at = None
 
@@ -2023,8 +2026,13 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
                 for session in sessions:
                     session['device_serial'] = device_serial
             historical = bool(result.get('first_run') and seed_history)
-            sent, _, failed = _backfill_send_sessions(
-                api_key, backend_url, sessions, backfilled=historical)
+            try:
+                sent, _, failed = _backfill_send_sessions(
+                    api_key, backend_url, sessions, backfilled=historical)
+            except _BackfillOutOfTime:
+                # The cutoff stays where it was, so the next sweep sends these again.
+                print("[visual-studio] Out of time; the rest goes on the next run.")
+                break
             # Anything not delivered must leave the cutoff where it is.
             if failed or sent < len(sessions):
                 debug_print("visual studio: %d of %d session(s) delivered for %s, retrying next run"
@@ -2845,12 +2853,14 @@ def main():
     # delivery those turns get, while the re-walk replays history that keeps.
     # Seeding rides --backfill, as the re-walk does for every other tool; without the
     # flag the sweep stays on its one-day window.
-    if success:
-        run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
-                                device_serial=device_id, seed_history=backfill_mode)
+    # One stop for both: the sweep's uploads count against the same watchdog as the re-walk's.
+    with _backfill_soft_stop(BACKFILL_SOFT_STOP_SECONDS if backfill_mode else SWEEP_ONLY_SOFT_STOP_SECONDS):
+        if success:
+            run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
+                                    device_serial=device_id, seed_history=backfill_mode)
 
-    if success and backfill_mode:
-        _run_backfill_until_soft_stop(api_key, base_url, user_homes, script_text)
+        if success and backfill_mode:
+            run_backfill(api_key, base_url, user_homes, script_text)
 
     return success
 

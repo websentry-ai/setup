@@ -330,7 +330,7 @@ class TestEveryBackfillUploadSurvivesASlowUplink:
 MDM_BACKFILLERS = [s for s in BACKFILLERS if "/mdm/" in s]
 
 
-SOFT_STOPPERS = [s for s in MDM_BACKFILLERS if _has(s, "_run_backfill_until_soft_stop")]
+SOFT_STOPPERS = [s for s in MDM_BACKFILLERS if _has(s, "_backfill_soft_stop")]
 
 
 def test_the_soft_stopper_inventory_is_codex_and_copilot():
@@ -344,7 +344,7 @@ class TestAScriptRunStopsItselfBeforeTheWatchdog:
     which has no watchdog, is left unbounded."""
 
     @staticmethod
-    def _run(module, monkeypatch, capsys, runner_name, chunk_seconds):
+    def _run(module, monkeypatch, capsys, as_script, chunk_seconds):
         """(chunks sent, homes whose cutoff was saved, output) for four one-session chunks."""
         from pathlib import Path
         clock = [1000.0]
@@ -369,13 +369,18 @@ class TestAScriptRunStopsItselfBeforeTheWatchdog:
         monkeypatch.setattr(module, "_run_as_user", run_as_user)
         monkeypatch.setattr(module, "_backfill_force_config", lambda *a: (None, None))
         monkeypatch.setattr(module, "_backfill_upload_chunk", upload)
-        getattr(module, runner_name)("key", "https://backend", [("alice", Path("/home/alice"))])
+        homes = [("alice", Path("/home/alice"))]
+        if as_script:
+            with module._backfill_soft_stop(module.BACKFILL_SOFT_STOP_SECONDS):
+                module.run_backfill("key", "https://backend", homes)
+        else:
+            module.run_backfill("key", "https://backend", homes)
         return sent, cutoffs, capsys.readouterr().out
 
     def test_the_script_stops_before_a_chunk_that_no_longer_fits_and_keeps_its_cutoff(
             self, relpath, monkeypatch, capsys):
         module = load_module(relpath)
-        sent, cutoffs, out = self._run(module, monkeypatch, capsys, "_run_backfill_until_soft_stop", 200)
+        sent, cutoffs, out = self._run(module, monkeypatch, capsys, True, 200)
         # 200s a chunk against a 600s stop less 40s for from-s3: the fourth would start with none left.
         assert sent == [["s0"], ["s1"], ["s2"]]
         assert cutoffs == []
@@ -384,7 +389,7 @@ class TestAScriptRunStopsItselfBeforeTheWatchdog:
 
     def test_the_packaged_binary_path_is_left_unbounded(self, relpath, monkeypatch, capsys):
         module = load_module(relpath)
-        sent, cutoffs, out = self._run(module, monkeypatch, capsys, "run_backfill", 200)
+        sent, cutoffs, out = self._run(module, monkeypatch, capsys, False, 200)
         assert sent == [["s0"], ["s1"], ["s2"], ["s3"]]
         assert cutoffs == ["alice"]
         assert "queued 4 past sessions" in out

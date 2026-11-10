@@ -14,6 +14,7 @@ import subprocess
 import hashlib
 import json
 import shlex
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 try:
@@ -2263,12 +2264,13 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
 
 
-def _run_backfill_until_soft_stop(*run_backfill_args) -> None:
-    """main()'s backfill: it stops itself before onboard's per-tool watchdog would kill the installer."""
+@contextmanager
+def _backfill_soft_stop(soft_stop_seconds: int):
+    """For main()'s uploads: they stop themselves before onboard's per-tool watchdog would kill the installer."""
     global _backfill_stop_at
-    _backfill_stop_at = _SCRIPT_START + BACKFILL_SOFT_STOP_SECONDS
+    _backfill_stop_at = _SCRIPT_START + soft_stop_seconds
     try:
-        run_backfill(*run_backfill_args)
+        yield
     finally:
         _backfill_stop_at = None
 
@@ -2620,7 +2622,8 @@ def main():
                               hook_hash=hook_script_hash(_installed_hook_script()), install_mode="mdm")
 
     if success and backfill_mode:
-        _run_backfill_until_soft_stop(api_key, base_url, get_all_user_homes())
+        with _backfill_soft_stop(BACKFILL_SOFT_STOP_SECONDS):
+            run_backfill(api_key, base_url, get_all_user_homes())
 
     return success
 
