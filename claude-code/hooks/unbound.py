@@ -9147,8 +9147,7 @@ def _account_repo_of(url: str) -> Optional[str]:
 def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
     """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
 
-    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file;
-    skipping them to find the subcommand is not the same as honouring them."""
+    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file."""
     folder, passed, overrides = cwd, dict(env or {}), {}
     i = 0
     while i < len(args):
@@ -9475,8 +9474,8 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 
 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
-    """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser for
-    it, so kubectl reads it; the jsonpath names three fields, so no credential is ever in the output."""
+    """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
+    for it, so kubectl reads it, and the jsonpath names only the fields kept."""
     context = _account_flag(args, ('--context',))
     kubeconfig = _account_flag(args, ('--kubeconfig',)) or _account_setting('KUBECONFIG', env) or ''
     # Exactly the two fields kept, so no credential from the `users` block is ever in the output to begin with.
@@ -9514,8 +9513,8 @@ def _account_docker_registry(image: str) -> str:
 def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the registry a docker call reached, and the AWS account an ECR hostname names outright, no repository).
 
-    No credential helper is run: a Mac with the login inline in `auths` has no helper to ask, and `auths[].auth`
-    is the base64 of a username and password. The hostname is the stronger signal anyway and costs nothing."""
+    No credential helper is run, and the stored login is never read; the hostname is the stronger signal and is
+    already in the command."""
     subcommand, after = _account_subcommand(args, _ACCOUNT_DOCKER_VALUE_OPTIONS)
     if subcommand not in _ACCOUNT_DOCKER_REGISTRY:
         return [], None

@@ -20,7 +20,7 @@ HOOK_PATHS = [
 HOOKS = [load_module(p) for p in HOOK_PATHS]
 # Not real credentials; they only have to sit where one goes.
 FAKE_SECRET = 'Zx9' + 'Qw8Er7Ty6Ui5Op4As3Df2Gh1Jk0LzXcVbNm'  # gitleaks:allow
-ECR_HOST = '228304386839.dkr.ecr.us-west-2.amazonaws.com'
+ECR_HOST = '210987654321.dkr.ecr.us-west-2.amazonaws.com'
 
 AWS_CONFIG = '''[default]
 region = us-west-2
@@ -295,7 +295,7 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('docker push %s/app:1' % ECR_HOST):
             self.assertEqual(resolved['accounts'], [
                 {'platform': 'docker', 'registry': ECR_HOST, 'source': 'hostname'},
-                {'platform': 'aws', 'account_id': '228304386839', 'source': 'hostname'}], path)
+                {'platform': 'aws', 'account_id': '210987654321', 'source': 'hostname'}], path)
         self.assertEqual(self.runs(), [])
 
     def test_no_credential_helper_is_ever_executed(self):
