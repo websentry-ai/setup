@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'ee9f5176d7cf0869add3def6cf2a3aef3012b2aa25c7cf1dd4f38c486b299e1a'
+BLOCK_SHA256 = '937be34fff6a27a5fdb7cc01f4aa6a07d5c101b556b842438e6b389ae82e583f'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -217,6 +217,31 @@ class AccountResolutionTests(unittest.TestCase):
                 for path, resolved in self.each('git push'):
                     self.assertEqual(resolved['pushed_repo'], 'acme/chosen', '%s via %s' % (path, setting))
 
+    def test_a_subcommands_own_option_is_not_read_as_gits(self):
+        """`git commit -C <commit>` reuses that commit's message; it is not git's global `-C <dir>`."""
+        for path, resolved in self.each('git commit -C HEAD~1 --amend'):
+            self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
+        # Nothing ran in a folder the option named, because it never named one.
+        for entry in self._run_entries():
+            self.assertEqual(os.path.realpath(entry['cwd']), os.path.realpath(self.repo))
+
+    def test_a_committer_identity_set_from_a_substitution_is_unknown(self):
+        """It is set to something this process cannot see, which is not the same as unset."""
+        for path, resolved in self.each('GIT_COMMITTER_EMAIL=$(id -un)@acme.com git commit -m wip'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_token_with_a_literal_prefix_and_a_substitution_is_still_a_token(self):
+        for path, resolved in self.each('GH_TOKEN=gho_$(cat ~/.suffix) gh pr list'):
+            self.assertIsNone(resolved, path)
+
+    def test_gh_reads_the_host_from_the_checkouts_own_remote(self):
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.origin.url'] = 'git@github.acme.com:acme/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('gh pr list'):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+                self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
+
     def test_an_optional_value_flag_does_not_swallow_the_remote(self):
         """`--force-with-lease` takes an optional value, so bare the next word is the remote."""
         for flag in ('--force-with-lease', '--signed'):
@@ -391,7 +416,9 @@ class AccountResolutionTests(unittest.TestCase):
         state = {}
         for _ in range(20):
             self.resolve(hook, 'gh pr list', state)
-        self.assertEqual(self.runs(), [['gh', 'config', 'get', '-h', 'github.com', 'user']])
+        # Two questions, each asked once: which host the checkout points at, and who is signed in there.
+        self.assertEqual(self.runs(), [['git', 'config', '--get', 'remote.origin.url'],
+                                       ['gh', 'config', 'get', '-h', 'github.com', 'user']])
 
     def test_only_allowlisted_commands_are_ever_run(self):
         hook = HOOKS[0]
