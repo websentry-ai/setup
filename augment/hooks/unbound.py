@@ -7555,11 +7555,19 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         if program is None:
             return None
         # Only the remembered names are carried from the command text, so nothing else it set can steer the run.
-        passed = {name: value for name, value in (env or {}).items()
-                  if name in _ACCOUNT_REMEMBERED and _account_value(value)}
+        passed, dropped = {}, []
+        for name, value in (env or {}).items():
+            if name not in _ACCOUNT_REMEMBERED:
+                continue
+            if _account_value(value):
+                passed[name] = value
+            else:
+                # The command's shell unset it, so the hook's own value must not reach the child either.
+                dropped.append(name)
+        child = {key: value for key, value in os.environ.items() if key not in dropped}
         result = subprocess.run([program] + argv[1:], cwd=cwd if isinstance(cwd, str) else None,
                                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                                env={**os.environ, **passed, **_ACCOUNT_RUN_ENV},
+                                env={**child, **passed, **_ACCOUNT_RUN_ENV},
                                 timeout=min(_ACCOUNT_RUN_TIMEOUT, remaining))
         return result.stdout if result.returncode == 0 else None
     except Exception:
@@ -7626,25 +7634,6 @@ def _account_setting(name: str, env: Dict) -> Optional[str]:
     return _account_known(name, env)[0]
 
 
-def _account_exports(shell: Dict, state: Dict) -> None:
-    """Remember what this call exported, so a later call in the same turn resolves against it as the shell would."""
-    try:
-        carried = {}
-        for name, value in _transfer_exported(shell).items():
-            if name not in _ACCOUNT_REMEMBERED:
-                continue
-            if value == _TRANSFER_SUBSTITUTED:
-                # Dropping it would read as "no token set", which credits the call to the stored login.
-                carried[name] = _TRANSFER_SUBSTITUTED
-            elif _account_value(value):
-                carried[name] = value.strip()
-        if _TRANSFER_UNKNOWN_ENV in shell.get('vars', {}):
-            carried[_TRANSFER_UNKNOWN_ENV] = ''
-        state['account_env'] = carried
-    except Exception:
-        pass
-
-
 def _account_host_of(url: str) -> Optional[str]:
     """The host a git remote URL names, for an https, ssh or scp-style address; None when it names none."""
     text = url.strip().rstrip('/')
@@ -7689,7 +7678,8 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
         arg, value = args[i], args[i + 1] if i + 1 < len(args) else None
         pair = arg.split('=', 1)
         if arg == '-C' and value is not None:
-            folder = value if os.path.isabs(value) else os.path.join(folder or '', value)
+            # A relative one needs a folder to resolve against; with none, every lookup here is refused anyway.
+            folder = value if os.path.isabs(value) else os.path.join(folder, value) if folder else None
             i += 2
             continue
         if arg == '-c' and value is not None:
@@ -7846,7 +7836,8 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     email, known = _account_known('GIT_COMMITTER_EMAIL', env)
     if not known:
         return [], None
-    email = email or _account_git_config('user.email', cwd, env, state, overrides)
+    for setting in ('committer.email', 'user.email'):
+        email = email or _account_git_config(setting, cwd, env, state, overrides)
     return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), (
         (repo, remote) if repo else None)
 
@@ -8090,13 +8081,10 @@ _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
 _ACCOUNT_TRIGGERS = re.compile(
-    r'(?<![\w.-])(%s)(?![\w.-])|(?<![A-Z_])(%s)(?![A-Z_])|(?<![\w.-])(source|eval)(?![\w.-])'
-    r'|(?:^|[;&|(]\s*)\.\s'
-    % ('|'.join(sorted(_ACCOUNT_HANDLERS)), '|'.join(sorted(_ACCOUNT_REMEMBERED))))
+    r'(?<![\w.-])(%s)(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)))
 
 
-def _accounts(command: Optional[str], cwd: Optional[str], state: Dict,
-              persistent: bool = False) -> Optional[Dict]:
+def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
     """The accounts a shell call acted as, and the repository a push reached; None when it names no platform.
     Never raises and never outlasts the turn's budget."""
     try:
@@ -8104,8 +8092,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict,
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
             return None
-        seeded = dict(state.get('account_env') or {}) if persistent else {}
-        shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, seeded, 0)
+        # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
+        # and the hook's ambient environment decide who ran it.
+        shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
         found, pushed = [], None
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             handler = _ACCOUNT_HANDLERS.get(program)
@@ -8118,8 +8107,6 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict,
                 if account not in found and len(found) < _ACCOUNT_MAX:
                     found.append(account)
             pushed = pushed or reached
-        if persistent:
-            _account_exports(shell, state)
         resolved = {}
         if found:
             resolved['accounts'] = found
