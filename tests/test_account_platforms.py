@@ -532,6 +532,32 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'], [{'platform': 'kubernetes', 'server': 'https://k8s.example.com',
                                                      'source': 'command'}], path)
 
+    def test_a_web_identity_profile_takes_its_role_from_the_environment_first(self):
+        """botocore lets AWS_ROLE_ARN override a web-identity profile's own role, unless --profile names it."""
+        config = Path(tempfile.mkdtemp(), 'config')
+        config.write_text('[profile wid]\nrole_arn = arn:aws:iam::111111111111:role/ci\n'
+                          'web_identity_token_file = /tmp/token\n')
+        env = {'AWS_CONFIG_FILE': str(config), 'AWS_ROLE_ARN': 'arn:aws:iam::555555555555:role/deploy',
+               'AWS_WEB_IDENTITY_TOKEN_FILE': '/tmp/other-token'}
+        with patch.dict(os.environ, env):
+            for path, resolved in self.each('AWS_PROFILE=wid aws s3 ls'):
+                self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
+            for path, resolved in self.each('aws s3 ls --profile wid'):
+                self.assertEqual(resolved['accounts'][0]['account_id'], '111111111111', path)
+
+    def test_klog_flags_and_a_double_dash_do_not_hide_kubectl_config(self):
+        """Older kubectl takes klog's on/off flags, and `--` ends cobra's search, so neither reaches a cluster."""
+        for command in ('kubectl --logtostderr config set-cluster prod --server=https://eks.example.com',
+                        'kubectl --alsologtostderr config set-cluster prod --server=https://eks.example.com',
+                        'kubectl -- config view', 'kubectl -- config set-cluster prod --server=https://x'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('kubectl get pods', self.repo, state)
+            hook._accounts('kubectl --logtostderr config use-context staging', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '87ed502eeb8344bd6d2f91887311564c9a84f4485cbdbe374b98af7e2e04d8a2'
+BLOCK_SHA256 = '081b59c15cf1ed28b5b48bf22f9cf26acc02d7032cfcba60ce70f48df8526d2a'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -243,7 +243,31 @@ class AccountResolutionTests(unittest.TestCase):
         with patch.dict(os.environ, {'GH_TOKEN': FAKE_TOKEN}):
             for path, resolved in self.each('gh pr list'):
                 self.assertIsNone(resolved, path)
-        self.assertEqual(self.runs(), [])
+        # gh's own login is never asked for; only the checkout's remote is read, to learn which host it is.
+        self.assertEqual([argv for argv in self.runs() if argv[0] == 'gh'], [])
+
+    def test_a_token_for_the_other_kind_of_host_leaves_the_login_known(self):
+        """gh reads GH_TOKEN for github.com only, and GH_ENTERPRISE_TOKEN for an enterprise host only."""
+        with patch.dict(os.environ, {'GH_ENTERPRISE_TOKEN': FAKE_TOKEN}):
+            for path, resolved in self.each('gh api user'):
+                self.assertEqual(resolved['accounts'][0]['login'], 'jdoe', path)
+            for path, resolved in self.each('gh api user --hostname github.acme.com'):
+                self.assertIsNone(resolved, path)
+        with patch.dict(os.environ, {'GH_TOKEN': FAKE_TOKEN}):
+            for path, resolved in self.each('gh api user --hostname github.acme.com'):
+                self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', path)
+        # GITHUB_TOKEN reaches an enterprise host too inside a codespace, so it leaves that login unknown.
+        with patch.dict(os.environ, {'GITHUB_TOKEN': FAKE_TOKEN}):
+            for path, resolved in self.each('gh api user --hostname github.acme.com'):
+                self.assertIsNone(resolved, path)
+
+    def test_an_unreadable_indexed_config_pair_refuses_the_lookup(self):
+        """A substituted GIT_CONFIG_KEY_n may override the committer, so nothing is read from the file instead."""
+        for command in ('GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=$(cat k) GIT_CONFIG_VALUE_0=me@x.com git commit -m a',
+                        'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email GIT_CONFIG_VALUE_0=$(cat v) git commit -m a'):
+            for path, resolved in self.each(command):
+                self.assertNotIn('accounts', resolved or {}, '%s / %s' % (path, command))
+        self.assertEqual([argv for argv in self.runs() if argv[:2] == ['git', 'config']], [])
 
     # -- the push remote follows git's own order -------------------------------
 
@@ -463,7 +487,7 @@ class AccountResolutionTests(unittest.TestCase):
         """`GH_TOKEN=$(...)` signs the call in as whoever owns it, which cannot be read offline."""
         for path, resolved in self.each('GH_TOKEN=$(cat ~/.work-token) gh pr create'):
             self.assertIsNone(resolved, path)
-        self.assertEqual(self.runs(), [])
+        self.assertEqual([argv for argv in self.runs() if argv[0] == 'gh'], [])
 
     def test_a_command_that_cleared_its_environment_does_not_inherit_ours(self):
         """`env -i` means the child sees nothing this process holds, so our own committer must not stand in."""
@@ -696,6 +720,16 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertEqual(acme.get('accounts'), [], path)
             hook._accounts('gh auth switch', self.repo, state)
             self.assertEqual(dotcom.get('accounts'), [], path)
+
+    def test_a_hostname_before_auth_still_marks_the_switch(self):
+        """gh, like any cobra CLI, takes options before its subcommand: `gh --hostname X auth switch`."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            dotcom = hook._accounts('gh api user', self.repo, state)
+            acme = hook._accounts('gh api user --hostname github.acme.com', self.repo, state)
+            hook._accounts('gh --hostname github.acme.com auth switch --user bot', self.repo, state)
+            self.assertEqual(dotcom['accounts'][0]['login'], 'jdoe', path)
+            self.assertEqual(acme.get('accounts'), [], path)
 
     def test_a_login_read_in_one_folder_is_not_reused_in_another(self):
         """A relative GH_CONFIG_DIR names a different config in each folder, so each folder is asked."""

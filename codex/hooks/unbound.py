@@ -7634,7 +7634,10 @@ _ACCOUNT_GH_REPO_SCOPED = frozenset({'pr', 'issue', 'repo', 'run', 'workflow', '
 # forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
 _ACCOUNT_GH_SWITCHES = frozenset({'--web', '--draft', '--fill', '--yes', '--comments'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
-_ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
+# gh reads the first pair for github.com and *.ghe.com, the second for any other host (and GITHUB_TOKEN there too
+# inside a codespace).
+_ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN')
+_ACCOUNT_GHE_TOKENS = ('GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GITHUB_TOKEN')
 # git subcommands that reach a remote, and those that write a commit the committer identity goes into.
 _ACCOUNT_GIT_REMOTE = frozenset({'push', 'fetch', 'pull', 'clone', 'ls-remote', 'archive'})
 _ACCOUNT_GIT_COMMITS = frozenset({'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'commit-tree'})
@@ -7663,9 +7666,9 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             return None
         if argv[:1] == ['git'] and not isinstance(cwd, str):
             return None
-        for name in _ACCOUNT_CONFIG_STEERING:
-            value = (env or {}).get(name)
-            if isinstance(value, str) and _TRANSFER_SUBSTITUTED in value:
+        for name, value in (env or {}).items():
+            if ((name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG))
+                    and isinstance(value, str) and _TRANSFER_SUBSTITUTED in value):
                 return None
         if argv[0] in _ACCOUNT_CONFIG_EXECUTORS and any(
                 name in (env or {}) for name in _ACCOUNT_CONFIG_LOCATIONS):
@@ -8177,11 +8180,6 @@ def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optio
 
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the GitHub account a gh call acted as, no repository); empty when a token in the environment signs it in."""
-    # A value the walk could not read is not an absent one: it still signs the call in as whoever owns it.
-    for name in _ACCOUNT_GH_TOKENS:
-        value, known = _account_known(name, env)
-        if value or not known:
-            return [], None
     # A repository the command names is resolved against gh's own host, not against whatever this folder
     # happens to point at; only a call that names none falls back to the checkout's remote.
     repo_named, readable = _account_gh_repo(args, env)
@@ -8201,7 +8199,13 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     ) or fallback or 'github.com'
     if not host:
         return [], None
-
+    lowered = host.lower()
+    dotcom = lowered in ('github.com', 'github.localhost') or lowered.endswith(('.github.com', '.ghe.com'))
+    for name in (_ACCOUNT_GH_TOKENS if dotcom else _ACCOUNT_GHE_TOKENS):
+        # A value the walk could not read is not an absent one: it still signs the call in as whoever owns it.
+        value, known = _account_known(name, env)
+        if value or not known:
+            return [], None
     # Keyed by folder too: a relative GH_CONFIG_DIR or XDG_CONFIG_HOME names a different config in each.
     login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
                                 ('gh-user', host, cwd, _account_env_key(env)))
@@ -8236,33 +8240,34 @@ def _account_aws_web_identity(env: Dict) -> tuple:
 
 
 def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) -> tuple:
-    """(the account of the role the profile assumes, the account it names, whether the file settled it)."""
+    """(the account of the role the profile assumes, the account it names, whether the file settled it, whether the
+    profile is a web-identity one)."""
     def resolve():
         import configparser
         named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
         if not known:
-            return None, None, False
+            return None, None, False, False
         if named and not os.path.isabs(named):
             # The CLI opens a relative path from the folder the call ran in; with that unknown, so is the file.
             if not isinstance(cwd, str):
-                return None, None, False
+                return None, None, False, False
             named = os.path.join(cwd, named)
         home = _account_home(env)
         path = named or (os.path.join(home, '.aws', 'config') if home else None)
         text = _account_file(path)
         if text is None:
-            return None, None, False
+            return None, None, False, False
         parser = configparser.RawConfigParser()
         try:
             parser.read_string(text)
         except Exception:
-            return None, None, False
+            return None, None, False, False
         section = 'default' if profile == 'default' else 'profile %s' % profile
         if not parser.has_section(section):
             # It may live only in the credentials file, which the hook never opens; the CLI, asked for this
             # profile by name, answers for it or fails.
-            return None, None, False
-        role = None
+            return None, None, False, False
+        role, web = None, parser.has_option(section, 'web_identity_token_file')
         if parser.has_option(section, 'role_arn'):
             match = _ACCOUNT_ROLE_ARN.match((parser.get(section, 'role_arn') or '').strip())
             role = match.group(1) if match else None
@@ -8270,9 +8275,9 @@ def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) 
             if parser.has_option(section, key):
                 found = _account_value(parser.get(section, key))
                 if found and _ACCOUNT_AWS_ID.match(found):
-                    return role, found, True
+                    return role, found, True, web
         # The profile names no account itself — static keys, say — so only a role or the CLI can say.
-        return role, None, bool(role)
+        return role, None, bool(role), web
 
     return _account_once(state, ('aws-file', profile, cwd, _account_env_key(env)), resolve)
 
@@ -8298,11 +8303,22 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     # `--profile default` would fail where no config file exists.
     chosen = bool(named) or any(_account_known(name, env, _account_path)[0]
                                 for name in ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'))
-    role, hint, settled = _account_aws_file(profile, env, cwd, state)
-    web, web_known = (None, True) if named else _account_aws_web_identity(env)
+    role, hint, settled, web_profile = _account_aws_file(profile, env, cwd, state)
+    role_source = 'file'
+    if web_profile and not named:
+        # botocore takes a web-identity profile's role from AWS_ROLE_ARN first, unless --profile named the profile.
+        arn, arn_known = _account_known('AWS_ROLE_ARN', env)
+        if not arn_known:
+            return [], None
+        if arn:
+            match = _ACCOUNT_ROLE_ARN.match(arn)
+            if not match:
+                return [], None
+            role, role_source = match.group(1), 'command'
+    web, web_known = (None, True) if named or web_profile else _account_aws_web_identity(env)
     if not role and not web_known:
         return [], None
-    account, source = role or web or hint, 'file' if role or not web else 'command'
+    account, source = role or web or hint, role_source if role else ('command' if web else 'file')
     if account is None and not settled:
         found = _account_first_line(
             ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']
@@ -8406,8 +8422,9 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
-    if _account_kube_subcommand(args)[0] == 'config':
-        # `kubectl config …` edits the local kubeconfig; even `set-cluster --server` reaches no cluster.
+    if _account_cobra_subcommand(args, _ACCOUNT_KUBE_SWITCHES)[0] in ('', 'config'):
+        # With no subcommand kubectl prints help, and `kubectl config …` edits the local kubeconfig; even
+        # `set-cluster --server` reaches no cluster.
         return [], None
     server, server_known = _account_option(args, ('--server', '-s'))
     if not server_known:
@@ -8503,31 +8520,43 @@ _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws
 
 # kubectl's options that take no value; cobra takes any other written without `=` to carry one.
 _ACCOUNT_KUBE_SWITCHES = frozenset({'--insecure-skip-tls-verify', '--match-server-version', '--warnings-as-errors',
-                                    '--disable-compression', '-h', '--help'})
+                                    '--disable-compression', '-h', '--help',
+                                    # klog's, which older kubectl releases still take.
+                                    '--logtostderr', '--alsologtostderr', '--add-dir-header', '--one-output',
+                                    '--skip-headers', '--skip-log-headers'})
 # The `kubectl config` subcommands that only read; every other one can move what the current context reaches.
 _ACCOUNT_KUBE_CONFIG_READS = frozenset({'', 'view', 'current-context', 'get-contexts', 'get-clusters', 'get-users'})
 # az's options that can come before its command group, with the value each takes.
 _ACCOUNT_AZ_VALUE_OPTIONS = frozenset({'-o', '--output', '--query', '--subscription'})
 
 
-def _account_kube_subcommand(args: List[str]) -> tuple:
-    """(kubectl's subcommand, the words after it), skipping options as cobra does when it looks for one."""
+def _account_cobra_subcommand(args: List[str], switches: frozenset) -> tuple:
+    """(the subcommand, the words after it), found as cobra finds one: an option written without `=` that is not
+    one of `switches` takes the next word as its value, and `--` ends the search."""
     i = 0
     while i < len(args):
         arg = args[i]
+        if arg == '--':
+            break
         if arg.startswith('-'):
-            takes = '=' not in arg and arg not in _ACCOUNT_KUBE_SWITCHES and (arg.startswith('--') or len(arg) == 2)
+            takes = '=' not in arg and arg not in switches and (arg.startswith('--') or len(arg) == 2)
             i += 2 if takes else 1
             continue
         return arg, args[i + 1:]
     return '', []
 
 
+# gh's options that take no value where they can come before a subcommand.
+_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'-h', '--help', '--version'})
+
+
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
     """The platform whose active account this call changes for the rest of the turn, or None."""
-    words = [arg for arg in args if not arg.startswith('-')]
-    if program == 'gh' and words[:2] in (['auth', 'switch'], ['auth', 'login'], ['auth', 'logout']):
-        return 'github'
+    if program == 'gh':
+        group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
+        if group == 'auth' and _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0] in (
+                'switch', 'login', 'logout'):
+            return 'github'
     if program == 'git':
         subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
         keys = [at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]
@@ -8540,8 +8569,9 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
                 or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
             return 'git'
     if program == 'kubectl':
-        subcommand, after = _account_kube_subcommand(args)
-        if subcommand == 'config' and _account_kube_subcommand(after)[0] not in _ACCOUNT_KUBE_CONFIG_READS:
+        subcommand, after = _account_cobra_subcommand(args, _ACCOUNT_KUBE_SWITCHES)
+        if subcommand == 'config' and (
+                _account_cobra_subcommand(after, _ACCOUNT_KUBE_SWITCHES)[0] not in _ACCOUNT_KUBE_CONFIG_READS):
             return 'kubernetes'
     if program == 'az':
         group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
