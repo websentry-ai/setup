@@ -8292,6 +8292,10 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     profile = named or _account_aws_env_profile(env)
     if not profile:
         return [], None
+    # Whether anything chose a profile; with none, the CLI's own chain answers, instance roles included, and
+    # `--profile default` would fail where no config file exists.
+    chosen = bool(named) or any(_account_known(name, env, _account_path)[0]
+                                for name in ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'))
     role, hint, settled = _account_aws_file(profile, env, cwd, state)
     web, web_known = (None, True) if named else _account_aws_web_identity(env)
     if not role and not web_known:
@@ -8299,7 +8303,8 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     account, source = role or web or hint, 'file' if role or not web else 'command'
     if account is None and not settled:
         found = _account_first_line(
-            ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text', '--profile', profile],
+            ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']
+            + (['--profile', profile] if chosen else []),
             cwd, env, state, ('aws-sts', profile, cwd, _account_env_key(env)))
         account, source = (found if found and _ACCOUNT_AWS_ID.match(found) else None), 'command'
     if not account:
@@ -8399,7 +8404,7 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
-    if [arg for arg in args if not arg.startswith('-')][:1] == ['config']:
+    if _account_subcommand(args, _ACCOUNT_KUBE_VALUE_OPTIONS)[0] == 'config':
         # `kubectl config …` edits the local kubeconfig; even `set-cluster --server` reaches no cluster.
         return [], None
     context, known = _account_option(args, ('--context',))
@@ -8494,6 +8499,14 @@ _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws
                      'az': _account_azure, 'kubectl': _account_kubernetes, 'docker': _account_docker}
 
 
+# kubectl's global options that take a value, so its subcommand is found past them.
+_ACCOUNT_KUBE_VALUE_OPTIONS = frozenset({
+    '--kubeconfig', '--context', '--cluster', '--user', '-n', '--namespace', '-s', '--server', '--token', '--as',
+    '--as-group', '--as-uid', '--request-timeout', '--certificate-authority', '--client-certificate',
+    '--client-key', '--tls-server-name', '--cache-dir', '-v', '--v', '--log-dir', '--log-file',
+})
+
+
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
     """The platform whose active account this call changes for the rest of the turn, or None."""
     words = [arg for arg in args if not arg.startswith('-')]
@@ -8502,13 +8515,18 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
     if program == 'git':
         subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
         keys = [at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]
-        # A set or an unset changes it; `git config user.email` alone only reads it.
+        # A set or an unset changes it, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
+        # `git config user.email` alone, or `git config get`, only reads it.
+        verb = after[0].lower() if after and not after[0].startswith('-') else ''
         if subcommand == 'config' and keys and (
-                any(arg.startswith('--unset') for arg in after)
-                or any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys)):
+                verb in ('set', 'unset')
+                or any(arg.startswith('--unset') for arg in after)
+                or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
             return 'git'
-    if program == 'kubectl' and words[:2] == ['config', 'use-context']:
-        return 'kubernetes'
+    if program == 'kubectl':
+        subcommand, after = _account_subcommand(args, _ACCOUNT_KUBE_VALUE_OPTIONS)
+        if subcommand == 'config' and _account_subcommand(after, _ACCOUNT_KUBE_VALUE_OPTIONS)[0] == 'use-context':
+            return 'kubernetes'
     if program == 'az' and (words[:2] == ['account', 'set'] or words[:1] == ['login']):
         return 'azure'
     return None

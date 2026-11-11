@@ -472,6 +472,26 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('kubectl config set-cluster prod --server=https://eks.example.com'):
             self.assertIsNone(resolved, path)
 
+    def test_the_sts_fallback_names_no_profile_when_the_call_chose_none(self):
+        """With no config file, `--profile default` fails where the instance role would have answered."""
+        config = Path(tempfile.mkdtemp(), 'absent')
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            with patch.dict(os.environ, {'AWS_CONFIG_FILE': str(config)}):
+                open(self.run_log, 'w').close()
+                hook._accounts('aws s3 ls', self.repo, {})
+                sts = [argv for argv in self.runs() if argv[:2] == ['aws', 'sts']]
+                self.assertTrue(sts, path)
+                self.assertNotIn('--profile', sts[0], path)
+
+    def test_a_context_switch_behind_a_global_option_is_still_a_switch(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('kubectl get pods', self.repo, state)
+            hook._accounts('kubectl --kubeconfig /tmp/a config use-context staging', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+        for path, resolved in self.each('kubectl --kubeconfig /tmp/a config set-cluster prod --server=https://x'):
+            self.assertIsNone(resolved, path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

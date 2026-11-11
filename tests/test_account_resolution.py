@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'c55b13b1a159771923806cd1f44cfe49fc13e741cdea729048fbeac8e2b091a7'
+BLOCK_SHA256 = '931afee37f52a2858362e5dc4fc641768fb78090f9b843f35db58e1c21cee08f'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -751,6 +751,20 @@ class AccountResolutionTests(unittest.TestCase):
             before = hook._accounts("GIT_CONFIG_PARAMETERS=\"'core.pager'='cat'\" git commit -m one", self.repo, state)
             hook._accounts('git config user.email work@acme.com', self.repo, state)
             self.assertEqual(before.get('accounts'), [], path)
+
+    def test_git_s_set_and_unset_verbs_are_switches_too(self):
+        """git 2.46 spells them `git config set|unset`; `git config get` only reads."""
+        for switch in ('git config unset user.email', 'git config set user.email work@acme.com'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('git commit -m one', self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, switch))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('git config get user.email', self.repo, state)
+            self.assertEqual(before['accounts'][0]['email'], 'jdoe@gmail.com', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
