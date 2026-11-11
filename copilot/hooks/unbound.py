@@ -9987,8 +9987,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             return None
         empty_git_config = bool(_ACCOUNT_EMPTY_GIT_CONFIG.search(command))
         steered = {''.join(names).upper() for names in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        # Resolves nothing, but its switches still count, as for a call that may not have run.
         if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
-            return None
+            sure = False
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
