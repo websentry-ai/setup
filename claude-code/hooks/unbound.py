@@ -10079,20 +10079,24 @@ _ACCOUNT_TRIGGERS = re.compile(
     r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
 # PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
 # SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
+# `GIT_CONFIG_GLOBAL=` set empty makes git read no global file, while `unset` makes it read the default one; the
+# walk sees both as empty, so a git call after an explicit empty one is not resolved.
+_ACCOUNT_EMPTY_GIT_CONFIG = re.compile(r'(?<![\w$])GIT_CONFIG_(?:GLOBAL|SYSTEM)=(?=\s|$|[;&|)]|""|\'\')')
 _ACCOUNT_POWERSHELL_ENV = re.compile(
     r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
     r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-(?:Literal)?Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
     r'|SetEnvironmentVariable\(\s*[\'"]([A-Za-z_]\w*)', re.IGNORECASE)
 
 
-def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
-    """The accounts a shell call acted as, and the repository a push reached; None when it names no platform.
-    Never raises and never outlasts the turn's budget."""
+def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: bool = True) -> Optional[Dict]:
+    """The accounts a shell call acted as, and the repository a push reached; None when it names no platform. A call
+    that may not have run (`sure` false) resolves nothing but still counts as a switch. Never raises."""
     try:
         if not isinstance(command, str) or not command.strip():
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
             return None
+        empty_git_config = bool(_ACCOUNT_EMPTY_GIT_CONFIG.search(command))
         steered = {''.join(names).upper() for names in _ACCOUNT_POWERSHELL_ENV.findall(command)}
         if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
             return None
@@ -10128,12 +10132,18 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             handler = _ACCOUNT_HANDLERS.get(program)
             # A call that only may have run tells us nothing about who ran it, one run as another user resolves
             # that user's configuration and not the hook's, and one past a source or eval resolves nothing.
-            if handler is None or unsure or other_user or _account_beyond_reading(env):
+            if handler is None or unsure or not sure or other_user or _account_beyond_reading(env):
+                continue
+            if program == 'git' and empty_git_config:
                 continue
             accounts, reached = handler(args, env, call_cwd, state)
             for account in accounts:
                 active = account.pop('_active', False)
-                if account not in found and len(found) < _ACCOUNT_MAX:
+                if account in found:
+                    if not active:
+                        # Named outright by this call too, so a later switch no longer decides it.
+                        taken[:] = [item for item in taken if not (item[1] is found and item[2] == account)]
+                elif len(found) < _ACCOUNT_MAX:
                     found.append(account)
                     # Registered under its platform, or under each selector named when more than one can move it.
                     for key in (active if isinstance(active, tuple) else (account['platform'],) if active else ()):
