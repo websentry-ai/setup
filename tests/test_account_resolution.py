@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'e508396208a78709dc990dc718b44b6b708e3e57964656217c72ed421914ad90'
+BLOCK_SHA256 = '379e63772066416470ed047ff3cc874c9d9046253cfed505afeee32537af33cc'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -62,14 +62,21 @@ if args[:2] == ['config', '--get']:
         print(answers[name])
         sys.exit(0)
     sys.exit(1)
-if args[:2] == ['ls-remote', '--get-url']:
-    # git applies `url.<base>.insteadOf` here without connecting; FAKE_GIT_ANSWERS['insteadof'] maps base to base.
-    url = args[2]
-    for want, have in answers.get('insteadof', {{}}).items():
-        if url.startswith(have):
-            url = want + url[len(have):]
-            break
-    print(url)
+if args[:2] == ['remote', '-v']:
+    # A remote named through the indexed config, its push URL rewritten as git does: pushInsteadOf first, then
+    # insteadOf. FAKE_GIT_ANSWERS['pushinsteadof'] / ['insteadof'] map the replacement base to the matched one.
+    for n in range(int(os.environ.get('GIT_CONFIG_COUNT') or 0)):
+        key = os.environ.get('GIT_CONFIG_KEY_%d' % n, '')
+        if key.startswith('remote.') and key.endswith('.url'):
+            name, url = key[len('remote.'):-len('.url')], os.environ.get('GIT_CONFIG_VALUE_%d' % n, '')
+            pushed = url
+            for table in ('pushinsteadof', 'insteadof'):
+                hit = next(((w, h) for w, h in answers.get(table, {{}}).items() if url.startswith(h)), None)
+                if hit:
+                    pushed = hit[0] + url[len(hit[1]):]
+                    break
+            print('%s\t%s (fetch)' % (name, url))
+            print('%s\t%s (push)' % (name, pushed))
     sys.exit(0)
 if args[:3] == ['remote', 'get-url', '--push']:
     # Keyed by folder as well as remote, so a `-C` that is ignored answers for the wrong checkout.
@@ -646,6 +653,46 @@ class AccountResolutionTests(unittest.TestCase):
         for command in ('git.exe commit -m wip', 'Gh.exe pr list'):
             for path, resolved in self.each(command):
                 self.assertIsNotNone(resolved, '%s / %s' % (path, command))
+
+    def test_a_push_to_a_url_follows_push_specific_rewrites_first(self):
+        """git applies `pushInsteadOf` before `insteadOf` for a push."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['pushinsteadof'] = {'https://github.com/work/': 'https://github.com/acme/'}
+        answers['insteadof'] = {'https://github.com/personal/': 'https://github.com/acme/'}
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git push https://github.com/acme/app.git main'):
+                self.assertEqual(resolved['pushed_repo'], 'work/app', path)
+
+    def test_a_later_switch_in_the_turn_leaves_earlier_calls_unknown(self):
+        """Accounts are read when the turn ends, so the call before `gh auth switch` would get the switched login."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('gh pr list', self.repo, state)
+            hook._accounts('gh auth switch --user acme-bot', self.repo, state)
+            after = hook._accounts('gh pr create', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+            self.assertEqual(after['accounts'][0]['login'], 'jdoe', path)
+
+    def test_a_committer_set_later_in_the_turn_leaves_the_earlier_commit_unknown(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('git config user.email work@acme.com', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+
+    def test_a_turn_with_no_switch_keeps_every_account(self):
+        """Reading the committer setting is not a switch."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('git config user.email', self.repo, state)
+            self.assertEqual(before['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_a_fetch_or_clone_records_no_committer(self):
+        """Neither makes a commit, so no committer acted."""
+        for command in ('git fetch origin', 'git clone https://github.com/acme/app.git'):
+            for path, resolved in self.each(command):
+                self.assertNotIn('accounts', resolved or {}, '%s / %s' % (path, command))
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
