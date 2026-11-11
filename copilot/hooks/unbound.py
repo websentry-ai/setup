@@ -9884,8 +9884,9 @@ def _account_cobra_subcommand(args: List[str], switches: frozenset) -> tuple:
     return '', []
 
 
-# gh's options that take no value where they can come before a subcommand.
-_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'-h', '--help', '--version'})
+# gh's options that take no value where they can come before a subcommand. Not `-h`: gh reads it there as the
+# subcommand's own `-h`, so `gh -h <host> auth status` names a host.
+_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'--help', '--version'})
 
 
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
@@ -9939,7 +9940,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             switched = _account_switches(program, args)
             if switched:
                 # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
-                host = _account_option(args, ('--hostname', '-h'))[0] if switched == 'github' else None
+                host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None
                 hit = [item for item in taken
                        if item[0] == switched and (host is None or str(item[2].get('host')).lower() == host.lower())]
                 for _platform, accounts, account in hit:
