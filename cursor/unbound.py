@@ -8080,7 +8080,8 @@ def _account_aws_env_profile(env: Dict) -> Optional[str]:
     """The profile the environment selects, in botocore's order: AWS_DEFAULT_PROFILE, AWS_PROFILE, else default;
     None when one of them cannot be read."""
     for name in ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'):
-        value, known = _account_known(name, env)
+        # A profile name may hold spaces, so it is read as a path rather than a one-word identity.
+        value, known = _account_known(name, env, _account_path)
         if not known:
             return None
         if value:
@@ -8108,7 +8109,7 @@ def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
         named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
         if not known or (named and not os.path.isabs(named)):
             # Relative to a folder we do not own, so which file the call read is unknown.
-            return None, False
+            return None, None, False
         home = _account_home(env)
         path = named or (os.path.join(home, '.aws', 'config') if home else None)
         text = _account_file(path)
@@ -8139,8 +8140,8 @@ def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
 
 def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the AWS account a call acted as, no repository); the file answers in about a millisecond, the CLI in 1,327."""
-    # botocore's chain: the environment's keys (an explicit --profile turns them off), the profile's role,
-    # a web-identity role, then the account the profile names.
+    # botocore's chain: the environment's keys, the profile's role, the environment's web-identity role, then
+    # the account the profile names. An explicit --profile turns both environment sources off.
     named, known = _account_option(args, ('--profile',))
     if not known:
         return [], None
@@ -8152,7 +8153,7 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     if not profile:
         return [], None
     role, hint, settled = _account_aws_file(profile, env, state)
-    web, web_known = _account_aws_web_identity(env)
+    web, web_known = (None, True) if named else _account_aws_web_identity(env)
     if not role and not web_known:
         return [], None
     account, source = role or web or hint, 'file' if role or not web else 'command'

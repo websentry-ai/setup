@@ -284,11 +284,27 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
 
     def test_a_web_identity_role_signs_the_call_in_ahead_of_the_profile(self):
-        """botocore assumes the role these name ahead of the profile's own account, explicit `--profile` or not."""
+        """botocore assumes the role these name ahead of the profile's own account."""
         web = 'AWS_ROLE_ARN=arn:aws:iam::999999999999:role/ci AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/t '
-        for command in (web + 'aws s3 ls', web + 'aws s3 ls --profile home'):
-            for path, resolved in self.each(command):
-                self.assertEqual(resolved['accounts'][0]['account_id'], '999999999999', '%s / %s' % (path, command))
+        for path, resolved in self.each(web + 'aws s3 ls'):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '999999999999', path)
+
+    def test_an_explicit_profile_turns_the_environment_web_identity_off(self):
+        """botocore sets `disable_env_vars` when a profile is named, so the profile answers."""
+        web = 'AWS_ROLE_ARN=arn:aws:iam::999999999999:role/ci AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/t '
+        for path, resolved in self.each(web + 'aws s3 ls --profile home'):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
+
+    def test_an_unreadable_config_file_drops_only_the_aws_account(self):
+        """The other platforms on the same command still resolve."""
+        for path, resolved in self.each('docker push %s/app:1; AWS_CONFIG_FILE=./config aws s3 ls' % ECR_HOST):
+            self.assertEqual(resolved['accounts'][0]['registry'], ECR_HOST, path)
+
+    def test_a_profile_name_with_a_space_is_that_profile_not_the_default(self):
+        config = Path(tempfile.mkdtemp(), 'config')
+        config.write_text('[profile my profile]\nsso_account_id = 555555555555\n')
+        for path, resolved in self.each("AWS_CONFIG_FILE=%s AWS_PROFILE='my profile' aws s3 ls" % config):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
     def test_half_a_web_identity_pair_is_not_web_identity(self):
         """botocore needs both variables; one alone leaves the profile to answer."""
