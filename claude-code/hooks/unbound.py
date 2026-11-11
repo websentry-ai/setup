@@ -9001,7 +9001,14 @@ _ACCOUNT_GH_REPO_SCOPED = frozenset({'pr', 'issue', 'repo', 'run', 'workflow', '
                                      'secret', 'variable', 'browse', 'ruleset', 'attestation'})
 # gh options that take no value, so the word after one is still an operand (`gh pr view --web <url>`). Long
 # forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
-_ACCOUNT_GH_SWITCHES = frozenset({'--web', '--draft', '--fill', '--yes', '--comments'})
+_ACCOUNT_GH_SWITCHES = frozenset({
+    '--web', '--draft', '--fill', '--fill-first', '--fill-verbose', '--yes', '--comments', '--approve',
+    '--request-changes', '--squash', '--merge', '--rebase', '--auto', '--disable-auto', '--admin', '--delete-branch',
+    '--detach', '--force', '--undo', '--dry-run', '--editor', '--watch', '--exit-status', '--log', '--log-failed',
+    '--verbose', '--prerelease', '--latest', '--clobber',
+})
+# gh options whose value is text, so a URL after one is a title or a body and never the operand.
+_ACCOUNT_GH_TEXT_OPTIONS = frozenset({'--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
 # gh reads the first pair for github.com and *.ghe.com, the second for any other host (and GITHUB_TOKEN there too
 # inside a codespace).
@@ -9226,6 +9233,15 @@ def _account_git_subcommand(args: List[str]) -> tuple:
     return '', []
 
 
+def _account_config_key(name: str) -> str:
+    """A git configuration key as git compares it: section and variable case-insensitive, the subsection exact."""
+    section, _, rest = name.strip().partition('.')
+    subsection, dot, variable = rest.rpartition('.')
+    if not rest:
+        return section.lower()
+    return '.'.join([section.lower()] + ([subsection] if dot else []) + [variable.lower()])
+
+
 def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
     """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
 
@@ -9245,7 +9261,7 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
         if arg == '-c' and value is not None:
             name, _, setting = value.partition('=')
             if name and _:
-                overrides[name.strip().lower()] = setting
+                overrides[_account_config_key(name)] = setting
             i += 2
             continue
         if pair[0] == '--config-env':
@@ -9254,7 +9270,7 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
             if name and _:
                 held, known = _account_known(variable, env)
                 # An override we cannot read still overrides, so the setting is unknown rather than the file's.
-                overrides[name.strip().lower()] = held if known else _TRANSFER_SUBSTITUTED
+                overrides[_account_config_key(name)] = held if known else _TRANSFER_SUBSTITUTED
             i += 1 if len(pair) == 2 else 2
             continue
         for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
@@ -9287,9 +9303,9 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
     """(one git configuration value, whether it is readable); a `-c` override wins, else git's own precedence."""
     if _account_includes(overrides):
         return None, False
-    if name.lower() in (overrides or {}):
+    if _account_config_key(name) in (overrides or {}):
         # Overridden to something we cannot read: the file's value no longer applies, so git's is unknown.
-        override = (overrides or {}).get(name.lower())
+        override = (overrides or {}).get(_account_config_key(name))
         value = None if override == _TRANSFER_SUBSTITUTED else _account_value(override)
         return (value, True) if value else (None, False)
     return _account_first_line(['git', 'config', '--get', name], cwd, env, state,
@@ -9431,8 +9447,12 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
         # option carried its value with `=` or takes none.
         before = args[at - 1] if at else ''
         # An option is never the operand, `--body=<url>` included, and neither is the value after one.
-        if arg.startswith('-') or (
-                before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES):
+        if arg.startswith('-'):
+            continue
+        if before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES:
+            if '://' in arg and before not in _ACCOUNT_GH_TEXT_OPTIONS:
+                # An option we cannot place may take no value, making this URL where the call acts.
+                return None, False
             continue
         if '://' in arg:
             if _account_host_of(arg):

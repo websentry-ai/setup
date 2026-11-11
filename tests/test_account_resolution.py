@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '483404600ace0f1be6fd021e1ee8fd6d7dde9c6bbda1ab43f9bc3924464a7fcf'
+BLOCK_SHA256 = '72128c95e6a8d1c1e1af4f7fb56e6144ce5d4e020a9e896159af0408fbc456f3'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -621,6 +621,28 @@ class AccountResolutionTests(unittest.TestCase):
                         'gh pr view --repo=github.acme.com/acme/app 1'):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
+
+    def test_a_url_after_a_no_value_flag_is_the_operand(self):
+        """`--approve`, `--squash` and the like take no value, so the PR URL after one names the host."""
+        for command in ('gh pr review --approve https://github.acme.com/acme/app/pull/5',
+                        'gh pr merge --squash --delete-branch https://github.acme.com/acme/app/pull/5'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
+
+    def test_a_url_after_an_option_we_cannot_place_leaves_the_host_unknown(self):
+        """Whether an unfamiliar option takes a value decides where the call acts, so the login is not guessed."""
+        for path, resolved in self.each('gh pr merge -s https://github.acme.com/acme/app/pull/5'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_branch_override_applies_only_to_the_branch_it_names(self):
+        """git compares a key's subsection exactly: `branch.feature.*` does not configure branch `Feature`."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['branch'] = 'Feature'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git -c branch.feature.pushRemote=personal push'):
+                self.assertEqual(resolved['pushed_remote'], 'origin', path)
+            for path, resolved in self.each('git -c branch.Feature.PUSHREMOTE=personal push'):
+                self.assertEqual(resolved['pushed_remote'], 'personal', path)
 
     def test_the_last_repository_a_gh_call_names_wins(self):
         """gh's own parser keeps the last `-R`, so an override appended to a command is the one that ran."""
