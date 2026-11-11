@@ -8033,10 +8033,13 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
     if program == 'git':
         subcommand, after = _account_git_subcommand(args)
         keys = [at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]
-        # A set or an unset changes it; `git config user.email` alone only reads it.
+        # A set or an unset changes it, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
+        # `git config user.email` alone, or `git config get`, only reads it.
+        verb = after[0].lower() if after and not after[0].startswith('-') else ''
         if subcommand == 'config' and keys and (
-                any(arg.startswith('--unset') for arg in after)
-                or any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys)):
+                verb in ('set', 'unset')
+                or any(arg.startswith('--unset') for arg in after)
+                or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
             return 'git'
     return None
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
