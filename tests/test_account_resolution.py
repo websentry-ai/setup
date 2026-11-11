@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'eabbbd55cc8b8b42ab76b513ff933cafa1e139ea063904b1507a779e8874777f'
+BLOCK_SHA256 = 'b2d1c3e29c8b3eeec54461748261dff4a6a2033410c46abf157a288636d6fd66'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -197,6 +197,14 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertEqual(resolved['pushed_remote'], 'personal', path)
         for path, resolved in self.each('git push'):
             self.assertEqual(resolved['pushed_remote'], 'origin', path)
+
+    def test_a_positional_repository_beats_dash_dash_repo(self):
+        """git: when both `--repo` and a repository argument are given, the argument wins."""
+        for command in ('git push --repo=origin personal main', 'git push --repo origin personal main'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['pushed_remote'], 'personal', '%s / %s' % (path, command))
+        for path, resolved in self.each('git push --repo=personal'):
+            self.assertEqual(resolved['pushed_remote'], 'personal', path)
 
     def test_the_push_url_loses_the_trailing_slash_git_returns(self):
         for path, resolved in self.each('git push personal main'):
@@ -643,6 +651,13 @@ class AccountResolutionTests(unittest.TestCase):
                 self.assertEqual(resolved['pushed_remote'], 'origin', path)
             for path, resolved in self.each('git -c branch.Feature.PUSHREMOTE=personal push'):
                 self.assertEqual(resolved['pushed_remote'], 'personal', path)
+
+    def test_a_body_that_looks_like_an_option_is_still_text(self):
+        """`--body '--repo=…'` posts that text; it does not move the call to another repository."""
+        for command in ("gh pr comment 12 --body '--repo=github.acme.com/acme/app'",
+                        "gh issue create --title '--hostname=github.acme.com' --body x"):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
 
     def test_the_last_repository_a_gh_call_names_wins(self):
         """gh's own parser keeps the last `-R`, so an override appended to a command is the one that ran."""
