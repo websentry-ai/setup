@@ -9017,7 +9017,7 @@ _ACCOUNT_DOCKER_GROUPS = frozenset({'image'})
 # What a registry-less image name is published to.
 _ACCOUNT_DOCKER_DEFAULT = 'docker.io'
 # docker's own options that take a value, so the image is not read out of one.
-_ACCOUNT_DOCKER_VALUE_OPTIONS = frozenset({'--context', '-H', '--host', '--config', '--log-level', '--tlscacert',
+_ACCOUNT_DOCKER_VALUE_OPTIONS = frozenset({'--context', '-c', '-H', '--host', '--config', '--log-level', '-l', '--tlscacert',
                                            '--tlscert', '--tlskey', '--platform', '-u', '--username', '-p',
                                            '--password'})
 # Separates the fields asked of kubectl in one go, because none of them may contain it.

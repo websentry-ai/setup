@@ -328,6 +328,12 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('kubectl logs pod -since=1h'):
             self.assertNotEqual((resolved or {}).get('accounts', [{}])[0].get('server'), 'ince=1h', path)
 
+    def test_docker_short_global_options_take_their_value(self):
+        """`-c` is `--context` and `-l` is `--log-level`; their value is not the subcommand."""
+        for command in ('docker -c prod push %s/app:1' % ECR_HOST, 'docker -l debug push %s/app:1' % ECR_HOST):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['registry'], ECR_HOST, '%s / %s' % (path, command))
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
