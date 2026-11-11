@@ -7887,33 +7887,30 @@ def _account_push_url_of(url: str, cwd: Optional[str], env: Dict, state: Dict) -
 
 
 def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
-    """(the accounts a git call acted as, the repository a push reached); both empty for a purely local call."""
+    """(the accounts a git call acted as, the repositories a push reached); both empty for a purely local call."""
     subcommand, after = _account_git_subcommand(args)
     if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
         return [], None
     cwd, env, overrides = _account_git_context(args, cwd, env)
-    repo, remote = None, None
+    pushed = []
     rewired = _account_includes(overrides) or any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
         remote, reachable = _account_push_remote(after, cwd, env, state, overrides)
         # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
         # remote in that case, so none is recorded.
-        repo = _account_repo_of(remote) if remote else None
-        if not reachable:
-            repo, remote = None, None
-        elif repo:
+        if reachable and remote and _account_repo_of(remote):
             rewritten = _account_push_url_of(remote, cwd, env, state)
             # A probe that failed says nothing about where the rules sent the push, so it stays unknown.
-            repo, remote = (_account_repo_of(rewritten) if rewritten else None), None
-        else:
-            url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
-                                      ('git-push-url', remote, cwd, _account_env_key(env)))
-            # The URL says where the push went, which is a destination and not an account; the trailing slash
-            # git returns for a bare host would otherwise make two spellings of one repository.
-            repo = _account_repo_of(url) if url else None
+            repo = _account_repo_of(rewritten) if rewritten else None
+            pushed = [(repo, None)] if repo else []
+        elif reachable and remote:
+            # A remote with several push URLs pushes to every one of them, so each is a destination. The trailing
+            # slash git returns for a bare host would otherwise make two spellings of one repository.
+            urls = _account_once(state, ('git-push-urls', remote, cwd, _account_env_key(env)), lambda: _account_run(
+                ['git', 'remote', 'get-url', '--push', '--all', remote], cwd, env, state))
+            pushed = [(repo, remote) for repo in (_account_repo_of(url) for url in (urls or '').splitlines()) if repo]
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
-    pushed = (repo, remote) if repo else None
     if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
         # fetch, clone, ls-remote and archive make no commit, so no committer acted.
         return [], pushed
@@ -8150,8 +8147,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
                     found.append(account)
                     if active:
                         taken.append((account['platform'], found, account))
-            if reached and reached not in pushes:
-                pushes.append(reached)
+            for push in reached or []:
+                if push not in pushes:
+                    pushes.append(push)
         resolved = {}
         if found:
             resolved['accounts'] = found
