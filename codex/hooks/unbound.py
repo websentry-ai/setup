@@ -8068,8 +8068,12 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
+# Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
-    r'(?<![\w.-])(%s)(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)))
+    r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
+# A PowerShell `$env:NAME = …` sets a variable the shell walk does not model, so a call after one that sets an
+# identity or configuration name cannot be resolved from what the walk sees.
+_ACCOUNT_POWERSHELL_ENV = re.compile(r'\$env:([A-Za-z_]\w*)\s*=', re.IGNORECASE)
 
 
 def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
@@ -8079,6 +8083,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         if not isinstance(command, str) or not command.strip():
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
+            return None
+        steered = {name.upper() for name in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
             return None
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
         # and the hook's ambient environment decide who ran it.

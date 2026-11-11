@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '62ad8c360123c6b6219d460ba45acb71dce7cc049d86b49984f4775bb2cb7c98'
+BLOCK_SHA256 = '257eb797485c9bf12f10e77601a3a2a10c305ecf8fdfe85b36f3e1dcf040f1ec'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -632,6 +632,20 @@ class AccountResolutionTests(unittest.TestCase):
         with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
             for path, resolved in self.each('git push https://github.com/acme/app.git main'):
                 self.assertEqual(resolved['pushed_repo'], 'personal/app', path)
+
+    def test_a_powershell_assignment_of_an_identity_leaves_the_call_unknown(self):
+        """`$env:GH_TOKEN = …` signs gh in, and the shell walk does not model PowerShell's assignments."""
+        for path, resolved in self.each("$env:GH_TOKEN = 'x'; gh pr create"):
+            self.assertIsNone(resolved, path)
+        # An assignment of a name that decides nothing leaves the call resolvable.
+        for path, resolved in self.each("$env:NODE_ENV = 'test'; gh pr create"):
+            self.assertEqual(resolved['accounts'][0]['login'], 'jdoe', path)
+
+    def test_the_windows_executable_names_are_still_git_and_gh(self):
+        """`git.exe` and `Gh.exe` are the same programs the walk already lowercases and strips."""
+        for command in ('git.exe commit -m wip', 'Gh.exe pr list'):
+            for path, resolved in self.each(command):
+                self.assertIsNotNone(resolved, '%s / %s' % (path, command))
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
