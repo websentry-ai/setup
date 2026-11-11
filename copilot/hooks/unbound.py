@@ -9318,7 +9318,10 @@ _ACCOUNT_GH_REPO_SCOPED = frozenset({'pr', 'issue', 'repo', 'run', 'workflow', '
 # forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
 _ACCOUNT_GH_SWITCHES = frozenset({'--web', '--draft', '--fill', '--yes', '--comments'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
-_ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
+# gh reads the first pair for github.com and *.ghe.com, the second for any other host (and GITHUB_TOKEN there too
+# inside a codespace).
+_ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN')
+_ACCOUNT_GHE_TOKENS = ('GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GITHUB_TOKEN')
 # git subcommands that reach a remote, and those that write a commit the committer identity goes into.
 _ACCOUNT_GIT_REMOTE = frozenset({'push', 'fetch', 'pull', 'clone', 'ls-remote', 'archive'})
 _ACCOUNT_GIT_COMMITS = frozenset({'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'commit-tree'})
@@ -9345,9 +9348,9 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             return None
         if argv[:1] == ['git'] and not isinstance(cwd, str):
             return None
-        for name in _ACCOUNT_CONFIG_STEERING:
-            value = (env or {}).get(name)
-            if isinstance(value, str) and _TRANSFER_SUBSTITUTED in value:
+        for name, value in (env or {}).items():
+            if ((name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG))
+                    and isinstance(value, str) and _TRANSFER_SUBSTITUTED in value):
                 return None
         program = _transfer_executable(argv[0])
         if program is None:
@@ -9802,11 +9805,6 @@ def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optio
 
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the GitHub account a gh call acted as, no repository); empty when a token in the environment signs it in."""
-    # A value the walk could not read is not an absent one: it still signs the call in as whoever owns it.
-    for name in _ACCOUNT_GH_TOKENS:
-        value, known = _account_known(name, env)
-        if value or not known:
-            return [], None
     # A repository the command names is resolved against gh's own host, not against whatever this folder
     # happens to point at; only a call that names none falls back to the checkout's remote.
     repo_named, readable = _account_gh_repo(args, env)
@@ -9826,7 +9824,13 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     ) or fallback or 'github.com'
     if not host:
         return [], None
-
+    lowered = host.lower()
+    dotcom = lowered in ('github.com', 'github.localhost') or lowered.endswith(('.github.com', '.ghe.com'))
+    for name in (_ACCOUNT_GH_TOKENS if dotcom else _ACCOUNT_GHE_TOKENS):
+        # A value the walk could not read is not an absent one: it still signs the call in as whoever owns it.
+        value, known = _account_known(name, env)
+        if value or not known:
+            return [], None
     # Keyed by folder too: a relative GH_CONFIG_DIR or XDG_CONFIG_HOME names a different config in each.
     login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
                                 ('gh-user', host, cwd, _account_env_key(env)))
@@ -9838,11 +9842,33 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
 
 
+def _account_cobra_subcommand(args: List[str], switches: frozenset) -> tuple:
+    """(the subcommand, the words after it), found as cobra finds one: an option written without `=` that is not
+    one of `switches` takes the next word as its value, and `--` ends the search."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--':
+            break
+        if arg.startswith('-'):
+            takes = '=' not in arg and arg not in switches and (arg.startswith('--') or len(arg) == 2)
+            i += 2 if takes else 1
+            continue
+        return arg, args[i + 1:]
+    return '', []
+
+
+# gh's options that take no value where they can come before a subcommand.
+_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'-h', '--help', '--version'})
+
+
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
     """The platform whose active account this call changes for the rest of the turn, or None."""
-    words = [arg for arg in args if not arg.startswith('-')]
-    if program == 'gh' and words[:2] in (['auth', 'switch'], ['auth', 'login'], ['auth', 'logout']):
-        return 'github'
+    if program == 'gh':
+        group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
+        if group == 'auth' and _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0] in (
+                'switch', 'login', 'logout'):
+            return 'github'
     if program == 'git':
         subcommand, after = _account_git_subcommand(args)
         keys = [at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]
