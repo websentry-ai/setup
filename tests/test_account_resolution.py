@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '230a0a352289ff4128c0237e4717378be225bfaa21e54f35fa53d6a1876dba50'
+BLOCK_SHA256 = '9db168fa6144726ae23340ec7bd6eacb318a42b3895a516148c6500f4aba3002'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -540,6 +540,40 @@ class AccountResolutionTests(unittest.TestCase):
             state = {'deadline': 1.0}
             self.assertEqual(hook._account_deadline(state), 1.0, path)
             self.assertNotIn('account_deadline', state, path)
+
+    def test_a_url_an_option_carries_is_not_the_repository(self):
+        """`--body https://...` is the text of a comment, not where the call acts."""
+        for path, resolved in self.each('gh issue create --title bug --body https://github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+        for path, resolved in self.each('gh pr comment 12 --body https://ci.acme.dev/run/1'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_a_positional_repository_operand_names_its_host(self):
+        """`gh repo clone HOST/OWNER/REPO` and `OWNER/REPO` are gh's own operands."""
+        for path, resolved in self.each('gh repo clone github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+        for path, resolved in self.each('gh repo view acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_a_slashed_branch_or_file_is_not_a_repository(self):
+        """Only `gh repo` takes `OWNER/REPO` as its operand; elsewhere a slashed word is a branch or a file."""
+        for command in ('gh pr checkout fix/login', 'gh pr view feature/x', 'gh release upload v1 dist/app.zip'):
+            for path, resolved in self.each(command):
+                # The checkout's remote answers, as it does for any call that names no repository.
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
+            self.assertIn(['git', 'config', '--get', 'remote.origin.url'], self.runs(), command)
+
+    def test_a_url_after_a_switch_or_an_equals_option_is_still_the_operand(self):
+        """`--web` takes no value and `--title=x` carried its own, so the URL after either is the operand."""
+        for command in ('gh pr view --web https://github.acme.com/acme/app/pull/1',
+                        'gh pr view --repo=github.acme.com/acme/app 1'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
+
+    def test_the_last_repository_a_gh_call_names_wins(self):
+        """gh's own parser keeps the last `-R`, so an override appended to a command is the one that ran."""
+        for path, resolved in self.each('gh pr list -R acme/app -R github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""

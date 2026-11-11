@@ -9025,6 +9025,9 @@ _ACCOUNT_KUBE_SEPARATOR = '|'
 # Fixed for every run: git must not page, prompt or take a lock on our account.
 _ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
                     'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'CLICOLOR': '0', 'NO_COLOR': '1'}
+# gh options that take no value, so the word after one is still an operand (`gh pr view --web <url>`). Long
+# forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
+_ACCOUNT_GH_SWITCHES = frozenset({'--web', '--draft', '--fill', '--yes', '--comments'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
 _ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
 # git subcommands that reach a remote, and those that write a commit the committer identity goes into.
@@ -9200,24 +9203,25 @@ def _account_setting(name: str, env: Dict) -> Optional[str]:
     return _account_known(name, env)[0]
 
 
-def _account_option(args: List[str], names: tuple, reader=None) -> tuple:
-    """(what a call names with one of these options, whether it is readable); (None, True) when it names none."""
+def _account_option(args: List[str], names: tuple, reader=None, attached: bool = False) -> tuple:
+    """(what a call names with one of these options, whether it is readable); (None, True) when it names none.
+    The last occurrence wins, as each CLI's own parser does."""
     raw = None
     i = 0
-    while i < len(args) and raw is None:
+    while i < len(args):
         arg = args[i]
         if arg == '--':
             # Everything after this belongs to the command being run, not to the one naming the option.
             break
         if arg in names and i + 1 < len(args):
-            raw = args[i + 1]
-            break
+            raw, i = args[i + 1], i + 2
+            continue
         for name in names:
             if arg.startswith(name + '='):
                 raw = arg.split('=', 1)[1]
                 break
-            if len(name) == 2 and name[0] == '-' and name[1] != '-' and arg.startswith(name) and len(arg) > 2:
-                # A one-letter option takes its value attached as well: `-Racme/app`.
+            if attached and len(name) == 2 and name[0] == '-' and arg.startswith(name) and len(arg) > 2:
+                # Only where the CLI takes it: gh reads `-Racme/app`, while kubectl reads `-server` as a flag.
                 raw = arg[2:]
                 break
         i += 1
@@ -9475,12 +9479,26 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
 
 def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     """(the repository a gh call names, whether it is readable); gh reads `GH_REPO` exactly as it reads `--repo`."""
-    repo, known = _account_option(args, ('-R', '--repo'))
+    repo, known = _account_option(args, ('-R', '--repo'), attached=True)
     if repo or not known:
         return repo, known
-    for arg in args:
-        # A positional URL names the repository, and its host, as plainly as the option does.
-        if '://' in arg and _account_host_of(arg):
+    # A bare `OWNER/REPO` is a repository only where gh takes one as its operand, under `gh repo`; elsewhere
+    # a slashed word is a branch or a file (`gh pr checkout fix/login`). A URL names its host anywhere.
+    takes_repo = args[:1] == ['repo']
+    for at, arg in enumerate(args):
+        # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
+        # option carried its value with `=` or takes none.
+        before = args[at - 1] if at else ''
+        if before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES:
+            continue
+        if '://' in arg:
+            if _account_host_of(arg):
+                return _account_value(arg), True
+            continue
+        parts = arg.split('/')
+        if takes_repo and len(parts) == 2 and all(parts) and '.' not in parts[0]:
+            return _account_value(arg), True
+        if takes_repo and len(parts) == 3 and all(parts) and '.' in parts[0]:
             return _account_value(arg), True
     return _account_known('GH_REPO', env)
 
