@@ -7972,7 +7972,9 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
 def _account_gh_host(args: List[str], env: Dict) -> tuple:
     """(the host a gh call talks to, whether what it names can be read); gh's order is `--hostname`, then the
     repository it names."""
-    host, known = _account_option(args, ('--hostname',))
+    # `-h` is the host only under `gh auth`; elsewhere it asks for help.
+    auth = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)[0] == 'auth'
+    host, known = _account_option(args, ('--hostname', '-h') if auth else ('--hostname',), attached=auth)
     if host or not known:
         return host, known
     repo, known = _account_gh_repo(args, env)

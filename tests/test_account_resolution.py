@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '72128c95e6a8d1c1e1af4f7fb56e6144ce5d4e020a9e896159af0408fbc456f3'
+BLOCK_SHA256 = 'eabbbd55cc8b8b42ab76b513ff933cafa1e139ea063904b1507a779e8874777f'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -752,6 +752,14 @@ class AccountResolutionTests(unittest.TestCase):
             hook._accounts('gh --hostname github.acme.com auth switch --user bot', self.repo, state)
             self.assertEqual(dotcom['accounts'][0]['login'], 'jdoe', path)
             self.assertEqual(acme.get('accounts'), [], path)
+
+    def test_gh_auth_takes_dash_h_as_its_host(self):
+        """Under `gh auth`, `-h` is `--hostname`, in either the spaced or the attached form."""
+        for command in ('gh auth status -h github.acme.com', 'gh auth status -hgithub.acme.com',
+                        'gh auth switch -h github.acme.com -u j.doe'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
+                self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', '%s / %s' % (path, command))
 
     def test_a_login_read_in_one_folder_is_not_reused_in_another(self):
         """A relative GH_CONFIG_DIR names a different config in each folder, so each folder is asked."""
