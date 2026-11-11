@@ -259,9 +259,17 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each("AWS_CONFIG_FILE='%s' aws s3 ls --profile home" % Path(folder, 'config')):
             self.assertEqual(resolved['accounts'][0]['account_id'], '222222222222', path)
 
-    def test_a_relative_config_file_is_not_read_against_our_own_folder(self):
+    def test_a_relative_config_file_is_read_from_the_call_s_own_folder(self):
+        """The CLI opens it from where the call ran, not from where the hook runs."""
+        Path(self.repo, 'config').write_text('[profile home]\nsso_account_id = 666666666666\n')
         for path, resolved in self.each('AWS_CONFIG_FILE=config aws s3 ls --profile home'):
-            self.assertIsNone(resolved, path)
+            self.assertEqual(resolved['accounts'][0]['account_id'], '666666666666', path)
+
+    def test_a_spaced_profile_named_on_the_command_is_that_profile(self):
+        config = Path(tempfile.mkdtemp(), 'config')
+        config.write_text('[profile my profile]\nsso_account_id = 555555555555\n')
+        for path, resolved in self.each("AWS_CONFIG_FILE=%s aws s3 ls --profile 'my profile'" % config):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
     def test_a_home_set_to_nothing_is_not_the_password_database_home(self):
         """`HOME=` was set to nothing on purpose; answering from the passwd home defeats that."""

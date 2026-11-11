@@ -8177,15 +8177,19 @@ def _account_aws_web_identity(env: Dict) -> tuple:
     return (match.group(1), True) if match else (None, False)
 
 
-def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
+def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the account of the role the profile assumes, the account it names, whether the file settled it). A profile
     the file does not contain settles as unknown, because the default would name the wrong account with confidence."""
     def resolve():
         import configparser
         named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
-        if not known or (named and not os.path.isabs(named)):
-            # Relative to a folder we do not own, so which file the call read is unknown.
+        if not known:
             return None, None, False
+        if named and not os.path.isabs(named):
+            # The CLI opens a relative path from the folder the call ran in; with that unknown, so is the file.
+            if not isinstance(cwd, str):
+                return None, None, False
+            named = os.path.join(cwd, named)
         home = _account_home(env)
         path = named or (os.path.join(home, '.aws', 'config') if home else None)
         text = _account_file(path)
@@ -8211,14 +8215,14 @@ def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
         # The profile names no account itself — static keys, say — so only a role or the CLI can say.
         return role, None, bool(role)
 
-    return _account_once(state, ('aws-file', profile, _account_env_key(env)), resolve)
+    return _account_once(state, ('aws-file', profile, cwd, _account_env_key(env)), resolve)
 
 
 def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the AWS account a call acted as, no repository); the file answers in about a millisecond, the CLI in 1,327."""
     # botocore's chain: the environment's keys, the profile's role, the environment's web-identity role, then
     # the account the profile names. An explicit --profile turns both environment sources off.
-    named, known = _account_option(args, ('--profile',))
+    named, known = _account_option(args, ('--profile',), _account_path)
     if not known:
         return [], None
     if not named:
@@ -8228,7 +8232,7 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     profile = named or _account_aws_env_profile(env)
     if not profile:
         return [], None
-    role, hint, settled = _account_aws_file(profile, env, state)
+    role, hint, settled = _account_aws_file(profile, env, cwd, state)
     web, web_known = (None, True) if named else _account_aws_web_identity(env)
     if not role and not web_known:
         return [], None
