@@ -278,6 +278,27 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('KUBECONFIG=/tmp/one.kc kubectl get pods'):
             self.assertEqual(resolved['accounts'][0]['platform'], 'kubernetes', path)
 
+    def test_the_last_profile_a_call_names_wins(self):
+        """The AWS CLI keeps the last `--profile`, so an override appended to a command is the one that ran."""
+        for path, resolved in self.each('aws s3 ls --profile default --profile home'):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
+
+    def test_a_web_identity_role_signs_the_call_in_ahead_of_the_profile(self):
+        """botocore assumes the role these name before any profile, so the default account is not the answer."""
+        for path, resolved in self.each(
+                'AWS_ROLE_ARN=arn:aws:iam::999999999999:role/ci AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/t aws s3 ls'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_list_given_to_the_kubeconfig_flag_is_not_the_default_cluster(self):
+        """The flag takes one file; kubectl cannot open a list there, so the default config did not answer."""
+        for path, resolved in self.each('kubectl --kubeconfig /tmp/a.kc:/tmp/b.kc get pods'):
+            self.assertIsNone(resolved, path)
+
+    def test_a_single_dash_long_option_is_not_an_attached_server(self):
+        """kubectl reads `-server` as a flag, not `-s` with `erver` attached."""
+        for path, resolved in self.each('kubectl logs pod -since=1h'):
+            self.assertNotEqual((resolved or {}).get('accounts', [{}])[0].get('server'), 'ince=1h', path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

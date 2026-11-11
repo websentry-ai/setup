@@ -7881,25 +7881,6 @@ def _account_file(path: Optional[str]) -> Optional[str]:
         return None
 
 
-def _account_flag_raw(args: List[str], names: tuple) -> Optional[str]:
-    """The word a call gives one of these options, written either as two words or with an equals sign."""
-    i = 0
-    while i < len(args):
-        arg = args[i]
-        if arg in names and i + 1 < len(args):
-            return args[i + 1]
-        for name in names:
-            if arg.startswith(name + '='):
-                return arg.split('=', 1)[1]
-        i += 1
-    return None
-
-
-def _account_flag(args: List[str], names: tuple) -> Optional[str]:
-    """What a call names with one of these options, as a single-word identity value."""
-    return _account_value(_account_flag_raw(args, names))
-
-
 def _account_subcommand(args: List[str], value_options: frozenset) -> tuple:
     """(the first word that is neither an option nor an option's value, the words after it); ('', []) when none."""
     i = 0
@@ -8088,20 +8069,24 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command'}] if login else []), None
 
 
+# Variables that sign an aws call in ahead of any profile, as botocore's credential chain reads them.
+_ACCOUNT_AWS_SIGN_IN = ('AWS_ACCESS_KEY_ID', 'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE')
+
+
 def _account_aws_profile(args: List[str], env: Dict) -> Optional[str]:
     """The profile an aws call uses, in botocore's own order: --profile, AWS_DEFAULT_PROFILE, AWS_PROFILE,
     else default."""
-    raw = _account_flag_raw(args, ('--profile',))
-    if raw is not None:
+    named, known = _account_option(args, ('--profile',))
+    if named or not known:
         # None when the value cannot be read, which leaves the account unknown rather than the default one.
-        return _account_value(raw)
-    for name in ('AWS_ACCESS_KEY_ID', 'AWS_DEFAULT_PROFILE', 'AWS_PROFILE'):
+        return named
+    for name in _ACCOUNT_AWS_SIGN_IN + ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'):
         value, known = _account_known(name, env)
         if not known:
             return None
         if value:
-            # Access keys sign the call in as whoever owns them, which cannot be read offline.
-            return None if name == 'AWS_ACCESS_KEY_ID' else value
+            # Keys or a web-identity role sign the call in as whoever owns them, which cannot be read offline.
+            return None if name in _ACCOUNT_AWS_SIGN_IN else value
     return 'default'
 
 
@@ -8246,7 +8231,10 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     context, known = _account_option(args, ('--context',))
     chosen, named = _account_option(args, ('--kubeconfig',), _account_path)
     cluster_named, cluster_known = _account_option(args, ('--cluster',))
-    if not known or not named or not cluster_known or cluster_named:
+    # `--kubeconfig` takes one file; a list there is a path kubectl cannot open, unlike the same list in
+    # KUBECONFIG, so the endpoint stays unknown rather than the default config's.
+    listed = bool(chosen) and os.pathsep in chosen
+    if not known or not named or not cluster_known or cluster_named or listed:
         # A selector we cannot read, or one that picks a cluster this lookup cannot ask for, leaves the
         # endpoint unknown rather than the current context's.
         return [], None
