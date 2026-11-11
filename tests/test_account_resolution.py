@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tests.conftest import load_module
-from tests.test_transfer_destination import _entries
+from tests.test_transfer_destination import FAKE_SSH, _entries
 
 HOOK_PATHS = [
     'claude-code/hooks/unbound.py',
@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '6ee163c8409e3203c42657902c69284db20e58041edaff5d961155f672ea3e07'
+BLOCK_SHA256 = 'ba9c232451c1ff7e8970d62acf41f3691b04db4eec0efbef71e40186573ce4da'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -591,6 +591,25 @@ class AccountResolutionTests(unittest.TestCase):
         """Under `gh search` a URL is what is searched for, not where the call acts."""
         for path, resolved in self.each('gh search code https://github.acme.com/acme/app'):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_an_ssh_host_alias_in_the_remote_is_the_host_it_maps_to(self):
+        """Two-account users point origin at an alias; gh, like ssh, talks to the host the alias names."""
+        ssh = Path(self.home, '.ssh')
+        ssh.mkdir(exist_ok=True)
+        Path(ssh, 'config').write_text('Host github-work\n    HostName github.acme.com\n')
+        bin_dir = tempfile.mkdtemp()
+        Path(bin_dir, 'ssh').write_text(FAKE_SSH.format(python=sys.executable))
+        Path(bin_dir, 'ssh').chmod(0o755)
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.origin.url'] = 'git@github-work:acme/app.git'
+        env = {'FAKE_GIT_ANSWERS': json.dumps(answers), 'FAKE_SSH_LOG': os.path.join(bin_dir, 'ssh.jsonl'),
+               'FAKE_SSH_SLEEP': '0', 'PATH': bin_dir + os.pathsep + os.environ['PATH']}
+        with patch.dict(os.environ, env):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                # ssh reads the account's own home, which the transfer tests point here the same way.
+                with patch.object(hook, '_transfer_home', lambda home=self.home: home):
+                    resolved = self.resolve(hook, 'gh pr list')
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
