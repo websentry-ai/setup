@@ -8111,7 +8111,13 @@ def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optio
     """The host the checkout's own remote points at, which gh reads before falling back to dotcom."""
     url = _account_first_line(['git', 'config', '--get', 'remote.origin.url'], cwd, env, state,
                               ('gh-remote-host', cwd, _account_env_key(env)))
-    return _account_host_of(url) if url else None
+    host = _account_host_of(url) if url else None
+    if host and ('://' not in url or url.startswith('ssh://')):
+        # gh maps an SSH host alias through the SSH config — `git@github-personal:…` to github.com — so the
+        # same lookup ssh does decides it. An alias that cannot be looked up is kept, and its login then misses.
+        resolved, _ = _transfer_ssh_hostname(host, [], cwd, state)
+        return resolved or host
+    return host
 
 
 def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
