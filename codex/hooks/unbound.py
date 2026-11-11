@@ -8195,9 +8195,12 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
 # Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
     r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
-# A PowerShell `$env:NAME = …` sets a variable the shell walk does not model, so a call after one that sets an
-# identity or configuration name cannot be resolved from what the walk sees.
-_ACCOUNT_POWERSHELL_ENV = re.compile(r'\$env:([A-Za-z_]\w*)\s*=', re.IGNORECASE)
+# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
+# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
+_ACCOUNT_POWERSHELL_ENV = re.compile(
+    r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
+    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
+    r'|SetEnvironmentVariable\(\s*[\'"]([A-Za-z_]\w*)', re.IGNORECASE)
 
 
 def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
@@ -8208,7 +8211,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
             return None
-        steered = {name.upper() for name in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        steered = {''.join(names).upper() for names in _ACCOUNT_POWERSHELL_ENV.findall(command)}
         if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
             return None
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
