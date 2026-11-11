@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '5747c4e92e51dcd1fcd1ec4e079cf1c906e0a5306f9ecf13f1d0e58295650ef8'
+BLOCK_SHA256 = 'fd652a3df7b26ede74c5fd93fbb775f37e21923b55987806a2fab0ec1117a56e'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -651,7 +651,7 @@ class AccountResolutionTests(unittest.TestCase):
 
     def test_a_url_after_an_option_we_cannot_place_leaves_the_host_unknown(self):
         """Whether an unfamiliar option takes a value decides where the call acts, so the login is not guessed."""
-        for path, resolved in self.each('gh pr merge -s https://github.acme.com/acme/app/pull/5'):
+        for path, resolved in self.each('gh pr view --some-new-flag https://github.acme.com/acme/app/pull/5'):
             self.assertIsNone(resolved, path)
 
     def test_a_branch_override_applies_only_to_the_branch_it_names(self):
@@ -803,9 +803,31 @@ class AccountResolutionTests(unittest.TestCase):
         for command in ('${env:GIT_COMMITTER_EMAIL} = "x@acme.com"; git commit -m a',
                         'Set-Item Env:GIT_COMMITTER_EMAIL "x@acme.com"; git commit -m a',
                         'Set-Item -Path "Env:GH_HOST" github.acme.com; gh pr list',
-                        '[Environment]::SetEnvironmentVariable("GH_TOKEN", "t"); gh pr list'):
+                        '[Environment]::SetEnvironmentVariable("GH_TOKEN", "t"); gh pr list',
+                        'Set-Item -LiteralPath Env:GIT_COMMITTER_EMAIL x@acme.com; git commit -m a'):
             for path, resolved in self.each(command):
                 self.assertIsNone(resolved, '%s / %s' % (path, command))
+
+    def test_another_users_switch_leaves_our_accounts_alone(self):
+        """`sudo -u deploy gh auth switch` changes deploy's login; only a repository-local git config write is shared."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            login = hook._accounts('gh api user', self.repo, state)
+            commit = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('sudo -u deploy gh auth switch --user bot', self.repo, state)
+            hook._accounts('sudo -u deploy git config --global user.email deploy@acme.com', self.repo, state)
+            hook._accounts('gh --help auth switch', self.repo, state)
+            self.assertEqual(login['accounts'][0]['login'], 'jdoe', path)
+            self.assertEqual(commit['accounts'][0]['email'], 'jdoe@gmail.com', path)
+            hook._accounts('sudo -u deploy git config user.email deploy@acme.com', self.repo, state)
+            self.assertEqual(commit.get('accounts'), [], path)
+
+    def test_the_short_no_value_flags_of_pr_merge_and_review_leave_the_url_the_operand(self):
+        for command in ('gh pr merge -s https://github.acme.com/acme/app/pull/5',
+                        'gh pr review -a https://github.acme.com/acme/app/pull/5',
+                        'gh pr review --comment https://github.acme.com/acme/app/pull/5'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
 
     def test_a_login_read_in_one_folder_is_not_reused_in_another(self):
         """A relative GH_CONFIG_DIR names a different config in each folder, so each folder is asked."""

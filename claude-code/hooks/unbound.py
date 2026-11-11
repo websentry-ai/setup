@@ -9018,6 +9018,9 @@ _ACCOUNT_GH_SWITCHES = frozenset({
     '--detach', '--force', '--undo', '--dry-run', '--editor', '--watch', '--exit-status', '--log', '--log-failed',
     '--verbose', '--prerelease', '--latest', '--clobber',
 })
+# Short no-value flags, which mean different things under different subcommands, so listed per subcommand.
+_ACCOUNT_GH_SHORT_SWITCHES = {('pr', 'merge'): frozenset({'-s', '-m', '-r', '-d'}),
+                              ('pr', 'review'): frozenset({'-a', '-r', '-c', '--comment'})}
 # gh options whose value is text, so a URL after one is a title or a body and never the operand.
 _ACCOUNT_GH_TEXT_OPTIONS = frozenset({'--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
@@ -9453,6 +9456,7 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
         # Nor does GH_REPO steer a command that acts on no repository; gh reads it only where it reads `--repo`.
         return None, True
     takes_repo = args[:1] == ['repo']
+    switches = _ACCOUNT_GH_SWITCHES | _ACCOUNT_GH_SHORT_SWITCHES.get(tuple(args[:2]), frozenset())
     for at, arg in enumerate(args):
         # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
         # option carried its value with `=` or takes none.
@@ -9460,7 +9464,7 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
         # An option is never the operand, `--body=<url>` included, and neither is the value after one.
         if arg.startswith('-'):
             continue
-        if before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES:
+        if before.startswith('-') and '=' not in before and before not in switches:
             if '://' in arg and before not in _ACCOUNT_GH_TEXT_OPTIONS:
                 # An option we cannot place may take no value, making this URL where the call acts.
                 return None, False
@@ -9584,7 +9588,7 @@ _ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'--help', '--version'})
 
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
     """The platform whose active account this call changes for the rest of the turn, or None."""
-    if program == 'gh':
+    if program == 'gh' and '--help' not in args:
         group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
         if group == 'auth' and _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0] in (
                 'switch', 'login', 'logout'):
@@ -9610,7 +9614,7 @@ _ACCOUNT_TRIGGERS = re.compile(
 # SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
 _ACCOUNT_POWERSHELL_ENV = re.compile(
     r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
-    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
+    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-(?:Literal)?Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
     r'|SetEnvironmentVariable\(\s*[\'"]([A-Za-z_]\w*)', re.IGNORECASE)
 
 
@@ -9634,6 +9638,11 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         taken = state.setdefault('account_active', [])
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
+            # Run as another user, a switch changes that user's configuration, not ours; only a git config write to
+            # the repository itself, which both read, still moves our committer.
+            if switched and other_user and (switched != 'git' or any(
+                    arg in ('--global', '--system', '-f', '--file') or arg.startswith('--file=') for arg in args)):
+                switched = None
             if switched:
                 # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
                 host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None
