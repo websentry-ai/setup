@@ -558,6 +558,21 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('kubectl --logtostderr config use-context staging', self.repo, state)
             self.assertEqual(before.get('accounts'), [], path)
 
+    def test_a_kubeconfig_edit_drops_a_named_context_but_use_context_does_not(self):
+        """`set-cluster` can move the server a named context reaches; `use-context` moves only the current one."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            named = hook._accounts('kubectl --context prod-eks get pods', self.repo, state)
+            hook._accounts('kubectl config use-context staging', self.repo, state)
+            self.assertEqual(named['accounts'][0]['context'], 'prod-eks', path)
+            hook._accounts('kubectl config set-cluster prod --server=https://new.example.com', self.repo, state)
+            self.assertEqual(named.get('accounts'), [], path)
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            explicit = hook._accounts('kubectl --server https://k8s.example.com get pods', self.repo, state)
+            hook._accounts('kubectl config set-cluster prod --server=https://new.example.com', self.repo, state)
+            self.assertEqual(explicit['accounts'][0]['server'], 'https://k8s.example.com', path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
