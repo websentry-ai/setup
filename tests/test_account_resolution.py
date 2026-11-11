@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '9e8831abb55604ed125ff995692c90c99fca04d7b490c3f3bacf22079ed1c650'
+BLOCK_SHA256 = '3f2cce6b93692536ba98d3d0fbc0bf4a698cc83cb2d9adf4706f133e740e6a1a'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1048,6 +1048,28 @@ class AccountResolutionTests(unittest.TestCase):
                 hook._accounts('git remote set-url origin https://github.acme.com/acme/app.git', self.repo, state)
                 self.assertEqual(checkout.get('accounts'), [], path)
                 self.assertEqual(named['accounts'][0]['host'], 'github.acme.com', path)
+
+    def test_a_branch_change_withdraws_a_push_the_branch_chose_and_keeps_a_named_one(self):
+        """A bare `git push` reaches the remote the current branch's config names, read when the turn ends."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            bare = hook._with_accounts({}, hook._accounts('git push', self.repo, state), state)
+            named = hook._with_accounts({}, hook._accounts('git push personal main', self.repo, state), state)
+            self.assertEqual(bare['pushed_repo'], 'acme/app', path)
+            hook._accounts('git checkout release', self.repo, state)
+            self.assertNotIn('pushed_repo', bare, path)
+            self.assertEqual(named['pushed_repo'], 'jdoe-dev/app', path)
+        for path, resolved in self.each('git push; git switch release'):
+            self.assertNotIn('pushed_repo', resolved or {}, path)
+
+    def test_gh_repo_subcommands_that_act_on_no_checkout_ignore_its_remote(self):
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.origin.url'] = 'https://github.acme.com/acme/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for command, host in (('gh repo list', 'github.com'), ('gh repo create acme/new --private', 'github.com'),
+                                  ('gh repo view', 'github.acme.com')):
+                for path, resolved in self.each(command):
+                    self.assertEqual(resolved['accounts'][0]['host'], host, '%s / %s' % (path, command))
 
     def test_the_claude_code_hook_withdraws_a_push_a_later_call_rewires(self):
         hook = load_module('claude-code/hooks/unbound.py')

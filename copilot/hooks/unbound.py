@@ -9416,8 +9416,9 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             # A configuration location set to something unreadable — a substitution, an unexpanded `$VAR` — would
             # be dropped from the child, which then reads the default file instead, so the lookup is refused.
             read = _account_value if name in _ACCOUNT_IDENTITY_VALUES else _account_path
-            if ((name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG)) and isinstance(value, str)
-                    and (_TRANSFER_SUBSTITUTED in value or (value.strip() and read(value) is None))):
+            steering = name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG)
+            if steering and isinstance(value, str) and (
+                    _TRANSFER_SUBSTITUTED in value or (value.strip() and read(value) is None)):
                 return None
         program = _transfer_executable(argv[0])
         if program is None:
@@ -9742,9 +9743,9 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
 
 
 def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
-                         overrides: Dict) -> Optional[str]:
-    """(the remote a push reaches, whether it is readable); git's order: the positional repository, `--repo`,
-    pushRemote, pushDefault, then the branch's remote."""
+                         overrides: Dict) -> tuple:
+    """(the remote a push reaches, whether it is readable, whether the current branch's config chose it); git's
+    order: the positional repository, `--repo`, pushRemote, pushDefault, then the branch's remote."""
     i = 0
     while i < len(after):
         arg = after[i]
@@ -9755,12 +9756,12 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
             i += 1
             continue
         value = _account_value(arg)
-        return (value, True) if value else (None, False)
+        return (value, True, False) if value else (None, False, False)
     named, known = _account_option(after, ('--repo',))
     if not known:
-        return None, False
+        return None, False, False
     if named:
-        return named, True
+        return named, True, False
     branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state,
                                  ('git-branch', cwd, _account_env_key(env)))
     for name in (('branch.%s.pushRemote' % branch) if branch else None, 'remote.pushDefault',
@@ -9768,10 +9769,10 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
         if name:
             found, readable = _account_git_config(name, cwd, env, state, overrides)
             if not readable:
-                return None, False
+                return None, False, True
             if found:
-                return found, True
-    return 'origin', True
+                return found, True, True
+    return 'origin', True, True
 
 
 def _account_command_sets(env: Dict, setting: str) -> bool:
@@ -9817,7 +9818,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     pushed = []
     rewired = _account_includes(overrides) or any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
-        remote, reachable = _account_push_remote(after, cwd, env, state, overrides)
+        remote, reachable, implicit = _account_push_remote(after, cwd, env, state, overrides)
         # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
         # remote in that case, so none is recorded.
         if reachable and remote and _account_repo_of(remote):
@@ -9831,6 +9832,9 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
             urls = _account_once(state, ('git-push-urls', remote, cwd, _account_env_key(env)), lambda: _account_run(
                 ['git', 'remote', 'get-url', '--push', '--all', remote], cwd, env, state))
             pushed = [(repo, remote) for repo in (_account_repo_of(url) for url in (urls or '').splitlines()) if repo]
+        if implicit:
+            # Chosen by the current branch's config, read when the turn ends, so a later branch change moves it.
+            state.setdefault('account_implicit', []).extend(pushed)
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
     if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
@@ -9945,7 +9949,11 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     named, known = _account_gh_host(args, env)
     if not readable or not known:
         return [], None
-    checkout = repo_named is None and args[:1] and args[0] in _ACCOUNT_GH_REPO_SCOPED
+    group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
+    action = _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0]
+    # `gh repo list`, `create`, `clone` and the template lookups act on no checkout, so its remote decides nothing.
+    checkout = repo_named is None and group in _ACCOUNT_GH_REPO_SCOPED and not (
+        group == 'repo' and action in ('list', 'create', 'clone', 'gitignore', 'license'))
     if named is None and checkout and not isinstance(cwd, str):
         # gh reads the checkout's remote before GH_HOST, and an unknown folder cannot be read, so every
         # remaining answer would be a guess at an enterprise host.
@@ -10034,8 +10042,10 @@ def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) 
             parser.read_string(text)
         except Exception:
             return None, None, False, False
-        # Matched as botocore splits a section name, so `[profile "my profile"]` and extra spaces still name it.
-        section = next((name for name in parser.sections() if _account_aws_section_profile(name) == profile), None)
+        # Matched as botocore splits a section name, so `[profile "my profile"]` and extra spaces still name it; where
+        # two sections name one profile, botocore keeps the last whole.
+        matches = [name for name in parser.sections() if _account_aws_section_profile(name) == profile]
+        section = matches[-1] if matches else None
         if section is None:
             # It may live only in the credentials file, which the hook never opens, so it stays unknown.
             return None, None, False, False
@@ -10061,8 +10071,11 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     """(the AWS account a call acted as, no repository); the file answers in about a millisecond, the CLI in 1,327."""
     # botocore's chain: the environment's keys, the profile's role, the environment's web-identity role, then
     # the account the profile names. An explicit --profile turns both environment sources off.
-    if '--no-sign-request' in args:
-        # Sent anonymously, so the call acted as no account at all.
+    if '--no-sign-request' in args or '--version' in args:
+        # Sent anonymously, so the call acted as no account at all; `--version` sends nothing.
+        return [], None
+    if _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)[0] in ('', 'configure', 'help'):
+        # Read or edit the local config, or print help; nothing reaches AWS.
         return [], None
     named, known = _account_option(args, ('--profile',), _account_path)
     if not known:
@@ -10199,12 +10212,30 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     return [account], None
 
 
-def _account_kube_server_value(raw: Any) -> Optional[str]:
-    """A server as kubectl takes one — a URL, a dotted host or IP, or `host:port` — else None, so a stray `-s…`
-    such as `-since 1h` is no server."""
+def _account_kube_server(args: List[str]) -> tuple:
+    """(the server a kubectl call names, whether it is readable), read as kubectl does: up to `--`, the last one
+    winning. Spelled out (`--server x`, `-s x`) any host counts, single-label or IPv6; attached (`-sx`) only a URL, a
+    dotted host or a port does, so `-since 1h` (`-s` `ince`) is no server."""
+    raw, attached, i = None, False, 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--':
+            break
+        if arg in ('--server', '-s') and i + 1 < len(args):
+            raw, attached, i = args[i + 1], False, i + 2
+            continue
+        if arg.startswith(('--server=', '-s=')):
+            raw, attached = arg.split('=', 1)[1], False
+        elif arg.startswith('-s') and not arg.startswith('--') and len(arg) > 2:
+            raw, attached = arg[2:], True
+        i += 1
+    if raw is None:
+        return None, True
     value = _account_value(raw)
-    host = r'^(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?|[A-Za-z0-9.-]+:\d+)$'
-    return value if value and ('://' in value or re.match(host, value)) else None
+    host = re.match(r'^(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+)(?::\d+)?$', value or '')
+    if value and ('://' in value or (host and (not attached or '.' in value or ':' in value))):
+        return value, True
+    return None, False
 
 
 def _account_kube_endpoint(server: str) -> Optional[str]:
@@ -10224,9 +10255,7 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     if subcommand in _ACCOUNT_KUBE_LOCAL or client_only:
         # None of these reaches a cluster, a kubeconfig edit included, even `set-cluster --server`.
         return [], None
-    # Read as kubectl does: up to `--`, the last one wins, `-s<value>` attached included. A value that is not a
-    # server (`-since=1h` reads as `-s` `ince=1h`) or cannot be read leaves the endpoint unknown.
-    server, server_known = _account_option(args, ('--server', '-s'), _account_kube_server_value, attached=True)
+    server, server_known = _account_kube_server(args)
     if not server_known:
         return [], None
     server = _account_kube_endpoint(server) if server else None
@@ -10368,7 +10397,7 @@ def _account_aws_configure_profile(args: List[str], env: Dict) -> Optional[str]:
     None when it cannot be told."""
     words = [arg for arg in _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)[1] if not arg.startswith('-')]
     if words[:1] == ['set'] and len(words) > 1 and words[1].startswith('profile.') and words[1].count('.') >= 2:
-        return words[1].split('.')[1]
+        return _account_path(words[1].split('.')[1])
     named, known = _account_option(args, ('--profile',), _account_path)
     if named or not known:
         return named
@@ -10387,6 +10416,8 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
         if subcommand == 'remote' and _account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[0] in _ACCOUNT_REMOTE_EDITS:
             return 'git-remote'
+        if subcommand in ('checkout', 'switch') and '--' not in after:
+            return 'git-branch'
         # A set or an unset changes a key, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
         # `git config user.email` alone, `git config get`, or `--get`/`--list` only read it.
         verb = after[0].lower() if after and not after[0].startswith('-') else ''
@@ -10428,8 +10459,8 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
 # `git remote` subcommands that change where a push goes, and the config keys that do.
 _ACCOUNT_REMOTE_EDITS = frozenset({'add', 'set-url', 'rename', 'remove', 'rm'})
 _ACCOUNT_REMOTE_KEY = re.compile(
-    r'^(?:remote\.(?P<remote>.+)\.(?:url|pushurl)|url\..+\.(?:insteadof|pushinsteadof)|branch\..+\.(?:remote|pushremote)'
-    r'|remote\.pushdefault)$', re.IGNORECASE)
+    r'^(?:remote\.(?P<remote>.+)\.(?:url|pushurl)|url\..+\.(?:insteadof|pushinsteadof)'
+    r'|branch\..+\.(?:remote|pushremote)|remote\.pushdefault)$', re.IGNORECASE)
 
 
 def _account_remote_scope(args: List[str]) -> Optional[str]:
@@ -10482,11 +10513,21 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             switched = _account_switches(program, args)
             # Run as another user, a switch changes that user's configuration, not ours; only a git write to this
             # repository's config, which both read, still moves our committer or our pushes.
-            if switched and other_user and (switched not in ('git', 'git-remote') or any(
+            if switched and other_user and (switched not in ('git', 'git-remote', 'git-branch') or any(
                     arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
                     or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
                 switched = None
-            if switched == 'git-remote':
+            if switched == 'git-branch':
+                # A push whose remote the branch's config chose was read for the branch the turn ends on.
+                implicit = state.get('account_implicit', [])
+                pushes[:] = [push for push in pushes if push not in implicit]
+                held = state.setdefault('account_pushes', [])
+                for entry, remotes in held:
+                    if '' in remotes:
+                        for key in ('pushed_repo', 'pushed_remote', 'pushed'):
+                            entry.pop(key, None)
+                held[:] = [(entry, remotes) for entry, remotes in held if '' not in remotes]
+            elif switched == 'git-remote':
                 # Push destinations are read when the turn ends too, so a later remote change would rewrite them.
                 scope = _account_remote_scope(args)
                 pushes[:] = [push for push in pushes if scope is not None and push[1] != scope]
@@ -10560,8 +10601,12 @@ def _with_accounts(entry: Dict, resolved: Optional[Dict], state: Optional[Dict] 
     if resolved:
         entry.update(resolved)
         if state is not None and resolved.get('pushed_repo'):
-            remotes = {push.get('remote') for push in resolved.get('pushed') or [
-                {'remote': resolved.get('pushed_remote')}]}
+            pushes = resolved.get('pushed') or [
+                {'repo': resolved['pushed_repo'], 'remote': resolved.get('pushed_remote')}]
+            remotes = {push.get('remote') for push in pushes}
+            # '' marks a push the current branch's config chose, which a later branch change moves.
+            if any((push.get('repo'), push.get('remote')) in state.get('account_implicit', []) for push in pushes):
+                remotes.add('')
             state.setdefault('account_pushes', []).append((entry, remotes))
     return entry
 # --- end account resolution ---

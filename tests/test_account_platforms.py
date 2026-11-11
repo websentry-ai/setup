@@ -644,6 +644,24 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each("AWS_CONFIG_FILE=%s aws s3 ls --profile 'my team'" % config):
             self.assertIsNone(resolved, path)
 
+    def test_where_two_sections_name_one_profile_the_last_wins(self):
+        """botocore keeps the last section that names a profile, whole, as `build_profile_map` does."""
+        config = Path(tempfile.mkdtemp(), 'config')
+        sso = 'sso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\n'
+        config.write_text('[default]\n' + sso + 'sso_account_id = 444444444444\n'
+                          '[profile default]\n' + sso + 'sso_account_id = 555555555555\n'
+                          '[profile ops]\n' + sso + 'sso_account_id = 111111111111\n'
+                          '[profile "ops"]\n' + sso + 'sso_account_id = 222222222222\n')
+        for command, account in (('aws s3 ls', '555555555555'), ('aws s3 ls --profile ops', '222222222222')):
+            for path, resolved in self.each('AWS_CONFIG_FILE=%s %s' % (config, command)):
+                self.assertEqual(resolved['accounts'][0]['account_id'], account, '%s / %s' % (path, command))
+
+    def test_local_only_aws_calls_reach_no_account(self):
+        for command in ('aws configure get region --profile home', 'aws configure list', 'aws help',
+                        'aws --version', 'aws s3 ls --version'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+
     def test_a_self_declared_account_label_is_not_the_account(self):
         """`aws_account_id`, or `sso_account_id` with no SSO sign-in, is a label an agent can write; botocore never checks it."""
         config = Path(tempfile.mkdtemp(), 'config')
@@ -667,6 +685,13 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'][0]['cluster'], 'prod', path)
         for path, resolved in self.each('kubectl -s"$(cat server)" get pods'):
             self.assertIsNone(resolved, path)
+
+    def test_a_spelled_out_server_may_be_single_label_or_ipv6(self):
+        for command, server in (('kubectl get pods --server myhost', 'https://myhost'),
+                                ('kubectl get pods -s [::1]:6443', 'https://[::1]:6443'),
+                                ('kubectl get pods --server=[fd00::1]', 'https://[fd00::1]')):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['server'], server, '%s / %s' % (path, command))
 
     def test_a_server_with_no_scheme_is_reached_over_https(self):
         """client-go takes a bare host and reaches it over https; a stray `-s…` that is no host is not a server."""
@@ -720,6 +745,12 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(home['accounts'][0]['account_id'], '987654321098', path)
             self.assertEqual(default.get('accounts'), [], path)
             hook._accounts('aws configure set profile.home.sso_account_id 999999999999', self.repo, state)
+            self.assertEqual(home.get('accounts'), [], path)
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            home = hook._accounts('aws s3 ls --profile home', self.repo, state)
+            # An unreadable profile in the dotted key could be any of them.
+            hook._accounts('aws configure set "profile.$P.sso_account_id" 999999999999', self.repo, state)
             self.assertEqual(home.get('accounts'), [], path)
 
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
