@@ -8109,8 +8109,9 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     if not host:
         return [], None
 
+    # Keyed by folder too: a relative GH_CONFIG_DIR or XDG_CONFIG_HOME names a different config in each.
     login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
-                                ('gh-user', host, _account_env_key(env)))
+                                ('gh-user', host, cwd, _account_env_key(env)))
     # The login gh holds for the host, which `gh auth switch` changes for every later call.
     return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command', '_active': True}]
             if login else []), None
@@ -8167,10 +8168,14 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
             if switched:
-                for platform, accounts, account in taken:
-                    if platform == switched and account in accounts:
+                # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
+                host = _account_option(args, ('--hostname', '-h'))[0] if switched == 'github' else None
+                hit = [item for item in taken
+                       if item[0] == switched and (host is None or str(item[2].get('host')).lower() == host.lower())]
+                for _platform, accounts, account in hit:
+                    if account in accounts:
                         accounts.remove(account)
-                taken[:] = [item for item in taken if item[0] != switched]
+                taken[:] = [item for item in taken if item not in hit]
             handler = _ACCOUNT_HANDLERS.get(program)
             # A call that only may have run tells us nothing about who ran it, one run as another user resolves
             # that user's configuration and not the hook's, and one past a source or eval resolves nothing.
