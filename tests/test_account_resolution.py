@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'da4d3b39702b72781dd36ff9d1f651237ecbc51b4d830feef679ce12dfaec508'
+BLOCK_SHA256 = 'd8b53dbe16d85676891a9c60a7ff9c8517fec1286d68329e728380bd64866319'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -668,6 +668,13 @@ class AccountResolutionTests(unittest.TestCase):
         """`--body '--repo=…'` posts that text; it does not move the call to another repository."""
         for command in ("gh pr comment 12 --body '--repo=github.acme.com/acme/app'",
                         "gh issue create --title '--hostname=github.acme.com' --body x"):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
+
+    def test_a_gh_api_field_that_looks_like_an_option_is_still_a_field(self):
+        """`gh api -f '--hostname=X'` sends that string as a parameter; the call still goes to github.com."""
+        for command in ("gh api --method GET user -f '--hostname=github.acme.com'",
+                        "gh api user -H '--hostname=github.acme.com'"):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
 

@@ -9340,8 +9340,13 @@ _ACCOUNT_GH_SWITCHES = frozenset({
 # Short no-value flags, which mean different things under different subcommands, so listed per subcommand.
 _ACCOUNT_GH_SHORT_SWITCHES = {('pr', 'merge'): frozenset({'-s', '-m', '-r', '-d'}),
                               ('pr', 'review'): frozenset({'-a', '-r', '-c', '--comment'})}
-# gh options whose value is text, so a URL after one is a title or a body and never the operand.
-_ACCOUNT_GH_TEXT_OPTIONS = frozenset({'--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject'})
+# gh options whose value is text or a payload — a title, a body, `gh api`'s fields, headers and filters — so the
+# word after one is never an option or the operand, however it reads.
+_ACCOUNT_GH_TEXT_OPTIONS = frozenset({
+    '--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject',
+    '-f', '--raw-field', '--field', '-H', '--header', '--input', '-q', '--jq', '--template', '-X', '--method',
+    '-p', '--preview', '--cache',
+})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
 # gh reads the first pair for github.com and *.ghe.com, the second for any other host (and GITHUB_TOKEN there too
 # inside a codespace).
