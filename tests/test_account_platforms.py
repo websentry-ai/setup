@@ -360,41 +360,25 @@ class AccountPlatformTests(unittest.TestCase):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['registry'], ECR_HOST, '%s / %s' % (path, command))
 
-    def test_the_sts_fallback_is_asked_again_from_another_folder(self):
-        """A relative config read from the call's folder can send two folders to STS for different accounts."""
-        first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            open(self.run_log, 'w').close()
-            state = {}
-            hook._accounts('aws s3 ls --profile static', first, state)
-            hook._accounts('aws s3 ls --profile static', second, state)
-            self.assertEqual(len([argv for argv in self.runs() if argv[:2] == ['aws', 'sts']]), 2, path)
-
     def test_an_unsigned_request_acts_as_no_account(self):
         """`--no-sign-request` sends the request anonymously."""
         for path, resolved in self.each('aws --no-sign-request s3 ls s3://public-bucket'):
             self.assertIsNone(resolved, path)
 
-    def test_the_azure_cli_is_asked_again_from_another_folder(self):
-        """A relative AZURE_CONFIG_DIR the hook inherits is read from the call's own folder."""
+    def test_a_relative_azure_config_dir_is_read_again_from_another_folder(self):
+        """A relative AZURE_CONFIG_DIR the hook inherits is read from each call's own folder."""
         first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for folder, name in ((first, 'First'), (second, 'Second')):
+            Path(folder, 'azcfg').mkdir()
+            Path(folder, 'azcfg', 'azureProfile.json').write_text(json.dumps({'subscriptions': [
+                {'id': '00000000-0000-0000-0000-00000000000%d' % len(name), 'name': name, 'isDefault': True}]}))
         with patch.dict(os.environ, {'AZURE_CONFIG_DIR': 'azcfg'}):
             for path, hook in zip(HOOK_PATHS, HOOKS):
-                open(self.run_log, 'w').close()
                 state = {}
-                hook._accounts('az group list', first, state)
-                hook._accounts('az group list', second, state)
-                self.assertEqual(len([argv for argv in self.runs() if argv[:2] == ['az', 'account']]), 2, path)
-
-    def test_a_call_that_names_its_credentials_file_does_not_reuse_another_s_answer(self):
-        """The credentials file is part of the question, so an earlier STS answer cannot stand in for it."""
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            state = {}
-            first = hook._accounts('aws s3 ls --profile static', self.repo, state)
-            second = hook._accounts('AWS_SHARED_CREDENTIALS_FILE=/tmp/two aws s3 ls --profile static',
-                                    self.repo, state)
-            self.assertEqual(first['accounts'][0]['account_id'], '333333333333', path)
-            self.assertIsNone(second, path)
+                one = hook._accounts('az group list', first, state)
+                two = hook._accounts('az group list', second, state)
+                self.assertEqual([one['accounts'][0]['subscription_name'], two['accounts'][0]['subscription_name']],
+                                 ['First', 'Second'], path)
 
     def test_docker_login_with_no_server_is_docker_hub(self):
         for path, resolved in self.each('docker login --username alice --password-stdin'):
@@ -473,17 +457,6 @@ class AccountPlatformTests(unittest.TestCase):
         """`set-cluster --server` writes the kubeconfig; it does not talk to that server."""
         for path, resolved in self.each('kubectl config set-cluster prod --server=https://eks.example.com'):
             self.assertIsNone(resolved, path)
-
-    def test_the_sts_fallback_names_no_profile_when_the_call_chose_none(self):
-        """With no config file, `--profile default` fails where the instance role would have answered."""
-        config = Path(tempfile.mkdtemp(), 'absent')
-        for path, hook in zip(HOOK_PATHS, HOOKS):
-            with patch.dict(os.environ, {'AWS_CONFIG_FILE': str(config)}):
-                open(self.run_log, 'w').close()
-                hook._accounts('aws s3 ls', self.repo, {})
-                sts = [argv for argv in self.runs() if argv[:2] == ['aws', 'sts']]
-                self.assertTrue(sts, path)
-                self.assertNotIn('--profile', sts[0], path)
 
     def test_a_context_switch_behind_a_global_option_is_still_a_switch(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
@@ -618,6 +591,41 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('docker login REGISTRY.EXAMPLE.COM:5000'):
             self.assertEqual(resolved['accounts'][0]['registry'], 'registry.example.com:5000', path)
 
+    def test_only_the_active_clouds_default_subscription_counts(self):
+        """azureProfile.json keeps a default per cloud; az uses the active cloud's, from its config or AZURE_CLOUD_NAME."""
+        folder = Path(self.home, '.azure')
+        Path(folder, 'azureProfile.json').write_text(json.dumps({'subscriptions': [
+            {'id': '00000000-0000-0000-0000-0000000000a1', 'name': 'Public', 'isDefault': True,
+             'environmentName': 'AzureCloud'},
+            {'id': '00000000-0000-0000-0000-0000000000b2', 'name': 'Gov', 'isDefault': True,
+             'environmentName': 'AzureUSGovernment'}]}))
+        Path(folder, 'config').write_text('[cloud]\nname = AzureUSGovernment\n')
+        for path, resolved in self.each('az group list'):
+            self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Gov', path)
+        for path, resolved in self.each('AZURE_CLOUD_NAME=AzureCloud az group list'):
+            self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Public', path)
+        os.remove(os.path.join(folder, 'config'))
+        for path, resolved in self.each('az group list'):
+            self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Public', path)
+
+    def test_local_only_kubectl_commands_reach_no_cluster(self):
+        for command in ('kubectl version --client', 'kubectl kustomize .', 'kubectl completion bash',
+                        'kubectl plugin list', 'kubectl help get'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+        for path, resolved in self.each('kubectl version'):
+            self.assertEqual(resolved['accounts'][0]['cluster'], 'prod', path)
+
+    def test_an_aws_configure_write_drops_only_the_profile_it_names(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            home = hook._accounts('aws s3 ls --profile home', self.repo, state)
+            hook._accounts('aws configure set region us-east-1 --profile other', self.repo, state)
+            hook._accounts('aws configure help', self.repo, state)
+            self.assertEqual(home['accounts'][0]['account_id'], '987654321098', path)
+            hook._accounts('aws configure set sso_account_id 999999999999 --profile home', self.repo, state)
+            self.assertEqual(home.get('accounts'), [], path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
@@ -672,49 +680,30 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('aws s3 ls --profile assumed'):
             self.assertEqual(resolved['accounts'][0]['account_id'], '222222222222', path)
 
-    def test_a_profile_the_file_cannot_resolve_falls_through_to_the_cli(self):
+    def test_a_profile_the_file_cannot_settle_stays_unknown_and_no_cli_runs(self):
+        """Static keys name no account in the config file, and the CLI is never asked instead."""
         for path, resolved in self.each('aws s3 ls --profile static'):
-            self.assertEqual(resolved['accounts'], [{'platform': 'aws', 'account_id': '333333333333',
-                                                     'profile': 'static', 'source': 'command'}], path)
-        self.assertEqual(self.runs()[0][:3], ['aws', 'sts', 'get-caller-identity'])
+            self.assertIsNone(resolved, path)
+        self.assertEqual([argv for argv in self.runs() if argv[0] in ('aws', 'az')], [])
+
+    def test_a_credential_process_an_agent_planted_is_never_run(self):
+        """The CLI would run a profile's `credential_process`, which an agent can write earlier in the turn."""
+        config = Path(tempfile.mkdtemp(), 'config')
+        config.write_text("[profile x]\ncredential_process = /bin/sh -c 'touch /tmp/planted'\n")
+        with patch.dict(os.environ, {'AWS_CONFIG_FILE': str(config)}):
+            for path, resolved in self.each('aws s3 ls --profile x'):
+                self.assertIsNone(resolved, path)
+        self.assertEqual([argv for argv in self.runs() if argv[0] == 'aws'], [])
 
     def test_a_profile_absent_from_the_file_is_unknown_and_never_the_default(self):
-        """The CLI is asked for that profile by name, and fails for one that exists nowhere."""
         for path, resolved in self.each('aws s3 ls --profile nosuchprofile'):
             self.assertIsNone(resolved, path)
-        for argv in self.runs():
-            self.assertEqual(argv[-2:], ['--profile', 'nosuchprofile'])
-
-    def test_a_profile_only_in_the_credentials_file_is_asked_by_name(self):
-        """The config file lacks it, but the CLI merges the credentials file in and answers for it."""
-        with patch.dict(os.environ, {'FAKE_AWS_STS': json.dumps({'creds-only': '444444444444'})}):
-            for path, resolved in self.each('aws s3 ls --profile creds-only'):
-                self.assertEqual(resolved['accounts'], [{'platform': 'aws', 'account_id': '444444444444',
-                                                         'profile': 'creds-only', 'source': 'command'}], path)
-
-    def test_no_profile_and_an_explicit_default_are_asked_apart(self):
-        """With no config file the two are different questions: the instance role, and a profile that is not there."""
-        config = Path(tempfile.mkdtemp(), 'absent')
-        answers = {'(none)': '999999999999', 'default': '222222222222'}
-        with patch.dict(os.environ, {'AWS_CONFIG_FILE': str(config), 'FAKE_AWS_STS': json.dumps(answers)}):
-            for path, hook in zip(HOOK_PATHS, HOOKS):
-                state = {}
-                bare = hook._accounts('aws s3 ls', self.repo, state)
-                named = hook._accounts('aws --profile default s3 ls', self.repo, state)
-                self.assertEqual([bare['accounts'][0]['account_id'], named['accounts'][0]['account_id']],
-                                 ['999999999999', '222222222222'], path)
+        self.assertEqual(self.runs(), [])
 
     def test_keys_in_the_environment_leave_the_account_unknown(self):
         with patch.dict(os.environ, {'AWS_ACCESS_KEY_ID': 'AKIAIOSFODNN7EXAMPLE'}):
             for path, resolved in self.each('aws s3 ls'):
                 self.assertIsNone(resolved, path)
-
-    def test_a_second_call_with_the_same_profile_does_not_look_it_up_again(self):
-        hook = HOOKS[0]
-        state = {}
-        for _ in range(5):
-            self.resolve(hook, 'aws s3 ls --profile static', state)
-        self.assertEqual(len(self.runs()), 1)
 
     def test_nothing_opens_the_credentials_file(self):
         hook = HOOKS[0]
@@ -744,12 +733,12 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertIsNone(resolved, path)
         self.assertEqual(self.runs(), [])
 
-    def test_azure_falls_through_to_the_cli_when_the_file_is_missing(self):
+    def test_azure_with_no_profile_file_stays_unknown_and_no_cli_runs(self):
+        """az loads the extensions in its config folder, so it is never run to fill a gap in the file."""
         os.remove(os.path.join(self.home, '.azure', 'azureProfile.json'))
         for path, resolved in self.each('az storage blob upload --file x'):
-            self.assertEqual(resolved['accounts'][0]['subscription_id'],
-                             '00000000-0000-0000-0000-000000000002', path)
-        self.assertEqual(self.runs()[0][:3], ['az', 'account', 'show'])
+            self.assertIsNone(resolved, path)
+        self.assertEqual([argv for argv in self.runs() if argv[0] == 'az'], [])
 
     def test_a_turn_that_never_runs_az_reads_nothing_about_azure(self):
         hook = HOOKS[0]

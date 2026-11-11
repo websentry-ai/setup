@@ -7476,8 +7476,6 @@ _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'symbolic-ref', '--short', 'HEAD'),
     ('gh', 'config', 'get'),
-    ('aws', 'sts', 'get-caller-identity'),
-    ('az', 'account', 'show'),
     ('kubectl', 'config', 'view'),
 )
 # Options that turn one of the allowed lookups into a credential dump. The allow-list is a prefix match, so
@@ -7507,7 +7505,7 @@ _ACCOUNT_REMEMBERED = frozenset({
     'GITHUB_ENTERPRISE_TOKEN',
     'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_ACCESS_KEY_ID',
     'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE',
-    'AZURE_CONFIG_DIR',
+    'AZURE_CONFIG_DIR', 'AZURE_CLOUD_NAME',
     'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
 # A configuration file longer than this is not one of the small files we read, and is skipped rather than parsed.
@@ -7583,9 +7581,6 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
             if ((name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG))
                     and isinstance(value, str) and _TRANSFER_SUBSTITUTED in value):
                 return None
-        if argv[0] in _ACCOUNT_CONFIG_EXECUTORS and any(
-                name in (env or {}) for name in _ACCOUNT_CONFIG_LOCATIONS):
-            return None
         program = _transfer_executable(argv[0])
         if program is None:
             return None
@@ -7612,13 +7607,6 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         return None
 
 
-# A cloud CLI runs what its configuration names: an AWS `credential_process`, an Azure extension path. A call
-# that chooses where that configuration lives would make us run its code, so the CLI is not run at all; the
-# configuration file is still read and parsed here, which executes nothing.
-_ACCOUNT_CONFIG_EXECUTORS = frozenset({'aws', 'az', 'kubectl', 'docker'})
-# KUBECONFIG is not here: `kubectl config view` prints the file and never runs its `exec` credential plugin.
-_ACCOUNT_CONFIG_LOCATIONS = frozenset({'HOME', 'USERPROFILE', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE',
-                                       'AZURE_CONFIG_DIR', 'DOCKER_CONFIG'})
 # The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
@@ -7980,33 +7968,30 @@ def _account_push_url_of(url: str, cwd: Optional[str], env: Dict, state: Dict) -
 
 
 def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
-    """(the accounts a git call acted as, the repository a push reached); both empty for a purely local call."""
+    """(the accounts a git call acted as, the repositories a push reached); both empty for a purely local call."""
     subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
     if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
         return [], None
     cwd, env, overrides = _account_git_context(args, cwd, env)
-    repo, remote = None, None
+    pushed = []
     rewired = _account_includes(overrides) or any(key.startswith(('url.', 'remote.')) for key in overrides)
     if subcommand == 'push' and not rewired:
         remote, reachable = _account_push_remote(after, cwd, env, state, overrides)
         # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
         # remote in that case, so none is recorded.
-        repo = _account_repo_of(remote) if remote else None
-        if not reachable:
-            repo, remote = None, None
-        elif repo:
+        if reachable and remote and _account_repo_of(remote):
             rewritten = _account_push_url_of(remote, cwd, env, state)
             # A probe that failed says nothing about where the rules sent the push, so it stays unknown.
-            repo, remote = (_account_repo_of(rewritten) if rewritten else None), None
-        else:
-            url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
-                                      ('git-push-url', remote, cwd, _account_env_key(env)))
-            # The URL says where the push went, which is a destination and not an account; the trailing slash
-            # git returns for a bare host would otherwise make two spellings of one repository.
-            repo = _account_repo_of(url) if url else None
+            repo = _account_repo_of(rewritten) if rewritten else None
+            pushed = [(repo, None)] if repo else []
+        elif reachable and remote:
+            # A remote with several push URLs pushes to every one of them, so each is a destination. The trailing
+            # slash git returns for a bare host would otherwise make two spellings of one repository.
+            urls = _account_once(state, ('git-push-urls', remote, cwd, _account_env_key(env)), lambda: _account_run(
+                ['git', 'remote', 'get-url', '--push', '--all', remote], cwd, env, state))
+            pushed = [(repo, remote) for repo in (_account_repo_of(url) for url in (urls or '').splitlines()) if repo]
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
-    pushed = (repo, remote) if repo else None
     if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
         # fetch, clone, ls-remote and archive make no commit, so no committer acted.
         return [], pushed
@@ -8233,9 +8218,7 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         return [], None
     # Whether anything chose a profile; with none, the CLI's own chain answers, instance roles included, and
     # `--profile default` would fail where no config file exists.
-    chosen = bool(named) or any(_account_known(name, env, _account_path)[0]
-                                for name in ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'))
-    role, hint, settled, web_profile = _account_aws_file(profile, env, cwd, state)
+    role, hint, _settled, web_profile = _account_aws_file(profile, env, cwd, state)
     role_source = 'file'
     if web_profile and not named:
         # botocore takes a web-identity profile's role from AWS_ROLE_ARN first, unless --profile named the profile.
@@ -8251,12 +8234,8 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     if not role and not web_known:
         return [], None
     account, source = role or web or hint, role_source if role else ('command' if web else 'file')
-    if account is None and not settled:
-        found = _account_first_line(
-            ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']
-            + (['--profile', profile] if chosen else []),
-            cwd, env, state, ('aws-sts', profile, chosen, cwd, _account_env_key(env)))
-        account, source = (found if found and _ACCOUNT_AWS_ID.match(found) else None), 'command'
+    # Never the CLI: it would run whatever `credential_process` the profile names, which an agent can plant
+    # earlier in the same turn. A profile the config file cannot settle stays unknown.
     if not account:
         return [], None
     # Read from the config when the turn ends, so a later `aws configure` write can move it.
@@ -8275,6 +8254,18 @@ def _account_azure_dir(env: Dict, cwd: Optional[str]) -> Optional[str]:
     return os.path.join(home, '.azure') if home else None
 
 
+def _account_azure_cloud(folder: str) -> Optional[str]:
+    """The cloud az is set to in its config file's `[cloud]` section; None when it names none."""
+    import configparser
+    text = _account_file(os.path.join(folder, 'config'))
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read_string(text or '')
+        return _account_value(parser.get('cloud', 'name')) if parser.has_option('cloud', 'name') else None
+    except Exception:
+        return None
+
+
 def _account_azure_entry(named: Optional[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the subscription azureProfile.json names, whether that file settled it). The file begins with a UTF-8 BOM."""
     def resolve():
@@ -8282,6 +8273,12 @@ def _account_azure_entry(named: Optional[str], env: Dict, cwd: Optional[str], st
         text = _account_file(os.path.join(folder, 'azureProfile.json') if folder else None)
         if text is None:
             return None, False
+        # The file keeps a default per cloud signed in to, so only the active cloud's entries count: AZURE_CLOUD_NAME,
+        # else the config file's [cloud] name, else public Azure.
+        cloud, known = _account_known('AZURE_CLOUD_NAME', env)
+        if not known:
+            return None, False
+        cloud = (cloud or _account_azure_cloud(folder) or 'AzureCloud').lower()
         try:
             data = json.loads(text)
         except Exception:
@@ -8292,6 +8289,8 @@ def _account_azure_entry(named: Optional[str], env: Dict, cwd: Optional[str], st
         wanted = (named or '').lower()
         for entry in subscriptions:
             if not isinstance(entry, dict):
+                continue
+            if isinstance(entry.get('environmentName'), str) and entry['environmentName'].lower() != cloud:
                 continue
             if wanted:
                 if wanted not in (str(entry.get('id') or '').lower(), str(entry.get('name') or '').lower()):
@@ -8327,19 +8326,9 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     named, known = _account_option(args, ('--subscription',), _account_path)
     if not known:
         return [], None
-    entry, settled = _account_azure_entry(named, env, cwd, state)
+    # Never the CLI: az loads the extensions in its config folder, which an agent can plant earlier in the turn.
+    entry, _settled = _account_azure_entry(named, env, cwd, state)
     source = 'file'
-    if entry is None and not settled:
-        directory, _ = _account_known('AZURE_CONFIG_DIR', env, _account_path)
-        if directory and not os.path.isabs(directory) and not isinstance(cwd, str):
-            # az reads a relative config directory from the call's folder; with that unknown, so is the login.
-            return [], None
-        argv = ['az', 'account', 'show', '-o', 'json'] + (['--subscription', named] if named else [])
-        output = _account_output(argv, cwd, env, state, ('azure-show', named or '', cwd, _account_env_key(env)))
-        try:
-            entry, source = (json.loads(output) if output else None), 'command'
-        except Exception:
-            entry = None
     if not isinstance(entry, dict):
         return [], None
     account = _account_azure_fields(entry)
@@ -8363,9 +8352,10 @@ def _account_kube_endpoint(server: str) -> Optional[str]:
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
-    if _account_cobra_subcommand(args, _ACCOUNT_KUBE_SWITCHES)[0] in ('', 'config'):
-        # With no subcommand kubectl prints help, and `kubectl config …` edits the local kubeconfig; even
-        # `set-cluster --server` reaches no cluster.
+    subcommand = _account_cobra_subcommand(args, _ACCOUNT_KUBE_SWITCHES)[0]
+    client_only = subcommand == 'version' and ('--client' in args or '--client=true' in args)
+    if subcommand in _ACCOUNT_KUBE_LOCAL or client_only:
+        # None of these reaches a cluster, a kubeconfig edit included, even `set-cluster --server`.
         return [], None
     server, server_known = _account_option(args, ('--server', '-s'))
     if not server_known:
@@ -8467,6 +8457,8 @@ _ACCOUNT_KUBE_SWITCHES = frozenset({'--insecure-skip-tls-verify', '--match-serve
                                     # klog's, which older kubectl releases still take.
                                     '--logtostderr', '--alsologtostderr', '--add-dir-header', '--one-output',
                                     '--skip-headers', '--skip-log-headers'})
+# kubectl subcommands that run on this machine only: help, completion, a local kustomize build, plugins, config.
+_ACCOUNT_KUBE_LOCAL = frozenset({'', 'config', 'completion', 'kustomize', 'plugin', 'help', 'options'})
 # The `kubectl config` subcommands that only read; every other one can move what the current context reaches.
 _ACCOUNT_KUBE_CONFIG_READS = frozenset({'', 'view', 'current-context', 'get-contexts', 'get-clusters', 'get-users'})
 # The AWS CLI's global options that take a value, which can come before the service.
@@ -8527,7 +8519,7 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
     if program == 'aws':
         service, after = _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)
         if service == 'configure' and _account_subcommand(after, _ACCOUNT_AWS_VALUE_OPTIONS)[0] not in (
-                'get', 'list', 'list-profiles', 'export-credentials'):
+                'get', 'list', 'list-profiles', 'export-credentials', 'help'):
             return 'aws'
     if program == 'az':
         group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
@@ -8569,10 +8561,15 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
             if switched:
-                # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
-                host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None
-                hit = [item for item in taken
-                       if item[0] == switched and (host is None or str(item[2].get('host')).lower() == host.lower())]
+                # `gh auth switch -h <host>` changes that host's login only, and `aws configure … --profile p` that
+                # profile only; with neither named, or one unreadable, any.
+                field, scope = None, None
+                if switched == 'github':
+                    field, scope = 'host', _account_option(args, ('--hostname', '-h'), attached=True)[0]
+                elif switched == 'aws':
+                    field, scope = 'profile', _account_option(args, ('--profile',), _account_path)[0]
+                hit = [item for item in taken if item[0] == switched and (
+                    scope is None or str(item[2].get(field)).lower() == scope.lower())]
                 for _platform, accounts, account in hit:
                     if account in accounts:
                         accounts.remove(account)
@@ -8590,8 +8587,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
                     # Registered under its platform, or under each selector named when more than one can move it.
                     for key in (active if isinstance(active, tuple) else (account['platform'],) if active else ()):
                         taken.append((key, found, account))
-            if reached and reached not in pushes:
-                pushes.append(reached)
+            for push in reached or []:
+                if push not in pushes:
+                    pushes.append(push)
         resolved = {}
         if found:
             resolved['accounts'] = found

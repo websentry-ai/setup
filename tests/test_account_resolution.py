@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '0918d56576da9faff88ca5f14afb48d72a8e20cb12ce2fccf41477ae44a6ff73'
+BLOCK_SHA256 = '38142795aa5a22bc16c770222fac6b4b86af2526e8955fa30af303544c4533b3'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -89,11 +89,13 @@ if args[:2] == ['remote', '-v']:
             print('%s\t%s (push)' % (name, pushed))
     sys.exit(0)
 if args[:3] == ['remote', 'get-url', '--push']:
-    # Keyed by folder as well as remote, so a `-C` that is ignored answers for the wrong checkout.
-    url = answers.get('remote.' + args[3] + '@' + os.getcwd(), answers.get('remote.' + args[3]))
+    # Keyed by folder as well as remote, so a `-C` that is ignored answers for the wrong checkout. A list is a
+    # remote with several push URLs, which `--all` prints one per line and the plain form prints the first of.
+    url = answers.get('remote.' + args[-1] + '@' + os.getcwd(), answers.get('remote.' + args[-1]))
     if url is None:
         sys.exit(2)
-    print(url)
+    urls = url if isinstance(url, list) else [url]
+    print('\\n'.join(urls if '--all' in args else urls[:1]))
     sys.exit(0)
 if args[:1] == ['symbolic-ref']:
     branch = answers.get('branch')
@@ -197,6 +199,16 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertEqual(resolved['pushed_remote'], 'personal', path)
         for path, resolved in self.each('git push'):
             self.assertEqual(resolved['pushed_remote'], 'origin', path)
+
+    def test_a_remote_with_several_push_urls_records_every_destination(self):
+        """git pushes to every `pushurl` a remote lists, so each is a destination of that one push."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.mirror'] = ['https://github.com/acme/app.git', 'git@github.com:personal/app.git']
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git push mirror main'):
+                self.assertEqual(resolved['pushed_repo'], 'acme/app', path)
+                self.assertEqual(resolved['pushed'], [{'repo': 'acme/app', 'remote': 'mirror'},
+                                                      {'repo': 'personal/app', 'remote': 'mirror'}], path)
 
     def test_a_positional_repository_beats_dash_dash_repo(self):
         """git: when both `--repo` and a repository argument are given, the argument wins."""
