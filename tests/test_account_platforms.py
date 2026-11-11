@@ -425,6 +425,37 @@ class AccountPlatformTests(unittest.TestCase):
             for path, hook in zip(HOOK_PATHS, HOOKS):
                 self.assertIsNone(hook._accounts('kubectl get pods', None, {}), path)
 
+    def test_a_later_context_switch_leaves_the_earlier_kubectl_call_unknown(self):
+        """Accounts are read when the turn ends; the call before `use-context` would get the switched cluster."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('kubectl get pods', self.repo, state)
+            hook._accounts('kubectl config use-context staging', self.repo, state)
+            named = hook._accounts('kubectl --context prod-eks get pods', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+            self.assertEqual(named['accounts'][0]['context'], 'prod-eks', path)
+
+    def test_a_later_subscription_switch_leaves_the_earlier_az_call_unknown(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('az group list', self.repo, state)
+            hook._accounts('az account set --subscription "Acme Sandbox"', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+
+    def test_a_named_subscription_survives_a_later_switch(self):
+        """An account the call named itself is not the active one, so a switch does not touch it."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts("az group list --subscription 'Acme Production'", self.repo, state)
+            hook._accounts('az account set --subscription "Acme Sandbox"', self.repo, state)
+            self.assertEqual(before['accounts'][0]['subscription_name'], 'Acme Production', path)
+
+    def test_a_docker_login_url_is_its_host(self):
+        for path, resolved in self.each('docker login --username AWS --password-stdin https://%s/' % ECR_HOST):
+            self.assertEqual(resolved['accounts'], [
+                {'platform': 'docker', 'registry': ECR_HOST, 'source': 'hostname'},
+                {'platform': 'aws', 'account_id': '210987654321', 'source': 'hostname'}], path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

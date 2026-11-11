@@ -8969,7 +8969,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # Only these commands are ever run; everything else is refused. All are local, and none of them prints a credential.
 _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'config', '--get'),
-    ('git', 'ls-remote', '--get-url'),
+    ('git', 'remote', '-v'),
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'symbolic-ref', '--short', 'HEAD'),
     ('gh', 'config', 'get'),
@@ -9422,6 +9422,30 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
     return 'origin', True
 
 
+# A remote name nobody uses, offered so git reports the URL a literal push would really reach.
+_ACCOUNT_PROBE_REMOTE = '__unbound_probe__'
+
+
+def _account_push_url_of(url: str, cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """The URL a push to this literal URL reaches after the user's `pushInsteadOf` and `insteadOf` rules.
+
+    git applies push rewrites only to a named remote, so the URL is named as a throwaway one through the indexed
+    config and `git remote -v` reports its push URL; nothing connects."""
+    count, known = _account_known('GIT_CONFIG_COUNT', env)
+    if not known or not (count or '0').isdigit():
+        return None
+    index = int(count or 0)
+    probe = {**(env or {}), 'GIT_CONFIG_COUNT': str(index + 1),
+             'GIT_CONFIG_KEY_%d' % index: 'remote.%s.url' % _ACCOUNT_PROBE_REMOTE, 'GIT_CONFIG_VALUE_%d' % index: url}
+    out = _account_once(state, ('git-push-rewrite', url, cwd, _account_env_key(env)),
+                        lambda: _account_run(['git', 'remote', '-v'], cwd, probe, state))
+    for line in (out or '').splitlines():
+        name, _, rest = line.partition('\t')
+        if name == _ACCOUNT_PROBE_REMOTE and rest.endswith(' (push)'):
+            return rest[:-len(' (push)')]
+    return None
+
+
 def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the accounts a git call acted as, the repository a push reached); both empty for a purely local call."""
     subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
@@ -9438,9 +9462,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         if not reachable:
             repo, remote = None, None
         elif repo:
-            # A URL is still rewritten by the user's `insteadOf` rules; ls-remote applies them without connecting.
-            rewritten = _account_first_line(['git', 'ls-remote', '--get-url', remote], cwd, env, state,
-                                            ('git-url-rewrite', remote, cwd, _account_env_key(env)))
+            rewritten = _account_push_url_of(remote, cwd, env, state)
             repo, remote = (_account_repo_of(rewritten) if rewritten else None) or repo, None
         else:
             url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
@@ -9451,10 +9473,14 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
     pushed = (repo, remote) if repo else None
+    if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
+        # fetch, clone, ls-remote and archive make no commit, so no committer acted.
+        return [], pushed
     email, known = _account_known('GIT_COMMITTER_EMAIL', env)
     if not known:
         # Who committed is a separate fact from where the push went; one unknown does not unsettle the other.
         return [], pushed
+    active = False
     for setting in ('committer.email', 'user.email'):
         if email:
             break
@@ -9462,7 +9488,11 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         if not readable:
             # git commits as the value we cannot read, so who committed is unknown rather than `user.email`.
             return [], pushed
-    return ([{'platform': 'git', 'email': email, 'source': 'command'}] if email else []), pushed
+        active = bool(email) and setting not in overrides
+    account = {'platform': 'git', 'email': email, 'source': 'command'}
+    if active:
+        account['_active'] = True
+    return ([account] if email else []), pushed
 
 
 def _account_gh_repo(args: List[str], env: Dict) -> tuple:
@@ -9556,7 +9586,9 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
 
     login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
                                 ('gh-user', host, _account_env_key(env)))
-    return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command'}] if login else []), None
+    # The login gh holds for the host, which `gh auth switch` changes for every later call.
+    return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command', '_active': True}]
+            if login else []), None
 
 
 def _account_aws_env_profile(env: Dict) -> Optional[str]:
@@ -9740,6 +9772,9 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     if not account:
         return [], None
     account['source'] = source
+    if not named:
+        # The default subscription, which `az account set` changes for every later call.
+        account['_active'] = True
     return [account], None
 
 
@@ -9789,6 +9824,9 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
         account['cluster'] = cluster
     if context:
         account['context'] = context
+    else:
+        # The current context, which `kubectl config use-context` changes for every later call.
+        account['_active'] = True
     return [account], None
 
 
@@ -9818,7 +9856,9 @@ def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict)
     if not target or _account_value(target) is None:
         # An image name we cannot read says nothing about the registry, least of all that it is the default one.
         return [], None
-    registry = _account_docker_registry(target) if subcommand != 'login' else _account_value(target)
+    # A login names a server, which may be written as a URL (`https://<ecr>/`); its host is the registry.
+    server = _account_host_of(target) if '://' in target else target
+    registry = _account_docker_registry(target) if subcommand != 'login' else _account_value(server)
     if not registry:
         return [], None
     accounts = [{'platform': 'docker', 'registry': registry, 'source': 'hostname'}]
@@ -9830,6 +9870,26 @@ def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict)
 
 _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws,
                      'az': _account_azure, 'kubectl': _account_kubernetes, 'docker': _account_docker}
+
+
+def _account_switches(program: str, args: List[str]) -> Optional[str]:
+    """The platform whose active account this call changes for the rest of the turn, or None."""
+    words = [arg for arg in args if not arg.startswith('-')]
+    if program == 'gh' and words[:2] in (['auth', 'switch'], ['auth', 'login'], ['auth', 'logout']):
+        return 'github'
+    if program == 'git':
+        subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
+        keys = [at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]
+        # A set or an unset changes it; `git config user.email` alone only reads it.
+        if subcommand == 'config' and keys and (
+                any(arg.startswith('--unset') for arg in after)
+                or any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys)):
+            return 'git'
+    if program == 'kubectl' and words[:2] == ['config', 'use-context']:
+        return 'kubernetes'
+    if program == 'az' and (words[:2] == ['account', 'set'] or words[:1] == ['login']):
+        return 'azure'
+    return None
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
 # Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
@@ -9855,7 +9915,16 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
         found, pushes = [], []
+        # Accounts are read when the turn ends, so one an earlier call took from the active configuration is the
+        # switched one if a later call switched it. Those earlier accounts are dropped then, in place.
+        taken = state.setdefault('account_active', [])
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
+            switched = _account_switches(program, args)
+            if switched:
+                for platform, accounts, account in taken:
+                    if platform == switched and account in accounts:
+                        accounts.remove(account)
+                taken[:] = [item for item in taken if item[0] != switched]
             handler = _ACCOUNT_HANDLERS.get(program)
             # A call that only may have run tells us nothing about who ran it, one run as another user resolves
             # that user's configuration and not the hook's, and one past a source or eval resolves nothing.
@@ -9863,8 +9932,11 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
                 continue
             accounts, reached = handler(args, env, call_cwd, state)
             for account in accounts:
+                active = account.pop('_active', False)
                 if account not in found and len(found) < _ACCOUNT_MAX:
                     found.append(account)
+                    if active:
+                        taken.append((account['platform'], found, account))
             if reached and reached not in pushes:
                 pushes.append(reached)
         resolved = {}
