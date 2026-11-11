@@ -9284,6 +9284,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # Only these commands are ever run; everything else is refused. All are local, and none of them prints a credential.
 _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'config', '--get'),
+    ('git', 'ls-remote', '--get-url'),
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'symbolic-ref', '--short', 'HEAD'),
     ('gh', 'config', 'get'),
@@ -9315,7 +9316,8 @@ _ACCOUNT_REMEMBERED = frozenset({
     'GH_HOST', 'GH_REPO', 'GH_CONFIG_DIR', 'GH_TOKEN',
     'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
     'GITHUB_ENTERPRISE_TOKEN',
-    'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_ACCESS_KEY_ID', 'AZURE_CONFIG_DIR',
+    'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_ACCESS_KEY_ID',
+    'AZURE_CONFIG_DIR',
     'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
 # A configuration file longer than this is not one of the small files we read, and is skipped rather than parsed.
@@ -9753,7 +9755,10 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         if not reachable:
             repo, remote = None, None
         elif repo:
-            remote = None
+            # A URL is still rewritten by the user's `insteadOf` rules; ls-remote applies them without connecting.
+            rewritten = _account_first_line(['git', 'ls-remote', '--get-url', remote], cwd, env, state,
+                                            ('git-url-rewrite', remote, cwd, _account_env_key(env)))
+            repo, remote = (_account_repo_of(rewritten) if rewritten else None) or repo, None
         else:
             url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
                                       ('git-push-url', remote, cwd, _account_env_key(env)))
@@ -9941,6 +9946,9 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     """(the AWS account a call acted as, no repository); the file answers in about a millisecond, the CLI in 1,327."""
     # botocore's chain: the environment's keys, the profile's role, the environment's web-identity role, then
     # the account the profile names. An explicit --profile turns both environment sources off.
+    if '--no-sign-request' in args:
+        # Sent anonymously, so the call acted as no account at all.
+        return [], None
     named, known = _account_option(args, ('--profile',), _account_path)
     if not known:
         return [], None
@@ -9978,7 +9986,7 @@ def _account_azure_dir(env: Dict) -> Optional[str]:
     return os.path.join(home, '.azure') if home else None
 
 
-def _account_azure_entry(named: Optional[str], env: Dict, state: Dict) -> tuple:
+def _account_azure_entry(named: Optional[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the subscription azureProfile.json names, whether that file settled it). The file begins with a UTF-8 BOM."""
     def resolve():
         folder = _account_azure_dir(env)
@@ -10005,7 +10013,7 @@ def _account_azure_entry(named: Optional[str], env: Dict, state: Dict) -> tuple:
         # Named but absent, or no default marked: unknown rather than the first subscription in the file.
         return None, True
 
-    return _account_once(state, ('azure-file', named or '', _account_env_key(env)), resolve)
+    return _account_once(state, ('azure-file', named or '', cwd, _account_env_key(env)), resolve)
 
 
 def _account_azure_fields(entry: Dict) -> Optional[Dict]:
@@ -10029,11 +10037,11 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     named, known = _account_option(args, ('--subscription',), _account_name)
     if not known:
         return [], None
-    entry, settled = _account_azure_entry(named, env, state)
+    entry, settled = _account_azure_entry(named, env, cwd, state)
     source = 'file'
     if entry is None and not settled:
         argv = ['az', 'account', 'show', '-o', 'json'] + (['--subscription', named] if named else [])
-        output = _account_output(argv, cwd, env, state, ('azure-show', named or '', _account_env_key(env)))
+        output = _account_output(argv, cwd, env, state, ('azure-show', named or '', cwd, _account_env_key(env)))
         try:
             entry, source = (json.loads(output) if output else None), 'command'
         except Exception:

@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '2fdb780238224db0c2ed27cb619871f86d79fd0997ccec488c6e5bec5ad0e4a8'
+BLOCK_SHA256 = 'dbd7a023e9d9292a7c1eec0b54c9b8cd2ce142d996217e1985c7a1a3cb524230'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -62,6 +62,15 @@ if args[:2] == ['config', '--get']:
         print(answers[name])
         sys.exit(0)
     sys.exit(1)
+if args[:2] == ['ls-remote', '--get-url']:
+    # git applies `url.<base>.insteadOf` here without connecting; FAKE_GIT_ANSWERS['insteadof'] maps base to base.
+    url = args[2]
+    for want, have in answers.get('insteadof', {{}}).items():
+        if url.startswith(have):
+            url = want + url[len(have):]
+            break
+    print(url)
+    sys.exit(0)
 if args[:3] == ['remote', 'get-url', '--push']:
     # Keyed by folder as well as remote, so a `-C` that is ignored answers for the wrong checkout.
     url = answers.get('remote.' + args[3] + '@' + os.getcwd(), answers.get('remote.' + args[3]))
@@ -615,6 +624,14 @@ class AccountResolutionTests(unittest.TestCase):
         """gh reads GH_REPO only where it reads `--repo`, so `gh api` stays on its default host."""
         for path, resolved in self.each('GH_REPO=github.acme.com/acme/app gh api user'):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_a_push_to_a_url_follows_the_user_s_rewrite_rules(self):
+        """`insteadOf` sends the push elsewhere, so the destination is where the rule sends it."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['insteadof'] = {'https://github.com/personal/': 'https://github.com/acme/'}
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git push https://github.com/acme/app.git main'):
+                self.assertEqual(resolved['pushed_repo'], 'personal/app', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""

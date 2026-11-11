@@ -368,6 +368,32 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('aws s3 ls --profile static', second, state)
             self.assertEqual(len([argv for argv in self.runs() if argv[:2] == ['aws', 'sts']]), 2, path)
 
+    def test_an_unsigned_request_acts_as_no_account(self):
+        """`--no-sign-request` sends the request anonymously."""
+        for path, resolved in self.each('aws --no-sign-request s3 ls s3://public-bucket'):
+            self.assertIsNone(resolved, path)
+
+    def test_the_azure_cli_is_asked_again_from_another_folder(self):
+        """A relative AZURE_CONFIG_DIR the hook inherits is read from the call's own folder."""
+        first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
+        with patch.dict(os.environ, {'AZURE_CONFIG_DIR': 'azcfg'}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                open(self.run_log, 'w').close()
+                state = {}
+                hook._accounts('az group list', first, state)
+                hook._accounts('az group list', second, state)
+                self.assertEqual(len([argv for argv in self.runs() if argv[:2] == ['az', 'account']]), 2, path)
+
+    def test_a_call_that_names_its_credentials_file_does_not_reuse_another_s_answer(self):
+        """The credentials file is part of the question, so an earlier STS answer cannot stand in for it."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            first = hook._accounts('aws s3 ls --profile static', self.repo, state)
+            second = hook._accounts('AWS_SHARED_CREDENTIALS_FILE=/tmp/two aws s3 ls --profile static',
+                                    self.repo, state)
+            self.assertEqual(first['accounts'][0]['account_id'], '333333333333', path)
+            self.assertIsNone(second, path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
