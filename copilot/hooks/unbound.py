@@ -9340,6 +9340,10 @@ _ACCOUNT_KUBE_SEPARATOR = '|'
 # Fixed for every run: git must not page, prompt or take a lock on our account.
 _ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
                     'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'CLICOLOR': '0', 'NO_COLOR': '1'}
+# The gh commands that act on a repository, and so read the checkout's remote when none is named: the ones
+# that take `--repo`. `gh api`, `gh search`, `gh gist` and `gh auth` use gh's default host instead.
+_ACCOUNT_GH_REPO_SCOPED = frozenset({'pr', 'issue', 'repo', 'run', 'workflow', 'release', 'label', 'cache',
+                                     'secret', 'variable', 'browse', 'ruleset', 'attestation'})
 # gh options that take no value, so the word after one is still an operand (`gh pr view --web <url>`). Long
 # forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
 _ACCOUNT_GH_SWITCHES = frozenset({'--web', '--draft', '--fill', '--yes', '--comments'})
@@ -9785,7 +9789,9 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
         # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
         # option carried its value with `=` or takes none.
         before = args[at - 1] if at else ''
-        if before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES:
+        # An option is never the operand, `--body=<url>` included, and neither is the value after one.
+        if arg.startswith('-') or (
+                before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES):
             continue
         if '://' in arg:
             if _account_host_of(arg):
@@ -9836,7 +9842,8 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     named, known = _account_gh_host(args, env)
     if not readable or not known:
         return [], None
-    if named is None and repo_named is None and not isinstance(cwd, str):
+    checkout = repo_named is None and args[:1] and args[0] in _ACCOUNT_GH_REPO_SCOPED
+    if named is None and checkout and not isinstance(cwd, str):
         # gh reads the checkout's remote before GH_HOST, and an unknown folder cannot be read, so every
         # remaining answer would be a guess at an enterprise host.
         return [], None
@@ -9844,7 +9851,7 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     if not fallback_known:
         return [], None
     host = named or (
-        None if repo_named else _account_gh_remote_host(cwd, env, state)
+        _account_gh_remote_host(cwd, env, state) if checkout else None
     ) or fallback or 'github.com'
     if not host:
         return [], None

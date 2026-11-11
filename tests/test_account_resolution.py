@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'a3a2ad0fe4f4c97c89ee6948c0d14f8524feda5a36994dec8e975fa01e619d63'
+BLOCK_SHA256 = '646b27b5f07c9005695b7fc56ca0cc5cbd2614cd168663494aba9974867d731c'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -574,6 +574,18 @@ class AccountResolutionTests(unittest.TestCase):
         """gh's own parser keeps the last `-R`, so an override appended to a command is the one that ran."""
         for path, resolved in self.each('gh pr list -R acme/app -R github.acme.com/acme/app'):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+
+    def test_a_gh_command_that_acts_on_no_repository_ignores_the_checkout(self):
+        """`gh api` and `gh search` use gh's default host, not the folder's remote."""
+        for command in ('gh api user', 'gh search repos unbound'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
+            self.assertNotIn(['git', 'config', '--get', 'remote.origin.url'], self.runs(), command)
+
+    def test_a_url_attached_to_an_option_is_not_the_repository(self):
+        """`--body=<url>` is the option itself, carrying a comment's text."""
+        for path, resolved in self.each('gh pr comment 12 --body=https://github.acme.com/acme/app'):
+            self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
