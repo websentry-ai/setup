@@ -8202,8 +8202,9 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     if not host:
         return [], None
 
+    # Keyed by folder too: a relative GH_CONFIG_DIR or XDG_CONFIG_HOME names a different config in each.
     login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
-                                ('gh-user', host, _account_env_key(env)))
+                                ('gh-user', host, cwd, _account_env_key(env)))
     # The login gh holds for the host, which `gh auth switch` changes for every later call.
     return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command', '_active': True}]
             if login else []), None
@@ -8235,8 +8236,7 @@ def _account_aws_web_identity(env: Dict) -> tuple:
 
 
 def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) -> tuple:
-    """(the account of the role the profile assumes, the account it names, whether the file settled it). A profile
-    the file does not contain settles as unknown, because the default would name the wrong account with confidence."""
+    """(the account of the role the profile assumes, the account it names, whether the file settled it)."""
     def resolve():
         import configparser
         named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
@@ -8259,7 +8259,9 @@ def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) 
             return None, None, False
         section = 'default' if profile == 'default' else 'profile %s' % profile
         if not parser.has_section(section):
-            return None, None, True
+            # It may live only in the credentials file, which the hook never opens; the CLI, asked for this
+            # profile by name, answers for it or fails.
+            return None, None, False
         role = None
         if parser.has_option(section, 'role_arn'):
             match = _ACCOUNT_ROLE_ARN.match((parser.get(section, 'role_arn') or '').strip())
@@ -8305,7 +8307,7 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         found = _account_first_line(
             ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text']
             + (['--profile', profile] if chosen else []),
-            cwd, env, state, ('aws-sts', profile, cwd, _account_env_key(env)))
+            cwd, env, state, ('aws-sts', profile, chosen, cwd, _account_env_key(env)))
         account, source = (found if found and _ACCOUNT_AWS_ID.match(found) else None), 'command'
     if not account:
         return [], None
@@ -8404,9 +8406,15 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
-    if _account_subcommand(args, _ACCOUNT_KUBE_VALUE_OPTIONS)[0] == 'config':
+    if _account_kube_subcommand(args)[0] == 'config':
         # `kubectl config …` edits the local kubeconfig; even `set-cluster --server` reaches no cluster.
         return [], None
+    server, server_known = _account_option(args, ('--server', '-s'))
+    if not server_known:
+        return [], None
+    if server:
+        # The endpoint the call names IS the cluster it reached, whatever context or cluster it also names.
+        return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
     context, known = _account_option(args, ('--context',))
     chosen, named = _account_option(args, ('--kubeconfig',), _account_path)
     cluster_named, cluster_known = _account_option(args, ('--cluster',))
@@ -8417,12 +8425,6 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
         # A selector we cannot read, or one that picks a cluster this lookup cannot ask for, leaves the
         # endpoint unknown rather than the current context's.
         return [], None
-    server, server_known = _account_option(args, ('--server', '-s'))
-    if not server_known:
-        return [], None
-    if server:
-        # The endpoint the call names IS the cluster it reached; nothing has to be read to know that.
-        return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
     kubeconfig = chosen or _account_known('KUBECONFIG', env, _account_path)[0] or ''
     if not isinstance(cwd, str) and any(part and not os.path.isabs(part) for part in kubeconfig.split(os.pathsep)):
         # kubectl reads a relative kubeconfig from the call's folder; with that unknown, so is the cluster.
@@ -8499,12 +8501,26 @@ _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws
                      'az': _account_azure, 'kubectl': _account_kubernetes, 'docker': _account_docker}
 
 
-# kubectl's global options that take a value, so its subcommand is found past them.
-_ACCOUNT_KUBE_VALUE_OPTIONS = frozenset({
-    '--kubeconfig', '--context', '--cluster', '--user', '-n', '--namespace', '-s', '--server', '--token', '--as',
-    '--as-group', '--as-uid', '--request-timeout', '--certificate-authority', '--client-certificate',
-    '--client-key', '--tls-server-name', '--cache-dir', '-v', '--v', '--log-dir', '--log-file',
-})
+# kubectl's options that take no value; cobra takes any other written without `=` to carry one.
+_ACCOUNT_KUBE_SWITCHES = frozenset({'--insecure-skip-tls-verify', '--match-server-version', '--warnings-as-errors',
+                                    '--disable-compression', '-h', '--help'})
+# The `kubectl config` subcommands that only read; every other one can move what the current context reaches.
+_ACCOUNT_KUBE_CONFIG_READS = frozenset({'', 'view', 'current-context', 'get-contexts', 'get-clusters', 'get-users'})
+# az's options that can come before its command group, with the value each takes.
+_ACCOUNT_AZ_VALUE_OPTIONS = frozenset({'-o', '--output', '--query', '--subscription'})
+
+
+def _account_kube_subcommand(args: List[str]) -> tuple:
+    """(kubectl's subcommand, the words after it), skipping options as cobra does when it looks for one."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith('-'):
+            takes = '=' not in arg and arg not in _ACCOUNT_KUBE_SWITCHES and (arg.startswith('--') or len(arg) == 2)
+            i += 2 if takes else 1
+            continue
+        return arg, args[i + 1:]
+    return '', []
 
 
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
@@ -8524,11 +8540,14 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
                 or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
             return 'git'
     if program == 'kubectl':
-        subcommand, after = _account_subcommand(args, _ACCOUNT_KUBE_VALUE_OPTIONS)
-        if subcommand == 'config' and _account_subcommand(after, _ACCOUNT_KUBE_VALUE_OPTIONS)[0] == 'use-context':
+        subcommand, after = _account_kube_subcommand(args)
+        if subcommand == 'config' and _account_kube_subcommand(after)[0] not in _ACCOUNT_KUBE_CONFIG_READS:
             return 'kubernetes'
-    if program == 'az' and (words[:2] == ['account', 'set'] or words[:1] == ['login']):
-        return 'azure'
+    if program == 'az':
+        group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
+        if group == 'login' or (group == 'account'
+                                and _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0] == 'set'):
+            return 'azure'
     return None
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
@@ -8561,10 +8580,14 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
             if switched:
-                for platform, accounts, account in taken:
-                    if platform == switched and account in accounts:
+                # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
+                host = _account_option(args, ('--hostname', '-h'))[0] if switched == 'github' else None
+                hit = [item for item in taken
+                       if item[0] == switched and (host is None or str(item[2].get('host')).lower() == host.lower())]
+                for _platform, accounts, account in hit:
+                    if account in accounts:
                         accounts.remove(account)
-                taken[:] = [item for item in taken if item[0] != switched]
+                taken[:] = [item for item in taken if item not in hit]
             handler = _ACCOUNT_HANDLERS.get(program)
             # A call that only may have run tells us nothing about who ran it, one run as another user resolves
             # that user's configuration and not the hook's, and one past a source or eval resolves nothing.

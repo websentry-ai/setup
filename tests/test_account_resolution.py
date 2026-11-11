@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '931afee37f52a2858362e5dc4fc641768fb78090f9b843f35db58e1c21cee08f'
+BLOCK_SHA256 = '87ed502eeb8344bd6d2f91887311564c9a84f4485cbdbe374b98af7e2e04d8a2'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -114,8 +114,10 @@ with open(os.environ['FAKE_RUN_LOG'], 'a') as log:
 users = json.loads(os.environ.get('FAKE_GH_USERS') or '{{}}')
 if args[:2] == ['config', 'get'] and '-h' in args:
     host = args[args.index('-h') + 1]
-    if args[-1] == 'user' and host in users:
-        print(users[host])
+    # `host@folder` answers only from that folder, as a relative GH_CONFIG_DIR would.
+    here = host + '@' + os.path.realpath(os.getcwd())
+    if args[-1] == 'user' and (here in users or host in users):
+        print(users.get(here, users.get(host)))
         sys.exit(0)
     sys.exit(1)
 sys.exit(3)
@@ -682,6 +684,31 @@ class AccountResolutionTests(unittest.TestCase):
             after = hook._accounts('gh pr create', self.repo, state)
             self.assertEqual(before.get('accounts'), [], path)
             self.assertEqual(after['accounts'][0]['login'], 'jdoe', path)
+
+    def test_a_switch_on_one_host_keeps_the_login_on_another(self):
+        """`gh auth switch -h <host>` changes that host's login only; with no host it may be any."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            dotcom = hook._accounts('gh api user', self.repo, state)
+            acme = hook._accounts('gh api user --hostname github.acme.com', self.repo, state)
+            hook._accounts('gh auth switch -h GitHub.acme.com --user j-doe-admin', self.repo, state)
+            self.assertEqual(dotcom['accounts'][0]['login'], 'jdoe', path)
+            self.assertEqual(acme.get('accounts'), [], path)
+            hook._accounts('gh auth switch', self.repo, state)
+            self.assertEqual(dotcom.get('accounts'), [], path)
+
+    def test_a_login_read_in_one_folder_is_not_reused_in_another(self):
+        """A relative GH_CONFIG_DIR names a different config in each folder, so each folder is asked."""
+        other = tempfile.mkdtemp()
+        users = {'github.com@' + os.path.realpath(self.repo): 'jdoe',
+                 'github.com@' + os.path.realpath(other): 'jdoe-work'}
+        with patch.dict(os.environ, {'GH_CONFIG_DIR': '.gh', 'FAKE_GH_USERS': json.dumps(users)}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                first = hook._accounts('gh api user', self.repo, state)
+                second = hook._accounts('gh api user', other, state)
+                self.assertEqual([first['accounts'][0]['login'], second['accounts'][0]['login']],
+                                 ['jdoe', 'jdoe-work'], path)
 
     def test_a_committer_set_later_in_the_turn_leaves_the_earlier_commit_unknown(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):

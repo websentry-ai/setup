@@ -87,7 +87,9 @@ with open(os.environ['FAKE_RUN_LOG'], 'a') as log:
 if args[:2] != ['sts', 'get-caller-identity']:
     sys.exit(3)
 answers = json.loads(os.environ.get('FAKE_AWS_STS') or '{{}}')
-profile = args[args.index('--profile') + 1] if '--profile' in args else 'default'
+# `(none)` answers a call that names no profile, as an instance role would, apart from `--profile default`.
+profile = args[args.index('--profile') + 1] if '--profile' in args else (
+    '(none)' if '(none)' in answers else 'default')
 if profile not in answers:
     sys.exit(1)
 print(answers[profile])
@@ -492,6 +494,44 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('kubectl --kubeconfig /tmp/a config set-cluster prod --server=https://x'):
             self.assertIsNone(resolved, path)
 
+    def test_every_kubectl_config_write_is_a_switch(self):
+        """`use` is `use-context`'s alias, and `set current-context` or an edit to the current context moves it too."""
+        for switch in ('kubectl config use staging', 'kubectl config set current-context staging',
+                       'kubectl config set-context --current --cluster=other',
+                       'kubectl -o json config use-context staging'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('kubectl get pods', self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, switch))
+        for read in ('kubectl config view', 'kubectl config current-context', 'kubectl config get-contexts'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('kubectl get pods', self.repo, state)
+                hook._accounts(read, self.repo, state)
+                self.assertEqual(before['accounts'][0]['cluster'], 'prod', '%s / %s' % (path, read))
+
+    def test_an_option_before_config_is_skipped_as_kubectl_does(self):
+        """kubectl's parser takes any option written without `=` to carry a value while it finds the subcommand."""
+        for option in ('-o json', '--output json', '--output=json'):
+            command = 'kubectl %s config set-cluster prod --server=https://eks.example.com' % option
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+
+    def test_an_az_switch_behind_a_global_option_is_still_a_switch(self):
+        for switch in ('az -o json account set --subscription "Acme Sandbox"', 'az --output none login'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('az group list', self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, switch))
+
+    def test_a_server_flag_wins_over_a_named_cluster(self):
+        """`--server` is the endpoint the call reached, whichever cluster or context it also names."""
+        for path, resolved in self.each('kubectl --cluster other --server https://k8s.example.com get pods'):
+            self.assertEqual(resolved['accounts'], [{'platform': 'kubernetes', 'server': 'https://k8s.example.com',
+                                                     'source': 'command'}], path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
@@ -553,9 +593,30 @@ class AccountPlatformTests(unittest.TestCase):
         self.assertEqual(self.runs()[0][:3], ['aws', 'sts', 'get-caller-identity'])
 
     def test_a_profile_absent_from_the_file_is_unknown_and_never_the_default(self):
+        """The CLI is asked for that profile by name, and fails for one that exists nowhere."""
         for path, resolved in self.each('aws s3 ls --profile nosuchprofile'):
             self.assertIsNone(resolved, path)
-        self.assertEqual(self.runs(), [])
+        for argv in self.runs():
+            self.assertEqual(argv[-2:], ['--profile', 'nosuchprofile'])
+
+    def test_a_profile_only_in_the_credentials_file_is_asked_by_name(self):
+        """The config file lacks it, but the CLI merges the credentials file in and answers for it."""
+        with patch.dict(os.environ, {'FAKE_AWS_STS': json.dumps({'creds-only': '444444444444'})}):
+            for path, resolved in self.each('aws s3 ls --profile creds-only'):
+                self.assertEqual(resolved['accounts'], [{'platform': 'aws', 'account_id': '444444444444',
+                                                         'profile': 'creds-only', 'source': 'command'}], path)
+
+    def test_no_profile_and_an_explicit_default_are_asked_apart(self):
+        """With no config file the two are different questions: the instance role, and a profile that is not there."""
+        config = Path(tempfile.mkdtemp(), 'absent')
+        answers = {'(none)': '999999999999', 'default': '222222222222'}
+        with patch.dict(os.environ, {'AWS_CONFIG_FILE': str(config), 'FAKE_AWS_STS': json.dumps(answers)}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                bare = hook._accounts('aws s3 ls', self.repo, state)
+                named = hook._accounts('aws --profile default s3 ls', self.repo, state)
+                self.assertEqual([bare['accounts'][0]['account_id'], named['accounts'][0]['account_id']],
+                                 ['999999999999', '222222222222'], path)
 
     def test_keys_in_the_environment_leave_the_account_unknown(self):
         with patch.dict(os.environ, {'AWS_ACCESS_KEY_ID': 'AKIAIOSFODNN7EXAMPLE'}):
