@@ -9284,6 +9284,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # Only these commands are ever run; everything else is refused. All are local, and none of them prints a credential.
 _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'config', '--get'),
+    ('git', 'ls-remote', '--get-url'),
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'symbolic-ref', '--short', 'HEAD'),
     ('gh', 'config', 'get'),
@@ -9661,7 +9662,10 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         if not reachable:
             repo, remote = None, None
         elif repo:
-            remote = None
+            # A URL is still rewritten by the user's `insteadOf` rules; ls-remote applies them without connecting.
+            rewritten = _account_first_line(['git', 'ls-remote', '--get-url', remote], cwd, env, state,
+                                            ('git-url-rewrite', remote, cwd, _account_env_key(env)))
+            repo, remote = (_account_repo_of(rewritten) if rewritten else None) or repo, None
         else:
             url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
                                       ('git-push-url', remote, cwd, _account_env_key(env)))
