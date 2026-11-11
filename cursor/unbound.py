@@ -8286,7 +8286,8 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         account, source = (found if found and _ACCOUNT_AWS_ID.match(found) else None), 'command'
     if not account:
         return [], None
-    return [{'platform': 'aws', 'account_id': account, 'profile': profile, 'source': source}], None
+    # Read from the config when the turn ends, so a later `aws configure` write can move it.
+    return [{'platform': 'aws', 'account_id': account, 'profile': profile, 'source': source, '_active': True}], None
 
 
 def _account_azure_dir(env: Dict, cwd: Optional[str]) -> Optional[str]:
@@ -8473,11 +8474,11 @@ def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict)
     # A login names a server, which may be written as a URL (`https://<ecr>/`); its host is the registry.
     # Its host and port, since registries on one host are told apart by port; any login in it is dropped.
     server = _transfer_url_split(target).netloc.rsplit('@', 1)[-1].lower() if '://' in target else target
-    registry = _account_docker_registry(target) if subcommand != 'login' else _account_value(server)
+    registry = _account_docker_registry(target) if subcommand != 'login' else _account_value(server.lower())
     if not registry:
         return [], None
     accounts = [{'platform': 'docker', 'registry': registry, 'source': 'hostname'}]
-    match = _ACCOUNT_ECR_HOST.match(registry)
+    match = _ACCOUNT_ECR_HOST.match(registry.rsplit(':', 1)[0] if ':' in registry else registry)
     if match:
         accounts.append({'platform': 'aws', 'account_id': match.group(1), 'source': 'hostname'})
     return accounts, None
@@ -8495,6 +8496,10 @@ _ACCOUNT_KUBE_SWITCHES = frozenset({'--insecure-skip-tls-verify', '--match-serve
                                     '--skip-headers', '--skip-log-headers'})
 # The `kubectl config` subcommands that only read; every other one can move what the current context reaches.
 _ACCOUNT_KUBE_CONFIG_READS = frozenset({'', 'view', 'current-context', 'get-contexts', 'get-clusters', 'get-users'})
+# The AWS CLI's global options that take a value, which can come before the service.
+_ACCOUNT_AWS_VALUE_OPTIONS = frozenset({'--profile', '--region', '--output', '--endpoint-url', '--query',
+                                        '--ca-bundle', '--color', '--cli-read-timeout', '--cli-connect-timeout',
+                                        '--cli-binary-format'})
 # az's options that can come before its command group, with the value each takes.
 _ACCOUNT_AZ_VALUE_OPTIONS = frozenset({'-o', '--output', '--query', '--subscription'})
 
@@ -8546,6 +8551,11 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
             return 'kubernetes'
         if subcommand == 'config' and action not in _ACCOUNT_KUBE_CONFIG_READS:
             return 'kubeconfig'
+    if program == 'aws':
+        service, after = _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)
+        if service == 'configure' and _account_subcommand(after, _ACCOUNT_AWS_VALUE_OPTIONS)[0] not in (
+                'get', 'list', 'list-profiles', 'export-credentials'):
+            return 'aws'
     if program == 'az':
         group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
         if group == 'login' or (group == 'account'
@@ -8557,9 +8567,12 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
 # Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
     r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
-# A PowerShell `$env:NAME = …` sets a variable the shell walk does not model, so a call after one that sets an
-# identity or configuration name cannot be resolved from what the walk sees.
-_ACCOUNT_POWERSHELL_ENV = re.compile(r'\$env:([A-Za-z_]\w*)\s*=', re.IGNORECASE)
+# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
+# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
+_ACCOUNT_POWERSHELL_ENV = re.compile(
+    r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
+    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
+    r'|SetEnvironmentVariable\(\s*[\'"]([A-Za-z_]\w*)', re.IGNORECASE)
 
 
 def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
@@ -8570,7 +8583,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
             return None
-        steered = {name.upper() for name in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        steered = {''.join(names).upper() for names in _ACCOUNT_POWERSHELL_ENV.findall(command)}
         if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
             return None
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text

@@ -601,6 +601,23 @@ class AccountPlatformTests(unittest.TestCase):
                 self.assertEqual(resolved['accounts'][0]['server'], 'https://eks.example.com:443', path)
                 self.assertNotIn('s3cret', json.dumps(resolved), path)
 
+    def test_an_aws_configure_write_drops_the_earlier_aws_account(self):
+        """Accounts are read when the turn ends, so one read before `aws configure set` would be the edited one."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('aws s3 ls --profile home', self.repo, state)
+            hook._accounts('aws configure get region --profile home', self.repo, state)
+            self.assertEqual(len(before['accounts']), 1, path)
+            hook._accounts('aws --profile home configure set sso_account_id 999999999999', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
+
+    def test_an_ecr_login_keeps_its_account_behind_a_port_and_a_bare_host_is_lowercased(self):
+        for path, resolved in self.each('docker login https://%s:443/' % ECR_HOST):
+            self.assertIn({'platform': 'aws', 'account_id': '210987654321', 'source': 'hostname'},
+                          resolved['accounts'], path)
+        for path, resolved in self.each('docker login REGISTRY.EXAMPLE.COM:5000'):
+            self.assertEqual(resolved['accounts'][0]['registry'], 'registry.example.com:5000', path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

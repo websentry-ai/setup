@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '59081d4660619d5af93457fa991b1fb49b9b67b7f94c77d3c4d4c8dbc6eade57'
+BLOCK_SHA256 = '0918d56576da9faff88ca5f14afb48d72a8e20cb12ce2fccf41477ae44a6ff73'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -786,6 +786,14 @@ class AccountResolutionTests(unittest.TestCase):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
                 self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', '%s / %s' % (path, command))
+
+    def test_every_powershell_form_of_setting_an_identity_variable_is_refused(self):
+        for command in ('${env:GIT_COMMITTER_EMAIL} = "x@acme.com"; git commit -m a',
+                        'Set-Item Env:GIT_COMMITTER_EMAIL "x@acme.com"; git commit -m a',
+                        'Set-Item -Path "Env:GH_HOST" github.acme.com; gh pr list',
+                        '[Environment]::SetEnvironmentVariable("GH_TOKEN", "t"); gh pr list'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
 
     def test_a_login_read_in_one_folder_is_not_reused_in_another(self):
         """A relative GH_CONFIG_DIR names a different config in each folder, so each folder is asked."""
