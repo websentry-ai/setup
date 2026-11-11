@@ -456,6 +456,11 @@ class AccountPlatformTests(unittest.TestCase):
                 {'platform': 'docker', 'registry': ECR_HOST, 'source': 'hostname'},
                 {'platform': 'aws', 'account_id': '210987654321', 'source': 'hostname'}], path)
 
+    def test_a_docker_login_url_keeps_its_port(self):
+        """Registries on one host are told apart by port, as an image push already records them."""
+        for path, resolved in self.each('docker login https://user@registry.example.com:5000/'):
+            self.assertEqual(resolved['accounts'][0]['registry'], 'registry.example.com:5000', path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
