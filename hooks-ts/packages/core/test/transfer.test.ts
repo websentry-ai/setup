@@ -1195,6 +1195,14 @@ test("PowerShell's own statements, script blocks and splats are read in its shap
       { direction: "out", host: "example.com", resolved_host: "example.com", address: "public" }] }],
     ["irm https://example.com/x  # later: { irm https://files.acme-infra.net/y -InFile s }", { tool: "powershell", endpoints: [
       { direction: "in", host: "example.com", resolved_host: "example.com", address: "public" }] }],
+    // A block set again before it runs, or run on another machine, has no direction; a backtick escapes a quote.
+    ["$cb = { irm https://example.com/a -InFile a }; $cb = { irm https://files.acme-infra.net/b -InFile b }; & $cb", {
+      tool: "powershell", endpoints: [{ host: "example.com", resolved_host: "example.com", address: "unresolved" },
+        { direction: "out", host: "files.acme-infra.net", resolved_host: "files.acme-infra.net", address: "private" }] }],
+    ["Invoke-Command -ComputerName srv1 -ScriptBlock { irm https://example.com/up -InFile s }", { tool: "powershell",
+      endpoints: [{ host: "example.com", resolved_host: "example.com", address: "unresolved" }] }],
+    ["Write-Host \"a`\" #\"; irm https://example.com/up -InFile secret.txt", { tool: "powershell", endpoints: [
+      { direction: "out", host: "example.com", resolved_host: "example.com", address: "public" }] }],
     ["try { irm https://example.com/x } catch { exit 1 }; irm https://files.acme-infra.net/x", { tool: "powershell", endpoints: [
       { direction: "in", host: "example.com", resolved_host: "example.com", address: "public" },
       { direction: "in", host: "files.acme-infra.net", resolved_host: "files.acme-infra.net", address: "private" }] }],
