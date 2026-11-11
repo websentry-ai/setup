@@ -7882,7 +7882,8 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     # a URL is a query. A bare `OWNER/REPO` only under `gh repo`, since elsewhere a slashed word is a branch or
     # a file (`gh pr checkout fix/login`).
     if not (args[:1] and args[0] in _ACCOUNT_GH_REPO_SCOPED):
-        return _account_known('GH_REPO', env)
+        # Nor does GH_REPO steer a command that acts on no repository; gh reads it only where it reads `--repo`.
+        return None, True
     takes_repo = args[:1] == ['repo']
     for at, arg in enumerate(args):
         # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
