@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'ea85b115f2fe99c1f52002b0a793ab6d486ef4049cbfb073a4be3340a07ea7c1'
+BLOCK_SHA256 = 'f61000ea80994f7962b4264047272066c047f0cd1f225ae66c1529aafb1f6232'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -722,6 +722,35 @@ class AccountResolutionTests(unittest.TestCase):
         """`GIT_CONFIG_PARAMETERS` is how `git -c` reaches git, so it reaches the lookup too."""
         for path, resolved in self.each("GIT_CONFIG_PARAMETERS=\"'user.email'='ci@acme.com'\" git commit -m wip"):
             self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
+
+    def test_skipping_the_system_config_reaches_the_lookup(self):
+        """`GIT_CONFIG_NOSYSTEM` decides whether git reads the system file, so the lookup has to see it."""
+        self.each('GIT_CONFIG_NOSYSTEM=1 git commit -m wip')
+        lookups = [entry for entry in self._run_entries() if entry['argv'][:3] == ['git', 'config', '--get']]
+        self.assertTrue(lookups)
+        self.assertTrue(all(entry['env'].get('GIT_CONFIG_NOSYSTEM') == '1' for entry in lookups))
+
+    def test_account_lookups_start_the_turn_s_one_clock(self):
+        """Run first, they start the clock the transfer walk reads, not a second one of their own."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            hook._accounts('git commit -m wip', self.repo, state)
+            self.assertIn('deadline', state, path)
+            self.assertNotIn('account_deadline', state, path)
+
+    def test_a_push_url_whose_rewrite_cannot_be_read_records_no_destination(self):
+        """With the budget spent the rules cannot be read, so the typed repository is not where it surely went."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            resolved = hook._accounts('git push https://github.com/acme/app.git main', self.repo, {'deadline': 0})
+            self.assertNotIn('pushed_repo', resolved or {}, path)
+
+    def test_unrelated_command_config_keeps_the_committer_active(self):
+        """`GIT_CONFIG_PARAMETERS` that sets something else leaves the committer the configured one."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts("GIT_CONFIG_PARAMETERS=\"'core.pager'='cat'\" git commit -m one", self.repo, state)
+            hook._accounts('git config user.email work@acme.com', self.repo, state)
+            self.assertEqual(before.get('accounts'), [], path)
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
