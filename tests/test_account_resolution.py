@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'e37c654f462183174d5cd876d6063b41ff57d64e46faa9e8112e2d2650c2bc00'
+BLOCK_SHA256 = '769d8c4159503c7d20b2ba616959655a8e75ea0f577bb59fe09f14f192c2dc7e'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1026,6 +1026,20 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertNotIn('pushed_repo', personal, path)
         for path, resolved in self.each('git push origin main; git remote set-url origin https://x.example.com/a/b.git'):
             self.assertNotIn('pushed_repo', resolved or {}, path)
+
+    def test_a_gh_login_read_through_the_checkout_remote_moves_with_it(self):
+        """`gh pr list` takes its host from the checkout's remote, so a later remote change would move it."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.origin.url'] = 'https://github.com/acme/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                checkout = hook._accounts('gh pr list', self.repo, state)
+                named = hook._accounts('gh api user --hostname github.acme.com', self.repo, state)
+                self.assertEqual(checkout['accounts'][0]['host'], 'github.com', path)
+                hook._accounts('git remote set-url origin https://github.acme.com/acme/app.git', self.repo, state)
+                self.assertEqual(checkout.get('accounts'), [], path)
+                self.assertEqual(named['accounts'][0]['host'], 'github.acme.com', path)
 
     def test_the_claude_code_hook_withdraws_a_push_a_later_call_rewires(self):
         hook = load_module('claude-code/hooks/unbound.py')

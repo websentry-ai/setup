@@ -9953,9 +9953,8 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     fallback, fallback_known = _account_known('GH_HOST', env)
     if not fallback_known:
         return [], None
-    host = named or (
-        _account_gh_remote_host(cwd, env, state) if checkout else None
-    ) or fallback or 'github.com'
+    remote_host = None if named else (_account_gh_remote_host(cwd, env, state) if checkout else None)
+    host = named or remote_host or fallback or 'github.com'
     if not host:
         return [], None
     lowered = host.lower()
@@ -9968,8 +9967,10 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     # Keyed by folder too: a relative GH_CONFIG_DIR or XDG_CONFIG_HOME names a different config in each.
     login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
                                 ('gh-user', host, cwd, _account_env_key(env)))
-    # The login gh holds for the host, which `gh auth switch` changes for every later call.
-    return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command', '_active': True}]
+    # The login gh holds for the host, which `gh auth switch` changes for every later call; a host the checkout's
+    # remotes decide, found or not, also moves with a later remote change.
+    active = ('github', 'git-remote') if checkout and not named else True
+    return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command', '_active': active}]
             if login else []), None
 
 
@@ -9998,6 +9999,18 @@ def _account_aws_web_identity(env: Dict) -> tuple:
     return (match.group(1), True) if match else (None, False)
 
 
+def _account_aws_section_profile(section: str) -> Optional[str]:
+    """The profile a config section names, split with shlex as botocore does; None for any other section."""
+    import shlex
+    if section == 'default':
+        return 'default'
+    try:
+        parts = shlex.split(section)
+    except ValueError:
+        return None
+    return parts[1] if len(parts) == 2 and parts[0] == 'profile' else None
+
+
 def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the account of the role the profile assumes, the account it names, whether the file settled it, whether the
     profile is a web-identity one)."""
@@ -10021,8 +10034,9 @@ def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) 
             parser.read_string(text)
         except Exception:
             return None, None, False, False
-        section = 'default' if profile == 'default' else 'profile %s' % profile
-        if not parser.has_section(section):
+        # Matched as botocore splits a section name, so `[profile "my profile"]` and extra spaces still name it.
+        section = next((name for name in parser.sections() if _account_aws_section_profile(name) == profile), None)
+        if section is None:
             # It may live only in the credentials file, which the hook never opens, so it stays unknown.
             return None, None, False, False
         role, web = None, parser.has_option(section, 'web_identity_token_file')
@@ -10479,6 +10493,12 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
                         for key in ('pushed_repo', 'pushed_remote', 'pushed'):
                             entry.pop(key, None)
                 held[:] = [(entry, remotes) for entry, remotes in held if scope is not None and scope not in remotes]
+                # A gh login read from the checkout's remote host moves with it too.
+                moved = [item for item in taken if item[0] == 'git-remote']
+                for _key, accounts, account in moved:
+                    if account in accounts:
+                        accounts.remove(account)
+                taken[:] = [item for item in taken if item not in moved]
             elif switched:
                 # `gh auth switch -h <host>` changes that host's login only, and `aws configure … --profile p` that
                 # profile only; with neither named, or one unreadable, any.

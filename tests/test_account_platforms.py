@@ -272,7 +272,7 @@ class AccountPlatformTests(unittest.TestCase):
 
     def test_a_spaced_profile_named_on_the_command_is_that_profile(self):
         config = Path(tempfile.mkdtemp(), 'config')
-        config.write_text('[profile my profile]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
+        config.write_text('[profile "my profile"]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
         for path, resolved in self.each("AWS_CONFIG_FILE=%s aws s3 ls --profile 'my profile'" % config):
             self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
@@ -315,7 +315,7 @@ class AccountPlatformTests(unittest.TestCase):
 
     def test_a_profile_name_with_a_space_is_that_profile_not_the_default(self):
         config = Path(tempfile.mkdtemp(), 'config')
-        config.write_text('[profile my profile]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
+        config.write_text('[profile "my profile"]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
         for path, resolved in self.each("AWS_CONFIG_FILE=%s AWS_PROFILE='my profile' aws s3 ls" % config):
             self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
@@ -628,6 +628,21 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(home['accounts'][0]['account_id'], '987654321098', path)
             hook._accounts('aws configure set sso_account_id 999999999999 --profile home', self.repo, state)
             self.assertEqual(home.get('accounts'), [], path)
+
+    def test_a_quoted_or_spaced_profile_section_is_that_profile(self):
+        """botocore splits a section with shlex, so `[profile "my team"]` and `[profile   ops]` are real profiles."""
+        config = Path(tempfile.mkdtemp(), 'config')
+        sso = 'sso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\n'
+        config.write_text('[profile "my team"]\n' + sso + 'sso_account_id = 121212121212\n'
+                          '[profile   ops]\n' + sso + 'sso_account_id = 343434343434\n')
+        for command, account in (("aws s3 ls --profile 'my team'", '121212121212'),
+                                 ('aws s3 ls --profile ops', '343434343434')):
+            for path, resolved in self.each('AWS_CONFIG_FILE=%s %s' % (config, command)):
+                self.assertEqual(resolved['accounts'][0]['account_id'], account, '%s / %s' % (path, command))
+        # Unquoted, `[profile my team]` splits into three words, and botocore loads no profile from it.
+        config.write_text('[profile my team]\n' + sso + 'sso_account_id = 121212121212\n')
+        for path, resolved in self.each("AWS_CONFIG_FILE=%s aws s3 ls --profile 'my team'" % config):
+            self.assertIsNone(resolved, path)
 
     def test_a_self_declared_account_label_is_not_the_account(self):
         """`aws_account_id`, or `sso_account_id` with no SSO sign-in, is a label an agent can write; botocore never checks it."""
