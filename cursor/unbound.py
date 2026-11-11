@@ -8076,30 +8076,33 @@ def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> 
     return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command'}] if login else []), None
 
 
-# Variables that sign an aws call in ahead of any profile, as botocore's credential chain reads them.
-_ACCOUNT_AWS_SIGN_IN = ('AWS_ACCESS_KEY_ID', 'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE')
-
-
-def _account_aws_profile(args: List[str], env: Dict) -> Optional[str]:
-    """The profile an aws call uses, in botocore's own order: --profile, AWS_DEFAULT_PROFILE, AWS_PROFILE,
-    else default."""
-    named, known = _account_option(args, ('--profile',))
-    if named or not known:
-        # None when the value cannot be read, which leaves the account unknown rather than the default one.
-        return named
-    for name in _ACCOUNT_AWS_SIGN_IN + ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'):
+def _account_aws_env_profile(env: Dict) -> Optional[str]:
+    """The profile the environment selects, in botocore's order: AWS_DEFAULT_PROFILE, AWS_PROFILE, else default;
+    None when one of them cannot be read."""
+    for name in ('AWS_DEFAULT_PROFILE', 'AWS_PROFILE'):
         value, known = _account_known(name, env)
         if not known:
             return None
         if value:
-            # Keys or a web-identity role sign the call in as whoever owns them, which cannot be read offline.
-            return None if name in _ACCOUNT_AWS_SIGN_IN else value
+            return value
     return 'default'
 
 
+def _account_aws_web_identity(env: Dict) -> tuple:
+    """(the account a web-identity role assumes, whether that is knowable); botocore uses it only with both set."""
+    arn, arn_known = _account_known('AWS_ROLE_ARN', env)
+    token, token_known = _account_known('AWS_WEB_IDENTITY_TOKEN_FILE', env, _account_path)
+    if not arn_known or not token_known:
+        return None, False
+    if not (arn and token):
+        return None, True
+    match = _ACCOUNT_ROLE_ARN.match(arn)
+    return (match.group(1), True) if match else (None, False)
+
+
 def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
-    """(the account ~/.aws/config gives this profile, whether that file settled it). A profile the file does not
-    contain settles as unknown, because falling back to the default would name the wrong account with confidence."""
+    """(the account of the role the profile assumes, the account it names, whether the file settled it). A profile
+    the file does not contain settles as unknown, because the default would name the wrong account with confidence."""
     def resolve():
         import configparser
         named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
@@ -8110,37 +8113,49 @@ def _account_aws_file(profile: str, env: Dict, state: Dict) -> tuple:
         path = named or (os.path.join(home, '.aws', 'config') if home else None)
         text = _account_file(path)
         if text is None:
-            return None, False
+            return None, None, False
         parser = configparser.RawConfigParser()
         try:
             parser.read_string(text)
         except Exception:
-            return None, False
+            return None, None, False
         section = 'default' if profile == 'default' else 'profile %s' % profile
         if not parser.has_section(section):
-            return None, True
+            return None, None, True
+        role = None
+        if parser.has_option(section, 'role_arn'):
+            match = _ACCOUNT_ROLE_ARN.match((parser.get(section, 'role_arn') or '').strip())
+            role = match.group(1) if match else None
         for key in ('sso_account_id', 'aws_account_id'):
             if parser.has_option(section, key):
                 found = _account_value(parser.get(section, key))
                 if found and _ACCOUNT_AWS_ID.match(found):
-                    return found, True
-        if parser.has_option(section, 'role_arn'):
-            match = _ACCOUNT_ROLE_ARN.match((parser.get(section, 'role_arn') or '').strip())
-            if match:
-                return match.group(1), True
-        # The profile is there but names no account — static keys, say — so the CLI is the only way to know.
-        return None, False
+                    return role, found, True
+        # The profile names no account itself — static keys, say — so only a role or the CLI can say.
+        return role, None, bool(role)
 
     return _account_once(state, ('aws-file', profile, _account_env_key(env)), resolve)
 
 
 def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the AWS account a call acted as, no repository); the file answers in about a millisecond, the CLI in 1,327."""
-    profile = _account_aws_profile(args, env)
+    # botocore's chain: the environment's keys (an explicit --profile turns them off), the profile's role,
+    # a web-identity role, then the account the profile names.
+    named, known = _account_option(args, ('--profile',))
+    if not known:
+        return [], None
+    if not named:
+        keys, keys_known = _account_known('AWS_ACCESS_KEY_ID', env)
+        if keys or not keys_known:
+            return [], None
+    profile = named or _account_aws_env_profile(env)
     if not profile:
         return [], None
-    account, settled = _account_aws_file(profile, env, state)
-    source = 'file'
+    role, hint, settled = _account_aws_file(profile, env, state)
+    web, web_known = _account_aws_web_identity(env)
+    if not role and not web_known:
+        return [], None
+    account, source = role or web or hint, 'file' if role or not web else 'command'
     if account is None and not settled:
         found = _account_first_line(
             ['aws', 'sts', 'get-caller-identity', '--query', 'Account', '--output', 'text', '--profile', profile],
@@ -8264,7 +8279,7 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     if kubeconfig:
         argv += ['--kubeconfig', kubeconfig]
     output = _account_output(argv, cwd, env, state,
-                            ('kube-view', context or '', kubeconfig, _account_env_key(env)))
+                            ('kube-view', context or '', kubeconfig, cwd, _account_env_key(env)))
     parts = (output or '').strip().split(_ACCOUNT_KUBE_SEPARATOR)
     server = _account_value(parts[0]) if parts else None
     if not server:

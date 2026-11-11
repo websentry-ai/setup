@@ -284,10 +284,39 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
 
     def test_a_web_identity_role_signs_the_call_in_ahead_of_the_profile(self):
-        """botocore assumes the role these name before any profile, so the default account is not the answer."""
-        for path, resolved in self.each(
-                'AWS_ROLE_ARN=arn:aws:iam::999999999999:role/ci AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/t aws s3 ls'):
-            self.assertIsNone(resolved, path)
+        """botocore assumes the role these name ahead of the profile's own account, explicit `--profile` or not."""
+        web = 'AWS_ROLE_ARN=arn:aws:iam::999999999999:role/ci AWS_WEB_IDENTITY_TOKEN_FILE=/tmp/t '
+        for command in (web + 'aws s3 ls', web + 'aws s3 ls --profile home'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['account_id'], '999999999999', '%s / %s' % (path, command))
+
+    def test_half_a_web_identity_pair_is_not_web_identity(self):
+        """botocore needs both variables; one alone leaves the profile to answer."""
+        for path, resolved in self.each('AWS_ROLE_ARN=arn:aws:iam::999999999999:role/ci aws s3 ls --profile home'):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
+
+    def test_the_role_a_profile_assumes_is_the_account_not_the_one_it_names(self):
+        """A profile with `role_arn` assumes that role, whatever account hint it also carries."""
+        config = Path(tempfile.mkdtemp(), 'config')
+        config.write_text('[profile ops]\nrole_arn = arn:aws:iam::444444444444:role/ops\n'
+                          'source_profile = home\nsso_account_id = 111111111111\n')
+        for path, resolved in self.each('AWS_CONFIG_FILE=%s aws s3 ls --profile ops' % config):
+            self.assertEqual(resolved['accounts'][0]['account_id'], '444444444444', path)
+
+    def test_an_explicit_profile_turns_the_environment_keys_off(self):
+        """botocore drops the environment's keys when `--profile` names a profile, so the profile answers."""
+        for path, resolved in self.each('AWS_ACCESS_KEY_ID=AKIA' + 'EXAMPLEEXAMPLE12 aws s3 ls --profile home'):  # gitleaks:allow
+            self.assertEqual(resolved['accounts'][0]['account_id'], '987654321098', path)
+
+    def test_a_relative_kubeconfig_is_asked_again_from_another_folder(self):
+        """kubectl reads `./kc` from the call's own folder, so the memo answers per folder."""
+        first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            open(self.run_log, 'w').close()
+            state = {}
+            hook._accounts('kubectl --kubeconfig ./kc get pods', first, state)
+            hook._accounts('kubectl --kubeconfig ./kc get pods', second, state)
+            self.assertEqual(len([argv for argv in self.runs() if argv[0] == 'kubectl']), 2, path)
 
     def test_a_list_given_to_the_kubeconfig_flag_is_not_the_default_cluster(self):
         """The flag takes one file; kubectl cannot open a list there, so the default config did not answer."""
