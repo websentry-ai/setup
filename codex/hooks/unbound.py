@@ -7744,21 +7744,25 @@ def _account_setting(name: str, env: Dict) -> Optional[str]:
     return _account_known(name, env)[0]
 
 
-def _account_option(args: List[str], names: tuple, reader=None) -> tuple:
-    """(what a call names with one of these options, whether it is readable); (None, True) when it names none."""
+def _account_option(args: List[str], names: tuple, reader=None, attached: bool = False) -> tuple:
+    """(what a call names with one of these options, whether it is readable); (None, True) when it names none.
+    The last occurrence wins, as each CLI's own parser does."""
     raw = None
     i = 0
-    while i < len(args) and raw is None:
+    while i < len(args):
         arg = args[i]
-        if arg in names and i + 1 < len(args):
-            raw = args[i + 1]
+        if arg == '--':
+            # Everything after this belongs to the command being run, not to the one naming the option.
             break
+        if arg in names and i + 1 < len(args):
+            raw, i = args[i + 1], i + 2
+            continue
         for name in names:
             if arg.startswith(name + '='):
                 raw = arg.split('=', 1)[1]
                 break
-            if len(name) == 2 and name[0] == '-' and name[1] != '-' and arg.startswith(name) and len(arg) > 2:
-                # A one-letter option takes its value attached as well: `-Racme/app`.
+            if attached and len(name) == 2 and name[0] == '-' and arg.startswith(name) and len(arg) > 2:
+                # Only where the CLI takes it: gh reads `-Racme/app`, while kubectl reads `-server` as a flag.
                 raw = arg[2:]
                 break
         i += 1
@@ -7961,7 +7965,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
 
 def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     """(the repository a gh call names, whether it is readable); gh reads `GH_REPO` exactly as it reads `--repo`."""
-    repo, known = _account_option(args, ('-R', '--repo'))
+    repo, known = _account_option(args, ('-R', '--repo'), attached=True)
     if repo or not known:
         return repo, known
     # A bare `OWNER/REPO` is a repository only where gh takes one as its operand, under `gh repo`; elsewhere
