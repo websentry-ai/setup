@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'd8b53dbe16d85676891a9c60a7ff9c8517fec1286d68329e728380bd64866319'
+BLOCK_SHA256 = '2ca76f44d94d6a2258dbf12ba68be4fe7818b497d6efb15f1b60fea0acfa33fc'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -395,6 +395,28 @@ class AccountResolutionTests(unittest.TestCase):
         with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': __import__('json').dumps(answers)}):
             for path, resolved in self.each('git commit -m wip'):
                 self.assertEqual(resolved['accounts'][0]['email'], 'actual@example.com', path)
+
+    def test_an_explicitly_empty_git_config_global_is_not_the_default_file(self):
+        """Set empty, git reads no global file; the walk cannot tell that from `unset`, so the committer is unknown."""
+        for command in ('GIT_CONFIG_GLOBAL= git commit -m wip', 'GIT_CONFIG_GLOBAL="" git commit -m wip',
+                        'export GIT_CONFIG_SYSTEM=; git commit -m wip'):
+            for path, resolved in self.each(command):
+                self.assertNotIn('accounts', resolved or {}, '%s / %s' % (path, command))
+
+    def test_an_explicit_identity_survives_a_switch_that_drops_the_same_configured_one(self):
+        """The second commit named its committer outright, so the later config write does not unsettle it."""
+        command = ('git commit -m one; GIT_COMMITTER_EMAIL=jdoe@gmail.com git commit -m two; '
+                   'git config user.email jdoe@gmail.com')
+        for path, resolved in self.each(command):
+            self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_a_call_that_may_not_have_run_resolves_nothing_but_still_switches(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('gh api user', self.repo, state)
+            self.assertIsNone(hook._accounts('gh pr list', self.repo, state, sure=False), path)
+            hook._accounts('gh auth switch --user bot', self.repo, state, sure=False)
+            self.assertEqual(before.get('accounts'), [], path)
 
     def test_a_variable_the_shell_unset_does_not_reach_the_lookup(self):
         """Removing it from the child's environment, not just from our own reading of it."""
