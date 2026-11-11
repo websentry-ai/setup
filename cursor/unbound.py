@@ -8180,11 +8180,11 @@ def _account_remote_scope(args: List[str]) -> Optional[str]:
 # Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
     r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
-# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
-# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
 # `GIT_CONFIG_GLOBAL=` set empty makes git read no global file, while `unset` makes it read the default one; the
 # walk sees both as empty, so a git call after an explicit empty one is not resolved.
 _ACCOUNT_EMPTY_GIT_CONFIG = re.compile(r'(?<![\w$])GIT_CONFIG_(?:GLOBAL|SYSTEM)=(?=\s|$|[;&|)]|""|\'\')')
+# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
+# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
 _ACCOUNT_POWERSHELL_ENV = re.compile(
     r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
     r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-(?:Literal)?Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
