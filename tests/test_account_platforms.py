@@ -358,6 +358,16 @@ class AccountPlatformTests(unittest.TestCase):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['registry'], ECR_HOST, '%s / %s' % (path, command))
 
+    def test_the_sts_fallback_is_asked_again_from_another_folder(self):
+        """A relative config read from the call's folder can send two folders to STS for different accounts."""
+        first, second = tempfile.mkdtemp(), tempfile.mkdtemp()
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            open(self.run_log, 'w').close()
+            state = {}
+            hook._accounts('aws s3 ls --profile static', first, state)
+            hook._accounts('aws s3 ls --profile static', second, state)
+            self.assertEqual(len([argv for argv in self.runs() if argv[:2] == ['aws', 'sts']]), 2, path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
