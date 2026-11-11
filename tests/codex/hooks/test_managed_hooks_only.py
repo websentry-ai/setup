@@ -56,7 +56,7 @@ def test_mdm_installs_system_hooks_except_on_windows(tmp_path, monkeypatch, os_n
                          ("fetch_api_key_from_mdm", "key"), ("set_env_var_system_wide", (True, True)),
                          ("detect_install_state", None), ("get_all_user_homes", [("u", Path(tmp_path))]),
                          ("remove_env_var_from_user", ""), ("remove_gateway_artifacts_for_user", None),
-                         ("write_unbound_config_for_user", None), ("enable_codex_hooks_feature_for_user", None),
+                         ("write_unbound_config_for_user", True), ("enable_codex_hooks_feature_for_user", None),
                          ("notify_setup_complete", None)]:
         monkeypatch.setattr(mdm, name, lambda *a, _r=result, **k: _r)
     for name in ("setup_managed_hooks", "remove_user_level_hooks_for_user", "configure_codex_hooks_for_user"):

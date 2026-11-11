@@ -1,4 +1,4 @@
-"""Every tool shares one UNBOUND_DEVICE_TOKEN; the per-tool key names still work as a fallback."""
+"""The device token lives in config.json only; setup drops the env var and the per-tool key names still work as a fallback."""
 
 import importlib.util
 import json
@@ -101,12 +101,37 @@ def test_setup_writes_both_config_fields(home, tool):
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))
-def test_setup_removes_only_its_own_legacy_key(home, monkeypatch, tool):
+def test_setup_drops_the_device_token_env_only_once_config_holds_the_key(home, monkeypatch, tool):
     setup = _load(SETUPS[tool], f"token_setup_{tool.replace('-', '_')}")
     removed = []
     monkeypatch.setattr(setup, "remove_env_var", lambda name, *a: removed.append(name) or ("cleared", ""))
     setup.remove_legacy_key_env()
     assert removed == [LEGACY[tool]]
+    removed.clear()
+    _write_config(home, {"device_token": "k"})
+    setup.remove_legacy_key_env()
+    assert removed == [LEGACY[tool], "UNBOUND_DEVICE_TOKEN"]
+
+
+@pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
+def test_mdm_drops_the_device_token_env_only_for_users_whose_config_holds_the_key(home, tmp_path, monkeypatch, tool):
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_drop_{tool.replace('-', '_')}")
+    with_key, without = tmp_path / "a", tmp_path / "b"
+    for h in (with_key, without):
+        (h / ".unbound").mkdir(parents=True)
+    (with_key / ".unbound" / "config.json").write_text(json.dumps({"api_key": "k"}))
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [("a", with_key), ("b", without)])
+    removed = []
+    monkeypatch.setattr(mdm, "remove_env_var_from_user", lambda user, home_dir, name, *a: removed.append((user, name)) or "cleared")
+    mdm.remove_legacy_key_env()
+    assert ("a", "UNBOUND_DEVICE_TOKEN") in removed and ("b", "UNBOUND_DEVICE_TOKEN") not in removed
+
+
+def test_no_installer_exports_the_device_token():
+    files = [*SETUPS.values(), *MDM_SETUPS.values(), REPO / "binary" / "src" / "unbound_hook" / "setup_cmd.py"]
+    sets = [f.name for f in files if re.search(r"set_env_var\w*\(\s*[\"']UNBOUND_DEVICE_TOKEN", f.read_text())]
+    assert sets == []
 
 
 @pytest.mark.parametrize("tool", sorted(SETUPS))
@@ -147,6 +172,18 @@ def test_windows_machine_token_stays_while_any_user_still_needs_it(home, tmp_pat
     monkeypatch.setattr(mdm, "get_all_user_homes", lambda: [("alice", alice)])
     assert mdm._remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=mdm.device_token_in_use) is True
     assert removed == ["UNBOUND_DEVICE_TOKEN"]
+
+
+@pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
+def test_windows_default_profile_is_enumerated_for_config(tool, tmp_path, monkeypatch):
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_{tool.replace('-', '_')}")
+    for name in ("Alice", "Default", "Public", "Default User"):
+        (tmp_path / "Users" / name).mkdir(parents=True)
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Windows")
+    monkeypatch.setenv("SystemDrive", str(tmp_path))
+    monkeypatch.setattr(mdm, "Path", lambda *a: __import__("pathlib").Path(str(a[0]).replace("\\", "/")))
+    names = {n for n, _ in mdm.get_all_user_homes()}
+    assert names == {"Alice", "Default"}
 
 
 def test_every_config_writer_also_writes_device_token():
@@ -215,3 +252,22 @@ def test_gateway_mdm_decides_windows_machine_token_once(home, tmp_path, monkeypa
     monkeypatch.setattr(gw_mdm.sys, "argv", ["setup.py", "--api-key", "admin"])
     assert not gw_mdm.main()
     assert ("UNBOUND_DEVICE_TOKEN" in removed) is (not bob_hooked)
+
+
+def test_user_setups_fail_when_the_config_write_fails():
+    unchecked = [f.name for f in SETUPS.values() if re.search(r"^\s+write_unbound_config\(", f.read_text(), re.M)]
+    assert unchecked == []
+
+
+@pytest.mark.parametrize("tool", sorted(MDM_SETUPS))
+def test_mdm_config_writer_reports_a_failed_write(home, tmp_path, monkeypatch, tool):
+    mdm = _load(MDM_SETUPS[tool], f"token_mdm_write_{tool.replace('-', '_')}")
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(mdm, "_repair_user_ownership", lambda *a, **k: None, raising=False)
+    monkeypatch.setattr(mdm, "_run_as_user", lambda *a, **k: None)
+    assert mdm.write_unbound_config_for_user("u", tmp_path, "k") is False
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Windows")
+    assert mdm.write_unbound_config_for_user("u", tmp_path, "k") is False
+    monkeypatch.setattr(mdm.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(mdm, "_run_as_user", lambda user, fn: fn())
+    assert mdm.write_unbound_config_for_user("u", tmp_path, "k") is True

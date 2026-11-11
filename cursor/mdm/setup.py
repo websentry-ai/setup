@@ -520,7 +520,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
             if users_dir.exists():
                 for user_dir in users_dir.iterdir():
                     if user_dir.is_dir() and user_dir.name not in [
-                        "Public", "Default", "Default User", "Administrator",
+                        "Public", "Default User", "Administrator",
                         "All Users",
                     ]:
                         user_homes.append((user_dir.name, user_dir))
@@ -931,10 +931,20 @@ def _remove_env_var_for_all_users(var_name: str, keep=lambda home_dir: False) ->
     return ok
 
 
+def _config_has_key(home_dir: Optional[Path] = None) -> bool:
+    try:
+        cfg = json.loads(((home_dir or Path.home()) / ".unbound" / "config.json").read_text(encoding="utf-8"))
+        return bool(cfg.get("api_key") or cfg.get("device_token"))
+    except Exception:
+        return False
+
+
 # Temporary: removes the per-tool key env var older installs wrote. Delete once fleets have re-run setup.
 def remove_legacy_key_env() -> None:
     try:
         _remove_env_var_for_all_users("UNBOUND_CURSOR_API_KEY")
+        # Env copy goes only once config.json holds the key; the Default profile gets one too, so later Windows profiles inherit it.
+        _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=lambda home_dir: home_dir is not None and not _config_has_key(home_dir))
     except Exception:
         pass
 
@@ -1333,16 +1343,6 @@ def main():
         return False
     print("✅ API key received")
 
-    # Set environment variable
-    debug_print("Setting UNBOUND_DEVICE_TOKEN environment variable...")
-    # Same key for every tool: the backend issues one application per user whatever app_type is sent.
-    success, env_changed, message = set_env_var("UNBOUND_DEVICE_TOKEN", cursor_api_key)
-    if not success:
-        print(f"❌ Failed to set environment variable: {message}")
-        return False
-    print(f"✅ Environment variable set ({message})")
-    remove_legacy_key_env()
-
     url_ok, _, url_message = set_env_var("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print(f"❌ Failed to set UNBOUND_BACKEND_URL: {url_message}")
@@ -1360,6 +1360,7 @@ def main():
             print(f"⚠️  Skipping hook removal for {username}: config write failed")
     if config_count > 0:
         print(f"✅ Config written for {config_count} user(s)")
+    remove_legacy_key_env()
 
     state = detect_install_state()
 
@@ -1371,6 +1372,10 @@ def main():
         return False
     debug_print("Hooks setup complete")
 
+    if config_count < len(user_homes):
+        print("Could not write ~/.unbound/config.json for every user")
+        return False
+
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
@@ -1378,8 +1383,8 @@ def main():
     notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url, install_state=state, serial_number=serial_number,
                           hook_hash=hook_script_hash(get_enterprise_hooks_dir() / "hooks" / "unbound.py"), install_mode="mdm")
 
-    if env_changed or hooks_changed:
-        debug_print(f"Restart needed: env_changed={env_changed}, hooks_changed={hooks_changed}")
+    if hooks_changed:
+        debug_print("Restart needed: hooks changed")
         restart_cursor()
     else:
         debug_print("No changes detected, skipping restart")

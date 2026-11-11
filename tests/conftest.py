@@ -7,7 +7,10 @@ module they mean, by repo-relative path, through `load_module` below.
 
 import importlib.util
 import sys
+import time
 from pathlib import Path
+
+import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -41,3 +44,11 @@ def load_module(relpath: str):
 def tool_module(tool: str, kind: str = "unbound"):
     """`tool` is the directory a tool's code lives in, e.g. "claude-code/hooks"."""
     return load_module("%s/%s.py" % (tool, kind))
+
+
+@pytest.fixture(autouse=True)
+def _run_clock_starts_with_the_test(monkeypatch):
+    """An installer's run clock starts at import, so without this a test inherits the age of the session."""
+    for module in list(_CACHE.values()):
+        if hasattr(module, "_SCRIPT_START"):
+            monkeypatch.setattr(module, "_SCRIPT_START", time.time())
