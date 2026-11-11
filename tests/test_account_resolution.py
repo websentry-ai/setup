@@ -24,14 +24,14 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '379e63772066416470ed047ff3cc874c9d9046253cfed505afeee32537af33cc'
+BLOCK_SHA256 = 'ea85b115f2fe99c1f52002b0a793ab6d486ef4049cbfb073a4be3340a07ea7c1'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
 # A `git` stand-in: answers `config --get`, `remote get-url --push` and `symbolic-ref` from FAKE_GIT_ANSWERS,
 # honours GIT_CONFIG_GLOBAL as git does, and logs every call.
 FAKE_GIT = '''#!{python}
-import json, os, sys
+import json, os, re, sys
 args = sys.argv[1:]
 with open(os.environ['FAKE_RUN_LOG'], 'a') as log:
     log.write(json.dumps({{'argv': ['git'] + args, 'cwd': os.getcwd(),
@@ -39,6 +39,11 @@ with open(os.environ['FAKE_RUN_LOG'], 'a') as log:
 answers = json.loads(os.environ.get('FAKE_GIT_ANSWERS') or '{{}}')
 if args[:2] == ['config', '--get']:
     name = args[2]
+    # Command-level configuration, as `git -c` hands it on, wins over every file.
+    for key, value in re.findall(r"'([^']*)'='([^']*)'", os.environ.get('GIT_CONFIG_PARAMETERS', '')):
+        if key == name:
+            print(value)
+            sys.exit(0)
     count = int(os.environ.get('GIT_CONFIG_COUNT') or 0)
     for n in range(count):
         if os.environ.get('GIT_CONFIG_KEY_%d' % n) == name:
@@ -63,6 +68,11 @@ if args[:2] == ['config', '--get']:
         sys.exit(0)
     sys.exit(1)
 if args[:2] == ['remote', '-v']:
+    # The checkout's remotes, from FAKE_GIT_ANSWERS['remote.<name>.url'], listed by name as git does.
+    for key in sorted(k for k in answers if k.startswith('remote.') and k.endswith('.url')):
+        name = key[len('remote.'):-len('.url')]
+        print('%s\t%s (fetch)' % (name, answers[key]))
+        print('%s\t%s (push)' % (name, answers[key]))
     # A remote named through the indexed config, its push URL rewritten as git does: pushInsteadOf first, then
     # insteadOf. FAKE_GIT_ANSWERS['pushinsteadof'] / ['insteadof'] map the replacement base to the matched one.
     for n in range(int(os.environ.get('GIT_CONFIG_COUNT') or 0)):
@@ -543,7 +553,7 @@ class AccountResolutionTests(unittest.TestCase):
         """gh accepts `-Rowner/repo` with no space, so it names a repository and the checkout is not consulted."""
         for path, resolved in self.each('gh pr view -Rgithub.acme.com/acme/app'):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
-        self.assertNotIn(['git', 'config', '--get', 'remote.origin.url'], self.runs())
+        self.assertNotIn(['git', 'remote', '-v'], self.runs())
 
     def test_a_call_that_adds_its_own_config_files_resolves_nothing(self):
         """git loads what an include names; this lookup cannot, so the committer it would use is unknown."""
@@ -577,7 +587,7 @@ class AccountResolutionTests(unittest.TestCase):
             for path, resolved in self.each(command):
                 # The checkout's remote answers, as it does for any call that names no repository.
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
-            self.assertIn(['git', 'config', '--get', 'remote.origin.url'], self.runs(), command)
+            self.assertIn(['git', 'remote', '-v'], self.runs(), command)
 
     def test_a_url_after_a_switch_or_an_equals_option_is_still_the_operand(self):
         """`--web` takes no value and `--title=x` carried its own, so the URL after either is the operand."""
@@ -596,7 +606,7 @@ class AccountResolutionTests(unittest.TestCase):
         for command in ('gh api user', 'gh search repos unbound'):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
-            self.assertNotIn(['git', 'config', '--get', 'remote.origin.url'], self.runs(), command)
+            self.assertNotIn(['git', 'remote', '-v'], self.runs(), command)
 
     def test_a_url_attached_to_an_option_is_not_the_repository(self):
         """`--body=<url>` is the option itself, carrying a comment's text."""
@@ -694,6 +704,25 @@ class AccountResolutionTests(unittest.TestCase):
             for path, resolved in self.each(command):
                 self.assertNotIn('accounts', resolved or {}, '%s / %s' % (path, command))
 
+    def test_gh_reads_the_checkout_remote_in_its_own_order(self):
+        """gh prefers `upstream`, then `github`, then `origin`, then the rest; not `origin` alone."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.upstream.url'] = 'https://github.acme.com/acme/app.git'
+        answers['remote.origin.url'] = 'https://github.com/jdoe/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('gh pr list'):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['remote.acme.url'] = 'https://github.acme.com/acme/app.git'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('gh pr list'):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
+
+    def test_config_parameters_set_on_the_command_decide_the_committer(self):
+        """`GIT_CONFIG_PARAMETERS` is how `git -c` reaches git, so it reaches the lookup too."""
+        for path, resolved in self.each("GIT_CONFIG_PARAMETERS=\"'user.email'='ci@acme.com'\" git commit -m wip"):
+            self.assertEqual(resolved['accounts'][0]['email'], 'ci@acme.com', path)
+
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""
         for path, hook in zip(HOOK_PATHS, HOOKS):
@@ -738,7 +767,7 @@ class AccountResolutionTests(unittest.TestCase):
         for _ in range(20):
             self.resolve(hook, 'gh pr list', state)
         # Two questions, each asked once: which host the checkout points at, and who is signed in there.
-        self.assertEqual(self.runs(), [['git', 'config', '--get', 'remote.origin.url'],
+        self.assertEqual(self.runs(), [['git', 'remote', '-v'],
                                        ['gh', 'config', 'get', '-h', 'github.com', 'user']])
 
     def test_only_allowlisted_commands_are_ever_run(self):

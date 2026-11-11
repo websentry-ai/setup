@@ -7489,7 +7489,7 @@ _ACCOUNT_MAX_PATH = 512
 # them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
 _ACCOUNT_REMEMBERED = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
-    'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'XDG_CONFIG_HOME', 'HOME', 'USERPROFILE',
+    'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'XDG_CONFIG_HOME', 'HOME', 'USERPROFILE',
     'GH_HOST', 'GH_REPO', 'GH_CONFIG_DIR', 'GH_TOKEN',
     'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
     'GITHUB_ENTERPRISE_TOKEN',
@@ -7569,8 +7569,8 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
 # The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
-    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_DIR', 'GIT_WORK_TREE',
-    'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'KUBECONFIG', 'HOME', 'USERPROFILE',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_DIR',
+    'GIT_WORK_TREE', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
 # git reads `GIT_CONFIG_COUNT` settings from indexed pairs, so they travel with it rather than being named one
 # by one in the table above.
@@ -7898,7 +7898,8 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         if not readable:
             # git commits as the value we cannot read, so who committed is unknown rather than `user.email`.
             return [], pushed
-        active = bool(email) and setting not in overrides
+        active = bool(email) and setting not in overrides and not any(
+            name in (env or {}) for name in ('GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT'))
     account = {'platform': 'git', 'email': email, 'source': 'command'}
     if active:
         account['_active'] = True
@@ -7954,10 +7955,22 @@ def _account_gh_host(args: List[str], env: Dict) -> tuple:
     return None, True
 
 
+# gh's order among a checkout's remotes: these by name, then the rest.
+_ACCOUNT_GH_REMOTE_ORDER = ('upstream', 'github', 'origin')
+
+
 def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
-    """The host the checkout's own remote points at, which gh reads before falling back to dotcom."""
-    url = _account_first_line(['git', 'config', '--get', 'remote.origin.url'], cwd, env, state,
-                              ('gh-remote-host', cwd, _account_env_key(env)))
+    """The host of the remote gh takes as the checkout's repository, which it reads before falling back to dotcom."""
+    out = _account_once(state, ('gh-remotes', cwd, _account_env_key(env)),
+                        lambda: _account_run(['git', 'remote', '-v'], cwd, env, state))
+    urls = {}
+    for line in (out or '').splitlines():
+        name, _, rest = line.partition('\t')
+        if rest.endswith(' (fetch)'):
+            urls.setdefault(name, rest[:-len(' (fetch)')])
+    named = [name for name in _ACCOUNT_GH_REMOTE_ORDER if name in urls]
+    ordered = named + sorted(name for name in urls if name not in _ACCOUNT_GH_REMOTE_ORDER)
+    url = urls[ordered[0]] if ordered else None
     host = _account_host_of(url) if url else None
     if host and ('://' not in url or url.startswith('ssh://')):
         # gh maps an SSH host alias through the SSH config — `git@github-personal:…` to github.com — so the
