@@ -394,6 +394,20 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(first['accounts'][0]['account_id'], '333333333333', path)
             self.assertIsNone(second, path)
 
+    def test_docker_login_with_no_server_is_docker_hub(self):
+        for path, resolved in self.each('docker login --username alice --password-stdin'):
+            self.assertEqual(resolved['accounts'][0]['registry'], 'docker.io', path)
+
+    def test_a_relative_kubeconfig_from_an_unknown_folder_is_unknown(self):
+        """kubectl would read it from a folder we cannot name, not from ours."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            self.assertIsNone(hook._accounts('kubectl --kubeconfig ./kc get pods', None, {}), path)
+
+    def test_a_relative_azure_directory_from_an_unknown_folder_is_unknown(self):
+        with patch.dict(os.environ, {'AZURE_CONFIG_DIR': 'azcfg'}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                self.assertIsNone(hook._accounts('az group list', None, {}), path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

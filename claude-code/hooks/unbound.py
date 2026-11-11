@@ -9725,6 +9725,10 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     entry, settled = _account_azure_entry(named, env, cwd, state)
     source = 'file'
     if entry is None and not settled:
+        directory, _ = _account_known('AZURE_CONFIG_DIR', env, _account_path)
+        if directory and not os.path.isabs(directory) and not isinstance(cwd, str):
+            # az reads a relative config directory from the call's folder; with that unknown, so is the login.
+            return [], None
         argv = ['az', 'account', 'show', '-o', 'json'] + (['--subscription', named] if named else [])
         output = _account_output(argv, cwd, env, state, ('azure-show', named or '', cwd, _account_env_key(env)))
         try:
@@ -9760,6 +9764,9 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
         # The endpoint the call names IS the cluster it reached; nothing has to be read to know that.
         return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
     kubeconfig = chosen or _account_setting('KUBECONFIG', env) or ''
+    if not isinstance(cwd, str) and any(part and not os.path.isabs(part) for part in kubeconfig.split(os.pathsep)):
+        # kubectl reads a relative kubeconfig from the call's folder; with that unknown, so is the cluster.
+        return [], None
     if os.pathsep in kubeconfig:
         # A list of files is not one path; kubectl reads the variable itself and merges them.
         kubeconfig = ''
@@ -9806,6 +9813,9 @@ def _account_docker(args: List[str], env: Dict, cwd: Optional[str], state: Dict)
     if subcommand not in _ACCOUNT_DOCKER_REGISTRY:
         return [], None
     target, _ = _account_subcommand(after, _ACCOUNT_DOCKER_VALUE_OPTIONS)
+    if subcommand == 'login' and not target:
+        # `docker login` with no server logs into Docker Hub.
+        target = _ACCOUNT_DOCKER_DEFAULT
     if not target or _account_value(target) is None:
         # An image name we cannot read says nothing about the registry, least of all that it is the default one.
         return [], None
@@ -9823,8 +9833,12 @@ _ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh, 'aws': _account_aws
                      'az': _account_azure, 'kubectl': _account_kubernetes, 'docker': _account_docker}
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
+# Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
-    r'(?<![\w.-])(%s)(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)))
+    r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
+# A PowerShell `$env:NAME = …` sets a variable the shell walk does not model, so a call after one that sets an
+# identity or configuration name cannot be resolved from what the walk sees.
+_ACCOUNT_POWERSHELL_ENV = re.compile(r'\$env:([A-Za-z_]\w*)\s*=', re.IGNORECASE)
 
 
 def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Optional[Dict]:
@@ -9834,6 +9848,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         if not isinstance(command, str) or not command.strip():
             return None
         if not _ACCOUNT_TRIGGERS.search(command):
+            return None
+        steered = {name.upper() for name in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
             return None
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
         # and the hook's ambient environment decide who ran it.
