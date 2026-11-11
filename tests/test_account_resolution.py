@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b9fb4751701731294a6c90aacbcde840123a6e603cc89b8d6c73818bac6a3eaa'
+BLOCK_SHA256 = 'e37c654f462183174d5cd876d6063b41ff57d64e46faa9e8112e2d2650c2bc00'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -417,6 +417,13 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertIsNone(hook._accounts('gh pr list', self.repo, state, sure=False), path)
             hook._accounts('gh auth switch --user bot', self.repo, state, sure=False)
             self.assertEqual(before.get('accounts'), [], path)
+
+    def test_an_unexpanded_variable_is_never_an_identity_or_a_config_file(self):
+        """The walk leaves `$EMAIL` as text; git sees whatever it expands to, so the committer is unknown."""
+        for command in ('GIT_COMMITTER_EMAIL=$EMAIL git commit -m a', 'GIT_COMMITTER_EMAIL="${EMAIL}" git commit -m a',
+                        'git -c user.email=$EMAIL commit -m a', 'GIT_CONFIG_GLOBAL=$CFG git commit -m a'):
+            for path, resolved in self.each(command):
+                self.assertNotIn('accounts', resolved or {}, '%s / %s' % (path, command))
 
     def test_a_variable_the_shell_unset_does_not_reach_the_lookup(self):
         """Removing it from the child's environment, not just from our own reading of it."""
@@ -1004,6 +1011,38 @@ class AccountResolutionTests(unittest.TestCase):
             entries = [e for e in _entries(hook.build_llm_exchange(events, cwd=self.repo))
                        if 'tool_use_id' in e]
         self.assertEqual([e.get('pushed_repo') for e in entries], ['acme/child-app'])
+
+    def test_a_later_remote_change_withdraws_the_earlier_pushes_it_would_rewrite(self):
+        """Destinations are read when the turn ends, so one read before `git remote set-url` would be the new URL."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            origin = hook._with_accounts({}, hook._accounts('git push origin main', self.repo, state), state)
+            personal = hook._with_accounts({}, hook._accounts('git push personal main', self.repo, state), state)
+            hook._accounts('git remote set-url origin https://github.com/personal/app.git', self.repo, state)
+            self.assertNotIn('pushed_repo', origin, path)
+            self.assertEqual(personal['pushed_repo'], 'jdoe-dev/app', path)
+            # A URL rewrite can move any push, so it withdraws every one.
+            hook._accounts('git config url.https://mirror.example.com/.insteadOf https://github.com/', self.repo, state)
+            self.assertNotIn('pushed_repo', personal, path)
+        for path, resolved in self.each('git push origin main; git remote set-url origin https://x.example.com/a/b.git'):
+            self.assertNotIn('pushed_repo', resolved or {}, path)
+
+    def test_the_claude_code_hook_withdraws_a_push_a_later_call_rewires(self):
+        hook = load_module('claude-code/hooks/unbound.py')
+        events = [
+            {'timestamp': '2026-10-22T16:39:58.000001Z',
+             'event': {'hook_event_name': 'UserPromptSubmit', 'prompt': 'ship it', 'session_id': 's1',
+                       'cwd': self.repo}},
+            {'timestamp': '2026-10-22T16:40:00.250000Z',
+             'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash',
+                       'tool_input': {'command': 'git push origin main'}, 'tool_response': {}}},
+            {'timestamp': '2026-10-22T16:40:01.250000Z',
+             'event': {'hook_event_name': 'PostToolUse', 'tool_name': 'Bash',
+                       'tool_input': {'command': 'git remote set-url origin https://x.example.com/a/b.git'},
+                       'tool_response': {}}},
+        ]
+        entries = [e for e in _entries(hook.build_llm_exchange(events, cwd=self.repo)) if 'tool_use_id' in e]
+        self.assertEqual([e.get('pushed_repo') for e in entries], [None, None])
 
     # -- cost and safety -------------------------------------------------------
 

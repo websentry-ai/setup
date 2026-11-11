@@ -9094,8 +9094,11 @@ def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) ->
         if argv[:1] == ['git'] and not isinstance(cwd, str):
             return None
         for name, value in (env or {}).items():
-            if ((name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG))
-                    and isinstance(value, str) and _TRANSFER_SUBSTITUTED in value):
+            # A configuration location set to something unreadable — a substitution, an unexpanded `$VAR` — would
+            # be dropped from the child, which then reads the default file instead, so the lookup is refused.
+            read = _account_value if name in _ACCOUNT_IDENTITY_VALUES else _account_path
+            if ((name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG)) and isinstance(value, str)
+                    and (_TRANSFER_SUBSTITUTED in value or (value.strip() and read(value) is None))):
                 return None
         program = _transfer_executable(argv[0])
         if program is None:
@@ -9162,11 +9165,12 @@ def _account_once(state: Dict, key: tuple, resolve) -> Any:
 
 
 def _account_value(value: Any) -> Optional[str]:
-    """One identity value, bounded and refused when it is not a single word; None when it names nothing."""
+    """One identity value, bounded and refused when it is not a single word or holds a `$` expansion the walk left
+    unexpanded; None when it names nothing or cannot be read."""
     if not isinstance(value, str):
         return None
     word = value.strip()[:_ACCOUNT_MAX_VALUE]
-    if not word or any(ch.isspace() or ord(ch) < 32 for ch in word):
+    if not word or '$' in word or any(ch.isspace() or ord(ch) < 32 for ch in word):
         return None
     return word
 
@@ -9186,7 +9190,7 @@ def _account_path(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
     text = value.strip()[:_ACCOUNT_MAX_PATH]
-    if not text or any(ord(ch) < 32 for ch in text):
+    if not text or '$' in text or any(ord(ch) < 32 for ch in text):
         return None
     return text
 
@@ -9207,8 +9211,10 @@ def _account_known(name: str, env: Dict, reader=None) -> tuple:
         return None, False
     read = reader or _account_value
     if name in (env or {}):
-        # Present and empty means the command's shell unset it, which is not the same as never having had it.
-        return read(raw), True
+        # Present and empty means the command's shell unset it, which is not the same as never having had it; set
+        # to something that cannot be read is not absent either, and stays unknown rather than falling through.
+        value = read(raw)
+        return value, value is not None or not (isinstance(raw, str) and raw.strip())
     if _TRANSFER_CLEAN_ENV in (env or {}):
         # `env -i` cleared the environment, so the child sees nothing this process holds.
         return None, True
@@ -9854,9 +9860,9 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     if not account:
         return [], None
     account['source'] = source
-    if not named:
-        # The default subscription, which `az account set` changes for every later call.
-        account['_active'] = True
+    # Matched within the active cloud, so a cloud change moves any of them; the default also moves with
+    # `az account set`, which leaves a named subscription where it was.
+    account['_active'] = ('azure-cloud',) if named else ('azure', 'azure-cloud')
     return [account], None
 
 
@@ -9905,7 +9911,11 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
         # A selector we cannot read, or one that picks a cluster this lookup cannot ask for, leaves the
         # endpoint unknown rather than the current context's.
         return [], None
-    kubeconfig = chosen or _account_known('KUBECONFIG', env, _account_path)[0] or ''
+    inherited, known = _account_known('KUBECONFIG', env, _account_path)
+    if not chosen and not known:
+        # A KUBECONFIG the call set to something we cannot read is not the hook's own; the cluster is unknown.
+        return [], None
+    kubeconfig = chosen or inherited or ''
     if not isinstance(cwd, str) and any(part and not os.path.isabs(part) for part in kubeconfig.split(os.pathsep)):
         # kubectl reads a relative kubeconfig from the call's folder; with that unknown, so is the cluster.
         return [], None
@@ -10042,16 +10052,21 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
             return 'github'
     if program == 'git':
         subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
-        keys = [at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]
-        # A set or an unset changes it, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
-        # `git config user.email` alone, or `git config get`, only reads it.
+        if subcommand == 'remote' and _account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[0] in _ACCOUNT_REMOTE_EDITS:
+            return 'git-remote'
+        # A set or an unset changes a key, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
+        # `git config user.email` alone, `git config get`, or `--get`/`--list` only read it.
         verb = after[0].lower() if after and not after[0].startswith('-') else ''
         reads = ('--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l')
-        if subcommand == 'config' and keys and not any(arg in reads for arg in after) and (
-                verb in ('set', 'unset')
-                or any(arg.startswith('--unset') for arg in after)
-                or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
+
+        def written(keys):
+            return subcommand == 'config' and keys and not any(arg in reads for arg in after) and (
+                verb in ('set', 'unset') or any(arg.startswith('--unset') for arg in after)
+                or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys)))
+        if written([at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]):
             return 'git'
+        if written([at for at, arg in enumerate(after) if _ACCOUNT_REMOTE_KEY.match(arg)]):
+            return 'git-remote'
     if program == 'kubectl':
         subcommand, after = _account_cobra_subcommand(args, _ACCOUNT_KUBE_SWITCHES)
         action = _account_cobra_subcommand(after, _ACCOUNT_KUBE_SWITCHES)[0] if subcommand == 'config' else ''
@@ -10067,21 +10082,41 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
     if program == 'az':
         group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
         action = _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0]
-        # `az cloud set` and an `az config` write change which cloud, and so which default, a later read sees.
-        if group == 'login' or (group, action) in (('account', 'set'), ('cloud', 'set'), ('config', 'set'),
-                                                   ('config', 'unset')):
+        if group == 'login' or (group, action) == ('account', 'set'):
             return 'azure'
+        # `az cloud set` and an `az config` write change the cloud every subscription is matched within.
+        if (group, action) in (('cloud', 'set'), ('config', 'set'), ('config', 'unset')):
+            return 'azure-cloud'
+    return None
+
+
+# `git remote` subcommands that change where a push goes, and the config keys that do.
+_ACCOUNT_REMOTE_EDITS = frozenset({'add', 'set-url', 'rename', 'remove', 'rm'})
+_ACCOUNT_REMOTE_KEY = re.compile(
+    r'^(?:remote\.(?P<remote>.+)\.(?:url|pushurl)|url\..+\.(?:insteadof|pushinsteadof)|branch\..+\.(?:remote|pushremote)'
+    r'|remote\.pushdefault)$', re.IGNORECASE)
+
+
+def _account_remote_scope(args: List[str]) -> Optional[str]:
+    """The one remote a remote change names, or None when it can move any push (a URL rewrite, a push target)."""
+    subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
+    if subcommand == 'remote':
+        return _account_value(_account_subcommand(_account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[1], _ACCOUNT_GIT_VALUE_OPTIONS)[0])
+    for arg in after:
+        match = _ACCOUNT_REMOTE_KEY.match(arg)
+        if match:
+            return match.group('remote')
     return None
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
 # Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
     r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
-# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
-# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
 # `GIT_CONFIG_GLOBAL=` set empty makes git read no global file, while `unset` makes it read the default one; the
 # walk sees both as empty, so a git call after an explicit empty one is not resolved.
 _ACCOUNT_EMPTY_GIT_CONFIG = re.compile(r'(?<![\w$])GIT_CONFIG_(?:GLOBAL|SYSTEM)=(?=\s|$|[;&|)]|""|\'\')')
+# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
+# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
 _ACCOUNT_POWERSHELL_ENV = re.compile(
     r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
     r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-(?:Literal)?Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
@@ -10109,13 +10144,23 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
         taken = state.setdefault('account_active', [])
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
-            # Run as another user, a switch changes that user's configuration, not ours; only a git config write to
-            # this repository, which both read, still moves our committer.
-            if switched and other_user and (switched != 'git' or any(
+            # Run as another user, a switch changes that user's configuration, not ours; only a git write to this
+            # repository's config, which both read, still moves our committer or our pushes.
+            if switched and other_user and (switched not in ('git', 'git-remote') or any(
                     arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
                     or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
                 switched = None
-            if switched:
+            if switched == 'git-remote':
+                # Push destinations are read when the turn ends too, so a later remote change would rewrite them.
+                scope = _account_remote_scope(args)
+                pushes[:] = [push for push in pushes if scope is not None and push[1] != scope]
+                held = state.setdefault('account_pushes', [])
+                for entry, remotes in held:
+                    if scope is None or scope in remotes:
+                        for key in ('pushed_repo', 'pushed_remote', 'pushed'):
+                            entry.pop(key, None)
+                held[:] = [(entry, remotes) for entry, remotes in held if scope is not None and scope not in remotes]
+            elif switched:
                 # `gh auth switch -h <host>` changes that host's login only, and `aws configure … --profile p` that
                 # profile only; with neither named, or one unreadable, any.
                 field, scope = None, None
@@ -10167,10 +10212,15 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
         return None
 
 
-def _with_accounts(entry: Dict, resolved: Optional[Dict]) -> Dict:
-    """The tool_use entry with the accounts its call acted as, and the repository a push reached."""
+def _with_accounts(entry: Dict, resolved: Optional[Dict], state: Optional[Dict] = None) -> Dict:
+    """The tool_use entry with the accounts its call acted as, and the repository a push reached; given the turn's
+    state, a push is remembered so a later remote change in the turn can withdraw it."""
     if resolved:
         entry.update(resolved)
+        if state is not None and resolved.get('pushed_repo'):
+            remotes = {push.get('remote') for push in resolved.get('pushed') or [
+                {'remote': resolved.get('pushed_remote')}]}
+            state.setdefault('account_pushes', []).append((entry, remotes))
     return entry
 # --- end account resolution ---
 
@@ -10274,7 +10324,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 turn_seeded = True
                 if transfer:
                     tool_use_entry['transfer'] = transfer
-                _with_accounts(tool_use_entry, accounts)
+                _with_accounts(tool_use_entry, accounts, transfer_state)
             # Lift the invoked skill to stable keys so the backend reads one
             # field regardless of how a tool spells its skill input.
             if tool_name == SKILL_TOOL_NAME and isinstance(tool_input, dict):

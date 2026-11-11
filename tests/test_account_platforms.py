@@ -670,6 +670,21 @@ class AccountPlatformTests(unittest.TestCase):
                 hook._accounts(switch, self.repo, state)
                 self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, switch))
 
+    def test_a_cloud_switch_drops_a_named_subscription_too(self):
+        """A name is matched within the active cloud, so a cloud change moves it; `az account set` does not."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            named = hook._accounts("az group list --subscription 'Acme Production'", self.repo, state)
+            hook._accounts('az account set --subscription "Acme Sandbox"', self.repo, state)
+            self.assertEqual(named['accounts'][0]['subscription_name'], 'Acme Production', path)
+            hook._accounts('az cloud set --name AzureUSGovernment', self.repo, state)
+            self.assertEqual(named.get('accounts'), [], path)
+
+    def test_a_kubeconfig_the_call_set_to_something_unreadable_is_not_ours(self):
+        for command in ('KUBECONFIG=$KCFG kubectl get pods', 'KUBECONFIG=$(cat kcfg) kubectl get pods'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+
     def test_the_active_clouds_entry_wins_over_one_that_names_no_cloud(self):
         folder = Path(self.home, '.azure')
         Path(folder, 'azureProfile.json').write_text(json.dumps({'subscriptions': [
