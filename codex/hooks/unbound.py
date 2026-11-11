@@ -3234,6 +3234,21 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
         return None
 
 
+def _git_branch(root: Optional[str]) -> Optional[str]:
+    """Checked-out branch of the repo at `root`; None on detached HEAD or any git failure."""
+    try:
+        if not root:
+            return None
+        result = subprocess.run(
+            ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
+            capture_output=True, text=True, timeout=10,
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else None
+    except Exception:
+        return None
+
+
 def _find_git_root(path: str) -> Optional[str]:
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
@@ -3491,10 +3506,8 @@ def _is_shell_write_command(command):
         return False
 
 
-def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Optional[str]]) -> Optional[str]:
-    """First project ("<org>/<repo>") resolved from `candidates` paths.
-    `root_projects` caches origin lookups so `git remote get-url` runs at
-    most once per distinct repo. None when nothing resolves (fail-open)."""
+def _repo_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Tuple[Optional[str], Optional[str]]]) -> tuple:
+    """First (project, branch) resolved from `candidates`, cached per repo root; (None, None) when nothing resolves."""
     try:
         for candidate in candidates:
             if not candidate:
@@ -3503,12 +3516,14 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
             if not root:
                 continue
             if root not in root_projects:
-                root_projects[root] = _get_project(root)
-            if root_projects[root]:
-                return root_projects[root]
+                project = _get_project(root)
+                root_projects[root] = (project, _git_branch(root) if project else None)
+            project, branch = root_projects[root]
+            if project:
+                return project, branch
     except Exception:
         pass
-    return None
+    return None, None
 
 
 # --- Repository-scope gate: blocks writes, git write subcommands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
@@ -7636,6 +7651,9 @@ _ACCOUNT_GH_SWITCHES = frozenset({
     '--detach', '--force', '--undo', '--dry-run', '--editor', '--watch', '--exit-status', '--log', '--log-failed',
     '--verbose', '--prerelease', '--latest', '--clobber',
 })
+# Short no-value flags, which mean different things under different subcommands, so listed per subcommand.
+_ACCOUNT_GH_SHORT_SWITCHES = {('pr', 'merge'): frozenset({'-s', '-m', '-r', '-d'}),
+                              ('pr', 'review'): frozenset({'-a', '-r', '-c', '--comment'})}
 # gh options whose value is text, so a URL after one is a title or a body and never the operand.
 _ACCOUNT_GH_TEXT_OPTIONS = frozenset({'--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
@@ -8120,6 +8138,7 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
         # Nor does GH_REPO steer a command that acts on no repository; gh reads it only where it reads `--repo`.
         return None, True
     takes_repo = args[:1] == ['repo']
+    switches = _ACCOUNT_GH_SWITCHES | _ACCOUNT_GH_SHORT_SWITCHES.get(tuple(args[:2]), frozenset())
     for at, arg in enumerate(args):
         # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
         # option carried its value with `=` or takes none.
@@ -8127,7 +8146,7 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
         # An option is never the operand, `--body=<url>` included, and neither is the value after one.
         if arg.startswith('-'):
             continue
-        if before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES:
+        if before.startswith('-') and '=' not in before and before not in switches:
             if '://' in arg and before not in _ACCOUNT_GH_TEXT_OPTIONS:
                 # An option we cannot place may take no value, making this URL where the call acts.
                 return None, False
@@ -8275,19 +8294,21 @@ def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) 
             return None, None, False, False
         section = 'default' if profile == 'default' else 'profile %s' % profile
         if not parser.has_section(section):
-            # It may live only in the credentials file, which the hook never opens; the CLI, asked for this
-            # profile by name, answers for it or fails.
+            # It may live only in the credentials file, which the hook never opens, so it stays unknown.
             return None, None, False, False
         role, web = None, parser.has_option(section, 'web_identity_token_file')
         if parser.has_option(section, 'role_arn'):
             match = _ACCOUNT_ROLE_ARN.match((parser.get(section, 'role_arn') or '').strip())
             role = match.group(1) if match else None
-        for key in ('sso_account_id', 'aws_account_id'):
-            if parser.has_option(section, key):
-                found = _account_value(parser.get(section, key))
-                if found and _ACCOUNT_AWS_ID.match(found):
-                    return role, found, True, web
-        # The profile names no account itself — static keys, say — so only a role or the CLI can say.
+        # sso_account_id is the account only where botocore signs in through SSO with it; aws_account_id is a
+        # label botocore never checks against the keys it uses, so it is not read at all.
+        sso = parser.has_option(section, 'sso_role_name') and (
+            parser.has_option(section, 'sso_start_url') or parser.has_option(section, 'sso_session'))
+        found = _account_value(parser.get(section, 'sso_account_id')) if sso and parser.has_option(
+            section, 'sso_account_id') else None
+        if found and _ACCOUNT_AWS_ID.match(found):
+            return role, found, True, web
+        # The profile names no account itself — static keys, say — so only a role can say.
         return role, None, bool(role), web
 
     return _account_once(state, ('aws-file', profile, cwd, _account_env_key(env)), resolve)
@@ -8381,11 +8402,11 @@ def _account_azure_entry(named: Optional[str], env: Dict, cwd: Optional[str], st
         if not isinstance(subscriptions, list):
             return None, False
         wanted = (named or '').lower()
-        for entry in subscriptions:
-            if not isinstance(entry, dict):
-                continue
-            if isinstance(entry.get('environmentName'), str) and entry['environmentName'].lower() != cloud:
-                continue
+        entries = [entry for entry in subscriptions if isinstance(entry, dict)]
+        # Entries that name the active cloud first, then any that name no cloud; another cloud's are skipped.
+        ordered = ([entry for entry in entries if str(entry.get('environmentName') or '').lower() == cloud]
+                   + [entry for entry in entries if not entry.get('environmentName')])
+        for entry in ordered:
             if wanted:
                 if wanted not in (str(entry.get('id') or '').lower(), str(entry.get('name') or '').lower()):
                     continue
@@ -8454,6 +8475,10 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     server, server_known = _account_option(args, ('--server', '-s'))
     if not server_known:
         return [], None
+    if not server:
+        # kubectl also takes `-s<url>` attached; only a URL is read that way, so `-since=1h` stays a flag.
+        server = next((arg[2:] for arg in reversed(args)
+                       if arg.startswith('-s') and not arg.startswith('--') and '://' in arg), None)
     server = _account_kube_endpoint(server) if server else None
     if server:
         # The endpoint the call names IS the cluster it reached, whatever context or cluster it also names.
@@ -8584,10 +8609,22 @@ def _account_cobra_subcommand(args: List[str], switches: frozenset) -> tuple:
 _ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'--help', '--version'})
 
 
+def _account_aws_configure_profile(args: List[str], env: Dict) -> Optional[str]:
+    """The profile an `aws configure` write edits: `set profile.<p>.key`, `--profile`, else the environment's;
+    None when it cannot be told."""
+    words = [arg for arg in _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)[1] if not arg.startswith('-')]
+    if words[:1] == ['set'] and len(words) > 1 and words[1].startswith('profile.') and words[1].count('.') >= 2:
+        return words[1].split('.')[1]
+    named, known = _account_option(args, ('--profile',), _account_path)
+    if named or not known:
+        return named
+    return _account_aws_env_profile(env)
+
+
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
     """What this call changes for the rest of the turn — a platform's active account, or any kubeconfig read — or
     None."""
-    if program == 'gh':
+    if program == 'gh' and '--help' not in args:
         group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
         if group == 'auth' and _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0] in (
                 'switch', 'login', 'logout'):
@@ -8630,7 +8667,7 @@ _ACCOUNT_TRIGGERS = re.compile(
 # SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
 _ACCOUNT_POWERSHELL_ENV = re.compile(
     r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
-    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
+    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-(?:Literal)?Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
     r'|SetEnvironmentVariable\(\s*[\'"]([A-Za-z_]\w*)', re.IGNORECASE)
 
 
@@ -8654,6 +8691,11 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         taken = state.setdefault('account_active', [])
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
+            # Run as another user, a switch changes that user's configuration, not ours; only a git config write to
+            # the repository itself, which both read, still moves our committer.
+            if switched and other_user and (switched != 'git' or any(
+                    arg in ('--global', '--system', '-f', '--file') or arg.startswith('--file=') for arg in args)):
+                switched = None
             if switched:
                 # `gh auth switch -h <host>` changes that host's login only, and `aws configure … --profile p` that
                 # profile only; with neither named, or one unreadable, any.
@@ -8661,7 +8703,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
                 if switched == 'github':
                     field, scope = 'host', _account_option(args, ('--hostname', '-h'), attached=True)[0]
                 elif switched == 'aws':
-                    field, scope = 'profile', _account_option(args, ('--profile',), _account_path)[0]
+                    field, scope = 'profile', _account_aws_configure_profile(args, env)
                 hit = [item for item in taken if item[0] == switched and (
                     scope is None or str(item[2].get(field)).lower() == scope.lower())]
                 for _platform, accounts, account in hit:
@@ -8773,9 +8815,9 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
 
         # Match calls with outputs and convert to PostToolUse format.
         # shell_dir mirrors the persistent shell across the turn's commands
-        # (seeded with the session cwd); root_projects caches origin lookups.
+        # (seeded with the session cwd); root_projects caches origin and branch lookups.
         shell_dir = session_cwd
-        root_projects: Dict[str, Optional[str]] = {}
+        root_projects: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
         # Every call's input, so a turn that names an ssh config makes no ssh lookups.
         transfer_state: Dict = {'turn_text': _transfer_turn_text(c.get('arguments') for c in function_calls.values())}
         for call_id, call_data in function_calls.items():
@@ -8809,7 +8851,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)
-                project = _project_for_paths(candidates, root_projects)
+                project, branch = _repo_for_paths(candidates, root_projects)
                 # Each exec_command starts a new shell in its workdir or the session folder, so no cd carries over.
                 start = os.path.join(session_cwd or '', workdir) if isinstance(workdir, str) and workdir else session_cwd
                 start = start if start and os.path.isabs(start) else None
@@ -8841,7 +8883,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 ]
                 if not candidates and shell_dir:
                     candidates = [shell_dir]
-                project = _project_for_paths(candidates, root_projects)
+                project, branch = _repo_for_paths(candidates, root_projects)
 
             tool_use = _with_call_ts({
                 'type': 'PostToolUse',
@@ -8849,7 +8891,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 'tool_input': tool_input,
                 'tool_response': tool_response,
                 'tool_use_id': call_id,
-                'project': project
+                'project': project,
+                'git_branch': branch
             }, call_data.get('timestamp'))
             if transfer:
                 tool_use['transfer'] = transfer
@@ -9210,6 +9253,7 @@ def process_stop_event(event: Dict, api_key: str):
     # Stop event's logged time, not processing time
     request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
+    turn_project = _get_project(cwd)
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
@@ -9218,7 +9262,8 @@ def process_stop_event(event: Dict, api_key: str):
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
-        'project': _get_project(cwd),
+        'project': turn_project,
+        'git_branch': _git_branch(cwd) if turn_project else None,
         'account_identity': build_account_identity(probe=True),
     }
 

@@ -24,11 +24,14 @@ ECR_HOST = '210987654321.dkr.ecr.us-west-2.amazonaws.com'
 
 AWS_CONFIG = '''[default]
 region = us-west-2
+sso_start_url = https://acme.awsapps.com/start
 sso_account_id = 111111111111
 sso_role_name = Engineer
 
 [profile home]
 region = us-west-2
+sso_start_url = https://acme.awsapps.com/start
+sso_role_name = Engineer
 sso_account_id = 987654321098
 
 [profile assumed]
@@ -234,7 +237,7 @@ class AccountPlatformTests(unittest.TestCase):
         home = Path(tempfile.mkdtemp(), 'My Home')
         aws = Path(home, '.aws')
         aws.mkdir(parents=True)
-        Path(aws, 'config').write_text('[profile home]\nsso_account_id = 555555555555\n')
+        Path(aws, 'config').write_text('[profile home]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
         for path, resolved in self.each("HOME='%s' aws s3 ls --profile home" % home):
             self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
@@ -257,19 +260,19 @@ class AccountPlatformTests(unittest.TestCase):
         """A path is not an identity, so the home profile must not answer in its place."""
         folder = Path(tempfile.mkdtemp(), 'My Config')
         folder.mkdir()
-        Path(folder, 'config').write_text('[profile home]\nsso_account_id = 222222222222\n')
+        Path(folder, 'config').write_text('[profile home]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 222222222222\n')
         for path, resolved in self.each("AWS_CONFIG_FILE='%s' aws s3 ls --profile home" % Path(folder, 'config')):
             self.assertEqual(resolved['accounts'][0]['account_id'], '222222222222', path)
 
     def test_a_relative_config_file_is_read_from_the_call_s_own_folder(self):
         """The CLI opens it from where the call ran, not from where the hook runs."""
-        Path(self.repo, 'config').write_text('[profile home]\nsso_account_id = 666666666666\n')
+        Path(self.repo, 'config').write_text('[profile home]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 666666666666\n')
         for path, resolved in self.each('AWS_CONFIG_FILE=config aws s3 ls --profile home'):
             self.assertEqual(resolved['accounts'][0]['account_id'], '666666666666', path)
 
     def test_a_spaced_profile_named_on_the_command_is_that_profile(self):
         config = Path(tempfile.mkdtemp(), 'config')
-        config.write_text('[profile my profile]\nsso_account_id = 555555555555\n')
+        config.write_text('[profile my profile]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
         for path, resolved in self.each("AWS_CONFIG_FILE=%s aws s3 ls --profile 'my profile'" % config):
             self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
@@ -312,7 +315,7 @@ class AccountPlatformTests(unittest.TestCase):
 
     def test_a_profile_name_with_a_space_is_that_profile_not_the_default(self):
         config = Path(tempfile.mkdtemp(), 'config')
-        config.write_text('[profile my profile]\nsso_account_id = 555555555555\n')
+        config.write_text('[profile my profile]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
         for path, resolved in self.each("AWS_CONFIG_FILE=%s AWS_PROFILE='my profile' aws s3 ls" % config):
             self.assertEqual(resolved['accounts'][0]['account_id'], '555555555555', path)
 
@@ -624,6 +627,40 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('aws configure help', self.repo, state)
             self.assertEqual(home['accounts'][0]['account_id'], '987654321098', path)
             hook._accounts('aws configure set sso_account_id 999999999999 --profile home', self.repo, state)
+            self.assertEqual(home.get('accounts'), [], path)
+
+    def test_a_self_declared_account_label_is_not_the_account(self):
+        """`aws_account_id`, or `sso_account_id` with no SSO sign-in, is a label an agent can write; botocore never checks it."""
+        config = Path(tempfile.mkdtemp(), 'config')
+        config.write_text('[profile labelled]\naws_account_id = 123456789012\n'
+                          '[profile half]\nsso_account_id = 123456789012\n')
+        for profile in ('labelled', 'half'):
+            for path, resolved in self.each('AWS_CONFIG_FILE=%s aws s3 ls --profile %s' % (config, profile)):
+                self.assertIsNone(resolved, '%s / %s' % (path, profile))
+
+    def test_an_attached_server_url_is_the_endpoint(self):
+        for path, resolved in self.each('kubectl -shttps://other.example.com get pods'):
+            self.assertEqual(resolved['accounts'], [{'platform': 'kubernetes', 'server': 'https://other.example.com',
+                                                     'source': 'command'}], path)
+
+    def test_the_active_clouds_entry_wins_over_one_that_names_no_cloud(self):
+        folder = Path(self.home, '.azure')
+        Path(folder, 'azureProfile.json').write_text(json.dumps({'subscriptions': [
+            {'id': '00000000-0000-0000-0000-0000000000b2', 'name': 'Unnamed', 'isDefault': True},
+            {'id': '00000000-0000-0000-0000-0000000000a1', 'name': 'Public', 'isDefault': True,
+             'environmentName': 'AzureCloud'}]}))
+        for path, resolved in self.each('az group list'):
+            self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Public', path)
+
+    def test_an_aws_configure_write_with_no_profile_edits_the_environments_profile(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            home = hook._accounts('aws s3 ls --profile home', self.repo, state)
+            default = hook._accounts('aws s3 ls', self.repo, state)
+            hook._accounts('aws configure set region us-east-1', self.repo, state)
+            self.assertEqual(home['accounts'][0]['account_id'], '987654321098', path)
+            self.assertEqual(default.get('accounts'), [], path)
+            hook._accounts('aws configure set profile.home.sso_account_id 999999999999', self.repo, state)
             self.assertEqual(home.get('accounts'), [], path)
 
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):

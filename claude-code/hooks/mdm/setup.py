@@ -51,6 +51,16 @@ _SCRIPT_START = time.time()
 BACKFILL_SOFT_STOP_SECONDS = 600
 BACKFILL_MIN_MARGIN_SECONDS = 90
 BACKFILL_DEADLINE_SECONDS = 660
+# An S3 PUT is given up on only after this long below this speed, then re-sent on a fresh link.
+BACKFILL_PUT_STALL_SECONDS = 60
+BACKFILL_PUT_STALL_BYTES_PER_SECOND = 1024
+BACKFILL_PUT_ATTEMPTS = 3
+# A PUT is capped by the time left before the soft stop, less from-s3's turn; under the floor none starts.
+BACKFILL_FROM_S3_RESERVE_SECONDS = 40
+BACKFILL_PUT_MIN_SECONDS = 45
+# from-s3 is sized to end this long before the hard deadline, and never given less than the floor per attempt.
+BACKFILL_FROM_S3_SLACK_SECONDS = 10
+BACKFILL_FROM_S3_MIN_SECONDS = 5
 
 
 def normalize_url(value: str) -> str:
@@ -2592,8 +2602,15 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     # --retry rides out transient backend errors (5xx/429/timeout/conn-refused)
     # so a flaky gateway during onboard doesn't drop a chunk; --max-time caps
     # each attempt and the subprocess budget below outlasts all the retries.
-    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}",
-           "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}", "--max-time", str(timeout)]
+    if method == 'PUT':
+        # A slow upload runs to the total cap, a stalled one is cut; the caller re-sends, on a fresh link.
+        cmd += ["--speed-limit", str(BACKFILL_PUT_STALL_BYTES_PER_SECOND),
+                "--speed-time", str(BACKFILL_PUT_STALL_SECONDS), "--retry", "0"]
+        process_timeout = timeout + 20
+    else:
+        cmd += ["--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+        process_timeout = timeout * 4 + 20
     for header_name, header_value in headers.items():
         cmd += ["-H", f"{header_name}: {header_value}"]
     if body is not None:
@@ -2601,10 +2618,16 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
         cmd += ["-H", "Expect:", "--data-binary", "@-"]
     cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
-        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout * 4 + 20)
-    except (subprocess.TimeoutExpired, OSError) as e:
+        result = subprocess.run(cmd, input=body, capture_output=True, timeout=process_timeout)
+    except subprocess.TimeoutExpired as e:
+        # Not str(e): it carries the whole curl command, auth header and upload link included.
+        debug_print(f"{method} request timed out after {e.timeout}s")
+        return -28, b''  # curl's own timeout exit, negated
+    except OSError as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    # A transport failure reads as curl's exit code negated, so it can be told from an HTTP status.
+    transport_failure = -abs(result.returncode)
     if result.returncode != 0:
         # curl transport error (DNS/TLS/refused/timeout); -sS keeps the message on stderr.
         debug_print(f"{method} failed, curl exit {result.returncode}: "
@@ -2614,12 +2637,15 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     sep = out.rfind(b'\n')
     if sep == -1:
         debug_print(f"HTTP request failed: curl exit {result.returncode}")
-        return 0, b''
+        return transport_failure, b''
     try:
         code = int(out[sep + 1:].strip() or b'0')
     except ValueError:
         debug_print(f"HTTP request failed: curl exit {result.returncode}")
-        return 0, b''
+        return transport_failure, b''
+    # An interim status such as 100 from a transfer that then died is the transport failure, not an answer.
+    if result.returncode != 0 and code < 200:
+        return transport_failure, b''
     return code, out[:sep]
 
 
@@ -2657,8 +2683,24 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
+def _backfill_put_budget_seconds() -> int:
+    # What one PUT may take and still leave from-s3 its turn before the soft stop.
+    return int(BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START)) - BACKFILL_FROM_S3_RESERVE_SECONDS
+
+
+def _backfill_has_time_for_a_chunk() -> bool:
+    return _backfill_put_budget_seconds() >= BACKFILL_PUT_MIN_SECONDS
+
+
+def _backfill_from_s3_timeout_seconds() -> int:
+    # Per attempt, sized so the whole call's subprocess budget (four attempts plus 20s) ends before the hard deadline.
+    seconds_left = BACKFILL_DEADLINE_SECONDS - (time.time() - _SCRIPT_START) - BACKFILL_FROM_S3_SLACK_SECONDS
+    return int(max(BACKFILL_FROM_S3_MIN_SECONDS, min(30, (seconds_left - 20) / 4)))
+
+
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False) -> bool:
+                           force: bool = False) -> Optional[bool]:
+    # None when the chunk ran out of time before its PUT could start: a stop, not a failed upload.
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if _backfill_uploader_stats is not None:
         payload['uploader_stats'] = _backfill_uploader_stats
@@ -2673,38 +2715,55 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         'Content-Type': 'application/json',
     })
 
-    code, body = _backfill_http_request(
-        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
-        method='POST',
-        headers=auth_headers,
-        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
-        debug_print(f"upload-url request failed: HTTP {code}")
-        return False
-    try:
-        url_resp = json.loads(body.decode('utf-8'))
-    except (ValueError, UnicodeDecodeError):
-        debug_print("upload-url response was not JSON")
-        return False
+    for _ in range(BACKFILL_PUT_ATTEMPTS):
+        if not _backfill_has_time_for_a_chunk():
+            debug_print("S3 PUT not started: too close to the soft stop")
+            return None
+        code, body = _backfill_http_request(
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
+            method='POST',
+            headers=auth_headers,
+            body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
+            timeout=30,
+        )
+        if code < 200 or code >= 300:
+            debug_print(f"upload-url request failed: HTTP {code}")
+            return False
+        try:
+            url_resp = json.loads(body.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            debug_print("upload-url response was not JSON")
+            return False
 
-    upload_url = url_resp.get('upload_url')
-    object_key = url_resp.get('object_key')
-    if not upload_url or not object_key:
-        debug_print("upload-url response missing fields")
-        return False
+        upload_url = url_resp.get('upload_url')
+        object_key = url_resp.get('object_key')
+        if not upload_url or not object_key:
+            debug_print("upload-url response missing fields")
+            return False
 
-    put_started = time.time()
-    code, _ = _backfill_http_request(
-        upload_url,
-        method='PUT',
-        headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
-        body=payload_bytes,
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
+        # Measured after the link request, whose own retries can use up to two minutes.
+        put_cap = _backfill_put_budget_seconds()
+        if put_cap < BACKFILL_PUT_MIN_SECONDS:
+            debug_print("S3 PUT not started: the link request used the time left")
+            return None
+        put_started = time.time()
+        code, put_answer = _backfill_http_request(
+            upload_url,
+            method='PUT',
+            headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
+            body=payload_bytes,
+            timeout=put_cap,
+        )
+        if 200 <= code < 300:
+            break
         debug_print(f"S3 PUT failed: HTTP {code}")
+        timed_out_at_s3 = code == 408 or (code == 400 and b'RequestTimeout' in put_answer)
+        if (0 <= code < 500 and not timed_out_at_s3) or (code < 0 and time.time() - put_started >= put_cap - 1):
+            # Refused, or still moving when the cap cut it: another attempt would end the same way.
+            return False
+        # A stall (S3 calls it out itself after ~20s of silence), another transport failure or a 5xx:
+        # the next attempt asks for a fresh link.
+    else:
         return False
 
     code, _ = _backfill_http_request(
@@ -2712,15 +2771,21 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         method='POST',
         headers=auth_headers,
         body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
-        timeout=30,
+        timeout=_backfill_from_s3_timeout_seconds(),
     )
     if code < 200 or code >= 300:
         debug_print(f"from-s3 request failed: HTTP {code}")
         return False
 
     # Rest as long as the upload took (at most 30s), so a long history holds the uplink half the time at most.
-    time.sleep(min(max(time.time() - put_started, 0), 30))
+    rest = min(max(time.time() - put_started, 0), 30)
+    # Never into the time the next chunk needs before the soft stop.
+    time.sleep(max(min(rest, _backfill_put_budget_seconds() - BACKFILL_PUT_MIN_SECONDS), 0))
     return True
+
+
+class _BackfillOutOfTime(Exception):
+    """A chunk was left unsent because it would not fit before the soft stop; carries the sessions sent so far."""
 
 
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
@@ -2728,7 +2793,8 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts
     distinct input session_ids that landed at least one successful chunk. Stops at
     the first failed chunk: against a hung backend each one burns ~2 min of curl
-    retries, and the caller keeps the whole batch for the next run anyway."""
+    retries, and the caller keeps the whole batch for the next run anyway.
+    Raises _BackfillOutOfTime, not a failed chunk, when the next chunk has no time left."""
     chunks_total = 0
     chunks_sent = 0
     sessions_sent_ids: set = set()
@@ -2740,8 +2806,13 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         nonlocal current_chunk, current_size, chunks_total, chunks_sent
         if not current_chunk:
             return
+        if not _backfill_has_time_for_a_chunk():
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
+        landed = _backfill_upload_chunk(api_key, backend_url, current_chunk, forced)
+        if landed is None:
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
+        if landed:
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))
@@ -2894,11 +2965,14 @@ class _BackfillRun:
         margin = max(BACKFILL_MIN_MARGIN_SECONDS, 1.5 * self.slowest_batch)
         return BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START) >= margin
 
-    def upload(self, sessions: List[Dict], forced: bool) -> Tuple[int, int]:
-        """(sessions_sent, chunks_failed) for one batch."""
+    def upload(self, sessions: List[Dict], forced: bool) -> Tuple[int, int, bool]:
+        """(sessions_sent, chunks_failed, out_of_time) for one batch."""
         _backfill_attach_identity(sessions, self.device_serial, None)
-        sent, _, failed = _backfill_send_sessions(self.api_key, self.backend_url, sessions, forced)
-        return sent, failed
+        try:
+            sent, _, failed = _backfill_send_sessions(self.api_key, self.backend_url, sessions, forced)
+        except _BackfillOutOfTime as stop:
+            return stop.args[0], 0, True
+        return sent, failed, False
 
 
 def _backfill_read_slice_or_false(session: Dict, resume: Optional[Dict], max_bytes: int):
@@ -2928,9 +3002,11 @@ def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], sessio
             return sent, None
         piece, resume = result
         if piece:
-            landed, failed = run.upload([piece], forced)
+            landed, failed, out_of_time = run.upload([piece], forced)
             if failed:
                 return sent, 'failed'
+            if out_of_time:
+                return sent, 'more'
             sent = max(sent, landed)
         run.slowest_batch = max(run.slowest_batch, time.time() - began)
         if resume is None:
@@ -2964,10 +3040,13 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
         heads = [s for s in sessions if 'transcript_path' in s]
         sessions = [s for s in sessions if 'transcript_path' not in s]
         if sessions:
-            sent, failed = run.upload(sessions, home_forced)
+            sent, failed, out_of_time = run.upload(sessions, home_forced)
             sent_total, batches = sent_total + sent, batches + 1
             if failed:
                 return sent_total, batches, 'failed'
+            if out_of_time:
+                # Before progress is saved, so the next run sends this batch again from its start.
+                return sent_total, batches, 'more'
         run.slowest_batch = max(run.slowest_batch, time.time() - began)
         for head in heads:
             sent, stopped = _backfill_stream_file(run, user_home, head, home_forced)
