@@ -10174,6 +10174,12 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     return [account], None
 
 
+def _account_kube_server_value(raw: Any) -> Optional[str]:
+    """A server as kubectl takes one, a URL or `host:port`; None for anything else."""
+    value = _account_value(raw)
+    return value if value and ('://' in value or re.match(r'^[\w.-]+:\d+$', value)) else None
+
+
 def _account_kube_endpoint(server: str) -> Optional[str]:
     """A cluster endpoint as `scheme://host[:port]`; a login, path or query written into it is never kept."""
     host = _transfer_url_split(server).netloc.rsplit('@', 1)[-1] if server else ''
@@ -10190,13 +10196,11 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     if subcommand in _ACCOUNT_KUBE_LOCAL or client_only:
         # None of these reaches a cluster, a kubeconfig edit included, even `set-cluster --server`.
         return [], None
-    server, server_known = _account_option(args, ('--server', '-s'))
+    # Read as kubectl does: up to `--`, the last one wins, `-s<value>` attached included. A value that is not a
+    # server (`-since=1h` reads as `-s` `ince=1h`) or cannot be read leaves the endpoint unknown.
+    server, server_known = _account_option(args, ('--server', '-s'), _account_kube_server_value, attached=True)
     if not server_known:
         return [], None
-    if not server:
-        # kubectl also takes `-s<url>` attached; only a URL is read that way, so `-since=1h` stays a flag.
-        server = next((arg[2:] for arg in reversed(args)
-                       if arg.startswith('-s') and not arg.startswith('--') and '://' in arg), None)
     server = _account_kube_endpoint(server) if server else None
     if server:
         # The endpoint the call names IS the cluster it reached, whatever context or cluster it also names.
@@ -10353,7 +10357,8 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         # A set or an unset changes it, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
         # `git config user.email` alone, or `git config get`, only reads it.
         verb = after[0].lower() if after and not after[0].startswith('-') else ''
-        if subcommand == 'config' and keys and (
+        reads = ('--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l')
+        if subcommand == 'config' and keys and not any(arg in reads for arg in after) and (
                 verb in ('set', 'unset')
                 or any(arg.startswith('--unset') for arg in after)
                 or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
@@ -10410,9 +10415,10 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
             # Run as another user, a switch changes that user's configuration, not ours; only a git config write to
-            # the repository itself, which both read, still moves our committer.
+            # this repository, which both read, still moves our committer.
             if switched and other_user and (switched != 'git' or any(
-                    arg in ('--global', '--system', '-f', '--file') or arg.startswith('--file=') for arg in args)):
+                    arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
+                    or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
                 switched = None
             if switched:
                 # `gh auth switch -h <host>` changes that host's login only, and `aws configure … --profile p` that

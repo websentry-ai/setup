@@ -643,6 +643,16 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'], [{'platform': 'kubernetes', 'server': 'https://other.example.com',
                                                      'source': 'command'}], path)
 
+    def test_a_server_is_read_as_kubectl_reads_it(self):
+        """The last server wins, attached or not; nothing after `--` is kubectl's; an unreadable one is unknown."""
+        for path, resolved in self.each('kubectl --server https://a.example.com -shttps://b.example.com get pods'):
+            self.assertEqual(resolved['accounts'][0]['server'], 'https://b.example.com', path)
+        for path, resolved in self.each('kubectl exec deploy/api -- curl -shttps://external.example.com/health'):
+            self.assertNotEqual(resolved['accounts'][0].get('server'), 'https://external.example.com', path)
+            self.assertEqual(resolved['accounts'][0]['cluster'], 'prod', path)
+        for path, resolved in self.each('kubectl -s"$(cat server)" get pods'):
+            self.assertIsNone(resolved, path)
+
     def test_the_active_clouds_entry_wins_over_one_that_names_no_cloud(self):
         folder = Path(self.home, '.azure')
         Path(folder, 'azureProfile.json').write_text(json.dumps({'subscriptions': [
