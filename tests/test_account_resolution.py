@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '6397904affa6bb90dcfb9853ad430dcad036781ef2c8d66bdc3973c33b65c8ef'
+BLOCK_SHA256 = 'c19a3b1d6aac5c0da2e484314933a08dd5df75d1ba18a0215bed85ed2b07c5b3'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -554,6 +554,21 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
         for path, resolved in self.each('gh repo view acme/app'):
             self.assertEqual(resolved['accounts'][0]['host'], 'github.com', path)
+
+    def test_a_slashed_branch_or_file_is_not_a_repository(self):
+        """Only `gh repo` takes `OWNER/REPO` as its operand; elsewhere a slashed word is a branch or a file."""
+        for command in ('gh pr checkout fix/login', 'gh pr view feature/x', 'gh release upload v1 dist/app.zip'):
+            for path, resolved in self.each(command):
+                # The checkout's remote answers, as it does for any call that names no repository.
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.com', '%s / %s' % (path, command))
+            self.assertIn(['git', 'config', '--get', 'remote.origin.url'], self.runs(), command)
+
+    def test_a_url_after_a_switch_or_an_equals_option_is_still_the_operand(self):
+        """`--web` takes no value and `--title=x` carried its own, so the URL after either is the operand."""
+        for command in ('gh pr view --web https://github.acme.com/acme/app/pull/1',
+                        'gh pr view --repo=github.acme.com/acme/app 1'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
 
     def test_a_gh_call_from_no_known_folder_resolves_nothing(self):
         """gh reads the checkout's remote before `GH_HOST`, so with no folder every answer is a guess."""

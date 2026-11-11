@@ -9308,6 +9308,9 @@ _ACCOUNT_REMEMBERED = frozenset({
 # Fixed for every run: git must not page, prompt or take a lock on our account.
 _ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
                     'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'CLICOLOR': '0', 'NO_COLOR': '1'}
+# gh options that take no value, so the word after one is still an operand (`gh pr view --web <url>`). Long
+# forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
+_ACCOUNT_GH_SWITCHES = frozenset({'--web', '--draft', '--fill', '--yes', '--comments'})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
 _ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN')
 # git subcommands that reach a remote, and those that write a commit the committer identity goes into.
@@ -9679,20 +9682,23 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     repo, known = _account_option(args, ('-R', '--repo'))
     if repo or not known:
         return repo, known
+    # A bare `OWNER/REPO` is a repository only where gh takes one as its operand, under `gh repo`; elsewhere
+    # a slashed word is a branch or a file (`gh pr checkout fix/login`). A URL names its host anywhere.
+    takes_repo = args[:1] == ['repo']
     for at, arg in enumerate(args):
-        # Only a true positional: the word after an option is that option's value, and a `--body` URL is
-        # the text of a comment, not the repository the call acts on.
-        if at and args[at - 1].startswith('-'):
+        # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
+        # option carried its value with `=` or takes none.
+        before = args[at - 1] if at else ''
+        if before.startswith('-') and '=' not in before and before not in _ACCOUNT_GH_SWITCHES:
             continue
         if '://' in arg:
             if _account_host_of(arg):
                 return _account_value(arg), True
             continue
         parts = arg.split('/')
-        # gh's own operands: `OWNER/REPO`, and `HOST/OWNER/REPO` where the first part is a host.
-        if len(parts) == 2 and all(parts) and '.' not in parts[0]:
+        if takes_repo and len(parts) == 2 and all(parts) and '.' not in parts[0]:
             return _account_value(arg), True
-        if len(parts) == 3 and all(parts) and '.' in parts[0]:
+        if takes_repo and len(parts) == 3 and all(parts) and '.' in parts[0]:
             return _account_value(arg), True
     return _account_known('GH_REPO', env)
 
