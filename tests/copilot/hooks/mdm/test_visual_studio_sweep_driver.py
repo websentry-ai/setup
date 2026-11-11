@@ -124,6 +124,46 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class SweepSharesTheInstallersTimeLimit(unittest.TestCase):
+    """WEB-6527: the sweep uploads through the same code as the re-walk, so it stops at the same soft stop
+    instead of running a slow upload past onboard's watchdog."""
+
+    def test_a_sweep_out_of_time_stops_and_leaves_the_rest_for_the_next_run(self):
+        clock, uploads, advanced = [1000.0], [], []
+
+        def _fake_run_as_user(username, fn, *args, **kw):
+            if fn is mdm._vs_collect_for_user:
+                return {"sessions": [_session(username)], "first_run": False, "truncated": False}
+            advanced.append(username)
+            return None
+
+        def _slow_upload(api_key, backend_url, chunk, *args, **kw):
+            uploads.append([s["session_id"] for s in chunk])
+            clock[0] += 500
+            return True
+
+        homes = [("alice", Path("/home/alice")), ("bob", Path("/home/bob"))]
+        with patch.object(mdm.platform, "system", return_value="Windows"), \
+             patch.object(mdm, "_run_as_user", _fake_run_as_user), \
+             patch.object(mdm, "_backfill_upload_chunk", _slow_upload), \
+             patch.object(mdm.time, "time", side_effect=lambda: clock[0]), \
+             patch.object(mdm, "_SCRIPT_START", clock[0]), \
+             patch("builtins.print") as printed:
+            with mdm._backfill_soft_stop(mdm.SWEEP_ONLY_SOFT_STOP_SECONDS):
+                mdm.run_visual_studio_sweep("key", "https://backend", homes)
+
+        self.assertEqual(uploads, [["alice"]])
+        self.assertEqual(advanced, ["alice"])
+        self.assertIn("Out of time", " ".join(str(call) for call in printed.call_args_list))
+        self.assertIsNone(mdm._backfill_stop_at)
+
+    def test_the_sweep_alone_stops_early_enough_for_the_shorter_watchdog(self):
+        # Without --backfill onboard allows 600s: a PUT ending by 440s leaves from-s3 its 126s of retries.
+        self.assertLessEqual(mdm.SWEEP_ONLY_SOFT_STOP_SECONDS - mdm.BACKFILL_FROM_S3_RESERVE_SECONDS + 126, 600)
+        source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
+        self.assertIn("BACKFILL_SOFT_STOP_SECONDS if backfill_mode else SWEEP_ONLY_SOFT_STOP_SECONDS", source)
+
+
 class PerUserIsolation(unittest.TestCase):
     def test_one_user_failing_does_not_skip_the_users_after_them(self):
         homes = [("alice", Path("/home/alice")), ("bob", Path("/home/bob"))]
@@ -225,8 +265,8 @@ class InstallerOrderingAndSeeding(unittest.TestCase):
         self.source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
 
     def test_the_sweep_runs_before_the_re_walk(self):
-        # The re-walk is bounded by session count, not time, and onboard.py allows one
-        # installer 600s. Visual Studio's only delivery must not queue behind it.
+        # The re-walk can use the installer's whole time allowance. Visual Studio's only
+        # delivery must not queue behind it.
         # The call sites, not the definitions: run_backfill is defined first either way.
         self.assertLess(self.source.index("run_visual_studio_sweep(api_key, base_url"),
                         self.source.index("run_backfill(api_key, base_url"))

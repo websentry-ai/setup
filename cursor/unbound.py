@@ -3142,6 +3142,21 @@ def _get_project(cwd):
         return None
 
 
+def _git_branch(root):
+    """Checked-out branch of the repo at `root`; None on detached HEAD or any git failure."""
+    try:
+        if not root:
+            return None
+        result = subprocess.run(
+            ['git', '-C', root, 'symbolic-ref', '--short', '-q', 'HEAD'],
+            capture_output=True, text=True, timeout=10,
+        )
+        branch = result.stdout.strip()
+        return branch if result.returncode == 0 and branch else None
+    except Exception:
+        return None
+
+
 def _find_git_root(path):
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
@@ -3730,10 +3745,8 @@ def _skill_name_from_path(file_path, cwd=None):
     except Exception:
         return None
 
-def _project_for_paths(candidates, root_projects):
-    """First project ("<org>/<repo>") resolved from `candidates` paths.
-    `root_projects` caches origin lookups so `git remote get-url` runs at
-    most once per distinct repo. None when nothing resolves (fail-open)."""
+def _repo_for_paths(candidates, root_projects):
+    """First (project, branch) resolved from `candidates`, cached per repo root; (None, None) when nothing resolves."""
     try:
         for candidate in candidates:
             if not candidate:
@@ -3742,12 +3755,14 @@ def _project_for_paths(candidates, root_projects):
             if not root:
                 continue
             if root not in root_projects:
-                root_projects[root] = _get_project(root)
-            if root_projects[root]:
-                return root_projects[root]
+                project = _get_project(root)
+                root_projects[root] = (project, _git_branch(root) if project else None)
+            project, branch = root_projects[root]
+            if project:
+                return project, branch
     except Exception:
         pass
-    return None
+    return None, None
 
 
 def _cursor_user_query(text):
@@ -8268,17 +8283,19 @@ def build_llm_exchange(events, api_key=None):
 
         elif hook_event_name == 'beforeReadFile':
             file_path = event.get('file_path')
+            project, branch = _repo_for_paths(
+                [os.path.dirname(file_path)]
+                if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
+                else [],
+                root_projects)
             read_entry = _with_call_ts({
                 'type': hook_event_name,
                 'file_path': file_path,
                 'content': event.get('content', ''),
                 'attachments': event.get('attachments', []),
                 'tool_use_id': _resolve_tool_use_id(event),
-                'project': _project_for_paths(
-                    [os.path.dirname(file_path)]
-                    if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
-                    else [],
-                    root_projects)
+                'project': project,
+                'git_branch': branch
             }, stamp)
             # Cursor loads a skill by reading its SKILL.md, so this read is the
             # only skill-invocation signal it emits.
@@ -8318,6 +8335,7 @@ def build_llm_exchange(events, api_key=None):
                     if isinstance(value, str) and value.startswith('/') and not _is_system_checkout_path(value):
                         candidates.append(os.path.dirname(value))
 
+            project, branch = _repo_for_paths(candidates or [workspace_cwd], root_projects)
             assistant_tool_uses.append(_with_call_ts({
                 'type': hook_event_name,
                 'tool_name': tool_name,
@@ -8325,21 +8343,24 @@ def build_llm_exchange(events, api_key=None):
                 'tool_output': tool_output,
                 'duration': event.get('duration'),
                 'tool_use_id': _resolve_tool_use_id(event),
-                'project': _project_for_paths(candidates or [workspace_cwd], root_projects)
+                'project': project,
+                'git_branch': branch
             }, stamp))
 
         elif hook_event_name == 'afterFileEdit':
             file_path = event.get('file_path')
+            project, branch = _repo_for_paths(
+                [os.path.dirname(file_path)]
+                if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
+                else [],
+                root_projects)
             assistant_tool_uses.append(_with_call_ts({
                 'type': hook_event_name,
                 'file_path': file_path,
                 'edits': event.get('edits', []),
                 'tool_use_id': _resolve_tool_use_id(event),
-                'project': _project_for_paths(
-                    [os.path.dirname(file_path)]
-                    if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
-                    else [],
-                    root_projects)
+                'project': project,
+                'git_branch': branch
             }, stamp))
 
         elif hook_event_name == 'afterShellExecution':
@@ -8358,12 +8379,14 @@ def build_llm_exchange(events, api_key=None):
                 )
             if not candidates and workspace_cwd:
                 candidates.append(workspace_cwd)
+            project, branch = _repo_for_paths(candidates, root_projects)
             shell_entry = _with_call_ts({
                 'type': hook_event_name,
                 'command': command,
                 'output': event.get('output', ''),
                 'tool_use_id': _resolve_tool_use_id(event),
-                'project': _project_for_paths(candidates, root_projects)
+                'project': project,
+                'git_branch': branch
             }, stamp)
             # Cursor runs commands in PowerShell on Windows, where a ; inside an @{ } hashtable separates its entries.
             script = _transfer_hashtables_emptied(command) if os.name == 'nt' and isinstance(command, str) else command
@@ -8414,6 +8437,7 @@ def build_llm_exchange(events, api_key=None):
     if not model or model == 'default' or model == 'unknown':
         model = 'auto'
 
+    turn_project, turn_branch = _repo_for_paths([workspace_cwd], root_projects)
     exchange = {
         'conversation_id': conversation_id,
         'model': model,
@@ -8421,7 +8445,8 @@ def build_llm_exchange(events, api_key=None):
         'cwd': workspace_cwd,
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the workspace repo.
-        'project': _project_for_paths([workspace_cwd], root_projects),
+        'project': turn_project,
+        'git_branch': turn_branch,
         'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
 

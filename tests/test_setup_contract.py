@@ -190,7 +190,239 @@ class TestEveryForceRequestReader:
                           code=500) == (None, None)
 
 
+def _link_then_put(put_codes, clock, put_seconds):
+    """A fake _backfill_http_request: every upload-url call hands out a new link, PUTs answer put_codes in turn
+    and take put_seconds(their cap) on the clock."""
+    calls, codes = [], iter(put_codes)
+
+    def http(url, method, headers, body=None, timeout=30):
+        calls.append((method, url, body))
+        if url.endswith("/upload-url/"):
+            link = sum(1 for c in calls if c[1].endswith("/upload-url/"))
+            return 200, json.dumps({"upload_url": "https://s3/put-%d" % link, "object_key": "key-%d" % link}).encode()
+        if method != "PUT":
+            return 200, b"{}"
+        clock[0] += put_seconds(timeout)
+        return next(codes), b"{}"
+    return calls, http
+
+
+@pytest.mark.parametrize("relpath", BACKFILLERS)
+class TestEveryBackfillUploadSurvivesASlowUplink:
+    """WEB-6527: a chunk that needed over 30s was timed out four times by curl and dropped without a word. Each
+    installer carries its own copy of the upload, so each is held to the same behaviour."""
+
+    @staticmethod
+    def _curl(module, method, timeout, returncode=0, stdout=b"\n200"):
+        from unittest.mock import patch
+        with patch.object(module.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], returncode, stdout, b"")
+            result = module._backfill_http_request("https://host/x", method, {}, body=b"{}", timeout=timeout)
+        return result, run.call_args[0][0], run.call_args[1]["timeout"]
+
+    @staticmethod
+    def _upload(module, monkeypatch, put_codes, put_seconds=lambda cap: 60):
+        """(landed, links asked for, PUT urls, object keys confirmed); a failed PUT stalls out after 60s by default."""
+        clock = [1000.0]
+        calls, http = _link_then_put(put_codes, clock, put_seconds)
+        monkeypatch.setattr(module, "_backfill_http_request", http)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        # Only the managed claude-code installer has a run clock.
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0], raising=False)
+        landed = module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}])
+        links = sum(1 for _, url, _ in calls if url.endswith("/upload-url/"))
+        puts = [url for method, url, _ in calls if method == "PUT"]
+        confirmed = [json.loads(body)["object_key"] for _, url, body in calls if url.endswith("/from-s3/")]
+        return landed, links, puts, confirmed
+
+    def test_a_put_is_cut_when_it_stalls_and_is_never_re_sent_by_curl(self, relpath):
+        module = load_module(relpath)
+        _, argv, process_timeout = self._curl(module, "PUT", timeout=500)
+        flags = dict(zip(argv, argv[1:]))
+        assert flags["--max-time"] == "500" and flags["--retry"] == "0"
+        assert flags["--speed-time"] == str(module.BACKFILL_PUT_STALL_SECONDS) == "60"
+        assert flags["--speed-limit"] == str(module.BACKFILL_PUT_STALL_BYTES_PER_SECOND)
+        assert process_timeout == 520
+
+    def test_every_other_request_keeps_its_flags(self, relpath):
+        module = load_module(relpath)
+        result, argv, process_timeout = self._curl(module, "POST", timeout=30)
+        assert argv[:13] == ["curl", "-sS", "-X", "POST", "-w", "\n%{http_code}", "--max-time", "30",
+                             "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+        assert "--speed-time" not in argv
+        assert (result, process_timeout) == ((200, b""), 140)
+
+    def test_a_curl_failure_reads_as_a_negative_code_and_an_http_error_as_itself(self, relpath):
+        module = load_module(relpath)
+        assert self._curl(module, "PUT", 500, returncode=28, stdout=b"\n000")[0] == (-28, b"")
+        assert self._curl(module, "PUT", 500, returncode=28, stdout=b"")[0] == (-28, b"")
+        # curl reports the interim 100 Continue when the upload stalls after it; that is still a stall.
+        assert self._curl(module, "PUT", 500, returncode=28, stdout=b"\n100")[0] == (-28, b"")
+        assert self._curl(module, "PUT", 500, stdout=b"denied\n403")[0] == (403, b"denied")
+
+    def test_a_timed_out_request_logs_neither_the_key_nor_the_upload_link(self, relpath, monkeypatch, capsys):
+        from unittest.mock import patch
+        module = load_module(relpath)
+        monkeypatch.setattr(module, "DEBUG", True)
+        argv = ["curl", "-H", "Authorization: Bearer secret-key", "https://s3/put?X-Amz-Signature=signed"]
+        with patch.object(module.subprocess, "run", side_effect=subprocess.TimeoutExpired(argv, 520)):
+            result = module._backfill_http_request(
+                "https://s3/put?X-Amz-Signature=signed", "PUT", {"Authorization": "Bearer secret-key"}, timeout=500)
+        logged = "".join(capsys.readouterr())
+        assert result == (-28, b"")
+        assert "timed out after 520s" in logged
+        assert "secret-key" not in logged and "X-Amz-Signature" not in logged
+
+    def test_slow_failed_attempts_share_one_budget_where_there_is_no_run_clock(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        if hasattr(module, "_backfill_put_budget_seconds"):
+            pytest.skip("the managed claude-code installer clips each attempt to its run clock instead")
+        # Two 140s attempts leave 20s of the chunk's 300s, under the floor: no third link, no third PUT.
+        landed, links, puts, confirmed = self._upload(module, monkeypatch, [503, 503, 200], lambda cap: 140)
+        assert (landed, links, len(puts), confirmed) == (False, 2, 2, [])
+        # The second attempt is capped at what the first left, not at a fresh 300s.
+        caps = []
+        self._upload(module, monkeypatch, [503, 200], lambda cap: caps.append(cap) or 140)
+        assert caps == [300, 160]
+
+    def test_a_stalled_put_is_sent_again_on_a_fresh_link(self, relpath, monkeypatch):
+        landed, links, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 503, 200])
+        assert landed and links == 3
+        assert puts == ["https://s3/put-1", "https://s3/put-2", "https://s3/put-3"]
+        assert confirmed == ["key-3"]
+
+    def test_a_put_that_ran_to_its_cap_is_not_sent_again(self, relpath, monkeypatch):
+        # Still moving but too slow for the cap: a second attempt would fail the same way.
+        landed, links, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [-28, 200],
+                                                      put_seconds=lambda cap: cap)
+        assert (landed, links, puts, confirmed) == (False, 1, ["https://s3/put-1"], [])
+
+    def test_a_put_s3_itself_timed_out_is_sent_again(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        clock = [1000.0]
+        answers = iter([(400, b"<Error><Code>RequestTimeout</Code></Error>"), (408, b""), (200, b"")])
+        calls = []
+
+        def http(url, method, headers, body=None, timeout=30):
+            calls.append(method)
+            if url.endswith("/upload-url/"):
+                return 200, json.dumps({"upload_url": "https://s3/put", "object_key": "k"}).encode()
+            return next(answers) if method == "PUT" else (200, b"{}")
+
+        monkeypatch.setattr(module, "_backfill_http_request", http)
+        monkeypatch.setattr(module.time, "sleep", lambda seconds: None)
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0], raising=False)
+        assert module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}]) is True
+        assert calls.count("PUT") == 3
+
+    def test_a_refused_put_is_not_sent_again(self, relpath, monkeypatch):
+        landed, _, puts, confirmed = self._upload(load_module(relpath), monkeypatch, [403, 200])
+        assert (landed, puts, confirmed) == (False, ["https://s3/put-1"], [])
+
+    def test_a_put_that_keeps_stalling_is_given_up_after_a_few_attempts(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        landed, _, puts, confirmed = self._upload(module, monkeypatch, [-28] * 10)
+        assert (landed, len(puts), confirmed) == (False, module.BACKFILL_PUT_ATTEMPTS, [])
+
+
 MDM_BACKFILLERS = [s for s in BACKFILLERS if "/mdm/" in s]
+
+
+SOFT_STOPPERS = [s for s in MDM_BACKFILLERS if _has(s, "_backfill_soft_stop")]
+
+
+def test_the_soft_stopper_inventory_is_codex_and_copilot():
+    assert SOFT_STOPPERS == ["codex/hooks/mdm/setup.py", "copilot/hooks/mdm/setup.py"]
+
+
+@pytest.mark.parametrize("relpath", SOFT_STOPPERS)
+class TestAScriptRunStopsItselfBeforeTheWatchdog:
+    """WEB-6527: these installers had no run clock, so a slow history ran until onboard's 720s watchdog killed
+    the tool and reported its setup as failed. Run as a script they now stop themselves; the packaged binary,
+    which has no watchdog, is left unbounded."""
+
+    @staticmethod
+    def _run(module, monkeypatch, capsys, as_script, chunk_seconds):
+        """(chunks sent, homes whose cutoff was saved, output) for four one-session chunks."""
+        from pathlib import Path
+        clock = [1000.0]
+        sessions = [{"session_id": "s%d" % n, "entries": [{"text": "x" * 120}]} for n in range(4)]
+        sent, cutoffs = [], []
+
+        def run_as_user(username, fn, *args, **kwargs):
+            if fn is module._backfill_collect_sessions:
+                return sessions, False, False
+            if fn is module._backfill_write_cutoff:
+                cutoffs.append(username)
+            return None
+
+        def upload(api_key, backend_url, chunk, *args, **kwargs):
+            sent.append([s["session_id"] for s in chunk])
+            clock[0] += chunk_seconds
+            return True
+
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0])
+        monkeypatch.setattr(module, "BACKFILL_CHUNK_BYTES", 200)
+        monkeypatch.setattr(module, "_run_as_user", run_as_user)
+        monkeypatch.setattr(module, "_backfill_force_config", lambda *a: (None, None))
+        monkeypatch.setattr(module, "_backfill_upload_chunk", upload)
+        homes = [("alice", Path("/home/alice"))]
+        if as_script:
+            with module._backfill_soft_stop(module.BACKFILL_SOFT_STOP_SECONDS):
+                module.run_backfill("key", "https://backend", homes)
+        else:
+            module.run_backfill("key", "https://backend", homes)
+        return sent, cutoffs, capsys.readouterr().out
+
+    def test_the_script_stops_before_a_chunk_that_no_longer_fits_and_keeps_its_cutoff(
+            self, relpath, monkeypatch, capsys):
+        module = load_module(relpath)
+        sent, cutoffs, out = self._run(module, monkeypatch, capsys, True, 200)
+        # 200s a chunk against a 600s stop less 40s for from-s3: the fourth would start with none left.
+        assert sent == [["s0"], ["s1"], ["s2"]]
+        assert cutoffs == []
+        assert "Queued 3 past sessions. More history remains" in out and "failed" not in out
+        assert module._backfill_stop_at is None
+
+    def test_a_run_already_out_of_time_starts_no_backfill_work_at_all(self, relpath, monkeypatch, capsys):
+        from pathlib import Path
+        module = load_module(relpath)
+        clock, touched = [1000.0], []
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        # 200s before the stop: enough for one PUT, not for the config request and walk ahead of it.
+        monkeypatch.setattr(module, "_SCRIPT_START", clock[0] - 400)
+        monkeypatch.setattr(module, "_run_as_user", lambda *a, **k: touched.append("walk"))
+        monkeypatch.setattr(module, "_backfill_force_config", lambda *a: touched.append("config") or (None, None))
+        with module._backfill_soft_stop(module.BACKFILL_SOFT_STOP_SECONDS):
+            module.run_backfill("key", "https://backend", [("alice", Path("/home/alice"))])
+        # Neither the config request (up to a minute of retries) nor the transcript walk is begun.
+        assert touched == []
+        assert "no time left in this run" in capsys.readouterr().out
+
+    def test_the_packaged_binary_path_is_left_unbounded(self, relpath, monkeypatch, capsys):
+        module = load_module(relpath)
+        sent, cutoffs, out = self._run(module, monkeypatch, capsys, False, 200)
+        assert sent == [["s0"], ["s1"], ["s2"], ["s3"]]
+        assert cutoffs == ["alice"]
+        assert "queued 4 past sessions" in out
+
+    def test_a_put_is_capped_by_the_time_left_before_the_stop(self, relpath, monkeypatch):
+        module = load_module(relpath)
+        clock, caps = [1000.0], []
+        calls, http = _link_then_put([200], clock, lambda cap: caps.append(cap) or 10)
+        monkeypatch.setattr(module, "_backfill_http_request", http)
+        monkeypatch.setattr(module.time, "time", lambda: clock[0])
+        monkeypatch.setattr(module, "_backfill_stop_at", clock[0] + 140)
+        assert module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}]) is True
+        assert caps == [100]
+        # With under the floor left no link is asked for, and it reads as a stop, not a failed upload.
+        del calls[:]
+        monkeypatch.setattr(module, "_backfill_stop_at", clock[0] + 60)
+        assert module._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}]) is None
+        assert calls == []
 
 
 class TestCollectorShapeMatchesEveryUnpacker:
