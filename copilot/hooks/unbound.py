@@ -9690,8 +9690,11 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     repo, known = _account_option(args, ('-R', '--repo'), attached=True)
     if repo or not known:
         return repo, known
-    # A bare `OWNER/REPO` is a repository only where gh takes one as its operand, under `gh repo`; elsewhere
-    # a slashed word is a branch or a file (`gh pr checkout fix/login`). A URL names its host anywhere.
+    # A positional names the repository only under a command that acts on one; under `gh search` or `gh api`
+    # a URL is a query. A bare `OWNER/REPO` only under `gh repo`, since elsewhere a slashed word is a branch or
+    # a file (`gh pr checkout fix/login`).
+    if not (args[:1] and args[0] in _ACCOUNT_GH_REPO_SCOPED):
+        return _account_known('GH_REPO', env)
     takes_repo = args[:1] == ['repo']
     for at, arg in enumerate(args):
         # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
