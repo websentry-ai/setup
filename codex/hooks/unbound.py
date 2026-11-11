@@ -7606,10 +7606,8 @@ _ACCOUNT_GIT_COMMITS = frozenset({'commit', 'merge', 'rebase', 'cherry-pick', 'r
 # git's own options before the subcommand that take a value, so the subcommand is found at the right word.
 _ACCOUNT_GIT_VALUE_OPTIONS = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path',
                                         '--config-env', '--super-prefix'})
-# `git push` options whose value is a separate word, so the remote is not read out of one. The ones whose
-# value is optional (`--force-with-lease`, `--signed`, `--recurse-submodules`) are deliberately absent: bare,
-# the word after them is the remote, and their `=` form is a single token the switch branch already skips.
-# `--repo` is absent for the opposite reason: its value names where the push goes, so it IS the remote.
+# `git push` options whose value is a separate word. Absent on purpose: those whose value is optional
+# (`--force-with-lease`), since bare the next word is the remote, and `--repo`, whose value IS the remote.
 _ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--push-option'})
 
 
