@@ -8133,7 +8133,8 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         # A set or an unset changes it, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
         # `git config user.email` alone, or `git config get`, only reads it.
         verb = after[0].lower() if after and not after[0].startswith('-') else ''
-        if subcommand == 'config' and keys and (
+        reads = ('--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l')
+        if subcommand == 'config' and keys and not any(arg in reads for arg in after) and (
                 verb in ('set', 'unset')
                 or any(arg.startswith('--unset') for arg in after)
                 or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys))):
@@ -8173,9 +8174,10 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
         for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
             switched = _account_switches(program, args)
             # Run as another user, a switch changes that user's configuration, not ours; only a git config write to
-            # the repository itself, which both read, still moves our committer.
+            # this repository, which both read, still moves our committer.
             if switched and other_user and (switched != 'git' or any(
-                    arg in ('--global', '--system', '-f', '--file') or arg.startswith('--file=') for arg in args)):
+                    arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
+                    or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
                 switched = None
             if switched:
                 # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.

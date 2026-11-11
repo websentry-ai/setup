@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'fd652a3df7b26ede74c5fd93fbb775f37e21923b55987806a2fab0ec1117a56e'
+BLOCK_SHA256 = 'da4d3b39702b72781dd36ff9d1f651237ecbc51b4d830feef679ce12dfaec508'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -821,6 +821,21 @@ class AccountResolutionTests(unittest.TestCase):
             self.assertEqual(commit['accounts'][0]['email'], 'jdoe@gmail.com', path)
             hook._accounts('sudo -u deploy git config user.email deploy@acme.com', self.repo, state)
             self.assertEqual(commit.get('accounts'), [], path)
+
+    def test_a_config_read_with_a_value_pattern_is_not_a_switch(self):
+        """`git config --get user.email '<pattern>'` and its siblings only read, whatever follows the key."""
+        for read in ("git config --get user.email '.*@acme.com'", "git config --get-all user.email x",
+                     "git config --get-regexp 'user.email' '.*'"):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                commit = hook._accounts('git commit -m one', self.repo, state)
+                hook._accounts(read, self.repo, state)
+                self.assertEqual(commit['accounts'][0]['email'], 'jdoe@gmail.com', '%s / %s' % (path, read))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            commit = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('sudo -u deploy git -C /srv/other config user.email deploy@acme.com', self.repo, state)
+            self.assertEqual(commit['accounts'][0]['email'], 'jdoe@gmail.com', path)
 
     def test_the_short_no_value_flags_of_pr_merge_and_review_leave_the_url_the_operand(self):
         for command in ('gh pr merge -s https://github.acme.com/acme/app/pull/5',
