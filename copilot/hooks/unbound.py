@@ -10034,7 +10034,8 @@ def _account_azure_fields(entry: Dict) -> Optional[Dict]:
 
 def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the Azure subscription a call acted as, no repository); no environment variable picks it, only --subscription."""
-    named, known = _account_option(args, ('--subscription',), _account_name)
+    # Kept exactly as written, so a name is matched as the CLI matches it rather than after normalising.
+    named, known = _account_option(args, ('--subscription',), _account_path)
     if not known:
         return [], None
     entry, settled = _account_azure_entry(named, env, cwd, state)
@@ -10078,7 +10079,7 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     if server:
         # The endpoint the call names IS the cluster it reached; nothing has to be read to know that.
         return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
-    kubeconfig = chosen or _account_setting('KUBECONFIG', env) or ''
+    kubeconfig = chosen or _account_known('KUBECONFIG', env, _account_path)[0] or ''
     if not isinstance(cwd, str) and any(part and not os.path.isabs(part) for part in kubeconfig.split(os.pathsep)):
         # kubectl reads a relative kubeconfig from the call's folder; with that unknown, so is the cluster.
         return [], None

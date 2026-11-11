@@ -408,6 +408,23 @@ class AccountPlatformTests(unittest.TestCase):
             for path, hook in zip(HOOK_PATHS, HOOKS):
                 self.assertIsNone(hook._accounts('az group list', None, {}), path)
 
+    def test_a_subscription_selector_is_matched_exactly_as_written(self):
+        folder = Path(tempfile.mkdtemp(), 'azure')
+        folder.mkdir()
+        Path(folder, 'azureProfile.json').write_bytes(json.dumps({'subscriptions': [
+            {'id': '00000000-0000-0000-0000-00000000000a', 'name': 'Acme  Production', 'isDefault': False},
+            {'id': '00000000-0000-0000-0000-00000000000b', 'name': 'Acme Production', 'isDefault': True},
+        ]}).encode('utf-8'))
+        for path, resolved in self.each("AZURE_CONFIG_DIR=%s az group list --subscription 'Acme  Production'"
+                                        % folder):
+            self.assertEqual(resolved['accounts'][0]['subscription_id'],
+                             '00000000-0000-0000-0000-00000000000a', path)
+
+    def test_a_relative_kubeconfig_with_a_space_from_an_unknown_folder_is_unknown(self):
+        with patch.dict(os.environ, {'KUBECONFIG': './my kc'}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                self.assertIsNone(hook._accounts('kubectl get pods', None, {}), path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
