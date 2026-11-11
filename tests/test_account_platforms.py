@@ -653,6 +653,23 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('kubectl -s"$(cat server)" get pods'):
             self.assertIsNone(resolved, path)
 
+    def test_a_server_with_no_scheme_is_reached_over_https(self):
+        """client-go takes a bare host and reaches it over https; a stray `-s…` that is no host is not a server."""
+        for command, server in (('kubectl get pods --server k8s.example.com', 'https://k8s.example.com'),
+                                ('kubectl get pods --server 10.0.0.1:6443', 'https://10.0.0.1:6443')):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['server'], server, '%s / %s' % (path, command))
+        for path, resolved in self.each('kubectl logs pod -since 1h'):
+            self.assertIsNone(resolved, path)
+
+    def test_an_azure_cloud_switch_drops_the_earlier_default(self):
+        for switch in ('az cloud set --name AzureUSGovernment', 'az config set cloud.name=AzureUSGovernment'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('az group list', self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, switch))
+
     def test_the_active_clouds_entry_wins_over_one_that_names_no_cloud(self):
         folder = Path(self.home, '.azure')
         Path(folder, 'azureProfile.json').write_text(json.dumps({'subscriptions': [

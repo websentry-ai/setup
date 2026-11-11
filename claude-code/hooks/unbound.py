@@ -9053,8 +9053,13 @@ _ACCOUNT_GH_SWITCHES = frozenset({
 # Short no-value flags, which mean different things under different subcommands, so listed per subcommand.
 _ACCOUNT_GH_SHORT_SWITCHES = {('pr', 'merge'): frozenset({'-s', '-m', '-r', '-d'}),
                               ('pr', 'review'): frozenset({'-a', '-r', '-c', '--comment'})}
-# gh options whose value is text, so a URL after one is a title or a body and never the operand.
-_ACCOUNT_GH_TEXT_OPTIONS = frozenset({'--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject'})
+# gh options whose value is text or a payload — a title, a body, `gh api`'s fields, headers and filters — so the
+# word after one is never an option or the operand, however it reads.
+_ACCOUNT_GH_TEXT_OPTIONS = frozenset({
+    '--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject',
+    '-f', '--raw-field', '--field', '-H', '--header', '--input', '-q', '--jq', '--template', '-X', '--method',
+    '-p', '--preview', '--cache',
+})
 # A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
 # gh reads the first pair for github.com and *.ghe.com, the second for any other host (and GITHUB_TOKEN there too
 # inside a codespace).
@@ -9856,9 +9861,11 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 
 
 def _account_kube_server_value(raw: Any) -> Optional[str]:
-    """A server as kubectl takes one, a URL or `host:port`; None for anything else."""
+    """A server as kubectl takes one — a URL, a dotted host or IP, or `host:port` — else None, so a stray `-s…`
+    such as `-since 1h` is no server."""
     value = _account_value(raw)
-    return value if value and ('://' in value or re.match(r'^[\w.-]+:\d+$', value)) else None
+    host = r'^(?:[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?|[A-Za-z0-9.-]+:\d+)$'
+    return value if value and ('://' in value or re.match(host, value)) else None
 
 
 def _account_kube_endpoint(server: str) -> Optional[str]:
@@ -9866,7 +9873,8 @@ def _account_kube_endpoint(server: str) -> Optional[str]:
     host = _transfer_url_split(server).netloc.rsplit('@', 1)[-1] if server else ''
     if not host:
         return None
-    return '%s://%s' % (server.split('://', 1)[0], host) if '://' in server else host
+    # client-go reaches a server written with no scheme over https.
+    return '%s://%s' % (server.split('://', 1)[0] if '://' in server else 'https', host)
 
 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
@@ -10058,8 +10066,10 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
             return 'aws'
     if program == 'az':
         group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
-        if group == 'login' or (group == 'account'
-                                and _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0] == 'set'):
+        action = _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0]
+        # `az cloud set` and an `az config` write change which cloud, and so which default, a later read sees.
+        if group == 'login' or (group, action) in (('account', 'set'), ('cloud', 'set'), ('config', 'set'),
+                                                   ('config', 'unset')):
             return 'azure'
     return None
 # A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
