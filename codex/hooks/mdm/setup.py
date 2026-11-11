@@ -14,6 +14,7 @@ import subprocess
 import hashlib
 import json
 import shlex
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 try:
@@ -33,6 +34,19 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+# An S3 PUT is given up on only after this long below this speed, then re-sent on a fresh link.
+BACKFILL_PUT_STALL_SECONDS = 60
+BACKFILL_PUT_STALL_BYTES_PER_SECOND = 1024
+BACKFILL_PUT_ATTEMPTS = 3
+BACKFILL_PUT_MAX_SECONDS = 300  # one chunk's PUT attempts share this, so retries cannot stack past a watchdog
+BACKFILL_PUT_MIN_SECONDS = 45  # with less than this left of it, no further attempt starts
+# Run as a script (onboard's 720s per-tool watchdog), the backfill stops itself here; the packaged binary sets no stop.
+_SCRIPT_START = time.time()
+BACKFILL_SOFT_STOP_SECONDS = 600
+BACKFILL_FROM_S3_RESERVE_SECONDS = 40
+# What a re-walk needs before its first chunk: the config request's retries (about 66s) and the walk itself.
+BACKFILL_START_MARGIN_SECONDS = 120
+_backfill_stop_at: Optional[float] = None
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -2029,18 +2043,31 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     # --retry rides out transient backend errors (5xx/429/timeout/conn-refused)
     # so a flaky gateway during onboard doesn't drop a chunk; --max-time caps
     # each attempt and the subprocess budget below outlasts all the retries.
-    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}",
-           "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}", "--max-time", str(timeout)]
+    if method == 'PUT':
+        # A slow upload runs to the total cap, a stalled one is cut; the caller re-sends, on a fresh link.
+        cmd += ["--speed-limit", str(BACKFILL_PUT_STALL_BYTES_PER_SECOND),
+                "--speed-time", str(BACKFILL_PUT_STALL_SECONDS), "--retry", "0"]
+        process_timeout = timeout + 20
+    else:
+        cmd += ["--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+        process_timeout = timeout * 4 + 20
     for header_name, header_value in headers.items():
         cmd += ["-H", f"{header_name}: {header_value}"]
     if body is not None:
         cmd += ["--data-binary", "@-"]
     cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
-        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout * 4 + 20)
-    except (subprocess.TimeoutExpired, OSError) as e:
+        result = subprocess.run(cmd, input=body, capture_output=True, timeout=process_timeout)
+    except subprocess.TimeoutExpired as e:
+        # Not str(e): it carries the whole curl command, auth header and upload link included.
+        debug_print(f"{method} request timed out after {e.timeout}s")
+        return -28, b''  # curl's own timeout exit, negated
+    except OSError as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    # A transport failure reads as curl's exit code negated, so it can be told from an HTTP status.
+    transport_failure = -abs(result.returncode)
     if result.returncode != 0:
         # curl transport error (DNS/TLS/refused); -sS keeps the message on stderr.
         debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
@@ -2049,12 +2076,15 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     sep = out.rfind(b'\n')
     if sep == -1:
         debug_print(f"HTTP request failed: curl exit {result.returncode}")
-        return 0, b''
+        return transport_failure, b''
     try:
         code = int(out[sep + 1:].strip() or b'0')
     except ValueError:
         debug_print(f"HTTP request failed: curl exit {result.returncode}")
-        return 0, b''
+        return transport_failure, b''
+    # An interim status such as 100 from a transfer that then died is the transport failure, not an answer.
+    if result.returncode != 0 and code < 200:
+        return transport_failure, b''
     return code, out[:sep]
 
 
@@ -2092,8 +2122,24 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
+def _backfill_run_seconds_left() -> float:
+    # What a PUT may still take before the soft stop, leaving from-s3 its turn; unbounded when no stop is set.
+    if _backfill_stop_at is None:
+        return float('inf')
+    return _backfill_stop_at - time.time() - BACKFILL_FROM_S3_RESERVE_SECONDS
+
+
+def _backfill_out_of_run_time() -> bool:
+    return _backfill_run_seconds_left() < BACKFILL_PUT_MIN_SECONDS
+
+
+class _BackfillOutOfTime(Exception):
+    """A chunk was left unsent because it would not fit before the soft stop; carries the sessions sent so far."""
+
+
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False) -> bool:
+                           force: bool = False) -> Optional[bool]:
+    # None when the run's soft stop left no time for the PUT: a stop, not a failed upload.
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
@@ -2106,37 +2152,60 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         'Content-Type': 'application/json',
     })
 
-    code, body = _backfill_http_request(
-        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
-        method='POST',
-        headers=auth_headers,
-        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
-        debug_print(f"upload-url request failed: HTTP {code}")
-        return False
-    try:
-        url_resp = json.loads(body.decode('utf-8'))
-    except (ValueError, UnicodeDecodeError):
-        debug_print("upload-url response was not JSON")
-        return False
+    chunk_started = time.time()
 
-    upload_url = url_resp.get('upload_url')
-    object_key = url_resp.get('object_key')
-    if not upload_url or not object_key:
-        debug_print("upload-url response missing fields")
-        return False
+    def put_seconds_left() -> int:
+        return int(min(BACKFILL_PUT_MAX_SECONDS - (time.time() - chunk_started), _backfill_run_seconds_left()))
 
-    code, _ = _backfill_http_request(
-        upload_url,
-        method='PUT',
-        headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
-        body=payload_bytes,
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
+    for _ in range(BACKFILL_PUT_ATTEMPTS):
+        if put_seconds_left() < BACKFILL_PUT_MIN_SECONDS:
+            debug_print("S3 PUT not retried: the chunk's time is used up")
+            return None if _backfill_out_of_run_time() else False
+        code, body = _backfill_http_request(
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
+            method='POST',
+            headers=auth_headers,
+            body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
+            timeout=30,
+        )
+        if code < 200 or code >= 300:
+            debug_print(f"upload-url request failed: HTTP {code}")
+            return False
+        try:
+            url_resp = json.loads(body.decode('utf-8'))
+        except (ValueError, UnicodeDecodeError):
+            debug_print("upload-url response was not JSON")
+            return False
+
+        upload_url = url_resp.get('upload_url')
+        object_key = url_resp.get('object_key')
+        if not upload_url or not object_key:
+            debug_print("upload-url response missing fields")
+            return False
+
+        # Measured after the link request, which comes out of the same budget.
+        put_cap = put_seconds_left()
+        if put_cap < BACKFILL_PUT_MIN_SECONDS:
+            debug_print("S3 PUT not started: the link request used the chunk's time")
+            return None if _backfill_out_of_run_time() else False
+        put_started = time.time()
+        code, put_answer = _backfill_http_request(
+            upload_url,
+            method='PUT',
+            headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
+            body=payload_bytes,
+            timeout=put_cap,
+        )
+        if 200 <= code < 300:
+            break
         debug_print(f"S3 PUT failed: HTTP {code}")
+        timed_out_at_s3 = code == 408 or (code == 400 and b'RequestTimeout' in put_answer)
+        if (0 <= code < 500 and not timed_out_at_s3) or (code < 0 and time.time() - put_started >= put_cap - 1):
+            # Refused, or still moving when the cap cut it: another attempt would end the same way.
+            return False
+        # A stall (S3 calls it out itself after ~20s of silence), another transport failure or a 5xx:
+        # the next attempt asks for a fresh link.
+    else:
         return False
 
     code, _ = _backfill_http_request(
@@ -2167,8 +2236,13 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         nonlocal current_chunk, current_size, chunks_total, chunks_sent
         if not current_chunk:
             return
+        if _backfill_out_of_run_time():
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
+        landed = _backfill_upload_chunk(api_key, backend_url, current_chunk, forced)
+        if landed is None:
+            raise _BackfillOutOfTime(len(sessions_sent_ids))
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
+        if landed:
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))
@@ -2192,6 +2266,17 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
 
 
+@contextmanager
+def _backfill_soft_stop(soft_stop_seconds: int):
+    """For main()'s uploads: they stop themselves before onboard's per-tool watchdog would kill the installer."""
+    global _backfill_stop_at
+    _backfill_stop_at = _SCRIPT_START + soft_stop_seconds
+    try:
+        yield
+    finally:
+        _backfill_stop_at = None
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.codex/sessions and seed historical sessions.
 
@@ -2205,6 +2290,10 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     try:
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
+            return
+        if _backfill_run_seconds_left() < BACKFILL_PUT_MIN_SECONDS + BACKFILL_START_MARGIN_SECONDS:
+            # The config request and the walk come before the first chunk and are not free either.
+            print("[backfill] Skipped — no time left in this run; history is sent on the next run.")
             return
 
         started_at = time.time()
@@ -2242,14 +2331,23 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Found {total} past sessions. Uploading (this may take a few minutes)...")
         sessions_sent = 0
         chunks_failed = 0
+        out_of_time = False
         for batch, forced in ((forced_sessions, True), (sessions, False)):
             if not batch:
                 continue
-            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            try:
+                sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            except _BackfillOutOfTime as stop:
+                sessions_sent += stop.args[0]
+                out_of_time = True
+                break
             sessions_sent += sent
             chunks_failed += failed
 
-        if sessions_sent == 0:
+        if out_of_time:
+            # The cutoff stays where it was, so the next run starts this history again.
+            print(f"[backfill] Queued {sessions_sent} past sessions. More history remains for the next run.")
+        elif sessions_sent == 0:
             print(f"[backfill] No sessions queued (all {chunks_failed} uploads failed).")
         elif chunks_failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({chunks_failed} chunks failed).")
@@ -2530,7 +2628,8 @@ def main():
                               hook_hash=hook_script_hash(_installed_hook_script()), install_mode="mdm")
 
     if success and backfill_mode:
-        run_backfill(api_key, base_url, get_all_user_homes())
+        with _backfill_soft_stop(BACKFILL_SOFT_STOP_SECONDS):
+            run_backfill(api_key, base_url, get_all_user_homes())
 
     return success
 
