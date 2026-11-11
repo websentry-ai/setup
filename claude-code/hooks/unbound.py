@@ -10098,8 +10098,10 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         action = _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0]
         if group == 'login' or (group, action) == ('account', 'set'):
             return 'azure'
-        # `az cloud set` and an `az config` write change the cloud every subscription is matched within.
-        if (group, action) in (('cloud', 'set'), ('config', 'set'), ('config', 'unset')):
+        # `az cloud set`, or an `az config` write to a `cloud.` key, changes the cloud every subscription is
+        # matched within; other config keys (`defaults.location`) do not.
+        if (group, action) == ('cloud', 'set') or (group == 'config' and action in ('set', 'unset') and any(
+                arg.lower().startswith('cloud.') for arg in args)):
             return 'azure-cloud'
     return None
 
@@ -10147,8 +10149,9 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             return None
         empty_git_config = bool(_ACCOUNT_EMPTY_GIT_CONFIG.search(command))
         steered = {''.join(names).upper() for names in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        # Resolves nothing, but its switches still count, as for a call that may not have run.
         if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
-            return None
+            sure = False
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)

@@ -692,6 +692,8 @@ class AccountPlatformTests(unittest.TestCase):
             named = hook._accounts("az group list --subscription 'Acme Production'", self.repo, state)
             hook._accounts('az account set --subscription "Acme Sandbox"', self.repo, state)
             self.assertEqual(named['accounts'][0]['subscription_name'], 'Acme Production', path)
+            hook._accounts('az config set defaults.location=westus', self.repo, state)
+            self.assertEqual(named['accounts'][0]['subscription_name'], 'Acme Production', path)
             hook._accounts('az cloud set --name AzureUSGovernment', self.repo, state)
             self.assertEqual(named.get('accounts'), [], path)
 

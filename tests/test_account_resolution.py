@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '769d8c4159503c7d20b2ba616959655a8e75ea0f577bb59fe09f14f192c2dc7e'
+BLOCK_SHA256 = '9e8831abb55604ed125ff995692c90c99fca04d7b490c3f3bacf22079ed1c650'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -409,6 +409,14 @@ class AccountResolutionTests(unittest.TestCase):
                    'git config user.email jdoe@gmail.com')
         for path, resolved in self.each(command):
             self.assertEqual(resolved['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_a_powershell_assignment_resolves_nothing_but_its_switch_still_counts(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            before = hook._accounts('gh api user', self.repo, state)
+            self.assertIsNone(hook._accounts('$env:GH_HOST = "github.acme.com"; gh auth switch --user bot',
+                                             self.repo, state), path)
+            self.assertEqual(before.get('accounts'), [], path)
 
     def test_a_call_that_may_not_have_run_resolves_nothing_but_still_switches(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
