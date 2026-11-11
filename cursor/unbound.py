@@ -7527,11 +7527,13 @@ _ACCOUNT_MAX_PATH = 512
 # them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
 _ACCOUNT_REMEMBERED = frozenset({
     'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
-    'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'XDG_CONFIG_HOME', 'HOME', 'USERPROFILE',
+    'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_NOSYSTEM', 'XDG_CONFIG_HOME',
+    'HOME', 'USERPROFILE',
     'GH_HOST', 'GH_REPO', 'GH_CONFIG_DIR', 'GH_TOKEN',
     'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
     'GITHUB_ENTERPRISE_TOKEN',
     'AWS_PROFILE', 'AWS_DEFAULT_PROFILE', 'AWS_CONFIG_FILE', 'AWS_SHARED_CREDENTIALS_FILE', 'AWS_ACCESS_KEY_ID',
+    'AWS_ROLE_ARN', 'AWS_WEB_IDENTITY_TOKEN_FILE',
     'AZURE_CONFIG_DIR',
     'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
@@ -7578,12 +7580,8 @@ _ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--pu
 
 
 def _account_deadline(state: Dict) -> float:
-    """When this turn's account lookups must stop, shared with the transfer walk so the hook has one limit."""
-    shared = state.get('deadline')
-    if isinstance(shared, (int, float)):
-        return shared
-    return state.setdefault('account_deadline',
-                            time.monotonic() + state.get('budget', _ACCOUNT_TURN_BUDGET))
+    """When this turn's account lookups must stop: the transfer walk's own clock, started by whichever runs first."""
+    return state.setdefault('deadline', time.monotonic() + state.get('budget', _ACCOUNT_TURN_BUDGET))
 
 
 def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
@@ -7641,9 +7639,9 @@ _ACCOUNT_CONFIG_LOCATIONS = frozenset({'HOME', 'USERPROFILE', 'AWS_CONFIG_FILE',
 # The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
 # makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
 _ACCOUNT_CONFIG_STEERING = frozenset({
-    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_DIR',
-    'GIT_WORK_TREE', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR', 'KUBECONFIG',
-    'HOME', 'USERPROFILE',
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+    'GIT_DIR', 'GIT_WORK_TREE', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'AZURE_CONFIG_DIR',
+    'KUBECONFIG', 'HOME', 'USERPROFILE',
 })
 # git reads `GIT_CONFIG_COUNT` settings from indexed pairs, so they travel with it rather than being named one
 # by one in the table above.
@@ -7952,6 +7950,16 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
     return 'origin', True
 
 
+def _account_command_sets(env: Dict, setting: str) -> bool:
+    """Whether the command's own configuration — GIT_CONFIG_PARAMETERS or the indexed pairs — sets this key."""
+    params = (env or {}).get('GIT_CONFIG_PARAMETERS') or ''
+    if re.search(r"'%s'=" % re.escape(setting), params, re.IGNORECASE):
+        return True
+    count = (env or {}).get('GIT_CONFIG_COUNT') or '0'
+    return count.isdigit() and any(
+        ((env or {}).get('GIT_CONFIG_KEY_%d' % n) or '').lower() == setting for n in range(int(count)))
+
+
 # A remote name nobody uses, offered so git reports the URL a literal push would really reach.
 _ACCOUNT_PROBE_REMOTE = '__unbound_probe__'
 
@@ -7993,7 +8001,8 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
             repo, remote = None, None
         elif repo:
             rewritten = _account_push_url_of(remote, cwd, env, state)
-            repo, remote = (_account_repo_of(rewritten) if rewritten else None) or repo, None
+            # A probe that failed says nothing about where the rules sent the push, so it stays unknown.
+            repo, remote = (_account_repo_of(rewritten) if rewritten else None), None
         else:
             url = _account_first_line(['git', 'remote', 'get-url', '--push', remote], cwd, env, state,
                                       ('git-push-url', remote, cwd, _account_env_key(env)))
@@ -8018,8 +8027,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
         if not readable:
             # git commits as the value we cannot read, so who committed is unknown rather than `user.email`.
             return [], pushed
-        active = bool(email) and setting not in overrides and not any(
-            name in (env or {}) for name in ('GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_COUNT'))
+        active = bool(email) and setting not in overrides and not _account_command_sets(env, setting)
     account = {'platform': 'git', 'email': email, 'source': 'command'}
     if active:
         account['_active'] = True
@@ -8324,6 +8332,9 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
+    if [arg for arg in args if not arg.startswith('-')][:1] == ['config']:
+        # `kubectl config …` edits the local kubeconfig; even `set-cluster --server` reaches no cluster.
+        return [], None
     context, known = _account_option(args, ('--context',))
     chosen, named = _account_option(args, ('--kubeconfig',), _account_path)
     cluster_named, cluster_known = _account_option(args, ('--cluster',))

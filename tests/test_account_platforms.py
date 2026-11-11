@@ -461,6 +461,17 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('docker login https://user@registry.example.com:5000/'):
             self.assertEqual(resolved['accounts'][0]['registry'], 'registry.example.com:5000', path)
 
+    def test_a_powershell_web_identity_assignment_leaves_the_call_unknown(self):
+        """The shell walk does not model `$env:`, and these two decide which account signs the call in."""
+        for path, resolved in self.each('$env:AWS_ROLE_ARN = "arn:aws:iam::999999999999:role/ci"; '
+                                        '$env:AWS_WEB_IDENTITY_TOKEN_FILE = "/tmp/t"; aws s3 ls'):
+            self.assertIsNone(resolved, path)
+
+    def test_kubectl_config_reaches_no_cluster(self):
+        """`set-cluster --server` writes the kubeconfig; it does not talk to that server."""
+        for path, resolved in self.each('kubectl config set-cluster prod --server=https://eks.example.com'):
+            self.assertIsNone(resolved, path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
