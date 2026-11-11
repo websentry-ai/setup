@@ -7653,7 +7653,7 @@ _ACCOUNT_GIT_VALUE_OPTIONS = frozenset({'-C', '-c', '--git-dir', '--work-tree', 
                                         '--config-env', '--super-prefix'})
 # `git push` options whose value is a separate word. Absent on purpose: those whose value is optional
 # (`--force-with-lease`), since bare the next word is the remote, and `--repo`, whose value IS the remote.
-_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--push-option'})
+_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--push-option', '--repo'})
 
 
 def _account_deadline(state: Dict) -> float:
@@ -7812,9 +7812,10 @@ def _account_setting(name: str, env: Dict) -> Optional[str]:
     return _account_known(name, env)[0]
 
 
-def _account_option(args: List[str], names: tuple, reader=None, attached: bool = False) -> tuple:
+def _account_option(args: List[str], names: tuple, reader=None, attached: bool = False,
+                    skip: frozenset = frozenset()) -> tuple:
     """(what a call names with one of these options, whether it is readable); (None, True) when it names none.
-    The last occurrence wins, as each CLI's own parser does."""
+    The last occurrence wins, as each CLI's own parser does; the value after an option in `skip` is not read."""
     raw = None
     i = 0
     while i < len(args):
@@ -7822,6 +7823,9 @@ def _account_option(args: List[str], names: tuple, reader=None, attached: bool =
         if arg == '--':
             # Everything after this belongs to the command being run, not to the one naming the option.
             break
+        if arg in skip:
+            i += 2
+            continue
         if arg in names and i + 1 < len(args):
             raw, i = args[i + 1], i + 2
             continue
@@ -8004,14 +8008,8 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
 
 def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
                          overrides: Dict) -> Optional[str]:
-    """(the remote a push reaches, whether it is readable); git's order: the command, pushRemote, pushDefault,
-    then the branch's remote."""
-    # `git push --repo <repository>` names where the push goes, so its value IS the remote.
-    named, known = _account_option(after, ('--repo',))
-    if not known:
-        return None, False
-    if named:
-        return named, True
+    """(the remote a push reaches, whether it is readable); git's order: the positional repository, `--repo`,
+    pushRemote, pushDefault, then the branch's remote."""
     i = 0
     while i < len(after):
         arg = after[i]
@@ -8023,6 +8021,11 @@ def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state:
             continue
         value = _account_value(arg)
         return (value, True) if value else (None, False)
+    named, known = _account_option(after, ('--repo',))
+    if not known:
+        return None, False
+    if named:
+        return named, True
     branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state,
                                  ('git-branch', cwd, _account_env_key(env)))
     for name in (('branch.%s.pushRemote' % branch) if branch else None, 'remote.pushDefault',
@@ -8122,7 +8125,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
 
 def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     """(the repository a gh call names, whether it is readable); gh reads `GH_REPO` exactly as it reads `--repo`."""
-    repo, known = _account_option(args, ('-R', '--repo'), attached=True)
+    repo, known = _account_option(args, ('-R', '--repo'), attached=True, skip=_ACCOUNT_GH_TEXT_OPTIONS)
     if repo or not known:
         return repo, known
     # A positional names the repository only under a command that acts on one; under `gh search` or `gh api`
@@ -8161,7 +8164,8 @@ def _account_gh_host(args: List[str], env: Dict) -> tuple:
     repository it names."""
     # `-h` is the host only under `gh auth`; elsewhere it asks for help.
     auth = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)[0] == 'auth'
-    host, known = _account_option(args, ('--hostname', '-h') if auth else ('--hostname',), attached=auth)
+    host, known = _account_option(args, ('--hostname', '-h') if auth else ('--hostname',), attached=auth,
+                                  skip=_ACCOUNT_GH_TEXT_OPTIONS)
     if host or not known:
         return host, known
     repo, known = _account_gh_repo(args, env)
@@ -8352,14 +8356,14 @@ def _account_aws(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
     return [{'platform': 'aws', 'account_id': account, 'profile': profile, 'source': source}], None
 
 
-def _account_azure_dir(env: Dict) -> Optional[str]:
+def _account_azure_dir(env: Dict, cwd: Optional[str]) -> Optional[str]:
     """The folder the Azure CLI reads its profile from, which `AZURE_CONFIG_DIR` moves off the home folder."""
     found, known = _account_known('AZURE_CONFIG_DIR', env, _account_path)
     if not known:
         return None
     if found:
-        # A relative setting is resolved against a folder this process does not own, so the CLI is asked instead.
-        return found if os.path.isabs(found) else None
+        # The CLI resolves a relative one from the call's folder; with that unknown, so is the profile.
+        return found if os.path.isabs(found) else os.path.join(cwd, found) if isinstance(cwd, str) else None
     home = _account_home(env)
     return os.path.join(home, '.azure') if home else None
 
@@ -8367,7 +8371,7 @@ def _account_azure_dir(env: Dict) -> Optional[str]:
 def _account_azure_entry(named: Optional[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the subscription azureProfile.json names, whether that file settled it). The file begins with a UTF-8 BOM."""
     def resolve():
-        folder = _account_azure_dir(env)
+        folder = _account_azure_dir(env, cwd)
         text = _account_file(os.path.join(folder, 'azureProfile.json') if folder else None)
         if text is None:
             return None, False
@@ -8454,7 +8458,8 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     if server:
         # The endpoint the call names IS the cluster it reached, whatever context or cluster it also names.
         return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
-    context, known = _account_option(args, ('--context',))
+    # A context name may hold spaces, so it is read as given rather than as a one-word identity.
+    context, known = _account_option(args, ('--context',), _account_path)
     chosen, named = _account_option(args, ('--kubeconfig',), _account_path)
     cluster_named, cluster_known = _account_option(args, ('--cluster',))
     # `--kubeconfig` takes one file; a list there is a path kubectl cannot open, unlike the same list in

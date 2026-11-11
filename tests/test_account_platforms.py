@@ -573,6 +573,23 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('kubectl config set-cluster prod --server=https://new.example.com', self.repo, state)
             self.assertEqual(explicit['accounts'][0]['server'], 'https://k8s.example.com', path)
 
+    def test_a_relative_azure_config_dir_is_read_from_the_calls_folder(self):
+        """az resolves a relative AZURE_CONFIG_DIR from where it runs, as the CLI itself would."""
+        folder = Path(self.repo, '.az')
+        folder.mkdir()
+        Path(folder, 'azureProfile.json').write_bytes(b'\xef\xbb\xbf' + json.dumps({'subscriptions': [
+            {'id': '00000000-0000-0000-0000-000000000009', 'name': 'Local Dev', 'isDefault': True}]}).encode())
+        for path, resolved in self.each('AZURE_CONFIG_DIR=.az az group list'):
+            self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Local Dev', path)
+
+    def test_a_context_name_with_a_space_is_still_looked_up(self):
+        kube = json.loads(os.environ['FAKE_KUBE'])
+        kube['clusters']['team ctx'] = {'server': 'https://team.example.com', 'name': 'team'}
+        with patch.dict(os.environ, {'FAKE_KUBE': json.dumps(kube)}):
+            for path, resolved in self.each("kubectl --context 'team ctx' get pods"):
+                self.assertEqual(resolved['accounts'][0]['server'], 'https://team.example.com', path)
+                self.assertEqual(resolved['accounts'][0]['context'], 'team ctx', path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):
