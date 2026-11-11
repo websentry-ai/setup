@@ -31,7 +31,7 @@ START = '# KEEP IN SYNC: transfer resolution'
 END = '# --- end transfer resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '59639fe4d6c257d8d7648b0a15e126ca9739be8be0e24ecfc41b7701f8e47eb0'
+BLOCK_SHA256 = '6f510848d1d20ebffa34729438c15e0e920e4b2056de725ad037553812b2ea86'
 # Not a real credential; it only has to sit where a login goes.
 FAKE_TOKEN = 'ghp_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -114,6 +114,14 @@ if os.environ.get('FAKE_ROUTE_OUT') is None:
     sys.exit(1)
 sys.stdout.write(os.environ['FAKE_ROUTE_OUT'])
 '''
+# macOS's scutil stand-in: prints FAKE_SCUTIL_OUT after FAKE_SCUTIL_SLEEP seconds; fails when that is unset.
+FAKE_SCUTIL = '''#!{python}
+import os, sys, time
+time.sleep(float(os.environ.get('FAKE_SCUTIL_SLEEP') or 0))
+if os.environ.get('FAKE_SCUTIL_OUT') is None:
+    sys.exit(1)
+sys.stdout.write(os.environ['FAKE_SCUTIL_OUT'])
+'''
 
 
 def _getaddrinfo(host, *args, **kwargs):
@@ -162,12 +170,17 @@ class TransferTestCase(unittest.TestCase):
             Path(bin_dir, name).chmod(0o755)
         self.route_log = os.path.join(bin_dir, 'routes.jsonl')
         Path(self.route_log).touch()
+        Path(bin_dir, 'scutil').write_text(FAKE_SCUTIL.format(python=sys.executable))
+        Path(bin_dir, 'scutil').chmod(0o755)
+        # The resolver's search suffixes are this test's own, and none until a test writes some.
+        self.resolv_conf = os.path.join(bin_dir, 'resolv.conf')
         env = {'PATH': bin_dir + os.pathsep + os.environ.get('PATH', ''), 'HOME': self.home,
                'FAKE_SSH_LOG': self.ssh_log, 'FAKE_SSH_SLEEP': '0', 'FAKE_ROUTE_LOG': self.route_log}
         for patcher in [patch.dict(os.environ, env), patch('socket.getaddrinfo', _getaddrinfo)] + \
                 [patch.object(hook, '_transfer_home', lambda home=self.home: home) for hook in HOOKS] + \
                 [patch.object(hook, '_TRANSFER_WGETRC_SYSTEM', ()) for hook in HOOKS] + \
-                [patch.object(hook, '_TRANSFER_CONTAINER_FILES', ()) for hook in HOOKS]:
+                [patch.object(hook, '_TRANSFER_CONTAINER_FILES', ()) for hook in HOOKS] + \
+                [patch.object(hook, '_TRANSFER_RESOLV_CONF', self.resolv_conf) for hook in HOOKS]:
             patcher.start()
             self.addCleanup(patcher.stop)
         # A proxy or curl config folder this machine's shell sets would change what is looked up; the dict patch above
@@ -576,6 +589,293 @@ class PowerShellTests(TransferTestCase):
         self.assert_endpoints("bash -lc 'curl -T b.zip https://files.acme-infra.net/up'",
                               [_endpoint('out', 'files.acme-infra.net', 'private')], 'curl')
         self.assert_hosts('bash deploy.sh', [])
+
+
+# Not a real password; it only has to sit where sshpass takes one.
+SSHPASS_PASSWORD = 'hunter2-' + 'Zq8xLm'
+
+
+class SshpassTests(TransferTestCase):
+    """sshpass and its own options are skipped, and the copy or ssh behind it is read as if run plainly; the password
+    reaches no field, ssh -G call or lookup."""
+
+    PLAIN = {
+        'scp dump.sql prod:/tmp': [_endpoint('out', 'prod', 'private', '10.0.4.12')],
+        'rsync -a -e ssh ./dist prod:/srv': [_endpoint('out', 'prod', 'private', '10.0.4.12')],
+        'sftp prod:/etc/hosts ./hosts': [_endpoint('in', 'prod', 'private', '10.0.4.12')],
+        "ssh prod 'tar x -C /srv' < site.tar": [_endpoint('out', 'prod', 'private', '10.0.4.12')],
+    }
+    # Every way sshpass takes its password, prompt and verbosity; -e takes a variable name only when attached.
+    OPTIONS = ['-p {pw}', '-p{pw}', '-v -p {pw}', '-vp {pw}', '-P assword: -p {pw}', '-Password: -p{pw}', '-f /tmp/pw',
+               '-f/tmp/pw', '-d 3', '-d3', '-e', '-eDEPLOY_PW', '-ep', '-p {pw} --', '/usr/bin/sshpass -p {pw}']
+
+    def test_the_command_behind_each_option_form_is_read_as_if_run_plainly(self):
+        looked_up = []
+
+        def lookup(host, *args, **kwargs):
+            looked_up.append(host)
+            return _getaddrinfo(host, *args, **kwargs)
+
+        with patch('socket.getaddrinfo', lookup):
+            for plain, expected in self.PLAIN.items():
+                tool = plain.split()[0]
+                for options in self.OPTIONS:
+                    written = options.format(pw=SSHPASS_PASSWORD)
+                    command = f'{written} {plain}' if written.startswith('/') else f'sshpass {written} {plain}'
+                    for hook, transfer in self.each(command):
+                        with self.subTest(hook=hook, command=command):
+                            self.assertEqual(transfer, {'tool': tool, 'endpoints': expected})
+                            self.assertNotIn(SSHPASS_PASSWORD, json.dumps(transfer))
+        self.assertNotIn(SSHPASS_PASSWORD, json.dumps([looked_up, self.ssh_calls()]))
+
+    def test_its_password_variable_and_other_wrappers_around_it_change_nothing(self):
+        for command in (f'SSHPASS={SSHPASS_PASSWORD} sshpass -e scp dump.sql prod:/tmp',
+                        f'timeout 30 sshpass -p {SSHPASS_PASSWORD} scp dump.sql prod:/tmp',
+                        f'sshpass -p {SSHPASS_PASSWORD} timeout 30 scp dump.sql prod:/tmp',
+                        f"bash -c 'sshpass -p {SSHPASS_PASSWORD} scp dump.sql prod:/tmp'"):
+            for hook, transfer in self.each(command):
+                with self.subTest(hook=hook, command=command):
+                    self.assertEqual(transfer, {'tool': 'scp',
+                                                'endpoints': [_endpoint('out', 'prod', 'private', '10.0.4.12')]})
+        self.assertNotIn(SSHPASS_PASSWORD, json.dumps(self.ssh_calls()))
+
+    def test_sshpass_alone_or_with_no_transfer_behind_it_sends_nothing(self):
+        for command in (f'sshpass -p {SSHPASS_PASSWORD}', 'sshpass -h', f'sshpass -p {SSHPASS_PASSWORD} ls /tmp'):
+            self.assert_hosts(command, [])
+
+
+class PowerShellShapeTests(TransferTestCase):
+    """PowerShell's own statements are read before the shell reader: a statement's `$x =`, script blocks and
+    hashtables, so the web cmdlet inside them is found; a splat binds what isn't known, so it names no host unless the
+    URL is named beside it."""
+
+    CASES = {
+        '$r = Invoke-RestMethod -Uri https://example.com/api; $r.items': 'in',
+        '$resp=iwr https://example.com/x -UseBasicParsing': 'in',
+        '[string]$script:page = (iwr https://example.com/x).Content': 'in',
+        '$o.p[0] += irm https://example.com/api': 'in',
+        'try { iwr https://example.com/x -OutFile x.zip } catch { Write-Host $_ }': 'in',
+        "$ErrorActionPreference = 'Stop'; try { $r = irm -Uri 'https://example.com/up' -Method Post -Body $b } "
+        'catch [System.Net.WebException] { exit 1 } finally { Write-Host done }': 'out',
+        'if ($ok) { Invoke-WebRequest -Uri https://example.com/up -InFile a.zip -Method Put } else { exit 1 }': 'out',
+        'Get-ChildItem *.zip | ForEach-Object { iwr https://example.com/up -InFile $_.FullName -Method Put }': 'out',
+        'Invoke-RestMethod -Headers @{Authorization="Bearer $t"; Accept="application/json"} -Uri https://example.com/x':
+            'in',
+        '$body = @{ name = "x"; n = 1 } | ConvertTo-Json\n$resp = Invoke-RestMethod -Uri "https://example.com/api" '
+        '-Method Post -Body $body -ContentType "application/json"': 'out',
+        'Write-Host "${env:TEMP} {not a block}"; iwr https://example.com/x': 'in',
+        'Invoke-WebRequest https://example.com/x -OutFile out.txt': 'in',
+        'Invoke-WebRequest -Uri https://example.com/x `\n  -OutFile x.zip': 'in',
+        'curl.exe -sS -T a.zip https://example.com/up': 'out',
+        '($r = irm https://example.com/api).Content': 'in',
+        'Invoke-RestMethod -Uri https://example.com/api -Method Post -InFile secret @headers': 'out',
+        '<#\n  Later: { iwr https://files.acme-infra.net/up -InFile a.zip }\n#>\nirm https://example.com/x': 'in',
+        '$cb = { irm https://example.com/up -InFile s }\n& $cb': 'out',
+    }
+
+    def test_each_shape_is_found_in_a_powershell_command(self):
+        for script, direction in self.CASES.items():
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__, script=script):
+                    transfer = hook._transfer(hook._transfer_powershell_text(script), self.repo, {})
+                    self.assertEqual([(e['direction'], e['host']) for e in (transfer or {}).get('endpoints', [])],
+                                     [(direction, 'example.com')])
+
+    def test_a_powershell_command_string_is_read_in_the_same_shape(self):
+        for script in ('$r = irm https://example.com/api', 'try { iwr https://example.com/x } catch { exit 1 }'):
+            self.assert_hosts('pwsh -NoProfile -Command ' + json.dumps(script), [('in', 'example.com')])
+
+    def test_a_splat_names_no_host_however_the_hashtable_reads(self):
+        for script in ('$p = @{Uri="https://example.com/x"; Method="Post"}; Invoke-RestMethod @p',
+                       'iwr -UseBasicParsing @params', 'irm @args'):
+            self.assert_hosts('powershell -Command ' + json.dumps(script), [])
+
+    def test_a_shell_command_is_still_read_as_the_shell_reads_it(self):
+        # Only a PowerShell command is read in PowerShell's shape: bash keeps its braces and $x.
+        self.assert_hosts("curl 'https://{a,b}.example/x'", [('in', 'a.example'), ('in', 'b.example')])
+        self.assert_hosts('$r = curl https://example.com/x', [])
+
+
+class ShortNameTests(TransferTestCase):
+    """A name without a dot that DNS resolved is recorded by the full name the resolver completed it with: the first
+    search suffix whose name has one of the same addresses. Anything unknown, slow or failing leaves it as written."""
+
+    NAMES = {'build-box': ['10.20.30.41'], 'build-box.corp.acme.com': ['10.20.30.41'],
+             'build-box.lab.acme.com': ['10.99.0.1'], 'printer': ['93.184.216.40'],
+             'printer.home.example': ['93.184.216.40'], 'mymac': ['127.0.0.1'], 'mymac.corp.acme.com': ['127.0.0.1']}
+    SCUTIL = ('DNS configuration\n\nresolver #1\n  search domain[0] : lab.acme.com\n  search domain[1] : corp.acme.com\n'
+              '  nameserver[0] : 10.0.0.2\n\nresolver #2\n  domain   : local\n  options  : mdns\n\nresolver #8\n'
+              '  domain   : search.tailscale\n  search domain[0] : home.example\n\n'
+              'DNS configuration (for scoped queries)\n\nresolver #1\n  search domain[0] : scoped.example\n')
+
+    def setUp(self):
+        super().setUp()
+        self.looked_up = []
+
+        def lookup(host, *args, **kwargs):
+            self.looked_up.append(host)
+            if host in self.NAMES:
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, 0)) for ip in self.NAMES[host]]
+            return _getaddrinfo(host, *args, **kwargs)
+
+        lookups = patch('socket.getaddrinfo', lookup)
+        lookups.start()
+        self.addCleanup(lookups.stop)
+        Path(self.home, '.ssh', 'config').write_text('Host bb\n  HostName build-box\n')
+
+    def on(self, platform):
+        return [patch.object(hook, '_transfer_platform', lambda: platform) for hook in HOOKS]
+
+    def resolved(self, command, platform='darwin'):
+        patchers = self.on(platform)
+        for patcher in patchers:
+            patcher.start()
+        try:
+            return [(hook, [(e['host'], e.get('resolved_host')) for e in (transfer or {}).get('endpoints', [])])
+                    for hook, transfer in self.each(command)]
+        finally:
+            for patcher in patchers:
+                patcher.stop()
+
+    def assert_resolved(self, command, expected, platform='darwin'):
+        for hook, got in self.resolved(command, platform):
+            with self.subTest(hook=hook, command=command, platform=platform):
+                self.assertEqual(got, expected)
+
+    def test_macos_reads_every_resolvers_search_suffixes_but_the_scoped_ones(self):
+        os.environ['FAKE_SCUTIL_OUT'] = self.SCUTIL
+        # lab.acme.com comes first but leads elsewhere, so build-box went to corp.acme.com.
+        self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box.corp.acme.com')])
+        self.assert_resolved('curl -T f http://build-box/up', [('build-box', 'build-box.corp.acme.com')])
+        self.assert_resolved('scp f bb:/tmp', [('bb', 'build-box.corp.acme.com')])
+        self.assert_resolved('curl http://printer/status', [('printer', 'printer.home.example')])
+        self.assertNotIn('build-box.scoped.example', self.looked_up)
+
+    def test_linux_reads_the_last_search_or_domain_line(self):
+        Path(self.resolv_conf).write_text('# generated\nsearch old.example\nnameserver 10.0.0.2\n'
+                                          'search lab.acme.com corp.acme.com.\noptions ndots:1\n')
+        self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box.corp.acme.com')], 'linux')
+        Path(self.resolv_conf).write_text('search lab.acme.com\ndomain corp.acme.com\n')
+        self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box.corp.acme.com')], 'linux')
+
+    def test_windows_takes_its_search_list_else_its_primary_and_adapter_suffixes(self):
+        parameters = r'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+        for registry in ({parameters: {'SearchList': 'lab.acme.com,corp.acme.com'}},
+                         {r'SOFTWARE\Policies\Microsoft\Windows NT\DNSClient': {'SearchList': 'corp.acme.com'},
+                          parameters: {'SearchList': 'lab.acme.com'}},
+                         {parameters: {'NV Domain': 'lab.acme.com', 'Domain': 'other.example'},
+                          parameters + r'\Interfaces': {},
+                          parameters + r'\Interfaces\{a1}': {'Domain': '', 'DhcpDomain': 'corp.acme.com'}}):
+            with self.subTest(registry=registry), patch.dict(sys.modules, {'winreg': _FakeWinreg(registry)}):
+                self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box.corp.acme.com')], 'windows')
+
+    def test_a_name_with_a_dot_an_address_this_machine_or_a_pinned_dial_stays_as_written(self):
+        os.environ['FAKE_SCUTIL_OUT'] = self.SCUTIL
+        self.assert_resolved('curl https://example.com/x', [('example.com', 'example.com')])
+        self.assert_resolved('scp f 10.0.4.12:/tmp', [('10.0.4.12', '10.0.4.12')])
+        self.assert_resolved('curl http://mymac:8080/x', [('mymac', 'mymac')])
+        self.assert_resolved('curl --resolve build-box:443:10.20.30.41 https://build-box/x',
+                             [('build-box', '10.20.30.41')])
+        self.assertNotIn('mymac.corp.acme.com', self.looked_up)
+
+    def test_a_call_that_may_not_have_run_or_goes_through_a_proxy_is_not_completed(self):
+        os.environ['FAKE_SCUTIL_OUT'] = self.SCUTIL
+        self.assert_resolved('test -f x && curl http://build-box/x', [('build-box', 'build-box')])
+        self.assert_resolved('curl -x http://proxy.example:3128 http://build-box/x', [('build-box', 'build-box')])
+        self.assertNotIn('build-box.corp.acme.com', self.looked_up)
+
+    def test_unknown_suffixes_or_none_that_match_leave_the_name(self):
+        self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box')])  # scutil fails
+        os.environ['FAKE_SCUTIL_OUT'] = 'DNS configuration\n\nresolver #1\n  search domain[0] : lab.acme.com\n'
+        self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box')])
+        self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box')], 'linux')  # no resolv.conf
+        with patch.dict(sys.modules, {'winreg': None}):
+            self.assert_resolved('scp f build-box:/tmp', [('build-box', 'build-box')], 'windows')
+
+    def test_the_suffixes_are_read_once_and_each_name_completed_once_per_turn(self):
+        os.environ['FAKE_SCUTIL_OUT'] = self.SCUTIL
+        with patch.object(HOOKS[0], '_transfer_platform', lambda: 'darwin'), \
+                patch.object(HOOKS[0].subprocess, 'run', wraps=HOOKS[0].subprocess.run) as run:
+            transfer = HOOKS[0]._transfer('scp f build-box:/a; scp f build-box:/b; curl -T f http://printer/up',
+                                          self.repo, {})
+        self.assertEqual([e['resolved_host'] for e in transfer['endpoints']],
+                         ['build-box.corp.acme.com', 'printer.home.example'])
+        self.assertEqual(sum('scutil' in str(call.args[0][0]) for call in run.call_args_list), 1)
+        self.assertEqual(self.looked_up.count('build-box.corp.acme.com'), 1)
+
+    def test_a_failing_or_hanging_lookup_or_scutil_stays_within_one_dns_timeout(self):
+        os.environ['FAKE_SCUTIL_OUT'] = self.SCUTIL
+        for failure in ('raise', 'hang'):
+            def lookup(host, *args, **kwargs):
+                if '.' in host and failure == 'raise':
+                    raise OSError('resolver broke')
+                if '.' in host:
+                    time.sleep(2)
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.20.30.41', 0))]
+
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__, failure=failure), patch('socket.getaddrinfo', lookup), \
+                        patch.object(hook, '_transfer_platform', lambda: 'darwin'), \
+                        patch.object(hook, '_TRANSFER_DNS_TIMEOUT', 0.3):
+                    started = time.monotonic()
+                    transfer = hook._transfer('curl -T f http://build-box/up', self.repo, {})
+                    self.assertLess(time.monotonic() - started, 1.0)
+                    self.assertEqual(transfer['endpoints'], [_endpoint('out', 'build-box', 'private')])
+        os.environ['FAKE_SCUTIL_SLEEP'] = '3'
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__, failure='slow scutil'), \
+                    patch.object(hook, '_transfer_platform', lambda: 'darwin'), \
+                    patch.object(hook, '_TRANSFER_DNS_TIMEOUT', 0.3):
+                started = time.monotonic()
+                transfer = hook._transfer('curl -T f http://build-box/up', self.repo, {})
+                self.assertLess(time.monotonic() - started, 1.5)
+                self.assertEqual(transfer['endpoints'], [_endpoint('out', 'build-box', 'private')])
+
+
+class _OsNamed:
+    """The os module under another system's name."""
+
+    def __init__(self, name):
+        self.name = name
+
+    def __getattr__(self, attribute):
+        return getattr(os, attribute)
+
+
+class _FakeWinreg:
+    """winreg over a dict of key path to values, for the keys under HKEY_LOCAL_MACHINE."""
+    HKEY_LOCAL_MACHINE = 'HKLM'
+
+    def __init__(self, keys):
+        self.keys = keys
+
+    def OpenKey(self, root, path):
+        if path not in self.keys:
+            raise FileNotFoundError(path)
+        key = self
+
+        class Key:
+            def __enter__(self):
+                return path
+
+            def __exit__(self, *args):
+                return False
+
+        return Key()
+
+    def QueryValueEx(self, path, name):
+        if name not in self.keys[path]:
+            raise FileNotFoundError(name)
+        return self.keys[path][name], 1
+
+    def _children(self, path):
+        return sorted(k[len(path) + 1:] for k in self.keys if k.startswith(path + '\\') and '\\' not in k[len(path) + 1:])
+
+    def QueryInfoKey(self, path):
+        return len(self._children(path)), len(self.keys[path]), 0
+
+    def EnumKey(self, path, n):
+        return self._children(path)[n]
 
 
 class AddressTests(TransferTestCase):
@@ -1659,6 +1959,45 @@ class EachHookCarriesTheTransferTests(TransferTestCase):
         output = hook.build_exchange_from_transcript(str(events), 's1', cwd=self.repo, already_forwarded={'call-0'})[0]
         self.assertEqual([e.get('transfer') for e in _tool_entries(output)],
                          [{'tool': 'scp', 'endpoints': [_endpoint('out', 'prod', 'public', '203.0.113.9')]}])
+
+    def _copilot_transfers(self, tool, commands):
+        """Each call's transfer, from a Copilot transcript (the hook's input) through its exchange builder."""
+        hook = load_module('copilot/hooks/unbound.py')
+        lines = [{'type': 'user.message', 'id': 'u1', 'timestamp': '2026-10-22T16:39:59.000Z', 'data': {'content': 'go'}}]
+        for n, command in enumerate(commands):
+            arguments = {'command': command, 'explanation': 'fetch', 'goal': 'fetch', 'mode': 'sync'}
+            lines += [{'type': 'tool.execution_start', 'timestamp': '2026-10-22T16:40:00.000Z',
+                       'data': {'toolCallId': f'call-{n}', 'toolName': tool, 'arguments': arguments}},
+                      {'type': 'tool.execution_complete', 'timestamp': '2026-10-22T16:40:00.500Z',
+                       'data': {'toolCallId': f'call-{n}', 'success': True}}]
+        events = Path(tempfile.mkdtemp(), 'events.jsonl')
+        events.write_text('\n'.join(json.dumps(line) for line in lines) + '\n')
+        output = hook.build_exchange_from_transcript(str(events), 's1', cwd=self.repo)[0]
+        return [e.get('transfer') for e in _tool_entries(output)]
+
+    def test_copilot_powershell_web_calls_carry_their_transfer_on_every_windows_shell_tool(self):
+        # The CLI's PowerShell tool anywhere, and VS Code's terminal tool on Windows, whose terminal is PowerShell.
+        scripts = list(PowerShellShapeTests.CASES)
+        expected = [{'tool': 'curl' if 'curl.exe' in script else 'powershell',
+                     'endpoints': [_endpoint(direction, 'example.com', 'public')]}
+                    for script, direction in PowerShellShapeTests.CASES.items()]
+        hook = load_module('copilot/hooks/unbound.py')
+        for tool, system in (('powershell', 'posix'), ('powershell', 'nt'), ('run_in_terminal', 'nt'),
+                             ('runInTerminal', 'nt')):
+            # Only the hook sees the other system's name; pathlib keeps this one's.
+            with self.subTest(tool=tool, system=system), patch.object(hook, 'os', _OsNamed(system)):
+                self.assertEqual(self._copilot_transfers(tool, scripts), expected)
+
+    def test_copilot_terminal_calls_elsewhere_are_read_as_bash(self):
+        # On macOS and Linux the terminal runs bash or zsh, where braces and $x mean what they do there.
+        self.assertEqual(self._copilot_transfers('run_in_terminal', ["curl 'https://{a,b}.example/x'"]),
+                         [{'tool': 'curl', 'endpoints': [_endpoint('in', 'a.example', 'unresolved'),
+                                                         _endpoint('in', 'b.example', 'unresolved')]}])
+        self.assertEqual(self._copilot_transfers('bash', ['$r = Invoke-RestMethod https://example.com/api']), [None])
+
+    def test_a_copilot_splat_sends_no_transfer(self):
+        self.assertEqual(self._copilot_transfers('powershell', [
+            '$p = @{Uri="https://example.com/x"; Method="Post"}; Invoke-RestMethod @p']), [None])
 
     def test_a_failed_copilot_call_leaves_the_folder_unknown(self):
         # A command that ran and failed may have stopped anywhere, sent on an earlier Stop or not.

@@ -115,6 +115,8 @@ RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
 SHELL_TOOLS = {'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+
+
 READ_TOOLS = {'read_file', 'readFile', 'view', 'cat'}
 WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
 EDIT_TOOLS = {
@@ -5592,12 +5594,15 @@ def _extract_patch_target_path(args):
 
 # Only these commands are ever run; everything else is refused. DNS is a resolver call, not a command.
 _TRANSFER_ALLOWED_RUNS = (('ssh', '-G'), ('route', '-n', 'get'), ('ip', '-o', 'route', 'get'),
-                          ('powershell', '-NoProfile', '-NonInteractive', '-Command'))
+                          ('powershell', '-NoProfile', '-NonInteractive', '-Command'), ('scutil', '--dns'))
 _TRANSFER_RUN_TIMEOUT = 5
 _TRANSFER_DNS_TIMEOUT = 1.5
 # Wall-clock budget for all lookups in one turn, so a slow lookup never delays the agent.
 _TRANSFER_TURN_BUDGET = 10.0
 _TRANSFER_MAX_ENDPOINTS = 10
+# How many search suffixes a name without a dot is tried with, as many as resolv.conf takes.
+_TRANSFER_MAX_SEARCH_DOMAINS = 6
+_TRANSFER_RESOLV_CONF = '/etc/resolv.conf'
 # How deep substitutions and `sh -c` strings are followed.
 _TRANSFER_MAX_DEPTH = 8
 # How many function calls are followed in one command, so a recursive function stays cheap.
@@ -5622,6 +5627,7 @@ _TRANSFER_WRAPPERS = {
     'command': ('', set(), 0),
     'builtin': ('', set(), 0),
     'nohup': ('', set(), 0),
+    'sshpass': ('fdpP', set(), 0),
 }
 # Reserved words that open, divide or close a compound command.
 _TRANSFER_KEYWORDS = frozenset({'{', '}', 'if', 'then', 'elif', 'else', 'fi', 'while', 'until', 'for', 'select', 'do',
@@ -5634,6 +5640,9 @@ _TRANSFER_SHELLS = frozenset({'sh', 'bash', 'zsh', 'dash', 'ksh', 'ash'})
 _TRANSFER_POWERSHELLS = frozenset({'powershell', 'pwsh'})
 # Set in a command's env by `env -i`: nothing is inherited from the hook's environment.
 _TRANSFER_CLEAN_ENV = '\0clean'
+# The program a PowerShell script block that is only stored is read through, and set in the env of what it runs: where
+# that goes has no direction, as it may never run. A NUL never reaches a real command line, so no command names it.
+_TRANSFER_PS_STORED = '\0stored'
 # Set after eval or source, whose text may set any variable: one not set since then is unknown.
 _TRANSFER_UNKNOWN_ENV = '\0unknown'
 # Set by set -a: '1' on, '' off, and a substitution when it may be either; plain assignments are then exported.
@@ -6797,6 +6806,8 @@ def _transfer_wrapper_option(wrapper: str, token: str, argv: List[str], i: int, 
             if wrapper == 'env' and flag == 'i':
                 env.clear()
                 env[_TRANSFER_CLEAN_ENV] = ''
+            if wrapper == 'sshpass' and flag == 'e':
+                break  # the rest of the word, if any, names the variable holding the password
             if flag in short_flags:
                 name, value = '-' + flag, token[j:]
                 if not value and i < len(argv):
@@ -7612,7 +7623,10 @@ def _transfer_shell_flags(args: List[str]) -> tuple:
 
 
 def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
-    """The command string `sh -c` or `powershell -Command` runs; None for any other command."""
+    """The command string `sh -c` or `powershell -Command` runs, or a stored PowerShell script block; None for any other
+    command."""
+    if program == _TRANSFER_PS_STORED:
+        return _transfer_powershell_text(args[0]) if args else None
     if program in _TRANSFER_SHELLS:
         i, letters = _transfer_shell_flags(args)[:2]
         return args[i] if 'c' in letters and i < len(args) else None
@@ -7620,31 +7634,152 @@ def _transfer_shell_string(program: str, args: List[str]) -> Optional[str]:
         for i, arg in enumerate(args):
             name = arg[1:].lower() if arg[:1] in '-/' else ''
             if name == 'c' or (len(name) >= 3 and 'command'.startswith(name)):
-                return _transfer_hashtables_emptied(' '.join(args[i + 1:]))
+                return _transfer_powershell_text(' '.join(args[i + 1:]))
     return None
 
 
-def _transfer_hashtables_emptied(text: str) -> str:
-    """A PowerShell command with each @{ } hashtable made empty: a ; in one separates its entries, not commands, and
-    what it holds names no host the cmdlet reaches."""
-    out, i, quote = [], 0, None
+# A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it, and
+# the { of a script block it assigns.
+_TRANSFER_PS_ASSIGNMENT = re.compile(
+    r'[ \t]*(?:\[[\w.,\[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)'
+    r'([ \t\r\n]*\{)?')
+# A statement's leading exit, return, throw, break or continue, in any case.
+_TRANSFER_PS_JUMP = re.compile(r'[ \t]*(?:exit|return|throw|break|continue)(?![\w-])', re.IGNORECASE | re.ASCII)
+# A PowerShell variable as written: $name, $scope:name or ${name}.
+_TRANSFER_PS_VARIABLE = re.compile(r'\$(\{[^}]*\}|[\w:?]+)')
+# What follows a variable that is set: = but not ==.
+_TRANSFER_PS_SET = re.compile(r'[ \t]*=(?!=)')
+# An Invoke-Command whose script block runs on another machine: a computer, session, host, VM, container or URI named.
+_TRANSFER_PS_REMOTE = re.compile(r'[\s(]*(?:invoke-command|icm)\s(?:.*\s)?-(?:comp\w*|cn|sess\w*|hostn\w*|vm\w*|'
+                                 r'cont\w*|conn\w*|uri|cu)(?![\w-])', re.IGNORECASE | re.ASCII | re.DOTALL)
+
+
+def _transfer_powershell_text(text: str) -> str:
+    """A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
+    entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
+    as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
+    assigns from is read, in parentheses as well. Its comments are dropped first. A script block a statement assigns is
+    only stored, so it is read apart, where it goes having no direction, unless the command names the variable again, as
+    to run it, and so is one Invoke-Command runs on another machine; a chained `$a = $b =` is dropped whole; and a block
+    may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is still read. A
+    backtick escapes the character after it, outside single quotes."""
+    text = _transfer_ps_uncommented(text)
+    out, i, quote, starts, depth, chain, command = [], 0, None, True, 0, [], 0
     while i < len(text):
+        found = _TRANSFER_PS_ASSIGNMENT.match(text, i) if starts else None
+        jump = _TRANSFER_PS_JUMP.match(text, i) if starts and depth else None
+        starts, assigned, chain = False, chain, []
+        if found and found.group(1):
+            end = _transfer_hashtable_end(text, found.end())
+            if _transfer_ps_named_later(assigned + [found.group(0)], text, end):
+                i = found.end() - 1  # its { is read next, as a block that runs
+            else:
+                out.append(_transfer_ps_stored(text[found.end() - 1:end]))
+                i = end
+            continue
+        if found:
+            # What it assigns from is read, another `$name =` included.
+            i, starts, chain = found.end(), True, assigned + [found.group(0)]
+            continue
+        if jump:
+            i = jump.end()  # what follows it, such as the pipeline a return passes on, still runs
+            continue
         if not quote and text.startswith('@{', i):
             out.append('@{}')
             i = _transfer_hashtable_end(text, i + 2)
             continue
+        if not quote and text.startswith('${', i):
+            end = text.find('}', i) + 1 or len(text)  # a ${name} variable
+            out.append(text[i:end])
+            i = end
+            continue
         ch = text[i]
+        if ch == '`' and quote != "'":
+            # An escaped character is literal, a quote, brace or line end included; written as the shell reader takes
+            # it, behind a backslash where it needs one.
+            escaped = '\n' if text.startswith('`\r\n', i) else text[i + 1:i + 2]
+            out.append('\\' + escaped if escaped and (not quote or escaped in '"$`\\') else escaped)
+            i += 2 + (escaped != text[i + 1:i + 2])
+            continue
+        if not quote and ch == '{' and _TRANSFER_PS_REMOTE.match(text, command, i):
+            end = _transfer_hashtable_end(text, i + 1)
+            out.append('\n' + _transfer_ps_stored(text[i:end]) + '\n')  # it runs on another machine
+            i = end
+            continue
+        if not quote and ch in '{}':
+            out.append('{\n' if ch == '{' else '\n}')
+            depth = depth + 1 if ch == '{' else max(depth - 1, 0)
+            starts, i, command = ch == '{', i + 1, i + 1
+            continue
         quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
+        starts = not quote and ch in ';\n('
+        command = i + 1 if not quote and ch in ';\n|&' else command
         out.append(ch)
         i += 1
     return ''.join(out)
 
 
+def _transfer_ps_stored(block: str) -> str:
+    """A script block that may not run here, read apart through the stored program, quoted for the shell reader."""
+    return _TRANSFER_PS_STORED + " '" + block.replace("'", "'\\''") + "'"
+
+
+def _transfer_ps_uncommented(text: str) -> str:
+    """PowerShell text with each comment made a space: a <# #> block whole and a # to the end of its line, each only
+    where a word starts outside quotes, so a URL's #fragment or a quoted or escaped # stays."""
+    out, i, quote, word = [], 0, None, True
+    while i < len(text):
+        if word and not quote and text.startswith(('<#', '#'), i):
+            block = text.startswith('<#', i)
+            end = text.find('#>', i + 2) if block else text.find('\n', i)
+            i = len(text) if end < 0 else end + 2 if block else end
+            out.append(' ')
+            continue
+        ch = text[i]
+        if ch == '`' and quote != "'":
+            out.append(text[i:i + 2])  # an escaped character is literal
+            i, word = i + 2, False
+            continue
+        quote = (None if ch == quote else quote) if quote else (ch if ch in '\'"' else None)
+        word = not quote and ch in ' \t\r\n;|&(){}'
+        out.append(ch)
+        i += 1
+    return ''.join(out)
+
+
+def _transfer_ps_named_later(assignments: List[str], text: str, end: int) -> bool:
+    """Whether a variable the assignments store a script block in is named again in text from end where PowerShell
+    reads it, unquoted or in double quotes and not escaped, as when the block is run, before it is set again."""
+    names = {_transfer_ps_name(found.group(1)) for found in map(_TRANSFER_PS_VARIABLE.search, assignments) if found}
+    i, quote = end, None
+    while i < len(text):
+        ch = text[i]
+        if ch == '`' and quote != "'":
+            i += 2  # an escaped character is literal
+            continue
+        found = _TRANSFER_PS_VARIABLE.match(text, i) if ch == '$' and quote != "'" else None
+        if found and _transfer_ps_name(found.group(1)) in names:
+            return bool(quote) or not _TRANSFER_PS_SET.match(text, found.end())  # set again, it holds the block no more
+        if ch in '\'"' and quote in (None, ch):
+            quote = None if quote else ch
+        i = found.end() if found else i + 1
+    return False
+
+
+def _transfer_ps_name(written: str) -> str:
+    """A PowerShell variable's name as written after its $, without braces or scope, in lower case."""
+    return (written[1:-1] if written[:1] == '{' else written).rsplit(':', 1)[-1].lower()
+
+
 def _transfer_hashtable_end(text: str, i: int) -> int:
-    """The index after the } that closes a PowerShell @{ whose contents start at i, past quotes and nested braces."""
+    """The index after the } that closes a PowerShell @{ or { whose contents start at i, past quotes and nested
+    braces."""
     depth, quote = 1, None
     while i < len(text) and depth:
         ch = text[i]
+        if ch == '`' and quote != "'":
+            i += 2  # an escaped character is literal
+            continue
         if quote:
             quote = None if ch == quote else quote
         elif ch in '\'"':
@@ -7825,9 +7960,12 @@ def _transfer_simple(words: List[str], before: str, after: str, io: list, shell:
         options = _transfer_shell_flags(args)[2] if program in _TRANSFER_SHELLS else {}
         nested = {k: v for k, v in env.items() if k not in _TRANSFER_SET_OPTIONS.values()}
         nested.update((_TRANSFER_SET_OPTIONS[name], value) for name, value in options.items() if name != 'noexec')
+        if program == _TRANSFER_PS_STORED:
+            nested[_TRANSFER_PS_STORED] = ''
         calls = [] if options.get('noexec') == '1' else _transfer_walk(items, cwd, nested, depth + 1, positional)
-        if options.get('noexec'):
-            _transfer_unsure_calls(calls)  # zsh's spelling of -n, which bash rejects: it may not run them
+        if options.get('noexec') or program == _TRANSFER_PS_STORED:
+            # zsh's spelling of -n, which bash rejects, or a script block only stored: it may not run them.
+            _transfer_unsure_calls(calls)
         calls = [call[:4] + (call[4] or other_user, call[5] + (layer,)) + call[6:] for call in calls]
     else:
         calls = [(program, args, env, cwd, other_user, (layer,), False)] if program else []
@@ -8743,13 +8881,17 @@ def _transfer_ps_parameter(name: str) -> str:
 
 def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) -> List[tuple]:
     """Invoke-WebRequest's or Invoke-RestMethod's URI: sent to with a body, file, form, piped input or sending
-    method; else fetched from. It goes through a proxy with -Proxy, or one the command set unless -NoProxy."""
-    uri, out, positional, proxy, named, i = '', sends, [], None, set(), 0
+    method; else fetched from, unless a splat may hold one, which leaves it unknown. It goes through a proxy with
+    -Proxy, or one the command set unless -NoProxy."""
+    uri, out, positional, proxy, named, splat, i = '', sends, [], None, set(), False, 0
     while i < len(args):
         arg, i = args[i], i + 1
         if arg == '--':
             positional.extend(args[i:])  # PowerShell's end of parameters: every word after it is an argument
             break
+        if arg.startswith('@'):
+            splat = True  # a splatted hashtable or array may bind any parameter not named here
+            continue
         if not re.match(r'^-[A-Za-z]', arg):
             positional.append(arg)
             continue
@@ -8778,8 +8920,8 @@ def _transfer_web_cmdlet(args: List[str], sends: bool, proxied: bool = False) ->
         return []  # -Proxy and -NoProxy, whatever its value, are in different parameter sets: PowerShell rejects them
     uri = uri or (positional[0] if positional else '')
     proxy = proxied if proxy is None else proxy
-    return [('out' if out else 'in', _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri \
-        else []
+    direction = 'out' if out else '' if splat else 'in'  # a splat may hold a body or sending method
+    return [(direction, _transfer_url_host(uri, _TRANSFER_POWERSHELL_SCHEMES), None, None, proxy)] if uri else []
 
 
 def _transfer_stdio(layers: tuple) -> tuple:
@@ -9120,6 +9262,90 @@ def _transfer_addresses(host: str, state: Dict, lookup: bool = True) -> list:
     return state[key]
 
 
+def _transfer_search_domains(state: Dict, stop: float) -> List[str]:
+    """The suffixes this machine's resolver tries after a name without a dot, in order, read once per turn by stop:
+    scutil's on macOS, whose VPN resolvers add their own, resolv.conf's elsewhere and the registry's on Windows; [] when
+    unknown."""
+    if 'search' not in state:
+        state['search'] = []
+        try:
+            if _transfer_platform() == 'windows':
+                found = _transfer_windows_search_domains()
+            elif _transfer_platform() == 'darwin':
+                out = _transfer_run(['scutil', '--dns'], None, state, _transfer_deadline(state) - stop) or ''
+                out = out.split('\nDNS configuration (for scoped')[0]
+                found = re.findall(r'^\s*search domain\[\d+\]\s*:\s*(\S+)', out, re.MULTILINE)
+            else:
+                with open(_TRANSFER_RESOLV_CONF, encoding='utf-8', errors='replace') as config:
+                    lines = [line.split() for line in config.read(64 * 1024).splitlines()]
+                # The last search or domain line wins, as the resolver reads them.
+                found = next((words[1:] for words in reversed(lines) if words[:1] in (['search'], ['domain'])), [])
+            names = [_transfer_clean_host(name.strip('.')) for name in found]
+            state['search'] = list(dict.fromkeys(name for name in names if name))[:_TRANSFER_MAX_SEARCH_DOMAINS]
+        except Exception:
+            pass
+    return state['search']
+
+
+def _transfer_windows_search_domains() -> List[str]:
+    """Windows' suffix search list when one is set, else its primary suffix and then each adapter's own."""
+    import winreg
+    parameters = r'SYSTEM\CurrentControlSet\Services\Tcpip\Parameters'
+
+    def values(path: str, names: tuple) -> List[str]:
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+                found = []
+                for name in names:
+                    try:
+                        found += [v for v in str(winreg.QueryValueEx(key, name)[0]).replace(' ', ',').split(',') if v]
+                    except OSError:
+                        pass
+                return found
+        except OSError:
+            return []
+
+    listed = values(r'SOFTWARE\Policies\Microsoft\Windows NT\DNSClient', ('SearchList',)) or \
+        values(parameters, ('SearchList',))
+    if listed:
+        return listed
+    found = values(r'SOFTWARE\Policies\Microsoft\System\DNSClient', ('PrimaryDnsSuffix',)) or \
+        values(parameters, ('NV Domain', 'Domain'))[:1]
+    try:
+        adapters = parameters + '\\Interfaces'
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, adapters) as interfaces:
+            for n in range(winreg.QueryInfoKey(interfaces)[0]):
+                found += values(adapters + '\\' + winreg.EnumKey(interfaces, n), ('Domain', 'DhcpDomain'))[:1]
+    except OSError:
+        pass
+    return found
+
+
+def _transfer_completed(host: str, addresses: list, state: Dict) -> str:
+    """The full name the resolver completed a name without a dot with: the first search suffix whose name resolves to
+    one of the same addresses, all tried within one DNS timeout; the name itself when none does or it has a dot."""
+    import ipaddress
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+    if '.' in host or not addresses:
+        return host
+    key = ('completed', host)
+    if key not in state:
+        state[key] = host
+        stop = min(time.monotonic() + _TRANSFER_DNS_TIMEOUT, _transfer_deadline(state))
+        for suffix in _transfer_search_domains(state, stop):
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                break
+            if set(_transfer_resolve(host + '.' + suffix, remaining)) & set(addresses):
+                state[key] = host + '.' + suffix
+                break
+    return state[key]
+
+
 def _transfer_address_kind(addresses: list) -> str:
     """public when any address is public, else the first address's kind; unresolved when there is none."""
     kinds = [_transfer_kind(a) for a in addresses]
@@ -9229,6 +9455,9 @@ def _transfer_endpoint(raw: tuple, cwd: Optional[str], state: Dict, lookup: bool
         resolved = host if jumps or failed else resolved or host
         found = [] if failed or jumps else _transfer_addresses(resolved, state, lookup)
     address = _transfer_address_kind(found)
+    # A name without a dot is recorded by the full name the resolver completed it with, unless it is this machine.
+    if lookup and found and not (dial and dial[1]) and address != 'loopback':
+        resolved = _transfer_completed(resolved, found, state)
     endpoint = {'direction': direction, 'host': host, 'resolved_host': resolved, 'address': address,
                 'route': _transfer_route(found, state) if lookup and address in ('private', 'cgnat') else ''}
     return {k: v for k, v in endpoint.items() if v}
@@ -9247,6 +9476,8 @@ def _transfer(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             for raw in (found[1] if found else []):
                 if len(endpoints) >= _TRANSFER_MAX_ENDPOINTS:
                     break
+                if _TRANSFER_PS_STORED in env:
+                    raw = ('',) + tuple(raw[1:])  # a script block only stored may never run: no direction
                 endpoint = _transfer_endpoint(raw, call_cwd, state, sure and not unsure)
                 if endpoint and endpoint not in endpoints:
                     endpoints.append(endpoint)
@@ -9276,6 +9507,12 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
         entry['ts'] = ts
     return entry
 # --- end transfer resolution ---
+
+
+def _runs_powershell(name):
+    """Whether a shell tool's command runs in PowerShell: the CLI's PowerShell tool, and on Windows the editor's
+    terminal tools too, whose terminal is PowerShell there."""
+    return name == 'powershell' or (os.name == 'nt' and name in SHELL_TOOLS and name != 'bash')
 
 
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
@@ -9315,8 +9552,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         candidates = []
         # Where this call's transfer lookups start; only a cd that surely ran moves it for the next call.
         start_dir = shell_state.setdefault('transfer_dir', shell_state.get('dir'))
-        # A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
-        script = _transfer_hashtables_emptied(command) if name == 'powershell' and isinstance(command, str) else command
+        # PowerShell is read in its own shape: a ; inside an @{ } hashtable separates its entries, not commands.
+        script = _transfer_powershell_text(command) if _runs_powershell(name) and isinstance(command, str) else command
         if isinstance(command, str):
             candidates.extend(p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p))
             candidates.extend(_git_path_opt_targets(command, shell_state.get('dir')))
@@ -10017,8 +10254,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 command = (call['arguments'].get('command') or call['arguments'].get('input')
                            or call['arguments'].get('text') or '')
                 if isinstance(command, str):
-                    # Read as map_copilot_tool reads it: a PowerShell tool's ; inside @{ } separates entries.
-                    script = _transfer_hashtables_emptied(command) if call['name'] == 'powershell' else command
+                    # Read as map_copilot_tool reads it, PowerShell in its own shape.
+                    script = _transfer_powershell_text(command) if _runs_powershell(call['name']) else command
                     shell_state.setdefault('transfer_dir', shell_state.get('dir'))
                     shell_state['dir'] = _next_shell_dir(script, shell_state.get('dir'))
                     if ran:

@@ -38,13 +38,15 @@ export interface Transfer {
 /** Only these lookups are ever run; anything else is refused before it starts. DNS is a resolver call. */
 const ALLOWED_RUNS: readonly (readonly string[])[] = [
   ["ssh", "-G"], ["route", "-n", "get"], ["ip", "-o", "route", "get"],
-  ["powershell", "-NoProfile", "-NonInteractive", "-Command"],
+  ["powershell", "-NoProfile", "-NonInteractive", "-Command"], ["scutil", "--dns"],
 ];
 const RUN_TIMEOUT_MS = 5_000;
 const DNS_TIMEOUT_MS = 1_500;
 const TURN_BUDGET_MS = 10_000;
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_ENDPOINTS = 10;
+/** How many search suffixes a name without a dot is tried with, as many as resolv.conf takes. */
+const MAX_SEARCH_DOMAINS = 6;
 /** How deep substitutions and `sh -c` strings are followed. */
 const MAX_DEPTH = 8;
 /** How many function calls are followed in one command, so a recursive function stays cheap. */
@@ -72,6 +74,7 @@ const WRAPPERS: Record<string, { short: string; long: readonly string[]; operand
   command: { short: "", long: [], operands: 0 },
   builtin: { short: "", long: [], operands: 0 },
   nohup: { short: "", long: [], operands: 0 },
+  sshpass: { short: "fdpP", long: [], operands: 0 },
 };
 /** Where `-C`/`--chdir` or `-D` moves a wrapped command. */
 const WRAPPER_CHDIR: Record<string, readonly string[]> = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
@@ -87,6 +90,9 @@ const SHELLS: ReadonlySet<string> = new Set(["sh", "bash", "zsh", "dash", "ksh",
 const POWERSHELLS: ReadonlySet<string> = new Set(["powershell", "pwsh"]);
 /** Set in a command's env by `env -i`: nothing is inherited from the hook's environment. */
 const CLEAN_ENV = "\0clean";
+/** The program a PowerShell script block that is only stored is read through, and set in the env of what it runs: where
+ *  that goes has no direction, as it may never run. A NUL never reaches a real command line, so no command names it. */
+const PS_STORED = "\0stored";
 /** Set after eval or source, whose text may set any variable: one not set since then is unknown. */
 const UNKNOWN_ENV = "\0unknown";
 /** Set by set -a: "1" on, "" off, and a substitution when it may be either; plain assignments are then exported. */
@@ -350,6 +356,8 @@ export interface ResolveOptions {
   platform?: string;
   /** The files whose presence means a container, for a test. */
   containerFiles?: readonly string[];
+  /** Where Linux keeps its resolver's search suffixes, for a test. */
+  resolvConf?: string;
 }
 
 interface State {
@@ -370,6 +378,10 @@ interface State {
   callText: string;
   /** Whether each curl or wget default config read this turn names an unsafe setting, wget's keyed wgetrc:<path>. */
   curlrc: Map<string, boolean>;
+  resolvConf: string;
+  /** The resolver's search suffixes once read, and the full name each name without a dot was completed to. */
+  search?: readonly string[];
+  completed: Map<string, string>;
 }
 
 type Env = Record<string, string>;
@@ -1430,6 +1442,7 @@ function wrapperOption(wrapper: string, token: string, argv: string[], start: nu
     for (let j = 1; j < token.length; j++) {
       const flag = token[j] as string;
       if (wrapper === "env" && flag === "i") out.env = { [CLEAN_ENV]: "" };
+      if (wrapper === "sshpass" && flag === "e") break; // the rest of the word, if any, names the password's variable
       if (!spec.short.includes(flag)) continue;
       name = `-${flag}`;
       value = token.slice(j + 1);
@@ -2365,8 +2378,10 @@ function curlConfig(text: string): string[] {
   return args;
 }
 
-/** The command string `sh -c` or `powershell -Command` runs; undefined for any other command. */
+/** The command string `sh -c` or `powershell -Command` runs, or a stored PowerShell script block; undefined for any
+ *  other command. */
 function shellString(name: string, args: string[]): string | undefined {
+  if (name === PS_STORED) return args[0] === undefined ? undefined : powershellText(args[0]);
   if (SHELLS.has(name)) {
     const [i, letters] = shellFlags(args);
     return letters.has("c") && i < args.length ? args[i] : undefined;
@@ -2375,38 +2390,193 @@ function shellString(name: string, args: string[]): string | undefined {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i] as string;
       const flag = arg.startsWith("-") || arg.startsWith("/") ? arg.slice(1).toLowerCase() : "";
-      if (flag === "c" || (flag.length >= 3 && "command".startsWith(flag))) return hashtablesEmptied(args.slice(i + 1).join(" "));
+      if (flag === "c" || (flag.length >= 3 && "command".startsWith(flag))) return powershellText(args.slice(i + 1).join(" "));
     }
   }
   return undefined;
 }
 
-/** A PowerShell command with each @{ } hashtable made empty: a ; in one separates its entries, not commands, and what
- *  it holds names no host the cmdlet reaches. */
-function hashtablesEmptied(text: string): string {
+/** A PowerShell statement's leading `$name =`, `[type]$scope:name +=` or `$a.b[0] =`, which assigns what follows it, and
+ *  the { of a script block it assigns. */
+const PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
+/** A statement's leading exit, return, throw, break or continue, in any case. */
+const PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
+/** A PowerShell variable as written: $name, $scope:name or ${name}. */
+const PS_VARIABLE = /\$(\{[^}]*\}|[\w:?]+)/g;
+/** What follows a variable that is set: = but not ==. */
+const PS_SET = /[ \t]*=(?!=)/y;
+/** An Invoke-Command whose script block runs on another machine: a computer, session, host, VM, container or URI named. */
+const PS_REMOTE =
+  /[ \t\n\r\f\v(]*(?:invoke-command|icm)[ \t\n\r\f\v](?:.*[ \t\n\r\f\v])?-(?:comp\w*|cn|sess\w*|hostn\w*|vm\w*|cont\w*|conn\w*|uri|cu)(?![\w-])/isy;
+
+/** A PowerShell command as the shell reader reads it: each @{ } hashtable made empty, as a ; in one separates its
+ *  entries and what it holds names no host; each script block's braces on lines of their own, so its statements read
+ *  as commands as they do written over several lines; and a statement's leading `$name =` dropped, so the command it
+ *  assigns from is read, in parentheses as well. Its comments are dropped first. A script block a statement assigns is
+ *  only stored, so it is read apart, where it goes having no direction, unless the command names the variable again, as
+ *  to run it, and so is one Invoke-Command runs on another machine; a chained `$a = $b =` is dropped whole; and a block
+ *  may not run, so an exit, return, throw, break or continue in one is dropped and what follows it is still read. A
+ *  backtick escapes the character after it, outside single quotes. */
+function powershellText(command: string): string {
+  const text = psUncommented(command);
   let out = "";
   let quote: string | undefined;
+  let starts = true;
+  let depth = 0;
+  let chain: string[] = [];
+  let at = 0; // where the command now being read starts
   for (let i = 0; i < text.length; ) {
+    PS_ASSIGNMENT.lastIndex = i;
+    PS_JUMP.lastIndex = i;
+    const found = starts ? PS_ASSIGNMENT.exec(text) : null;
+    const jump = starts && depth > 0 ? PS_JUMP.exec(text) : null;
+    starts = false;
+    const assigned = chain;
+    chain = [];
+    if (found && found[1] !== undefined) {
+      const after = PS_ASSIGNMENT.lastIndex;
+      const end = hashtableEnd(text, after);
+      if (psNamedLater([...assigned, found[0]], text, end)) {
+        i = after - 1; // its { is read next, as a block that runs
+      } else {
+        out += psStored(text.slice(after - 1, end));
+        i = end;
+      }
+      continue;
+    }
+    if (found) {
+      // What it assigns from is read, another `$name =` included.
+      i = PS_ASSIGNMENT.lastIndex;
+      starts = true;
+      chain = [...assigned, found[0]];
+      continue;
+    }
+    if (jump) {
+      i = PS_JUMP.lastIndex; // what follows it, such as the pipeline a return passes on, still runs
+      continue;
+    }
     if (quote === undefined && text.startsWith("@{", i)) {
       out += "@{}";
       i = hashtableEnd(text, i + 2);
       continue;
     }
+    if (quote === undefined && text.startsWith("${", i)) {
+      const end = text.indexOf("}", i) + 1 || text.length; // a ${name} variable
+      out += text.slice(i, end);
+      i = end;
+      continue;
+    }
     const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      // An escaped character is literal, a quote, brace or line end included; written as the shell reader takes it,
+      // behind a backslash where it needs one.
+      const next = text.slice(i + 1, i + 2);
+      const escaped = text.startsWith("`\r\n", i) ? "\n" : next;
+      out += escaped !== "" && (quote === undefined || '"$`\\'.includes(escaped)) ? "\\" + escaped : escaped;
+      i += escaped === next ? 2 : 3;
+      continue;
+    }
+    if (quote === undefined && ch === "{") {
+      PS_REMOTE.lastIndex = at;
+      if (PS_REMOTE.test(text.slice(0, i))) {
+        const end = hashtableEnd(text, i + 1);
+        out += "\n" + psStored(text.slice(i, end)) + "\n"; // it runs on another machine
+        i = end;
+        continue;
+      }
+    }
+    if (quote === undefined && (ch === "{" || ch === "}")) {
+      out += ch === "{" ? "{\n" : "\n}";
+      depth = ch === "{" ? depth + 1 : Math.max(depth - 1, 0);
+      starts = ch === "{";
+      i++;
+      at = i;
+      continue;
+    }
     quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
+    starts = quote === undefined && (ch === ";" || ch === "\n" || ch === "(");
+    if (quote === undefined && ";\n|&".includes(ch)) at = i + 1;
     out += ch;
     i++;
   }
   return out;
 }
 
-/** The index after the } that closes a PowerShell @{ whose contents start at `start`, past quotes and nested braces. */
+/** A script block that may not run here, read apart through the stored program, quoted for the shell reader. */
+function psStored(block: string): string {
+  return `${PS_STORED} '${block.replace(/'/g, "'\\''")}'`;
+}
+
+/** PowerShell text with each comment made a space: a <# #> block whole and a # to the end of its line, each only where
+ *  a word starts outside quotes, so a URL's #fragment or a quoted or escaped # stays. */
+function psUncommented(text: string): string {
+  let out = "";
+  let quote: string | undefined;
+  let word = true;
+  for (let i = 0; i < text.length; ) {
+    if (word && quote === undefined && (text.startsWith("<#", i) || text[i] === "#")) {
+      const block = text.startsWith("<#", i);
+      const end = block ? text.indexOf("#>", i + 2) : text.indexOf("\n", i);
+      i = end < 0 ? text.length : block ? end + 2 : end;
+      out += " ";
+      continue;
+    }
+    const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      out += text.slice(i, i + 2); // an escaped character is literal
+      i += 2;
+      word = false;
+      continue;
+    }
+    quote = quote !== undefined ? (ch === quote ? undefined : quote) : ch === "'" || ch === '"' ? ch : undefined;
+    word = quote === undefined && " \t\r\n;|&(){}".includes(ch);
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+/** Whether a variable the assignments store a script block in is named again in text from end where PowerShell reads
+ *  it, unquoted or in double quotes and not escaped, as when the block is run, before it is set again. */
+function psNamedLater(assignments: string[], text: string, end: number): boolean {
+  const names = new Set(assignments.flatMap((a) => [...a.matchAll(PS_VARIABLE)].slice(0, 1).map((m) => psName(m[1] as string))));
+  const variable = new RegExp(PS_VARIABLE.source, "y");
+  let quote: string | undefined;
+  for (let i = end; i < text.length; ) {
+    const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      i += 2; // an escaped character is literal
+      continue;
+    }
+    variable.lastIndex = i;
+    const found = ch === "$" && quote !== "'" ? variable.exec(text) : null;
+    if (found && names.has(psName(found[1] as string))) {
+      PS_SET.lastIndex = variable.lastIndex;
+      return quote !== undefined || !PS_SET.test(text); // set again, it holds the block no more
+    }
+    if ((ch === "'" || ch === '"') && (quote === undefined || quote === ch)) quote = quote === undefined ? ch : undefined;
+    i = found ? variable.lastIndex : i + 1;
+  }
+  return false;
+}
+
+/** A PowerShell variable's name as written after its $, without braces or scope, in lower case. */
+function psName(written: string): string {
+  return ((written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop() as string).toLowerCase();
+}
+
+/** The index after the } that closes a PowerShell @{ or { whose contents start at `start`, past quotes and nested
+ *  braces. */
 function hashtableEnd(text: string, start: number): number {
   let depth = 1;
   let quote: string | undefined;
   let i = start;
   for (; i < text.length && depth > 0; i++) {
     const ch = text[i] as string;
+    if (ch === "`" && quote !== "'") {
+      i++; // an escaped character is literal
+      continue;
+    }
     if (quote !== undefined) {
       if (ch === quote) quote = undefined;
     } else if (ch === "'" || ch === '"') {
@@ -2596,10 +2766,11 @@ function simple(words: string[], item: Item, before: string, shell: Shell, depth
     for (const [option, value] of Object.entries(options)) {
       if (option !== "noexec") nested[SET_OPTIONS[option] as string] = value;
     }
+    if (name === PS_STORED) nested[PS_STORED] = "";
     const items = script === undefined ? read : scriptStdin(inner, lexer, read);
     const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
-    // zsh's spelling of -n, which bash rejects: it may not run them.
-    if (options.noexec !== undefined && options.noexec !== "") markUnsure(calls);
+    // zsh's spelling of -n, which bash rejects, or a script block only stored: it may not run them.
+    if ((options.noexec !== undefined && options.noexec !== "") || name === PS_STORED) markUnsure(calls);
     return maybeShadowed(known, replaced(argv, subshell, shell, calls.map((call) => ({
       ...call,
       otherUser: call.otherUser || parsed.otherUser,
@@ -3577,12 +3748,17 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   let uri = "";
   let out = sends;
   let proxy: boolean | undefined;
+  let splat = false;
   const positional: string[] = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++] as string;
     if (arg === "--") {
       positional.push(...args.slice(i)); // PowerShell's end of parameters: every word after it is an argument
       break;
+    }
+    if (arg.startsWith("@")) {
+      splat = true; // a splatted hashtable or array may bind any parameter not named here
+      continue;
     }
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
@@ -3610,8 +3786,9 @@ function webCmdlet(args: string[], sends: boolean, proxied = false): Raw[] {
   // -Proxy and -NoProxy, whatever its value, are in different parameter sets: PowerShell rejects them.
   if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
+  const direction = out ? "out" : splat ? "" : "in"; // a splat may hold a body or sending method
   // It goes through a proxy with -Proxy, or one the command set unless -NoProxy.
-  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), undefined, undefined, proxy ?? proxied]] : [];
+  return uri ? [[direction, urlHost(uri, POWERSHELL_SCHEMES), undefined, undefined, proxy ?? proxied]] : [];
 }
 
 /** Whether a call's stdin is fed from a file or pipe, and whether its stdout goes to one, from the pipes and
@@ -4040,6 +4217,63 @@ async function addresses(host: string, state: State, lookup = true): Promise<rea
   return found;
 }
 
+/** Windows' suffix search list when one is set, else its primary suffix and then each adapter's own, one per line. */
+const WINDOWS_SEARCH = [
+  "$p = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters'",
+  "function v($k, $n) { (Get-ItemProperty -LiteralPath $k -Name $n -ErrorAction SilentlyContinue).$n }",
+  "$l = @((v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient' 'SearchList'), (v $p 'SearchList')) | ? { $_ } | select -First 1",
+  "if ($l) { $l -split '[ ,]' } else { $d = v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\System\\DNSClient' 'PrimaryDnsSuffix'",
+  "if (-not $d) { $d = @((v $p 'NV Domain'), (v $p 'Domain')) | ? { $_ } | select -First 1 }; $d",
+  "Get-ChildItem -LiteralPath \"$p\\Interfaces\" -ErrorAction SilentlyContinue | % { @((v $_.PSPath 'Domain'), (v $_.PSPath 'DhcpDomain')) | ? { $_ } | select -First 1 } }",
+].join("; ");
+
+/** The suffixes this machine's resolver tries after a name without a dot, in order, read once per turn by `stop`:
+ *  scutil's on macOS, whose VPN resolvers add their own, resolv.conf's elsewhere and the registry's on Windows; []
+ *  when unknown. */
+async function searchDomains(state: State, stop: number): Promise<readonly string[]> {
+  if (state.search !== undefined) return state.search;
+  state.search = [];
+  try {
+    let found: string[];
+    if (state.platform === "win32") {
+      found = ((await run(["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SEARCH], state, state.deadline - stop)) ?? "")
+        .split(/[\s,]+/);
+    } else if (state.platform === "darwin") {
+      const out = ((await run(["scutil", "--dns"], state, state.deadline - stop)) ?? "").split("\nDNS configuration (for scoped")[0] ?? "";
+      found = [...out.matchAll(/^\s*search domain\[\d+\]\s*:\s*(\S+)/gm)].map((match) => match[1] as string);
+    } else {
+      const lines = readFileSync(state.resolvConf, "utf8").slice(0, 64 * 1024).split("\n").map((line) => line.trim().split(/\s+/));
+      // The last search or domain line wins, as the resolver reads them.
+      found = lines.reverse().find((words) => words[0] === "search" || words[0] === "domain")?.slice(1) ?? [];
+    }
+    const names = found.map((name) => cleanHost(name.replace(/^\.+|\.+$/g, ""))).filter((name) => name !== "");
+    state.search = [...new Set(names)].slice(0, MAX_SEARCH_DOMAINS);
+  } catch {
+    // Unknown suffixes leave every name as written.
+  }
+  return state.search;
+}
+
+/** The full name the resolver completed a name without a dot with: the first search suffix whose name resolves to one
+ *  of the same addresses, all tried within one DNS timeout; the name itself when none does or it has a dot. */
+async function completed(host: string, found: readonly string[], state: State): Promise<string> {
+  if (isIP(host) !== 0 || host.includes(".") || found.length === 0) return host;
+  const known = state.completed.get(host);
+  if (known !== undefined) return known;
+  state.completed.set(host, host);
+  const stop = Math.min(state.now() + DNS_TIMEOUT_MS, state.deadline);
+  for (const suffix of await searchDomains(state, stop)) {
+    const remaining = stop - state.now();
+    if (remaining <= 0) break;
+    const answer = await resolveAddresses(`${host}.${suffix}`, remaining, state);
+    if (answer.some((a) => found.some((b) => sameAddress(a, b)))) {
+      state.completed.set(host, `${host}.${suffix}`);
+      break;
+    }
+  }
+  return state.completed.get(host) ?? host;
+}
+
 /** public when any address is public, else the first address's kind; unresolved when there is none. */
 function addressKind(found: readonly string[]): AddressKind {
   const kinds = found.map(kindOf);
@@ -4146,6 +4380,10 @@ async function endpoint(raw: Raw, cwd: string | undefined, state: State, sure = 
     if (!(failed || jumps)) found = await addresses(resolved, state, lookup);
   }
   const kind = addressKind(found);
+  // A name without a dot is recorded by the full name the resolver completed it with, unless it is this machine.
+  if (lookup && found.length > 0 && !(dial !== undefined && dial[1].length > 0) && kind !== "loopback") {
+    resolved = await completed(resolved, found, state);
+  }
   const via = lookup && (kind === "private" || kind === "cgnat") ? await route(found, state) : undefined;
   const out: TransferEndpoint = { host, resolved_host: resolved, address: kind, ...(via === undefined ? {} : { route: via }) };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
@@ -4168,7 +4406,9 @@ async function transferOf(
     const found = parse(call, state.env, state);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
+      // A script block only stored may never run: no direction.
+      const read: Raw = PS_STORED in call.env ? ["", raw[1], raw[2], raw[3], raw[4]] : raw;
+      const one = await endpoint(read, call.cwd, state, sure && call.unsure !== true);
       if (one !== undefined && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];
@@ -4231,6 +4471,8 @@ export async function resolveTransfers(
       }).join("\n"),
       callText: "",
       curlrc: new Map(),
+      resolvConf: opts.resolvConf ?? "/etc/resolv.conf",
+      completed: new Map(),
     };
     for (const call of calls) {
       const input = call.tool_input;
@@ -4240,8 +4482,8 @@ export async function resolveTransfers(
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if ((typeof call.decision === "string" && NEVER_RAN.has(call.decision)) || call.ran === false) continue;
       if (typeof command !== "string" || command.trim() === "" || typeof call.tool_use_id !== "string") continue;
-      // A PowerShell tool's ; inside an @{ } hashtable separates its entries, not commands.
-      const script = call.tool_name === "powershell" ? hashtablesEmptied(command) : command;
+      // A PowerShell tool's command is read in PowerShell's own shape.
+      const script = call.tool_name === "powershell" ? powershellText(command) : command;
       const transfer = await transferOf(script, cwd, state, call.ran !== "maybe");
       if (transfer !== undefined) transfers.set(call.tool_use_id, transfer);
     }

@@ -1887,13 +1887,15 @@ var ALLOWED_RUNS = [
   ["ssh", "-G"],
   ["route", "-n", "get"],
   ["ip", "-o", "route", "get"],
-  ["powershell", "-NoProfile", "-NonInteractive", "-Command"]
+  ["powershell", "-NoProfile", "-NonInteractive", "-Command"],
+  ["scutil", "--dns"]
 ];
 var RUN_TIMEOUT_MS = 5e3;
 var DNS_TIMEOUT_MS = 1500;
 var TURN_BUDGET_MS = 1e4;
 var MAX_OUTPUT_BYTES = 64 * 1024;
 var MAX_ENDPOINTS = 10;
+var MAX_SEARCH_DOMAINS = 6;
 var MAX_DEPTH = 8;
 var MAX_CALLS = 32;
 var MAX_WORDS = 64;
@@ -1915,7 +1917,8 @@ var WRAPPERS = {
   exec: { short: "a", long: [], operands: 0 },
   command: { short: "", long: [], operands: 0 },
   builtin: { short: "", long: [], operands: 0 },
-  nohup: { short: "", long: [], operands: 0 }
+  nohup: { short: "", long: [], operands: 0 },
+  sshpass: { short: "fdpP", long: [], operands: 0 }
 };
 var WRAPPER_CHDIR = { env: ["-C", "--chdir"], sudo: ["-D", "--chdir"] };
 var KEYWORDS = new Set(
@@ -1927,6 +1930,7 @@ var DECLARES = ["declare", "typeset", "local", "readonly"];
 var SHELLS = /* @__PURE__ */ new Set(["sh", "bash", "zsh", "dash", "ksh", "ash"]);
 var POWERSHELLS = /* @__PURE__ */ new Set(["powershell", "pwsh"]);
 var CLEAN_ENV = "\0clean";
+var PS_STORED = "\0stored";
 var UNKNOWN_ENV = "\0unknown";
 var ALLEXPORT = "\0allexport";
 var ERREXIT = "\0errexit";
@@ -3127,6 +3131,7 @@ function wrapperOption(wrapper, token, argv, start, out) {
     for (let j = 1; j < token.length; j++) {
       const flag = token[j];
       if (wrapper === "env" && flag === "i") out.env = { [CLEAN_ENV]: "" };
+      if (wrapper === "sshpass" && flag === "e") break;
       if (!spec.short.includes(flag)) continue;
       name = `-${flag}`;
       value = token.slice(j + 1);
@@ -3783,6 +3788,7 @@ function curlConfig(text) {
   return args;
 }
 function shellString(name, args) {
+  if (name === PS_STORED) return args[0] === void 0 ? void 0 : powershellText(args[0]);
   if (SHELLS.has(name)) {
     const [i, letters] = shellFlags(args);
     return letters.has("c") && i < args.length ? args[i] : void 0;
@@ -3791,26 +3797,149 @@ function shellString(name, args) {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i];
       const flag = arg.startsWith("-") || arg.startsWith("/") ? arg.slice(1).toLowerCase() : "";
-      if (flag === "c" || flag.length >= 3 && "command".startsWith(flag)) return hashtablesEmptied(args.slice(i + 1).join(" "));
+      if (flag === "c" || flag.length >= 3 && "command".startsWith(flag)) return powershellText(args.slice(i + 1).join(" "));
     }
   }
   return void 0;
 }
-function hashtablesEmptied(text) {
+var PS_ASSIGNMENT = /[ \t]*(?:\[[\w.,[\] ]*\][ \t]*)*\$(?:\{[^}]*\}|[\w:?]+)(?:\.\w+|\[[^\]]*\])*[ \t]*(?:[-+*/%]|\?\?)?=(?!=)([ \t\r\n]*\{)?/y;
+var PS_JUMP = /[ \t]*(?:exit|return|throw|break|continue)(?![\w-])/iy;
+var PS_VARIABLE = /\$(\{[^}]*\}|[\w:?]+)/g;
+var PS_SET = /[ \t]*=(?!=)/y;
+var PS_REMOTE = /[ \t\n\r\f\v(]*(?:invoke-command|icm)[ \t\n\r\f\v](?:.*[ \t\n\r\f\v])?-(?:comp\w*|cn|sess\w*|hostn\w*|vm\w*|cont\w*|conn\w*|uri|cu)(?![\w-])/isy;
+function powershellText(command2) {
+  const text = psUncommented(command2);
   let out = "";
   let quote;
+  let starts = true;
+  let depth = 0;
+  let chain = [];
+  let at = 0;
   for (let i = 0; i < text.length; ) {
+    PS_ASSIGNMENT.lastIndex = i;
+    PS_JUMP.lastIndex = i;
+    const found = starts ? PS_ASSIGNMENT.exec(text) : null;
+    const jump2 = starts && depth > 0 ? PS_JUMP.exec(text) : null;
+    starts = false;
+    const assigned = chain;
+    chain = [];
+    if (found && found[1] !== void 0) {
+      const after = PS_ASSIGNMENT.lastIndex;
+      const end2 = hashtableEnd(text, after);
+      if (psNamedLater([...assigned, found[0]], text, end2)) {
+        i = after - 1;
+      } else {
+        out += psStored(text.slice(after - 1, end2));
+        i = end2;
+      }
+      continue;
+    }
+    if (found) {
+      i = PS_ASSIGNMENT.lastIndex;
+      starts = true;
+      chain = [...assigned, found[0]];
+      continue;
+    }
+    if (jump2) {
+      i = PS_JUMP.lastIndex;
+      continue;
+    }
     if (quote === void 0 && text.startsWith("@{", i)) {
       out += "@{}";
       i = hashtableEnd(text, i + 2);
       continue;
     }
+    if (quote === void 0 && text.startsWith("${", i)) {
+      const end2 = text.indexOf("}", i) + 1 || text.length;
+      out += text.slice(i, end2);
+      i = end2;
+      continue;
+    }
     const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      const next = text.slice(i + 1, i + 2);
+      const escaped = text.startsWith("`\r\n", i) ? "\n" : next;
+      out += escaped !== "" && (quote === void 0 || '"$`\\'.includes(escaped)) ? "\\" + escaped : escaped;
+      i += escaped === next ? 2 : 3;
+      continue;
+    }
+    if (quote === void 0 && ch === "{") {
+      PS_REMOTE.lastIndex = at;
+      if (PS_REMOTE.test(text.slice(0, i))) {
+        const end2 = hashtableEnd(text, i + 1);
+        out += "\n" + psStored(text.slice(i, end2)) + "\n";
+        i = end2;
+        continue;
+      }
+    }
+    if (quote === void 0 && (ch === "{" || ch === "}")) {
+      out += ch === "{" ? "{\n" : "\n}";
+      depth = ch === "{" ? depth + 1 : Math.max(depth - 1, 0);
+      starts = ch === "{";
+      i++;
+      at = i;
+      continue;
+    }
     quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
+    starts = quote === void 0 && (ch === ";" || ch === "\n" || ch === "(");
+    if (quote === void 0 && ";\n|&".includes(ch)) at = i + 1;
     out += ch;
     i++;
   }
   return out;
+}
+function psStored(block) {
+  return `${PS_STORED} '${block.replace(/'/g, "'\\''")}'`;
+}
+function psUncommented(text) {
+  let out = "";
+  let quote;
+  let word = true;
+  for (let i = 0; i < text.length; ) {
+    if (word && quote === void 0 && (text.startsWith("<#", i) || text[i] === "#")) {
+      const block = text.startsWith("<#", i);
+      const end2 = block ? text.indexOf("#>", i + 2) : text.indexOf("\n", i);
+      i = end2 < 0 ? text.length : block ? end2 + 2 : end2;
+      out += " ";
+      continue;
+    }
+    const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      out += text.slice(i, i + 2);
+      i += 2;
+      word = false;
+      continue;
+    }
+    quote = quote !== void 0 ? ch === quote ? void 0 : quote : ch === "'" || ch === '"' ? ch : void 0;
+    word = quote === void 0 && " 	\r\n;|&(){}".includes(ch);
+    out += ch;
+    i++;
+  }
+  return out;
+}
+function psNamedLater(assignments, text, end2) {
+  const names = new Set(assignments.flatMap((a) => [...a.matchAll(PS_VARIABLE)].slice(0, 1).map((m) => psName(m[1]))));
+  const variable2 = new RegExp(PS_VARIABLE.source, "y");
+  let quote;
+  for (let i = end2; i < text.length; ) {
+    const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      i += 2;
+      continue;
+    }
+    variable2.lastIndex = i;
+    const found = ch === "$" && quote !== "'" ? variable2.exec(text) : null;
+    if (found && names.has(psName(found[1]))) {
+      PS_SET.lastIndex = variable2.lastIndex;
+      return quote !== void 0 || !PS_SET.test(text);
+    }
+    if ((ch === "'" || ch === '"') && (quote === void 0 || quote === ch)) quote = quote === void 0 ? ch : void 0;
+    i = found ? variable2.lastIndex : i + 1;
+  }
+  return false;
+}
+function psName(written) {
+  return (written.startsWith("{") ? written.slice(1, -1) : written).split(":").pop().toLowerCase();
 }
 function hashtableEnd(text, start) {
   let depth = 1;
@@ -3818,6 +3947,10 @@ function hashtableEnd(text, start) {
   let i = start;
   for (; i < text.length && depth > 0; i++) {
     const ch = text[i];
+    if (ch === "`" && quote !== "'") {
+      i++;
+      continue;
+    }
     if (quote !== void 0) {
       if (ch === quote) quote = void 0;
     } else if (ch === "'" || ch === '"') {
@@ -3974,9 +4107,10 @@ function simple(words2, item, before, shell, depth) {
     for (const [option, value] of Object.entries(options)) {
       if (option !== "noexec") nested[SET_OPTIONS[option]] = value;
     }
+    if (name === PS_STORED) nested[PS_STORED] = "";
     const items = script === void 0 ? read : scriptStdin(inner, lexer, read);
     const calls = options.noexec === "1" ? [] : walk(items, parsed.cwd, nested, shell.processEnv, depth + 1, positional);
-    if (options.noexec !== void 0 && options.noexec !== "") markUnsure(calls);
+    if (options.noexec !== void 0 && options.noexec !== "" || name === PS_STORED) markUnsure(calls);
     return maybeShadowed(known, replaced(argv, subshell, shell, calls.map((call2) => ({
       ...call2,
       otherUser: call2.otherUser || parsed.otherUser,
@@ -4777,12 +4911,17 @@ function webCmdlet(args, sends, proxied = false) {
   let uri = "";
   let out = sends;
   let proxy;
+  let splat = false;
   const positional = [];
   for (let i = 0; i < args.length; ) {
     const arg = args[i++];
     if (arg === "--") {
       positional.push(...args.slice(i));
       break;
+    }
+    if (arg.startsWith("@")) {
+      splat = true;
+      continue;
     }
     if (!/^-[A-Za-z]/.test(arg)) {
       positional.push(arg);
@@ -4807,7 +4946,8 @@ function webCmdlet(args, sends, proxied = false) {
   }
   if (named.size === 2) return [];
   uri ||= positional[0] ?? "";
-  return uri ? [[out ? "out" : "in", urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
+  const direction = out ? "out" : splat ? "" : "in";
+  return uri ? [[direction, urlHost(uri, POWERSHELL_SCHEMES), void 0, void 0, proxy ?? proxied]] : [];
 }
 function stdio(layers) {
   const fds = /* @__PURE__ */ new Map([[0, "null"], [1, "null"], [2, "null"]]);
@@ -5160,6 +5300,51 @@ async function addresses(host, state, lookup = true) {
   state.addresses.set(host, found);
   return found;
 }
+var WINDOWS_SEARCH = [
+  "$p = 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters'",
+  "function v($k, $n) { (Get-ItemProperty -LiteralPath $k -Name $n -ErrorAction SilentlyContinue).$n }",
+  "$l = @((v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows NT\\DNSClient' 'SearchList'), (v $p 'SearchList')) | ? { $_ } | select -First 1",
+  "if ($l) { $l -split '[ ,]' } else { $d = v 'HKLM:\\SOFTWARE\\Policies\\Microsoft\\System\\DNSClient' 'PrimaryDnsSuffix'",
+  "if (-not $d) { $d = @((v $p 'NV Domain'), (v $p 'Domain')) | ? { $_ } | select -First 1 }; $d",
+  `Get-ChildItem -LiteralPath "$p\\Interfaces" -ErrorAction SilentlyContinue | % { @((v $_.PSPath 'Domain'), (v $_.PSPath 'DhcpDomain')) | ? { $_ } | select -First 1 } }`
+].join("; ");
+async function searchDomains(state, stop) {
+  if (state.search !== void 0) return state.search;
+  state.search = [];
+  try {
+    let found;
+    if (state.platform === "win32") {
+      found = (await run(["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_SEARCH], state, state.deadline - stop) ?? "").split(/[\s,]+/);
+    } else if (state.platform === "darwin") {
+      const out = (await run(["scutil", "--dns"], state, state.deadline - stop) ?? "").split("\nDNS configuration (for scoped")[0] ?? "";
+      found = [...out.matchAll(/^\s*search domain\[\d+\]\s*:\s*(\S+)/gm)].map((match) => match[1]);
+    } else {
+      const lines = readFileSync3(state.resolvConf, "utf8").slice(0, 64 * 1024).split("\n").map((line) => line.trim().split(/\s+/));
+      found = lines.reverse().find((words2) => words2[0] === "search" || words2[0] === "domain")?.slice(1) ?? [];
+    }
+    const names = found.map((name) => cleanHost(name.replace(/^\.+|\.+$/g, ""))).filter((name) => name !== "");
+    state.search = [...new Set(names)].slice(0, MAX_SEARCH_DOMAINS);
+  } catch {
+  }
+  return state.search;
+}
+async function completed(host, found, state) {
+  if (isIP(host) !== 0 || host.includes(".") || found.length === 0) return host;
+  const known = state.completed.get(host);
+  if (known !== void 0) return known;
+  state.completed.set(host, host);
+  const stop = Math.min(state.now() + DNS_TIMEOUT_MS, state.deadline);
+  for (const suffix of await searchDomains(state, stop)) {
+    const remaining = stop - state.now();
+    if (remaining <= 0) break;
+    const answer = await resolveAddresses(`${host}.${suffix}`, remaining, state);
+    if (answer.some((a) => found.some((b) => sameAddress(a, b)))) {
+      state.completed.set(host, `${host}.${suffix}`);
+      break;
+    }
+  }
+  return state.completed.get(host) ?? host;
+}
 function addressKind(found) {
   const kinds = found.map(kindOf);
   return kinds.length === 0 ? "unresolved" : kinds.includes("public") ? "public" : kinds[0];
@@ -5248,6 +5433,9 @@ async function endpoint(raw, cwd, state, sure = true) {
     if (!(failed || jumps)) found = await addresses(resolved, state, lookup);
   }
   const kind = addressKind(found);
+  if (lookup && found.length > 0 && !(dial !== void 0 && dial[1].length > 0) && kind !== "loopback") {
+    resolved = await completed(resolved, found, state);
+  }
   const via = lookup && (kind === "private" || kind === "cgnat") ? await route(found, state) : void 0;
   const out = { host, resolved_host: resolved, address: kind, ...via === void 0 ? {} : { route: via } };
   return direction === "out" || direction === "in" ? { direction, ...out } : out;
@@ -5266,7 +5454,8 @@ async function transferOf(command2, cwd, state, sure = true) {
     const found = parse(call, state.env, state);
     for (const raw of found?.[1] ?? []) {
       if (endpoints.length >= MAX_ENDPOINTS) break;
-      const one = await endpoint(raw, call.cwd, state, sure && call.unsure !== true);
+      const read = PS_STORED in call.env ? ["", raw[1], raw[2], raw[3], raw[4]] : raw;
+      const one = await endpoint(read, call.cwd, state, sure && call.unsure !== true);
       if (one !== void 0 && !endpoints.some((e) => JSON.stringify(e) === JSON.stringify(one))) {
         endpoints.push(one);
         tool ??= found?.[0];
@@ -5308,7 +5497,9 @@ async function resolveTransfers(calls, cwd, opts = {}) {
         }
       }).join("\n"),
       callText: "",
-      curlrc: /* @__PURE__ */ new Map()
+      curlrc: /* @__PURE__ */ new Map(),
+      resolvConf: opts.resolvConf ?? "/etc/resolv.conf",
+      completed: /* @__PURE__ */ new Map()
     };
     for (const call of calls) {
       const input = call.tool_input;
@@ -5316,7 +5507,7 @@ async function resolveTransfers(calls, cwd, opts = {}) {
       if (typeof call.tool_name !== "string" || !SHELL_TOOLS.has(call.tool_name)) continue;
       if (typeof call.decision === "string" && NEVER_RAN.has(call.decision) || call.ran === false) continue;
       if (typeof command2 !== "string" || command2.trim() === "" || typeof call.tool_use_id !== "string") continue;
-      const script = call.tool_name === "powershell" ? hashtablesEmptied(command2) : command2;
+      const script = call.tool_name === "powershell" ? powershellText(command2) : command2;
       const transfer = await transferOf(script, cwd, state, call.ran !== "maybe");
       if (transfer !== void 0) transfers.set(call.tool_use_id, transfer);
     }

@@ -9794,6 +9794,696 @@
      }
     ]
    }
+  },
+  {
+   "command": "sshpass -p hunter2 scp build.zip prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -phunter2 rsync -a ./dist prod:/srv",
+   "transfer": {
+    "tool": "rsync",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -e ssh prod \"tar x -C /srv\" < site.tar",
+   "transfer": {
+    "tool": "ssh",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -ep scp prod:/var/log/app.log .",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -v -f ~/.pw -P assword: sftp prod:/etc/hosts ./hosts",
+   "transfer": {
+    "tool": "sftp",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -d3 scp build.zip example.com:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "timeout 30 sshpass -p hunter2 -- scp build.zip prod:/srv",
+   "transfer": {
+    "tool": "scp",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "prod",
+      "resolved_host": "10.0.4.12",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "sshpass -p hunter2 ls /srv",
+   "transfer": null
+  },
+  {
+   "command": "powershell -NoProfile -Command \"$r = Invoke-RestMethod -Uri https://example.com/api -Method Post -Body $b; $r.id\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "pwsh -c 'try { iwr https://files.acme-infra.net/a.zip -OutFile a.zip } catch { exit 1 } finally { Write-Host done }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'Get-ChildItem *.zip | ForEach-Object { iwr https://example.com/up -InFile $_.FullName -Method Put }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '[string]$global:page = irm https://example.com/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'Invoke-RestMethod -Headers @{A=\"x\"; B=\"y\"} -Uri https://example.com/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$p = @{Uri=\"https://example.com/x\"}; Invoke-RestMethod @p'",
+   "transfer": null
+  },
+  {
+   "command": "powershell -Command 'Write-Host \"${env:TEMP}\"; if ($ok) { irm https://example.com/x }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$callback = { irm https://example.com/upload -InFile secret.txt }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '[scriptblock]$script:send = {\n  iwr https://files.acme-infra.net/up -InFile a.zip -Method Put\n}\nirm https://example.com/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "unresolved"
+     },
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'try { irm https://example.com/x } catch { exit 1 }; irm https://files.acme-infra.net/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'try { irm https://example.com/x } catch { Write-Error $_; EXIT 1 } finally { Write-Host done }; irm https://files.acme-infra.net/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'if ($ok) { irm https://example.com/x } else { exit }; irm https://files.acme-infra.net/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'function Send-Dump { return irm https://example.com/up -Method Post -Body $b }; Send-Dump'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '($resp = Invoke-RestMethod -Uri https://example.com/api -Method Post -Body $b).id'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '($r = irm https://example.com/api).Content'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$x=@{}; Invoke-RestMethod -Uri https://example.com/up -Method Post -InFile .env @x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'Invoke-RestMethod https://example.com/api @headers'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$sb = { iwr https://example.com/x -OutFile x }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'Start-Job -ScriptBlock { iwr https://example.com/x -OutFile x }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'if ($ok) { irm https://example.com/x } else { irm https://files.acme-infra.net/x }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     },
+     {
+      "direction": "in",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'irm https://example.com/x  # later: { irm https://files.acme-infra.net/y -InFile s }'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '<# old: { irm https://files.acme-infra.net/y -InFile s } #> irm https://example.com/x'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command 'irm https://example.com/x#frag'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$cb = { irm https://example.com/up -InFile s }; & $cb'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$Upload = { irm https://example.com/up -InFile s }; . $upload'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$script:cb = { irm https://example.com/up -InFile s }; $cb.Invoke()'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '${cb} = { irm https://example.com/up -InFile s }; Invoke-Command -ScriptBlock $cb'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$cb = { irm https://example.com/up -InFile s }; Start-Job -ScriptBlock $cb'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command '$cb = { irm https://example.com/up -InFile s }; Write-Host $cbx'",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; Write-Host '\\$cb'\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; Write-Host \\\"cost is \\`\\$cb\\\"\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; \\$cb = \\\"plain\\\"; Write-Host \\$cb\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; \\$cb = { irm https://files.acme-infra.net/up -InFile b }; & \\$cb\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     },
+     {
+      "direction": "out",
+      "host": "files.acme-infra.net",
+      "resolved_host": "files.acme-infra.net",
+      "address": "private"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$cb = { irm https://example.com/up -InFile s }; Invoke-Expression \\\"& \\$cb\\\"\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Invoke-Command -ComputerName srv1 -ScriptBlock { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Invoke-Command -Session \\$s { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Invoke-Command -ScriptBlock { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$a = \\$b = irm https://example.com/x\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "in",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$a = \\$b = { irm https://example.com/up -InFile s }\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "unresolved"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"\\$a = \\$b = { irm https://example.com/up -InFile s }; & \\$a\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
+  },
+  {
+   "command": "powershell -Command \"Write-Host \\\"a\\`\\\" #\\\"; irm https://example.com/up -InFile secret.txt\"",
+   "transfer": {
+    "tool": "powershell",
+    "endpoints": [
+     {
+      "direction": "out",
+      "host": "example.com",
+      "resolved_host": "example.com",
+      "address": "public"
+     }
+    ]
+   }
   }
  ]
 }
