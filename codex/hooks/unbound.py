@@ -8445,6 +8445,14 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     return [account], None
 
 
+def _account_kube_endpoint(server: str) -> Optional[str]:
+    """A cluster endpoint as `scheme://host[:port]`; a login, path or query written into it is never kept."""
+    host = _transfer_url_split(server).netloc.rsplit('@', 1)[-1] if server else ''
+    if not host:
+        return None
+    return '%s://%s' % (server.split('://', 1)[0], host) if '://' in server else host
+
+
 def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the cluster a kubectl call acted as, no repository). The kubeconfig is YAML and the hook has no parser
     for it, so kubectl reads it, and the jsonpath names only the fields kept."""
@@ -8455,6 +8463,7 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     server, server_known = _account_option(args, ('--server', '-s'))
     if not server_known:
         return [], None
+    server = _account_kube_endpoint(server) if server else None
     if server:
         # The endpoint the call names IS the cluster it reached, whatever context or cluster it also names.
         return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
@@ -8487,7 +8496,7 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
     output = _account_output(argv, cwd, env, state,
                             ('kube-view', context or '', kubeconfig, cwd, _account_env_key(env)))
     parts = (output or '').strip().split(_ACCOUNT_KUBE_SEPARATOR)
-    server = _account_value(parts[0]) if parts else None
+    server = _account_kube_endpoint(_account_value(parts[0]) or '') if parts else None
     if not server:
         return [], None
     account = {'platform': 'kubernetes', 'server': server, 'source': 'command'}
@@ -8573,8 +8582,9 @@ def _account_cobra_subcommand(args: List[str], switches: frozenset) -> tuple:
     return '', []
 
 
-# gh's options that take no value where they can come before a subcommand.
-_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'-h', '--help', '--version'})
+# gh's options that take no value where they can come before a subcommand. Not `-h`: gh reads it there as the
+# subcommand's own `-h`, so `gh -h <host> auth status` names a host.
+_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'--help', '--version'})
 
 
 def _account_switches(program: str, args: List[str]) -> Optional[str]:
@@ -8641,7 +8651,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict) -> Option
             switched = _account_switches(program, args)
             if switched:
                 # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
-                host = _account_option(args, ('--hostname', '-h'))[0] if switched == 'github' else None
+                host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None
                 hit = [item for item in taken
                        if item[0] == switched and (host is None or str(item[2].get('host')).lower() == host.lower())]
                 for _platform, accounts, account in hit:

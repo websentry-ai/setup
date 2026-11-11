@@ -590,6 +590,17 @@ class AccountPlatformTests(unittest.TestCase):
                 self.assertEqual(resolved['accounts'][0]['server'], 'https://team.example.com', path)
                 self.assertEqual(resolved['accounts'][0]['context'], 'team ctx', path)
 
+    def test_a_login_written_into_a_server_url_is_never_kept(self):
+        """`https://user:token@host:6443/path?x` is recorded as `https://host:6443`, from the flag or the kubeconfig."""
+        for path, resolved in self.each('kubectl --server https://u:s3cret@k8s.example.com:6443/api?x=1 get pods'):
+            self.assertEqual(resolved['accounts'][0]['server'], 'https://k8s.example.com:6443', path)
+        kube = json.loads(os.environ['FAKE_KUBE'])
+        kube['clusters']['prod-eks']['server'] = 'https://u:s3cret@eks.example.com:443/'
+        with patch.dict(os.environ, {'FAKE_KUBE': json.dumps(kube)}):
+            for path, resolved in self.each('kubectl get pods'):
+                self.assertEqual(resolved['accounts'][0]['server'], 'https://eks.example.com:443', path)
+                self.assertNotIn('s3cret', json.dumps(resolved), path)
+
     def test_a_cloud_call_whose_home_cannot_be_read_resolves_nothing(self):
         """A substituted `HOME` is not our own home, so the ambient config file must not answer for it."""
         for path, resolved in self.each('HOME=$(cat .where) aws s3 ls --profile home'):

@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'b91a0285cf56c92471807449fa9d20f2f5847b10bd4fb11b0dadeb7c49f18725'
+BLOCK_SHA256 = '59081d4660619d5af93457fa991b1fb49b9b67b7f94c77d3c4d4c8dbc6eade57'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -758,6 +758,15 @@ class AccountResolutionTests(unittest.TestCase):
             hook._accounts('gh auth switch', self.repo, state)
             self.assertEqual(dotcom.get('accounts'), [], path)
 
+    def test_an_attached_dash_h_switch_keeps_the_other_hosts_login(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            dotcom = hook._accounts('gh api user', self.repo, state)
+            acme = hook._accounts('gh api user --hostname github.acme.com', self.repo, state)
+            hook._accounts('gh auth switch -hgithub.acme.com -u bot', self.repo, state)
+            self.assertEqual(dotcom['accounts'][0]['login'], 'jdoe', path)
+            self.assertEqual(acme.get('accounts'), [], path)
+
     def test_a_hostname_before_auth_still_marks_the_switch(self):
         """gh, like any cobra CLI, takes options before its subcommand: `gh --hostname X auth switch`."""
         for path, hook in zip(HOOK_PATHS, HOOKS):
@@ -771,7 +780,9 @@ class AccountResolutionTests(unittest.TestCase):
     def test_gh_auth_takes_dash_h_as_its_host(self):
         """Under `gh auth`, `-h` is `--hostname`, in either the spaced or the attached form."""
         for command in ('gh auth status -h github.acme.com', 'gh auth status -hgithub.acme.com',
-                        'gh auth switch -h github.acme.com -u j.doe'):
+                        'gh auth switch -h github.acme.com -u j.doe',
+                        # gh reads `-h` before the subcommand as the hostname too.
+                        'gh -h github.acme.com auth status', 'gh auth -h github.acme.com status'):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', '%s / %s' % (path, command))
                 self.assertEqual(resolved['accounts'][0]['login'], 'j.doe', '%s / %s' % (path, command))
