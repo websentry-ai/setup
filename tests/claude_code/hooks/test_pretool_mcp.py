@@ -1082,9 +1082,23 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.cwd = str(self.repo)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
 
     def forwarded(self):
         return self.run_capture("mcp__fsx__write_file").get("mcp_server_config")
+
+    def test_launch_folder_is_used_after_an_in_session_cd(self):
+        # Claude keeps the servers it loaded at launch; a cd into a folder with its
+        # own .mcp.json must not change which server is reported.
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        _write_json(sub / ".mcp.json", {"mcpServers": {"fsx": self.OTHER}})
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
 
     def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})

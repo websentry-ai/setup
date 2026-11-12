@@ -2263,7 +2263,8 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                         break
                     cwd_path = parent
 
-            result = _project_mcp_json_server(server_name, cwd)
+            # Claude loads .mcp.json from where it was launched; the event cwd follows an in-session cd.
+            result = _project_mcp_json_server(server_name, os.environ.get('CLAUDE_PROJECT_DIR') or cwd)
             if result:
                 return _augment_script_hash(result, cwd)
 
