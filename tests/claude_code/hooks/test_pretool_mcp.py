@@ -1139,6 +1139,19 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         (self.repo / ".mcp.json").write_text("[" * 100000 + "]" * 100000)
         self.assertEqual(self.forwarded(), self.FS)
 
+    def test_unusable_nearer_entry_falls_through_to_parent(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        _write_json(sub / ".mcp.json", {"mcpServers": {"fsx": {}}})
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_oversized_mcp_json_is_skipped(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".mcp.json", {
+            "mcpServers": {"fsx": self.OTHER}, "pad": "x" * 1_100_000})
+        self.assertEqual(self.forwarded(), self.FS)
+
     def test_malformed_nearer_file_falls_through_to_parent(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
         sub = self.repo / "pkg"

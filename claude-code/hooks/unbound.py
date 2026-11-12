@@ -2217,13 +2217,20 @@ def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
     except (TypeError, ValueError):
         return None
     for folder in (start, *start.parents):
+        if folder == folder.parent:
+            break  # Claude stops below the filesystem root
+        path = folder / '.mcp.json'
         try:
-            data = json.loads((folder / '.mcp.json').read_text(encoding='utf-8'))
+            if not path.is_file() or path.stat().st_size > 1_000_000:
+                continue
+            data = json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             continue
         servers = data.get('mcpServers') if isinstance(data, dict) else None
         if isinstance(servers, dict) and server_name in servers:
-            return _extract_mcp_server_fields(servers[server_name])
+            result = _extract_mcp_server_fields(servers[server_name])
+            if result:
+                return result
     return None
 
 
