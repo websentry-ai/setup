@@ -693,6 +693,27 @@ class AccountPlatformTests(unittest.TestCase):
             for path, resolved in self.each(command):
                 self.assertEqual(resolved['accounts'][0]['server'], server, '%s / %s' % (path, command))
 
+    def test_a_server_option_inside_a_template_is_text(self):
+        for path, resolved in self.each("kubectl get pods -o go-template --template '--server=https://other.example'"):
+            self.assertEqual(resolved['accounts'][0]['cluster'], 'prod', path)
+            self.assertNotEqual(resolved['accounts'][0].get('server'), 'https://other.example', path)
+
+    def test_eks_and_aks_kubeconfig_writers_drop_the_earlier_cluster(self):
+        """Both rewrite the kubeconfig and its current context, which an earlier kubectl call was read from."""
+        for writer in ('aws eks update-kubeconfig --name prod --region us-west-2',
+                       'az aks get-credentials --resource-group rg --name prod'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('kubectl get pods', self.repo, state)
+                hook._accounts(writer, self.repo, state)
+                self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, writer))
+
+    def test_local_only_az_commands_act_as_no_subscription(self):
+        for command in ('az --version', 'az config set defaults.location=westus', 'az extension add -n ml',
+                        'az bicep build -f main.bicep', 'az account list', 'az configure'):
+            for path, resolved in self.each(command):
+                self.assertIsNone(resolved, '%s / %s' % (path, command))
+
     def test_a_server_with_no_scheme_is_reached_over_https(self):
         """client-go takes a bare host and reaches it over https; a stray `-s…` that is no host is not a server."""
         for command, server in (('kubectl get pods --server k8s.example.com', 'https://k8s.example.com'),

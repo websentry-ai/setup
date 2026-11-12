@@ -7944,12 +7944,12 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
 
 
 def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
-                        key: tuple) -> Optional[str]:
-    """The first line one allowlisted lookup printed, asked once per distinct question in a turn."""
+                        key: tuple, raw: bool = False) -> Optional[str]:
+    """The first line one allowlisted lookup printed (as printed, with `raw`), asked once per distinct question."""
     def resolve():
         output = _account_run(argv, cwd, env, state)
         lines = (output or '').splitlines()
-        return _account_value(lines[0]) if lines else None
+        return (lines[0] if raw else _account_value(lines[0])) if lines else None
 
     return _account_once(state, key, resolve)
 
@@ -8020,8 +8020,14 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
         override = (overrides or {}).get(_account_config_key(name))
         value = None if override == _TRANSFER_SUBSTITUTED else _account_value(override)
         return (value, True) if value else (None, False)
-    return _account_first_line(['git', 'config', '--get', name], cwd, env, state,
-                               ('git-config', name, cwd, _account_env_key(env))), True
+    line = _account_first_line(['git', 'config', '--get', name], cwd, env, state,
+                               ('git-config', name, cwd, _account_env_key(env)), raw=True)
+    if not (line or '').strip():
+        return None, True
+    # Printed by git, so a `$` in it is literal; one that is still not a single word is unknown, not absent, or the
+    # next setting would answer for it.
+    value = (line or '').strip()[:_ACCOUNT_MAX_VALUE]
+    return (value, True) if not any(ch.isspace() or ord(ch) < 32 for ch in value) else (None, False)
 
 
 def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
@@ -8116,7 +8122,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
             pushed = [(repo, remote) for repo in (_account_repo_of(url) for url in (urls or '').splitlines()) if repo]
         if implicit:
             # Chosen by the current branch's config, read when the turn ends, so a later branch change moves it.
-            state.setdefault('account_implicit', []).extend(pushed)
+            state.setdefault('account_implicit_call', []).extend(pushed)
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
     if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
@@ -8476,6 +8482,11 @@ def _account_azure_fields(entry: Dict) -> Optional[Dict]:
 
 def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
     """(the Azure subscription a call acted as, no repository); no environment variable picks it, only --subscription."""
+    group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
+    action = _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0]
+    if '--version' in args or group in _ACCOUNT_AZ_LOCAL or (group, action) in _ACCOUNT_AZ_LOCAL_ACTIONS:
+        # Configuration, extensions, help or the account list on this machine; nothing acts on a subscription.
+        return [], None
     # Kept exactly as written, so a name is matched as the CLI matches it rather than after normalising.
     named, known = _account_option(args, ('--subscription',), _account_path)
     if not known:
@@ -8504,6 +8515,10 @@ def _account_kube_server(args: List[str]) -> tuple:
         arg = args[i]
         if arg == '--':
             break
+        if arg in _ACCOUNT_KUBE_TEXT_OPTIONS and i + 1 < len(args):
+            # A template, patch or selector is text; a `--server=…` inside one is not an option.
+            i += 2
+            continue
         if arg in ('--server', '-s') and i + 1 < len(args):
             raw, attached, i = args[i + 1], False, i + 2
             continue
@@ -8642,6 +8657,12 @@ _ACCOUNT_KUBE_SWITCHES = frozenset({'--insecure-skip-tls-verify', '--match-serve
                                     # klog's, which older kubectl releases still take.
                                     '--logtostderr', '--alsologtostderr', '--add-dir-header', '--one-output',
                                     '--skip-headers', '--skip-log-headers'})
+# kubectl options whose value is free text, so nothing inside one is read as an option.
+_ACCOUNT_KUBE_TEXT_OPTIONS = frozenset({
+    '-o', '--output', '--template', '-p', '--patch', '--overrides', '-l', '--selector', '--field-selector',
+    '-f', '--filename', '-k', '--kustomize', '--from-literal', '--env', '-e', '--sort-by', '-L', '--label-columns',
+    '--image', '--command', '--annotation',
+})
 # kubectl subcommands that run on this machine only: help, completion, a local kustomize build, plugins, config.
 _ACCOUNT_KUBE_LOCAL = frozenset({'', 'config', 'completion', 'kustomize', 'plugin', 'help', 'options'})
 # The `kubectl config` subcommands that only read; every other one can move what the current context reaches.
@@ -8650,6 +8671,11 @@ _ACCOUNT_KUBE_CONFIG_READS = frozenset({'', 'view', 'current-context', 'get-cont
 _ACCOUNT_AWS_VALUE_OPTIONS = frozenset({'--profile', '--region', '--output', '--endpoint-url', '--query',
                                         '--ca-bundle', '--color', '--cli-read-timeout', '--cli-connect-timeout',
                                         '--cli-binary-format'})
+# az command groups that run on this machine only, and the `az account` actions that read or set local state.
+_ACCOUNT_AZ_LOCAL = frozenset({'', 'help', 'configure', 'config', 'extension', 'bicep', 'cloud', 'version',
+                               'upgrade', 'find', 'feedback', 'interactive', 'init', 'self-test', 'login', 'logout'})
+_ACCOUNT_AZ_LOCAL_ACTIONS = frozenset({('account', 'list'), ('account', 'show'), ('account', 'set'),
+                                       ('account', 'clear')})
 # az's options that can come before its command group, with the value each takes.
 _ACCOUNT_AZ_VALUE_OPTIONS = frozenset({'-o', '--output', '--query', '--subscription'})
 
@@ -8724,12 +8750,18 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
             return 'kubeconfig'
     if program == 'aws':
         service, after = _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)
+        if service == 'eks' and _account_subcommand(after, _ACCOUNT_AWS_VALUE_OPTIONS)[0] == 'update-kubeconfig':
+            # Rewrites the kubeconfig and its current context, so it moves what an earlier kubectl call read.
+            return 'kubeconfig'
         if service == 'configure' and _account_subcommand(after, _ACCOUNT_AWS_VALUE_OPTIONS)[0] not in (
                 'get', 'list', 'list-profiles', 'export-credentials', 'help'):
             return 'aws'
     if program == 'az':
         group, after = _account_subcommand(args, _ACCOUNT_AZ_VALUE_OPTIONS)
         action = _account_subcommand(after, _ACCOUNT_AZ_VALUE_OPTIONS)[0]
+        if (group, action) == ('aks', 'get-credentials'):
+            # Merges a cluster into the kubeconfig and makes it the current context.
+            return 'kubeconfig'
         if group == 'login' or (group, action) == ('account', 'set'):
             return 'azure'
         # `az cloud set`, or an `az config` write to a `cloud.` key, changes the cloud every subscription is
@@ -8791,6 +8823,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
         found, pushes = [], []
+        state['account_implicit_call'] = []
         # Accounts are read when the turn ends, so one an earlier call took from the active configuration is the
         # switched one if a later call switched it. Those earlier accounts are dropped then, in place.
         taken = state.setdefault('account_active', [])
@@ -8805,17 +8838,19 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             if switched in ('git-branch', 'git-remote'):
                 # Push destinations are read when the turn ends, so a later branch change moves a push its branch's
                 # config chose, and a remote change one through that remote (any, for a rewrite rule).
-                implicit, scope = state.get('account_implicit', []), _account_remote_scope(args)
+                scope = _account_remote_scope(args)
 
-                def moved(repo, remote):
-                    if switched == 'git-branch':
-                        return (repo, remote) in implicit
-                    return scope is None or remote == scope
-                pushes[:] = [push for push in pushes if not moved(*push)]
+                def moved(implicit):
+                    def picks(repo, remote):
+                        if switched == 'git-branch':
+                            return (repo, remote) in implicit
+                        return scope is None or remote == scope
+                    return picks
+                pushes[:] = [push for push in pushes if not moved(state['account_implicit_call'])(*push)]
                 held = state.setdefault('account_pushes', [])
-                for entry in held:
-                    _account_withdraw(entry, moved)
-                held[:] = [entry for entry in held if entry.get('pushed_repo')]
+                for entry, implicit in held:
+                    _account_withdraw(entry, moved(implicit))
+                held[:] = [(entry, implicit) for entry, implicit in held if entry.get('pushed_repo')]
                 if switched == 'git-remote':
                     # A gh login read from the checkout's remote host moves with it too.
                     hit = [item for item in taken if item[0] == 'git-remote']
@@ -8881,7 +8916,8 @@ def _with_accounts(entry: Dict, resolved: Optional[Dict], state: Optional[Dict] 
     if resolved:
         entry.update(resolved)
         if state is not None and resolved.get('pushed_repo'):
-            state.setdefault('account_pushes', []).append(entry)
+            # With the pushes its branch's config chose, which only a later branch change moves.
+            state.setdefault('account_pushes', []).append((entry, list(state.get('account_implicit_call') or [])))
     return entry
 
 

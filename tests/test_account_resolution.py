@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '872a77e7066deedad9db7c55bb9c936c138adff256609b655e5efde49912d7f9'
+BLOCK_SHA256 = '6ee77173f2ed2f2b8877ee1b6505aaf2c89cbea1b031660a8c7179868dc98ebb'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -432,6 +432,18 @@ class AccountResolutionTests(unittest.TestCase):
                         'git -c user.email=$EMAIL commit -m a', 'GIT_CONFIG_GLOBAL=$CFG git commit -m a'):
             for path, resolved in self.each(command):
                 self.assertNotIn('accounts', resolved or {}, '%s / %s' % (path, command))
+
+    def test_a_configured_value_is_read_as_git_prints_it(self):
+        """git's output is final, so a `$` in it is literal; a value that is not one word is unknown, not absent."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        answers['user.email'] = 'build$bot@example.com'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git commit -m a'):
+                self.assertEqual(resolved['accounts'][0]['email'], 'build$bot@example.com', path)
+        answers['committer.email'] = 'Build Bot'
+        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+            for path, resolved in self.each('git commit -m a'):
+                self.assertNotIn('accounts', resolved or {}, path)
 
     def test_a_variable_the_shell_unset_does_not_reach_the_lookup(self):
         """Removing it from the child's environment, not just from our own reading of it."""
@@ -1070,6 +1082,16 @@ class AccountResolutionTests(unittest.TestCase):
                                   ('gh repo view', 'github.acme.com')):
                 for path, resolved in self.each(command):
                     self.assertEqual(resolved['accounts'][0]['host'], host, '%s / %s' % (path, command))
+
+    def test_a_branch_change_keeps_a_named_push_equal_to_a_bare_one(self):
+        """`git push` and `git push origin main` both reach acme/app; only the bare one followed the branch."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            bare = hook._with_accounts({}, hook._accounts('git push', self.repo, state), state)
+            named = hook._with_accounts({}, hook._accounts('git push origin main', self.repo, state), state)
+            hook._accounts('git checkout release', self.repo, state)
+            self.assertNotIn('pushed_repo', bare, path)
+            self.assertEqual(named['pushed_repo'], 'acme/app', path)
 
     def test_a_scoped_remote_change_keeps_the_sibling_pushes_of_one_call(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
