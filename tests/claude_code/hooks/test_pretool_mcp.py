@@ -1109,6 +1109,43 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.cwd = str(sub)
         self.assertIn("scriptHash", self.forwarded())
 
+    def test_local_scope_is_found_from_the_launch_folder_after_a_cd(self):
+        _write_json(self.claude_json, {
+            "mcpServers": {}, "projects": {str(self.repo): {"mcpServers": {"fsx": self.FS}}}})
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.cwd = str(elsewhere)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_sibling_worktree_local_server_beats_project_mcp_json(self):
+        # Claude unions local scope across a repo's worktrees and ranks it above .mcp.json.
+        import subprocess
+        git = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True)
+        git("-C", str(self.repo), "init", "-q")
+        git("-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i")
+        wt = self.root / "wt"
+        git("-C", str(self.repo), "worktree", "add", "-q", str(wt))
+        main = os.path.realpath(self.repo)  # git records worktree paths resolved
+        _write_json(self.claude_json, {
+            "mcpServers": {}, "projects": {main: {"mcpServers": {"fsx": self.OTHER}}}})
+        _write_json(wt / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(wt)
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_script_scan_reads_from_the_launch_folder(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        seen = {}
+        event = {"hook_event_name": "PreToolUse", "tool_name": "mcp__fsx__write_file",
+                 "tool_input": {}, "cwd": str(sub), "session_id": "sess"}
+        with patch.object(unbound, "send_to_hook_api", lambda b, k: {"decision": "allow", "unknown_mcp_server": True}), \
+             patch.object(unbound, "_dispatch_mcp_server_scan", lambda name, cfg, cwd=None: seen.update(cwd=cwd)):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(seen.get("cwd"), str(self.repo))
+
     def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
         self.assertEqual(self.forwarded(), self.FS)

@@ -2234,9 +2234,16 @@ def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
     return None
 
 
+def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:
+    """Where Claude was launched: it loads and starts MCP servers there, while the
+    event cwd follows an in-session cd."""
+    return os.environ.get('CLAUDE_PROJECT_DIR') or cwd
+
+
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
-    """Claude Code's own scope order: local (~/.claude.json projects), then
-    project (.mcp.json), then user (~/.claude.json top level)."""
+    """Claude Code's own scope order, from the launch folder: local (~/.claude.json
+    projects, including sibling worktrees), then project (.mcp.json), then user."""
+    cwd = _claude_launch_dir(cwd)
     try:
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -2263,12 +2270,12 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                         break
                     cwd_path = parent
 
-            # Claude loads .mcp.json, and starts its servers, from where it was launched;
-            # the event cwd follows an in-session cd.
-            launch_dir = os.environ.get('CLAUDE_PROJECT_DIR') or cwd
-            result = _project_mcp_json_server(server_name, launch_dir)
+            union = _read_mcp_server_config_worktree_union(server_name, config_path, cwd=cwd)
+            if union:
+                return union
+            result = _project_mcp_json_server(server_name, cwd)
             if result:
-                return _augment_script_hash(result, launch_dir)
+                return _augment_script_hash(result, cwd)
 
         top_servers = config.get('mcpServers', {})
         if isinstance(top_servers, dict) and server_name in top_servers:
@@ -4138,7 +4145,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         plugin_dirs = plugin_urls = None  # lazy: --plugin-dir paths / --plugin-url values
 
         if mcp_server_name:
-            cwd = event.get('cwd')
+            cwd = _claude_launch_dir(event.get('cwd'))
             server_cfg = _read_mcp_server_config(
                 mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
             )
@@ -4282,7 +4289,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     if is_mcp and api_response.get('unknown_mcp_server'):
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
-            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
+            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=_claude_launch_dir(metadata.get('cwd')))
 
     # Null fingerprint: the hook resolved no config for a real MCP server. The
     # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
