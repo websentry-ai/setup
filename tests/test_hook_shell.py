@@ -136,6 +136,38 @@ class VSCodeTests(ShellTestCase):
             with patch.dict(os.environ, hint):
                 self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
 
+    def installed(self, name):
+        path = Path(tempfile.mkdtemp(), name)
+        path.write_text('')
+        return str(path)
+
+    def test_a_default_profile_whose_only_path_is_missing_names_nothing(self):
+        missing = str(Path(tempfile.mkdtemp(), 'pwsh.exe'))
+        self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Dev',
+                                       'terminal.integrated.profiles.windows': {'Dev': {'path': missing}}}))
+        self.assert_shell('copilot', 'run_in_terminal', {}, windows=True)
+
+    def test_a_profile_path_set_through_an_environment_variable_is_named_by_its_value(self):
+        with patch.dict(os.environ, {'PS7': self.installed('pwsh.exe')}):
+            self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': '${env:PS7}'}}))
+            self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
+            self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Dev',
+                                           'terminal.integrated.profiles.windows': {'Dev': {'path': ['${env:PS7}']}}}))
+            self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
+
+    def test_a_network_path_in_a_profile_is_never_looked_up(self):
+        seen = []
+        real_isfile = os.path.isfile
+        local = self.installed('powershell.exe')
+        self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {
+            'path': ['\\\\attacker.example\\s\\pwsh.exe', '//attacker.example/s/pwsh.exe', local]}}))
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_windows', return_value=True), \
+                    patch.object(hook.os.path, 'isfile', side_effect=lambda p: seen.append(p) or real_isfile(p)):
+                hook._SHELL_CACHE.clear()
+                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal'), _shell('powershell', 'agent_rule'))
+        self.assertFalse([p for p in seen if 'attacker' in str(p)], seen)
+
     def test_a_profile_listing_several_paths_names_the_first_one_installed(self):
         installed = Path(tempfile.mkdtemp(), 'powershell.exe')
         installed.write_text('')
@@ -156,7 +188,7 @@ class VSCodeTests(ShellTestCase):
                 ({'terminal.integrated.defaultProfile.windows': 'Git Bash'}, 'bash'),
                 ({'terminal.integrated.defaultProfile.windows': 'Command Prompt'}, 'powershell'),
                 ({'terminal.integrated.defaultProfile.windows': 'Dev',
-                  'terminal.integrated.profiles.windows': {'Dev': {'path': 'C:\\tools\\pwsh.exe'}}}, 'pwsh')):
+                  'terminal.integrated.profiles.windows': {'Dev': {'path': self.installed('pwsh.exe')}}}, 'pwsh')):
             self.user_settings(json.dumps(settings))
             self.assert_shell('copilot', 'run_in_terminal', _shell(expected, 'agent_rule'), windows=True)
 

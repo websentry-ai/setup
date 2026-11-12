@@ -3898,18 +3898,18 @@ def _shell_vscode_app():
     return 'Code'
 
 
-def _shell_profile_path(path):
-    """A profile's executable: a single path as written, or the first of a list that exists, as VS Code picks it."""
-    if isinstance(path, str):
-        return path
-    if not isinstance(path, list):
-        return None
-    for candidate in path:
+def _shell_profile_path(path, check=True):
+    """A profile's executable as VS Code resolves it: `${env:…}` expanded, then the first entry that is installed, or
+    nothing. A network path is never looked up, so a repository's settings can't make the hook reach a server."""
+    for candidate in [path] if isinstance(path, str) else path if isinstance(path, list) else []:
         if not isinstance(candidate, str):
             continue
-        expanded = re.sub(r'\$\{env:([^}]+)\}', lambda m: os.environ.get(m.group(1), ''), candidate)
-        if os.path.isfile(expanded) or ('/' not in expanded and '\\' not in expanded and shutil.which(expanded)):
-            return candidate
+        expanded = re.sub(r'\$\{env:([^}]+)\}', lambda m: os.environ.get(m.group(1), ''), candidate).strip().strip('"')
+        if not expanded or expanded.startswith(('\\\\', '//')):
+            continue
+        if not check or os.path.isfile(expanded) or (
+                '/' not in expanded and '\\' not in expanded and shutil.which(expanded)):
+            return expanded
     return None
 
 
@@ -3929,7 +3929,8 @@ def _shell_vscode(cwd):
     for layer in layers:
         profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
         if isinstance(profile, dict) and 'path' in profile:
-            return _shell_name(_shell_profile_path(profile['path']))
+            # Copilot keeps its own profile's single path even when the file is missing.
+            return _shell_name(_shell_profile_path(profile['path'], check=not isinstance(profile['path'], str)))
     for layer in layers:
         chosen = layer.get('terminal.integrated.defaultProfile.' + key)
         if not isinstance(chosen, str):
