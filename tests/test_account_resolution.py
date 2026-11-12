@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '5a1712e2416f9eed797f363f5c566c9cd432616cf53456a220112ed5090f05d4'
+BLOCK_SHA256 = 'c13af404df7f7c7c55f717db696f3e9db92525ef099b774cb4774c62f3282f83'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1070,6 +1070,22 @@ class AccountResolutionTests(unittest.TestCase):
                                   ('gh repo view', 'github.acme.com')):
                 for path, resolved in self.each(command):
                     self.assertEqual(resolved['accounts'][0]['host'], host, '%s / %s' % (path, command))
+
+    def test_a_scoped_remote_change_keeps_the_sibling_pushes_of_one_call(self):
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            both = hook._with_accounts({}, hook._accounts('git push origin main; git push personal main',
+                                                          self.repo, state), state)
+            self.assertEqual(len(both['pushed']), 2, path)
+            hook._accounts('git remote set-url origin https://x.example.com/a/b.git', self.repo, state)
+            self.assertEqual((both['pushed_repo'], both['pushed_remote']), ('jdoe-dev/app', 'personal'), path)
+            self.assertNotIn('pushed', both, path)
+
+    def test_options_before_the_gh_subcommand_keep_its_repository_scope(self):
+        """`gh --limit 10 issue list` is still `issue list`, so GH_REPO decides its host."""
+        with patch.dict(os.environ, {'GH_REPO': 'github.acme.com/acme/app'}):
+            for path, resolved in self.each('gh --limit 10 issue list'):
+                self.assertEqual(resolved['accounts'][0]['host'], 'github.acme.com', path)
 
     def test_the_claude_code_hook_withdraws_a_push_a_later_call_rewires(self):
         hook = load_module('claude-code/hooks/unbound.py')

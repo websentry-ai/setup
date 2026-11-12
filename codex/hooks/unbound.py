@@ -8068,10 +8068,11 @@ def _account_gh_repo(args: List[str], env: Dict) -> tuple:
     # A positional names the repository only under a command that acts on one; under `gh search` or `gh api`
     # a URL is a query. A bare `OWNER/REPO` only under `gh repo`, since elsewhere a slashed word is a branch or
     # a file (`gh pr checkout fix/login`).
-    if not (args[:1] and args[0] in _ACCOUNT_GH_REPO_SCOPED):
+    group = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)[0]
+    if group not in _ACCOUNT_GH_REPO_SCOPED:
         # Nor does GH_REPO steer a command that acts on no repository; gh reads it only where it reads `--repo`.
         return None, True
-    takes_repo = args[:1] == ['repo']
+    takes_repo = group == 'repo'
     switches = _ACCOUNT_GH_SWITCHES | _ACCOUNT_GH_SHORT_SWITCHES.get(tuple(args[:2]), frozenset())
     for at, arg in enumerate(args):
         # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
@@ -8297,32 +8298,27 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
                     arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
                     or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
                 switched = None
-            if switched == 'git-branch':
-                # A push whose remote the branch's config chose was read for the branch the turn ends on.
-                implicit = state.get('account_implicit', [])
-                pushes[:] = [push for push in pushes if push not in implicit]
+            if switched in ('git-branch', 'git-remote'):
+                # Push destinations are read when the turn ends, so a later branch change moves a push its branch's
+                # config chose, and a remote change one through that remote (any, for a rewrite rule).
+                implicit, scope = state.get('account_implicit', []), _account_remote_scope(args)
+
+                def moved(repo, remote):
+                    if switched == 'git-branch':
+                        return (repo, remote) in implicit
+                    return scope is None or remote == scope
+                pushes[:] = [push for push in pushes if not moved(*push)]
                 held = state.setdefault('account_pushes', [])
-                for entry, remotes in held:
-                    if '' in remotes:
-                        for key in ('pushed_repo', 'pushed_remote', 'pushed'):
-                            entry.pop(key, None)
-                held[:] = [(entry, remotes) for entry, remotes in held if '' not in remotes]
-            elif switched == 'git-remote':
-                # Push destinations are read when the turn ends too, so a later remote change would rewrite them.
-                scope = _account_remote_scope(args)
-                pushes[:] = [push for push in pushes if scope is not None and push[1] != scope]
-                held = state.setdefault('account_pushes', [])
-                for entry, remotes in held:
-                    if scope is None or scope in remotes:
-                        for key in ('pushed_repo', 'pushed_remote', 'pushed'):
-                            entry.pop(key, None)
-                held[:] = [(entry, remotes) for entry, remotes in held if scope is not None and scope not in remotes]
-                # A gh login read from the checkout's remote host moves with it too.
-                moved = [item for item in taken if item[0] == 'git-remote']
-                for _key, accounts, account in moved:
-                    if account in accounts:
-                        accounts.remove(account)
-                taken[:] = [item for item in taken if item not in moved]
+                for entry in held:
+                    _account_withdraw(entry, moved)
+                held[:] = [entry for entry in held if entry.get('pushed_repo')]
+                if switched == 'git-remote':
+                    # A gh login read from the checkout's remote host moves with it too.
+                    hit = [item for item in taken if item[0] == 'git-remote']
+                    for _key, accounts, account in hit:
+                        if account in accounts:
+                            accounts.remove(account)
+                    taken[:] = [item for item in taken if item not in hit]
             elif switched:
                 # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
                 host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None
@@ -8376,14 +8372,24 @@ def _with_accounts(entry: Dict, resolved: Optional[Dict], state: Optional[Dict] 
     if resolved:
         entry.update(resolved)
         if state is not None and resolved.get('pushed_repo'):
-            pushes = resolved.get('pushed') or [
-                {'repo': resolved['pushed_repo'], 'remote': resolved.get('pushed_remote')}]
-            remotes = {push.get('remote') for push in pushes}
-            # '' marks a push the current branch's config chose, which a later branch change moves.
-            if any((push.get('repo'), push.get('remote')) in state.get('account_implicit', []) for push in pushes):
-                remotes.add('')
-            state.setdefault('account_pushes', []).append((entry, remotes))
+            state.setdefault('account_pushes', []).append(entry)
     return entry
+
+
+def _account_withdraw(entry: Dict, moved) -> None:
+    """Drop from an entry the pushes `moved(repo, remote)` picks, keeping the rest of a call that pushed more than
+    once, its first named as before."""
+    pushes = entry.get('pushed') or (
+        [{'repo': entry['pushed_repo'], 'remote': entry.get('pushed_remote')}] if entry.get('pushed_repo') else [])
+    kept = [push for push in pushes if not moved(push.get('repo'), push.get('remote'))]
+    for key in ('pushed_repo', 'pushed_remote', 'pushed'):
+        entry.pop(key, None)
+    if kept:
+        entry['pushed_repo'] = kept[0]['repo']
+        if kept[0].get('remote'):
+            entry['pushed_remote'] = kept[0]['remote']
+        if len(kept) > 1:
+            entry['pushed'] = kept
 # --- end account resolution ---
 
 
