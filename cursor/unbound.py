@@ -8173,6 +8173,13 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
                 or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys)))
         if written([at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]):
             return 'git'
+        # Removing or renaming a whole section changes every key in it: `user` the committer, a remote, URL or
+        # branch section where a push goes.
+        section = _account_config_section(after) if subcommand == 'config' else ''
+        if section in ('user', 'committer'):
+            return 'git'
+        if section.startswith(('remote', 'url', 'branch')):
+            return 'git-remote'
         if written([at for at, arg in enumerate(after) if _ACCOUNT_REMOTE_KEY.match(arg)]):
             return 'git-remote'
     return None
@@ -8185,11 +8192,21 @@ _ACCOUNT_REMOTE_KEY = re.compile(
     r'|branch\..+\.(?:remote|pushremote)|remote\.pushdefault)$', re.IGNORECASE)
 
 
+def _account_config_section(after: List[str]) -> str:
+    """The section a `git config --remove-section`/`--rename-section` (or the `remove-section` verb) acts on."""
+    ops = ('--remove-section', '--rename-section', 'remove-section', 'rename-section')
+    at = next((i for i, arg in enumerate(after) if arg.lower() in ops), None)
+    return after[at + 1].lower() if at is not None and at + 1 < len(after) else ''
+
+
 def _account_remote_scope(args: List[str]) -> Optional[str]:
     """The one remote a remote change names, or None when it can move any push (a URL rewrite, a push target)."""
     subcommand, after = _account_git_subcommand(args)
     if subcommand == 'remote':
         return _account_value(_account_git_subcommand(_account_git_subcommand(after)[1])[0])
+    section = _account_config_section(after)
+    if section.startswith('remote.'):
+        return _account_value(section[len('remote.'):])
     for arg in after:
         match = _ACCOUNT_REMOTE_KEY.match(arg)
         if match:

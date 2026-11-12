@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'd03e9f75b6c8502eb08c041ab2c61333dec57e5597a77cd92b6e8a7c8f353f40'
+BLOCK_SHA256 = '17cfdcacbab53f0ea55877f1d3c3e9b71eba8d1e4804147d278095e18d73c27e'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1093,6 +1093,23 @@ class AccountResolutionTests(unittest.TestCase):
             hook._accounts('git checkout release', self.repo, state)
             self.assertNotIn('pushed_repo', bare, path)
             self.assertEqual(named['pushed_repo'], 'acme/app', path)
+
+    def test_removing_or_renaming_a_config_section_is_a_switch(self):
+        """`--remove-section user` exposes another committer; `--rename-section remote.origin` moves origin's pushes."""
+        for switch in ('git config --remove-section user', 'git config --rename-section user backup',
+                       'git config remove-section user'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                commit = hook._accounts('git commit -m one', self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(commit.get('accounts'), [], '%s / %s' % (path, switch))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            origin = hook._with_accounts({}, hook._accounts('git push origin main', self.repo, state), state)
+            personal = hook._with_accounts({}, hook._accounts('git push personal main', self.repo, state), state)
+            hook._accounts('git config --remove-section remote.origin', self.repo, state)
+            self.assertNotIn('pushed_repo', origin, path)
+            self.assertEqual(personal['pushed_repo'], 'jdoe-dev/app', path)
 
     def test_a_scoped_remote_change_keeps_the_sibling_pushes_of_one_call(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
