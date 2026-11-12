@@ -4,7 +4,9 @@ The end-to-end tests in test_transfer_e2e.py run each real hook on this machine;
 VS Code settings Copilot reads, and failing open, on every hook's copy of the block."""
 import json
 import os
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -98,6 +100,23 @@ class WindowsRuleTests(ShellTestCase):
         self.assert_shell('augment', 'launch-process', _shell('pwsh', 'agent_rule'), windows=True)
 
 
+class CodexTests(ShellTestCase):
+    def test_a_login_shell_codex_does_not_support_runs_as_its_platform_default(self):
+        for platform, expected in (('darwin', 'zsh'), ('linux', 'bash')):
+            for hook in HOOKS:
+                hook._SHELL_CACHE.clear()
+                with self.subTest(hook=hook.__file__, platform=platform), \
+                        patch.object(hook, '_shell_login', return_value='fish'), \
+                        patch.object(sys, 'platform', platform):
+                    self.assertEqual(hook.detect_shell('codex', 'Bash'), _shell(expected, 'agent_rule'))
+
+    def test_a_supported_login_shell_is_named(self):
+        for hook in HOOKS:
+            hook._SHELL_CACHE.clear()
+            with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_login', return_value='sh'):
+                self.assertEqual(hook.detect_shell('codex', 'Bash'), _shell('sh', 'agent_rule'))
+
+
 class VSCodeTests(ShellTestCase):
     def user_settings(self, settings):
         path = Path(os.environ['APPDATA'], 'Code', 'User', 'settings.json')
@@ -127,9 +146,39 @@ class VSCodeTests(ShellTestCase):
             {'chat.tools.terminal.terminalProfile.windows': {'path': 'pwsh.exe'}}))
         self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), cwd=workspace, windows=True)
 
+    def test_copilots_own_profile_of_cmd_or_sh_is_not_swapped_like_a_default_is(self):
+        for path, expected in (('C:\\Windows\\System32\\cmd.exe', 'cmd'), ('/bin/sh', 'sh')):
+            self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': path}}))
+            self.assert_shell('copilot', 'run_in_terminal', _shell(expected, 'agent_rule'), windows=True)
+
     def test_unreadable_settings_fall_back_to_the_default(self):
         self.user_settings('{ not json')
         self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
+
+    @unittest.skipUnless(hasattr(os, 'mkfifo'), 'needs named pipes')
+    def test_a_workspace_settings_pipe_or_oversized_file_is_skipped_without_blocking(self):
+        workspace = tempfile.mkdtemp()
+        Path(workspace, '.vscode').mkdir()
+        os.mkfifo(Path(workspace, '.vscode', 'settings.json'))
+        self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), cwd=workspace, windows=True)
+        self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': 'bash.exe'}}) +
+                           ' ' * (1 << 20))
+        self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
+
+    def test_a_symlinked_settings_file_is_still_read(self):
+        real = Path(tempfile.mkdtemp(), 'settings.json')
+        real.write_text(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': 'pwsh.exe'}}))
+        link = Path(os.environ['APPDATA'], 'Code', 'User', 'settings.json')
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(real)
+        self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
+
+    def test_a_malformed_file_of_unclosed_quotes_and_comments_parses_in_linear_time(self):
+        for junk in ('"' * 200_000, '/*' * 100_000, '"\\' * 100_000):
+            self.user_settings(junk)
+            start = time.monotonic()
+            self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
+            self.assertLess(time.monotonic() - start, 5)
 
 
 class FailOpenTests(ShellTestCase):

@@ -5290,6 +5290,7 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
 # applies the rule that agent uses to pick its shell ('agent_rule'). Fails open: nothing is sent when neither works.
 _SHELL_NAMES = frozenset({'bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'powershell', 'pwsh', 'cmd'})
 _SHELL_CACHE = {}
+_SHELL_SETTINGS_MAX_BYTES = 1 << 20
 
 
 def _shell_name(program):
@@ -5325,13 +5326,21 @@ def _shell_login():
 
 def _shell_settings(path):
     """A JSON settings file that may hold comments and trailing commas, as VS Code writes them; {} when unreadable."""
+    # Only a small regular file: a repo's own settings could be a pipe or a device that never finishes reading.
     try:
-        text = Path(path).read_text(encoding='utf-8-sig')
+        if not os.path.isfile(path):
+            return {}
+        with open(path, 'rb') as f:
+            raw = f.read(_SHELL_SETTINGS_MAX_BYTES + 1)
+        if len(raw) > _SHELL_SETTINGS_MAX_BYTES:
+            return {}
+        text = raw.decode('utf-8-sig')
     except (OSError, ValueError):
         return {}
-    # Drop // and /* */ comments outside strings, then commas before a closing bracket.
-    text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or '', text, flags=re.S)
-    text = re.sub(r'("(?:\\.|[^"\\])*")|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text)
+    # Drop // and /* */ comments outside strings, then commas before a closing bracket. An unclosed string or comment
+    # runs to the end, so a malformed file is one linear pass rather than a rescan from every quote.
+    text = re.sub(r'("(?:\\.|[^"\\])*"?)|//[^\n]*|/\*.*?(?:\*/|\Z)', lambda m: m.group(1) or '', text, flags=re.S)
+    text = re.sub(r'("(?:\\.|[^"\\])*"?)|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text)
     try:
         data = json.loads(text)
     except ValueError:
@@ -5346,7 +5355,7 @@ _SHELL_VSCODE_BUILTIN = {'powershell': None, 'windows powershell': 'powershell',
 
 def _shell_vscode(cwd):
     """The shell Copilot's run_in_terminal uses: its own terminal profile, else the default one; workspace settings
-    win over the user's, cmd runs as Windows PowerShell and /bin/sh as bash."""
+    win over the user's, and a default of cmd runs as Windows PowerShell and of /bin/sh as bash."""
     windows = _shell_windows()
     key = 'windows' if windows else 'osx' if sys.platform == 'darwin' else 'linux'
     if windows:
@@ -5357,30 +5366,27 @@ def _shell_vscode(cwd):
         user_root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
     layers = ([_shell_settings(Path(cwd) / '.vscode' / 'settings.json')] if cwd else []) + \
         [_shell_settings(user_root / app / 'User' / 'settings.json') for app in ('Code', 'Code - Insiders')]
-    name = None
     for layer in layers:
         profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
         if isinstance(profile, dict) and isinstance(profile.get('path'), str):
-            name = _shell_name(profile['path'])
-            break
-    else:
-        for layer in layers:
-            chosen = layer.get('terminal.integrated.defaultProfile.' + key)
-            if not isinstance(chosen, str):
-                continue
-            profiles = [lay.get('terminal.integrated.profiles.' + key) for lay in layers]
-            spec = next((p[chosen] for p in profiles if isinstance(p, dict) and isinstance(p.get(chosen), dict)), {})
-            path = spec.get('path')
-            path = path[0] if isinstance(path, list) and path else path
-            if isinstance(path, str):
-                name = _shell_name(path)
-            elif chosen.lower() in _SHELL_VSCODE_BUILTIN:
-                name = _SHELL_VSCODE_BUILTIN[chosen.lower()] or _shell_windows_powershell()
-            else:
-                name = _shell_name(chosen)
-            break
+            return _shell_name(profile['path'])
+    for layer in layers:
+        chosen = layer.get('terminal.integrated.defaultProfile.' + key)
+        if not isinstance(chosen, str):
+            continue
+        profiles = [lay.get('terminal.integrated.profiles.' + key) for lay in layers]
+        spec = next((p[chosen] for p in profiles if isinstance(p, dict) and isinstance(p.get(chosen), dict)), {})
+        path = spec.get('path')
+        path = path[0] if isinstance(path, list) and path else path
+        if isinstance(path, str):
+            name = _shell_name(path)
+        elif chosen.lower() in _SHELL_VSCODE_BUILTIN:
+            name = _SHELL_VSCODE_BUILTIN[chosen.lower()] or _shell_windows_powershell()
         else:
-            name = _shell_windows_powershell() if windows else _shell_env()
+            name = _shell_name(chosen)
+        break
+    else:
+        name = _shell_windows_powershell() if windows else _shell_env()
     return {'cmd': 'powershell', 'sh': 'bash'}.get(name, name)
 
 
@@ -5415,7 +5421,13 @@ def _shell_detect(agent, tool_name, cwd):
             return _shell_vscode(cwd), 'agent_rule'
         return ('powershell' if windows else 'bash'), 'agent_rule'
     if agent == 'codex':
-        return (_shell_windows_powershell() if windows else _shell_login()), 'agent_rule'
+        # Codex runs a login shell it supports, else zsh on macOS and bash elsewhere.
+        if windows:
+            return _shell_windows_powershell(), 'agent_rule'
+        login = _shell_login()
+        if login not in ('bash', 'zsh', 'sh', 'pwsh', 'powershell'):
+            login = 'zsh' if sys.platform == 'darwin' else 'bash'
+        return login, 'agent_rule'
     if agent == 'cursor':
         return (_shell_windows_powershell() if windows else _shell_env() or _shell_login()), 'agent_rule'
     if agent == 'augment':
