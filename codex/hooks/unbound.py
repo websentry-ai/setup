@@ -7915,11 +7915,13 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
 
 def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
                         key: tuple, raw: bool = False) -> Optional[str]:
-    """The first line one allowlisted lookup printed (as printed, with `raw`), asked once per distinct question."""
+    """The first line one allowlisted lookup printed (all of it, as printed, with `raw`), asked once per question."""
     def resolve():
         output = _account_run(argv, cwd, env, state)
+        if raw:
+            return output
         lines = (output or '').splitlines()
-        return (lines[0] if raw else _account_value(lines[0])) if lines else None
+        return _account_value(lines[0]) if lines else None
 
     return _account_once(state, key, resolve)
 
@@ -7943,8 +7945,8 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
                                ('git-config', name, cwd, _account_env_key(env)), raw=True)
     if not (line or '').strip():
         return None, True
-    # Printed by git, so a `$` in it is literal; one that is still not a single word is unknown, not absent, or the
-    # next setting would answer for it.
+    # Printed by git, so a `$` in it is literal; one that is still not a single word — a multi-line value included —
+    # is unknown, not absent, or the next setting would answer for it.
     value = (line or '').strip()[:_ACCOUNT_MAX_VALUE]
     return (value, True) if not any(ch.isspace() or ord(ch) < 32 for ch in value) else (None, False)
 
