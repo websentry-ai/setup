@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '95d4e094cb4cd0a9f3bd300206b7b0ac59584e1c866c156a48e66022892685e5'
+BLOCK_SHA256 = '7c0c9998740207eb2da88eae7c19c6fdd718f979e069918838114452c1aa1d64'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1160,6 +1160,25 @@ class AccountResolutionTests(unittest.TestCase):
                     commit = hook._accounts('git commit -m one', self.repo, state)
                     hook._accounts('git switch release', self.repo, state)
                     self.assertEqual(bool(commit.get('accounts')), kept, '%s / included=%s' % (path, included))
+
+    def test_a_remote_change_moves_the_committer_only_when_a_file_is_included_by_remote(self):
+        """`includeIf "hasconfig:remote.*.url:..."` picks the committer by remote; without one a remote change keeps it."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        for included, kept in ((False, True), (True, False)):
+            if included:
+                answers['includeIf.hasconfig:remote.*.url:git@github.com:acme/**.path'] = '/tmp/work.gitconfig'
+            with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+                for path, hook in zip(HOOK_PATHS, HOOKS):
+                    state = {}
+                    commit = hook._accounts('git commit -m one', self.repo, state)
+                    hook._accounts('git remote set-url origin git@github.com:jdoe/app.git', self.repo, state)
+                    self.assertEqual(bool(commit.get('accounts')), kept, '%s / included=%s' % (path, included))
+
+    def test_an_inherited_committer_email_the_reader_cannot_take_is_unknown(self):
+        """Inherited and already expanded, a `$` in it is literal; it is still set, so the config does not answer."""
+        with patch.dict(os.environ, {'GIT_COMMITTER_EMAIL': 'j$doe@gmail.com'}):
+            for path, resolved in self.each('git commit -m one'):
+                self.assertFalse((resolved or {}).get('accounts'), path)
 
     def test_a_scoped_remote_change_keeps_the_sibling_pushes_of_one_call(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):

@@ -9496,7 +9496,10 @@ def _account_known(name: str, env: Dict) -> tuple:
         return None, True
     if _account_beyond_reading(env):
         return None, False
-    return _account_value(os.environ.get(name)), True
+    # Inherited and already expanded; one this reader cannot take is still set, so unknown rather than absent.
+    raw = os.environ.get(name)
+    value = _account_value(raw)
+    return value, value is not None or not (isinstance(raw, str) and raw.strip())
 
 
 def _account_setting(name: str, env: Dict) -> Optional[str]:
@@ -9983,13 +9986,17 @@ _ACCOUNT_REMOTE_KEY = re.compile(
 _ACCOUNT_INCLUDE_KEY = re.compile(r'^include(?:if\..+)?\.path$', re.IGNORECASE)
 
 
-def _account_branch_includes(args: List[str], cwd: Optional[str], env: Dict, state: Dict) -> bool:
-    """Whether this checkout's configuration includes a file by branch (`includeIf "onbranch:..."`), so a branch
-    change can change the committer; true when the key names cannot be read. Reads key names only, never values."""
+def _account_includes_on(condition: str, args: List[str], cwd: Optional[str], env: Dict, state: Dict) -> bool:
+    """Whether this checkout's configuration includes a file on `condition` (`onbranch:`, `hasconfig:remote.`), so
+    a branch or remote change can change the committer; true when the key names cannot be read. Names only."""
     cwd, env, _overrides = _account_git_context(args, cwd, env)
     names = _account_once(state, ('git-config-names', cwd, _account_env_key(env)), lambda: _account_run(
         ['git', 'config', '--name-only', '--list'], cwd, env, state))
-    return names is None or any(name.lower().startswith('includeif.onbranch:') for name in names.splitlines())
+    return names is None or any(name.lower().startswith('includeif.' + condition) for name in names.splitlines())
+
+
+# The include conditions a branch or a remote change can flip.
+_ACCOUNT_INCLUDE_CONDITIONS = {'git-branch': 'onbranch:', 'git-remote': 'hasconfig:remote.'}
 
 
 def _account_config_section(after: List[str]) -> str:
@@ -10074,10 +10081,11 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
                     _account_withdraw(entry, moved(implicit))
                 held[:] = [(entry, implicit) for entry, implicit in held if entry.get('pushed_repo')]
                 # A gh login read from the checkout's remote host moves with the remote, and the committer with an
-                # include, or with a branch change when a file is included by branch.
+                # include, or with a branch or remote change when a file is included on one.
                 moving = {'git-remote'} if switched != 'git-branch' else set()
-                if switched == 'git-include' or (switched == 'git-branch' and any(
-                        item[0] == 'git' for item in taken) and _account_branch_includes(args, call_cwd, env, state)):
+                condition = _ACCOUNT_INCLUDE_CONDITIONS.get(switched)
+                if switched == 'git-include' or (condition and any(item[0] == 'git' for item in taken)
+                                                 and _account_includes_on(condition, args, call_cwd, env, state)):
                     moving.add('git')
                 hit = [item for item in taken if item[0] in moving]
                 for _key, accounts, account in hit:
