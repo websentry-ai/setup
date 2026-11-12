@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '6ee77173f2ed2f2b8877ee1b6505aaf2c89cbea1b031660a8c7179868dc98ebb'
+BLOCK_SHA256 = 'e2319fa34a2f21dbbe52c959c67554a89eb27dfd8cf2dba4ae4ef13afbef3315'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -440,10 +440,11 @@ class AccountResolutionTests(unittest.TestCase):
         with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
             for path, resolved in self.each('git commit -m a'):
                 self.assertEqual(resolved['accounts'][0]['email'], 'build$bot@example.com', path)
-        answers['committer.email'] = 'Build Bot'
-        with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
-            for path, resolved in self.each('git commit -m a'):
-                self.assertNotIn('accounts', resolved or {}, path)
+        for committer in ('Build Bot', 'build@example.com\nother@example.com'):
+            answers['committer.email'] = committer
+            with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+                for path, resolved in self.each('git commit -m a'):
+                    self.assertNotIn('accounts', resolved or {}, '%s / %r' % (path, committer))
 
     def test_a_variable_the_shell_unset_does_not_reach_the_lookup(self):
         """Removing it from the child's environment, not just from our own reading of it."""

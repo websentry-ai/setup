@@ -7945,11 +7945,13 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
 
 def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
                         key: tuple, raw: bool = False) -> Optional[str]:
-    """The first line one allowlisted lookup printed (as printed, with `raw`), asked once per distinct question."""
+    """The first line one allowlisted lookup printed (all of it, as printed, with `raw`), asked once per question."""
     def resolve():
         output = _account_run(argv, cwd, env, state)
+        if raw:
+            return output
         lines = (output or '').splitlines()
-        return (lines[0] if raw else _account_value(lines[0])) if lines else None
+        return _account_value(lines[0]) if lines else None
 
     return _account_once(state, key, resolve)
 
@@ -8024,8 +8026,8 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
                                ('git-config', name, cwd, _account_env_key(env)), raw=True)
     if not (line or '').strip():
         return None, True
-    # Printed by git, so a `$` in it is literal; one that is still not a single word is unknown, not absent, or the
-    # next setting would answer for it.
+    # Printed by git, so a `$` in it is literal; one that is still not a single word — a multi-line value included —
+    # is unknown, not absent, or the next setting would answer for it.
     value = (line or '').strip()[:_ACCOUNT_MAX_VALUE]
     return (value, True) if not any(ch.isspace() or ord(ch) < 32 for ch in value) else (None, False)
 
@@ -8561,9 +8563,10 @@ def _account_kubernetes(args: List[str], env: Dict, cwd: Optional[str], state: D
         # The endpoint the call names IS the cluster it reached, whatever context or cluster it also names.
         return [{'platform': 'kubernetes', 'server': server, 'source': 'command'}], None
     # A context name may hold spaces, so it is read as given rather than as a one-word identity.
-    context, known = _account_option(args, ('--context',), _account_path)
-    chosen, named = _account_option(args, ('--kubeconfig',), _account_path)
-    cluster_named, cluster_known = _account_option(args, ('--cluster',))
+    # Read past the values of the free-text options, as the server is, so a template cannot pick a cluster.
+    context, known = _account_option(args, ('--context',), _account_path, skip=_ACCOUNT_KUBE_TEXT_OPTIONS)
+    chosen, named = _account_option(args, ('--kubeconfig',), _account_path, skip=_ACCOUNT_KUBE_TEXT_OPTIONS)
+    cluster_named, cluster_known = _account_option(args, ('--cluster',), skip=_ACCOUNT_KUBE_TEXT_OPTIONS)
     # `--kubeconfig` takes one file; a list there is a path kubectl cannot open, unlike the same list in
     # KUBECONFIG, so the endpoint stays unknown rather than the default config's.
     listed = bool(chosen) and os.pathsep in chosen
@@ -8658,10 +8661,12 @@ _ACCOUNT_KUBE_SWITCHES = frozenset({'--insecure-skip-tls-verify', '--match-serve
                                     '--logtostderr', '--alsologtostderr', '--add-dir-header', '--one-output',
                                     '--skip-headers', '--skip-log-headers'})
 # kubectl options whose value is free text, so nothing inside one is read as an option.
+# Not `-f`, `-p` or `--command`: on `logs` and `run` they take no value, and a path or a patch never reads as an
+# option anyway.
 _ACCOUNT_KUBE_TEXT_OPTIONS = frozenset({
-    '-o', '--output', '--template', '-p', '--patch', '--overrides', '-l', '--selector', '--field-selector',
-    '-f', '--filename', '-k', '--kustomize', '--from-literal', '--env', '-e', '--sort-by', '-L', '--label-columns',
-    '--image', '--command', '--annotation',
+    '-o', '--output', '--template', '--patch', '--overrides', '-l', '--selector', '--field-selector',
+    '--filename', '-k', '--kustomize', '--from-literal', '--env', '-e', '--sort-by', '-L', '--label-columns',
+    '--image', '--annotation',
 })
 # kubectl subcommands that run on this machine only: help, completion, a local kustomize build, plugins, config.
 _ACCOUNT_KUBE_LOCAL = frozenset({'', 'config', 'completion', 'kustomize', 'plugin', 'help', 'options'})

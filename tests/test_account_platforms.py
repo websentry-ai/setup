@@ -698,6 +698,18 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(resolved['accounts'][0]['cluster'], 'prod', path)
             self.assertNotEqual(resolved['accounts'][0].get('server'), 'https://other.example', path)
 
+    def test_a_selector_inside_a_template_is_text_and_a_boolean_flag_takes_no_value(self):
+        """`--context=` in a template picks no cluster; `logs -f` is `--follow`, so the `--server` after it counts."""
+        for path, resolved in self.each("kubectl get pods -o go-template --template '--context=staging'"):
+            self.assertEqual(resolved['accounts'][0]['cluster'], 'prod', path)
+            self.assertNotIn('context', resolved['accounts'][0], path)
+        for command in ('kubectl logs pod -f --server https://other.example.com',
+                        'kubectl logs pod -p --server https://other.example.com',
+                        'kubectl run net --image=nginx --command --server https://other.example.com'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['server'], 'https://other.example.com',
+                                 '%s / %s' % (path, command))
+
     def test_eks_and_aks_kubeconfig_writers_drop_the_earlier_cluster(self):
         """Both rewrite the kubeconfig and its current context, which an earlier kubectl call was read from."""
         for writer in ('aws eks update-kubeconfig --name prod --region us-west-2',
