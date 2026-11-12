@@ -2219,7 +2219,7 @@ def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
     for folder in (start, *start.parents):
         try:
             data = json.loads((folder / '.mcp.json').read_text(encoding='utf-8'))
-        except (OSError, ValueError):
+        except Exception:
             continue
         servers = data.get('mcpServers') if isinstance(data, dict) else None
         if isinstance(servers, dict) and server_name in servers:
@@ -2231,10 +2231,11 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
     """Claude Code's own scope order: local (~/.claude.json projects), then
     project (.mcp.json), then user (~/.claude.json top level)."""
     try:
-        config = {}
-        if config_path.exists():
+        try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = json.loads(f.read())
+        except Exception:
+            config = {}  # missing or mid-write: project .mcp.json still applies
         if not isinstance(config, dict):
             config = {}
 

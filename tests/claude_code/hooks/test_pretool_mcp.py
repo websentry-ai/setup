@@ -1129,6 +1129,16 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
         self.assertEqual(self.forwarded(), self.FS)
 
+    def test_read_with_an_unparseable_claude_json(self):
+        self.claude_json.write_text('{"mcpServers": {')
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_deeply_nested_mcp_json_does_not_drop_user_scope(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
+        (self.repo / ".mcp.json").write_text("[" * 100000 + "]" * 100000)
+        self.assertEqual(self.forwarded(), self.FS)
+
     def test_malformed_nearer_file_falls_through_to_parent(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
         sub = self.repo / "pkg"
