@@ -2221,7 +2221,7 @@ def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
             break  # Claude stops below the filesystem root
         path = folder / '.mcp.json'
         try:
-            if not path.is_file() or path.stat().st_size > 1_000_000:
+            if not path.is_file():
                 continue
             data = json.loads(path.read_text(encoding='utf-8'))
         except Exception:

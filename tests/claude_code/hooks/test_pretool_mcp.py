@@ -1146,11 +1146,12 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.cwd = str(sub)
         self.assertEqual(self.forwarded(), self.FS)
 
-    def test_oversized_mcp_json_is_skipped(self):
+    def test_large_mcp_json_is_still_read(self):
+        # Claude has no size cap, so padding must not swap in another scope's server.
         _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
         _write_json(self.repo / ".mcp.json", {
             "mcpServers": {"fsx": self.OTHER}, "pad": "x" * 1_100_000})
-        self.assertEqual(self.forwarded(), self.FS)
+        self.assertEqual(self.forwarded(), self.OTHER)
 
     def test_malformed_nearer_file_falls_through_to_parent(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
