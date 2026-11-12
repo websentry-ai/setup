@@ -2242,7 +2242,7 @@ def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:
 
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
     """Claude Code's own scope order, from the launch folder: local (~/.claude.json
-    projects, including sibling worktrees), then project (.mcp.json), then user."""
+    projects, keyed by the main checkout in a worktree), then project (.mcp.json), then user."""
     cwd = _claude_launch_dir(cwd)
     try:
         try:
@@ -2270,9 +2270,14 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                         break
                     cwd_path = parent
 
-            union = _read_mcp_server_config_worktree_union(server_name, config_path, cwd=cwd)
-            if union:
-                return union
+            # From a linked worktree, Claude's local scope is the main checkout's entry.
+            roots = _git_worktree_roots(cwd)
+            main = projects.get(roots[0].replace('\\', '/').rstrip('/')) if roots and isinstance(projects, dict) else None
+            main_servers = main.get('mcpServers') if isinstance(main, dict) else None
+            if isinstance(main_servers, dict) and server_name in main_servers:
+                result = _extract_mcp_server_fields(main_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
             result = _project_mcp_json_server(server_name, cwd)
             if result:
                 return _augment_script_hash(result, cwd)

@@ -1118,19 +1118,35 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.cwd = str(elsewhere)
         self.assertEqual(self.forwarded(), self.FS)
 
-    def test_sibling_worktree_local_server_beats_project_mcp_json(self):
-        # Claude unions local scope across a repo's worktrees and ranks it above .mcp.json.
+    def _worktrees(self):
         import subprocess
         git = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True)
         git("-C", str(self.repo), "init", "-q")
         git("-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i")
-        wt = self.root / "wt"
-        git("-C", str(self.repo), "worktree", "add", "-q", str(wt))
-        main = os.path.realpath(self.repo)  # git records worktree paths resolved
-        _write_json(self.claude_json, {
-            "mcpServers": {}, "projects": {main: {"mcpServers": {"fsx": self.OTHER}}}})
-        _write_json(wt / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
-        self.cwd = str(wt)
+        a, b = self.root / "wtA", self.root / "wtB"
+        git("-C", str(self.repo), "worktree", "add", "-q", str(a))
+        git("-C", str(self.repo), "worktree", "add", "-q", str(b))
+        # git records worktree paths resolved, and so does Claude's projects key
+        return os.path.realpath(self.repo), a, os.path.realpath(b)
+
+    def test_main_checkout_local_server_beats_project_mcp_json_in_a_worktree(self):
+        main, a, _ = self._worktrees()
+        _write_json(self.claude_json, {"mcpServers": {}, "projects": {main: {"mcpServers": {"fsx": self.OTHER}}}})
+        _write_json(a / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(a)
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_entry_keyed_under_a_sibling_worktree_does_not_beat_project_mcp_json(self):
+        _, a, b = self._worktrees()
+        _write_json(self.claude_json, {"mcpServers": {}, "projects": {b: {"mcpServers": {"fsx": self.OTHER}}}})
+        _write_json(a / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(a)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_sibling_worktree_entry_is_still_the_last_resort(self):
+        _, a, b = self._worktrees()
+        _write_json(self.claude_json, {"mcpServers": {}, "projects": {b: {"mcpServers": {"fsx": self.OTHER}}}})
+        self.cwd = str(a)
         self.assertEqual(self.forwarded(), self.OTHER)
 
     def test_script_scan_reads_from_the_launch_folder(self):
