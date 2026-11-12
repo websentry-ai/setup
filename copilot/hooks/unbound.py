@@ -5670,11 +5670,31 @@ def _shell_settings(path):
 # VS Code's built-in terminal profile names on each OS, for a default profile with no path of its own.
 _SHELL_VSCODE_BUILTIN = {'powershell': None, 'windows powershell': 'powershell', 'command prompt': 'cmd',
                          'git bash': 'bash'}
+# Folders a shell is installed into; a workspace setting pointing anywhere else names a file the repository ships.
+_SHELL_SYSTEM_DIRS = ('/bin/', '/usr/bin/', '/usr/local/bin/', '/opt/homebrew/bin/', '/opt/microsoft/powershell/',
+                      '/usr/local/microsoft/powershell/', 'c:/windows/', 'c:/program files/', 'c:/program files (x86)/',
+                      '${env:windir}/', '%windir%/', '%systemroot%/')
+
+
+def _shell_system_path(path):
+    """A shell named bare (found on PATH) or installed in a system folder, never one inside a repository."""
+    p = path.strip().strip('"').lower().replace('\\', '/')
+    return '/' not in p or (p.startswith(_SHELL_SYSTEM_DIRS) and '/../' not in p)
+
+
+def _shell_vscode_app():
+    """The VS Code edition running the hook: Insiders when its environment says so, else the stable one."""
+    for key in ('VSCODE_IPC_HOOK', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_CODE_CACHE_PATH', 'VSCODE_NLS_CONFIG',
+                'TERM_PROGRAM_VERSION'):
+        if 'insider' in (os.environ.get(key) or '').lower():
+            return 'Code - Insiders'
+    return 'Code'
 
 
 def _shell_vscode(cwd):
-    """The shell Copilot's run_in_terminal uses: its own terminal profile, else the default one; workspace settings
-    win over the user's, and a default of cmd runs as Windows PowerShell and of /bin/sh as bash."""
+    """The shell Copilot's run_in_terminal uses: its own terminal profile, else the default one. Workspace settings
+    win over the editor's user settings only for a system shell; a default of cmd runs as Windows PowerShell and of
+    /bin/sh as bash."""
     windows = _shell_windows()
     key = 'windows' if windows else 'osx' if sys.platform == 'darwin' else 'linux'
     if windows:
@@ -5683,21 +5703,30 @@ def _shell_vscode(cwd):
         user_root = Path.home() / 'Library' / 'Application Support'
     else:
         user_root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-    layers = ([_shell_settings(Path(cwd) / '.vscode' / 'settings.json')] if cwd else []) + \
-        [_shell_settings(user_root / app / 'User' / 'settings.json') for app in ('Code', 'Code - Insiders')]
-    for layer in layers:
+    # (settings, from the workspace): one editor's user settings, as a window reads only its own.
+    layers = ([(_shell_settings(Path(cwd) / '.vscode' / 'settings.json'), True)] if cwd else []) + \
+        [(_shell_settings(user_root / _shell_vscode_app() / 'User' / 'settings.json'), False)]
+    for layer, workspace in layers:
         profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
         if isinstance(profile, dict) and isinstance(profile.get('path'), str):
+            if workspace and not _shell_system_path(profile['path']):
+                continue
             return _shell_name(profile['path'])
-    for layer in layers:
+    for layer, workspace in layers:
         chosen = layer.get('terminal.integrated.defaultProfile.' + key)
         if not isinstance(chosen, str):
             continue
-        profiles = [lay.get('terminal.integrated.profiles.' + key) for lay in layers]
-        spec = next((p[chosen] for p in profiles if isinstance(p, dict) and isinstance(p.get(chosen), dict)), {})
+        spec, spec_workspace = {}, workspace
+        for lay, lay_workspace in layers:
+            found = lay.get('terminal.integrated.profiles.' + key)
+            if isinstance(found, dict) and isinstance(found.get(chosen), dict):
+                spec, spec_workspace = found[chosen], workspace or lay_workspace
+                break
         path = spec.get('path')
         path = path[0] if isinstance(path, list) and path else path
         if isinstance(path, str):
+            if spec_workspace and not _shell_system_path(path):
+                continue
             name = _shell_name(path)
         elif chosen.lower() in _SHELL_VSCODE_BUILTIN:
             name = _SHELL_VSCODE_BUILTIN[chosen.lower()] or _shell_windows_powershell()
