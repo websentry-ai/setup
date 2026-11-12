@@ -2607,6 +2607,59 @@ def _read_mcp_server_config_regex(server_name, config_path):
         return None
 
 
+
+def _codex_project_root(cwd):
+    """Codex's project root: the nearest folder at or above cwd holding .git, else cwd."""
+    start = Path(cwd).expanduser()
+    for folder in (start, *start.parents):
+        if (folder / '.git').exists():
+            return folder
+    return start
+
+
+def _codex_trusted_projects():
+    """Paths the user trusted in $CODEX_HOME/config.toml ([projects."<path>"] trust_level)."""
+    try:
+        raw = CODEX_CONFIG_PATH.read_text(encoding='utf-8')
+    except OSError:
+        return []
+    try:
+        import tomllib
+        projects = tomllib.loads(raw).get('projects')
+        if not isinstance(projects, dict):
+            return []
+        return [p for p, v in projects.items() if isinstance(v, dict) and v.get('trust_level') == 'trusted']
+    except ImportError:
+        section_re = re.compile(
+            r'^\s*\[projects\.(?:"([^"]+)"|\'([^\']+)\')\][^\n]*\n(.*?)(?=^\s*\[|\Z)',
+            re.MULTILINE | re.DOTALL,
+        )
+        return [m.group(1) or m.group(2) for m in section_re.finditer(raw)
+                if re.search(r'^\s*trust_level\s*=\s*["\']trusted["\']', m.group(3), re.MULTILINE)]
+    except Exception:
+        return []
+
+
+def _codex_mcp_server_config(server_name, cwd):
+    """Codex's precedence: a trusted project's .codex/config.toml files, nearest to
+    cwd first, then $CODEX_HOME/config.toml. Untrusted projects are skipped, as
+    Codex skips them."""
+    try:
+        if cwd:
+            root = _codex_project_root(cwd)
+            target = os.path.realpath(root)
+            if any(os.path.realpath(os.path.expanduser(p)) == target for p in _codex_trusted_projects()):
+                start = Path(cwd).expanduser()
+                for folder in (start, *start.parents):
+                    cfg = _read_mcp_server_config(server_name, folder / '.codex' / 'config.toml')
+                    if cfg:
+                        return cfg
+                    if folder == root:
+                        break
+    except Exception:
+        pass
+    return _read_mcp_server_config(server_name, CODEX_CONFIG_PATH)
+
 def _email_domain(email: Optional[str]) -> Optional[str]:
     try:
         if email and '@' in email:
@@ -2930,7 +2983,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
         if mcp_server:
-            server_cfg = _read_mcp_server_config(mcp_server, CODEX_CONFIG_PATH)
+            server_cfg = _codex_mcp_server_config(mcp_server, metadata.get('cwd'))
             if server_cfg:
                 metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd'))
             _attach_tool_content_hash(metadata)
