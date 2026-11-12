@@ -7481,6 +7481,7 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # Only these commands are ever run; everything else is refused. All are local, and none of them prints a credential.
 _ACCOUNT_ALLOWED_RUNS = (
     ('git', 'config', '--get'),
+    ('git', 'config', '--name-only', '--list'),
     ('git', 'remote', '-v'),
     ('git', 'remote', 'get-url', '--push'),
     ('git', 'symbolic-ref', '--short', 'HEAD'),
@@ -8143,6 +8144,10 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         # Removing or renaming a whole section changes every key in it: `user` the committer, a remote, URL or
         # branch section where a push goes.
         section = _account_config_section(after) if subcommand == 'config' else ''
+        # An included file can set any key, so a change to what is included moves the committer and the pushes.
+        if section.startswith('include') or written(
+                [at for at, arg in enumerate(after) if _ACCOUNT_INCLUDE_KEY.match(arg)]):
+            return 'git-include'
         if section in ('user', 'committer'):
             return 'git'
         if section.startswith(('remote', 'url', 'branch')):
@@ -8157,6 +8162,16 @@ _ACCOUNT_REMOTE_EDITS = frozenset({'add', 'set-url', 'rename', 'remove', 'rm'})
 _ACCOUNT_REMOTE_KEY = re.compile(
     r'^(?:remote\.(?P<remote>.+)\.(?:url|pushurl)|url\..+\.(?:insteadof|pushinsteadof)'
     r'|branch\..+\.(?:remote|pushremote)|remote\.pushdefault)$', re.IGNORECASE)
+_ACCOUNT_INCLUDE_KEY = re.compile(r'^include(?:if\..+)?\.path$', re.IGNORECASE)
+
+
+def _account_branch_includes(args: List[str], cwd: Optional[str], env: Dict, state: Dict) -> bool:
+    """Whether this checkout's configuration includes a file by branch (`includeIf "onbranch:..."`), so a branch
+    change can change the committer; true when the key names cannot be read. Reads key names only, never values."""
+    cwd, env, _overrides = _account_git_context(args, cwd, env)
+    names = _account_once(state, ('git-config-names', cwd, _account_env_key(env)), lambda: _account_run(
+        ['git', 'config', '--name-only', '--list'], cwd, env, state))
+    return names is None or any(name.lower().startswith('includeif.onbranch:') for name in names.splitlines())
 
 
 def _account_config_section(after: List[str]) -> str:
@@ -8220,13 +8235,13 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             switched = _account_switches(program, args)
             # Run as another user, a switch changes that user's configuration, not ours; only a git write to this
             # repository's config, which both read, still moves our committer or our pushes.
-            if switched and other_user and (switched not in ('git', 'git-remote', 'git-branch') or any(
+            if switched and other_user and (switched not in ('git', 'git-remote', 'git-branch', 'git-include') or any(
                     arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
                     or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
                 switched = None
-            if switched in ('git-branch', 'git-remote'):
+            if switched in ('git-branch', 'git-remote', 'git-include'):
                 # Push destinations are read when the turn ends, so a later branch change moves a push its branch's
-                # config chose, and a remote change one through that remote (any, for a rewrite rule).
+                # config chose, and a remote change one through that remote (any, for a rewrite or an include).
                 scope = _account_remote_scope(args)
 
                 def moved(implicit):
@@ -8240,13 +8255,17 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
                 for entry, implicit in held:
                     _account_withdraw(entry, moved(implicit))
                 held[:] = [(entry, implicit) for entry, implicit in held if entry.get('pushed_repo')]
-                if switched == 'git-remote':
-                    # A gh login read from the checkout's remote host moves with it too.
-                    hit = [item for item in taken if item[0] == 'git-remote']
-                    for _key, accounts, account in hit:
-                        if account in accounts:
-                            accounts.remove(account)
-                    taken[:] = [item for item in taken if item not in hit]
+                # A gh login read from the checkout's remote host moves with the remote, and the committer with an
+                # include, or with a branch change when a file is included by branch.
+                moving = {'git-remote'} if switched != 'git-branch' else set()
+                if switched == 'git-include' or (switched == 'git-branch' and any(
+                        item[0] == 'git' for item in taken) and _account_branch_includes(args, call_cwd, env, state)):
+                    moving.add('git')
+                hit = [item for item in taken if item[0] in moving]
+                for _key, accounts, account in hit:
+                    if account in accounts:
+                        accounts.remove(account)
+                taken[:] = [item for item in taken if item not in hit]
             elif switched:
                 # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
                 host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None

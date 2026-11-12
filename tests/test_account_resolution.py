@@ -24,11 +24,12 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '2dc5061b2acb2d0dd9f4b358c4de98204adaed06e7031aba09f1e97dc13813a9'
+BLOCK_SHA256 = '95d4e094cb4cd0a9f3bd300206b7b0ac59584e1c866c156a48e66022892685e5'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
-# A `git` stand-in: answers `config --get`, `remote get-url --push` and `symbolic-ref` from FAKE_GIT_ANSWERS,
+# A `git` stand-in: answers `config --get`, `config --name-only --list`, `remote get-url --push` and `symbolic-ref`
+# from FAKE_GIT_ANSWERS,
 # honours GIT_CONFIG_GLOBAL as git does, and logs every call.
 FAKE_GIT = '''#!{python}
 import json, os, re, sys
@@ -67,6 +68,13 @@ if args[:2] == ['config', '--get']:
         print(answers[name])
         sys.exit(0)
     sys.exit(1)
+if args[:3] == ['config', '--name-only', '--list']:
+    # Key names only, as git lists them: every dotted answer and every indexed key.
+    for key in sorted(k for k in answers if '.' in k):
+        print(key.lower())
+    for n in range(int(os.environ.get('GIT_CONFIG_COUNT') or 0)):
+        print(os.environ.get('GIT_CONFIG_KEY_%d' % n, '').lower())
+    sys.exit(0)
 if args[:2] == ['remote', '-v']:
     # The checkout's remotes, from FAKE_GIT_ANSWERS['remote.<name>.url'], listed by name as git does.
     for key in sorted(k for k in answers if k.startswith('remote.') and k.endswith('.url')):
@@ -1121,6 +1129,37 @@ class AccountResolutionTests(unittest.TestCase):
             hook._accounts('git config --remove-section remote.origin', self.repo, state)
             self.assertNotIn('pushed_repo', origin, path)
             self.assertEqual(personal['pushed_repo'], 'jdoe-dev/app', path)
+
+    def test_changing_what_is_included_is_a_switch(self):
+        """An included file can set the committer and where a push goes, so a change to the includes moves both."""
+        for switch in ('git config --local include.path /tmp/personal.gitconfig',
+                       'git config includeIf.onbranch:main.path /tmp/personal.gitconfig',
+                       'git config --remove-section include'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                commit = hook._accounts('git commit -m one', self.repo, state)
+                push = hook._with_accounts({}, hook._accounts('git push origin main', self.repo, state), state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(commit.get('accounts'), [], '%s / %s' % (path, switch))
+                self.assertNotIn('pushed_repo', push, '%s / %s' % (path, switch))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            commit = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('git config --get include.path', self.repo, state)
+            self.assertEqual(commit['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_a_branch_change_moves_the_committer_only_when_a_file_is_included_by_branch(self):
+        """`includeIf "onbranch:..."` picks the committer by branch; without one a branch change keeps it."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        for included, kept in ((False, True), (True, False)):
+            if included:
+                answers['includeIf.onbranch:work/**.path'] = '/tmp/work.gitconfig'
+            with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+                for path, hook in zip(HOOK_PATHS, HOOKS):
+                    state = {}
+                    commit = hook._accounts('git commit -m one', self.repo, state)
+                    hook._accounts('git switch release', self.repo, state)
+                    self.assertEqual(bool(commit.get('accounts')), kept, '%s / included=%s' % (path, included))
 
     def test_a_scoped_remote_change_keeps_the_sibling_pushes_of_one_call(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
