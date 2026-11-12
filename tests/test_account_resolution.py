@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '17cfdcacbab53f0ea55877f1d3c3e9b71eba8d1e4804147d278095e18d73c27e'
+BLOCK_SHA256 = '2dc5061b2acb2d0dd9f4b358c4de98204adaed06e7031aba09f1e97dc13813a9'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
@@ -1093,6 +1093,17 @@ class AccountResolutionTests(unittest.TestCase):
             hook._accounts('git checkout release', self.repo, state)
             self.assertNotIn('pushed_repo', bare, path)
             self.assertEqual(named['pushed_repo'], 'acme/app', path)
+
+    def test_a_branch_change_keeps_a_named_push_that_one_call_also_made_bare(self):
+        """In one call the two pushes collapse into one destination; the named one still reached it."""
+        for command in ('git push; git push origin main', 'git push origin main; git push'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                both = hook._with_accounts({}, hook._accounts(command, self.repo, state), state)
+                hook._accounts('git checkout release', self.repo, state)
+                self.assertEqual(both.get('pushed_repo'), 'acme/app', '%s / %s' % (path, command))
+            for path, resolved in self.each(command + '; git switch release'):
+                self.assertEqual((resolved or {}).get('pushed_repo'), 'acme/app', '%s / %s' % (path, command))
 
     def test_removing_or_renaming_a_config_section_is_a_switch(self):
         """`--remove-section user` exposes another committer; `--rename-section remote.origin` moves origin's pushes."""

@@ -8311,7 +8311,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
         # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
-        found, pushes = [], []
+        found, pushes, named = [], [], []
         state['account_implicit_call'] = []
         # Accounts are read when the turn ends, so one an earlier call took from the active configuration is the
         # switched one if a later call switched it. Those earlier accounts are dropped then, in place.
@@ -8363,7 +8363,12 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
                 continue
             if program == 'git' and empty_git_config:
                 continue
+            implicit_call = state['account_implicit_call']
+            before = len(implicit_call)
             accounts, reached = handler(args, env, call_cwd, state)
+            # A push named outright stays known whatever branch a bare push to the same place in this call followed.
+            named.extend(push for push in reached or [] if push not in implicit_call[before:])
+            implicit_call[:] = [push for push in implicit_call if push not in named]
             for account in accounts:
                 active = account.pop('_active', False)
                 if account in found:
