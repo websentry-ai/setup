@@ -24,7 +24,7 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = '3f2cce6b93692536ba98d3d0fbc0bf4a698cc83cb2d9adf4706f133e740e6a1a'
+BLOCK_SHA256 = 'ca29b01370dd46f7c530968beee1cc95e1ffaea0dbfb2b3b9d6a752a877ef74c'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 

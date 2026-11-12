@@ -8696,7 +8696,8 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
             return 'github'
     if program == 'git':
         subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
-        if subcommand == 'remote' and _account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[0] in _ACCOUNT_REMOTE_EDITS:
+        edit = _account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[0] if subcommand == 'remote' else ''
+        if edit in _ACCOUNT_REMOTE_EDITS:
             return 'git-remote'
         if subcommand in ('checkout', 'switch') and '--' not in after:
             return 'git-branch'
@@ -8749,7 +8750,8 @@ def _account_remote_scope(args: List[str]) -> Optional[str]:
     """The one remote a remote change names, or None when it can move any push (a URL rewrite, a push target)."""
     subcommand, after = _account_subcommand(args, _ACCOUNT_GIT_VALUE_OPTIONS)
     if subcommand == 'remote':
-        return _account_value(_account_subcommand(_account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[1], _ACCOUNT_GIT_VALUE_OPTIONS)[0])
+        edited = _account_subcommand(after, _ACCOUNT_GIT_VALUE_OPTIONS)[1]
+        return _account_value(_account_subcommand(edited, _ACCOUNT_GIT_VALUE_OPTIONS)[0])
     for arg in after:
         match = _ACCOUNT_REMOTE_KEY.match(arg)
         if match:
