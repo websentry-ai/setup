@@ -452,12 +452,19 @@ def _login_shell():
     return name if name in ('bash', 'zsh', 'sh', 'fish', 'dash', 'ksh') else 'zsh'
 
 
+def _codex_shell():
+    """Codex runs a login shell it supports, else zsh on macOS and bash elsewhere."""
+    import pwd
+    name = os.path.basename(pwd.getpwuid(os.getuid()).pw_shell or '').lower()
+    return name if name in ('bash', 'zsh', 'sh') else 'zsh' if sys.platform == 'darwin' else 'bash'
+
+
 # On macOS and Linux, with SHELL=/bin/zsh: (shell, how the hook knows) for each agent's shell tool.
 EXPECTED_SHELL = {
     'claude-code': ('zsh', 'tool'),          # Claude Code's Bash tool runs the user's bash or zsh.
     'cursor': ('zsh', 'agent_rule'),         # Cursor runs $SHELL.
     'copilot': ('bash', 'tool'),             # Copilot CLI's lowercase `bash` tool.
-    'codex': (None, 'agent_rule'),           # Codex runs the account's login shell, filled in below.
+    'codex': (None, 'agent_rule'),           # Codex runs the account's login shell if it supports it; below.
     'augment': ('zsh', 'agent_rule'),        # Auggie runs $SHELL when it is bash, zsh, fish or sh.
     'pi': ('bash', 'tool'),                  # Pi's bash tool runs bash.
 }
@@ -475,7 +482,7 @@ def shell_of(entry):
 def test_the_real_hook_names_the_shell_on_the_policy_check_and_the_turn_log(tool, sandbox, gateway):
     expected = EXPECTED_SHELL[tool]
     if tool == 'codex':
-        expected = (_login_shell(), 'agent_rule')
+        expected = (_codex_shell(), 'agent_rule')
     RUNS[tool](sandbox, shell_env(sandbox, gateway))
 
     calls = [entry for entry in tool_entries(turn_log(gateway, tool)) if command_of(entry) == COMMAND]
