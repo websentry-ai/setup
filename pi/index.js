@@ -1225,7 +1225,7 @@ function redactSecrets(text, apiKey) {
 }
 
 // packages/core/src/shell.ts
-import { existsSync, readFileSync as readFileSync2 } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join as join4 } from "node:path";
 var SHELL_NAMES = /* @__PURE__ */ new Set(["bash", "zsh", "sh", "fish", "dash", "ksh", "powershell", "pwsh", "cmd"]);
@@ -1242,7 +1242,10 @@ function onPath(program2) {
 }
 function piShellPath() {
   try {
-    const settings = JSON.parse(readFileSync2(join4(homedir(), ".pi", "agent", "settings.json"), "utf8"));
+    const dir = resolvePiAgentDir(process.env, homedir());
+    const raw = dir === void 0 ? void 0 : readSmallRegularFile(join4(dir, "settings.json"), MAX_CONFIG_BYTES);
+    if (raw === void 0) return void 0;
+    const settings = JSON.parse(raw.replace(/^\uFEFF/, ""));
     if (settings === null || typeof settings !== "object") return void 0;
     return settings.shellPath;
   } catch {
@@ -1257,8 +1260,9 @@ function detectShell(toolName) {
   if (cached !== void 0) return { ...cached };
   let info = {};
   try {
-    const shell = tool === "powershell" ? process.platform === "win32" && !onPath("pwsh") ? "powershell" : "pwsh" : shellName(piShellPath()) ?? "bash";
-    info = { shell, shell_source: "tool" };
+    const custom = tool === "bash" ? piShellPath() : void 0;
+    const shell = tool === "powershell" ? process.platform === "win32" && !onPath("pwsh") ? "powershell" : "pwsh" : typeof custom === "string" && custom !== "" ? shellName(custom) : "bash";
+    info = shell === void 0 ? {} : { shell, shell_source: "tool" };
   } catch {
     info = {};
   }
@@ -1434,7 +1438,7 @@ function createKeyState(opts = {}) {
 var keyState = createKeyState();
 
 // packages/core/src/piVersion.ts
-import { readFileSync as readFileSync3 } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join5 } from "node:path";
 var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 var MAX_WALK_UP_LEVELS = 8;
@@ -1443,7 +1447,7 @@ function readManagedInstallVersion(env) {
   const root = env[ENV_PI_INSTALL_ROOT];
   if (typeof root !== "string" || root.length === 0) return void 0;
   try {
-    const version = readFileSync3(join5(root, "current-version"), "utf8").trim();
+    const version = readFileSync2(join5(root, "current-version"), "utf8").trim();
     return version.length > 0 ? version : void 0;
   } catch {
     return void 0;
@@ -1454,7 +1458,7 @@ function readVersionFromArgv(argv1) {
   let dir = dirname2(argv1);
   for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
     try {
-      const parsed = JSON.parse(readFileSync3(join5(dir, "package.json"), "utf8"));
+      const parsed = JSON.parse(readFileSync2(join5(dir, "package.json"), "utf8"));
       if (parsed !== null && typeof parsed === "object") {
         const pkg = parsed;
         if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
@@ -1920,7 +1924,7 @@ import {
   mkdtempSync,
   openSync,
   readdirSync,
-  readFileSync as readFileSync4,
+  readFileSync as readFileSync3,
   readSync,
   realpathSync,
   rmSync,
@@ -4320,7 +4324,7 @@ function curlrcUnsafe(env, state) {
 function curlrcHasUnsafe(path) {
   let text;
   try {
-    const data = readFileSync4(path);
+    const data = readFileSync3(path);
     if (data.length > SSH_CONFIG_MAX_BYTES) return true;
     text = data.toString("utf8");
   } catch {
@@ -4370,7 +4374,7 @@ function wgetrcUnsafe(env, state) {
 function wgetrcHasUnsafe(path) {
   let text;
   try {
-    const data = readFileSync4(path);
+    const data = readFileSync3(path);
     if (data.length > SSH_CONFIG_MAX_BYTES) return true;
     text = data.toString("utf8");
   } catch {

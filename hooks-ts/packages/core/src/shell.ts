@@ -1,11 +1,15 @@
 /**
  * Which shell runs a Pi shell-tool call. Pi's tools name it: `bash` runs bash (Git Bash on Windows) unless the user set
- * `shellPath` in `~/.pi/agent/settings.json`, and `powershell` runs PowerShell 7 when it is on PATH, else Windows
+ * `shellPath` in Pi's agent-dir `settings.json`, and `powershell` runs PowerShell 7 when it is on PATH, else Windows
  * PowerShell. Mirrors the Python hooks' shell detection; never throws, and says nothing when it can't tell.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
+
+import { resolvePiAgentDir } from "./cache.ts";
+import { MAX_CONFIG_BYTES } from "./constants.ts";
+import { readSmallRegularFile } from "./safeRead.ts";
 
 const SHELL_NAMES = new Set(["bash", "zsh", "sh", "fish", "dash", "ksh", "powershell", "pwsh", "cmd"]);
 
@@ -33,7 +37,10 @@ function onPath(program: string): boolean {
 
 function piShellPath(): unknown {
   try {
-    const settings: unknown = JSON.parse(readFileSync(join(homedir(), ".pi", "agent", "settings.json"), "utf8"));
+    const dir = resolvePiAgentDir(process.env, homedir());
+    const raw = dir === undefined ? undefined : readSmallRegularFile(join(dir, "settings.json"), MAX_CONFIG_BYTES);
+    if (raw === undefined) return undefined;
+    const settings: unknown = JSON.parse(raw.replace(/^\uFEFF/, ""));
     if (settings === null || typeof settings !== "object") return undefined;
     return (settings as Record<string, unknown>).shellPath;
   } catch {
@@ -50,13 +57,17 @@ export function detectShell(toolName: unknown): ShellInfo {
   if (cached !== undefined) return { ...cached };
   let info: ShellInfo = {};
   try {
+    // A shellPath that names no known shell is still the shell Pi runs, so it names nothing rather than bash.
+    const custom = tool === "bash" ? piShellPath() : undefined;
     const shell =
       tool === "powershell"
         ? process.platform === "win32" && !onPath("pwsh")
           ? "powershell"
           : "pwsh"
-        : (shellName(piShellPath()) ?? "bash");
-    info = { shell, shell_source: "tool" };
+        : typeof custom === "string" && custom !== ""
+          ? shellName(custom)
+          : "bash";
+    info = shell === undefined ? {} : { shell, shell_source: "tool" };
   } catch {
     info = {};
   }

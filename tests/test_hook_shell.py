@@ -144,8 +144,8 @@ class FailOpenTests(ShellTestCase):
                     hook._SHELL_CACHE.clear()
                     self.assertEqual(hook.detect_shell('cursor', 'Shell'), {})
 
-    def test_a_tool_that_is_not_a_shell_names_nothing(self):
-        self.assert_shell('pi', 'bash', {})
+    def test_an_agent_with_no_rule_names_nothing(self):
+        self.assert_shell('windsurf', 'Bash', {})
 
 
 if __name__ == '__main__':

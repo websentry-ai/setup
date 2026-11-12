@@ -13,8 +13,9 @@ import { buildTurnLogBody } from "../src/turnLog.ts";
 import type { PretoolPayloadInput } from "../src/types.ts";
 
 function withEnv(env: Record<string, string>, platform: NodeJS.Platform, fn: () => void): void {
-  const saved = { HOME: process.env.HOME, PATH: process.env.PATH };
+  const saved = { HOME: process.env.HOME, PATH: process.env.PATH, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
   const savedPlatform = Object.getOwnPropertyDescriptor(process, "platform");
+  delete process.env.PI_CODING_AGENT_DIR;
   Object.assign(process.env, env);
   Object.defineProperty(process, "platform", { value: platform });
   resetShellCache();
@@ -51,6 +52,15 @@ test("bash runs bash unless Pi's shellPath setting picks another shell", () => {
   mkdirSync(join(dir, ".pi", "agent"), { recursive: true });
   writeFileSync(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({ shellPath: "/usr/bin/zsh" }));
   withEnv({ HOME: dir }, "linux", () => assert.deepEqual(bash(), { shell: "zsh", shell_source: "tool" }));
+  writeFileSync(join(dir, ".pi", "agent", "settings.json"), JSON.stringify({ shellPath: "/usr/bin/nu" }));
+  withEnv({ HOME: dir }, "linux", () => assert.deepEqual(bash(), {}));
+});
+
+test("Pi's settings are read from PI_CODING_AGENT_DIR when it is set", () => {
+  const agent = home();
+  writeFileSync(join(agent, "settings.json"), JSON.stringify({ shellPath: "/bin/fish" }));
+  withEnv({ HOME: home(), PI_CODING_AGENT_DIR: agent }, "linux", () =>
+    assert.deepEqual(detectShell("bash"), { shell: "fish", shell_source: "tool" }));
 });
 
 test("powershell runs PowerShell 7 when it is on PATH and Windows PowerShell when not", () => {
