@@ -2209,13 +2209,34 @@ def _claude_plugin_launch_values() -> tuple:
         return [], []
 
 
-def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
+def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
+    """The server's entry in the nearest project .mcp.json at or above cwd, where
+    Claude Code loads its project-scoped servers."""
     try:
-        if not config_path.exists():
-            return None
+        start = Path(cwd).expanduser()
+    except (TypeError, ValueError):
+        return None
+    for folder in (start, *start.parents):
+        try:
+            data = json.loads((folder / '.mcp.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            continue
+        servers = data.get('mcpServers') if isinstance(data, dict) else None
+        if isinstance(servers, dict) and server_name in servers:
+            return _extract_mcp_server_fields(servers[server_name])
+    return None
 
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.loads(f.read())
+
+def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
+    """Claude Code's own scope order: local (~/.claude.json projects), then
+    project (.mcp.json), then user (~/.claude.json top level)."""
+    try:
+        config = {}
+        if config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.loads(f.read())
+        if not isinstance(config, dict):
+            config = {}
 
         if cwd:
             projects = config.get('projects', {})
@@ -2233,6 +2254,10 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                     if parent == cwd_path:
                         break
                     cwd_path = parent
+
+            result = _project_mcp_json_server(server_name, cwd)
+            if result:
+                return _augment_script_hash(result, cwd)
 
         top_servers = config.get('mcpServers', {})
         if isinstance(top_servers, dict) and server_name in top_servers:
@@ -9827,7 +9852,7 @@ def _mcp_diag_claude_json(server, cwd):
 
 
 def _mcp_diag_project_mcp_json(cwd):
-    """Project .mcp.json up the cwd chain — the hook does NOT read these."""
+    """Project .mcp.json files up the cwd chain."""
     found = []
     try:
         start = Path(cwd or os.getcwd()).resolve()
@@ -10003,7 +10028,7 @@ def _diag_inventory(cwd, ps_out):
             seen.add(f)
             m = _diag_servers_from_json(f)
             if m:
-                inv.append({'source': 'project .mcp.json (hook does NOT read)',
+                inv.append({'source': 'project .mcp.json',
                             'file': str(f), 'servers': _summ(m)})
     except Exception:
         pass
@@ -10369,7 +10394,7 @@ def _render_mcp_diagnostic(d):
     for f in (d.get('launch_flags') or []):
         L.append('  %s' % f)
 
-    head('project .mcp.json files (hook does NOT read)')
+    head('project .mcp.json files')
     for pj in (d.get('project_mcp_json') or []):
         L.append('  %s -> %s' % (pj.get('file'), ', '.join(pj.get('servers') or [])))
 

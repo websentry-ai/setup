@@ -1069,6 +1069,80 @@ class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
             "toolchain", cache_dir=self.cache))
 
 
+class TestProjectMcpJson(ProcessPreToolUseBase):
+    """Project-scoped servers live in .mcp.json at or above the session's cwd.
+    Claude prefers local scope, then project, then user, and the hook must
+    report the same server Claude actually runs."""
+
+    FS = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]}
+    OTHER = {"command": "python3", "args": ["/opt/other_server.py"]}
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.cwd = str(self.repo)
+
+    def forwarded(self):
+        return self.run_capture("mcp__fsx__write_file").get("mcp_server_config")
+
+    def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_mcp_json_in_a_parent_folder_is_read(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg" / "src"
+        sub.mkdir(parents=True)
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_nearest_mcp_json_wins(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.OTHER}})
+        sub = self.repo / "pkg"
+        _write_json(sub / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_project_mcp_json_beats_user_scope_with_the_same_name(self):
+        # Claude runs the project server here; reporting the user one would let a
+        # repo put any server behind a trusted name.
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_local_scope_beats_project_mcp_json(self):
+        _write_json(self.claude_json, {
+            "mcpServers": {},
+            "projects": {str(self.repo): {"mcpServers": {"fsx": self.OTHER}}},
+        })
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_user_scope_still_used_when_no_project_entry(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"another": self.OTHER}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_read_without_a_claude_json(self):
+        self.claude_json.unlink()
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_malformed_nearer_file_falls_through_to_parent(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        (sub / ".mcp.json").write_text("{not json")
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_secrets_in_project_entry_are_not_forwarded(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": {
+            **self.FS, "env": {"API_TOKEN": "s3cr3t"}, "headers": {"Authorization": "Bearer x"}}}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+
 class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
     """WEB-5335 end-to-end: numeric plugin IDs and --plugin-dir plugins must
     still forward a config; unresolved misses must log loudly, not silently."""
