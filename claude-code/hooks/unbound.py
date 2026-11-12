@@ -4180,6 +4180,8 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     }
 
     request_body['pre_tool_use_data']['tool_use_id'] = resolve_tool_use_id(event)
+    if tool_name in SHELL_TOOL_NAMES:
+        request_body['pre_tool_use_data'].update(detect_shell('claude-code', tool_name, event.get('cwd')))
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -5281,6 +5283,157 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         return None
     (copies,) = sources.values()
     return str(max(copies, key=lambda c: (c.stat().st_mtime, str(c))))
+
+
+# KEEP IN SYNC: shell detection — byte-identical in every agent hook, do not diverge.
+# Which shell runs an agent's terminal command, and how the hook knows: the agent's tool names it ('tool'), or the hook
+# applies the rule that agent uses to pick its shell ('agent_rule'). Fails open: nothing is sent when neither works.
+_SHELL_NAMES = frozenset({'bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'powershell', 'pwsh', 'cmd'})
+_SHELL_CACHE = {}
+
+
+def _shell_name(program):
+    """The shell a path or program name runs ('/bin/zsh', 'pwsh.exe'), or None for anything else."""
+    if not isinstance(program, str) or not program.strip():
+        return None
+    name = re.split(r'[\\/]', program.strip().strip('"'))[-1].lower()
+    name = name[:-4] if name.endswith('.exe') else name
+    return name if name in _SHELL_NAMES else None
+
+
+def _shell_windows():
+    return os.name == 'nt'
+
+
+def _shell_windows_powershell():
+    """PowerShell 7 when it is on PATH, else Windows PowerShell, which every Windows install has."""
+    return 'pwsh' if shutil.which('pwsh') else 'powershell'
+
+
+def _shell_env():
+    return _shell_name(os.environ.get('SHELL'))
+
+
+def _shell_login():
+    """The account's login shell from the user database, as Codex reads it, else $SHELL."""
+    try:
+        import pwd
+        return _shell_name(pwd.getpwuid(os.getuid()).pw_shell) or _shell_env()
+    except Exception:
+        return _shell_env()
+
+
+def _shell_settings(path):
+    """A JSON settings file that may hold comments and trailing commas, as VS Code writes them; {} when unreadable."""
+    try:
+        text = Path(path).read_text(encoding='utf-8-sig')
+    except (OSError, ValueError):
+        return {}
+    # Drop // and /* */ comments outside strings, then commas before a closing bracket.
+    text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or '', text, flags=re.S)
+    text = re.sub(r'("(?:\\.|[^"\\])*")|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# VS Code's built-in terminal profile names on each OS, for a default profile with no path of its own.
+_SHELL_VSCODE_BUILTIN = {'powershell': None, 'windows powershell': 'powershell', 'command prompt': 'cmd',
+                         'git bash': 'bash'}
+
+
+def _shell_vscode(cwd):
+    """The shell Copilot's run_in_terminal uses: its own terminal profile, else the default one; workspace settings
+    win over the user's, cmd runs as Windows PowerShell and /bin/sh as bash."""
+    windows = _shell_windows()
+    key = 'windows' if windows else 'osx' if sys.platform == 'darwin' else 'linux'
+    if windows:
+        user_root = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    elif sys.platform == 'darwin':
+        user_root = Path.home() / 'Library' / 'Application Support'
+    else:
+        user_root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    layers = ([_shell_settings(Path(cwd) / '.vscode' / 'settings.json')] if cwd else []) + \
+        [_shell_settings(user_root / app / 'User' / 'settings.json') for app in ('Code', 'Code - Insiders')]
+    name = None
+    for layer in layers:
+        profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
+        if isinstance(profile, dict) and isinstance(profile.get('path'), str):
+            name = _shell_name(profile['path'])
+            break
+    else:
+        for layer in layers:
+            chosen = layer.get('terminal.integrated.defaultProfile.' + key)
+            if not isinstance(chosen, str):
+                continue
+            profiles = [lay.get('terminal.integrated.profiles.' + key) for lay in layers]
+            spec = next((p[chosen] for p in profiles if isinstance(p, dict) and isinstance(p.get(chosen), dict)), {})
+            path = spec.get('path')
+            path = path[0] if isinstance(path, list) and path else path
+            if isinstance(path, str):
+                name = _shell_name(path)
+            elif chosen.lower() in _SHELL_VSCODE_BUILTIN:
+                name = _SHELL_VSCODE_BUILTIN[chosen.lower()] or _shell_windows_powershell()
+            else:
+                name = _shell_name(chosen)
+            break
+        else:
+            name = _shell_windows_powershell() if windows else _shell_env()
+    return {'cmd': 'powershell', 'sh': 'bash'}.get(name, name)
+
+
+def _shell_augment():
+    """Augment's shellPath setting, else the user's shell when Augment supports it, else its own default."""
+    settings = _shell_settings(Path.home() / '.augment' / 'settings.json')
+    for key in ('shellPath', 'shell'):
+        chosen = _shell_name(settings.get(key))
+        if chosen:
+            return chosen
+    if _shell_windows():
+        return 'powershell'
+    env = _shell_env()
+    return env if env in ('bash', 'zsh', 'fish', 'sh') else 'zsh' if sys.platform == 'darwin' else 'sh'
+
+
+def _shell_detect(agent, tool_name, cwd):
+    windows = _shell_windows()
+    tool = tool_name if isinstance(tool_name, str) else ''
+    if tool.lower() == 'powershell':
+        # Claude Code's, Copilot CLI's and Pi's PowerShell tools: pwsh, else Windows PowerShell.
+        return (_shell_windows_powershell() if windows else 'pwsh'), 'tool'
+    if agent == 'claude-code':
+        # The Bash tool runs Git Bash on Windows and the user's bash or zsh elsewhere.
+        env = None if windows else _shell_env()
+        return (env if env in ('bash', 'zsh') else 'bash'), 'tool'
+    if agent == 'copilot':
+        # The CLI's lowercase `bash` is its Unix tool; its PascalCase `Bash` names either shell.
+        if tool == 'bash':
+            return 'bash', 'tool'
+        if tool in ('run_in_terminal', 'runInTerminal'):
+            return _shell_vscode(cwd), 'agent_rule'
+        return ('powershell' if windows else 'bash'), 'agent_rule'
+    if agent == 'codex':
+        return (_shell_windows_powershell() if windows else _shell_login()), 'agent_rule'
+    if agent == 'cursor':
+        return (_shell_windows_powershell() if windows else _shell_env() or _shell_login()), 'agent_rule'
+    if agent == 'augment':
+        return _shell_augment(), 'agent_rule'
+    return None, None
+
+
+def detect_shell(agent, tool_name=None, cwd=None):
+    """{'shell': …, 'shell_source': …} for one terminal call, or {} when the hook can't tell; never raises."""
+    key = (agent, tool_name, cwd)
+    if key not in _SHELL_CACHE:
+        try:
+            shell, source = _shell_detect(agent, tool_name, cwd)
+        except Exception:
+            shell, source = None, None
+        _SHELL_CACHE[key] = {'shell': shell, 'shell_source': source} if shell in _SHELL_NAMES else {}
+    return dict(_SHELL_CACHE[key])
+# --- end shell detection ---
 
 
 # KEEP IN SYNC: transfer resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
@@ -9063,6 +9216,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'git_branch': tool_branch
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
+                tool_use_entry.update(detect_shell('claude-code', tool_name, event.get('cwd')))
                 transfer = _transfer(command, transfer_dir, transfer_state)
                 # A background call runs in its own shell; how far a failed one got, and so its folder, is not known.
                 if tool_input.get('run_in_background') is not True:

@@ -14,7 +14,7 @@
  */
 
 // packages/pi/src/index.ts
-import { homedir as homedir2 } from "node:os";
+import { homedir as homedir3 } from "node:os";
 
 // packages/core/src/accountIdentity.ts
 import { execFile as nodeExecFile } from "node:child_process";
@@ -836,6 +836,10 @@ function buildPretoolPayload(input) {
   if (typeof input.toolUseId === "string" && input.toolUseId.length > 0) {
     preToolUseData.tool_use_id = input.toolUseId;
   }
+  if (mcp === void 0 && typeof input.shell?.shell === "string") {
+    preToolUseData.shell = input.shell.shell;
+    if (typeof input.shell.shell_source === "string") preToolUseData.shell_source = input.shell.shell_source;
+  }
   const body = {
     conversation_id: input.sessionId,
     // `model` is required on the wire and `ctx.model` may be undefined (§A4); `'auto'` is the same
@@ -1220,6 +1224,48 @@ function redactSecrets(text, apiKey) {
   return out;
 }
 
+// packages/core/src/shell.ts
+import { existsSync, readFileSync as readFileSync2 } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join as join4 } from "node:path";
+var SHELL_NAMES = /* @__PURE__ */ new Set(["bash", "zsh", "sh", "fish", "dash", "ksh", "powershell", "pwsh", "cmd"]);
+var shellCache = /* @__PURE__ */ new Map();
+function shellName(program2) {
+  if (typeof program2 !== "string" || program2.trim() === "") return void 0;
+  let name = (program2.trim().replace(/^"|"$/g, "").split(/[\\/]/).pop() ?? "").toLowerCase();
+  if (name.endsWith(".exe")) name = name.slice(0, -4);
+  return SHELL_NAMES.has(name) ? name : void 0;
+}
+function onPath(program2) {
+  const suffixes = process.platform === "win32" ? [".exe", ""] : [""];
+  return (process.env.PATH ?? "").split(delimiter).some((dir) => dir !== "" && suffixes.some((suffix) => existsSync(join4(dir, program2 + suffix))));
+}
+function piShellPath() {
+  try {
+    const settings = JSON.parse(readFileSync2(join4(homedir(), ".pi", "agent", "settings.json"), "utf8"));
+    if (settings === null || typeof settings !== "object") return void 0;
+    return settings.shellPath;
+  } catch {
+    return void 0;
+  }
+}
+function detectShell(toolName) {
+  if (typeof toolName !== "string") return {};
+  const tool = toolName.toLowerCase();
+  if (tool !== "bash" && tool !== "powershell") return {};
+  const cached = shellCache.get(tool);
+  if (cached !== void 0) return { ...cached };
+  let info = {};
+  try {
+    const shell = tool === "powershell" ? process.platform === "win32" && !onPath("pwsh") ? "powershell" : "pwsh" : shellName(piShellPath()) ?? "bash";
+    info = { shell, shell_source: "tool" };
+  } catch {
+    info = {};
+  }
+  shellCache.set(tool, info);
+  return { ...info };
+}
+
 // packages/core/src/turnLog.ts
 function shouldPostTurn(record) {
   try {
@@ -1332,6 +1378,7 @@ function buildTurnLogBody(record, opts) {
       if (ts !== void 0) entry.ts = ts;
       const transfer = toolUseId === "" ? void 0 : opts?.transfers?.get(toolUseId);
       if (transfer !== void 0) entry.transfer = transfer;
+      Object.assign(entry, detectShell(entry.tool_name));
       return entry;
     });
   } catch {
@@ -1387,8 +1434,8 @@ function createKeyState(opts = {}) {
 var keyState = createKeyState();
 
 // packages/core/src/piVersion.ts
-import { readFileSync as readFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join4 } from "node:path";
+import { readFileSync as readFileSync3 } from "node:fs";
+import { dirname as dirname2, join as join5 } from "node:path";
 var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 var MAX_WALK_UP_LEVELS = 8;
 var MAX_VERSION_CHARS = 32;
@@ -1396,7 +1443,7 @@ function readManagedInstallVersion(env) {
   const root = env[ENV_PI_INSTALL_ROOT];
   if (typeof root !== "string" || root.length === 0) return void 0;
   try {
-    const version = readFileSync2(join4(root, "current-version"), "utf8").trim();
+    const version = readFileSync3(join5(root, "current-version"), "utf8").trim();
     return version.length > 0 ? version : void 0;
   } catch {
     return void 0;
@@ -1407,7 +1454,7 @@ function readVersionFromArgv(argv1) {
   let dir = dirname2(argv1);
   for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
     try {
-      const parsed = JSON.parse(readFileSync2(join4(dir, "package.json"), "utf8"));
+      const parsed = JSON.parse(readFileSync3(join5(dir, "package.json"), "utf8"));
       if (parsed !== null && typeof parsed === "object") {
         const pkg = parsed;
         if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
@@ -1868,12 +1915,12 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import {
   closeSync,
   constants,
-  existsSync,
+  existsSync as existsSync2,
   fstatSync,
   mkdtempSync,
   openSync,
   readdirSync,
-  readFileSync as readFileSync3,
+  readFileSync as readFileSync4,
   readSync,
   realpathSync,
   rmSync,
@@ -1881,8 +1928,8 @@ import {
   writeFileSync as writeFileSync2
 } from "node:fs";
 import { BlockList, isIP } from "node:net";
-import { homedir, tmpdir as tmpdir2, userInfo } from "node:os";
-import { basename, delimiter, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, normalize, sep } from "node:path";
+import { homedir as homedir2, tmpdir as tmpdir2, userInfo } from "node:os";
+import { basename, delimiter as delimiter2, dirname as dirname3, isAbsolute as isAbsolute3, join as join6, normalize, sep } from "node:path";
 var ALLOWED_RUNS = [
   ["ssh", "-G"],
   ["route", "-n", "get"],
@@ -2212,7 +2259,7 @@ async function run(argv, state, keepMs = 0) {
     let [file, ...args] = argv;
     if (file === void 0) return void 0;
     if (file === "ssh" && args[0] === "-G") {
-      folder = mkdtempSync(join5(tmpdir2(), "unbound-ssh-"));
+      folder = mkdtempSync(join6(tmpdir2(), "unbound-ssh-"));
       const end2 = argv.indexOf("--");
       const options = end2 < 0 ? void 0 : vetted(argv.slice(2, end2), state.home, state.env, folder);
       if (options === void 0) return void 0;
@@ -2400,8 +2447,8 @@ function parenEnd(text, start) {
         i += 2;
       } else if (text.startsWith("<<", i)) {
         const strip = text.startsWith("<<-", i);
-        const [delimiter2, wordStop] = readWord(text, i + (strip ? 3 : 2));
-        heredocs.push([delimiter2, strip]);
+        const [delimiter3, wordStop] = readWord(text, i + (strip ? 3 : 2));
+        heredocs.push([delimiter3, strip]);
         i = wordStop - 1;
       } else if (cases.at(-1) === "pattern" && (ch === "(" || ch === ")")) {
         if (ch === ")") [cases[cases.length - 1], atStart] = ["body", true];
@@ -2422,12 +2469,12 @@ function parenEnd(text, start) {
 function heredocsEnd(text, start, heredocs) {
   let i = start;
   while (heredocs.length > 0) {
-    const [delimiter2, stripTabs] = heredocs.shift();
+    const [delimiter3, stripTabs] = heredocs.shift();
     while (i + 1 < text.length) {
       const end2 = text.indexOf("\n", i + 1);
       const line = end2 < 0 ? text.slice(i + 1) : text.slice(i + 1, end2);
       i = end2 < 0 ? text.length - 1 : end2;
-      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter2) break;
+      if ((stripTabs ? line.replace(/^\t+/, "") : line) === delimiter3) break;
     }
   }
   return i;
@@ -2764,14 +2811,14 @@ var Lexer = class _Lexer {
     const { text } = this;
     let shift = 0;
     while (this.heredocs.length > 0) {
-      const [delimiter2, stripTabs, at, fed] = this.heredocs.shift();
+      const [delimiter3, stripTabs, at, fed] = this.heredocs.shift();
       const lines = [];
       while (this.i + 1 < text.length) {
         const end2 = text.indexOf("\n", this.i + 1);
         const raw = end2 < 0 ? text.slice(this.i + 1) : text.slice(this.i + 1, end2);
         const line = stripTabs ? raw.replace(/^\t+/, "") : raw;
         this.i = end2 < 0 ? text.length - 1 : end2;
-        if (line === delimiter2) break;
+        if (line === delimiter3) break;
         lines.push(line);
       }
       const body = lines.join("\n");
@@ -2982,7 +3029,7 @@ function cdTarget(args, cwd, shell, given) {
   if (path === void 0) return [void 0, void 0];
   const last = letters === "" ? "L" : letters[Math.max(letters.lastIndexOf("L"), letters.lastIndexOf("P"))];
   const landed = new Set([last === "P", letters.includes("P")].map((physical) => moveTo(cwd, path, physical)));
-  const target = isAbsolute3(path) ? path : cwd === void 0 || path === "-" ? void 0 : join5(cwd, path);
+  const target = isAbsolute3(path) ? path : cwd === void 0 || path === "-" ? void 0 : join6(cwd, path);
   if (target !== void 0 && isFile(target)) return [cwd, 1];
   if (target === void 0 || shell.names.has(basename(normalize(target))) || landed.size > 1) return [void 0, void 0];
   const folder = [...landed][0];
@@ -4252,10 +4299,10 @@ function curlrc(env, state) {
     if (!value || plain && xdg) continue;
     if (value.includes(SUBSTITUTED)) return "";
     for (const name of plain ? ["curlrc"] : platform.windows ? [".curlrc", "_curlrc"] : [".curlrc"]) {
-      if (regularFile(join5(value + append, name))) return join5(value + append, name);
+      if (regularFile(join6(value + append, name))) return join6(value + append, name);
     }
   }
-  return state.home && regularFile(join5(state.home, ".curlrc")) ? join5(state.home, ".curlrc") : void 0;
+  return state.home && regularFile(join6(state.home, ".curlrc")) ? join6(state.home, ".curlrc") : void 0;
 }
 function regularFile(path) {
   return statSync(path, { throwIfNoEntry: false })?.isFile() ?? false;
@@ -4273,7 +4320,7 @@ function curlrcUnsafe(env, state) {
 function curlrcHasUnsafe(path) {
   let text;
   try {
-    const data = readFileSync3(path);
+    const data = readFileSync4(path);
     if (data.length > SSH_CONFIG_MAX_BYTES) return true;
     text = data.toString("utf8");
   } catch {
@@ -4309,7 +4356,7 @@ function wgetrcUnsafe(env, state) {
   if (named && !isAbsolute3(named)) return true;
   const paths = platform.windows ? [] : WGETRC_SYSTEM.filter(regularFile);
   if (named && !regularFile(named)) return true;
-  const user = named || (home ? join5(home, ".wgetrc") : "");
+  const user = named || (home ? join6(home, ".wgetrc") : "");
   if (user && regularFile(user)) paths.push(user);
   return paths.some((path) => {
     let unsafe = state.curlrc.get(`wgetrc:${path}`);
@@ -4323,7 +4370,7 @@ function wgetrcUnsafe(env, state) {
 function wgetrcHasUnsafe(path) {
   let text;
   try {
-    const data = readFileSync3(path);
+    const data = readFileSync4(path);
     if (data.length > SSH_CONFIG_MAX_BYTES) return true;
     text = data.toString("utf8");
   } catch {
@@ -4857,14 +4904,14 @@ function normalizeV6(address) {
     return address;
   }
 }
-function expandHome(path, home = homedir()) {
-  return path === "~" || path.startsWith("~/") ? join5(home, path.slice(1)) : path;
+function expandHome(path, home = homedir2()) {
+  return path === "~" || path.startsWith("~/") ? join6(home, path.slice(1)) : path;
 }
 function accountHome() {
   try {
-    return userInfo().homedir || homedir();
+    return userInfo().homedir || homedir2();
   } catch {
-    return homedir();
+    return homedir2();
   }
 }
 function globMatch(pattern, name) {
@@ -4892,7 +4939,7 @@ function globMatch(pattern, name) {
 function includeTargets(pattern, bases, homes) {
   if (pattern.startsWith("~") && pattern !== "~" && !pattern.startsWith("~/") || /[$%]/.test(pattern)) return void 0;
   const unescaped = pattern.replace(/\\(.)/g, "$1");
-  const fulls = unescaped === "~" || unescaped.startsWith("~/") ? homes.map((home) => expandHome(unescaped, home)) : bases.map((base) => isAbsolute3(unescaped) ? unescaped : join5(base, unescaped));
+  const fulls = unescaped === "~" || unescaped.startsWith("~/") ? homes.map((home) => expandHome(unescaped, home)) : bases.map((base) => isAbsolute3(unescaped) ? unescaped : join6(base, unescaped));
   const out = [];
   for (const full of new Set(fulls)) {
     const found = globTargets(full);
@@ -4905,7 +4952,7 @@ function globTargets(full) {
   if (!/[*?[]/.test(full)) return [full];
   if (/[*?[]/.test(dirname3(full)) || basename(full).includes("[")) return void 0;
   try {
-    return readdirSync(dirname3(full)).filter((entry) => globMatch(basename(full), entry)).sort().map((entry) => join5(dirname3(full), entry));
+    return readdirSync(dirname3(full)).filter((entry) => globMatch(basename(full), entry)).sort().map((entry) => join6(dirname3(full), entry));
   } catch {
     return [];
   }
@@ -4973,10 +5020,10 @@ function configLine(line, bases, homes) {
   return [true, paths];
 }
 function sshSystemDir(processEnv) {
-  if (process.platform === "win32") return join5(processEnv.PROGRAMDATA ?? "", "ssh");
-  const bin = (processEnv.PATH ?? "").split(delimiter).find((dir) => isAbsolute3(dir) && isFile(join5(dir, "ssh")));
+  if (process.platform === "win32") return join6(processEnv.PROGRAMDATA ?? "", "ssh");
+  const bin = (processEnv.PATH ?? "").split(delimiter2).find((dir) => isAbsolute3(dir) && isFile(join6(dir, "ssh")));
   const prefix = dirname3(bin ?? "/usr/bin");
-  return prefix === "/usr" || prefix === "/" ? "/etc/ssh" : join5(prefix, "etc", "ssh");
+  return prefix === "/usr" || prefix === "/" ? "/etc/ssh" : join6(prefix, "etc", "ssh");
 }
 function readOnce(path) {
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
@@ -4995,7 +5042,7 @@ function vetted(options, home, processEnv, folder) {
   const envHome = processEnv.HOME || home;
   if (platform.windows && envHome !== home) return void 0;
   const homes = [envHome];
-  const userBases = [join5(envHome, ".ssh")];
+  const userBases = [join6(envHome, ".ssh")];
   if (options.length % 2 !== 0) return void 0;
   const configs = [];
   const rest = [];
@@ -5007,14 +5054,14 @@ function vetted(options, home, processEnv, folder) {
   if (config === "none") return [...options];
   if (config !== void 0 && !isAbsolute3(config)) return void 0;
   const system = sshSystemDir(processEnv);
-  const sources = config !== void 0 ? [[config, userBases]] : [[join5(home, ".ssh", "config"), userBases], [join5(system, "ssh_config"), [system]]];
+  const sources = config !== void 0 ? [[config, userBases]] : [[join6(home, ".ssh", "config"), userBases], [join6(system, "ssh_config"), [system]]];
   const copies = /* @__PURE__ */ new Map();
   const queue = [];
   const copyOf = (path, bases) => {
     const key = JSON.stringify([path, bases]);
     let copy2 = copies.get(key);
     if (copy2 === void 0) {
-      copy2 = join5(folder, String(copies.size));
+      copy2 = join6(folder, String(copies.size));
       copies.set(key, copy2);
       queue.push([path, bases]);
     }
@@ -5044,7 +5091,7 @@ function vetted(options, home, processEnv, folder) {
   }
   let top = tops[0];
   if (config === void 0) {
-    top = join5(folder, "config");
+    top = join6(folder, "config");
     writeFileSync2(top, tops.map((copy2) => `Include "${copy2}"
 `).join(""), { mode: 384 });
   }
@@ -5080,7 +5127,7 @@ async function sshHostname(destination, options, cwd, state) {
   if (sshConfigNamed(options, state)) return ["", true];
   const resolved = options.map((value, i) => {
     if (options[i - 1] !== "-F") return value;
-    return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join5(cwd, value);
+    return value === "none" || isAbsolute3(value) || cwd === void 0 ? value : join6(cwd, value);
   });
   const key = JSON.stringify([destination, resolved]);
   const cached = state.sshHosts.get(key);
@@ -5216,7 +5263,7 @@ function routeKind(out, address, platform2) {
   return gateway ? "routed" : "local";
 }
 async function route(found, state) {
-  if (found.length === 0 || REMOTE_ENV.some((name) => state.env[name]) || state.containerFiles.some((f) => existsSync(f))) {
+  if (found.length === 0 || REMOTE_ENV.some((name) => state.env[name]) || state.containerFiles.some((f) => existsSync2(f))) {
     return void 0;
   }
   const address = ipv4Mapped(found[0].split("%")[0]);
@@ -5504,6 +5551,7 @@ async function decideToolCall(event, ctx, deps) {
       command: command2,
       toolUseId: event.toolCallId,
       toolInput,
+      shell: detectShell(event.toolName),
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
@@ -5793,7 +5841,7 @@ function mintBrokerId() {
 
 // packages/pi/src/mcpConfig.ts
 import { closeSync as closeSync2, constants as fsConstants, fstatSync as fstatSync2, lstatSync as lstatSync2, openSync as openSync2, readSync as readSync2, statSync as statSync2 } from "node:fs";
-import { isAbsolute as isAbsolute4, join as join6 } from "node:path";
+import { isAbsolute as isAbsolute4, join as join7 } from "node:path";
 var KNOWN_SERVER_KEYS = /* @__PURE__ */ new Set([
   "command",
   "args",
@@ -5867,23 +5915,23 @@ function mcpConfigSources(options, cwd) {
       if (!isAbsolute4(agentEnv)) return void 0;
       agentDir = agentEnv;
     } else {
-      agentDir = join6(homeDir, ".pi", "agent");
+      agentDir = join7(homeDir, ".pi", "agent");
     }
-    const adapterFile = join6(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
+    const adapterFile = join7(agentDir, MCP_ADAPTER_CONFIG_FILE_NAME);
     const mode = env[ENV_PI_MCP_CONFIG_MODE];
     if (typeof mode === "string" && mode.trim().toLowerCase() === "exclusive") return [adapterFile];
     const sources = [];
     for (const path of [
-      join6(homeDir, ".config", "mcp", "mcp.json"),
-      join6(homeDir, ".agents", "mcp.json"),
-      join6(homeDir, ".agents", "mcp", "mcp.json")
+      join7(homeDir, ".config", "mcp", "mcp.json"),
+      join7(homeDir, ".agents", "mcp.json"),
+      join7(homeDir, ".agents", "mcp", "mcp.json")
     ]) {
       if (path !== adapterFile) sources.push(path);
     }
     sources.push(adapterFile);
-    const project = join6(cwd, ".mcp.json");
+    const project = join7(cwd, ".mcp.json");
     if (project !== adapterFile) sources.push(project);
-    sources.push(join6(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
+    sources.push(join7(cwd, ".pi", MCP_ADAPTER_CONFIG_FILE_NAME));
     return [...new Set(sources)];
   } catch {
     return void 0;
@@ -6145,6 +6193,7 @@ async function decideUserBash(event, ctx, deps) {
       toolName: "bash",
       command: command2,
       toolUseId,
+      shell: detectShell("bash"),
       // Empty by construction: there is no model-produced input here, so the allowlist has nothing
       // to forward and no file body can ride along.
       toolInput: {},
@@ -6258,7 +6307,7 @@ function hydrateFromCache(apiKey, baseUrl, env, homeDir) {
 }
 function safeHomeDir() {
   try {
-    return homedir2();
+    return homedir3();
   } catch {
     return "";
   }
