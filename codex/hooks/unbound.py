@@ -7914,12 +7914,12 @@ def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tupl
 
 
 def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
-                        key: tuple) -> Optional[str]:
-    """The first line one allowlisted lookup printed, asked once per distinct question in a turn."""
+                        key: tuple, raw: bool = False) -> Optional[str]:
+    """The first line one allowlisted lookup printed (as printed, with `raw`), asked once per distinct question."""
     def resolve():
         output = _account_run(argv, cwd, env, state)
         lines = (output or '').splitlines()
-        return _account_value(lines[0]) if lines else None
+        return (lines[0] if raw else _account_value(lines[0])) if lines else None
 
     return _account_once(state, key, resolve)
 
@@ -7939,8 +7939,14 @@ def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
         override = (overrides or {}).get(_account_config_key(name))
         value = None if override == _TRANSFER_SUBSTITUTED else _account_value(override)
         return (value, True) if value else (None, False)
-    return _account_first_line(['git', 'config', '--get', name], cwd, env, state,
-                               ('git-config', name, cwd, _account_env_key(env))), True
+    line = _account_first_line(['git', 'config', '--get', name], cwd, env, state,
+                               ('git-config', name, cwd, _account_env_key(env)), raw=True)
+    if not (line or '').strip():
+        return None, True
+    # Printed by git, so a `$` in it is literal; one that is still not a single word is unknown, not absent, or the
+    # next setting would answer for it.
+    value = (line or '').strip()[:_ACCOUNT_MAX_VALUE]
+    return (value, True) if not any(ch.isspace() or ord(ch) < 32 for ch in value) else (None, False)
 
 
 def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
@@ -8035,7 +8041,7 @@ def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) ->
             pushed = [(repo, remote) for repo in (_account_repo_of(url) for url in (urls or '').splitlines()) if repo]
         if implicit:
             # Chosen by the current branch's config, read when the turn ends, so a later branch change moves it.
-            state.setdefault('account_implicit', []).extend(pushed)
+            state.setdefault('account_implicit_call', []).extend(pushed)
     # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
     # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
     if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
@@ -8287,6 +8293,7 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
         # and the hook's ambient environment decide who ran it.
         shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
         found, pushes = [], []
+        state['account_implicit_call'] = []
         # Accounts are read when the turn ends, so one an earlier call took from the active configuration is the
         # switched one if a later call switched it. Those earlier accounts are dropped then, in place.
         taken = state.setdefault('account_active', [])
@@ -8301,17 +8308,19 @@ def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: boo
             if switched in ('git-branch', 'git-remote'):
                 # Push destinations are read when the turn ends, so a later branch change moves a push its branch's
                 # config chose, and a remote change one through that remote (any, for a rewrite rule).
-                implicit, scope = state.get('account_implicit', []), _account_remote_scope(args)
+                scope = _account_remote_scope(args)
 
-                def moved(repo, remote):
-                    if switched == 'git-branch':
-                        return (repo, remote) in implicit
-                    return scope is None or remote == scope
-                pushes[:] = [push for push in pushes if not moved(*push)]
+                def moved(implicit):
+                    def picks(repo, remote):
+                        if switched == 'git-branch':
+                            return (repo, remote) in implicit
+                        return scope is None or remote == scope
+                    return picks
+                pushes[:] = [push for push in pushes if not moved(state['account_implicit_call'])(*push)]
                 held = state.setdefault('account_pushes', [])
-                for entry in held:
-                    _account_withdraw(entry, moved)
-                held[:] = [entry for entry in held if entry.get('pushed_repo')]
+                for entry, implicit in held:
+                    _account_withdraw(entry, moved(implicit))
+                held[:] = [(entry, implicit) for entry, implicit in held if entry.get('pushed_repo')]
                 if switched == 'git-remote':
                     # A gh login read from the checkout's remote host moves with it too.
                     hit = [item for item in taken if item[0] == 'git-remote']
@@ -8372,7 +8381,8 @@ def _with_accounts(entry: Dict, resolved: Optional[Dict], state: Optional[Dict] 
     if resolved:
         entry.update(resolved)
         if state is not None and resolved.get('pushed_repo'):
-            state.setdefault('account_pushes', []).append(entry)
+            # With the pushes its branch's config chose, which only a later branch change moves.
+            state.setdefault('account_pushes', []).append((entry, list(state.get('account_implicit_call') or [])))
     return entry
 
 
