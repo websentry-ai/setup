@@ -123,7 +123,7 @@ class CursorMcpIdentity(unittest.TestCase):
         script.write_bytes(b"console.log('x')\n")
         self._write(self.workspace / ".cursor" / "mcp.json",
                     {"fsx": {"command": "node", "args": ["server.js"]}})
-        _, cfg = self._send()
+        _, cfg = self._send(command="node server.js")
         self.assertIn("scriptHash", cfg)
 
 
