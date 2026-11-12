@@ -7508,6 +7508,885 @@ def _with_call_ts(entry: Dict, stamp: Any) -> Dict:
 # --- end transfer resolution ---
 
 
+# KEEP IN SYNC: account resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
+# --- Account resolution: which account each platform command acted as, identity fields only, fail-open ---
+
+# Only these commands are ever run; everything else is refused. All are local, and none of them prints a credential.
+_ACCOUNT_ALLOWED_RUNS = (
+    ('git', 'config', '--get'),
+    ('git', 'config', '--name-only', '--list'),
+    ('git', 'remote', '-v'),
+    ('git', 'remote', 'get-url', '--push'),
+    ('git', 'symbolic-ref', '--short', 'HEAD'),
+    ('gh', 'config', 'get'),
+)
+_ACCOUNT_RUN_TIMEOUT = 5
+# Wall-clock budget for every account lookup in one turn, so a slow one never delays the agent.
+_ACCOUNT_TURN_BUDGET = 10.0
+# Accounts kept for one call; two is the real maximum today (a login and a committer identity).
+_ACCOUNT_MAX = 4
+_ACCOUNT_MAX_VALUE = 255
+# A path or configuration value, which is longer than an identity and may hold spaces.
+_ACCOUNT_MAX_PATH = 512
+# Variables an `export` earlier in the turn still decides. The hook is a fresh process per event and never inherits
+# them, so they are remembered from the command text; prod has 86 commands beginning with `export` per 12,000.
+_ACCOUNT_REMEMBERED = frozenset({
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_DIR', 'GIT_WORK_TREE', 'GIT_AUTHOR_EMAIL',
+    'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS', 'GIT_CONFIG_NOSYSTEM', 'XDG_CONFIG_HOME',
+    'HOME', 'USERPROFILE',
+    'GH_HOST', 'GH_REPO', 'GH_CONFIG_DIR', 'GH_TOKEN',
+    'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN',
+    'GITHUB_ENTERPRISE_TOKEN',
+})
+# Fixed for every run: git must not page, prompt or take a lock on our account.
+_ACCOUNT_RUN_ENV = {'GIT_PAGER': 'cat', 'PAGER': 'cat', 'GIT_TERMINAL_PROMPT': '0', 'GIT_OPTIONAL_LOCKS': '0',
+                    'GIT_ASKPASS': '', 'SSH_ASKPASS': '', 'CLICOLOR': '0', 'NO_COLOR': '1'}
+# The gh commands that act on a repository, and so read the checkout's remote when none is named: the ones
+# that take `--repo`. `gh api`, `gh search`, `gh gist` and `gh auth` use gh's default host instead.
+_ACCOUNT_GH_REPO_SCOPED = frozenset({'pr', 'issue', 'repo', 'run', 'workflow', 'release', 'label', 'cache',
+                                     'secret', 'variable', 'browse', 'ruleset', 'attestation'})
+# gh options that take no value, so the word after one is still an operand (`gh pr view --web <url>`). Long
+# forms only: a short flag means different things under different subcommands (`-f` takes a value in `gh api`).
+_ACCOUNT_GH_SWITCHES = frozenset({
+    '--web', '--draft', '--fill', '--fill-first', '--fill-verbose', '--yes', '--comments', '--approve',
+    '--request-changes', '--squash', '--merge', '--rebase', '--auto', '--disable-auto', '--admin', '--delete-branch',
+    '--detach', '--force', '--undo', '--dry-run', '--editor', '--watch', '--exit-status', '--log', '--log-failed',
+    '--verbose', '--prerelease', '--latest', '--clobber',
+})
+# Short no-value flags, which mean different things under different subcommands, so listed per subcommand.
+_ACCOUNT_GH_SHORT_SWITCHES = {('pr', 'merge'): frozenset({'-s', '-m', '-r', '-d'}),
+                              ('pr', 'review'): frozenset({'-a', '-r', '-c', '--comment'})}
+# gh options whose value is text or a payload — a title, a body, `gh api`'s fields, headers and filters — so the
+# word after one is never an option or the operand, however it reads.
+_ACCOUNT_GH_TEXT_OPTIONS = frozenset({
+    '--title', '-t', '--body', '-b', '--body-file', '-F', '--notes', '--subject',
+    '-f', '--raw-field', '--field', '-H', '--header', '--input', '-q', '--jq', '--template', '-X', '--method',
+    '-p', '--preview', '--cache',
+})
+# A token in the environment signs in as whoever owns it, which cannot be read offline, so the login is unknown.
+# gh reads the first pair for github.com and *.ghe.com, the second for any other host (and GITHUB_TOKEN there too
+# inside a codespace).
+_ACCOUNT_GH_TOKENS = ('GH_TOKEN', 'GITHUB_TOKEN')
+_ACCOUNT_GHE_TOKENS = ('GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GITHUB_TOKEN')
+# git subcommands that reach a remote, and those that write a commit the committer identity goes into.
+_ACCOUNT_GIT_REMOTE = frozenset({'push', 'fetch', 'pull', 'clone', 'ls-remote', 'archive'})
+_ACCOUNT_GIT_COMMITS = frozenset({'commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'commit-tree'})
+# git's own options before the subcommand that take a value, so the subcommand is found at the right word.
+_ACCOUNT_GIT_VALUE_OPTIONS = frozenset({'-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path',
+                                        '--config-env', '--super-prefix'})
+# `git push` options whose value is a separate word. Absent on purpose: those whose value is optional
+# (`--force-with-lease`), since bare the next word is the remote, and `--repo`, whose value IS the remote.
+_ACCOUNT_PUSH_VALUE_OPTIONS = frozenset({'--receive-pack', '--exec', '-o', '--push-option', '--repo'})
+
+
+def _account_deadline(state: Dict) -> float:
+    """When this turn's account lookups must stop: the transfer walk's own clock, started by whichever runs first."""
+    return state.setdefault('deadline', time.monotonic() + state.get('budget', _ACCOUNT_TURN_BUDGET))
+
+
+def _account_run(argv: List[str], cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """Run one allowlisted lookup within its timeout and the turn's budget; None when refused, slow or failing."""
+    try:
+        if not any(tuple(argv[:len(p)]) == p for p in _ACCOUNT_ALLOWED_RUNS):
+            return None
+        remaining = _account_deadline(state) - time.monotonic()
+        if remaining <= 0:
+            return None
+        if argv[:1] == ['git'] and not isinstance(cwd, str):
+            return None
+        for name, value in (env or {}).items():
+            # A configuration location set to something unreadable — a substitution, an unexpanded `$VAR` — would
+            # be dropped from the child, which then reads the default file instead, so the lookup is refused.
+            read = _account_value if name in _ACCOUNT_IDENTITY_VALUES else _account_path
+            steering = name in _ACCOUNT_CONFIG_STEERING or name.startswith(_ACCOUNT_INDEXED_CONFIG)
+            if steering and isinstance(value, str) and (
+                    _TRANSFER_SUBSTITUTED in value or (value.strip() and read(value) is None)):
+                return None
+        program = _transfer_executable(argv[0])
+        if program is None:
+            return None
+        # Only the remembered names are carried from the command text, so nothing else it set can steer the run.
+        passed, dropped = {}, []
+        for name, value in (env or {}).items():
+            if name not in _ACCOUNT_REMEMBERED and not name.startswith(_ACCOUNT_INDEXED_CONFIG):
+                continue
+            # A path or a configuration value may hold spaces; only an identity has to be one word.
+            kept = _account_value(value) if name in _ACCOUNT_IDENTITY_VALUES else _account_path(value)
+            if kept:
+                passed[name] = value
+            else:
+                # The command's shell unset it, so the hook's own value must not reach the child either.
+                dropped.append(name)
+        child = {} if _TRANSFER_CLEAN_ENV in (env or {}) else {
+            key: value for key, value in os.environ.items() if key not in dropped}
+        result = subprocess.run([program] + argv[1:], cwd=cwd if isinstance(cwd, str) else None,
+                                capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                env={**child, **passed, **_ACCOUNT_RUN_ENV},
+                                timeout=min(_ACCOUNT_RUN_TIMEOUT, remaining))
+        return result.stdout if result.returncode == 0 else None
+    except Exception:
+        return None
+
+
+# The variables that decide WHERE a tool reads its configuration. One of these set to something unreadable
+# makes every lookup answer for the wrong file, so the lookup is refused rather than answered.
+_ACCOUNT_CONFIG_STEERING = frozenset({
+    'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_SYSTEM', 'GIT_CONFIG_NOSYSTEM', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_PARAMETERS',
+    'GIT_DIR',
+    'GIT_WORK_TREE', 'XDG_CONFIG_HOME', 'GH_CONFIG_DIR', 'AWS_CONFIG_FILE', 'KUBECONFIG', 'HOME', 'USERPROFILE',
+})
+# git reads `GIT_CONFIG_COUNT` settings from indexed pairs, so they travel with it rather than being named one
+# by one in the table above.
+_ACCOUNT_INDEXED_CONFIG = ('GIT_CONFIG_KEY_', 'GIT_CONFIG_VALUE_')
+# The remembered names whose value names a person rather than a place, so it is one word by definition.
+_ACCOUNT_IDENTITY_VALUES = frozenset({
+    'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_EMAIL', 'GIT_CONFIG_COUNT', 'GH_HOST', 'GH_TOKEN', 'GITHUB_TOKEN',
+    'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN',
+})
+
+
+def _account_env_key(env: Dict) -> tuple:
+    """The settings that can change a lookup's answer, so a memo never answers a different question.
+
+    Every name the lookup forwards is part of it, the indexed `GIT_CONFIG_KEY_n` pairs included, and so is a
+    name the shell unset: `unset GIT_CONFIG_GLOBAL` must not share an answer with a call that never had it."""
+    present = tuple(sorted((name, value) for name, value in (env or {}).items()
+                           if name in _ACCOUNT_REMEMBERED or name.startswith(_ACCOUNT_INDEXED_CONFIG)))
+    for marker in (_TRANSFER_UNKNOWN_ENV, _TRANSFER_CLEAN_ENV):
+        if marker in (env or {}) or (marker is _TRANSFER_UNKNOWN_ENV and _account_beyond_reading(env)):
+            present += (('', marker),)
+    return present
+
+
+def _account_once(state: Dict, key: tuple, resolve) -> Any:
+    """One lookup per distinct question in a turn, so twenty calls to the same host resolve it once."""
+    memo = state.setdefault('account_memo', {})
+    if key not in memo:
+        memo[key] = resolve()
+    return memo[key]
+
+
+def _account_value(value: Any) -> Optional[str]:
+    """One identity value, bounded and refused when it is not a single word or holds a `$` expansion the walk left
+    unexpanded; None when it names nothing or cannot be read."""
+    if not isinstance(value, str):
+        return None
+    word = value.strip()[:_ACCOUNT_MAX_VALUE]
+    if not word or '$' in word or any(ch.isspace() or ord(ch) < 32 for ch in word):
+        return None
+    return word
+
+
+def _account_path(value: Any) -> Optional[str]:
+    """One configuration value as it was given, spaces and all; None when it names nothing or cannot be read."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()[:_ACCOUNT_MAX_PATH]
+    if not text or '$' in text or any(ord(ch) < 32 for ch in text):
+        return None
+    return text
+
+
+def _account_beyond_reading(env: Dict) -> bool:
+    """Whether this call's environment is past reading at all, as it is after a `source` or an `eval`."""
+    return _TRANSFER_UNKNOWN_ENV in (env or {})
+
+
+def _account_known(name: str, env: Dict) -> tuple:
+    """(the variable's value, whether it is knowable at all).
+
+    A substitution anywhere in it — `ghp_$(cat token)` as much as `$(cat token)` — means it is set to something
+    this process cannot see, and a source or eval may have set it to anything. Neither is the same as unset, so
+    the hook's own value must not stand in for either."""
+    raw = (env or {}).get(name)
+    if isinstance(raw, str) and _TRANSFER_SUBSTITUTED in raw:
+        return None, False
+    if name in (env or {}):
+        # Present and empty means the command's shell unset it, which is not the same as never having had it; set
+        # to something that cannot be read is not absent either, and stays unknown rather than falling through.
+        value = _account_value(raw)
+        return value, value is not None or not (isinstance(raw, str) and raw.strip())
+    if _TRANSFER_CLEAN_ENV in (env or {}):
+        # `env -i` cleared the environment, so the child sees nothing this process holds.
+        return None, True
+    if _account_beyond_reading(env):
+        return None, False
+    # Inherited and already expanded; one this reader cannot take is still set, so unknown rather than absent.
+    raw = os.environ.get(name)
+    value = _account_value(raw)
+    return value, value is not None or not (isinstance(raw, str) and raw.strip())
+
+
+def _account_setting(name: str, env: Dict) -> Optional[str]:
+    """What a variable is worth for this call, or None when it is unset or beyond reading."""
+    return _account_known(name, env)[0]
+
+
+def _account_option(args: List[str], names: tuple, reader=None, attached: bool = False,
+                    skip: frozenset = frozenset()) -> tuple:
+    """(what a call names with one of these options, whether it is readable); (None, True) when it names none.
+    The last occurrence wins, as each CLI's own parser does; the value after an option in `skip` is not read."""
+    raw = None
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--':
+            # Everything after this belongs to the command being run, not to the one naming the option.
+            break
+        if arg in skip:
+            i += 2
+            continue
+        if arg in names and i + 1 < len(args):
+            raw, i = args[i + 1], i + 2
+            continue
+        for name in names:
+            if arg.startswith(name + '='):
+                raw = arg.split('=', 1)[1]
+                break
+            if attached and len(name) == 2 and name[0] == '-' and arg.startswith(name) and len(arg) > 2:
+                # Only where the CLI takes it: gh reads `-Racme/app`, while kubectl reads `-server` as a flag.
+                raw = arg[2:]
+                break
+        i += 1
+    if raw is None:
+        return None, True
+    value = (reader or _account_value)(raw)
+    return (value, True) if value else (None, False)
+
+
+def _account_host_of(url: str) -> Optional[str]:
+    """The host a git remote URL names, for an https, ssh or scp-style address; None when it names none."""
+    text = url.strip().rstrip('/')
+    if not text:
+        return None
+    if '://' in text:
+        host = _transfer_url_host(text, frozenset({'https', 'http', 'ssh', 'git', 'ftp', 'ftps'}))
+        return _account_value((host or '').split('@')[-1].split(':')[0])
+    if ':' in text and not text.startswith('/'):
+        # scp-style `[user@]host:path`, which has no scheme and whose colon separates the path.
+        return _account_value(text.split(':', 1)[0].split('@')[-1])
+    return None
+
+
+def _account_repo_of(url: str) -> Optional[str]:
+    """The `owner/repo` a git remote URL points at, with any `.git` suffix and login dropped; None when unreadable."""
+    text = url.strip().rstrip('/')
+    if '://' in text:
+        path = _transfer_url_split(text).path
+    elif ':' in text and not text.startswith('/'):
+        path = text.split(':', 1)[1]
+    else:
+        return None
+    parts = [part for part in path.split('/') if part]
+    if len(parts) < 2:
+        return None
+    owner, name = parts[-2], parts[-1]
+    if name.endswith('.git'):
+        name = name[:-4]
+    return _account_value('%s/%s' % (owner, name))
+
+
+def _account_git_subcommand(args: List[str]) -> tuple:
+    """(the git subcommand, the arguments after it); ('', []) when the call names none."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in _ACCOUNT_GIT_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith('-'):
+            i += 1
+            continue
+        return arg, args[i + 1:]
+    return '', []
+
+
+def _account_config_key(name: str) -> str:
+    """A git configuration key as git compares it: section and variable case-insensitive, the subsection exact."""
+    section, _, rest = name.strip().partition('.')
+    subsection, dot, variable = rest.rpartition('.')
+    if not rest:
+        return section.lower()
+    return '.'.join([section.lower()] + ([subsection] if dot else []) + [variable.lower()])
+
+
+def _account_git_context(args: List[str], cwd: Optional[str], env: Dict) -> tuple:
+    """(the folder git would run in, the environment it would read, its `-c key=value` overrides).
+
+    `-C` moves git's folder and stacks, `--git-dir`/`--work-tree` repoint it, and `-c` beats the config file."""
+    folder, passed, overrides = cwd, dict(env or {}), {}
+    i = 0
+    while i < len(args):
+        if not args[i].startswith('-') and args[i - 1] not in _ACCOUNT_GIT_VALUE_OPTIONS:
+            break  # the subcommand; everything after it is the subcommand's own option surface
+        arg, value = args[i], args[i + 1] if i + 1 < len(args) else None
+        pair = arg.split('=', 1)
+        if arg == '-C' and value is not None:
+            # A relative one needs a folder to resolve against; with none, every lookup here is refused anyway.
+            folder = value if os.path.isabs(value) else os.path.join(folder, value) if folder else None
+            i += 2
+            continue
+        if arg == '-c' and value is not None:
+            name, _, setting = value.partition('=')
+            if name and _:
+                overrides[_account_config_key(name)] = setting
+            i += 2
+            continue
+        if pair[0] == '--config-env':
+            setting = pair[1] if len(pair) == 2 else value
+            name, _, variable = (setting or '').partition('=')
+            if name and _:
+                held, known = _account_known(variable, env)
+                # An override we cannot read still overrides, so the setting is unknown rather than the file's.
+                overrides[_account_config_key(name)] = held if known else _TRANSFER_SUBSTITUTED
+            i += 1 if len(pair) == 2 else 2
+            continue
+        for option, name in (('--git-dir', 'GIT_DIR'), ('--work-tree', 'GIT_WORK_TREE')):
+            if arg == option and value is not None:
+                passed[name] = value
+            elif pair[0] == option and len(pair) == 2:
+                passed[name] = pair[1]
+        i += 2 if arg in _ACCOUNT_GIT_VALUE_OPTIONS else 1
+    return folder, passed, overrides
+
+
+def _account_first_line(argv: List[str], cwd: Optional[str], env: Dict, state: Dict,
+                        key: tuple, raw: bool = False) -> Optional[str]:
+    """The first line one allowlisted lookup printed (all of it, as printed, with `raw`), asked once per question."""
+    def resolve():
+        output = _account_run(argv, cwd, env, state)
+        if raw:
+            return output
+        lines = (output or '').splitlines()
+        return _account_value(lines[0]) if lines else None
+
+    return _account_once(state, key, resolve)
+
+
+def _account_includes(overrides: Optional[Dict]) -> bool:
+    """Whether the call adds configuration files of its own, which this lookup cannot load the way git does."""
+    return any(key.startswith(('include.', 'includeif.')) for key in (overrides or {}))
+
+
+def _account_git_config(name: str, cwd: Optional[str], env: Dict, state: Dict,
+                        overrides: Optional[Dict] = None) -> Optional[str]:
+    """(one git configuration value, whether it is readable); a `-c` override wins, else git's own precedence."""
+    if _account_includes(overrides):
+        return None, False
+    if _account_config_key(name) in (overrides or {}):
+        # Overridden to something we cannot read: the file's value no longer applies, so git's is unknown.
+        override = (overrides or {}).get(_account_config_key(name))
+        value = None if override == _TRANSFER_SUBSTITUTED else _account_value(override)
+        return (value, True) if value else (None, False)
+    line = _account_first_line(['git', 'config', '--get', name], cwd, env, state,
+                               ('git-config', name, cwd, _account_env_key(env)), raw=True)
+    if not (line or '').strip():
+        return None, True
+    # Printed by git, so a `$` in it is literal; one that is still not a single word — a multi-line value included —
+    # is unknown, not absent, or the next setting would answer for it.
+    value = (line or '').strip()[:_ACCOUNT_MAX_VALUE]
+    return (value, True) if not any(ch.isspace() or ord(ch) < 32 for ch in value) else (None, False)
+
+
+def _account_push_remote(after: List[str], cwd: Optional[str], env: Dict, state: Dict,
+                         overrides: Dict) -> tuple:
+    """(the remote a push reaches, whether it is readable, whether the current branch's config chose it); git's
+    order: the positional repository, `--repo`, pushRemote, pushDefault, then the branch's remote."""
+    i = 0
+    while i < len(after):
+        arg = after[i]
+        if arg in _ACCOUNT_PUSH_VALUE_OPTIONS:
+            i += 2
+            continue
+        if arg.startswith('-'):
+            i += 1
+            continue
+        value = _account_value(arg)
+        return (value, True, False) if value else (None, False, False)
+    named, known = _account_option(after, ('--repo',))
+    if not known:
+        return None, False, False
+    if named:
+        return named, True, False
+    branch = _account_first_line(['git', 'symbolic-ref', '--short', 'HEAD'], cwd, env, state,
+                                 ('git-branch', cwd, _account_env_key(env)))
+    for name in (('branch.%s.pushRemote' % branch) if branch else None, 'remote.pushDefault',
+                 ('branch.%s.remote' % branch) if branch else None):
+        if name:
+            found, readable = _account_git_config(name, cwd, env, state, overrides)
+            if not readable:
+                return None, False, True
+            if found:
+                return found, True, True
+    return 'origin', True, True
+
+
+def _account_command_sets(env: Dict, setting: str) -> bool:
+    """Whether the command's own configuration — GIT_CONFIG_PARAMETERS or the indexed pairs — sets this key."""
+    params = (env or {}).get('GIT_CONFIG_PARAMETERS') or ''
+    if re.search(r"'%s'=" % re.escape(setting), params, re.IGNORECASE):
+        return True
+    count = (env or {}).get('GIT_CONFIG_COUNT') or '0'
+    return count.isdigit() and any(
+        ((env or {}).get('GIT_CONFIG_KEY_%d' % n) or '').lower() == setting for n in range(int(count)))
+
+
+# A remote name nobody uses, offered so git reports the URL a literal push would really reach.
+_ACCOUNT_PROBE_REMOTE = '__unbound_probe__'
+
+
+def _account_push_url_of(url: str, cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """The URL a push to this literal URL reaches after the user's `pushInsteadOf` and `insteadOf` rules.
+
+    git applies push rewrites only to a named remote, so the URL is named as a throwaway one through the indexed
+    config and `git remote -v` reports its push URL; nothing connects."""
+    count, known = _account_known('GIT_CONFIG_COUNT', env)
+    if not known or not (count or '0').isdigit():
+        return None
+    index = int(count or 0)
+    probe = {**(env or {}), 'GIT_CONFIG_COUNT': str(index + 1),
+             'GIT_CONFIG_KEY_%d' % index: 'remote.%s.url' % _ACCOUNT_PROBE_REMOTE, 'GIT_CONFIG_VALUE_%d' % index: url}
+    out = _account_once(state, ('git-push-rewrite', url, cwd, _account_env_key(env)),
+                        lambda: _account_run(['git', 'remote', '-v'], cwd, probe, state))
+    for line in (out or '').splitlines():
+        name, _, rest = line.partition('\t')
+        if name == _ACCOUNT_PROBE_REMOTE and rest.endswith(' (push)'):
+            return rest[:-len(' (push)')]
+    return None
+
+
+def _account_git(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the accounts a git call acted as, the repositories a push reached); both empty for a purely local call."""
+    subcommand, after = _account_git_subcommand(args)
+    if subcommand not in _ACCOUNT_GIT_REMOTE and subcommand not in _ACCOUNT_GIT_COMMITS:
+        return [], None
+    cwd, env, overrides = _account_git_context(args, cwd, env)
+    pushed = []
+    rewired = _account_includes(overrides) or any(key.startswith(('url.', 'remote.')) for key in overrides)
+    if subcommand == 'push' and not rewired:
+        remote, reachable, implicit = _account_push_remote(after, cwd, env, state, overrides)
+        # A push can name a URL rather than a remote, and then it names the destination outright. Nothing is a
+        # remote in that case, so none is recorded.
+        if reachable and remote and _account_repo_of(remote):
+            rewritten = _account_push_url_of(remote, cwd, env, state)
+            # A probe that failed says nothing about where the rules sent the push, so it stays unknown.
+            repo = _account_repo_of(rewritten) if rewritten else None
+            pushed = [(repo, None)] if repo else []
+        elif reachable and remote:
+            # A remote with several push URLs pushes to every one of them, so each is a destination. The trailing
+            # slash git returns for a bare host would otherwise make two spellings of one repository.
+            urls = _account_once(state, ('git-push-urls', remote, cwd, _account_env_key(env)), lambda: _account_run(
+                ['git', 'remote', 'get-url', '--push', '--all', remote], cwd, env, state))
+            pushed = [(repo, remote) for repo in (_account_repo_of(url) for url in (urls or '').splitlines()) if repo]
+        if implicit:
+            # Chosen by the current branch's config, read when the turn ends, so a later branch change moves it.
+            state.setdefault('account_implicit_call', []).extend(pushed)
+    # The committer identity, in git's own order. GIT_AUTHOR_EMAIL sets the author, not the committer, so it is
+    # not in this chain. It is a separate fact from the login that pushed and may disagree with it.
+    if subcommand not in _ACCOUNT_GIT_COMMITS and subcommand not in ('push', 'pull'):
+        # fetch, clone, ls-remote and archive make no commit, so no committer acted.
+        return [], pushed
+    email, known = _account_known('GIT_COMMITTER_EMAIL', env)
+    if not known:
+        # Who committed is a separate fact from where the push went; one unknown does not unsettle the other.
+        return [], pushed
+    active = False
+    for setting in ('committer.email', 'user.email'):
+        if email:
+            break
+        email, readable = _account_git_config(setting, cwd, env, state, overrides)
+        if not readable:
+            # git commits as the value we cannot read, so who committed is unknown rather than `user.email`.
+            return [], pushed
+        active = bool(email) and setting not in overrides and not _account_command_sets(env, setting)
+    account = {'platform': 'git', 'email': email, 'source': 'command'}
+    if active:
+        account['_active'] = True
+    return ([account] if email else []), pushed
+
+
+def _account_gh_repo(args: List[str], env: Dict) -> tuple:
+    """(the repository a gh call names, whether it is readable); gh reads `GH_REPO` exactly as it reads `--repo`."""
+    repo, known = _account_option(args, ('-R', '--repo'), attached=True, skip=_ACCOUNT_GH_TEXT_OPTIONS)
+    if repo or not known:
+        return repo, known
+    # A positional names the repository only under a command that acts on one; under `gh search` or `gh api`
+    # a URL is a query. A bare `OWNER/REPO` only under `gh repo`, since elsewhere a slashed word is a branch or
+    # a file (`gh pr checkout fix/login`).
+    group = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)[0]
+    if group not in _ACCOUNT_GH_REPO_SCOPED:
+        # Nor does GH_REPO steer a command that acts on no repository; gh reads it only where it reads `--repo`.
+        return None, True
+    takes_repo = group == 'repo'
+    switches = _ACCOUNT_GH_SWITCHES | _ACCOUNT_GH_SHORT_SWITCHES.get(tuple(args[:2]), frozenset())
+    for at, arg in enumerate(args):
+        # The word after an option is that option's value — a `--body` URL is a comment's text — unless the
+        # option carried its value with `=` or takes none.
+        before = args[at - 1] if at else ''
+        # An option is never the operand, `--body=<url>` included, and neither is the value after one.
+        if arg.startswith('-'):
+            continue
+        if before.startswith('-') and '=' not in before and before not in switches:
+            if '://' in arg and before not in _ACCOUNT_GH_TEXT_OPTIONS:
+                # An option we cannot place may take no value, making this URL where the call acts.
+                return None, False
+            continue
+        if '://' in arg:
+            if _account_host_of(arg):
+                return _account_value(arg), True
+            continue
+        parts = arg.split('/')
+        if takes_repo and len(parts) == 2 and all(parts) and '.' not in parts[0]:
+            return _account_value(arg), True
+        if takes_repo and len(parts) == 3 and all(parts) and '.' in parts[0]:
+            return _account_value(arg), True
+    return _account_known('GH_REPO', env)
+
+
+def _account_gh_host(args: List[str], env: Dict) -> tuple:
+    """(the host a gh call talks to, whether what it names can be read); gh's order is `--hostname`, then the
+    repository it names."""
+    # `-h` is the host only under `gh auth`; elsewhere it asks for help.
+    auth = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)[0] == 'auth'
+    host, known = _account_option(args, ('--hostname', '-h') if auth else ('--hostname',), attached=auth,
+                                  skip=_ACCOUNT_GH_TEXT_OPTIONS)
+    if host or not known:
+        return host, known
+    repo, known = _account_gh_repo(args, env)
+    if not known:
+        return None, False
+    if repo and '://' in repo:
+        return _account_host_of(repo), True
+    if repo and repo.count('/') == 2:
+        # gh's own `HOST/OWNER/REPO` form, which names the host outright.
+        return _account_value(repo.split('/')[0]), True
+    return None, True
+
+
+# gh's order among a checkout's remotes: these by name, then the rest.
+_ACCOUNT_GH_REMOTE_ORDER = ('upstream', 'github', 'origin')
+
+
+def _account_gh_remote_host(cwd: Optional[str], env: Dict, state: Dict) -> Optional[str]:
+    """The host of the remote gh takes as the checkout's repository, which it reads before falling back to dotcom."""
+    out = _account_once(state, ('gh-remotes', cwd, _account_env_key(env)),
+                        lambda: _account_run(['git', 'remote', '-v'], cwd, env, state))
+    urls = {}
+    for line in (out or '').splitlines():
+        name, _, rest = line.partition('\t')
+        if rest.endswith(' (fetch)'):
+            urls.setdefault(name, rest[:-len(' (fetch)')])
+    named = [name for name in _ACCOUNT_GH_REMOTE_ORDER if name in urls]
+    ordered = named + sorted(name for name in urls if name not in _ACCOUNT_GH_REMOTE_ORDER)
+    url = urls[ordered[0]] if ordered else None
+    host = _account_host_of(url) if url else None
+    if host and ('://' not in url or url.startswith('ssh://')):
+        # gh maps an SSH host alias through the SSH config — `git@github-personal:…` to github.com — so the
+        # same lookup ssh does decides it. An alias that cannot be looked up is kept, and its login then misses.
+        resolved, _ = _transfer_ssh_hostname(host, [], cwd, state)
+        return resolved or host
+    return host
+
+
+def _account_gh(args: List[str], env: Dict, cwd: Optional[str], state: Dict) -> tuple:
+    """(the GitHub account a gh call acted as, no repository); empty when a token in the environment signs it in."""
+    # A repository the command names is resolved against gh's own host, not against whatever this folder
+    # happens to point at; only a call that names none falls back to the checkout's remote.
+    repo_named, readable = _account_gh_repo(args, env)
+    named, known = _account_gh_host(args, env)
+    if not readable or not known:
+        return [], None
+    group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
+    action = _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0]
+    # `gh repo list`, `create`, `clone` and the template lookups act on no checkout, so its remote decides nothing.
+    checkout = repo_named is None and group in _ACCOUNT_GH_REPO_SCOPED and not (
+        group == 'repo' and action in ('list', 'create', 'clone', 'gitignore', 'license'))
+    if named is None and checkout and not isinstance(cwd, str):
+        # gh reads the checkout's remote before GH_HOST, and an unknown folder cannot be read, so every
+        # remaining answer would be a guess at an enterprise host.
+        return [], None
+    fallback, fallback_known = _account_known('GH_HOST', env)
+    if not fallback_known:
+        return [], None
+    remote_host = None if named else (_account_gh_remote_host(cwd, env, state) if checkout else None)
+    host = named or remote_host or fallback or 'github.com'
+    if not host:
+        return [], None
+    lowered = host.lower()
+    dotcom = lowered in ('github.com', 'github.localhost') or lowered.endswith(('.github.com', '.ghe.com'))
+    for name in (_ACCOUNT_GH_TOKENS if dotcom else _ACCOUNT_GHE_TOKENS):
+        # A value the walk could not read is not an absent one: it still signs the call in as whoever owns it.
+        value, known = _account_known(name, env)
+        if value or not known:
+            return [], None
+    # Keyed by folder too: a relative GH_CONFIG_DIR or XDG_CONFIG_HOME names a different config in each.
+    login = _account_first_line(['gh', 'config', 'get', '-h', host, 'user'], cwd, env, state,
+                                ('gh-user', host, cwd, _account_env_key(env)))
+    # The login gh holds for the host, which `gh auth switch` changes for every later call; a host the checkout's
+    # remotes decide, found or not, also moves with a later remote change.
+    active = ('github', 'git-remote') if checkout and not named else True
+    return ([{'platform': 'github', 'host': host, 'login': login, 'source': 'command', '_active': active}]
+            if login else []), None
+
+
+_ACCOUNT_HANDLERS = {'git': _account_git, 'gh': _account_gh}
+
+
+def _account_cobra_subcommand(args: List[str], switches: frozenset) -> tuple:
+    """(the subcommand, the words after it), found as cobra finds one: an option written without `=` that is not
+    one of `switches` takes the next word as its value, and `--` ends the search."""
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--':
+            break
+        if arg.startswith('-'):
+            takes = '=' not in arg and arg not in switches and (arg.startswith('--') or len(arg) == 2)
+            i += 2 if takes else 1
+            continue
+        return arg, args[i + 1:]
+    return '', []
+
+
+# gh's options that take no value where they can come before a subcommand. Not `-h`: gh reads it there as the
+# subcommand's own `-h`, so `gh -h <host> auth status` names a host.
+_ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'--help', '--version'})
+
+
+def _account_switches(program: str, args: List[str]) -> Optional[str]:
+    """The platform whose active account this call changes for the rest of the turn, or None."""
+    if program == 'gh' and '--help' not in args:
+        group, after = _account_cobra_subcommand(args, _ACCOUNT_GH_SWITCH_OPTIONS)
+        if group == 'auth' and _account_cobra_subcommand(after, _ACCOUNT_GH_SWITCH_OPTIONS)[0] in (
+                'switch', 'login', 'logout'):
+            return 'github'
+    if program == 'git':
+        subcommand, after = _account_git_subcommand(args)
+        if subcommand == 'remote' and _account_git_subcommand(after)[0] in _ACCOUNT_REMOTE_EDITS:
+            return 'git-remote'
+        if subcommand in ('checkout', 'switch') and '--' not in after:
+            return 'git-branch'
+        # A set or an unset changes a key, in either spelling — `--unset`, or git 2.46's `set`/`unset` verbs;
+        # `git config user.email` alone, `git config get`, or `--get`/`--list` only read it.
+        verb = after[0].lower() if after and not after[0].startswith('-') else ''
+        reads = ('--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l')
+
+        def written(keys):
+            return subcommand == 'config' and keys and not any(arg in reads for arg in after) and (
+                verb in ('set', 'unset') or any(arg.startswith('--unset') for arg in after)
+                or (verb != 'get' and any(at + 1 < len(after) and not after[at + 1].startswith('-') for at in keys)))
+        if written([at for at, arg in enumerate(after) if arg.lower() in ('user.email', 'committer.email')]):
+            return 'git'
+        # Removing or renaming a whole section changes every key in it: `user` the committer, a remote, URL or
+        # branch section where a push goes.
+        section = _account_config_section(after) if subcommand == 'config' else ''
+        # An included file can set any key, so a change to what is included moves the committer and the pushes.
+        if section.startswith('include') or written(
+                [at for at, arg in enumerate(after) if _ACCOUNT_INCLUDE_KEY.match(arg)]):
+            return 'git-include'
+        if section in ('user', 'committer'):
+            return 'git'
+        if section.startswith(('remote', 'url', 'branch')):
+            return 'git-remote'
+        if written([at for at, arg in enumerate(after) if _ACCOUNT_REMOTE_KEY.match(arg)]):
+            return 'git-remote'
+    return None
+
+
+# `git remote` subcommands that change where a push goes, and the config keys that do.
+_ACCOUNT_REMOTE_EDITS = frozenset({'add', 'set-url', 'rename', 'remove', 'rm'})
+_ACCOUNT_REMOTE_KEY = re.compile(
+    r'^(?:remote\.(?P<remote>.+)\.(?:url|pushurl)|url\..+\.(?:insteadof|pushinsteadof)'
+    r'|branch\..+\.(?:remote|pushremote)|remote\.pushdefault)$', re.IGNORECASE)
+_ACCOUNT_INCLUDE_KEY = re.compile(r'^include(?:if\..+)?\.path$', re.IGNORECASE)
+
+
+def _account_includes_on(condition: str, args: List[str], cwd: Optional[str], env: Dict, state: Dict) -> bool:
+    """Whether this checkout's configuration includes a file on `condition` (`onbranch:`, `hasconfig:remote.`), so
+    a branch or remote change can change the committer; true when the key names cannot be read. Names only."""
+    cwd, env, _overrides = _account_git_context(args, cwd, env)
+    names = _account_once(state, ('git-config-names', cwd, _account_env_key(env)), lambda: _account_run(
+        ['git', 'config', '--name-only', '--list'], cwd, env, state))
+    return names is None or any(name.lower().startswith('includeif.' + condition) for name in names.splitlines())
+
+
+# The include conditions a branch or a remote change can flip.
+_ACCOUNT_INCLUDE_CONDITIONS = {'git-branch': 'onbranch:', 'git-remote': 'hasconfig:remote.'}
+
+
+def _account_config_section(after: List[str]) -> str:
+    """The section a `git config --remove-section`/`--rename-section` (or the `remove-section` verb) acts on."""
+    ops = ('--remove-section', '--rename-section', 'remove-section', 'rename-section')
+    at = next((i for i, arg in enumerate(after) if arg.lower() in ops), None)
+    return after[at + 1].lower() if at is not None and at + 1 < len(after) else ''
+
+
+def _account_remote_scope(args: List[str]) -> Optional[str]:
+    """The one remote a remote change names, or None when it can move any push (a URL rewrite, a push target)."""
+    subcommand, after = _account_git_subcommand(args)
+    if subcommand == 'remote':
+        return _account_value(_account_git_subcommand(_account_git_subcommand(after)[1])[0])
+    section = _account_config_section(after)
+    if section.startswith('remote.'):
+        return _account_value(section[len('remote.'):])
+    for arg in after:
+        match = _ACCOUNT_REMOTE_KEY.match(arg)
+        if match:
+            return match.group('remote')
+    return None
+# A command that names none of these is not parsed at all, because the transfer block has already parsed it once.
+# A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
+# Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
+_ACCOUNT_TRIGGERS = re.compile(
+    r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
+# `GIT_CONFIG_GLOBAL=` set empty makes git read no global file, while `unset` makes it read the default one; the
+# walk sees both as empty, so a git call after an explicit empty one is not resolved.
+_ACCOUNT_EMPTY_GIT_CONFIG = re.compile(r'(?<![\w$])GIT_CONFIG_(?:GLOBAL|SYSTEM)=(?=\s|$|[;&|)]|""|\'\')')
+# PowerShell sets variables the shell walk does not model — `$env:NAME =`, `${env:NAME} =`, `Set-Item Env:NAME`,
+# SetEnvironmentVariable — so a call after one that sets an identity or configuration name is not resolved.
+_ACCOUNT_POWERSHELL_ENV = re.compile(
+    r'\$\{?env:([A-Za-z_]\w*)\}?\s*='
+    r'|(?:Set-Item|New-Item|Set-Content)\s+(?:-(?:Literal)?Path\s+)?[\'"]?Env:([A-Za-z_]\w*)'
+    r'|SetEnvironmentVariable\(\s*[\'"]([A-Za-z_]\w*)', re.IGNORECASE)
+
+
+def _accounts(command: Optional[str], cwd: Optional[str], state: Dict, sure: bool = True) -> Optional[Dict]:
+    """The accounts a shell call acted as, and the repository a push reached; None when it names no platform. A call
+    that may not have run (`sure` false) resolves nothing but still counts as a switch. Never raises."""
+    try:
+        if not isinstance(command, str) or not command.strip():
+            return None
+        if not _ACCOUNT_TRIGGERS.search(command):
+            return None
+        empty_git_config = bool(_ACCOUNT_EMPTY_GIT_CONFIG.search(command))
+        steered = {''.join(names).upper() for names in _ACCOUNT_POWERSHELL_ENV.findall(command)}
+        # Resolves nothing, but its switches still count, as for a call that may not have run.
+        if steered & _ACCOUNT_REMEMBERED or any(n.startswith(_ACCOUNT_INDEXED_CONFIG) for n in steered):
+            sure = False
+        # Nothing is seeded from an earlier call: each command runs in its own shell, so only its own text
+        # and the hook's ambient environment decide who ran it.
+        shell = _transfer_shell(_TransferLexer(command).read() or [], cwd, {}, 0)
+        found, pushes, named = [], [], []
+        state['account_implicit_call'] = []
+        # Accounts are read when the turn ends, so one an earlier call took from the active configuration is the
+        # switched one if a later call switched it. Those earlier accounts are dropped then, in place.
+        taken = state.setdefault('account_active', [])
+        for program, args, env, call_cwd, other_user, _layers, unsure in shell['calls']:
+            switched = _account_switches(program, args)
+            # Run as another user, a switch changes that user's configuration, not ours; only a git write to this
+            # repository's config, which both read, still moves our committer or our pushes.
+            if switched and other_user and (switched not in ('git', 'git-remote', 'git-branch', 'git-include') or any(
+                    arg in ('--global', '--system', '-f', '--file', '-C', '--git-dir')
+                    or arg.startswith(('--file=', '--git-dir=')) for arg in args)):
+                switched = None
+            if switched in ('git-branch', 'git-remote', 'git-include'):
+                # Push destinations are read when the turn ends, so a later branch change moves a push its branch's
+                # config chose, and a remote change one through that remote (any, for a rewrite or an include).
+                scope = _account_remote_scope(args)
+
+                def moved(implicit):
+                    def picks(repo, remote):
+                        if switched == 'git-branch':
+                            return (repo, remote) in implicit
+                        return scope is None or remote == scope
+                    return picks
+                pushes[:] = [push for push in pushes if not moved(state['account_implicit_call'])(*push)]
+                held = state.setdefault('account_pushes', [])
+                for entry, implicit in held:
+                    _account_withdraw(entry, moved(implicit))
+                held[:] = [(entry, implicit) for entry, implicit in held if entry.get('pushed_repo')]
+                # A gh login read from the checkout's remote host moves with the remote, and the committer with an
+                # include, or with a branch or remote change when a file is included on one.
+                moving = {'git-remote'} if switched != 'git-branch' else set()
+                condition = _ACCOUNT_INCLUDE_CONDITIONS.get(switched)
+                if switched == 'git-include' or (condition and any(item[0] == 'git' for item in taken)
+                                                 and _account_includes_on(condition, args, call_cwd, env, state)):
+                    moving.add('git')
+                hit = [item for item in taken if item[0] in moving]
+                for _key, accounts, account in hit:
+                    if account in accounts:
+                        accounts.remove(account)
+                taken[:] = [item for item in taken if item not in hit]
+            elif switched:
+                # `gh auth switch -h <host>` changes that host's login only; with no host, or one unreadable, any.
+                host = _account_option(args, ('--hostname', '-h'), attached=True)[0] if switched == 'github' else None
+                hit = [item for item in taken
+                       if item[0] == switched and (host is None or str(item[2].get('host')).lower() == host.lower())]
+                for _platform, accounts, account in hit:
+                    if account in accounts:
+                        accounts.remove(account)
+                taken[:] = [item for item in taken if item not in hit]
+            handler = _ACCOUNT_HANDLERS.get(program)
+            # A call that only may have run tells us nothing about who ran it, one run as another user resolves
+            # that user's configuration and not the hook's, and one past a source or eval resolves nothing.
+            if handler is None or unsure or not sure or other_user or _account_beyond_reading(env):
+                continue
+            if program == 'git' and empty_git_config:
+                continue
+            implicit_call = state['account_implicit_call']
+            before = len(implicit_call)
+            accounts, reached = handler(args, env, call_cwd, state)
+            # A push named outright stays known whatever branch a bare push to the same place in this call followed.
+            named.extend(push for push in reached or [] if push not in implicit_call[before:])
+            implicit_call[:] = [push for push in implicit_call if push not in named]
+            for account in accounts:
+                active = account.pop('_active', False)
+                if account in found:
+                    if not active:
+                        # Named outright by this call too, so a later switch no longer decides it.
+                        taken[:] = [item for item in taken if not (item[1] is found and item[2] == account)]
+                elif len(found) < _ACCOUNT_MAX:
+                    found.append(account)
+                    # Registered under its platform, or under each selector named when more than one can move it.
+                    for key in (active if isinstance(active, tuple) else (account['platform'],) if active else ()):
+                        taken.append((key, found, account))
+            for push in reached or []:
+                if push not in pushes:
+                    pushes.append(push)
+        resolved = {}
+        if found:
+            resolved['accounts'] = found
+        if pushes:
+            # The remote rides with each one, so the backend applies it to that push and not to the call's other
+            # actions. The first is named on its own, and a command that pushed more than once lists them all.
+            resolved['pushed_repo'], pushed_remote = pushes[0]
+            if pushed_remote:
+                resolved['pushed_remote'] = pushed_remote
+            if len(pushes) > 1:
+                resolved['pushed'] = [{'repo': repo, 'remote': remote} for repo, remote in pushes]
+        return resolved or None
+    except Exception:
+        return None
+
+
+def _with_accounts(entry: Dict, resolved: Optional[Dict], state: Optional[Dict] = None) -> Dict:
+    """The tool_use entry with the accounts its call acted as, and the repository a push reached; given the turn's
+    state, a push is remembered so a later remote change in the turn can withdraw it."""
+    if resolved:
+        entry.update(resolved)
+        if state is not None and resolved.get('pushed_repo'):
+            # With the pushes its branch's config chose, which only a later branch change moves.
+            state.setdefault('account_pushes', []).append((entry, list(state.get('account_implicit_call') or [])))
+    return entry
+
+
+def _account_withdraw(entry: Dict, moved) -> None:
+    """Drop from an entry the pushes `moved(repo, remote)` picks, keeping the rest of a call that pushed more than
+    once, its first named as before."""
+    pushes = entry.get('pushed') or (
+        [{'repo': entry['pushed_repo'], 'remote': entry.get('pushed_remote')}] if entry.get('pushed_repo') else [])
+    kept = [push for push in pushes if not moved(push.get('repo'), push.get('remote'))]
+    for key in ('pushed_repo', 'pushed_remote', 'pushed'):
+        entry.pop(key, None)
+    if kept:
+        entry['pushed_repo'] = kept[0]['repo']
+        if kept[0].get('remote'):
+            entry['pushed_remote'] = kept[0]['remote']
+        if len(kept) > 1:
+            entry['pushed'] = kept
+# --- end account resolution ---
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
@@ -7685,6 +8564,8 @@ def build_llm_exchange(events, api_key=None):
             transfer = _transfer(script, event.get('cwd') or workspace_cwd, transfer_state)
             if transfer:
                 shell_entry['transfer'] = transfer
+            _with_accounts(shell_entry, _accounts(script, event.get('cwd') or workspace_cwd, transfer_state),
+                           transfer_state)
             assistant_tool_uses.append(shell_entry)
 
         elif hook_event_name == 'afterMCPExecution':
