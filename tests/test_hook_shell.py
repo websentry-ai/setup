@@ -168,16 +168,39 @@ class VSCodeTests(ShellTestCase):
                 self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal'), _shell('powershell', 'agent_rule'))
         self.assertFalse([p for p in seen if 'attacker' in str(p)], seen)
 
+    def test_a_symlink_to_a_network_share_is_never_followed(self):
+        link = Path(tempfile.mkdtemp(), 'pwsh.exe')
+        link.symlink_to('//attacker.example/s/pwsh.exe')
+        local = self.installed('powershell.exe')
+        self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Dev',
+                                       'terminal.integrated.profiles.windows': {'Dev': {'path': [str(link), local]}}}))
+        seen = []
+        real_isfile = os.path.isfile
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_windows', return_value=True), \
+                    patch.object(hook.os.path, 'isfile', side_effect=lambda p: seen.append(p) or real_isfile(p)):
+                hook._SHELL_CACHE.clear()
+                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal'), _shell('powershell', 'agent_rule'))
+        self.assertNotIn(str(link), [str(p) for p in seen])
+
     def test_a_profile_listing_several_paths_names_the_first_one_installed(self):
         installed = Path(tempfile.mkdtemp(), 'powershell.exe')
         installed.write_text('')
         missing = str(Path(tempfile.mkdtemp(), 'pwsh.exe'))
-        both = {'chat.tools.terminal.terminalProfile.windows': {'path': [missing, str(installed)]}}
-        self.user_settings(json.dumps(both))
+        def default(paths):
+            return json.dumps({'terminal.integrated.defaultProfile.windows': 'Dev',
+                               'terminal.integrated.profiles.windows': {'Dev': {'path': paths}}})
+        self.user_settings(default([missing, str(installed)]))
         self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
         # None of them installed: VS Code can't start it, so no shell is named.
-        self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': [missing]}}))
+        self.user_settings(default([missing]))
         self.assert_shell('copilot', 'run_in_terminal', {}, windows=True)
+
+    def test_copilots_own_profile_with_a_list_of_paths_is_ignored_as_vs_code_ignores_it(self):
+        listed = {'path': [str(Path(tempfile.mkdtemp(), 'pwsh.exe')), self.installed('bash.exe')]}
+        self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': listed,
+                                       'terminal.integrated.defaultProfile.windows': 'Command Prompt'}))
+        self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
 
     def test_an_unset_profile_is_powershell_on_windows_and_the_users_shell_elsewhere(self):
         self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)

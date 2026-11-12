@@ -5364,6 +5364,22 @@ def _shell_vscode_app():
     return 'Code'
 
 
+def _shell_network_path(path):
+    """A network share, or a symlink that leads to one; links are read, never followed, so no server is reached."""
+    for _ in range(8):
+        if path.startswith(('\\\\', '//')):
+            return True
+        try:
+            if not os.path.islink(path):
+                return False
+            target = os.readlink(path)
+        except (OSError, ValueError):
+            return False
+        path = target if os.path.isabs(target) or target.startswith(('\\\\', '//')) else \
+            os.path.join(os.path.dirname(path), target)
+    return True
+
+
 def _shell_profile_path(path, check=True):
     """A profile's executable as VS Code resolves it: `${env:…}` expanded, then the first entry that is installed, or
     nothing. A network path is never looked up, so a repository's settings can't make the hook reach a server."""
@@ -5371,7 +5387,7 @@ def _shell_profile_path(path, check=True):
         if not isinstance(candidate, str):
             continue
         expanded = re.sub(r'\$\{env:([^}]+)\}', lambda m: os.environ.get(m.group(1), ''), candidate).strip().strip('"')
-        if not expanded or expanded.startswith(('\\\\', '//')):
+        if not expanded or _shell_network_path(expanded):
             continue
         if not check or os.path.isfile(expanded) or (
                 '/' not in expanded and '\\' not in expanded and shutil.which(expanded)):
@@ -5394,9 +5410,9 @@ def _shell_vscode(cwd):
         [_shell_settings(user_root / _shell_vscode_app() / 'User' / 'settings.json')]
     for layer in layers:
         profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
-        if isinstance(profile, dict) and 'path' in profile:
-            # Copilot keeps its own profile's single path even when the file is missing.
-            return _shell_name(_shell_profile_path(profile['path'], check=not isinstance(profile['path'], str)))
+        # Copilot's own profile takes one path, kept even when the file is missing; any other shape is ignored.
+        if isinstance(profile, dict) and isinstance(profile.get('path'), str):
+            return _shell_name(_shell_profile_path(profile['path'], check=False))
     for layer in layers:
         chosen = layer.get('terminal.integrated.defaultProfile.' + key)
         if not isinstance(chosen, str):
