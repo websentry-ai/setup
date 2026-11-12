@@ -1100,6 +1100,15 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.cwd = str(sub)
         self.assertEqual(self.forwarded(), self.FS)
 
+    def test_relative_script_is_hashed_from_the_launch_folder_after_a_cd(self):
+        (self.repo / "server.js").write_bytes(b"console.log('x')\n")
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": {"command": "node", "args": ["server.js"]}}})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.cwd = str(sub)
+        self.assertIn("scriptHash", self.forwarded())
+
     def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
         self.assertEqual(self.forwarded(), self.FS)

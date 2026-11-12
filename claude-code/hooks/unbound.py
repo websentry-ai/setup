@@ -2263,10 +2263,12 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                         break
                     cwd_path = parent
 
-            # Claude loads .mcp.json from where it was launched; the event cwd follows an in-session cd.
-            result = _project_mcp_json_server(server_name, os.environ.get('CLAUDE_PROJECT_DIR') or cwd)
+            # Claude loads .mcp.json, and starts its servers, from where it was launched;
+            # the event cwd follows an in-session cd.
+            launch_dir = os.environ.get('CLAUDE_PROJECT_DIR') or cwd
+            result = _project_mcp_json_server(server_name, launch_dir)
             if result:
-                return _augment_script_hash(result, cwd)
+                return _augment_script_hash(result, launch_dir)
 
         top_servers = config.get('mcpServers', {})
         if isinstance(top_servers, dict) and server_name in top_servers:
