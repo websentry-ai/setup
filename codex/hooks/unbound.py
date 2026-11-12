@@ -2607,7 +2607,6 @@ def _read_mcp_server_config_regex(server_name, config_path):
         return None
 
 
-
 def _codex_project_root(cwd):
     """Codex's project root: the nearest folder at or above cwd holding .git, else cwd."""
     start = Path(cwd).expanduser()
@@ -2615,6 +2614,22 @@ def _codex_project_root(cwd):
         if (folder / '.git').exists():
             return folder
     return start
+
+
+def _codex_trust_keys(root):
+    """Paths whose trust covers root: root itself and, for a linked worktree,
+    the main checkout (Codex keys trust to the parent of the git common dir)."""
+    keys = {os.path.realpath(root)}
+    try:
+        line = (root / '.git').read_text(encoding='utf-8').strip()
+        if line.startswith('gitdir:'):
+            gitdir = root / line[len('gitdir:'):].strip()
+            commondir = gitdir / 'commondir'
+            common = gitdir / commondir.read_text(encoding='utf-8').strip() if commondir.exists() else gitdir
+            keys.add(os.path.dirname(os.path.realpath(common)))
+    except OSError:
+        pass
+    return keys
 
 
 def _codex_trusted_projects():
@@ -2647,8 +2662,8 @@ def _codex_mcp_server_config(server_name, cwd):
     try:
         if cwd:
             root = _codex_project_root(cwd)
-            target = os.path.realpath(root)
-            if any(os.path.realpath(os.path.expanduser(p)) == target for p in _codex_trusted_projects()):
+            keys = _codex_trust_keys(root)
+            if any(os.path.realpath(os.path.expanduser(p)) in keys for p in _codex_trusted_projects()):
                 start = Path(cwd).expanduser()
                 for folder in (start, *start.parents):
                     cfg = _read_mcp_server_config(server_name, folder / '.codex' / 'config.toml')
@@ -2659,6 +2674,7 @@ def _codex_mcp_server_config(server_name, cwd):
     except Exception:
         pass
     return _read_mcp_server_config(server_name, CODEX_CONFIG_PATH)
+
 
 def _email_domain(email: Optional[str]) -> Optional[str]:
     try:

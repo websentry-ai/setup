@@ -105,6 +105,18 @@ class CodexProjectMcpConfig(unittest.TestCase):
         self.cwd = sub
         self.assertEqual(self.forwarded(), FS)
 
+    def test_linked_worktree_inherits_the_main_checkouts_trust(self):
+        gitdir = self.repo / ".git" / "worktrees" / "wt"
+        gitdir.mkdir(parents=True)
+        (gitdir / "commondir").write_text("../..\n")
+        wt = self.repo.parent / "wt"
+        wt.mkdir()
+        (wt / ".git").write_text(f"gitdir: {gitdir}\n")
+        self._user(trust=self.repo)
+        self._project(wt, FS_TOML)
+        self.cwd = wt
+        self.assertEqual(self.forwarded(), FS)
+
     def test_project_beats_user_with_the_same_name(self):
         self._user(server=OTHER_TOML, trust=self.repo)
         self._project(self.repo, FS_TOML)
