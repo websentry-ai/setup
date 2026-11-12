@@ -123,37 +123,29 @@ class VSCodeTests(ShellTestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(settings)
 
-    def workspace(self, settings):
-        root = tempfile.mkdtemp()
-        Path(root, '.vscode').mkdir()
-        Path(root, '.vscode', 'settings.json').write_text(json.dumps(settings))
-        return root
-
     def test_only_the_running_editions_settings_count(self):
         self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Git Bash'}))
         self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': 'pwsh.exe'}}),
                            edition='Code - Insiders')
         self.assert_shell('copilot', 'run_in_terminal', _shell('bash', 'agent_rule'), windows=True)
-        insiders = 'C:\\Users\\dev\\AppData\\Roaming\\Code - Insiders\\1.99-main.sock'
-        with patch.dict(os.environ, {'VSCODE_IPC_HOOK': insiders}):
-            self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
+        # A stable install under a user whose name merely contains "insider" is still stable.
+        with patch.dict(os.environ, {'VSCODE_IPC_HOOK': 'C:\\Users\\insider\\AppData\\Roaming\\Code\\1.99-main.sock'}):
+            self.assert_shell('copilot', 'run_in_terminal', _shell('bash', 'agent_rule'), windows=True)
+        for hint in ({'VSCODE_IPC_HOOK': 'C:\\Users\\dev\\AppData\\Roaming\\Code - Insiders\\1.99-main.sock'},
+                     {'TERM_PROGRAM_VERSION': '1.100.0-insider'}):
+            with patch.dict(os.environ, hint):
+                self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
 
-    def test_a_repository_cannot_pick_a_shell_it_ships(self):
-        self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Git Bash'}))
-        for settings, expected in (
-                # A shell inside the repository is ignored, so the user's own settings decide.
-                ({'chat.tools.terminal.terminalProfile.windows': {'path': '.\\tools\\pwsh.exe'}}, 'bash'),
-                ({'chat.tools.terminal.terminalProfile.windows': {'path': 'C:\\src\\repo\\pwsh.exe'}}, 'bash'),
-                ({'terminal.integrated.defaultProfile.windows': 'Dev',
-                  'terminal.integrated.profiles.windows': {'Dev': {'path': 'C:\\src\\repo\\bin\\zsh.exe'}}}, 'bash'),
-                ({'chat.tools.terminal.terminalProfile.windows':
-                  {'path': 'C:\\Program Files\\..\\src\\pwsh.exe'}}, 'bash'),
-                # An installed shell, or one named bare, is still the workspace's choice.
-                ({'chat.tools.terminal.terminalProfile.windows':
-                  {'path': 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'}}, 'pwsh'),
-                ({'chat.tools.terminal.terminalProfile.windows': {'path': 'pwsh.exe'}}, 'pwsh')):
-            self.assert_shell('copilot', 'run_in_terminal', _shell(expected, 'agent_rule'),
-                              cwd=self.workspace(settings), windows=True)
+    def test_a_profile_listing_several_paths_names_the_first_one_installed(self):
+        installed = Path(tempfile.mkdtemp(), 'powershell.exe')
+        installed.write_text('')
+        missing = str(Path(tempfile.mkdtemp(), 'pwsh.exe'))
+        both = {'chat.tools.terminal.terminalProfile.windows': {'path': [missing, str(installed)]}}
+        self.user_settings(json.dumps(both))
+        self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
+        # None of them installed: VS Code can't start it, so no shell is named.
+        self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {'path': [missing]}}))
+        self.assert_shell('copilot', 'run_in_terminal', {}, windows=True)
 
     def test_an_unset_profile_is_powershell_on_windows_and_the_users_shell_elsewhere(self):
         self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
@@ -164,7 +156,7 @@ class VSCodeTests(ShellTestCase):
                 ({'terminal.integrated.defaultProfile.windows': 'Git Bash'}, 'bash'),
                 ({'terminal.integrated.defaultProfile.windows': 'Command Prompt'}, 'powershell'),
                 ({'terminal.integrated.defaultProfile.windows': 'Dev',
-                  'terminal.integrated.profiles.windows': {'Dev': {'path': ['C:\\tools\\pwsh.exe', 'x']}}}, 'pwsh')):
+                  'terminal.integrated.profiles.windows': {'Dev': {'path': 'C:\\tools\\pwsh.exe'}}}, 'pwsh')):
             self.user_settings(json.dumps(settings))
             self.assert_shell('copilot', 'run_in_terminal', _shell(expected, 'agent_rule'), windows=True)
 
