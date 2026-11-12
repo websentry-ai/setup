@@ -1162,6 +1162,19 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
             unbound.process_pre_tool_use(event, "API_KEY")
         self.assertEqual(seen.get("cwd"), str(self.repo))
 
+    def test_disabled_project_server_falls_through_to_user_scope(self):
+        # Claude runs the user-scope server when the project entry is disabled.
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".claude" / "settings.local.json", {"disabledMcpjsonServers": ["fsx"]})
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_disabling_another_server_keeps_the_project_entry(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".claude" / "settings.json", {"disabledMcpjsonServers": ["other"]})
+        self.assertEqual(self.forwarded(), self.FS)
+
     def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
         self.assertEqual(self.forwarded(), self.FS)

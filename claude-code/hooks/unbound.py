@@ -2209,12 +2209,28 @@ def _claude_plugin_launch_values() -> tuple:
         return [], []
 
 
+def _disabled_mcpjson_servers(cwd: str) -> set:
+    """Project servers the user disabled (disabledMcpjsonServers in any settings
+    file Claude merges); Claude runs the user-scope server of that name instead."""
+    names = set()
+    for path in _diag_settings_files(cwd):
+        try:
+            value = json.loads(path.read_text(encoding='utf-8')).get('disabledMcpjsonServers')
+        except Exception:
+            continue
+        if isinstance(value, list):
+            names.update(v for v in value if isinstance(v, str))
+    return names
+
+
 def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
     """The server's entry in the nearest project .mcp.json at or above cwd, where
     Claude Code loads its project-scoped servers."""
     try:
         start = Path(cwd).expanduser()
     except (TypeError, ValueError):
+        return None
+    if server_name in _disabled_mcpjson_servers(cwd):
         return None
     for folder in (start, *start.parents):
         if folder == folder.parent:
