@@ -2661,24 +2661,28 @@ def _codex_trusted_projects():
 
 
 def _codex_mcp_server_config(server_name, cwd):
-    """Codex's precedence: a trusted project's .codex/config.toml files, nearest to
-    cwd first, then $CODEX_HOME/config.toml. Untrusted projects are skipped, as
-    Codex skips them."""
+    """Codex's layering: $CODEX_HOME/config.toml, then a trusted project's
+    .codex/config.toml files from the git root down to cwd, nearer fields winning.
+    Untrusted projects are skipped, as Codex skips them."""
+    layers = [CODEX_CONFIG_PATH]
     try:
         if cwd:
             root = _codex_project_root(cwd)
             keys = _codex_trust_keys(root)
             if any(os.path.realpath(os.path.expanduser(p)) in keys for p in _codex_trusted_projects()):
                 start = Path(cwd).expanduser()
+                project = []
                 for folder in (start, *start.parents):
-                    cfg = _read_mcp_server_config(server_name, folder / '.codex' / 'config.toml')
-                    if cfg:
-                        return cfg
+                    project.append(folder / '.codex' / 'config.toml')
                     if folder == root:
                         break
+                layers += reversed(project)
     except Exception:
         pass
-    return _read_mcp_server_config(server_name, CODEX_CONFIG_PATH)
+    merged = {}
+    for path in layers:
+        merged.update(_read_mcp_server_config(server_name, path) or {})
+    return merged or None
 
 
 def _email_domain(email: Optional[str]) -> Optional[str]:

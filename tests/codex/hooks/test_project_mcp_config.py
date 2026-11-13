@@ -160,6 +160,12 @@ class CodexProjectMcpConfig(unittest.TestCase):
         self.cwd = evil
         self.assertIsNone(self.forwarded())
 
+    def test_project_fields_merge_over_the_user_definition(self):
+        self._user(server=FS_TOML, trust=self.repo)
+        (self.repo / ".codex").mkdir()
+        (self.repo / ".codex" / "config.toml").write_text('[mcp_servers.fsx]\nargs = ["/opt/other_server.py"]\n')
+        self.assertEqual(self.forwarded(), {"command": "npx", "args": ["/opt/other_server.py"]})
+
     def test_project_beats_user_with_the_same_name(self):
         self._user(server=OTHER_TOML, trust=self.repo)
         self._project(self.repo, FS_TOML)
