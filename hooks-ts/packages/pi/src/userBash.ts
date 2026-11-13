@@ -41,6 +41,7 @@ import {
   USER_BASH_ID_PREFIX,
 } from "../../core/src/constants.ts";
 import { auditToolInput, buildPretoolPayload } from "../../core/src/payload.ts";
+import { detectShell } from "../../core/src/shell.ts";
 import type { CheckHooks } from "../../core/src/policy.ts";
 import { transferCommand } from "../../core/src/transfer.ts";
 import { denyBashResult } from "./bashResult.ts";
@@ -90,6 +91,7 @@ export async function decideUserBash(
       toolName: "bash",
       command,
       toolUseId,
+      shell: detectShell("bash"),
       // Empty by construction: there is no model-produced input here, so the allowlist has nothing
       // to forward and no file body can ride along.
       toolInput: {},
