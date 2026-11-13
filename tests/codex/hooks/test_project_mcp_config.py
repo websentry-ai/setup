@@ -136,6 +136,16 @@ class CodexProjectMcpConfig(unittest.TestCase):
         self.cwd = wt
         self.assertIsNone(self.forwarded())
 
+    def test_symlinked_git_file_does_not_borrow_a_worktrees_trust(self):
+        wt = self._real_worktree()
+        link = self.repo.parent / "link"
+        link.mkdir()
+        (link / ".git").symlink_to(wt / ".git")
+        self._user(trust=self.repo)
+        self._project(link, FS_TOML)
+        self.cwd = link
+        self.assertIsNone(self.forwarded())
+
     def test_project_beats_user_with_the_same_name(self):
         self._user(server=OTHER_TOML, trust=self.repo)
         self._project(self.repo, FS_TOML)

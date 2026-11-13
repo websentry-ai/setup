@@ -2629,8 +2629,9 @@ def _codex_trust_keys(root):
                           if commondir.exists() else gitdir)
             backlink = (gitdir / 'gitdir').read_text(encoding='utf-8').strip()
             # Only a real linked worktree: git's admin dir for it points back at this checkout.
+            # Compare folders, not .git entries, so a symlinked .git can't pose as the worktree.
             if (gitdir.parent == common / 'worktrees'
-                    and os.path.realpath(os.path.join(gitdir, backlink)) == os.path.realpath(root / '.git')):
+                    and os.path.realpath(os.path.dirname(os.path.join(gitdir, backlink))) == os.path.realpath(root)):
                 keys.add(os.path.dirname(str(common)))
     except OSError:
         pass
