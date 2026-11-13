@@ -4006,7 +4006,8 @@ def _shell_detect(agent, tool_name, cwd):
             login = 'zsh' if sys.platform == 'darwin' else 'bash'
         return login, 'agent_rule'
     if agent == 'cursor':
-        return (_shell_windows_powershell() if windows else _shell_env() or _shell_login()), 'agent_rule'
+        # Cursor runs $SHELL; one this hook doesn't know names nothing rather than a guess.
+        return (_shell_windows_powershell() if windows else _shell_env()), 'agent_rule'
     if agent == 'augment':
         return _shell_augment(), 'agent_rule'
     return None, None

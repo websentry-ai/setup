@@ -526,11 +526,15 @@ def test_augment_names_the_shell_its_settings_pick(sandbox, gateway):
     assert [shell_of(c) for c in calls] == [('fish', 'agent_rule')], json.dumps(calls, indent=2)
 
 
-def test_cursor_names_the_login_shell_when_shell_is_one_the_hook_does_not_know(sandbox, gateway):
+def test_cursor_names_no_shell_when_shell_is_one_the_hook_does_not_know(sandbox, gateway):
+    # Cursor runs $SHELL, so an unknown one is sent as nothing; the call is still checked and logged.
     run_cursor(sandbox, {**hook_env(sandbox, gateway), 'SHELL': '/opt/bin/nu'})
 
     calls = [entry for entry in tool_entries(turn_log(gateway, 'cursor')) if command_of(entry) == COMMAND]
-    assert [shell_of(c) for c in calls] == [(_login_shell(), 'agent_rule')], json.dumps(calls, indent=2)
+    assert [shell_of(c) for c in calls] == [(None, None)], json.dumps(calls, indent=2)
+    checks = [r['body']['pre_tool_use_data'] for r in gateway.requests if 'pretool' in r['path']
+              and (r['body'].get('pre_tool_use_data') or {}).get('command') == COMMAND]
+    assert checks and all(shell_of(c) == (None, None) for c in checks), json.dumps(checks, indent=2)
 
 
 def test_codex_names_the_shell_the_model_picked_for_a_call(sandbox, gateway):
