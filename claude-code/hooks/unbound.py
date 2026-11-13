@@ -2264,21 +2264,30 @@ def _user_scope_has(config: Dict, server_name: str) -> bool:
     return isinstance(top, dict) and server_name in top
 
 
+def _project_settings_loaded(argv: List[str]) -> bool:
+    """Claude loads every settings source unless --setting-sources narrows them."""
+    sources = None
+    for i, a in enumerate(argv):
+        if a == '--setting-sources':
+            sources = argv[i + 1] if i + 1 < len(argv) else ''
+        elif a.startswith('--setting-sources='):
+            sources = a.split('=', 1)[1]
+    return sources is None or 'project' in sources.split(',')
+
+
 def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
-    settings = _mcpjson_settings(cwd)
-    if settings['enable_all'] or server_name in settings['enabled']:
-        return True
-    # Claude auto-approves project servers in bypass and non-interactive sessions (-p, the
-    # SDKs, the GitHub Action) while project settings are loaded. A nested `claude -p`
-    # keeps its parent's entrypoint, so the flag is checked too.
+    # Claude approves project servers only while project settings load: via the approval keys,
+    # or automatically in bypass and non-interactive sessions (-p, SDKs, GitHub Action). A
+    # nested `claude -p` keeps its parent's entrypoint, hence the argv check.
     found = _claude_launch_argv()
     argv = found[1][1:] if found else []
-    auto = (permission_mode == 'bypassPermissions'
+    if not _project_settings_loaded(argv):
+        return False
+    settings = _mcpjson_settings(cwd)
+    return (settings['enable_all'] or server_name in settings['enabled']
+            or permission_mode == 'bypassPermissions'
             or os.environ.get('CLAUDE_CODE_ENTRYPOINT') in ('sdk-cli', 'sdk-ts', 'sdk-py', 'claude-code-github-action')
             or any(a in ('-p', '--print') for a in argv))
-    if not any(a == '--setting-sources' or a.startswith('--setting-sources=') for a in argv):
-        return auto
-    return auto and 'project' in ','.join(_argv_flag_values(argv, '--setting-sources')).split(',')
 
 
 def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:

@@ -1252,10 +1252,17 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         os.environ["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts"
         for argv, expected in ((["claude", "--setting-sources=user"], self.OTHER),
                                (["claude", "--setting-sources="], self.OTHER),
+                               (["claude", "-p", "--setting-sources", "user", "project"], self.OTHER),
                                (["claude", "--setting-sources", "user,project"], self.FS),
                                (["claude", "--output-format", "stream-json"], self.FS)):
             with self.subTest(argv=argv), patch.object(unbound, "_claude_launch_argv", return_value=(4321, argv)):
                 self.assertEqual(self.forwarded(permission_mode="default"), expected)
+
+    def test_approval_keys_do_not_count_without_project_settings(self):
+        self._clash()
+        _write_json(self.repo / ".claude" / "settings.local.json", {"enabledMcpjsonServers": ["fsx"]})
+        with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "--setting-sources=user"])):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
 
     def test_managed_drop_in_approval_counts(self):
         self._clash()
