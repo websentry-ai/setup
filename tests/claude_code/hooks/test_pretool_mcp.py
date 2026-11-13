@@ -1086,6 +1086,7 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
     def forwarded(self, **event_fields):
         if not event_fields:
@@ -1226,9 +1227,24 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self._clash()
         self.assertEqual(self.forwarded(permission_mode="bypassPermissions"), self.FS)
 
+    def test_non_interactive_session_counts_as_approval(self):
+        # -p and the SDK auto-approve project servers with permission_mode "default".
+        self._clash()
+        for entrypoint in ("sdk-cli", "sdk-ts", "sdk-py"):
+            with self.subTest(entrypoint=entrypoint), patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": entrypoint}):
+                self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
+    def test_managed_drop_in_approval_counts(self):
+        self._clash()
+        managed = self.root / "managed"
+        _write_json(managed / "managed-settings.d" / "50-mcp.json", {"enableAllProjectMcpServers": True})
+        with patch.object(unbound, "MANAGED_SETTINGS_DIRS", (managed,)):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
     def test_unapproved_project_server_keeps_the_user_scope_server(self):
         # Claude doesn't start an unapproved project server and runs the user one.
         self._clash()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
         self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
 
     def test_unclashed_project_server_needs_no_approval_proof(self):

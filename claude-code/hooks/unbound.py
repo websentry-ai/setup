@@ -2211,15 +2211,12 @@ def _claude_plugin_launch_values() -> tuple:
 
 def _mcpjson_settings(cwd: str) -> Dict:
     """disabledMcpjsonServers / enabledMcpjsonServers / enableAllProjectMcpServers merged
-    from every settings file Claude reads, including the git root's and, in a worktree,
-    the main checkout's project settings."""
-    dirs = [cwd, _find_git_root(cwd)] + (_git_worktree_roots(cwd)[:1] or [])
-    paths, seen = [], set()
-    for d in dirs:
-        for path in (_diag_settings_files(d) if d else []):
-            if path not in seen:
-                seen.add(path)
-                paths.append(path)
+    from user, managed and project settings (the launch folder's, the git root's and, in
+    a worktree, the main checkout's)."""
+    paths = [_CONFIG_DIR / 'settings.json', _CONFIG_DIR / 'settings.local.json']
+    for d in dict.fromkeys(filter(None, [cwd, _find_git_root(cwd)] + _git_worktree_roots(cwd)[:1])):
+        paths += [Path(d) / '.claude' / 'settings.json', Path(d) / '.claude' / 'settings.local.json']
+    paths += _managed_settings_files()
     out = {'disabled': set(), 'enabled': set(), 'enable_all': False}
     for path in paths:
         try:
@@ -2268,7 +2265,9 @@ def _user_scope_has(config: Dict, server_name: str) -> bool:
 
 
 def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
-    if permission_mode == 'bypassPermissions':
+    # Claude auto-approves project servers in bypass and non-interactive (-p, SDK) sessions.
+    if (permission_mode == 'bypassPermissions'
+            or os.environ.get('CLAUDE_CODE_ENTRYPOINT') in ('sdk-cli', 'sdk-ts', 'sdk-py')):
         return True
     settings = _mcpjson_settings(cwd)
     return settings['enable_all'] or server_name in settings['enabled']
@@ -3615,15 +3614,22 @@ def _settings_base_url(path: Path) -> Optional[str]:
     return url if isinstance(url, str) and url.strip() else None
 
 
-def _managed_base_url() -> Optional[str]:
-    url = None
+def _managed_settings_files() -> List[Path]:
+    """Base file first, then drop-ins in the order Claude applies them."""
+    files = []
     for directory in MANAGED_SETTINGS_DIRS:
         try:
             dropins = sorted((directory / 'managed-settings.d').glob('*.json'))
         except Exception:
             dropins = []
-        for path in [directory / 'managed-settings.json', *dropins]:
-            url = _settings_base_url(path) or url
+        files += [directory / 'managed-settings.json', *dropins]
+    return files
+
+
+def _managed_base_url() -> Optional[str]:
+    url = None
+    for path in _managed_settings_files():
+        url = _settings_base_url(path) or url
     return url
 
 
