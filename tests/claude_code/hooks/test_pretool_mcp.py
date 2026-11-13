@@ -1087,8 +1087,20 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.addCleanup(env.stop)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
 
-    def forwarded(self):
-        return self.run_capture("mcp__fsx__write_file").get("mcp_server_config")
+    def forwarded(self, **event_fields):
+        if not event_fields:
+            return self.run_capture("mcp__fsx__write_file").get("mcp_server_config")
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["md"] = request_body["pre_tool_use_data"]["metadata"]
+            return {"decision": "allow"}
+
+        event = {"hook_event_name": "PreToolUse", "tool_name": "mcp__fsx__write_file",
+                 "tool_input": {"q": "x"}, "cwd": self.cwd, "session_id": "sess", **event_fields}
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        return captured.get("md", {}).get("mcp_server_config")
 
     def test_launch_folder_is_used_after_an_in_session_cd(self):
         # Claude keeps the servers it loaded at launch; a cd into a folder with its
@@ -1172,7 +1184,8 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
     def test_disabling_another_server_keeps_the_project_entry(self):
         _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
-        _write_json(self.repo / ".claude" / "settings.json", {"disabledMcpjsonServers": ["other"]})
+        _write_json(self.repo / ".claude" / "settings.json",
+                    {"disabledMcpjsonServers": ["other"], "enabledMcpjsonServers": ["fsx"]})
         self.assertEqual(self.forwarded(), self.FS)
 
     def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
@@ -1193,12 +1206,45 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.cwd = str(sub)
         self.assertEqual(self.forwarded(), self.FS)
 
-    def test_project_mcp_json_beats_user_scope_with_the_same_name(self):
-        # Claude runs the project server here; reporting the user one would let a
-        # repo put any server behind a trusted name.
+    def _clash(self):
         _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
         _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+
+    def test_approved_project_server_beats_user_scope_with_the_same_name(self):
+        # Claude runs the approved project server; reporting the user one would let a
+        # repo put any server behind a trusted name.
+        self._clash()
+        _write_json(self.repo / ".claude" / "settings.local.json", {"enabledMcpjsonServers": ["fsx"]})
         self.assertEqual(self.forwarded(), self.FS)
+
+    def test_enable_all_project_servers_counts_as_approval(self):
+        self._clash()
+        _write_json(self.repo / ".claude" / "settings.json", {"enableAllProjectMcpServers": True})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_bypass_permissions_mode_counts_as_approval(self):
+        self._clash()
+        self.assertEqual(self.forwarded(permission_mode="bypassPermissions"), self.FS)
+
+    def test_unapproved_project_server_keeps_the_user_scope_server(self):
+        # Claude doesn't start an unapproved project server and runs the user one.
+        self._clash()
+        self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
+
+    def test_unclashed_project_server_needs_no_approval_proof(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
+    def test_disabled_list_at_the_git_root_applies_from_a_subfolder(self):
+        import subprocess
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".claude" / "settings.local.json", {"disabledMcpjsonServers": ["fsx"]})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.OTHER)
 
     def test_local_scope_beats_project_mcp_json(self):
         _write_json(self.claude_json, {
@@ -1240,6 +1286,7 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
         _write_json(self.repo / ".mcp.json", {
             "mcpServers": {"fsx": self.OTHER}, "pad": "x" * 1_100_000})
+        _write_json(self.repo / ".claude" / "settings.local.json", {"enabledMcpjsonServers": ["fsx"]})
         self.assertEqual(self.forwarded(), self.OTHER)
 
     def test_malformed_nearer_file_falls_through_to_parent(self):

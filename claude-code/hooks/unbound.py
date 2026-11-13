@@ -2209,18 +2209,30 @@ def _claude_plugin_launch_values() -> tuple:
         return [], []
 
 
-def _disabled_mcpjson_servers(cwd: str) -> set:
-    """Project servers the user disabled (disabledMcpjsonServers in any settings
-    file Claude merges); Claude runs the user-scope server of that name instead."""
-    names = set()
-    for path in _diag_settings_files(cwd):
+def _mcpjson_settings(cwd: str) -> Dict:
+    """disabledMcpjsonServers / enabledMcpjsonServers / enableAllProjectMcpServers merged
+    from every settings file Claude reads, including the git root's and, in a worktree,
+    the main checkout's project settings."""
+    dirs = [cwd, _find_git_root(cwd)] + (_git_worktree_roots(cwd)[:1] or [])
+    paths, seen = [], set()
+    for d in dirs:
+        for path in (_diag_settings_files(d) if d else []):
+            if path not in seen:
+                seen.add(path)
+                paths.append(path)
+    out = {'disabled': set(), 'enabled': set(), 'enable_all': False}
+    for path in paths:
         try:
-            value = json.loads(path.read_text(encoding='utf-8')).get('disabledMcpjsonServers')
+            data = json.loads(path.read_text(encoding='utf-8'))
         except Exception:
             continue
-        if isinstance(value, list):
-            names.update(v for v in value if isinstance(v, str))
-    return names
+        if not isinstance(data, dict):
+            continue
+        for key, bucket in (('disabledMcpjsonServers', 'disabled'), ('enabledMcpjsonServers', 'enabled')):
+            if isinstance(data.get(key), list):
+                out[bucket].update(v for v in data[key] if isinstance(v, str))
+        out['enable_all'] = out['enable_all'] or data.get('enableAllProjectMcpServers') is True
+    return out
 
 
 def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
@@ -2230,7 +2242,7 @@ def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
         start = Path(cwd).expanduser()
     except (TypeError, ValueError):
         return None
-    if server_name in _disabled_mcpjson_servers(cwd):
+    if server_name in _mcpjson_settings(cwd)['disabled']:
         return None
     for folder in (start, *start.parents):
         if folder == folder.parent:
@@ -2250,13 +2262,26 @@ def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
     return None
 
 
+def _user_scope_has(config: Dict, server_name: str) -> bool:
+    top = config.get('mcpServers')
+    return isinstance(top, dict) and server_name in top
+
+
+def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
+    if permission_mode == 'bypassPermissions':
+        return True
+    settings = _mcpjson_settings(cwd)
+    return settings['enable_all'] or server_name in settings['enabled']
+
+
 def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:
     """Where Claude was launched: it loads and starts MCP servers there, while the
     event cwd follows an in-session cd."""
     return os.environ.get('CLAUDE_PROJECT_DIR') or cwd
 
 
-def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
+def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None,
+                            permission_mode: Optional[str] = None) -> Optional[Dict]:
     """Claude Code's own scope order, from the launch folder: local (~/.claude.json
     projects, keyed by the main checkout in a worktree), then project (.mcp.json), then user."""
     cwd = _claude_launch_dir(cwd)
@@ -2295,7 +2320,10 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                 if result:
                     return _augment_script_hash(result, cwd)
             result = _project_mcp_json_server(server_name, cwd)
-            if result:
+            # Claude runs an unapproved project server's user-scope namesake instead; when
+            # approval can't be shown, keep reporting the user-scope server.
+            if result and (not _user_scope_has(config, server_name)
+                           or _project_server_approved(server_name, cwd, permission_mode)):
                 return _augment_script_hash(result, cwd)
 
         top_servers = config.get('mcpServers', {})
@@ -4168,7 +4196,8 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         if mcp_server_name:
             cwd = _claude_launch_dir(event.get('cwd'))
             server_cfg = _read_mcp_server_config(
-                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd,
+                permission_mode=event.get('permission_mode'),
             )
             if server_cfg:
                 metadata['mcp_server_config'] = server_cfg
