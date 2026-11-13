@@ -1,7 +1,7 @@
 // The shell a Pi shell-tool call runs in, on the pretool body and the turn log. The end-to-end run of the real
 // bundle (setup's tests/test_transfer_e2e.py) covers bash on this machine; these cover the rest.
 
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -61,6 +61,15 @@ test("Pi's settings are read from PI_CODING_AGENT_DIR when it is set", () => {
   writeFileSync(join(agent, "settings.json"), JSON.stringify({ shellPath: "/bin/fish" }));
   withEnv({ HOME: home(), PI_CODING_AGENT_DIR: agent }, "linux", () =>
     assert.deepEqual(detectShell("bash"), { shell: "fish", shell_source: "tool" }));
+});
+
+test("a linked Pi settings file names no shell, as Pi follows the link and this reader won't", () => {
+  const dir = home();
+  const real = join(home(), "settings.json");
+  writeFileSync(real, JSON.stringify({ shellPath: "/usr/bin/zsh" }));
+  mkdirSync(join(dir, ".pi", "agent"), { recursive: true });
+  symlinkSync(real, join(dir, ".pi", "agent", "settings.json"));
+  withEnv({ HOME: dir }, "linux", () => assert.deepEqual(detectShell("bash"), {}));
 });
 
 test("powershell runs PowerShell 7 when it is on PATH and Windows PowerShell when not", () => {

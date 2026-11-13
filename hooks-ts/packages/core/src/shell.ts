@@ -3,7 +3,7 @@
  * `shellPath` in Pi's agent-dir `settings.json`, and `powershell` runs PowerShell 7 when it is on PATH, else Windows
  * PowerShell. Mirrors the Python hooks' shell detection; never throws, and says nothing when it can't tell.
  */
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 
@@ -35,11 +35,24 @@ function onPath(program: string): boolean {
     .some((dir) => dir !== "" && suffixes.some((suffix) => existsSync(join(dir, program + suffix))));
 }
 
+/** A settings file the safe reader won't follow (a link), so Pi's shell can't be known from here. */
+const UNREADABLE = Symbol("unreadable");
+
+function isLink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 function piShellPath(): unknown {
   try {
     const dir = resolvePiAgentDir(process.env, homedir());
-    const raw = dir === undefined ? undefined : readSmallRegularFile(join(dir, "settings.json"), MAX_CONFIG_BYTES);
-    if (raw === undefined) return undefined;
+    if (dir === undefined) return undefined;
+    const file = join(dir, "settings.json");
+    const raw = readSmallRegularFile(file, MAX_CONFIG_BYTES);
+    if (raw === undefined) return isLink(file) ? UNREADABLE : undefined;
     const settings: unknown = JSON.parse(raw.replace(/^\uFEFF/, ""));
     if (settings === null || typeof settings !== "object") return undefined;
     return (settings as Record<string, unknown>).shellPath;
@@ -59,6 +72,11 @@ export function detectShell(toolName: unknown): ShellInfo {
   try {
     // A shellPath that names no known shell is still the shell Pi runs, so it names nothing rather than bash.
     const custom = tool === "bash" ? piShellPath() : undefined;
+    // Pi follows a linked settings file this reader won't open, so its shell is unknown rather than bash.
+    if (custom === UNREADABLE) {
+      shellCache.set(tool, {});
+      return {};
+    }
     const shell =
       tool === "powershell"
         ? process.platform === "win32" && !onPath("pwsh")

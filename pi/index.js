@@ -1225,7 +1225,7 @@ function redactSecrets(text, apiKey) {
 }
 
 // packages/core/src/shell.ts
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync as lstatSync2 } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join as join4 } from "node:path";
 var SHELL_NAMES = /* @__PURE__ */ new Set(["bash", "zsh", "sh", "fish", "dash", "ksh", "powershell", "pwsh", "cmd"]);
@@ -1240,11 +1240,21 @@ function onPath(program2) {
   const suffixes = process.platform === "win32" ? [".exe", ""] : [""];
   return (process.env.PATH ?? "").split(delimiter).some((dir) => dir !== "" && suffixes.some((suffix) => existsSync(join4(dir, program2 + suffix))));
 }
+var UNREADABLE = /* @__PURE__ */ Symbol("unreadable");
+function isLink(path) {
+  try {
+    return lstatSync2(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
 function piShellPath() {
   try {
     const dir = resolvePiAgentDir(process.env, homedir());
-    const raw = dir === void 0 ? void 0 : readSmallRegularFile(join4(dir, "settings.json"), MAX_CONFIG_BYTES);
-    if (raw === void 0) return void 0;
+    if (dir === void 0) return void 0;
+    const file = join4(dir, "settings.json");
+    const raw = readSmallRegularFile(file, MAX_CONFIG_BYTES);
+    if (raw === void 0) return isLink(file) ? UNREADABLE : void 0;
     const settings = JSON.parse(raw.replace(/^\uFEFF/, ""));
     if (settings === null || typeof settings !== "object") return void 0;
     return settings.shellPath;
@@ -1261,6 +1271,10 @@ function detectShell(toolName) {
   let info = {};
   try {
     const custom = tool === "bash" ? piShellPath() : void 0;
+    if (custom === UNREADABLE) {
+      shellCache.set(tool, {});
+      return {};
+    }
     const shell = tool === "powershell" ? process.platform === "win32" && !onPath("pwsh") ? "powershell" : "pwsh" : typeof custom === "string" && custom !== "" ? shellName(custom) : "bash";
     info = shell === void 0 ? {} : { shell, shell_source: "tool" };
   } catch {
@@ -5844,7 +5858,7 @@ function mintBrokerId() {
 }
 
 // packages/pi/src/mcpConfig.ts
-import { closeSync as closeSync2, constants as fsConstants, fstatSync as fstatSync2, lstatSync as lstatSync2, openSync as openSync2, readSync as readSync2, statSync as statSync2 } from "node:fs";
+import { closeSync as closeSync2, constants as fsConstants, fstatSync as fstatSync2, lstatSync as lstatSync3, openSync as openSync2, readSync as readSync2, statSync as statSync2 } from "node:fs";
 import { isAbsolute as isAbsolute4, join as join7 } from "node:path";
 var KNOWN_SERVER_KEYS = /* @__PURE__ */ new Set([
   "command",
@@ -6063,7 +6077,7 @@ function signatureOf(paths) {
   const parts = [];
   for (const path of paths) {
     let part = `${path}=`;
-    for (const stat of [lstatSync2, statSync2]) {
+    for (const stat of [lstatSync3, statSync2]) {
       try {
         const s = stat(path);
         part += `${s.dev}:${s.ino}:${s.size}:${s.mtimeMs}:${s.ctimeMs};`;

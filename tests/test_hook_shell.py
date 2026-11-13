@@ -179,6 +179,20 @@ class VSCodeTests(ShellTestCase):
                 self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal', root), {})
         self.assertFalse([q for q in touched if 'attacker' in q or 'linked' in q], touched)
 
+    def test_a_repositorys_settings_reached_through_a_link_are_never_read(self):
+        # A linked `.vscode` folder or settings file could lead to a share, so the user's settings decide instead.
+        self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Git Bash'}))
+        elsewhere = tempfile.mkdtemp()
+        Path(elsewhere, 'settings.json').write_text(json.dumps(
+            {'chat.tools.terminal.terminalProfile.windows': {'path': 'pwsh.exe'}}))
+        linked_folder = tempfile.mkdtemp()
+        Path(linked_folder, '.vscode').symlink_to(elsewhere, target_is_directory=True)
+        linked_file = tempfile.mkdtemp()
+        Path(linked_file, '.vscode').mkdir()
+        Path(linked_file, '.vscode', 'settings.json').symlink_to(Path(elsewhere, 'settings.json'))
+        for root in (linked_folder, linked_file):
+            self.assert_shell('copilot', 'run_in_terminal', _shell('bash', 'agent_rule'), cwd=root, windows=True)
+
     def test_a_single_path_from_the_repositorys_settings_is_named_as_written(self):
         root = tempfile.mkdtemp()
         Path(root, '.vscode').mkdir()

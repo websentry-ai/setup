@@ -5683,6 +5683,18 @@ def _shell_vscode_app():
     return 'Code'
 
 
+def _shell_workspace_settings(cwd):
+    """The repository's own VS Code settings, read only when neither `.vscode` nor the file is a link: a link could
+    lead to a network share, and the folder is checked first so the file's own check never passes through it."""
+    folder = Path(cwd) / '.vscode'
+    try:
+        if os.path.islink(folder) or os.path.islink(folder / 'settings.json'):
+            return {}
+    except (OSError, ValueError):
+        return {}
+    return _shell_settings(folder / 'settings.json')
+
+
 def _shell_profile_path(path, check=True):
     """A profile's executable as VS Code resolves it: `${env:…}` expanded, then the first entry that is installed, or
     nothing. Without `check` nothing on disk is touched: one path is taken as written, and a list, whose pick needs
@@ -5714,7 +5726,7 @@ def _shell_vscode(cwd):
     else:
         user_root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
     # (settings, from the repository's own workspace settings)
-    layers = ([(_shell_settings(Path(cwd) / '.vscode' / 'settings.json'), True)] if cwd else []) + \
+    layers = ([(_shell_workspace_settings(cwd), True)] if cwd else []) + \
         [(_shell_settings(user_root / _shell_vscode_app() / 'User' / 'settings.json'), False)]
     for layer, _ in layers:
         profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
