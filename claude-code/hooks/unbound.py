@@ -2265,12 +2265,17 @@ def _user_scope_has(config: Dict, server_name: str) -> bool:
 
 
 def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
-    # Claude auto-approves project servers in bypass and non-interactive (-p, SDK) sessions.
-    if (permission_mode == 'bypassPermissions'
-            or os.environ.get('CLAUDE_CODE_ENTRYPOINT') in ('sdk-cli', 'sdk-ts', 'sdk-py')):
+    # Claude auto-approves project servers in bypass and non-interactive sessions
+    # (-p, the SDKs, the GitHub Action).
+    if (permission_mode == 'bypassPermissions' or os.environ.get('CLAUDE_CODE_ENTRYPOINT')
+            in ('sdk-cli', 'sdk-ts', 'sdk-py', 'claude-code-github-action')):
         return True
     settings = _mcpjson_settings(cwd)
-    return settings['enable_all'] or server_name in settings['enabled']
+    if settings['enable_all'] or server_name in settings['enabled']:
+        return True
+    # A nested `claude -p` keeps its parent's entrypoint, so check the flag too.
+    found = _claude_launch_argv()
+    return bool(found) and any(a in ('-p', '--print') for a in found[1][1:])
 
 
 def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:

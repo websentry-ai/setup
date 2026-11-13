@@ -1087,6 +1087,9 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         self.addCleanup(env.stop)
         os.environ.pop("CLAUDE_PROJECT_DIR", None)
         os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        argv = patch.object(unbound, "_claude_launch_argv", return_value=None)
+        argv.start()
+        self.addCleanup(argv.stop)
 
     def forwarded(self, **event_fields):
         if not event_fields:
@@ -1230,9 +1233,18 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
     def test_non_interactive_session_counts_as_approval(self):
         # -p and the SDK auto-approve project servers with permission_mode "default".
         self._clash()
-        for entrypoint in ("sdk-cli", "sdk-ts", "sdk-py"):
+        for entrypoint in ("sdk-cli", "sdk-ts", "sdk-py", "claude-code-github-action"):
             with self.subTest(entrypoint=entrypoint), patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": entrypoint}):
                 self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
+    def test_nested_print_session_counts_as_approval(self):
+        # A `claude -p` run from inside another session keeps that session's entrypoint.
+        self._clash()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "claude-vscode"
+        with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "-p", "hi"])):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+        with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "--resume"])):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
 
     def test_managed_drop_in_approval_counts(self):
         self._clash()
