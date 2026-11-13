@@ -2265,17 +2265,20 @@ def _user_scope_has(config: Dict, server_name: str) -> bool:
 
 
 def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
-    # Claude auto-approves project servers in bypass and non-interactive sessions
-    # (-p, the SDKs, the GitHub Action).
-    if (permission_mode == 'bypassPermissions' or os.environ.get('CLAUDE_CODE_ENTRYPOINT')
-            in ('sdk-cli', 'sdk-ts', 'sdk-py', 'claude-code-github-action')):
-        return True
     settings = _mcpjson_settings(cwd)
     if settings['enable_all'] or server_name in settings['enabled']:
         return True
-    # A nested `claude -p` keeps its parent's entrypoint, so check the flag too.
+    # Claude auto-approves project servers in bypass and non-interactive sessions (-p, the
+    # SDKs, the GitHub Action) while project settings are loaded. A nested `claude -p`
+    # keeps its parent's entrypoint, so the flag is checked too.
     found = _claude_launch_argv()
-    return bool(found) and any(a in ('-p', '--print') for a in found[1][1:])
+    argv = found[1][1:] if found else []
+    auto = (permission_mode == 'bypassPermissions'
+            or os.environ.get('CLAUDE_CODE_ENTRYPOINT') in ('sdk-cli', 'sdk-ts', 'sdk-py', 'claude-code-github-action')
+            or any(a in ('-p', '--print') for a in argv))
+    if not any(a == '--setting-sources' or a.startswith('--setting-sources=') for a in argv):
+        return auto
+    return auto and 'project' in ','.join(_argv_flag_values(argv, '--setting-sources')).split(',')
 
 
 def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:

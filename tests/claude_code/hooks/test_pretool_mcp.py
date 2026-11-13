@@ -1246,6 +1246,17 @@ class TestProjectMcpJson(ProcessPreToolUseBase):
         with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "--resume"])):
             self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
 
+    def test_setting_sources_without_project_turns_auto_approval_off(self):
+        # The SDK passes --setting-sources; without "project" Claude doesn't auto-approve.
+        self._clash()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts"
+        for argv, expected in ((["claude", "--setting-sources=user"], self.OTHER),
+                               (["claude", "--setting-sources="], self.OTHER),
+                               (["claude", "--setting-sources", "user,project"], self.FS),
+                               (["claude", "--output-format", "stream-json"], self.FS)):
+            with self.subTest(argv=argv), patch.object(unbound, "_claude_launch_argv", return_value=(4321, argv)):
+                self.assertEqual(self.forwarded(permission_mode="default"), expected)
+
     def test_managed_drop_in_approval_counts(self):
         self._clash()
         managed = self.root / "managed"
