@@ -175,9 +175,17 @@ class VSCodeTests(ShellTestCase):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_windows', return_value=True):
                 hook._SHELL_CACHE.clear()
-                # Taken as written: the first entry names the shell, and nothing about it is checked.
-                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal', root), _shell('pwsh', 'agent_rule'))
+                # Which entry VS Code would pick needs the disk, so no shell is named and nothing is looked up.
+                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal', root), {})
         self.assertFalse([q for q in touched if 'attacker' in q or 'linked' in q], touched)
+
+    def test_a_single_path_from_the_repositorys_settings_is_named_as_written(self):
+        root = tempfile.mkdtemp()
+        Path(root, '.vscode').mkdir()
+        Path(root, '.vscode', 'settings.json').write_text(json.dumps({
+            'terminal.integrated.defaultProfile.windows': 'Repo',
+            'terminal.integrated.profiles.windows': {'Repo': {'path': 'C:\\Program Files\\Git\\bin\\bash.exe'}}}))
+        self.assert_shell('copilot', 'run_in_terminal', _shell('bash', 'agent_rule'), cwd=root, windows=True)
 
     def test_a_path_from_the_users_own_settings_is_still_checked(self):
         missing = str(Path(tempfile.mkdtemp(), 'pwsh.exe'))

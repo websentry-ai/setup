@@ -3900,7 +3900,10 @@ def _shell_vscode_app():
 
 def _shell_profile_path(path, check=True):
     """A profile's executable as VS Code resolves it: `${env:…}` expanded, then the first entry that is installed, or
-    nothing. Without `check` nothing on disk is touched and the first entry is taken as written."""
+    nothing. Without `check` nothing on disk is touched: one path is taken as written, and a list, whose pick needs
+    the disk, names nothing."""
+    if not check and isinstance(path, list) and len(path) > 1:
+        return None
     for candidate in [path] if isinstance(path, str) else path if isinstance(path, list) else []:
         if not isinstance(candidate, str):
             continue
