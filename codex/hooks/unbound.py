@@ -2624,15 +2624,14 @@ def _codex_trust_keys(root):
         line = (root / '.git').read_text(encoding='utf-8').strip()
         if line.startswith('gitdir:'):
             gitdir = Path(os.path.realpath(root / line[len('gitdir:'):].strip()))
-            commondir = gitdir / 'commondir'
-            common = Path(os.path.realpath(gitdir / commondir.read_text(encoding='utf-8').strip())
-                          if commondir.exists() else gitdir)
+            common = Path(os.path.realpath(gitdir / (gitdir / 'commondir').read_text(encoding='utf-8').strip()))
             backlink = (gitdir / 'gitdir').read_text(encoding='utf-8').strip()
-            # Only a real linked worktree: git's admin dir for it points back at this checkout.
-            # Compare folders, not .git entries, so a symlinked .git can't pose as the worktree.
+            # Only a real linked worktree: its admin dir sits in the main checkout's .git/worktrees
+            # and points back at this folder (not this .git entry, which could be a symlink).
             if (gitdir.parent == common / 'worktrees'
+                    and os.path.realpath(common.parent / '.git') == str(common)
                     and os.path.realpath(os.path.dirname(os.path.join(gitdir, backlink))) == os.path.realpath(root)):
-                keys.add(os.path.dirname(str(common)))
+                keys.add(str(common.parent))
     except OSError:
         pass
     return keys

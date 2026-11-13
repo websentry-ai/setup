@@ -146,6 +146,20 @@ class CodexProjectMcpConfig(unittest.TestCase):
         self.cwd = link
         self.assertIsNone(self.forwarded())
 
+    def test_worktrees_folder_outside_git_does_not_vouch_for_another_checkout(self):
+        # Ordinary files a trusted repo could commit, laid out like worktree metadata.
+        evil = self.repo.parent / "evil"
+        evil.mkdir()
+        admin = self.repo / "decoy" / "worktrees" / "x"
+        admin.mkdir(parents=True)
+        (admin / "commondir").write_text("../..\n")
+        (admin / "gitdir").write_text(f"{evil / '.git'}\n")
+        (evil / ".git").write_text(f"gitdir: {admin}\n")
+        self._user(trust=self.repo)
+        self._project(evil, FS_TOML)
+        self.cwd = evil
+        self.assertIsNone(self.forwarded())
+
     def test_project_beats_user_with_the_same_name(self):
         self._user(server=OTHER_TOML, trust=self.repo)
         self._project(self.repo, FS_TOML)
