@@ -2564,7 +2564,7 @@ def _read_mcp_server_config(server_name, config_path):
             result['url'] = server['url']
         if server.get('command'):
             result['command'] = server['command']
-        if server.get('args'):
+        if server.get('args') is not None:
             result['args'] = server['args']
         if server.get('type'):
             result['type'] = server['type']
@@ -2598,9 +2598,7 @@ def _read_mcp_server_config_regex(server_name, config_path):
             args_match = re.search(r'^\s*args\s*=\s*\[([^\]]*)\]', body, re.MULTILINE | re.DOTALL)
             if args_match:
                 items = re.findall(r'"([^"]*)"|\'([^\']*)\'', args_match.group(1))
-                args = [a or b for a, b in items]
-                if args:
-                    result['args'] = args
+                result['args'] = [a or b for a, b in items]
             return result if result else None
         return None
     except Exception:
@@ -2682,6 +2680,9 @@ def _codex_mcp_server_config(server_name, cwd):
     merged = {}
     for path in layers:
         merged.update(_read_mcp_server_config(server_name, path) or {})
+    # Empty args are kept per layer so a nearer one can clear them, then dropped.
+    if not merged.get('args'):
+        merged.pop('args', None)
     return merged or None
 
 
