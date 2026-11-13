@@ -2623,10 +2623,15 @@ def _codex_trust_keys(root):
     try:
         line = (root / '.git').read_text(encoding='utf-8').strip()
         if line.startswith('gitdir:'):
-            gitdir = root / line[len('gitdir:'):].strip()
+            gitdir = Path(os.path.realpath(root / line[len('gitdir:'):].strip()))
             commondir = gitdir / 'commondir'
-            common = gitdir / commondir.read_text(encoding='utf-8').strip() if commondir.exists() else gitdir
-            keys.add(os.path.dirname(os.path.realpath(common)))
+            common = Path(os.path.realpath(gitdir / commondir.read_text(encoding='utf-8').strip())
+                          if commondir.exists() else gitdir)
+            backlink = (gitdir / 'gitdir').read_text(encoding='utf-8').strip()
+            # Only a real linked worktree: git's admin dir for it points back at this checkout.
+            if (gitdir.parent == common / 'worktrees'
+                    and os.path.realpath(os.path.join(gitdir, backlink)) == os.path.realpath(root / '.git')):
+                keys.add(os.path.dirname(str(common)))
     except OSError:
         pass
     return keys

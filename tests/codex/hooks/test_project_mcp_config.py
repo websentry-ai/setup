@@ -105,7 +105,26 @@ class CodexProjectMcpConfig(unittest.TestCase):
         self.cwd = sub
         self.assertEqual(self.forwarded(), FS)
 
+    def _real_worktree(self):
+        import shutil
+        import subprocess
+        shutil.rmtree(self.repo / ".git")
+        git = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True)
+        git("-C", str(self.repo), "init", "-q")
+        git("-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i")
+        wt = self.repo.parent / "wt"
+        git("-C", str(self.repo), "worktree", "add", "-q", str(wt))
+        return wt
+
     def test_linked_worktree_inherits_the_main_checkouts_trust(self):
+        wt = self._real_worktree()
+        self._user(trust=self.repo)
+        self._project(wt, FS_TOML)
+        self.cwd = wt
+        self.assertEqual(self.forwarded(), FS)
+
+    def test_forged_git_file_does_not_borrow_another_repos_trust(self):
+        # A hand-written .git pointer with no backlink from the trusted repo's admin dir.
         gitdir = self.repo / ".git" / "worktrees" / "wt"
         gitdir.mkdir(parents=True)
         (gitdir / "commondir").write_text("../..\n")
@@ -115,7 +134,7 @@ class CodexProjectMcpConfig(unittest.TestCase):
         self._user(trust=self.repo)
         self._project(wt, FS_TOML)
         self.cwd = wt
-        self.assertEqual(self.forwarded(), FS)
+        self.assertIsNone(self.forwarded())
 
     def test_project_beats_user_with_the_same_name(self):
         self._user(server=OTHER_TOML, trust=self.repo)
