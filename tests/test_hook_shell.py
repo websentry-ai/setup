@@ -155,33 +155,36 @@ class VSCodeTests(ShellTestCase):
                                            'terminal.integrated.profiles.windows': {'Dev': {'path': ['${env:PS7}']}}}))
             self.assert_shell('copilot', 'run_in_terminal', _shell('pwsh', 'agent_rule'), windows=True)
 
-    def test_a_network_path_in_a_profile_is_never_looked_up(self):
-        seen = []
-        real_isfile = os.path.isfile
+    def test_a_path_from_the_repositorys_settings_is_never_looked_up_on_disk(self):
+        # Every spelling of a network share, and a repo folder linked to one, is out of reach: the disk is never touched.
         local = self.installed('powershell.exe')
-        self.user_settings(json.dumps({'chat.tools.terminal.terminalProfile.windows': {
-            'path': ['\\\\attacker.example\\s\\pwsh.exe', '//attacker.example/s/pwsh.exe', local]}}))
+        root = tempfile.mkdtemp()
+        Path(root, '.vscode').mkdir()
+        Path(root, 'linked').symlink_to('//attacker.example/share')
+        paths = ['\\\\attacker.example\\s\\pwsh.exe', '/\\attacker.example\\s\\pwsh.exe',
+                 '\\??\\UNC\\attacker.example\\s\\pwsh.exe', str(Path(root, 'linked', 'pwsh.exe')), local]
+        Path(root, '.vscode', 'settings.json').write_text(json.dumps({
+            'terminal.integrated.defaultProfile.windows': 'Repo',
+            'terminal.integrated.profiles.windows': {'Repo': {'path': paths}}}))
+        touched = []
+        for name in ('isfile', 'islink', 'exists', 'lexists'):
+            real = getattr(os.path, name)
+            patcher = patch.object(os.path, name, side_effect=lambda q, real=real: touched.append(str(q)) or real(q))
+            patcher.start()
+            self.addCleanup(patcher.stop)
         for hook in HOOKS:
-            with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_windows', return_value=True), \
-                    patch.object(hook.os.path, 'isfile', side_effect=lambda p: seen.append(p) or real_isfile(p)):
+            with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_windows', return_value=True):
                 hook._SHELL_CACHE.clear()
-                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal'), _shell('powershell', 'agent_rule'))
-        self.assertFalse([p for p in seen if 'attacker' in str(p)], seen)
+                # Taken as written: the first entry names the shell, and nothing about it is checked.
+                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal', root), _shell('pwsh', 'agent_rule'))
+        self.assertFalse([q for q in touched if 'attacker' in q or 'linked' in q], touched)
 
-    def test_a_symlink_to_a_network_share_is_never_followed(self):
-        link = Path(tempfile.mkdtemp(), 'pwsh.exe')
-        link.symlink_to('//attacker.example/s/pwsh.exe')
-        local = self.installed('powershell.exe')
+    def test_a_path_from_the_users_own_settings_is_still_checked(self):
+        missing = str(Path(tempfile.mkdtemp(), 'pwsh.exe'))
         self.user_settings(json.dumps({'terminal.integrated.defaultProfile.windows': 'Dev',
-                                       'terminal.integrated.profiles.windows': {'Dev': {'path': [str(link), local]}}}))
-        seen = []
-        real_isfile = os.path.isfile
-        for hook in HOOKS:
-            with self.subTest(hook=hook.__file__), patch.object(hook, '_shell_windows', return_value=True), \
-                    patch.object(hook.os.path, 'isfile', side_effect=lambda p: seen.append(p) or real_isfile(p)):
-                hook._SHELL_CACHE.clear()
-                self.assertEqual(hook.detect_shell('copilot', 'run_in_terminal'), _shell('powershell', 'agent_rule'))
-        self.assertNotIn(str(link), [str(p) for p in seen])
+                                       'terminal.integrated.profiles.windows': {
+                                           'Dev': {'path': [missing, self.installed('powershell.exe')]}}}))
+        self.assert_shell('copilot', 'run_in_terminal', _shell('powershell', 'agent_rule'), windows=True)
 
     def test_a_profile_listing_several_paths_names_the_first_one_installed(self):
         installed = Path(tempfile.mkdtemp(), 'powershell.exe')
