@@ -4422,10 +4422,14 @@ def _native_path(path: str) -> str:
 
 # Absolute paths inside a Bash command; the left boundary stops a relative
 # token like tests/webapp/ reading as absolute.
-# On Windows, C:\ and C:/ paths count too; a quoted one keeps its spaces.
+# On Windows, C:\ and C:/ paths count too, and a single- or double-quoted
+# C:\ or Git Bash /c/ path keeps its spaces.
 _ABS_PATH_RE = re.compile(
-    r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+'
-    + (r'|(?<=")[A-Za-z]:[\\/][^"]*(?=")|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
+    r'(?:^|[\s"\'=(])('
+    + (r'(?<=")(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^"]*(?=")|'
+       r"(?<=')(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^']*(?=')|" if _WINDOWS_PATHS else '')
+    + r'/[^\s"\';|&<>()]+'
+    + (r'|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
     + r')')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).

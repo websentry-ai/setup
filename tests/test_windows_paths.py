@@ -153,9 +153,12 @@ class TestWindowsRepoGate:
         candidates = _gate_candidates(tool, m, str(tmp_path), command=command)
         assert m._repo_gate_violating_repo(candidates, ALLOWED_ONLY, {}) == "acme/web"
 
-    def test_a_quoted_drive_path_with_a_space_is_judged(self, tool, tmp_path):
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    @pytest.mark.parametrize("spelling", ["drive", "git-bash"])
+    def test_a_quoted_path_with_a_space_is_judged(self, tool, tmp_path, quote, spelling):
         m = tool_module(HOOKS[tool])
         spaced = _make_repo(tmp_path / "John Smith" / "web")
-        command = 'echo x > "%s"' % (spaced / "a.txt")
+        target = str(spaced / "a.txt") if spelling == "drive" else _git_bash_path(spaced / "a.txt")
+        command = "touch %s%s%s" % (quote, target, quote)
         candidates = _gate_candidates(tool, m, str(tmp_path), command=command)
         assert m._repo_gate_violating_repo(candidates, ALLOWED_ONLY, {}) == "acme/web"
