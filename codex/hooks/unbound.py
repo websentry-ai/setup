@@ -2564,7 +2564,7 @@ def _read_mcp_server_config(server_name, config_path):
             result['url'] = server['url']
         if server.get('command'):
             result['command'] = server['command']
-        if server.get('args'):
+        if server.get('args') is not None:
             result['args'] = server['args']
         if server.get('type'):
             result['type'] = server['type']
@@ -2598,13 +2598,92 @@ def _read_mcp_server_config_regex(server_name, config_path):
             args_match = re.search(r'^\s*args\s*=\s*\[([^\]]*)\]', body, re.MULTILINE | re.DOTALL)
             if args_match:
                 items = re.findall(r'"([^"]*)"|\'([^\']*)\'', args_match.group(1))
-                args = [a or b for a, b in items]
-                if args:
-                    result['args'] = args
+                result['args'] = [a or b for a, b in items]
             return result if result else None
         return None
     except Exception:
         return None
+
+
+def _codex_project_root(cwd):
+    """Codex's project root: the nearest folder at or above cwd holding .git, else cwd."""
+    start = Path(cwd).expanduser()
+    for folder in (start, *start.parents):
+        if (folder / '.git').exists():
+            return folder
+    return start
+
+
+def _codex_trust_keys(root):
+    """Paths whose trust covers root: root itself and, for a linked worktree,
+    the main checkout (Codex keys trust to the parent of the git common dir)."""
+    keys = {os.path.realpath(root)}
+    try:
+        line = (root / '.git').read_text(encoding='utf-8').strip()
+        if line.startswith('gitdir:'):
+            gitdir = Path(os.path.realpath(root / line[len('gitdir:'):].strip()))
+            common = Path(os.path.realpath(gitdir / (gitdir / 'commondir').read_text(encoding='utf-8').strip()))
+            backlink = (gitdir / 'gitdir').read_text(encoding='utf-8').strip()
+            # Only a real linked worktree: its admin dir sits in the main checkout's .git/worktrees
+            # and points back at this folder (not this .git entry, which could be a symlink).
+            if (gitdir.parent == common / 'worktrees'
+                    and os.path.realpath(common.parent / '.git') == str(common)
+                    and os.path.realpath(os.path.dirname(os.path.join(gitdir, backlink))) == os.path.realpath(root)):
+                keys.add(str(common.parent))
+    except OSError:
+        pass
+    return keys
+
+
+def _codex_trusted_projects():
+    """Paths the user trusted in $CODEX_HOME/config.toml ([projects."<path>"] trust_level)."""
+    try:
+        raw = CODEX_CONFIG_PATH.read_text(encoding='utf-8')
+    except OSError:
+        return []
+    try:
+        import tomllib
+        projects = tomllib.loads(raw).get('projects')
+        if not isinstance(projects, dict):
+            return []
+        return [p for p, v in projects.items() if isinstance(v, dict) and v.get('trust_level') == 'trusted']
+    except ImportError:
+        section_re = re.compile(
+            r'^\s*\[projects\.(?:"([^"]+)"|\'([^\']+)\')\][^\n]*\n(.*?)(?=^\s*\[|\Z)',
+            re.MULTILINE | re.DOTALL,
+        )
+        return [m.group(1) or m.group(2) for m in section_re.finditer(raw)
+                if re.search(r'^\s*trust_level\s*=\s*["\']trusted["\']', m.group(3), re.MULTILINE)]
+    except Exception:
+        return []
+
+
+def _codex_mcp_server_config(server_name, cwd):
+    """Codex's layering: $CODEX_HOME/config.toml, then a trusted project's
+    .codex/config.toml files from the git root down to cwd, nearer fields winning.
+    Untrusted projects are skipped, as Codex skips them."""
+    layers = [CODEX_CONFIG_PATH]
+    try:
+        if cwd:
+            root = _codex_project_root(cwd)
+            keys = _codex_trust_keys(root)
+            if any(os.path.realpath(os.path.expanduser(p)) in keys for p in _codex_trusted_projects()):
+                start = Path(cwd).expanduser()
+                project = []
+                for folder in (start, *start.parents):
+                    project.append(folder / '.codex' / 'config.toml')
+                    if folder == root:
+                        break
+                layers += reversed(project)
+    except Exception:
+        pass
+    merged = {}
+    for path in layers:
+        merged.update(_read_mcp_server_config(server_name, path) or {})
+    # Empty args are kept per layer so a nearer one can clear them, then dropped.
+    if not merged.get('args'):
+        merged.pop('args', None)
+    return merged or None
 
 
 def _email_domain(email: Optional[str]) -> Optional[str]:
@@ -2930,7 +3009,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
         if mcp_server:
-            server_cfg = _read_mcp_server_config(mcp_server, CODEX_CONFIG_PATH)
+            server_cfg = _codex_mcp_server_config(mcp_server, metadata.get('cwd'))
             if server_cfg:
                 metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd'))
             _attach_tool_content_hash(metadata)
