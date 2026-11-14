@@ -3251,10 +3251,30 @@ def _git_branch(root: Optional[str]) -> Optional[str]:
         return None
 
 
+_WINDOWS_PATHS = os.name == 'nt'
+# C:\x, C:/x, or a \\server\share path.
+_DRIVE_PATH_RE = re.compile(r'^(?:[A-Za-z]:[\\/]|\\\\[^\\])')
+# Git Bash spells C:\x as /c/x, and Windows normpath turns that into \c\x.
+_GIT_BASH_DRIVE_RE = re.compile(r'^[\\/]([A-Za-z])(?=[\\/]|$)')
+
+
+def _is_abs_path(path: str) -> bool:
+    """True for /x everywhere, and for C:\\x, C:/x or \\\\server\\share on Windows."""
+    return path.startswith('/') or (_WINDOWS_PATHS and bool(_DRIVE_PATH_RE.match(path)))
+
+
+def _native_path(path: str) -> str:
+    """On Windows, Git Bash's /c/x becomes C:/x; any other path is returned unchanged."""
+    match = _GIT_BASH_DRIVE_RE.match(path) if _WINDOWS_PATHS else None
+    if not match:
+        return path
+    return match.group(1).upper() + ':' + (path[2:] or '\\')
+
+
 def _find_git_root(path: str) -> Optional[str]:
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
-        p = Path(path)
+        p = Path(_native_path(path))
         for parent in [p] + list(p.parents):
             if (parent / '.git').exists():
                 return str(parent)
@@ -3265,7 +3285,15 @@ def _find_git_root(path: str) -> Optional[str]:
 
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# On Windows, C:\ and C:/ paths count too, and a single- or double-quoted
+# C:\ or Git Bash /c/ path keeps its spaces.
+_ABS_PATH_RE = re.compile(
+    r'(?:^|[\s"\'=(])('
+    + (r'(?<=")(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^"]*(?=")|'
+       r"(?<=')(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^']*(?=')|" if _WINDOWS_PATHS else '')
+    + r'/[^\s"\';|&<>()]+'
+    + (r'|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
+    + r')')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -3338,11 +3366,11 @@ def _git_path_opt_targets(command, shell_dir):
                         continue
                     for cwd in cwds:
                         target = os.path.expanduser(raw) if raw.startswith('~') else raw
-                        if not target.startswith('/'):
+                        if not _is_abs_path(target):
                             if not cwd:
                                 continue
                             target = os.path.join(cwd, target)
-                        target = os.path.normpath(target)
+                        target = os.path.normpath(_native_path(target))
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
@@ -3379,8 +3407,8 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
-            return os.path.normpath(target)
+        if _is_abs_path(target):
+            return os.path.normpath(_native_path(target))
         if target == '-':
             return shell_dir
         if shell_dir:
@@ -3602,6 +3630,19 @@ def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict],
     return None
 
 
+# apply_patch names each file on its own unquoted header line, spaces and all.
+_PATCH_HEADER_RE = re.compile(r'^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$', re.MULTILINE)
+
+
+def _patch_header_paths(tool_input: Optional[Dict]) -> List[str]:
+    """Absolute file paths named by apply_patch headers in any string field of the input."""
+    paths = []
+    for value in (tool_input or {}).values():
+        if isinstance(value, str):
+            paths.extend(path for path in _PATCH_HEADER_RE.findall(value) if _is_abs_path(path))
+    return paths
+
+
 def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], cwd: Optional[str]) -> List[str]:
     """Paths a Codex call works in; apply_patch hides them in the patch body."""
     tool_input = tool_input or {}
@@ -3616,6 +3657,10 @@ def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], 
             candidates.extend(_git_path_opt_targets(command, cwd))
             cwd = _next_shell_dir(command, cwd)
     else:
+        candidates.extend(
+            os.path.dirname(p) for p in _patch_header_paths(tool_input)
+            if not _is_system_checkout_path(p)
+        )
         try:
             blob = json.dumps(tool_input)
         except (TypeError, ValueError):
@@ -7911,6 +7956,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 # Resolve from any absolute paths in the arguments (e.g.
                 # apply_patch file paths), falling back to the shell dir.
                 candidates = [
+                    os.path.dirname(p) for p in _patch_header_paths(tool_input) if not _is_system_checkout_path(p)
+                ] + [
                     p for p in _ABS_PATH_RE.findall(json.dumps(tool_input)) if not _is_system_checkout_path(p)
                 ]
                 if not candidates and shell_dir:
