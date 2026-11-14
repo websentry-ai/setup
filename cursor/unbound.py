@@ -3159,10 +3159,30 @@ def _git_branch(root):
         return None
 
 
+_WINDOWS_PATHS = os.name == 'nt'
+# C:\x, C:/x, or a \\server\share path.
+_DRIVE_PATH_RE = re.compile(r'^(?:[A-Za-z]:[\\/]|\\\\[^\\])')
+# Git Bash spells C:\x as /c/x, and Windows normpath turns that into \c\x.
+_GIT_BASH_DRIVE_RE = re.compile(r'^[\\/]([A-Za-z])(?=[\\/]|$)')
+
+
+def _is_abs_path(path):
+    """True for /x everywhere, and for C:\\x, C:/x or \\\\server\\share on Windows."""
+    return path.startswith('/') or (_WINDOWS_PATHS and bool(_DRIVE_PATH_RE.match(path)))
+
+
+def _native_path(path):
+    """On Windows, Git Bash's /c/x becomes C:/x; any other path is returned unchanged."""
+    match = _GIT_BASH_DRIVE_RE.match(path) if _WINDOWS_PATHS else None
+    if not match:
+        return path
+    return match.group(1).upper() + ':' + (path[2:] or '\\')
+
+
 def _find_git_root(path):
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
-        p = Path(path)
+        p = Path(_native_path(path))
         for parent in [p] + list(p.parents):
             if (parent / '.git').exists():
                 return str(parent)
@@ -3173,7 +3193,11 @@ def _find_git_root(path):
 
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# On Windows, C:\ and C:/ paths count too; a quoted one keeps its spaces.
+_ABS_PATH_RE = re.compile(
+    r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+'
+    + (r'|(?<=")[A-Za-z]:[\\/][^"]*(?=")|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
+    + r')')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -3211,8 +3235,8 @@ def _next_shell_dir(command, shell_dir):
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
-            return os.path.normpath(target)
+        if _is_abs_path(target):
+            return os.path.normpath(_native_path(target))
         if target == '-':
             return shell_dir
         if shell_dir:
@@ -3268,11 +3292,11 @@ def _git_path_opt_targets(command, shell_dir):
                         continue
                     for cwd in cwds:
                         target = os.path.expanduser(raw) if raw.startswith('~') else raw
-                        if not target.startswith('/'):
+                        if not _is_abs_path(target):
                             if not cwd:
                                 continue
                             target = os.path.join(cwd, target)
-                        target = os.path.normpath(target)
+                        target = os.path.normpath(_native_path(target))
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
@@ -3510,11 +3534,11 @@ def _repo_gate_candidates(event, tool_name, command):
     if not isinstance(path, str) or not path:
         return []
     # A relative path resolves against the workspace dir, or nothing is judged.
-    if not path.startswith('/'):
+    if not _is_abs_path(path):
         workspace = _repo_gate_workspace_dir(event)
         if workspace:
             path = os.path.normpath(os.path.join(workspace, path))
-    if path.startswith('/') and not _is_system_checkout_path(path):
+    if _is_abs_path(path) and not _is_system_checkout_path(path):
         return [os.path.dirname(path)]
     return []
 
@@ -7786,7 +7810,7 @@ def build_llm_exchange(events, api_key=None):
             file_path = event.get('file_path')
             project, branch = _repo_for_paths(
                 [os.path.dirname(file_path)]
-                if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
+                if isinstance(file_path, str) and _is_abs_path(file_path) and not _is_system_checkout_path(file_path)
                 else [],
                 root_projects)
             read_entry = _with_call_ts({
@@ -7833,7 +7857,7 @@ def build_llm_exchange(events, api_key=None):
             tool_input = event.get('tool_input')
             if isinstance(tool_input, dict):
                 for value in tool_input.values():
-                    if isinstance(value, str) and value.startswith('/') and not _is_system_checkout_path(value):
+                    if isinstance(value, str) and _is_abs_path(value) and not _is_system_checkout_path(value):
                         candidates.append(os.path.dirname(value))
 
             project, branch = _repo_for_paths(candidates or [workspace_cwd], root_projects)
@@ -7852,7 +7876,7 @@ def build_llm_exchange(events, api_key=None):
             file_path = event.get('file_path')
             project, branch = _repo_for_paths(
                 [os.path.dirname(file_path)]
-                if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
+                if isinstance(file_path, str) and _is_abs_path(file_path) and not _is_system_checkout_path(file_path)
                 else [],
                 root_projects)
             assistant_tool_uses.append(_with_call_ts({

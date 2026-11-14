@@ -5037,10 +5037,30 @@ def _git_branch(root):
         return None
 
 
+_WINDOWS_PATHS = os.name == 'nt'
+# C:\x, C:/x, or a \\server\share path.
+_DRIVE_PATH_RE = re.compile(r'^(?:[A-Za-z]:[\\/]|\\\\[^\\])')
+# Git Bash spells C:\x as /c/x, and Windows normpath turns that into \c\x.
+_GIT_BASH_DRIVE_RE = re.compile(r'^[\\/]([A-Za-z])(?=[\\/]|$)')
+
+
+def _is_abs_path(path):
+    """True for /x everywhere, and for C:\\x, C:/x or \\\\server\\share on Windows."""
+    return path.startswith('/') or (_WINDOWS_PATHS and bool(_DRIVE_PATH_RE.match(path)))
+
+
+def _native_path(path):
+    """On Windows, Git Bash's /c/x becomes C:/x; any other path is returned unchanged."""
+    match = _GIT_BASH_DRIVE_RE.match(path) if _WINDOWS_PATHS else None
+    if not match:
+        return path
+    return match.group(1).upper() + ':' + (path[2:] or '\\')
+
+
 def _find_git_root(path):
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
-        p = Path(path)
+        p = Path(_native_path(path))
         for parent in [p] + list(p.parents):
             if (parent / '.git').exists():
                 return str(parent)
@@ -5051,7 +5071,11 @@ def _find_git_root(path):
 
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# On Windows, C:\ and C:/ paths count too; a quoted one keeps its spaces.
+_ABS_PATH_RE = re.compile(
+    r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+'
+    + (r'|(?<=")[A-Za-z]:[\\/][^"]*(?=")|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
+    + r')')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -5123,11 +5147,11 @@ def _git_path_opt_targets(command, shell_dir):
                         continue
                     for cwd in cwds:
                         target = os.path.expanduser(raw) if raw.startswith('~') else raw
-                        if not target.startswith('/'):
+                        if not _is_abs_path(target):
                             if not cwd:
                                 continue
                             target = os.path.join(cwd, target)
-                        target = os.path.normpath(target)
+                        target = os.path.normpath(_native_path(target))
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
@@ -5164,8 +5188,8 @@ def _next_shell_dir(command, shell_dir):
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
-            return os.path.normpath(target)
+        if _is_abs_path(target):
+            return os.path.normpath(_native_path(target))
         if target == '-':
             return shell_dir
         if shell_dir:
@@ -5417,9 +5441,9 @@ def _repo_gate_candidates(canonical, tool_input, cwd):
     path = (tool_input.get('filePath') or tool_input.get('path')
             or tool_input.get('file_path'))
     # A relative path resolves against the cwd; unresolvable falls to the blob scan.
-    if isinstance(path, str) and path and not path.startswith('/') and cwd:
+    if isinstance(path, str) and path and not _is_abs_path(path) and cwd:
         path = os.path.normpath(os.path.join(cwd, path))
-    if isinstance(path, str) and path.startswith('/'):
+    if isinstance(path, str) and _is_abs_path(path):
         if not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path))
         return candidates
@@ -9522,7 +9546,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     def _abs(path):
         if not isinstance(path, str) or not path:
             return None
-        if path.startswith('/'):
+        if _is_abs_path(path):
             return path
         base = shell_state.get('dir')
         return os.path.normpath(os.path.join(base, path)) if base else None
