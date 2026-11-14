@@ -2209,13 +2209,106 @@ def _claude_plugin_launch_values() -> tuple:
         return [], []
 
 
-def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
-    try:
-        if not config_path.exists():
-            return None
+def _mcpjson_settings(cwd: str) -> Dict:
+    """disabledMcpjsonServers / enabledMcpjsonServers / enableAllProjectMcpServers merged
+    from user, managed and project settings (the launch folder's, the git root's and, in
+    a worktree, the main checkout's)."""
+    paths = [_CONFIG_DIR / 'settings.json', _CONFIG_DIR / 'settings.local.json']
+    for d in dict.fromkeys(filter(None, [cwd, _find_git_root(cwd)] + _git_worktree_roots(cwd)[:1])):
+        paths += [Path(d) / '.claude' / 'settings.json', Path(d) / '.claude' / 'settings.local.json']
+    paths += _managed_settings_files()
+    out = {'disabled': set(), 'enabled': set(), 'enable_all': False}
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key, bucket in (('disabledMcpjsonServers', 'disabled'), ('enabledMcpjsonServers', 'enabled')):
+            if isinstance(data.get(key), list):
+                out[bucket].update(v for v in data[key] if isinstance(v, str))
+        out['enable_all'] = out['enable_all'] or data.get('enableAllProjectMcpServers') is True
+    return out
 
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.loads(f.read())
+
+def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
+    """The server's entry in the nearest project .mcp.json at or above cwd, where
+    Claude Code loads its project-scoped servers."""
+    try:
+        start = Path(cwd).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if server_name in _mcpjson_settings(cwd)['disabled']:
+        return None
+    for folder in (start, *start.parents):
+        if folder == folder.parent:
+            break  # Claude stops below the filesystem root
+        path = folder / '.mcp.json'
+        try:
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        servers = data.get('mcpServers') if isinstance(data, dict) else None
+        if isinstance(servers, dict) and server_name in servers:
+            result = _extract_mcp_server_fields(servers[server_name])
+            if result:
+                return result
+    return None
+
+
+def _user_scope_has(config: Dict, server_name: str) -> bool:
+    top = config.get('mcpServers')
+    return isinstance(top, dict) and server_name in top
+
+
+def _project_settings_loaded(argv: List[str]) -> bool:
+    """Claude loads every settings source unless --setting-sources narrows them."""
+    sources = None
+    for i, a in enumerate(argv):
+        if a == '--setting-sources':
+            sources = argv[i + 1] if i + 1 < len(argv) else ''
+        elif a.startswith('--setting-sources='):
+            sources = a.split('=', 1)[1]
+    return sources is None or 'project' in sources.split(',')
+
+
+def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
+    # Claude approves project servers only while project settings load: via the approval keys,
+    # or automatically in bypass and non-interactive sessions (-p, SDKs, GitHub Action). A
+    # nested `claude -p` keeps its parent's entrypoint, hence the argv check.
+    found = _claude_launch_argv()
+    argv = found[1][1:] if found else []
+    if not _project_settings_loaded(argv):
+        return False
+    settings = _mcpjson_settings(cwd)
+    return (settings['enable_all'] or server_name in settings['enabled']
+            or permission_mode == 'bypassPermissions'
+            or os.environ.get('CLAUDE_CODE_ENTRYPOINT') in ('sdk-cli', 'sdk-ts', 'sdk-py', 'claude-code-github-action')
+            or any(a in ('-p', '--print') for a in argv))
+
+
+def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:
+    """Where Claude was launched: it loads and starts MCP servers there, while the
+    event cwd follows an in-session cd."""
+    return os.environ.get('CLAUDE_PROJECT_DIR') or cwd
+
+
+def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None,
+                            permission_mode: Optional[str] = None) -> Optional[Dict]:
+    """Claude Code's own scope order, from the launch folder: local (~/.claude.json
+    projects, keyed by the main checkout in a worktree), then project (.mcp.json), then user."""
+    cwd = _claude_launch_dir(cwd)
+    try:
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.loads(f.read())
+        except Exception:
+            config = {}  # missing or mid-write: project .mcp.json still applies
+        if not isinstance(config, dict):
+            config = {}
 
         if cwd:
             projects = config.get('projects', {})
@@ -2233,6 +2326,21 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                     if parent == cwd_path:
                         break
                     cwd_path = parent
+
+            # From a linked worktree, Claude's local scope is the main checkout's entry.
+            roots = _git_worktree_roots(cwd)
+            main = projects.get(roots[0].replace('\\', '/').rstrip('/')) if roots and isinstance(projects, dict) else None
+            main_servers = main.get('mcpServers') if isinstance(main, dict) else None
+            if isinstance(main_servers, dict) and server_name in main_servers:
+                result = _extract_mcp_server_fields(main_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+            result = _project_mcp_json_server(server_name, cwd)
+            # Claude runs an unapproved project server's user-scope namesake instead; when
+            # approval can't be shown, keep reporting the user-scope server.
+            if result and (not _user_scope_has(config, server_name)
+                           or _project_server_approved(server_name, cwd, permission_mode)):
+                return _augment_script_hash(result, cwd)
 
         top_servers = config.get('mcpServers', {})
         if isinstance(top_servers, dict) and server_name in top_servers:
@@ -3523,15 +3631,22 @@ def _settings_base_url(path: Path) -> Optional[str]:
     return url if isinstance(url, str) and url.strip() else None
 
 
-def _managed_base_url() -> Optional[str]:
-    url = None
+def _managed_settings_files() -> List[Path]:
+    """Base file first, then drop-ins in the order Claude applies them."""
+    files = []
     for directory in MANAGED_SETTINGS_DIRS:
         try:
             dropins = sorted((directory / 'managed-settings.d').glob('*.json'))
         except Exception:
             dropins = []
-        for path in [directory / 'managed-settings.json', *dropins]:
-            url = _settings_base_url(path) or url
+        files += [directory / 'managed-settings.json', *dropins]
+    return files
+
+
+def _managed_base_url() -> Optional[str]:
+    url = None
+    for path in _managed_settings_files():
+        url = _settings_base_url(path) or url
     return url
 
 
@@ -4102,9 +4217,10 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         plugin_dirs = plugin_urls = None  # lazy: --plugin-dir paths / --plugin-url values
 
         if mcp_server_name:
-            cwd = event.get('cwd')
+            cwd = _claude_launch_dir(event.get('cwd'))
             server_cfg = _read_mcp_server_config(
-                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd,
+                permission_mode=event.get('permission_mode'),
             )
             if server_cfg:
                 metadata['mcp_server_config'] = server_cfg
@@ -4248,7 +4364,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     if is_mcp and api_response.get('unknown_mcp_server'):
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
-            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
+            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=_claude_launch_dir(metadata.get('cwd')))
 
     # Null fingerprint: the hook resolved no config for a real MCP server. The
     # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
@@ -10065,7 +10181,7 @@ def _mcp_diag_claude_json(server, cwd):
 
 
 def _mcp_diag_project_mcp_json(cwd):
-    """Project .mcp.json up the cwd chain — the hook does NOT read these."""
+    """Project .mcp.json files up the cwd chain."""
     found = []
     try:
         start = Path(cwd or os.getcwd()).resolve()
@@ -10241,7 +10357,7 @@ def _diag_inventory(cwd, ps_out):
             seen.add(f)
             m = _diag_servers_from_json(f)
             if m:
-                inv.append({'source': 'project .mcp.json (hook does NOT read)',
+                inv.append({'source': 'project .mcp.json',
                             'file': str(f), 'servers': _summ(m)})
     except Exception:
         pass
@@ -10607,7 +10723,7 @@ def _render_mcp_diagnostic(d):
     for f in (d.get('launch_flags') or []):
         L.append('  %s' % f)
 
-    head('project .mcp.json files (hook does NOT read)')
+    head('project .mcp.json files')
     for pj in (d.get('project_mcp_json') or []):
         L.append('  %s -> %s' % (pj.get('file'), ', '.join(pj.get('servers') or [])))
 

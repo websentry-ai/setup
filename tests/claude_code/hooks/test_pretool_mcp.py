@@ -1069,6 +1069,286 @@ class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
             "toolchain", cache_dir=self.cache))
 
 
+class TestProjectMcpJson(ProcessPreToolUseBase):
+    """Project-scoped servers live in .mcp.json at or above the session's cwd.
+    Claude prefers local scope, then project, then user, and the hook must
+    report the same server Claude actually runs."""
+
+    FS = {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/data"]}
+    OTHER = {"command": "python3", "args": ["/opt/other_server.py"]}
+
+    def setUp(self):
+        super().setUp()
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.cwd = str(self.repo)
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("CLAUDE_PROJECT_DIR", None)
+        os.environ.pop("CLAUDE_CODE_ENTRYPOINT", None)
+        argv = patch.object(unbound, "_claude_launch_argv", return_value=None)
+        argv.start()
+        self.addCleanup(argv.stop)
+
+    def forwarded(self, **event_fields):
+        if not event_fields:
+            return self.run_capture("mcp__fsx__write_file").get("mcp_server_config")
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["md"] = request_body["pre_tool_use_data"]["metadata"]
+            return {"decision": "allow"}
+
+        event = {"hook_event_name": "PreToolUse", "tool_name": "mcp__fsx__write_file",
+                 "tool_input": {"q": "x"}, "cwd": self.cwd, "session_id": "sess", **event_fields}
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        return captured.get("md", {}).get("mcp_server_config")
+
+    def test_launch_folder_is_used_after_an_in_session_cd(self):
+        # Claude keeps the servers it loaded at launch; a cd into a folder with its
+        # own .mcp.json must not change which server is reported.
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        _write_json(sub / ".mcp.json", {"mcpServers": {"fsx": self.OTHER}})
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_relative_script_is_hashed_from_the_launch_folder_after_a_cd(self):
+        (self.repo / "server.js").write_bytes(b"console.log('x')\n")
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": {"command": "node", "args": ["server.js"]}}})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.cwd = str(sub)
+        self.assertIn("scriptHash", self.forwarded())
+
+    def test_local_scope_is_found_from_the_launch_folder_after_a_cd(self):
+        _write_json(self.claude_json, {
+            "mcpServers": {}, "projects": {str(self.repo): {"mcpServers": {"fsx": self.FS}}}})
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        self.cwd = str(elsewhere)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def _worktrees(self):
+        import subprocess
+        git = lambda *a: subprocess.run(["git", *a], check=True, capture_output=True)
+        git("-C", str(self.repo), "init", "-q")
+        git("-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "i")
+        a, b = self.root / "wtA", self.root / "wtB"
+        git("-C", str(self.repo), "worktree", "add", "-q", str(a))
+        git("-C", str(self.repo), "worktree", "add", "-q", str(b))
+        # git records worktree paths resolved, and so does Claude's projects key
+        return os.path.realpath(self.repo), a, os.path.realpath(b)
+
+    def test_main_checkout_local_server_beats_project_mcp_json_in_a_worktree(self):
+        main, a, _ = self._worktrees()
+        _write_json(self.claude_json, {"mcpServers": {}, "projects": {main: {"mcpServers": {"fsx": self.OTHER}}}})
+        _write_json(a / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(a)
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_entry_keyed_under_a_sibling_worktree_does_not_beat_project_mcp_json(self):
+        _, a, b = self._worktrees()
+        _write_json(self.claude_json, {"mcpServers": {}, "projects": {b: {"mcpServers": {"fsx": self.OTHER}}}})
+        _write_json(a / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(a)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_sibling_worktree_entry_is_still_the_last_resort(self):
+        _, a, b = self._worktrees()
+        _write_json(self.claude_json, {"mcpServers": {}, "projects": {b: {"mcpServers": {"fsx": self.OTHER}}}})
+        self.cwd = str(a)
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_script_scan_reads_from_the_launch_folder(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        os.environ["CLAUDE_PROJECT_DIR"] = str(self.repo)
+        seen = {}
+        event = {"hook_event_name": "PreToolUse", "tool_name": "mcp__fsx__write_file",
+                 "tool_input": {}, "cwd": str(sub), "session_id": "sess"}
+        with patch.object(unbound, "send_to_hook_api", lambda b, k: {"decision": "allow", "unknown_mcp_server": True}), \
+             patch.object(unbound, "_dispatch_mcp_server_scan", lambda name, cfg, cwd=None: seen.update(cwd=cwd)):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(seen.get("cwd"), str(self.repo))
+
+    def test_disabled_project_server_falls_through_to_user_scope(self):
+        # Claude runs the user-scope server when the project entry is disabled.
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".claude" / "settings.local.json", {"disabledMcpjsonServers": ["fsx"]})
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_disabling_another_server_keeps_the_project_entry(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".claude" / "settings.json",
+                    {"disabledMcpjsonServers": ["other"], "enabledMcpjsonServers": ["fsx"]})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_server_defined_only_in_project_mcp_json_is_forwarded(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_mcp_json_in_a_parent_folder_is_read(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg" / "src"
+        sub.mkdir(parents=True)
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_nearest_mcp_json_wins(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.OTHER}})
+        sub = self.repo / "pkg"
+        _write_json(sub / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def _clash(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+
+    def test_approved_project_server_beats_user_scope_with_the_same_name(self):
+        # Claude runs the approved project server; reporting the user one would let a
+        # repo put any server behind a trusted name.
+        self._clash()
+        _write_json(self.repo / ".claude" / "settings.local.json", {"enabledMcpjsonServers": ["fsx"]})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_enable_all_project_servers_counts_as_approval(self):
+        self._clash()
+        _write_json(self.repo / ".claude" / "settings.json", {"enableAllProjectMcpServers": True})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_bypass_permissions_mode_counts_as_approval(self):
+        self._clash()
+        self.assertEqual(self.forwarded(permission_mode="bypassPermissions"), self.FS)
+
+    def test_non_interactive_session_counts_as_approval(self):
+        # -p and the SDK auto-approve project servers with permission_mode "default".
+        self._clash()
+        for entrypoint in ("sdk-cli", "sdk-ts", "sdk-py", "claude-code-github-action"):
+            with self.subTest(entrypoint=entrypoint), patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": entrypoint}):
+                self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
+    def test_nested_print_session_counts_as_approval(self):
+        # A `claude -p` run from inside another session keeps that session's entrypoint.
+        self._clash()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "claude-vscode"
+        with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "-p", "hi"])):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+        with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "--resume"])):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
+
+    def test_setting_sources_without_project_turns_auto_approval_off(self):
+        # The SDK passes --setting-sources; without "project" Claude doesn't auto-approve.
+        self._clash()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "sdk-ts"
+        for argv, expected in ((["claude", "--setting-sources=user"], self.OTHER),
+                               (["claude", "--setting-sources="], self.OTHER),
+                               (["claude", "-p", "--setting-sources", "user", "project"], self.OTHER),
+                               (["claude", "--setting-sources", "user,project"], self.FS),
+                               (["claude", "--output-format", "stream-json"], self.FS)):
+            with self.subTest(argv=argv), patch.object(unbound, "_claude_launch_argv", return_value=(4321, argv)):
+                self.assertEqual(self.forwarded(permission_mode="default"), expected)
+
+    def test_approval_keys_do_not_count_without_project_settings(self):
+        self._clash()
+        _write_json(self.repo / ".claude" / "settings.local.json", {"enabledMcpjsonServers": ["fsx"]})
+        with patch.object(unbound, "_claude_launch_argv", return_value=(4321, ["claude", "--setting-sources=user"])):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
+
+    def test_managed_drop_in_approval_counts(self):
+        self._clash()
+        managed = self.root / "managed"
+        _write_json(managed / "managed-settings.d" / "50-mcp.json", {"enableAllProjectMcpServers": True})
+        with patch.object(unbound, "MANAGED_SETTINGS_DIRS", (managed,)):
+            self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
+    def test_unapproved_project_server_keeps_the_user_scope_server(self):
+        # Claude doesn't start an unapproved project server and runs the user one.
+        self._clash()
+        os.environ["CLAUDE_CODE_ENTRYPOINT"] = "cli"
+        self.assertEqual(self.forwarded(permission_mode="default"), self.OTHER)
+
+    def test_unclashed_project_server_needs_no_approval_proof(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(permission_mode="default"), self.FS)
+
+    def test_disabled_list_at_the_git_root_applies_from_a_subfolder(self):
+        import subprocess
+        subprocess.run(["git", "-C", str(self.repo), "init", "-q"], check=True, capture_output=True)
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.OTHER}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".claude" / "settings.local.json", {"disabledMcpjsonServers": ["fsx"]})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_local_scope_beats_project_mcp_json(self):
+        _write_json(self.claude_json, {
+            "mcpServers": {},
+            "projects": {str(self.repo): {"mcpServers": {"fsx": self.OTHER}}},
+        })
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_user_scope_still_used_when_no_project_entry(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"another": self.OTHER}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_read_without_a_claude_json(self):
+        self.claude_json.unlink()
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_read_with_an_unparseable_claude_json(self):
+        self.claude_json.write_text('{"mcpServers": {')
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_deeply_nested_mcp_json_does_not_drop_user_scope(self):
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
+        (self.repo / ".mcp.json").write_text("[" * 100000 + "]" * 100000)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_unusable_nearer_entry_falls_through_to_parent(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        _write_json(sub / ".mcp.json", {"mcpServers": {"fsx": {}}})
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_large_mcp_json_is_still_read(self):
+        # Claude has no size cap, so padding must not swap in another scope's server.
+        _write_json(self.claude_json, {"mcpServers": {"fsx": self.FS}})
+        _write_json(self.repo / ".mcp.json", {
+            "mcpServers": {"fsx": self.OTHER}, "pad": "x" * 1_100_000})
+        _write_json(self.repo / ".claude" / "settings.local.json", {"enabledMcpjsonServers": ["fsx"]})
+        self.assertEqual(self.forwarded(), self.OTHER)
+
+    def test_malformed_nearer_file_falls_through_to_parent(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": self.FS}})
+        sub = self.repo / "pkg"
+        sub.mkdir()
+        (sub / ".mcp.json").write_text("{not json")
+        self.cwd = str(sub)
+        self.assertEqual(self.forwarded(), self.FS)
+
+    def test_secrets_in_project_entry_are_not_forwarded(self):
+        _write_json(self.repo / ".mcp.json", {"mcpServers": {"fsx": {
+            **self.FS, "env": {"API_TOKEN": "s3cr3t"}, "headers": {"Authorization": "Bearer x"}}}})
+        self.assertEqual(self.forwarded(), self.FS)
+
+
 class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
     """WEB-5335 end-to-end: numeric plugin IDs and --plugin-dir plugins must
     still forward a config; unresolved misses must log loudly, not silently."""
