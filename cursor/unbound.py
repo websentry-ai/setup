@@ -2759,6 +2759,22 @@ def _read_mcp_server_config(server_name, config_path):
         return None
 
 
+def _cursor_mcp_server_config(event, server_name):
+    """Cursor loads MCP servers from each workspace's .cursor/mcp.json before
+    ~/.cursor/mcp.json. A remote server defined elsewhere (a plugin) is still
+    identified by the URL on the event. Returns (config, workspace root or None)."""
+    roots = [r for r in (event.get('workspace_roots') or []) if isinstance(r, str) and r]
+    for root in roots:
+        cfg = _read_mcp_server_config(server_name, Path(root) / '.cursor' / 'mcp.json')
+        if cfg:
+            return cfg, root
+    cfg = _read_mcp_server_config(server_name, CURSOR_MCP_CONFIG_PATH)
+    if cfg:
+        return cfg, None
+    url = event.get('mcp_server_url') or event.get('url')
+    return ({'url': url}, None) if isinstance(url, str) and url else (None, None)
+
+
 def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
     """beforeShellExecution / beforeMCPExecution entry point; the gate runs first and applies to the shell event only, an MCP call names no local path to resolve."""
     gate = _repo_gate_evaluate(event, tool_name, command)
@@ -2787,9 +2803,10 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
     if mcp_server is not None:
         metadata['mcp_server'] = mcp_server
 
-        server_cfg = _read_mcp_server_config(mcp_server, CURSOR_MCP_CONFIG_PATH)
+        server_cfg, root = _cursor_mcp_server_config(event, mcp_server)
         if server_cfg:
-            metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd'))
+            # Cursor sends no cwd on MCP events; a relative script resolves against its workspace.
+            metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd') or root)
 
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
@@ -8595,7 +8612,8 @@ def main():
             return
 
         if hook_event_name == 'beforeMCPExecution':
-            mcp_server = event.get('command', '')
+            # `command` is the stdio launch string, not a name; older Cursor builds sent no name.
+            mcp_server = event.get('mcp_server_name') or event.get('command') or ''
             mcp_tool_name = event.get('tool_name', '')
 
             response = _with_deferred_skill_context(event, process_pre_tool_use_execution(
