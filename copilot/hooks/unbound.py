@@ -5443,7 +5443,7 @@ def _repo_gate_candidates(canonical, tool_input, cwd):
             candidates.append(cwd)
         return candidates
     path = (tool_input.get('filePath') or tool_input.get('path')
-            or tool_input.get('file_path'))
+            or tool_input.get('file_path') or _extract_patch_target_path(tool_input))
     # A relative path resolves against the cwd; unresolvable falls to the blob scan.
     if isinstance(path, str) and path and not _is_abs_path(path) and cwd:
         path = os.path.normpath(os.path.join(cwd, path))

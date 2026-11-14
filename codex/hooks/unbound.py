@@ -3630,6 +3630,19 @@ def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict],
     return None
 
 
+# apply_patch names each file on its own unquoted header line, spaces and all.
+_PATCH_HEADER_RE = re.compile(r'^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$', re.MULTILINE)
+
+
+def _patch_header_paths(tool_input: Optional[Dict]) -> List[str]:
+    """Absolute file paths named by apply_patch headers in any string field of the input."""
+    paths = []
+    for value in (tool_input or {}).values():
+        if isinstance(value, str):
+            paths.extend(path for path in _PATCH_HEADER_RE.findall(value) if _is_abs_path(path))
+    return paths
+
+
 def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], cwd: Optional[str]) -> List[str]:
     """Paths a Codex call works in; apply_patch hides them in the patch body."""
     tool_input = tool_input or {}
@@ -3644,6 +3657,10 @@ def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], 
             candidates.extend(_git_path_opt_targets(command, cwd))
             cwd = _next_shell_dir(command, cwd)
     else:
+        candidates.extend(
+            os.path.dirname(p) for p in _patch_header_paths(tool_input)
+            if not _is_system_checkout_path(p)
+        )
         try:
             blob = json.dumps(tool_input)
         except (TypeError, ValueError):
@@ -7939,6 +7956,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 # Resolve from any absolute paths in the arguments (e.g.
                 # apply_patch file paths), falling back to the shell dir.
                 candidates = [
+                    os.path.dirname(p) for p in _patch_header_paths(tool_input) if not _is_system_checkout_path(p)
+                ] + [
                     p for p in _ABS_PATH_RE.findall(json.dumps(tool_input)) if not _is_system_checkout_path(p)
                 ]
                 if not candidates and shell_dir:

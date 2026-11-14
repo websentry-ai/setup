@@ -162,3 +162,28 @@ class TestWindowsRepoGate:
         command = "touch %s%s%s" % (quote, target, quote)
         candidates = _gate_candidates(tool, m, str(tmp_path), command=command)
         assert m._repo_gate_violating_repo(candidates, ALLOWED_ONLY, {}) == "acme/web"
+
+
+class TestCodexPatchHeaders:
+    """apply_patch names files on unquoted header lines, so a path with a space must survive."""
+
+    def test_a_patch_into_a_spaced_repo_is_judged(self, tmp_path):
+        m = tool_module("codex/hooks")
+        spaced = _make_repo(tmp_path / "John Smith" / "web")
+        patch_text = "*** Begin Patch\n*** Update File: %s\n@@\n-a\n+b\n*** End Patch\n" % (spaced / "a.py")
+        candidates = m._repo_gate_candidates("apply_patch", {"command": patch_text}, str(tmp_path))
+        assert m._repo_gate_violating_repo(candidates, ALLOWED_ONLY, {}) == "acme/web"
+
+    def test_relative_patch_headers_add_no_candidates(self):
+        m = tool_module("codex/hooks")
+        patch_text = "*** Begin Patch\n*** Add File: src/a.py\n+x\n*** End Patch\n"
+        assert m._patch_header_paths({"command": patch_text}) == []
+
+
+class TestCopilotPatchHeaders:
+    def test_a_patch_into_a_spaced_repo_is_judged(self, tmp_path):
+        m = tool_module("copilot/hooks")
+        spaced = _make_repo(tmp_path / "John Smith" / "web")
+        patch_text = "*** Begin Patch\n*** Update File: %s\n@@\n-a\n+b\n*** End Patch\n" % (spaced / "a.py")
+        candidates = m._repo_gate_candidates("Edit", {"input": patch_text}, str(tmp_path))
+        assert m._repo_gate_violating_repo(candidates, ALLOWED_ONLY, {}) == "acme/web"
