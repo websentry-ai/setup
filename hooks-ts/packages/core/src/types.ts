@@ -18,6 +18,7 @@
 // Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
 // future opencode adapter can reuse it unchanged.
 
+import type { ShellInfo } from "./shell.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
 
 export interface PretoolMessage {
@@ -30,6 +31,9 @@ export interface PreToolUseData {
   /** May be `''` — file tools send a `metadata.file_path` instead (§B3). */
   command: string;
   tool_use_id?: string;
+  /** The shell that runs `command` and how the hook knows; absent for a non-shell tool. */
+  shell?: string;
+  shell_source?: string;
   metadata: Record<string, unknown>;
 }
 
@@ -103,6 +107,8 @@ export interface PretoolPayloadInput {
   pullPolicies?: boolean;
   /** The process's settled account identity, when known. */
   accountIdentity?: AccountIdentity;
+  /** The shell that runs a shell tool's command, from `detectShell`; kept off the body when empty. */
+  shell?: ShellInfo;
   /**
    * A resolved MCP call (see the header). When set, `toolName`/`command`/`toolInput` no longer shape
    * the body: the builder sends the Path-3 MCP shape instead. Absent for every native/custom tool.

@@ -4795,6 +4795,8 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         },
         **_build_user_prompt_payload(recent_user_prompts),
     }
+    if canonical == 'Bash':
+        request_body['pre_tool_use_data'].update(detect_shell('copilot', raw_tool, event.get('cwd')))
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -5035,10 +5037,30 @@ def _git_branch(root):
         return None
 
 
+_WINDOWS_PATHS = os.name == 'nt'
+# C:\x, C:/x, or a \\server\share path.
+_DRIVE_PATH_RE = re.compile(r'^(?:[A-Za-z]:[\\/]|\\\\[^\\])')
+# Git Bash spells C:\x as /c/x, and Windows normpath turns that into \c\x.
+_GIT_BASH_DRIVE_RE = re.compile(r'^[\\/]([A-Za-z])(?=[\\/]|$)')
+
+
+def _is_abs_path(path):
+    """True for /x everywhere, and for C:\\x, C:/x or \\\\server\\share on Windows."""
+    return path.startswith('/') or (_WINDOWS_PATHS and bool(_DRIVE_PATH_RE.match(path)))
+
+
+def _native_path(path):
+    """On Windows, Git Bash's /c/x becomes C:/x; any other path is returned unchanged."""
+    match = _GIT_BASH_DRIVE_RE.match(path) if _WINDOWS_PATHS else None
+    if not match:
+        return path
+    return match.group(1).upper() + ':' + (path[2:] or '\\')
+
+
 def _find_git_root(path):
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
-        p = Path(path)
+        p = Path(_native_path(path))
         for parent in [p] + list(p.parents):
             if (parent / '.git').exists():
                 return str(parent)
@@ -5049,7 +5071,15 @@ def _find_git_root(path):
 
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# On Windows, C:\ and C:/ paths count too, and a single- or double-quoted
+# C:\ or Git Bash /c/ path keeps its spaces.
+_ABS_PATH_RE = re.compile(
+    r'(?:^|[\s"\'=(])('
+    + (r'(?<=")(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^"]*(?=")|'
+       r"(?<=')(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^']*(?=')|" if _WINDOWS_PATHS else '')
+    + r'/[^\s"\';|&<>()]+'
+    + (r'|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
+    + r')')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -5121,11 +5151,11 @@ def _git_path_opt_targets(command, shell_dir):
                         continue
                     for cwd in cwds:
                         target = os.path.expanduser(raw) if raw.startswith('~') else raw
-                        if not target.startswith('/'):
+                        if not _is_abs_path(target):
                             if not cwd:
                                 continue
                             target = os.path.join(cwd, target)
-                        target = os.path.normpath(target)
+                        target = os.path.normpath(_native_path(target))
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
@@ -5162,8 +5192,8 @@ def _next_shell_dir(command, shell_dir):
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/'):
-            return os.path.normpath(target)
+        if _is_abs_path(target):
+            return os.path.normpath(_native_path(target))
         if target == '-':
             return shell_dir
         if shell_dir:
@@ -5413,11 +5443,11 @@ def _repo_gate_candidates(canonical, tool_input, cwd):
             candidates.append(cwd)
         return candidates
     path = (tool_input.get('filePath') or tool_input.get('path')
-            or tool_input.get('file_path'))
+            or tool_input.get('file_path') or _extract_patch_target_path(tool_input))
     # A relative path resolves against the cwd; unresolvable falls to the blob scan.
-    if isinstance(path, str) and path and not path.startswith('/') and cwd:
+    if isinstance(path, str) and path and not _is_abs_path(path) and cwd:
         path = os.path.normpath(os.path.join(cwd, path))
-    if isinstance(path, str) and path.startswith('/'):
+    if isinstance(path, str) and _is_abs_path(path):
         if not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path))
         return candidates
@@ -5600,6 +5630,213 @@ def _extract_patch_target_path(args):
         return ''
     m = re.search(r'^\*\*\*\s+(?:Add|Update|Delete)\s+File:\s*(.+)$', text, re.MULTILINE)
     return m.group(1).strip() if m else ''
+
+
+# KEEP IN SYNC: shell detection — byte-identical in every agent hook, do not diverge.
+# Which shell runs an agent's terminal command, and how the hook knows: the agent's tool names it ('tool'), or the hook
+# applies the rule that agent uses to pick its shell ('agent_rule'). Fails open: nothing is sent when neither works.
+_SHELL_NAMES = frozenset({'bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'powershell', 'pwsh', 'cmd'})
+_SHELL_CACHE = {}
+_SHELL_SETTINGS_MAX_BYTES = 1 << 20
+
+
+def _shell_name(program):
+    """The shell a path or program name runs ('/bin/zsh', 'pwsh.exe'), or None for anything else."""
+    if not isinstance(program, str) or not program.strip():
+        return None
+    name = re.split(r'[\\/]', program.strip().strip('"'))[-1].lower()
+    name = name[:-4] if name.endswith('.exe') else name
+    return name if name in _SHELL_NAMES else None
+
+
+def _shell_windows():
+    return os.name == 'nt'
+
+
+def _shell_windows_powershell():
+    """PowerShell 7 when it is on PATH, else Windows PowerShell, which every Windows install has."""
+    return 'pwsh' if shutil.which('pwsh') else 'powershell'
+
+
+def _shell_env():
+    return _shell_name(os.environ.get('SHELL'))
+
+
+def _shell_login():
+    """The account's login shell from the user database, as Codex reads it, else $SHELL."""
+    try:
+        import pwd
+        return _shell_name(pwd.getpwuid(os.getuid()).pw_shell) or _shell_env()
+    except Exception:
+        return _shell_env()
+
+
+def _shell_settings(path):
+    """A JSON settings file that may hold comments and trailing commas, as VS Code writes them; {} when unreadable."""
+    # Only a small regular file: a repo's own settings could be a pipe or a device that never finishes reading.
+    try:
+        if not os.path.isfile(path):
+            return {}
+        with open(path, 'rb') as f:
+            raw = f.read(_SHELL_SETTINGS_MAX_BYTES + 1)
+        if len(raw) > _SHELL_SETTINGS_MAX_BYTES:
+            return {}
+        text = raw.decode('utf-8-sig')
+    except (OSError, ValueError):
+        return {}
+    # Drop // and /* */ comments outside strings, then commas before a closing bracket. An unclosed string or comment
+    # runs to the end, so a malformed file is one linear pass rather than a rescan from every quote.
+    text = re.sub(r'("(?:\\.|[^"\\])*"?)|//[^\n]*|/\*.*?(?:\*/|\Z)', lambda m: m.group(1) or '', text, flags=re.S)
+    text = re.sub(r'("(?:\\.|[^"\\])*"?)|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# VS Code's built-in terminal profile names on each OS, for a default profile with no path of its own.
+_SHELL_VSCODE_BUILTIN = {'powershell': None, 'windows powershell': 'powershell', 'command prompt': 'cmd',
+                         'git bash': 'bash'}
+# How the Insiders build names itself in its folders, sockets and version string.
+_SHELL_INSIDERS = re.compile(r'code - insiders|code-insiders|-insider\b', re.I)
+
+
+def _shell_vscode_app():
+    """The VS Code edition running the hook: Insiders when its environment names that build, else the stable one."""
+    for key in ('VSCODE_IPC_HOOK', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_CODE_CACHE_PATH', 'VSCODE_NLS_CONFIG',
+                'TERM_PROGRAM_VERSION'):
+        if _SHELL_INSIDERS.search(os.environ.get(key) or ''):
+            return 'Code - Insiders'
+    return 'Code'
+
+
+def _shell_workspace_settings(cwd):
+    """The repository's own VS Code settings, read only when neither `.vscode` nor the file is a link: a link could
+    lead to a network share, and the folder is checked first so the file's own check never passes through it."""
+    folder = Path(cwd) / '.vscode'
+    try:
+        if os.path.islink(folder) or os.path.islink(folder / 'settings.json'):
+            return {}
+    except (OSError, ValueError):
+        return {}
+    return _shell_settings(folder / 'settings.json')
+
+
+def _shell_profile_path(path, check=True):
+    """A profile's executable as VS Code resolves it: `${env:…}` expanded, then the first entry that is installed, or
+    nothing. Without `check` nothing on disk is touched: one path is taken as written, and a list, whose pick needs
+    the disk, names nothing."""
+    if not check and isinstance(path, list) and len(path) > 1:
+        return None
+    for candidate in [path] if isinstance(path, str) else path if isinstance(path, list) else []:
+        if not isinstance(candidate, str):
+            continue
+        expanded = re.sub(r'\$\{env:([^}]+)\}', lambda m: os.environ.get(m.group(1), ''), candidate).strip().strip('"')
+        if not expanded:
+            continue
+        if not check or os.path.isfile(expanded) or (
+                '/' not in expanded and '\\' not in expanded and shutil.which(expanded)):
+            return expanded
+    return None
+
+
+def _shell_vscode(cwd):
+    """The shell Copilot's run_in_terminal uses: its own terminal profile, else the default one, from the workspace
+    and then the running edition's user settings; a default of cmd runs as Windows PowerShell and of /bin/sh as bash.
+    A path a repository's settings supply is never looked up on disk, so it can't make the hook reach a network share."""
+    windows = _shell_windows()
+    key = 'windows' if windows else 'osx' if sys.platform == 'darwin' else 'linux'
+    if windows:
+        user_root = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    elif sys.platform == 'darwin':
+        user_root = Path.home() / 'Library' / 'Application Support'
+    else:
+        user_root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    # (settings, from the repository's own workspace settings)
+    layers = ([(_shell_workspace_settings(cwd), True)] if cwd else []) + \
+        [(_shell_settings(user_root / _shell_vscode_app() / 'User' / 'settings.json'), False)]
+    for layer, _ in layers:
+        profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
+        # Copilot's own profile takes one path, kept even when the file is missing; any other shape is ignored.
+        if isinstance(profile, dict) and isinstance(profile.get('path'), str):
+            return _shell_name(_shell_profile_path(profile['path'], check=False))
+    for layer, _ in layers:
+        chosen = layer.get('terminal.integrated.defaultProfile.' + key)
+        if not isinstance(chosen, str):
+            continue
+        spec, from_repo = next(((p[chosen], repo) for p, repo in
+                                ((lay.get('terminal.integrated.profiles.' + key), repo) for lay, repo in layers)
+                                if isinstance(p, dict) and isinstance(p.get(chosen), dict)), ({}, False))
+        if 'path' in spec:
+            name = _shell_name(_shell_profile_path(spec['path'], check=not from_repo))
+        elif chosen.lower() in _SHELL_VSCODE_BUILTIN:
+            name = _SHELL_VSCODE_BUILTIN[chosen.lower()] or _shell_windows_powershell()
+        else:
+            name = _shell_name(chosen)
+        break
+    else:
+        name = _shell_windows_powershell() if windows else _shell_env()
+    return {'cmd': 'powershell', 'sh': 'bash'}.get(name, name)
+
+
+def _shell_augment():
+    """Augment's shellPath setting, else the user's shell when Augment supports it, else its own default."""
+    settings = _shell_settings(Path.home() / '.augment' / 'settings.json')
+    for key in ('shellPath', 'shell'):
+        chosen = _shell_name(settings.get(key))
+        if chosen:
+            return chosen
+    if _shell_windows():
+        return 'powershell'
+    env = _shell_env()
+    return env if env in ('bash', 'zsh', 'fish', 'sh') else 'zsh' if sys.platform == 'darwin' else 'sh'
+
+
+def _shell_detect(agent, tool_name, cwd):
+    windows = _shell_windows()
+    tool = tool_name if isinstance(tool_name, str) else ''
+    if tool.lower() == 'powershell':
+        # Claude Code's, Copilot CLI's and Pi's PowerShell tools: pwsh, else Windows PowerShell.
+        return (_shell_windows_powershell() if windows else 'pwsh'), 'tool'
+    if agent == 'claude-code':
+        # The Bash tool runs Git Bash on Windows and the user's bash or zsh elsewhere.
+        env = None if windows else _shell_env()
+        return (env if env in ('bash', 'zsh') else 'bash'), 'tool'
+    if agent == 'copilot':
+        # The CLI's lowercase `bash` is its Unix tool; its PascalCase `Bash` names either shell.
+        if tool == 'bash':
+            return 'bash', 'tool'
+        if tool in ('run_in_terminal', 'runInTerminal'):
+            return _shell_vscode(cwd), 'agent_rule'
+        return ('powershell' if windows else 'bash'), 'agent_rule'
+    if agent == 'codex':
+        # Codex runs a login shell it supports, else zsh on macOS and bash elsewhere.
+        if windows:
+            return _shell_windows_powershell(), 'agent_rule'
+        login = _shell_login()
+        if login not in ('bash', 'zsh', 'sh', 'pwsh', 'powershell'):
+            login = 'zsh' if sys.platform == 'darwin' else 'bash'
+        return login, 'agent_rule'
+    if agent == 'cursor':
+        # Cursor runs $SHELL; one this hook doesn't know names nothing rather than a guess.
+        return (_shell_windows_powershell() if windows else _shell_env()), 'agent_rule'
+    if agent == 'augment':
+        return _shell_augment(), 'agent_rule'
+    return None, None
+
+
+def detect_shell(agent, tool_name=None, cwd=None):
+    """{'shell': …, 'shell_source': …} for one terminal call, or {} when the hook can't tell; never raises."""
+    key = (agent, tool_name, cwd)
+    if key not in _SHELL_CACHE:
+        try:
+            shell, source = _shell_detect(agent, tool_name, cwd)
+        except Exception:
+            shell, source = None, None
+        _SHELL_CACHE[key] = {'shell': shell, 'shell_source': source} if shell in _SHELL_NAMES else {}
+    return dict(_SHELL_CACHE[key])
+# --- end shell detection ---
 
 
 # KEEP IN SYNC: transfer resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
@@ -9313,7 +9550,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     def _abs(path):
         if not isinstance(path, str) or not path:
             return None
-        if path.startswith('/'):
+        if _is_abs_path(path):
             return path
         base = shell_state.get('dir')
         return os.path.normpath(os.path.join(base, path)) if base else None
@@ -9326,6 +9563,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             'type': 'afterShellExecution',
             'command': command,
             'output': result_content or '',
+            **detect_shell('copilot', name, cwd),
         }
         candidates = []
         # Where this call's transfer lookups start; only a cd that surely ran moves it for the next call.
