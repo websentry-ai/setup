@@ -133,6 +133,9 @@ DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
 # Spread a fleet-wide Jamf push across a window, like the per-tool MDM scripts.
 MDM_RETRY_JITTER_SECONDS = 5
 
+# Set by onboard.ps1: where to list the failed steps for its install report.
+RESULT_FILE_ENV = "UNBOUND_ONBOARD_RESULT_FILE"
+
 USAGE = (
     "Usage:\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" \\\n"
@@ -703,6 +706,19 @@ def _stdout_never_raises() -> None:
             pass
 
 
+def write_result_file(failures: list) -> None:
+    """Lists the failed steps for onboard.ps1, which names them in its install report.
+    The report is best-effort, so a file that cannot be written never fails onboarding."""
+    path = os.environ.get(RESULT_FILE_ENV)
+    if not path:
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"failed_steps": failures}, f)
+    except OSError as e:
+        print(f"Warning: could not record the failed steps: {e}", file=sys.stderr)
+
+
 def main() -> int:
     _stdout_never_raises()
     args = sys.argv[1:]
@@ -775,6 +791,8 @@ def main() -> int:
             discovery_skipped = True
         elif not run_discovery(scan_key, discovery_backend):
             failures.append("Discovery")
+
+    write_result_file(failures)
 
     print(f"\n{'=' * 60}")
     if failures:
