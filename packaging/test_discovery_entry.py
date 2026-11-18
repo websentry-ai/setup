@@ -43,8 +43,14 @@ def entry(tmp_path, monkeypatch):
     mod = _load_entry()
     cfg_path = tmp_path / "discovery.json"
     monkeypatch.setattr(mod, "DISCOVERY_CONFIG_PATH", str(cfg_path))
+    users_root = tmp_path / "Users"
+    users_root.mkdir()
+    monkeypatch.setattr(mod, "USERS_ROOT", str(users_root))
+    install_current = tmp_path / "current"
+    install_current.mkdir()
+    monkeypatch.setattr(mod, "INSTALL_CURRENT", str(install_current))
 
-    calls = {"sweep": 0}
+    calls = {"sweep": 0, "sentry": []}
 
     def fake_sweep():
         calls["sweep"] += 1
@@ -64,8 +70,12 @@ def entry(tmp_path, monkeypatch):
     sub = types.ModuleType("coding_discovery_tools.ai_tools_discovery")
     sub.main = fake_sweep
     pkg.ai_tools_discovery = sub
+    utils = types.ModuleType("coding_discovery_tools.utils")
+    utils.report_to_sentry = lambda exc, context=None, level="error": calls["sentry"].append((str(exc), level))
+    pkg.utils = utils
     monkeypatch.setitem(sys.modules, "coding_discovery_tools", pkg)
     monkeypatch.setitem(sys.modules, "coding_discovery_tools.ai_tools_discovery", sub)
+    monkeypatch.setitem(sys.modules, "coding_discovery_tools.utils", utils)
 
     # Default to a clean env so flags/env never leak across cases.
     monkeypatch.delenv("UNBOUND_API_KEY", raising=False)
@@ -139,6 +149,37 @@ def test_no_config_file_idles_exit_0(entry, monkeypatch, caplog):
     rc = _run(entry, ["scan"], monkeypatch)
     assert rc == 0
     assert entry._test_calls["sweep"] == 0, "sweep ran without any config (should idle)"
+
+
+def _onboard(entry, install_age_seconds):
+    import os
+    import time
+
+    user_cfg = Path(entry.USERS_ROOT) / "alice" / ".unbound" / "config.json"
+    user_cfg.parent.mkdir(parents=True)
+    user_cfg.write_text("{}")
+    stamp = time.time() - install_age_seconds
+    os.utime(entry.INSTALL_CURRENT, (stamp, stamp))
+
+
+def test_daemon_without_creds_on_onboarded_device_warns(entry, monkeypatch):
+    _onboard(entry, install_age_seconds=2 * 3600)
+    assert _run(entry, ["scan"], monkeypatch) == 0
+    assert entry._test_calls["sentry"] == [
+        ("discovery daemon has no credentials on an onboarded device", "warning")
+    ]
+
+
+@pytest.mark.parametrize("argv,onboarded,install_age", [
+    (["scan"], False, 2 * 3600),
+    (["scan"], True, 60),
+    ([], True, 2 * 3600),
+])
+def test_missing_creds_stays_quiet_outside_an_onboarded_daemon(entry, monkeypatch, argv, onboarded, install_age):
+    if onboarded:
+        _onboard(entry, install_age_seconds=install_age)
+    assert _run(entry, argv, monkeypatch) == 0
+    assert entry._test_calls["sentry"] == []
 
 
 def test_partial_config_file_idles_when_key_missing(entry, monkeypatch):

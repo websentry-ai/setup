@@ -39,6 +39,9 @@ import sys
 # install) credential resolution falls through to the existing missing-config
 # idle path — discovery must never crash or block dev work because of it.
 DISCOVERY_CONFIG_PATH = "/opt/unbound/etc/discovery.json"
+USERS_ROOT = "/Users"
+INSTALL_CURRENT = "/opt/unbound/current"
+SETUP_GRACE_SECONDS = 3600
 
 # Discovery's user-facing version. Mirrors unbound-hook's __version__
 # (binary/src/unbound_hook/__init__.py) so both binaries report the same
@@ -124,6 +127,27 @@ def _missing_required_config(argv):
     return missing
 
 
+def _report_daemon_without_creds(missing):
+    try:
+        import glob
+        import time
+
+        if not glob.glob(os.path.join(USERS_ROOT, "*", ".unbound", "config.json")):
+            return
+        # onboard.sh installs the pkg (RunAtLoad fires) moments before setup writes the file.
+        if time.time() - os.lstat(INSTALL_CURRENT).st_mtime < SETUP_GRACE_SECONDS:
+            return
+        from coding_discovery_tools.utils import report_to_sentry
+
+        report_to_sentry(
+            RuntimeError("discovery daemon has no credentials on an onboarded device"),
+            context={"phase": "daemon_config", "missing": ", ".join(missing)},
+            level="warning",
+        )
+    except Exception:
+        pass
+
+
 def _log_crash():
     logging.basicConfig(
         level=logging.INFO,
@@ -167,7 +191,8 @@ def main():
     # creds resolve, an unstripped "scan" would SystemExit(2). Stripping it
     # here keeps the world-readable plist free of secrets AND lets the
     # credentialed sweep run (WEB-4808). No-op when "scan" is absent.
-    if argv and argv[0] == "scan":
+    is_daemon = bool(argv) and argv[0] == "scan"
+    if is_daemon:
         argv = argv[1:]
         sys.argv = [sys.argv[0]] + argv
 
@@ -188,6 +213,8 @@ def main():
             "do and is idling (fail-open). Exiting 0.",
             ", ".join(missing),
         )
+        if is_daemon:
+            _report_daemon_without_creds(missing)
         return 0
 
     # Config is present (from flags/env and/or the persisted config file).

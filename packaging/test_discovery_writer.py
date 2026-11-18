@@ -33,9 +33,8 @@ if str(SRC) not in sys.path:
 from unbound_hook import setup_cmd  # noqa: E402
 
 
-def _opts(discovery_key="disc-key", backend_url="https://backend.example.com"):
-    # _write_discovery_config only reads these two keys.
-    return {"discovery_key": discovery_key, "backend_url": backend_url}
+def _opts(api_key="disc-key", domain="https://backend.example.com"):
+    return (api_key, domain)
 
 
 def _provisioned_cfg_path(tmp_path):
@@ -53,7 +52,7 @@ def test_writes_creds_and_roundtrips(tmp_path, monkeypatch):
     cfg = _provisioned_cfg_path(tmp_path)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_CONFIG_PATH", cfg)
 
-    err = setup_cmd._write_discovery_config(_opts())
+    err = setup_cmd._write_discovery_config(*_opts())
 
     assert err is None, f"expected success, got reason: {err}"
     assert cfg.is_file()
@@ -65,7 +64,7 @@ def test_credential_file_is_0600(tmp_path, monkeypatch):
     cfg = _provisioned_cfg_path(tmp_path)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_CONFIG_PATH", cfg)
 
-    assert setup_cmd._write_discovery_config(_opts()) is None
+    assert setup_cmd._write_discovery_config(*_opts()) is None
 
     mode = stat.S_IMODE(os.stat(cfg).st_mode)
     assert mode == 0o600, f"credential file mode {oct(mode)} != 0600"
@@ -75,7 +74,7 @@ def test_leaf_dir_created_0750_not_world_traversable(tmp_path, monkeypatch):
     cfg = _provisioned_cfg_path(tmp_path)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_CONFIG_PATH", cfg)
 
-    assert setup_cmd._write_discovery_config(_opts()) is None
+    assert setup_cmd._write_discovery_config(*_opts()) is None
 
     mode = stat.S_IMODE(os.stat(cfg.parent).st_mode)
     # The leaf etc dir must not be world-traversable (no o+x); 0750 is the
@@ -94,7 +93,7 @@ def test_missing_grandparent_returns_reason(tmp_path, monkeypatch):
     cfg = tmp_path / "opt" / "unbound" / "etc" / "discovery.json"
     monkeypatch.setattr(setup_cmd, "DISCOVERY_CONFIG_PATH", cfg)
 
-    err = setup_cmd._write_discovery_config(_opts())
+    err = setup_cmd._write_discovery_config(*_opts())
 
     assert isinstance(err, str) and err, "expected a reason string"
     assert not cfg.exists()
@@ -111,7 +110,7 @@ def test_non_writable_parent_returns_reason(tmp_path, monkeypatch):
     monkeypatch.setattr(setup_cmd, "DISCOVERY_CONFIG_PATH", etc / "discovery.json")
 
     try:
-        err = setup_cmd._write_discovery_config(_opts())
+        err = setup_cmd._write_discovery_config(*_opts())
     finally:
         etc.chmod(0o700)  # restore so tmp_path cleanup can proceed
 
