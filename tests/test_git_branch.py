@@ -1,6 +1,7 @@
 """WEB-6034: every hook reports the checked-out branch at the repo root its project came from."""
 
 import json
+import os
 import subprocess
 from unittest.mock import patch
 
@@ -44,7 +45,7 @@ def _resolve(tool, module, path, cache):
     """(project, branch) a hook resolves for a write at `path`."""
     if tool in TOOL_HOOKS:
         return module._repo_for_tool_use("Write", {"file_path": path}, None, cache)[:2]
-    return module._repo_for_paths([str(path).rsplit("/", 1)[0]], cache)
+    return module._repo_for_paths([os.path.dirname(str(path))], cache)
 
 
 @pytest.mark.parametrize("tool", sorted(HOOKS))
