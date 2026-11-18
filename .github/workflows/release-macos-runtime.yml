@@ -441,7 +441,7 @@ jobs:
       - name: Smoke-run both binaries (--version + sample stdin event)
         run: ./packaging/scripts/smoke-test.sh dist
 
-      - name: Build pkg (payload + pre-warm postinstall + LaunchDaemon)
+      - name: Build pkg (payload + pre-warm postinstall)
         env:
           VERSION: ${{ steps.cfg.outputs.version }}
           PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
@@ -518,7 +518,10 @@ jobs:
             fi
           done
           pkgutil --pkg-info ai.getunbound.runtime
-          sudo launchctl print system/ai.getunbound.discovery >/dev/null
+          if sudo launchctl print system/ai.getunbound.discovery >/dev/null 2>&1; then
+            echo "::error::discovery LaunchDaemon still loaded"; exit 1
+          fi
+          [[ ! -f /Library/LaunchDaemons/ai.getunbound.discovery.plist ]]
           [[ -d /var/log/unbound && -f /etc/newsyslog.d/ai.getunbound.conf ]]
           echo "install-test OK"
 

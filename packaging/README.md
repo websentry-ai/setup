@@ -17,8 +17,7 @@ template), WEB-4792 (pkg payload).
 | `specs/unbound-discovery.spec` + `placeholder/unbound_discovery_main.py` | Placeholder discovery for local builds without `UNBOUND_DISCOVERY_SRC`; CI always builds from the checkout (the hook side has no placeholder anymore — it always builds from `binary/`) |
 | `requirements-nuitka-build.txt` + `nuitka/` + `scripts/build-nuitka.sh` + `scripts/lipo-merge.sh` | **Alternative Nuitka builder** (WEB-4804 EDR bake-off, `workflow_dispatch` `builder=nuitka` only — tag releases always use PyInstaller). Nuitka pinned to 2.8.x, the last Apache-2.0 series. `--standalone` only, never `--onefile` (onefile's self-extract-to-temp is the EDR "packer" pattern the bake-off exists to avoid). Nuitka 2.8 cannot emit universal binaries, so the script builds arm64 + x86_64 from the same universal2 CPython and `lipo -create`-merges them; output layout is contract-identical (`dist/<name>/<name>`), so the lipo gate, per-Mach-O signing, smoke test, and pkg stages run unchanged. `unbound-hook` builds the real `binary/src` package — vendored data files and hidden imports are parsed from `binary/unbound-hook.spec` so the two builders cannot drift; `nuitka/unbound_hook_entry.py` is a build-only shim supplying the `sys.frozen`/`sys._MEIPASS` contract PyInstaller's bootloader provides |
 | `scripts/` | Build steps factored out of the workflow so they're shellcheckable and runnable locally |
-| `pkg/postinstall` | Pre-warms both binaries (Gatekeeper first-exec) **before** flipping `current`, bootstraps the LaunchDaemon, sets up `/var/log/unbound` + newsyslog, keep-2 version GC |
-| `pkg/ai.getunbound.discovery.plist` | System LaunchDaemon: local binary, `StartInterval` 43200, `RunAtLoad`, `LowPriorityIO`, `Nice` 10, zero network code fetch |
+| `pkg/postinstall` | Pre-warms both binaries (Gatekeeper first-exec) **before** flipping `current`, removes the discovery LaunchDaemon older versions installed, sets up `/var/log/unbound` + newsyslog, keep-2 version GC |
 | `pkg/newsyslog-ai.getunbound.conf` | Log rotation for `/var/log/unbound/*.log` |
 
 The rendered `onboard.sh` (from `../mdm/onboard.sh.tmpl`) is the Jamf
@@ -52,7 +51,6 @@ to share a slot.
 /opt/unbound/<version>/{unbound-hook/,unbound-discovery/,share/}
 /opt/unbound/current -> /opt/unbound/<version>     (flipped by postinstall AFTER pre-warm)
 /opt/unbound/etc/                                  (config; written by onboard, never by the pkg)
-/Library/LaunchDaemons/ai.getunbound.discovery.plist
 /var/log/unbound/                                  (+ /etc/newsyslog.d/ai.getunbound.conf)
 ```
 
