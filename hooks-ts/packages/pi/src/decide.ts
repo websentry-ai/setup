@@ -33,6 +33,7 @@ import {
   capCommand,
   resolveFilePath,
 } from "../../core/src/payload.ts";
+import { detectShell } from "../../core/src/shell.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
 import type { McpCallInfo } from "../../core/src/types.ts";
 import type { PolicyOutcome } from "../../core/src/verdict.ts";
@@ -270,6 +271,7 @@ export async function decideToolCall(
       command,
       toolUseId: event.toolCallId,
       toolInput,
+      shell: detectShell(event.toolName),
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,

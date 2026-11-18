@@ -47,6 +47,7 @@ import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./con
 import type { AccountIdentity } from "./accountIdentity.ts";
 import { capCommand, withAccountIdentity } from "./payload.ts";
 import type { TurnRecord } from "./turn.ts";
+import { detectShell } from "./shell.ts";
 
 /**
  * `{}` for a call with no result; otherwise the hash pair (or the honest statement that the output was
@@ -80,6 +81,9 @@ export interface TurnLogToolUse {
   ts?: string;
   /** Where a shell call sent to or fetched from, resolved locally as hosts and address kinds only; absent when none. */
   transfer?: Transfer;
+  /** The shell a shell tool's call ran in and how the hook knows; absent for any other tool. */
+  shell?: string;
+  shell_source?: string;
 }
 
 export interface TurnLogMessage {
@@ -332,6 +336,7 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
       if (ts !== undefined) entry.ts = ts;
       const transfer = toolUseId === "" ? undefined : opts?.transfers?.get(toolUseId);
       if (transfer !== undefined) entry.transfer = transfer;
+      Object.assign(entry, detectShell(entry.tool_name));
       return entry;
     });
   } catch {

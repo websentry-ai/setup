@@ -302,7 +302,7 @@ def run_copilot(sandbox, env, command=COMMAND):
     fire('copilot', {**base, 'hook_event_name': 'Stop', 'stop_hook_active': False}, env, project)
 
 
-def run_codex(sandbox, env, command=COMMAND):
+def run_codex(sandbox, env, command=COMMAND, extra_arguments=None):
     session, project = str(uuid.uuid4()), str(sandbox['project'])
     rollout = sandbox['home'] / '.codex' / 'sessions' / '2026' / '10' / '28' / ('rollout-%s.jsonl' % session)
     base = {'session_id': session, 'transcript_path': str(rollout), 'cwd': project, 'model': 'gpt-5-codex',
@@ -323,7 +323,7 @@ def run_codex(sandbox, env, command=COMMAND):
                 'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': prompt}]}},
             {'timestamp': stamp(2), 'type': 'response_item', 'payload': {
                 'type': 'function_call', 'name': 'exec_command', 'call_id': 'call_e2e',
-                'arguments': json.dumps({'cmd': command, 'workdir': project})}},
+                'arguments': json.dumps({'cmd': command, 'workdir': project, **(extra_arguments or {})})}},
             {'timestamp': stamp(3), 'type': 'response_item', 'payload': {
                 'type': 'function_call_output', 'call_id': 'call_e2e', 'output': output}},
             {'timestamp': stamp(4), 'type': 'response_item', 'payload': {
@@ -441,3 +441,104 @@ def test_claude_never_sends_what_curlrc_holds(sandbox, gateway):
     assert len(calls) == 1, json.dumps(tool_entries(body), indent=2)
     assert 'transfer' not in calls[0], json.dumps(calls[0], indent=2)
     assert_private(gateway, 'hunter2', base64.b64encode(b'admin:hunter2').decode())
+
+
+# --- The shell each hook names for the command, on the policy check and the turn log -----------------------------
+
+
+def _login_shell():
+    import pwd
+    name = os.path.basename(pwd.getpwuid(os.getuid()).pw_shell or '').lower()
+    return name if name in ('bash', 'zsh', 'sh', 'fish', 'dash', 'ksh') else 'zsh'
+
+
+def _codex_shell():
+    """Codex runs a login shell it supports, else zsh on macOS and bash elsewhere."""
+    import pwd
+    name = os.path.basename(pwd.getpwuid(os.getuid()).pw_shell or '').lower()
+    return name if name in ('bash', 'zsh', 'sh') else 'zsh' if sys.platform == 'darwin' else 'bash'
+
+
+# On macOS and Linux, with SHELL=/bin/zsh: (shell, how the hook knows) for each agent's shell tool.
+EXPECTED_SHELL = {
+    'claude-code': ('zsh', 'tool'),          # Claude Code's Bash tool runs the user's bash or zsh.
+    'cursor': ('zsh', 'agent_rule'),         # Cursor runs $SHELL.
+    'copilot': ('bash', 'tool'),             # Copilot CLI's lowercase `bash` tool.
+    'codex': (None, 'agent_rule'),           # Codex runs the account's login shell if it supports it; below.
+    'augment': ('zsh', 'agent_rule'),        # Auggie runs $SHELL when it is bash, zsh, fish or sh.
+    'pi': ('bash', 'tool'),                  # Pi's bash tool runs bash.
+}
+
+
+def shell_env(sandbox, gateway):
+    return {**hook_env(sandbox, gateway), 'SHELL': '/bin/zsh'}
+
+
+def shell_of(entry):
+    return entry.get('shell'), entry.get('shell_source')
+
+
+@pytest.mark.parametrize('tool', sorted(RUNS))
+def test_the_real_hook_names_the_shell_on_the_policy_check_and_the_turn_log(tool, sandbox, gateway):
+    expected = EXPECTED_SHELL[tool]
+    if tool == 'codex':
+        expected = (_codex_shell(), 'agent_rule')
+    RUNS[tool](sandbox, shell_env(sandbox, gateway))
+
+    calls = [entry for entry in tool_entries(turn_log(gateway, tool)) if command_of(entry) == COMMAND]
+    assert len(calls) == 1, json.dumps(calls, indent=2)
+    assert shell_of(calls[0]) == expected, json.dumps(calls[0], indent=2)
+    checks = [r['body'] for r in gateway.requests if 'pretool' in r['path'] and isinstance(r['body'], dict)
+              and (r['body'].get('pre_tool_use_data') or {}).get('command') == COMMAND]
+    assert checks, 'no policy check for the command: %s' % sorted({r['path'] for r in gateway.requests})
+    for body in checks:
+        assert shell_of(body['pre_tool_use_data']) == expected, json.dumps(body['pre_tool_use_data'], indent=2)
+
+
+def _vscode_user_settings(home):
+    if sys.platform == 'darwin':
+        return home / 'Library' / 'Application Support' / 'Code' / 'User' / 'settings.json'
+    return home / '.config' / 'Code' / 'User' / 'settings.json'
+
+
+def test_copilot_in_vs_code_names_the_terminal_profile_copilot_runs_in(sandbox, gateway):
+    # VS Code writes settings with comments and trailing commas; Copilot's own terminal profile wins over the default.
+    key = 'osx' if sys.platform == 'darwin' else 'linux'
+    settings = _vscode_user_settings(sandbox['home'])
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{\n  // the agent\'s terminal\n  "chat.tools.terminal.terminalProfile.%s": {"path": "/bin/bash"},\n'
+                        '  "terminal.integrated.defaultProfile.%s": "zsh",\n}\n' % (key, key))
+    env, project = shell_env(sandbox, gateway), str(sandbox['project'])
+    event = {'session_id': str(uuid.uuid4()), 'cwd': project, 'hook_event_name': 'PreToolUse',
+             'tool_name': 'run_in_terminal', 'tool_input': {'command': COMMAND, 'explanation': 'copy', 'goal': 'copy'}}
+    fire('copilot', event, env, project)
+
+    checks = [r['body']['pre_tool_use_data'] for r in gateway.requests if 'pretool' in r['path']]
+    assert checks and all(shell_of(c) == ('bash', 'agent_rule') for c in checks), json.dumps(checks, indent=2)
+
+
+def test_augment_names_the_shell_its_settings_pick(sandbox, gateway):
+    (sandbox['home'] / '.augment').mkdir()
+    (sandbox['home'] / '.augment' / 'settings.json').write_text(json.dumps({'shellPath': '/usr/local/bin/fish'}))
+    run_augment(sandbox, shell_env(sandbox, gateway))
+
+    calls = [entry for entry in tool_entries(turn_log(gateway, 'augment')) if command_of(entry) == COMMAND]
+    assert [shell_of(c) for c in calls] == [('fish', 'agent_rule')], json.dumps(calls, indent=2)
+
+
+def test_cursor_names_no_shell_when_shell_is_one_the_hook_does_not_know(sandbox, gateway):
+    # Cursor runs $SHELL, so an unknown one is sent as nothing; the call is still checked and logged.
+    run_cursor(sandbox, {**hook_env(sandbox, gateway), 'SHELL': '/opt/bin/nu'})
+
+    calls = [entry for entry in tool_entries(turn_log(gateway, 'cursor')) if command_of(entry) == COMMAND]
+    assert [shell_of(c) for c in calls] == [(None, None)], json.dumps(calls, indent=2)
+    checks = [r['body']['pre_tool_use_data'] for r in gateway.requests if 'pretool' in r['path']
+              and (r['body'].get('pre_tool_use_data') or {}).get('command') == COMMAND]
+    assert checks and all(shell_of(c) == (None, None) for c in checks), json.dumps(checks, indent=2)
+
+
+def test_codex_names_the_shell_the_model_picked_for_a_call(sandbox, gateway):
+    run_codex(sandbox, shell_env(sandbox, gateway), extra_arguments={'shell': '/bin/bash'})
+
+    calls = [entry for entry in tool_entries(turn_log(gateway, 'codex')) if command_of(entry) == COMMAND]
+    assert [shell_of(c) for c in calls] == [('bash', 'tool')], json.dumps(calls, indent=2)
