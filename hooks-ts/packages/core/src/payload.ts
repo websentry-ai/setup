@@ -521,6 +521,10 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   if (typeof input.toolUseId === "string" && input.toolUseId.length > 0) {
     preToolUseData.tool_use_id = input.toolUseId;
   }
+  if (mcp === undefined && typeof input.shell?.shell === "string") {
+    preToolUseData.shell = input.shell.shell;
+    if (typeof input.shell.shell_source === "string") preToolUseData.shell_source = input.shell.shell_source;
+  }
 
   const body: PretoolRequestBody = {
     conversation_id: input.sessionId,
