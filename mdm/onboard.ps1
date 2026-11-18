@@ -116,8 +116,10 @@ function Get-DeviceSerial {
         # Fall through to the next identifier
     }
     try {
-        $guid = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name MachineGuid -ErrorAction Stop).MachineGuid
-        if (-not [string]::IsNullOrWhiteSpace($guid)) { return $guid.Trim() }
+        # The 64-bit view, so a 32-bit PowerShell host reads the value 64-bit Python reads.
+        $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+        $guid = $hklm.OpenSubKey('SOFTWARE\Microsoft\Cryptography').GetValue('MachineGuid')
+        if (-not [string]::IsNullOrWhiteSpace($guid)) { return ([string]$guid).Trim() }
     } catch {
         # Fall through to the next identifier
     }

@@ -39,6 +39,7 @@ sys.exit(int(os.environ.get("STUB_EXIT", "0")))
 """
 
 RUNNER = r"""
+{prelude}
 {no_python}
 function Invoke-WebRequest {{
     [CmdletBinding()]
@@ -53,7 +54,18 @@ function Invoke-WebRequest {{
     Microsoft.PowerShell.Utility\Invoke-WebRequest @PSBoundParameters
 }}
 & '{script}' {args}
+{after}
 exit $LASTEXITCODE
+"""
+
+# The entry point before the report was added, to compare how a failure reaches callers.
+REPORTING_ENTRY_POINT = """try {
+    $exitCode = Main
+} catch {
+    Send-InstallReport -Step $script:CurrentStep -ExitCode $script:FailureExitCode
+    throw
+}
+Send-InstallReport -Step $script:CurrentStep -ExitCode $exitCode
 """
 
 NO_PYTHON = "\n".join(f"function {name} {{ throw 'not installed' }}" for name in ("py", "python3", "python"))
@@ -103,15 +115,19 @@ def backend():
     server.close()
 
 
-def _run(tmp_path, backend_url, args=None, no_python=False, **env):
+def _run(tmp_path, backend_url, args=None, no_python=False, prelude="", after="", source=None, **env):
     script = tmp_path / "onboard.ps1"
-    shutil.copy(str(REPO / "mdm" / "onboard.ps1"), str(script))
+    if source is None:
+        shutil.copy(str(REPO / "mdm" / "onboard.ps1"), str(script))
+    else:
+        script.write_text(source)
     child = tmp_path / "stub_child.py"
     child.write_text(STUB_CHILD)
     if args is None:
         args = f"-ApiKey '{API_KEY}' -BackendUrl '{backend_url}'"
     runner = tmp_path / "runner.ps1"
-    runner.write_text(RUNNER.format(script=script, args=args, no_python=NO_PYTHON if no_python else ""))
+    runner.write_text(RUNNER.format(script=script, args=args, prelude=prelude, after=after,
+                                    no_python=NO_PYTHON if no_python else ""))
     return subprocess.run(
         ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(runner)],
         capture_output=True, text=True, timeout=180,
@@ -162,6 +178,24 @@ def test_download_failure_is_reported_and_still_fails_the_run(tmp_path, backend)
     result = _run(tmp_path, backend.url, STUB_DOWNLOAD_FAILS="1")
     assert result.returncode == 1
     assert [(r["step"], r["exit_code"]) for r in backend.reports] == [("download_onboard_py", 1)]
+
+
+@windows_only
+def test_failure_reaches_a_lenient_caller_exactly_as_it_did_before_the_report(tmp_path, backend):
+    """Intune wrappers read $LASTEXITCODE after the call, so reporting and rethrowing must
+    not make a failure more or less fatal to a caller running under Continue."""
+    source = (REPO / "mdm" / "onboard.ps1").read_text()
+    assert REPORTING_ENTRY_POINT in source
+    before = source.replace(REPORTING_ENTRY_POINT, "$exitCode = Main\n")
+    lenient = {"prelude": "$ErrorActionPreference = 'Continue'", "after": "Write-Output 'CALLER-CONTINUED'"}
+
+    (tmp_path / "before").mkdir()
+    (tmp_path / "after").mkdir()
+    old = _run(tmp_path / "before", backend.url, source=before, STUB_DOWNLOAD_FAILS="1", **lenient)
+    new = _run(tmp_path / "after", backend.url, STUB_DOWNLOAD_FAILS="1", **lenient)
+
+    assert new.returncode == old.returncode
+    assert ("CALLER-CONTINUED" in new.stdout) == ("CALLER-CONTINUED" in old.stdout)
 
 
 @windows_only
