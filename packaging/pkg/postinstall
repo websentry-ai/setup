@@ -3,7 +3,7 @@
 # packaging/scripts/build-pkg.sh at pkg-assembly time.
 #
 # Ordering is the whole point of this script:
-#   pre-warm BOTH binaries --> flip `current` symlink --> (re)bootstrap daemon
+#   pre-warm BOTH binaries --> flip `current` symlink --> remove old daemon
 #
 # Gatekeeper's first-exec assessment of a freshly installed (new-inode)
 # notarized binary measured at 3-5s (Defect 2). Pre-warming runs it during
@@ -63,14 +63,10 @@ install -d -o root -g wheel -m 0755 /var/log/unbound
 install -o root -g wheel -m 0644 \
   "$NEW/share/newsyslog-ai.getunbound.conf" /etc/newsyslog.d/ai.getunbound.conf
 
-# --- 4. (Re)load the discovery LaunchDaemon ---------------------------------
-# bootout is idempotent-ish but errors when the job isn't loaded; that's the
-# normal first-install case, so ignore it. bootstrap failing is NOT ignored:
-# a pkg that can't start its daemon should fail visibly in Jamf.
+# --- 4. Remove the discovery LaunchDaemon older versions installed ----------
+# Jamf runs and SessionStart hooks do the scanning; the 12h daemon never had credentials.
 launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
-launchctl bootstrap system "$DAEMON_PLIST"
-launchctl enable "system/$DAEMON_LABEL"
-log "daemon $DAEMON_LABEL bootstrapped"
+rm -f "$DAEMON_PLIST"
 
 # --- 5. Keep-2 GC: live version + newest other survive (rollback headroom) --
 # Keep exactly two dirs: the one `current` points at (always the version
