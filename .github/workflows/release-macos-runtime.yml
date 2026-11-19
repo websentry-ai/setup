@@ -489,7 +489,7 @@ jobs:
           spctl -a -vv -t install "out/$PKG_NAME"
 
       # Live install on the runner: exercises the postinstall (pre-warm ->
-      # symlink flip -> daemon bootstrap -> GC) and then the rendered
+      # symlink flip -> old daemon removal -> GC) and then the rendered
       # onboard.sh --clear fallback teardown, end to end.
       - name: Install-test pkg on runner
         env:
@@ -498,6 +498,19 @@ jobs:
           PUBLISH: ${{ steps.cfg.outputs.publish }}
         run: |
           set -euo pipefail
+          # Load a no-op stand-in for the old daemon so the upgrade removal path actually runs.
+          old_plist=/Library/LaunchDaemons/ai.getunbound.discovery.plist
+          sudo tee "$old_plist" >/dev/null <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>Label</key><string>ai.getunbound.discovery</string>
+            <key>ProgramArguments</key><array><string>/usr/bin/true</string></array>
+            <key>StartInterval</key><integer>43200</integer>
+          </dict></plist>
+          EOF
+          sudo launchctl bootstrap system "$old_plist"
+          sudo launchctl print system/ai.getunbound.discovery >/dev/null
           sudo installer -pkg "out/$PKG_NAME" -target /
           [[ "$(readlink /opt/unbound/current)" == "/opt/unbound/$VERSION" ]]
           # Version assert: a published binary must self-identify as the
