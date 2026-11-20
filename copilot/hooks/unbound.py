@@ -1872,14 +1872,6 @@ def _get_device_serial() -> Optional[str]:
                     return out.stdout.strip()
             except Exception:
                 pass
-            try:
-                out = subprocess.run(['powershell', '-NoProfile', '-Command',
-                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
-                                     capture_output=True, text=True, timeout=10)
-                if out.returncode == 0 and _valid_serial(out.stdout):
-                    return out.stdout.strip()
-            except Exception:
-                pass
     except Exception:
         pass
     return None
@@ -1894,7 +1886,9 @@ def _device_serial(probe: bool = True) -> Optional[str]:
         if isinstance(loaded, dict):
             data = loaded
             cached = data.get('device_serial')
-            if isinstance(cached, str) and cached.strip():
+            # Windows caches written before BIOS-only probing may hold a MachineGuid; re-probe once.
+            if isinstance(cached, str) and cached.strip() and (
+                    data.get('serial_source') == 'bios' or platform.system() != 'Windows'):
                 return cached.strip()
     except Exception:
         data = {}
@@ -1907,6 +1901,7 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     if serial:
         try:
             data['device_serial'] = serial
+            data['serial_source'] = 'bios'
             IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
             tmp.write_text(json.dumps(data), encoding='utf-8')
