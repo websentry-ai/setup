@@ -25,8 +25,19 @@ function Invoke-WebRequest {
         [string]$OutFile,
         [int]$TimeoutSec,
         [switch]$UseBasicParsing,
+        [string]$Method,
+        [hashtable]$Headers,
+        [string]$ContentType,
+        $Body,
+        [int]$MaximumRedirection,
         [Parameter(ValueFromRemainingArguments = $true)]$Extra
     )
+    if ($Method -eq 'Post') {
+        # onboard.ps1's install report: keep the body so the battery can read it.
+        [System.IO.File]::WriteAllBytes($env:UNBOUND_TEST_REPORT_FILE, [byte[]]$Body)
+        if ($env:UNBOUND_TEST_REPORT_FAILS -eq '1') { throw 'install-report endpoint unavailable' }
+        return [pscustomobject]@{ StatusCode = 201 }
+    }
     if ($OutFile) {
         # The Intune/Task wrapper's installer download: hand back the real head onboard.ps1.
         Copy-Item -LiteralPath $env:UNBOUND_TEST_ONBOARD_PS1 -Destination $OutFile -Force
@@ -60,13 +71,15 @@ function Invoke-OnboardRun {
         parent  - run the synthesized pre-change artifact (T6)
         intune  - run through the documented Intune remediation wrapper (T7)
         task    - run through the documented Scheduled Task runner (T8)
-      Returns ProcExit (the real process exit code), captured Stdout/Stderr, and
-      whether the wrapper's last-success.txt marker was written.
+      Returns ProcExit (the real process exit code), captured Stdout/Stderr, whether
+      the wrapper's last-success.txt marker was written, and the install report sent.
+      -ReportFails makes the install-report POST throw.
     #>
     param(
         [ValidateSet('direct', 'parent', 'intune', 'task')][string]$Mode = 'direct',
         [int]$ChildExit = 0,
-        [int]$StdoutLines = 5
+        [int]$StdoutLines = 5,
+        [switch]$ReportFails
     )
 
     $work = Join-Path $env:TEMP ("unbound-onboard-test-" + [guid]::NewGuid().ToString('N'))
@@ -136,6 +149,9 @@ exit `$code
     $env:UNBOUND_TEST_CHILD_EXIT   = "$ChildExit"
     $env:UNBOUND_TEST_STDOUT_LINES = "$StdoutLines"
     $env:UNBOUND_TEST_BASEDIR      = $work
+    $reportFile = Join-Path $work 'install-report.json'
+    $env:UNBOUND_TEST_REPORT_FILE  = $reportFile
+    $env:UNBOUND_TEST_REPORT_FAILS = if ($ReportFails) { '1' } else { '0' }
 
     # Start-Process joins -ArgumentList with spaces and adds no quoting, so the
     # runner path must be quoted itself or a $env:TEMP under "C:\Users\First Last"
@@ -153,6 +169,7 @@ exit `$code
         Stdout        = (Get-Content -Raw -LiteralPath $out -ErrorAction SilentlyContinue)
         Stderr        = (Get-Content -Raw -LiteralPath $err -ErrorAction SilentlyContinue)
         MarkerWritten = (Test-Path (Join-Path $work 'last-success.txt'))
+        Report        = if (Test-Path $reportFile) { Get-Content -Raw -LiteralPath $reportFile | ConvertFrom-Json } else { $null }
         Work          = $work
     }
 }

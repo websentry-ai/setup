@@ -29,7 +29,7 @@ failing child while the fixed wrapper returns the child's real code.
 From an elevated PowerShell, in this repo checked out at the PR head:
 
 ```powershell
-# Main battery: T1-T5, T7 (Intune), T8 (Scheduled Task), T9 (stress)
+# Main battery: T1-T5, T7 (Intune), T8 (Scheduled Task), T9 (stress), T10 (install report)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\mdm\test\Invoke-OnboardTests.ps1
 
 # Proven-to-fail: T6 (parent masks failure, head reports it)
@@ -61,8 +61,12 @@ assertion fails.
 | T7 | Intune remediation wrapper | exit 0 / 1 | success -> exit 0 + marker; failure -> **exit 1** and no `last-success.txt` |
 | T8 | Scheduled Task runner | exit 0 / 1 | success -> exit 0 + marker; failure -> **exit 1** and no `last-success.txt` |
 | T9 | direct | exit 0 and 42, 5000 stdout lines | exit == child code; the failing leg uses a distinctive **42**, not 1, so a masking regression's own generic 1 cannot be mistaken for a pass |
+| T10 | direct | exit 0 and 42 | the install report carries `step=setup` and the child's exit code; a report that fails leaves the process exit unchanged |
 
-T10 lives in `unbound-integration-tests`
+The end-to-end install report cases, against a real local HTTP server, are in
+`tests/test_mdm_onboard_install_report.py`.
+
+The `unbound-integration-tests` repo also covers this script
 (`tests/connect/discovery/test_discovery_key_backcompat_e2e.py`): the existing
 Windows `onboard.ps1` tests are repointed from `refs/heads/main` to this PR's
 commit so the UIT Windows job exercises the PR artifact. Run it there, not here.
