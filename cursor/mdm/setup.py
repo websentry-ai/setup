@@ -196,41 +196,31 @@ def get_mac_serial_number() -> str:
         return None
 
 
-def get_windows_device_identifier() -> str:
-    """Get a stable device identifier on Windows.
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
+    'na', 'n/a', 'unknown', 'default', 'default string',
+    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
+    'system serial number', 'serial number', 'chassis serial number',
+    'system manufacturer', 'not applicable', 'not specified',
+    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
+    'xxxxxxxxxxxxxx',
+}
 
-    Tries BIOS serial, then registry MachineGuid, then hostname.
-    """
-    import socket
+
+def get_windows_device_identifier() -> str:
+    """Windows BIOS serial only; None if unreadable or a placeholder value."""
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
              "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
-            capture_output=True,
-            text=True,
-            timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
-        if result.returncode == 0:
-            serial = result.stdout.strip()
-            if serial:
-                return serial
+        serial = result.stdout.strip() if result.returncode == 0 else ""
+        if serial and serial.lower() not in _PLACEHOLDER_SERIALS:
+            return serial
     except Exception:
-        debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
-
-    try:
-        import winreg
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                            r"SOFTWARE\Microsoft\Cryptography") as key:
-            value, _ = winreg.QueryValueEx(key, "MachineGuid")
-            if value:
-                return str(value).strip()
-    except Exception:
-        debug_print("MachineGuid registry read failed, falling back to hostname")
-
-    try:
-        return socket.gethostname()
-    except Exception:
-        return None
+        pass
+    return None
 
 
 def get_linux_device_identifier() -> str:

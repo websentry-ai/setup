@@ -210,6 +210,17 @@ def check_admin_privileges() -> bool:
         return False
 
 
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
+    'na', 'n/a', 'unknown', 'default', 'default string',
+    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
+    'system serial number', 'serial number', 'chassis serial number',
+    'system manufacturer', 'not applicable', 'not specified',
+    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
+    'xxxxxxxxxxxxxx',
+}
+
+
 def get_device_identifier() -> Optional[str]:
     system = platform.system().lower()
     try:
@@ -278,32 +289,14 @@ def get_device_identifier() -> Optional[str]:
                 result = subprocess.run(
                     ["powershell", "-NoProfile", "-Command",
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
+                    capture_output=True, text=True, timeout=10,
                 )
-                if result.returncode == 0:
-                    serial = result.stdout.strip()
-                    if serial:
-                        return serial
+                serial = result.stdout.strip() if result.returncode == 0 else ""
+                if serial and serial.lower() not in _PLACEHOLDER_SERIALS:
+                    return serial
             except Exception:
-                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
-
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                    r"SOFTWARE\Microsoft\Cryptography") as key:
-                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
-                    if value:
-                        return str(value).strip()
-            except Exception:
-                debug_print("MachineGuid registry read failed, falling back to hostname")
-
-            try:
-                import socket
-                return socket.gethostname()
-            except Exception:
-                return None
+                pass
+            return None
 
     except Exception as e:
         debug_print(f"Failed to get device identifier: {e}")

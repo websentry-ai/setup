@@ -1822,11 +1822,13 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
 
 
 _PLACEHOLDER_SERIALS = {
-    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
-    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
-    'to be filled by oem', 'system serial number', 'serial number',
-    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
-    'invalid', '123456789', 'xxxxxxxx',
+    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
+    'na', 'n/a', 'unknown', 'default', 'default string',
+    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
+    'system serial number', 'serial number', 'chassis serial number',
+    'system manufacturer', 'not applicable', 'not specified',
+    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
+    'xxxxxxxxxxxxxx',
 }
 
 
@@ -1867,14 +1869,6 @@ def _get_device_serial() -> Optional[str]:
             try:
                 out = subprocess.run(['powershell', '-NoProfile', '-Command',
                                       '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
-                                     capture_output=True, text=True, timeout=10)
-                if out.returncode == 0 and _valid_serial(out.stdout):
-                    return out.stdout.strip()
-            except Exception:
-                pass
-            try:
-                out = subprocess.run(['powershell', '-NoProfile', '-Command',
-                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
                                      capture_output=True, text=True, timeout=10)
                 if out.returncode == 0 and _valid_serial(out.stdout):
                     return out.stdout.strip()
