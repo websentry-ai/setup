@@ -277,6 +277,17 @@ def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -
         print(f"[Discovery] [{host}] discovery not reaped within 10s of SIGKILL.", file=sys.stderr)
 
 
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
+    'na', 'n/a', 'unknown', 'default', 'default string',
+    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
+    'system serial number', 'serial number', 'chassis serial number',
+    'system manufacturer', 'not applicable', 'not specified',
+    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
+    'xxxxxxxxxxxxxx',
+}
+
+
 def get_device_identifier():
     """Hardware serial, resolved exactly as the per-tool MDM scripts resolve it
     (claude-code/hooks/mdm/setup.py). Steps 1-5 enroll the device under this
@@ -336,24 +347,13 @@ def get_device_identifier():
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True, text=True, timeout=10,
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
+                serial = result.stdout.strip() if result.returncode == 0 else ""
+                if serial and serial.lower() not in _PLACEHOLDER_SERIALS:
+                    return serial
             except Exception:
                 pass
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                    r"SOFTWARE\Microsoft\Cryptography") as key:
-                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
-                    if value:
-                        return str(value).strip()
-            except Exception:
-                pass
-            try:
-                import socket
-                return socket.gethostname()
-            except Exception:
-                return None
+            return None
+
     except Exception as e:
         print(f"[Discovery] device identifier probe failed: {e}", file=sys.stderr)
         return None
