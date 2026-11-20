@@ -1242,13 +1242,11 @@ def _remember_account(email, plan, org_id=None):
 # shared sentinel string (with a zero exit code), which would map many machines
 # onto one fake serial. Treat these as "no serial" and fall through.
 _PLACEHOLDER_SERIALS = {
-    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
-    'na', 'n/a', 'unknown', 'default', 'default string',
-    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
-    'system serial number', 'serial number', 'chassis serial number',
-    'system manufacturer', 'not applicable', 'not specified',
-    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
-    'xxxxxxxxxxxxxx',
+    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
+    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+    'to be filled by oem', 'system serial number', 'serial number',
+    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
+    'invalid', '123456789', 'xxxxxxxx',
 }
 
 
@@ -1314,7 +1312,9 @@ def _device_serial(probe=True):
         if isinstance(loaded, dict):
             data = loaded
             cached = data.get('device_serial')
-            if isinstance(cached, str) and cached.strip():
+            # Windows caches written before BIOS-only probing may hold a MachineGuid; re-probe once.
+            if isinstance(cached, str) and cached.strip() and (
+                    data.get('serial_source') == 'bios' or platform.system() != 'Windows'):
                 return cached.strip()
     except Exception:
         data = {}
@@ -1327,6 +1327,7 @@ def _device_serial(probe=True):
     if serial:
         try:
             data['device_serial'] = serial
+            data['serial_source'] = 'bios'
             IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
             tmp.write_text(json.dumps(data), encoding='utf-8')
