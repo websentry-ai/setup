@@ -86,7 +86,9 @@ the python path, by design:
   that prints `Scan skipped: <reason>` is `skipped`. The run itself posts
   `phase: start` first and `phase: end` last to the MDM install report.
   Each tool's adapter also forwards its hook's `error.log` entries newer than
-  the last forwarded one to the gateway's `/v1/hooks/errors` (ten a request),
+  the last forwarded one to the gateway's `/v1/hooks/errors` (ten a request,
+  at most the newest 25 per tool and home, none older than seven days, with
+  `category: forwarded_error_log`),
   recording the newest accepted timestamp in `.error_log_forwarded` beside the
   log; a failed request saves nothing and ends forwarding for the run.
 - **`detect_install_state`** is adapted: the python version checked for the

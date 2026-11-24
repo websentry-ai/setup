@@ -30,7 +30,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
@@ -281,6 +281,12 @@ _HOOK_ERROR_LOGS = {
 # Beside each error.log: the timestamp of the newest entry the gateway accepted.
 FORWARDED_STATE_NAME = ".error_log_forwarded"
 HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
+# error.log is the user's to write: per tool and home, a run sends at most the newest 25 (what a hook keeps)
+# and nothing older than a week, so a flooded or first-seen log costs at most three requests.
+HOOK_ERRORS_PER_RUN = 25
+HOOK_ERROR_MAX_AGE = timedelta(days=7)
+# Sentry groups by category: forwarded entries group together, apart from the hook's live reports.
+FORWARDED_ERROR_CATEGORY = "forwarded_error_log"
 _HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
 
 
@@ -294,19 +300,24 @@ def _log_time(text):
 
 
 def _unsent_hook_errors(log: Path) -> list:
-    """Runs as the profile's user: the log's entries newer than the last one forwarded, oldest first."""
+    """Runs as the profile's user: the newest HOOK_ERRORS_PER_RUN entries newer than both the last one
+    forwarded and HOOK_ERROR_MAX_AGE, oldest first."""
+    floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
     try:
         last = _log_time(_read_user_file(log.with_name(FORWARDED_STATE_NAME), follow=False).decode().strip())
     except (OSError, UnicodeDecodeError):
         last = None
+    if last is not None and last > floor:
+        floor = last
     entries = []
     for line in _read_user_file(log, follow=False).decode("utf-8", "replace").splitlines():
         match = _HOOK_ERROR_LINE.match(line)
         when = _log_time(match.group(1)) if match else None
-        if when and (last is None or when > last):
-            entries.append((when, {"timestamp": match.group(1), "message": match.group(2)[:2000]}))
+        if when and when > floor:
+            entries.append((when, {"timestamp": match.group(1), "message": match.group(2)[:2000],
+                                   "category": FORWARDED_ERROR_CATEGORY}))
     entries.sort(key=lambda entry: entry[0])
-    return [entry for _, entry in entries]
+    return [entry for _, entry in entries[-HOOK_ERRORS_PER_RUN:]]
 
 
 def _save_forwarded(log: Path, timestamp: str) -> bool:

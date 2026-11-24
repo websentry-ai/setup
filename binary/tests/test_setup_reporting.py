@@ -8,6 +8,7 @@ primitives are stubbed by the `env` fixture, as in test_setup_migration.
 import json
 import re
 import threading
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -288,8 +289,17 @@ def _log(home, tool, lines):
     return path
 
 
-def _utc(n):
-    return "2026-11-21T16:%02d:%02d.000123Z" % (n // 60, n % 60)
+# Entries are stamped an hour before the test run, so the seven-day limit never ages them out.
+BASE = datetime.now(timezone.utc).replace(microsecond=123) - timedelta(hours=1)
+
+
+def _utc(n, days_ago=0):
+    return (BASE + timedelta(seconds=n) - timedelta(days=days_ago)).isoformat().replace("+00:00", "Z")
+
+
+def _pacific(n):
+    """How Cursor's and Copilot's hooks stamp: local time with its offset."""
+    return (BASE + timedelta(seconds=n)).astimezone(timezone(timedelta(hours=-8))).isoformat()
 
 
 def _forwarded(backend):
@@ -345,8 +355,8 @@ def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, 
     for m in env["modules"].values():
         monkeypatch.setattr(m, "get_all_user_homes", lambda: [("alice", env["home"]), ("bob", other)])
     # Cursor's and Copilot's hooks stamp local time with its offset.
-    _log(env["home"], "cursor", ["2026-11-21T08:40:11.000001-08:00: cursor broke"])
-    _log(env["home"], "copilot", ["2026-11-21T08:41:11.000001-08:00: copilot broke"])
+    _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke"])
+    _log(env["home"], "copilot", [f"{_pacific(1)}: copilot broke"])
     _log(env["home"], "codex", [f"{_utc(1)}: codex broke"])
     _log(other, "claude-code", [f"{_utc(2)}: bob's claude broke"])
     _log(other, "augment", [f"{_utc(3)}: auggie broke"])
@@ -354,7 +364,7 @@ def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, 
     sent = {r["body"]["hook_source"]: [e["message"] for e in r["body"]["errors"]] for r in _forwarded(backend)}
     assert sent == {"cursor": ["cursor broke"], "copilot": ["copilot broke"], "codex": ["codex broke"],
                     "claude-code": ["bob's claude broke"], "augment_code": ["auggie broke"]}
-    assert (env["home"] / ".copilot/hooks" / STATE).read_text() == "2026-11-21T08:41:11.000001-08:00"
+    assert (env["home"] / ".copilot/hooks" / STATE).read_text() == _pacific(1)
     assert (other / ".claude/hooks" / STATE).exists() and not (env["home"] / ".claude/hooks" / STATE).exists()
     # Cursor's setup removes the python-era ~/.cursor/hooks, log and all, after its errors went out.
     assert not (env["home"] / ".cursor/hooks").exists()
@@ -409,3 +419,38 @@ def test_preflight_checks_that_raise_cost_only_the_warnings(env, backend, monkey
     assert _run(backend) == 0
     _installs_everything(env)
     assert _run_reports(backend)[-1]["body"]["preflight_warnings"] == []
+
+
+# --- F7: a per-run cap and an age limit on forwarded errors ------------------------
+
+def _messages(backend):
+    return [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]]
+
+
+def test_a_huge_log_sends_only_its_25_newest_entries(env, backend):
+    # About 4 MB in 40,000 lines, just under the read cap: the gateway must not get 4,000 requests.
+    lines = [f"{_utc(n / 100)}: flood {n} " + "x" * 50 for n in range(40000)]
+    log = _log(env["home"], "claude-code", lines)
+    assert 3.5e6 < log.stat().st_size < 4 * 1024 * 1024
+    _run(backend)
+    assert len(_forwarded(backend)) <= 3
+    assert [m.split()[1] for m in _messages(backend)] == [str(n) for n in range(39975, 40000)]
+    assert log.with_name(STATE).read_text() == _utc(39999 / 100)
+
+
+def test_entries_older_than_seven_days_are_never_sent(env, backend):
+    log = _log(env["home"], "claude-code", [f"{_utc(0, days_ago=8)}: stale", f"{_utc(1, days_ago=6)}: recent"])
+    _run(backend)
+    assert _messages(backend) == ["recent"]
+    # Not even when the last forwarded entry is older still.
+    log.write_text(f"{_utc(0, days_ago=8)}: stale again\n")
+    log.with_name(STATE).write_text(_utc(0, days_ago=30))
+    backend.requests.clear()
+    _run(backend)
+    assert _messages(backend) == []
+
+
+def test_forwarded_errors_carry_a_category_of_their_own(env, backend):
+    _log(env["home"], "claude-code", [f"{_utc(0)}: e0"])
+    _run(backend)
+    assert [e["category"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["forwarded_error_log"]
