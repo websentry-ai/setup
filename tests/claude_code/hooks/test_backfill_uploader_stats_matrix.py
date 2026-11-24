@@ -254,13 +254,6 @@ class StatsHelpersTestCase(unittest.TestCase):
                 up._backfill_add_stats(total, _stats(0, 0, 1, 900, 900))
                 self.assertEqual(total, _stats(5, 5, 4, 900, 1950))
 
-    def test_only_a_skip_counts_as_skipping(self):
-        for up in uploaders:
-            for over, unreadable in ((0, 0), (1, 0), (0, 1), (2, 3)):
-                with self.subTest(up.__name__, over=over, unreadable=unreadable):
-                    stats = _stats(seen=7, unreadable=unreadable, count=over)
-                    self.assertIs(up._backfill_skipped_anything(stats), bool(over or unreadable))
-
     def _payload(self, up):
         bodies = []
         with patch.object(up, "_backfill_http_request", side_effect=_fake_http(bodies)):

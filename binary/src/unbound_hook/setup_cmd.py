@@ -290,10 +290,11 @@ def _tool_installed(tool, user_homes) -> bool:
         return True
 
 
-def _report(m, tool, api_key, status, reason=None, **fields):
+def _report(m, tool, api_key, status, reason=None, installed=True, **fields):
     """This tool's setup/complete call for the run; returns the (status, reason) it sent. Configured on a Mac
-    without the tool reads skipped: its config is still written, so the hook works once the tool arrives."""
-    if status == "configured" and not _tool_installed(tool, m.get_all_user_homes()):
+    without the tool (installed False, from the run's one check) reads skipped: its config is still written,
+    so the hook works once the tool arrives."""
+    if status == "configured" and not installed:
         status, reason = "skipped", f"{_TOOL_FOOTPRINTS[tool][0]} is not installed"
     m.notify_setup_complete(api_key, _TOOL_TYPES[tool], status=status, reason=reason, **fields)
     return status, reason
@@ -1367,6 +1368,7 @@ def _setup_claude_code(opts):
         return ("deferred", "MDM api key fetch failed")
     skip_settings = opts["skip_managed_settings"]
     report = functools.partial(_report, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
+                               installed=opts.get("installed", {}).get("claude-code", True),
                                install_mode="binary-skip" if skip_settings else "binary")
     _forward_hook_errors(m, "claude-code", api_key, opts)
 
@@ -1428,6 +1430,7 @@ def _setup_augment(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "augment", api_key, backend_url=base, serial_number=device_id,
+                               installed=opts.get("installed", {}).get("augment", True),
                                install_mode="binary")
     _forward_hook_errors(m, "augment", api_key, opts)
 
@@ -1468,6 +1471,7 @@ def _setup_codex(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "codex", api_key, backend_url=base, serial_number=device_id,
+                               installed=opts.get("installed", {}).get("codex", True),
                                install_mode="binary")
     _forward_hook_errors(m, "codex", api_key, opts)
 
@@ -1679,6 +1683,7 @@ def _setup_cursor(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "cursor", api_key, backend_url=base, serial_number=device_id,
+                               installed=opts.get("installed", {}).get("cursor", True),
                                install_mode="binary")
     _forward_hook_errors(m, "cursor", api_key, opts)
 
@@ -1767,6 +1772,7 @@ def _setup_copilot(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "copilot", api_key, backend_url=base, serial_number=device_id,
+                               installed=opts.get("installed", {}).get("copilot", True),
                                install_mode="binary")
     _forward_hook_errors(m, "copilot", api_key, opts)
 
@@ -1942,6 +1948,10 @@ def run(argv) -> int:
     serial = _report_input(m0.get_device_identifier, None, "device serial")
     user_homes = _report_input(m0.get_all_user_homes, None, "user homes")
     warnings = _report_input(lambda: _preflight_warnings(user_homes), [], "preflight checks")
+    # Once, before any tool writes: unknown homes (or a failed check) leave every tool reported as installed.
+    opts["installed"] = _report_input(lambda: {} if user_homes is None else {
+        tool: _tool_installed(tool, user_homes) for tool in opts["tools"] if tool in _TOOL_FOOTPRINTS},
+        {}, "installed tools")
     _send_run_report(opts, serial, "start", _start_fields)
 
     statuses = {}

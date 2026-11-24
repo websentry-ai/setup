@@ -668,3 +668,20 @@ def test_an_npm_prefix_from_npmrc_counts(env, machine, prefix):
     setup_cmd.run(["--api-key", "admin-key"])
     assert _reports(env, "codex")[0]["status"] == "configured"
     assert _reports(env, "cursor")[0]["status"] == "skipped"
+
+
+# --- Review #10: which tools are installed is worked out once per run -------------
+
+def test_installed_tools_are_found_once_before_the_first_report(env, machine, monkeypatch):
+    events, real = [], setup_cmd._tool_installed
+    monkeypatch.setattr(setup_cmd, "_tool_installed",
+                        lambda tool, homes: events.append(("check", tool)) or real(tool, homes))
+    for m in env["modules"].values():
+        monkeypatch.setattr(m, "notify_setup_complete", lambda *a, **k: events.append(("report", a[1])))
+    _install(machine, FOOTPRINTS["codex"])
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    checks = [tool for kind, tool in events if kind == "check"]
+    assert sorted(checks) == sorted(FOOTPRINTS)  # once each
+    first_report = next(i for i, (kind, _) in enumerate(events) if kind == "report")
+    assert all(kind == "check" for kind, _ in events[:first_report])
+    assert len(events[:first_report]) == len(FOOTPRINTS)

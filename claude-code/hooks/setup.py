@@ -1660,10 +1660,6 @@ def _backfill_first_session_id(transcript_path: Path):
     return None
 
 
-def _backfill_skipped_anything(stats: Dict) -> bool:
-    return bool(stats['skipped_over_cap']['count'] or stats['unreadable'])
-
-
 def _backfill_walk_stats(root: Path) -> Dict:
     """uploader_stats for every transcript under root, whatever its age: how many, which are over the cap, and
     which can't be read."""
