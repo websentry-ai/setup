@@ -85,6 +85,10 @@ the python path, by design:
   written but reported `skipped` ("<Tool> is not installed"). A discovery run
   that prints `Scan skipped: <reason>` is `skipped`. The run itself posts
   `phase: start` first and `phase: end` last to the MDM install report.
+  Each tool's adapter also forwards its hook's `error.log` entries newer than
+  the last forwarded one to the gateway's `/v1/hooks/errors` (ten a request),
+  recording the newest accepted timestamp in `.error_log_forwarded` beside the
+  log; a failed request saves nothing and ends forwarding for the run.
 - **`detect_install_state`** is adapted: the python version checked for the
   managed `unbound.py`, which no longer exists. Binary semantics: settings
   file absent → `fresh`; present and referencing the binary → `persisted`;

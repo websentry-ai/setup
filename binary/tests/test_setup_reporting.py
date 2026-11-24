@@ -271,3 +271,96 @@ def test_the_notifier_sends_status_reason_and_where_it_wrote(tool, monkeypatch):
     assert (skipped["status"], skipped["reason"], skipped["written_to"]) == ("skipped", "r" * 500, ("/p" * 300)[:500])
     # An old-style call sends the body it always did: a missing status means configured.
     assert not {"status", "reason", "written_to"} & set(plain)
+
+
+# --- Step 7: forward hook errors stuck in error.log ------------------------------
+
+ERROR_LOGS = {"claude-code": ".claude/hooks/error.log", "cursor": ".cursor/hooks/error.log",
+              "codex": ".codex/hooks/error.log", "copilot": ".copilot/hooks/error.log",
+              "augment": ".augment/hooks/error.log"}
+STATE = ".error_log_forwarded"
+
+
+def _log(home, tool, lines):
+    path = home / ERROR_LOGS[tool]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(line + "\n" for line in lines))
+    return path
+
+
+def _utc(n):
+    return "2026-11-21T16:%02d:%02d.000123Z" % (n // 60, n % 60)
+
+
+def _forwarded(backend):
+    return [r for r in backend.requests if r["path"] == "/v1/hooks/errors"]
+
+
+def test_errors_newer_than_the_last_forwarded_one_go_to_the_gateway(env, backend):
+    log = _log(env["home"], "claude-code", [f"{_utc(n)}: gateway unreachable {n}" for n in range(3)])
+    log.with_name(STATE).write_text(_utc(0))
+    _run(backend)
+    [request] = _forwarded(backend)
+    assert request["headers"]["Authorization"] == "Bearer per-device-key"
+    body = request["body"]
+    assert body["hook_source"] == "claude-code" and len(body["hook_sha"]) == 12
+    assert [(e["timestamp"], e["message"]) for e in body["errors"]] == [
+        (_utc(1), "gateway unreachable 1"), (_utc(2), "gateway unreachable 2")]
+    assert log.with_name(STATE).read_text() == _utc(2)
+
+
+def test_errors_go_ten_to_a_request_and_none_is_sent_twice(env, backend):
+    log = _log(env["home"], "claude-code", [f"{_utc(n)}: e{n}" for n in range(25)])
+    _run(backend)
+    assert [len(r["body"]["errors"]) for r in _forwarded(backend)] == [10, 10, 5]
+    assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == [f"e{n}" for n in range(25)]
+    assert log.with_name(STATE).read_text() == _utc(24)
+    backend.requests.clear()
+    _run(backend)
+    assert _forwarded(backend) == []
+
+
+def test_an_unreachable_gateway_saves_nothing_and_the_next_run_sends_it_all(env, backend):
+    log = _log(env["home"], "claude-code", [f"{_utc(n)}: e{n}" for n in range(3)])
+    rc = setup_cmd.run(["--api-key", "admin-key", "--backend-url", backend.url,
+                        "--gateway-url", "http://127.0.0.1:9"])
+    assert rc == 0
+    assert not log.with_name(STATE).exists()
+    _run(backend)
+    assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["e0", "e1", "e2"]
+
+
+def test_a_refused_request_saves_nothing(env, backend):
+    log = _log(env["home"], "claude-code", [f"{_utc(0)}: e0"])
+    # The gateway answers an unknown key with 200 and success false.
+    backend.answer = lambda path: (200, {"success": False, "reason": "invalid_key"})
+    assert _run(backend) == 0
+    assert len(_forwarded(backend)) == 1
+    assert not log.with_name(STATE).exists()
+
+
+def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, tmp_path):
+    other = tmp_path / "other-home"
+    other.mkdir()
+    for m in env["modules"].values():
+        monkeypatch.setattr(m, "get_all_user_homes", lambda: [("alice", env["home"]), ("bob", other)])
+    # Cursor's and Copilot's hooks stamp local time with its offset.
+    _log(env["home"], "cursor", ["2026-11-21T08:40:11.000001-08:00: cursor broke"])
+    _log(env["home"], "copilot", ["2026-11-21T08:41:11.000001-08:00: copilot broke"])
+    _log(env["home"], "codex", [f"{_utc(1)}: codex broke"])
+    _log(other, "claude-code", [f"{_utc(2)}: bob's claude broke"])
+    _log(other, "augment", [f"{_utc(3)}: auggie broke"])
+    _run(backend)
+    sent = {r["body"]["hook_source"]: [e["message"] for e in r["body"]["errors"]] for r in _forwarded(backend)}
+    assert sent == {"cursor": ["cursor broke"], "copilot": ["copilot broke"], "codex": ["codex broke"],
+                    "claude-code": ["bob's claude broke"], "augment_code": ["auggie broke"]}
+    assert (env["home"] / ".copilot/hooks" / STATE).read_text() == "2026-11-21T08:41:11.000001-08:00"
+    assert (other / ".claude/hooks" / STATE).exists() and not (env["home"] / ".claude/hooks" / STATE).exists()
+    # Cursor's setup removes the python-era ~/.cursor/hooks, log and all, after its errors went out.
+    assert not (env["home"] / ".cursor/hooks").exists()
+
+
+def test_lines_that_are_not_log_entries_are_skipped(env, backend):
+    _log(env["home"], "claude-code", ["not an entry", f"{_utc(5)}: real one", "  continued text"])
+    _run(backend)
+    assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["real one"]

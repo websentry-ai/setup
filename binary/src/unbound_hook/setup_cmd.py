@@ -23,6 +23,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import stat
 import subprocess
@@ -250,6 +251,109 @@ def _end_fields(opts, user_homes, warnings) -> dict:
     return {"timestamps": {"completed_at": _utc_now()},
             "preflight_warnings": warnings,
             "user_homes": {"configured": configured, "skipped": len(user_homes) - configured}}
+
+
+# ---------------------------------------------------------------------------
+# Stuck hook errors (WEB-6392): a hook reports an error to the gateway at most
+# once a minute and never retries, so the rest wait in its error.log. Each run
+# sends the entries newer than the last one forwarded, per tool and per home.
+# ---------------------------------------------------------------------------
+
+# Each tool's hook log under a home, and the hook_source its hook reports as.
+_HOOK_ERROR_LOGS = {
+    "claude-code": (".claude/hooks/error.log", "claude-code"),
+    "cursor": (".cursor/hooks/error.log", "cursor"),
+    "codex": (".codex/hooks/error.log", "codex"),
+    "copilot": (".copilot/hooks/error.log", "copilot"),
+    "augment": (".augment/hooks/error.log", "augment_code"),
+}
+# Beside each error.log: the timestamp of the newest entry the gateway accepted.
+FORWARDED_STATE_NAME = ".error_log_forwarded"
+HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
+_HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
+
+
+def _log_time(text):
+    """An entry's timestamp as an aware datetime (hooks write UTC 'Z' or local time with its offset), else None."""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo else None
+
+
+def _unsent_hook_errors(log: Path) -> list:
+    """Runs as the profile's user: the log's entries newer than the last one forwarded, oldest first."""
+    try:
+        last = _log_time(_read_user_file(log.with_name(FORWARDED_STATE_NAME), follow=False).decode().strip())
+    except (OSError, UnicodeDecodeError):
+        last = None
+    entries = []
+    for line in _read_user_file(log, follow=False).decode("utf-8", "replace").splitlines():
+        match = _HOOK_ERROR_LINE.match(line)
+        when = _log_time(match.group(1)) if match else None
+        if when and (last is None or when > last):
+            entries.append((when, {"timestamp": match.group(1), "message": match.group(2)[:2000]}))
+    entries.sort(key=lambda entry: entry[0])
+    return [entry for _, entry in entries]
+
+
+def _save_forwarded(log: Path, timestamp: str) -> bool:
+    """Runs as the profile's user."""
+    _replace_user_file(log.with_name(FORWARDED_STATE_NAME), timestamp.encode("utf-8"), 0o600)
+    return True
+
+
+def _post_hook_errors(url, api_key, hook_source, hook_sha, batch) -> bool:
+    """The hook's own request shape and auth. True only when the gateway took them: it answers an
+    unknown key with 200 and success false."""
+    errors = [dict(entry, message=re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]",
+                                          entry["message"].replace(api_key, "[REDACTED]")))
+              for entry in batch]
+    code, answer = _post_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
+                              {"Authorization": f"Bearer {api_key}"})
+    try:
+        return 200 <= code < 300 and json.loads(answer.decode("utf-8")).get("success") is True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _forward_home_errors(m, username, log, send):
+    """(entries sent, whether every request went through). The place is saved after each accepted request."""
+    entries = _as_user(m, username, _unsent_hook_errors, log) or []
+    for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
+        batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
+        if not send(batch):
+            return start, False
+        _as_user(m, username, _save_forwarded, log, batch[-1]["timestamp"])
+    return len(entries), True
+
+
+def _forward_hook_errors(m, tool, api_key, opts) -> None:
+    """Forward every home's unsent error.log entries for this tool. The first failed request ends forwarding
+    for the whole run, so a gateway that is down costs one short timeout; the next run retries."""
+    if opts.get("hook_errors_held"):
+        return
+    relpath, hook_source = _HOOK_ERROR_LOGS[tool]
+    sent = 0
+    try:
+        hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
+        send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
+                                 api_key, hook_source, hook_sha)
+        for username, home_dir in m.get_all_user_homes():
+            log = home_dir / relpath if home_dir is not None else None
+            if log is None or not os.path.lexists(log):
+                continue
+            count, ok = _forward_home_errors(m, username, log, send)
+            sent += count
+            if not ok:
+                opts["hook_errors_held"] = True
+                print(f"[errors] {tool} hook errors not forwarded; the next run retries")
+                break
+    except Exception as e:
+        print(f"[errors] {tool} hook errors not forwarded: {e}")
+    if sent:
+        print(f"[errors] forwarded {sent} {tool} hook errors")
 
 
 def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
@@ -1163,6 +1267,7 @@ def _setup_claude_code(opts):
     skip_settings = opts["skip_managed_settings"]
     report = functools.partial(_report, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
                                install_mode="binary-skip" if skip_settings else "binary")
+    _forward_hook_errors(m, "claude-code", api_key, opts)
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
@@ -1223,6 +1328,7 @@ def _setup_augment(opts):
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "augment", api_key, backend_url=base, serial_number=device_id,
                                install_mode="binary")
+    _forward_hook_errors(m, "augment", api_key, opts)
 
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
@@ -1262,6 +1368,7 @@ def _setup_codex(opts):
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "codex", api_key, backend_url=base, serial_number=device_id,
                                install_mode="binary")
+    _forward_hook_errors(m, "codex", api_key, opts)
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
@@ -1472,6 +1579,7 @@ def _setup_cursor(opts):
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "cursor", api_key, backend_url=base, serial_number=device_id,
                                install_mode="binary")
+    _forward_hook_errors(m, "cursor", api_key, opts)
 
     config_ok = True
     for username, home_dir in m.get_all_user_homes():
@@ -1559,6 +1667,7 @@ def _setup_copilot(opts):
         return ("deferred", "MDM api key fetch failed")
     report = functools.partial(_report, m, "copilot", api_key, backend_url=base, serial_number=device_id,
                                install_mode="binary")
+    _forward_hook_errors(m, "copilot", api_key, opts)
 
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
