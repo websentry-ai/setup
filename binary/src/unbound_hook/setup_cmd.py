@@ -1768,12 +1768,18 @@ SCAN_SKIPPED_PREFIX = "Scan skipped:"
 
 def _echo_scan_output(stream, skipped) -> None:
     """Pass the scan's stdout through to the MDM log line by line, keeping the reason
-    of the first 'Scan skipped: <reason>' line it prints."""
+    of the first 'Scan skipped: <reason>' line it prints. A log that can't be written stops the
+    echo, never the reading: a full pipe would stall the scan until the backstop."""
+    echo = True
     try:
         for raw in iter(stream.readline, b""):
             line = raw.decode("utf-8", "replace")
-            sys.stdout.write(line)
-            sys.stdout.flush()
+            if echo:
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    echo = False
             if not skipped and line.startswith(SCAN_SKIPPED_PREFIX):
                 skipped.append(line[len(SCAN_SKIPPED_PREFIX):].strip())
     except Exception:

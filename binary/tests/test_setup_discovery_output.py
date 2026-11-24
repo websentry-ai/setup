@@ -1,7 +1,7 @@
 """WEB-6392: setup now reads the discovery scan's stdout (for the 'Scan skipped:' line) instead of
 letting the scan inherit it. A pipe can stall a child that a shared stdout never could, so these run
 _run_discovery against real child processes: a big and noisy scan, a grandchild that keeps the pipe
-open, and a scan that hangs past the backstop.
+open, a scan that hangs past the backstop, and an MDM log that can no longer be written.
 """
 
 import os
@@ -87,3 +87,27 @@ def test_a_scan_past_the_backstop_is_killed_with_its_whole_group_and_deferred(tm
         time.sleep(0.1)
     assert not [pid for pid in pids if _alive(pid)], "a scan process outlived the backstop kill"
 
+
+class _UnwritableLog:
+    """setup's stdout once the MDM agent reading it is gone, or the disk it goes to is full."""
+    encoding = "utf-8"
+
+    def write(self, text):
+        raise BrokenPipeError(32, "Broken pipe")
+
+    def flush(self):
+        raise BrokenPipeError(32, "Broken pipe")
+
+
+def test_a_log_that_cannot_be_written_never_stalls_the_scan(tmp_path, monkeypatch, reap):
+    # Before setup piped it, the scan wrote to that log itself and carried on (its logging drops
+    # failed writes). Now setup must keep draining the pipe, or the scan blocks on a full one.
+    _scan(tmp_path, monkeypatch, "for n in range(40000): print('detecting', n)\nprint('Scan complete')\n")
+    monkeypatch.setattr(setup_cmd, "DISCOVERY_TIMEOUT_SECONDS", 20)
+    monkeypatch.setattr(setup_cmd, "DISCOVERY_KILL_GRACE_SECONDS", 0)
+    monkeypatch.setattr(sys, "stdout", _UnwritableLog())
+    began = time.monotonic()
+    result = setup_cmd._run_discovery(OPTS)
+    elapsed = time.monotonic() - began
+    assert result == ("configured", None)
+    assert elapsed < 10
