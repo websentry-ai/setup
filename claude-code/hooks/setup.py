@@ -2187,7 +2187,7 @@ WSL_HOOKS_PROBE = ('grep -qsE "hooks/unbound\\.py|anthropic_key\\.sh" "$HOME/.cl
                    'command -v python3 >/dev/null || exit 3; exit 1')
 
 
-def _wsl_distros() -> List[str]:
+def _wsl_distros():
     """This Windows user's WSL distros, from the registry: wsl.exe blocks on an install prompt when WSL is absent."""
     import winreg
     names = []
@@ -2196,15 +2196,36 @@ def _wsl_distros() -> List[str]:
             for i in range(winreg.QueryInfoKey(root)[0]):
                 try:
                     with winreg.OpenKey(root, winreg.EnumKey(root, i)) as sub:
-                        name = winreg.QueryValueEx(sub, "DistributionName")[0]
+                        names.append(winreg.QueryValueEx(sub, "DistributionName")[0])
                 except OSError:
                     continue
-                if isinstance(name, str) and re.fullmatch(r"[\w.-]+", name) and not re.match(
-                        r"(docker-desktop|rancher-desktop|podman-)", name, re.I):
-                    names.append(name)
     except OSError:
         pass
-    return names
+    return [n for n in names if isinstance(n, str) and n and all(c.isalnum() or c in "._-" for c in n)
+            and not n.lower().startswith(("docker-desktop", "rancher-desktop", "podman-"))]
+
+
+def setup_wsl(argv) -> None:
+    """Windows: run this same setup in each of the user's WSL distros, which keep their own Linux home."""
+    if platform.system() != "Windows" or not {"--api-key", "--clear"} & set(argv):
+        return
+    # --config-dir is a Windows path; inside WSL the default ~/.claude applies.
+    args = [a for i, a in enumerate(argv) if not a.startswith("--config-dir") and (i == 0 or argv[i - 1] != "--config-dir")]
+    try:
+        source = Path(__file__).read_bytes()
+    except (NameError, OSError):
+        return
+    for distro in _wsl_distros():
+        try:
+            r = subprocess.run(["wsl.exe", "-d", distro, "--exec", "python3", "-", *args], input=source,
+                               capture_output=True, timeout=900, env={**os.environ, "WSL_UTF8": "1"},
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out = (r.stdout + r.stderr).decode("utf-8", "replace")
+            status = {0: "done", 3: "managed by MDM"}.get(r.returncode) or (
+                "skipped, python3 not installed" if "execvpe(python3)" in out else f"failed (exit {r.returncode})")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            status = f"failed ({type(e).__name__})"
+        print(f"WSL {distro}: {status}")
 
 
 def run_in_wsl() -> bool:
@@ -2402,6 +2423,7 @@ def main():
 
 if __name__ == "__main__":
     try:
+        setup_wsl(sys.argv[1:])
         ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")

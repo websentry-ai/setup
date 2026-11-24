@@ -1125,8 +1125,50 @@ def main():
     return True
 
 
+def _wsl_distros():
+    """This Windows user's WSL distros, from the registry: wsl.exe blocks on an install prompt when WSL is absent."""
+    import winreg
+    names = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Lxss") as root:
+            for i in range(winreg.QueryInfoKey(root)[0]):
+                try:
+                    with winreg.OpenKey(root, winreg.EnumKey(root, i)) as sub:
+                        names.append(winreg.QueryValueEx(sub, "DistributionName")[0])
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return [n for n in names if isinstance(n, str) and n and all(c.isalnum() or c in "._-" for c in n)
+            and not n.lower().startswith(("docker-desktop", "rancher-desktop", "podman-"))]
+
+
+def setup_wsl(argv) -> None:
+    """Windows: run this same setup in each of the user's WSL distros, which keep their own Linux home."""
+    if platform.system() != "Windows" or not {"--api-key", "--clear"} & set(argv):
+        return
+    # --config-dir is a Windows path; inside WSL the default ~/.claude applies.
+    args = [a for i, a in enumerate(argv) if not a.startswith("--config-dir") and (i == 0 or argv[i - 1] != "--config-dir")]
+    try:
+        source = Path(__file__).read_bytes()
+    except (NameError, OSError):
+        return
+    for distro in _wsl_distros():
+        try:
+            r = subprocess.run(["wsl.exe", "-d", distro, "--exec", "python3", "-", *args], input=source,
+                               capture_output=True, timeout=900, env={**os.environ, "WSL_UTF8": "1"},
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out = (r.stdout + r.stderr).decode("utf-8", "replace")
+            status = {0: "done", 3: "managed by MDM"}.get(r.returncode) or (
+                "skipped, python3 not installed" if "execvpe(python3)" in out else f"failed (exit {r.returncode})")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            status = f"failed ({type(e).__name__})"
+        print(f"WSL {distro}: {status}")
+
+
 if __name__ == "__main__":
     try:
+        setup_wsl(sys.argv[1:])
         ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")
