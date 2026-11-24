@@ -1382,6 +1382,68 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         return False
 
 
+WSL_SETUP_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/setup.py"
+WSL_TASK_NAME = "Unbound Claude Code WSL"
+
+
+def _run_powershell(script: str, env: Dict[str, str]) -> subprocess.CompletedProcess:
+    cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=120, env={**os.environ, **env})
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def _trusted_windows_launcher() -> Optional[str]:
+    """This interpreter's pythonw.exe, only when it sits under Program Files (admin-only writes), since every user's logon runs it."""
+    roots = [os.environ.get(v) for v in ("ProgramFiles", "ProgramFiles(x86)")]
+    roots = tuple(os.path.normcase(os.path.abspath(r)) + os.sep for r in roots if r)
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    if roots and os.path.normcase(os.path.abspath(pythonw)).startswith(roots) and pythonw.is_file():
+        return str(pythonw)
+    return None
+
+
+def install_wsl_logon_task() -> None:
+    """Windows: at each user logon, set up hooks in that user's WSL distros. WSL is
+    per user and refuses SYSTEM, so this runs as the logged-on user."""
+    script = get_managed_settings_dir() / "wsl_setup.py"
+    launcher = _trusted_windows_launcher()
+    if not launcher:
+        print("Skipped WSL setup: Python is not installed for all users under Program Files")
+        return
+    try:
+        if not download_file(WSL_SETUP_URL, script):
+            raise ValueError("download failed")
+        compile(script.read_bytes(), str(script), "exec")
+    except (OSError, ValueError, SyntaxError) as e:
+        print(f"Skipped WSL setup: could not fetch setup.py ({e})")
+        return
+    args = f'-I "{script}" --wsl'
+    result = _run_powershell(
+        "$a = New-ScheduledTaskAction -Execute $env:UNBOUND_TASK_EXE -Argument $env:UNBOUND_TASK_ARGS;"
+        "$p = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited;"
+        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries"
+        " -ExecutionTimeLimit (New-TimeSpan -Minutes 30);"
+        "Register-ScheduledTask -TaskName $env:UNBOUND_TASK_NAME -Action $a -Trigger (New-ScheduledTaskTrigger -AtLogOn)"
+        " -Principal $p -Settings $s -Force | Out-Null;"
+        "Start-ScheduledTask -TaskName $env:UNBOUND_TASK_NAME",
+        {"UNBOUND_TASK_EXE": launcher, "UNBOUND_TASK_ARGS": args, "UNBOUND_TASK_NAME": WSL_TASK_NAME})
+    if result.returncode == 0:
+        print("WSL distros will be set up at each user logon")
+    else:
+        print(f"Could not register the WSL logon task: {result.stderr.strip()[:300]}")
+
+
+def remove_wsl_logon_task() -> None:
+    _run_powershell("Unregister-ScheduledTask -TaskName $env:UNBOUND_TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue",
+                    {"UNBOUND_TASK_NAME": WSL_TASK_NAME})
+    try:
+        (get_managed_settings_dir() / "wsl_setup.py").unlink()
+    except OSError:
+        pass
+
+
 def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     """Ours when the command RUNS our managed hook or the /opt/unbound binary, not
     merely mentions one: a decoy like '/bin/true # <our path>' is not ours."""
@@ -1665,6 +1727,10 @@ def clear_setup() -> bool:
     if not _remove_env_var_for_all_users("UNBOUND_DEVICE_TOKEN", keep=device_token_in_use):
         teardown_failed = True
         print("Failed to clear UNBOUND_DEVICE_TOKEN")
+
+    if platform.system().lower() == "windows":
+        remove_wsl_logon_task()
+        print("WSL distros keep their hooks; each user removes them with `unbound setup claude-code --clear`")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -2375,7 +2441,7 @@ def _claude_desktop_support_dirs(home: Path) -> List[Path]:
     Taken from unbound.py, keyed off `home` instead of Path.home()/APPDATA: MDM
     backfill walks every profile, so per-process paths would resolve to the
     admin's for all of them. On Windows APPDATA is that user's
-    <home>\AppData\Roaming.
+    <home>\\AppData\\Roaming.
     """
     system = platform.system().lower()
     if system == 'darwin':
@@ -3345,6 +3411,9 @@ def main():
     if not config_ok:
         print("Could not write ~/.unbound/config.json for every user")
         return False
+
+    if platform.system().lower() == "windows":
+        install_wsl_logon_task()
 
     print("\n" + "=" * 60)
     print("Setup Complete!")

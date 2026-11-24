@@ -1909,7 +1909,7 @@ def _claude_desktop_support_dirs(home: Path) -> List[Path]:
     Taken from unbound.py, keyed off `home` instead of Path.home()/APPDATA: MDM
     backfill walks every profile, so per-process paths would resolve to the
     admin's for all of them. On Windows APPDATA is that user's
-    <home>\AppData\Roaming.
+    <home>\\AppData\\Roaming.
     """
     system = platform.system().lower()
     if system == 'darwin':
@@ -2181,6 +2181,77 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
+# 0: either mode installed with this key ($1); 3: no python3 to set up with; else install, which also pushes a rotated key.
+WSL_HOOKS_PROBE = ('grep -qsE "hooks/unbound\\.py|anthropic_key\\.sh" "$HOME/.claude/settings.json" '
+                   '/etc/claude-code/managed-settings.json && grep -qsF -- "$1" "$HOME/.unbound/config.json" && exit 0; '
+                   'command -v python3 >/dev/null || exit 3; exit 1')
+
+
+def _wsl_distros() -> List[str]:
+    """This Windows user's WSL distros, from the registry: wsl.exe blocks on an install prompt when WSL is absent."""
+    import winreg
+    names = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Lxss") as root:
+            for i in range(winreg.QueryInfoKey(root)[0]):
+                try:
+                    with winreg.OpenKey(root, winreg.EnumKey(root, i)) as sub:
+                        name = winreg.QueryValueEx(sub, "DistributionName")[0]
+                except OSError:
+                    continue
+                if isinstance(name, str) and re.fullmatch(r"[\w.-]+", name) and not re.match(
+                        r"(docker-desktop|rancher-desktop|podman-)", name, re.I):
+                    names.append(name)
+    except OSError:
+        pass
+    return names
+
+
+def run_in_wsl() -> bool:
+    """Windows: set up each of this user's WSL distros that lacks Unbound hooks or holds an older key."""
+    if platform.system().lower() != "windows":
+        print("❌ --wsl runs only on Windows")
+        return False
+    if sys.stdout is None:
+        # pythonw at logon has no console; keep the last run per user.
+        log = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Unbound" / "wsl_setup.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        sys.stdout = sys.stderr = open(log, "w", encoding="utf-8")
+    try:
+        cfg = json.loads((Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cfg = {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    api_key = next((v for v in (cfg.get("device_token"), cfg.get("api_key")) if isinstance(v, str) and v), None)
+    if not api_key:
+        print("No Unbound key in ~/.unbound/config.json; skipping WSL setup.")
+        return True
+    child_args = ["--api-key", api_key]
+    for flag, field in (("--backend-url", "base_url"), ("--gateway-url", "gateway_url")):
+        if isinstance(cfg.get(field), str) and cfg[field]:
+            child_args += [flag, cfg[field]]
+    source = Path(__file__).read_bytes()
+    ok = True
+    for distro in _wsl_distros():
+        def wsl(cmd, **kwargs):
+            return subprocess.run(["wsl.exe", "-d", distro, "--exec", *cmd], capture_output=True,
+                                  env={**os.environ, "WSL_UTF8": "1"},
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0), **kwargs)
+        try:
+            probe = wsl(["sh", "-c", WSL_HOOKS_PROBE, "sh", api_key], timeout=120).returncode
+            if probe in (0, 3):
+                print(f"WSL {distro}: {'already set up' if probe == 0 else 'skipped, no python3'}")
+                continue
+            code = wsl(["python3", "-", *child_args], input=source, timeout=900).returncode
+        except subprocess.TimeoutExpired:
+            code = "timeout"
+        # 3 means the distro has its own managed install, which already covers it.
+        print(f"WSL {distro}: {'set up' if code == 0 else 'managed by MDM' if code == 3 else f'failed ({code})'}")
+        ok = ok and code in (0, 3)
+    return ok
+
+
 def main():
     global DEBUG
 
@@ -2192,6 +2263,9 @@ def main():
     if debug_mode:
         DEBUG = True
         debug_print("Debug mode enabled")
+
+    if "--wsl" in sys.argv:
+        return run_in_wsl()
 
     config_dir = _resolve_claude_config_dir(sys.argv)
     # Claude Code resolves CLAUDE_CONFIG_DIR against the current directory when it
