@@ -474,3 +474,61 @@ def test_installs_through_version_managers_and_editors_count(env, machine, tool,
     _install(env["home"], relpath)
     setup_cmd.run(["--api-key", "admin-key"])
     assert _reports(env, tool)[0]["status"] == "configured"
+
+
+# --- S-U4: setup runs as root over paths the user controls -----------------------
+
+def _as_user_like_the_real_one(env, monkeypatch):
+    """The real _run_as_user answers None when fn raises in the user's child; the env stub raises instead."""
+    def run_as(username, fn, *args, _timeout=None, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+    for m in env["modules"].values():
+        monkeypatch.setattr(m, "_run_as_user", run_as)
+
+
+def test_an_error_log_that_is_a_link_is_never_read_through(env, backend, monkeypatch, tmp_path):
+    _as_user_like_the_real_one(env, monkeypatch)
+    other = tmp_path / "other-home"
+    other.mkdir()
+    for m in env["modules"].values():
+        monkeypatch.setattr(m, "get_all_user_homes", lambda: [("alice", env["home"]), ("bob", other)])
+    # alice points her log at a file she must not be able to make setup read and send.
+    secret = tmp_path / "root-only.txt"
+    secret.write_text(f"{_utc(0)}: root secret\n")
+    log = env["home"] / ERROR_LOGS["claude-code"]
+    log.parent.mkdir(parents=True)
+    log.symlink_to(secret)
+    _log(other, "claude-code", [f"{_utc(1)}: bob's error"])
+    _run(backend)
+    assert _messages(backend) == ["bob's error"]
+    assert not log.with_name(STATE).exists()
+
+
+def test_a_state_file_that_is_a_link_is_replaced_not_followed(env, backend, tmp_path):
+    log = _log(env["home"], "claude-code", [f"{_utc(0)}: e0", f"{_utc(1)}: e1"])
+    # Read through, the link's target would say everything was already sent; written through, it gets overwritten.
+    victim = tmp_path / "victim.txt"
+    victim.write_text(_utc(100))
+    log.with_name(STATE).symlink_to(victim)
+    _run(backend)
+    assert _messages(backend) == ["e0", "e1"]
+    assert victim.read_text() == _utc(100)
+    state = log.with_name(STATE)
+    assert not state.is_symlink() and state.read_text() == _utc(1)
+
+
+# --- S-U5: what reaches the gateway, and Sentry behind it ------------------------
+
+def test_the_key_and_bearer_tokens_are_redacted_and_messages_cut(env, backend):
+    _log(env["home"], "claude-code", [
+        f"{_utc(0)}: POST failed for per-device-key with Authorization: Bearer sk-live-abc123",
+        f"{_utc(1)}: retry said bearer tok_lower and gave up",
+        f"{_utc(2)}: " + "y" * 5000])
+    _run(backend)
+    assert _messages(backend) == ["POST failed for [REDACTED] with Authorization: Bearer [REDACTED]",
+                                  "retry said Bearer [REDACTED] and gave up", "y" * 2000]
+    [request] = _forwarded(backend)
+    assert not re.search(r"per-device-key|sk-live-abc123|tok_lower", json.dumps(request["body"]))
