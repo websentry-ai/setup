@@ -372,10 +372,26 @@ def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, 
     assert not (env["home"] / ".cursor/hooks").exists()
 
 
-def test_lines_that_are_not_log_entries_are_skipped(env, backend):
+def test_lines_before_the_first_entry_are_skipped_and_later_ones_continue_it(env, backend):
     _log(env["home"], "claude-code", ["not an entry", f"{_utc(5)}: real one", "  continued text"])
     _run(backend)
-    assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["real one"]
+    assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["real one\n  continued text"]
+
+
+def test_a_multi_line_entry_goes_up_whole_cut_and_redacted(env, backend):
+    _log(env["home"], "claude-code", [
+        f"{_utc(0)}: Traceback (most recent call last):",
+        '  File "unbound.py", line 9, in post',
+        "    Authorization: Bearer sk-live-123",
+        "ValueError: boom " + "x" * 3000,
+        f"{_utc(1)}: next entry",
+    ])
+    _run(backend)
+    first, second = _messages(backend)
+    assert first.startswith('Traceback (most recent call last):\n  File "unbound.py", line 9, in post\n')
+    assert "Bearer [REDACTED]" in first and "sk-live-123" not in first
+    assert len(first) <= 2000
+    assert second == "next entry"
 
 
 # --- F9: the run reports' inputs fail open ---------------------------------------

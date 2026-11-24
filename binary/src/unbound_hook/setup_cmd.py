@@ -335,18 +335,23 @@ def _unsent_hook_errors(log: Path) -> list:
     newer than HOOK_ERROR_MAX_AGE, oldest first. Each carries the 'state' to save once it is sent."""
     floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
     last, sent_then = _forwarded_place(log)
-    entries, seen_then = [], 0
+    entries, seen_then, current = [], 0, None
     for line in _read_user_file(log, follow=False).decode("utf-8", "replace").splitlines():
         match = _HOOK_ERROR_LINE.match(line)
-        when = _log_time(match.group(1)) if match else None
+        if not match:  # a message's own later lines (a traceback); they go with the entry they follow
+            if current is not None:
+                current["message"] = (current["message"] + "\n" + line)[:2000]
+            continue
+        when, current = _log_time(match.group(1)), None
         if when is None or when <= floor:
             continue
         if last is not None and when <= last:
             seen_then += when == last
             if when < last or seen_then <= sent_then:
                 continue  # sent already
-        entries.append((when, {"timestamp": match.group(1), "message": match.group(2)[:2000],
-                               "category": FORWARDED_ERROR_CATEGORY}))
+        current = {"timestamp": match.group(1), "message": match.group(2)[:2000],
+                   "category": FORWARDED_ERROR_CATEGORY}
+        entries.append((when, current))
     entries.sort(key=lambda entry: entry[0])  # stable: entries sharing a stamp keep the log's order
     chosen = entries[-HOOK_ERRORS_PER_RUN:]
     for i, (when, entry) in enumerate(chosen):
