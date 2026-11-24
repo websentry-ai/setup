@@ -344,40 +344,46 @@ def _save_forwarded(log: Path, timestamp: str) -> bool:
     return True
 
 
-def _post_hook_errors(url, api_key, hook_source, hook_sha, batch) -> bool:
-    """The hook's own request shape and auth. True only when the gateway took them: it answers an
-    unknown key with 200 and success false."""
+def _post_hook_errors(url, api_key, hook_source, hook_sha, batch) -> str:
+    """The hook's own request shape and auth. 'sent' when the gateway took them; 'down' when it gave no
+    answer or a 5xx; 'refused' when it answered no. It refuses only a key (200 with success false, or a
+    4xx), never an entry, so a refusal is about this tool's key and not about what the log holds."""
     errors = [dict(entry, message=re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]",
                                           entry["message"].replace(api_key, "[REDACTED]")))
               for entry in batch]
     code, answer = _post_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
                               {"Authorization": f"Bearer {api_key}"})
+    if code <= 0 or code >= 500:
+        return "down"
     try:
-        return 200 <= code < 300 and json.loads(answer.decode("utf-8")).get("success") is True
+        taken = 200 <= code < 300 and json.loads(answer.decode("utf-8")).get("success") is True
     except (ValueError, AttributeError):
-        return False
+        taken = False
+    return "sent" if taken else "refused"
 
 
 def _forward_home_errors(m, username, log, send):
-    """(entries sent, whether every request went through). The place is saved after each accepted request;
-    where it can't be saved nothing more is sent, or every run would send the same entries again."""
+    """(entries sent, 'sent' or the verdict that stopped it). The place is saved after each accepted
+    request; where it can't be saved nothing more is sent, or every run would send the same entries again."""
     if _as_user(m, username, _writable_dir, log.parent) is not True:
         print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
-        return 0, True
+        return 0, "sent"
     entries = _as_user(m, username, _unsent_hook_errors, log) or []
     for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
         batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
-        if not send(batch):
-            return start, False
+        verdict = send(batch)
+        if verdict != "sent":
+            return start, verdict
         if _as_user(m, username, _save_forwarded, log, batch[-1]["timestamp"]) is not True:
             print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
-            return start + len(batch), True
-    return len(entries), True
+            return start + len(batch), "sent"
+    return len(entries), "sent"
 
 
 def _forward_hook_errors(m, tool, api_key, opts) -> None:
-    """Forward every home's unsent error.log entries for this tool. The first failed request ends forwarding
-    for the whole run, so a gateway that is down costs one short timeout; the next run retries."""
+    """Forward every home's unsent error.log entries for this tool. A gateway that is down ends forwarding
+    for the whole run, so it costs one short timeout; a refused key ends it for this tool only. Either way
+    nothing is marked sent, and the next run retries."""
     if opts.get("hook_errors_held"):
         return
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
@@ -390,11 +396,11 @@ def _forward_hook_errors(m, tool, api_key, opts) -> None:
             log = home_dir / relpath if home_dir is not None else None
             if log is None or not os.path.lexists(log):
                 continue
-            count, ok = _forward_home_errors(m, username, log, send)
+            count, verdict = _forward_home_errors(m, username, log, send)
             sent += count
-            if not ok:
-                opts["hook_errors_held"] = True
-                print(f"[errors] {tool} hook errors not forwarded; the next run retries")
+            if verdict != "sent":
+                opts["hook_errors_held"] = opts.get("hook_errors_held") or verdict == "down"
+                print(f"[errors] {tool} hook errors not forwarded (gateway {verdict}); the next run retries")
                 break
     except Exception as e:
         print(f"[errors] {tool} hook errors not forwarded: {e}")

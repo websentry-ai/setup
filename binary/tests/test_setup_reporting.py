@@ -583,3 +583,22 @@ def test_a_save_that_fails_after_a_send_stops_that_home(env, backend, monkeypatc
     _run(backend)
     # The first ten went out; with their place unsaved the rest wait rather than pile up repeats.
     assert [len(r["body"]["errors"]) for r in _forwarded(backend)] == [10]
+
+
+# --- Review #4: one tool's refused key doesn't hold back the others --------------
+
+def test_a_key_the_gateway_refuses_stops_only_that_tool(env, backend):
+    ok = {"status": "ok", "success": True, "accepted": 1}
+
+    def answer(path):
+        refused = path == "/v1/hooks/errors" and backend.requests[-1]["body"].get("hook_source") == "codex"
+        return (200, {"success": False, "reason": "invalid_key"}) if refused else (200, ok)
+
+    backend.answer = answer
+    _log(env["home"], "codex", [f"{_utc(0)}: codex broke"])
+    _log(env["home"], "copilot", [f"{_pacific(1)}: copilot broke"])
+    _run(backend)
+    # Codex runs before Copilot; its refusal must not cost Copilot its turn.
+    assert {r["body"]["hook_source"] for r in _forwarded(backend)} == {"codex", "copilot"}
+    assert (env["home"] / ".copilot/hooks" / STATE).exists()
+    assert not (env["home"] / ".codex/hooks" / STATE).exists()  # refused: retried next run
