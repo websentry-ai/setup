@@ -219,8 +219,16 @@ _TOOL_FOOTPRINTS = {
     "codex": ("Codex", "codex", ("Codex.app",), (".codex/auth.json", ".codex/sessions")),
     "copilot": ("GitHub Copilot", "copilot",
                 ("Visual Studio Code.app", "Visual Studio Code - Insiders.app"), ()),
-    "augment": ("Augment", "auggie", (), ()),
+    # The editor extension alone, in VS Code, VS Code Insiders or Cursor, also counts.
+    "augment": ("Augment", "auggie", (), tuple(f"{editor}/extensions/augment.vscode-augment-*"
+                                              for editor in (".vscode", ".vscode-insiders", ".cursor"))),
 }
+# Where a CLI lands under a home: a user install, Bun, npm's user prefix, and the Node version managers
+# (nvm, Volta, pnpm's default PNPM_HOME, fnm in both its folders, asdf and mise shims, mise's installs).
+_HOME_CLI_DIRS = (".local/bin", ".bun/bin", ".npm-global/bin", ".nvm/versions/node/*/bin", ".volta/bin",
+                  "Library/pnpm", ".local/share/fnm/node-versions/*/installation/bin",
+                  ".fnm/node-versions/*/installation/bin", ".asdf/shims", ".local/share/mise/shims",
+                  ".local/share/mise/installs/*/*/bin")
 _MACHINE_ROOT = Path("/")
 
 
@@ -232,14 +240,13 @@ def _present(root: Path, relpath: str) -> bool:
 
 
 def _tool_installed(tool, user_homes) -> bool:
-    """Any footprint machine-wide (Homebrew, /usr/local, /Applications) or in a home (a user install, Bun,
-    npm, nvm, ~/Applications). A check that fails counts as installed, the report setup always sent."""
+    """Any footprint machine-wide (Homebrew, /usr/local, /Applications) or in a home (_HOME_CLI_DIRS,
+    ~/Applications, the tool's own files). A check that fails counts as installed, the report setup always sent."""
     try:
         _, cli, apps, home_files = _TOOL_FOOTPRINTS[tool]
         app_paths = [f"Applications/{app}" for app in apps]
         machine = [f"opt/homebrew/bin/{cli}", f"usr/local/bin/{cli}", *app_paths]
-        per_home = [f".local/bin/{cli}", f".bun/bin/{cli}", f".npm-global/bin/{cli}",
-                    f".nvm/versions/node/*/bin/{cli}", *home_files, *app_paths]
+        per_home = [f"{folder}/{cli}" for folder in _HOME_CLI_DIRS] + [*home_files, *app_paths]
         roots = [(_MACHINE_ROOT, machine)] + [(home, per_home) for _, home in user_homes if home is not None]
         return any(_present(root, rel) for root, rels in roots for rel in rels)
     except Exception:

@@ -454,3 +454,23 @@ def test_forwarded_errors_carry_a_category_of_their_own(env, backend):
     _log(env["home"], "claude-code", [f"{_utc(0)}: e0"])
     _run(backend)
     assert [e["category"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["forwarded_error_log"]
+
+
+# --- S-U2: version managers and editor extensions count as installed -------------
+
+@pytest.mark.parametrize("tool,relpath", [
+    ("claude-code", ".volta/bin/claude"),
+    ("codex", "Library/pnpm/codex"),
+    ("copilot", ".local/share/fnm/node-versions/v22.11.0/installation/bin/copilot"),
+    ("claude-code", ".fnm/node-versions/v20.1.0/installation/bin/claude"),
+    ("augment", ".asdf/shims/auggie"),
+    ("codex", ".local/share/mise/shims/codex"),
+    ("claude-code", ".local/share/mise/installs/node/22.1.0/bin/claude"),
+    ("augment", ".vscode/extensions/augment.vscode-augment-0.512.0"),
+    ("augment", ".vscode-insiders/extensions/augment.vscode-augment-0.512.0"),
+    ("augment", ".cursor/extensions/augment.vscode-augment-0.512.0-darwin-arm64"),
+])
+def test_installs_through_version_managers_and_editors_count(env, machine, tool, relpath):
+    _install(env["home"], relpath)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert _reports(env, tool)[0]["status"] == "configured"
