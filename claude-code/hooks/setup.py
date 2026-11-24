@@ -40,6 +40,9 @@ BACKFILL_MAX_ENTRIES_PER_SLICE = 10000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+# How a run that could not send its closing report ended, for the next run to send as previous_outcome.
+BACKFILL_OUTCOME_FILE = '.unbound_backfill_outcome'
+BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'failed')
 # An S3 PUT is given up on only after this long below this speed, then re-sent on a fresh link.
 BACKFILL_PUT_STALL_SECONDS = 60
 BACKFILL_PUT_STALL_BYTES_PER_SECOND = 1024
@@ -1529,6 +1532,54 @@ def _backfill_write_cutoff(config_dir: Path, ts: float) -> None:
         debug_print(f"failed to persist backfill timestamp: {e}")
 
 
+def _backfill_outcome_path(config_dir: Path) -> Path:
+    return _backfill_state_path(config_dir).with_name(BACKFILL_OUTCOME_FILE)
+
+
+def _backfill_read_outcome(config_dir: Path) -> Optional[str]:
+    try:
+        value = _backfill_outcome_path(config_dir).read_text().strip()
+    except OSError:
+        return None
+    return value if value in BACKFILL_OUTCOMES else None
+
+
+def _backfill_save_outcome(config_dir: Path, outcome: Optional[str]) -> None:
+    # None clears it. Never raises: it also runs from the error path.
+    path = _backfill_outcome_path(config_dir)
+    try:
+        if outcome is None:
+            path.unlink()
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
+        tmp.write_text(outcome)
+        os.replace(tmp, path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        debug_print(f"failed to persist backfill outcome: {e}")
+
+
+def _backfill_send_outcome(api_key: str, backend_url: str, config_dir: Path, outcome: str,
+                           uploads_failed: int, previous: Optional[str]) -> None:
+    """The run's closing upload: the walk's counts, how the run ended, and an earlier run's unsent outcome.
+    Left on disk for the next run when it can't go."""
+    global _backfill_uploader_stats
+    counts = _backfill_uploader_stats
+    stats = dict(counts, outcome=outcome, uploads_failed=uploads_failed)
+    if previous:
+        stats['previous_outcome'] = previous
+    _backfill_uploader_stats = stats
+    try:
+        sent = _backfill_upload_chunk(api_key, backend_url, [])
+    finally:
+        _backfill_uploader_stats = counts  # data uploads carry the counts alone
+    if not sent:
+        debug_print(f"backfill outcome {outcome} not sent; the next run sends it")
+    _backfill_save_outcome(config_dir, None if sent else outcome)
+
+
 def _backfill_jsonl_files(root: Path, skip_dirs=()):
     """Every .jsonl under root, never entering or yielding a symlink or Windows junction."""
     for dirpath, dirnames, filenames in os.walk(root):
@@ -2081,12 +2132,14 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
     except (OSError, AttributeError) as e:
         debug_print(f"lowering backfill priority failed: {e}")
 
+    reported = False
     try:
         # The signed-in email and the desktop session cache are keyed off the home
         # dir; only the transcripts and the cutoff follow the config dir.
         home = Path.home()
         if config_dir is None:
             config_dir = home / '.claude'
+        previous = _backfill_read_outcome(config_dir)
         started_at = time.time()
         cutoff_mtime = _backfill_read_cutoff(config_dir)
         force_epoch, force_days = _backfill_force_config(api_key, backend_url)
@@ -2159,15 +2212,15 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
                 current_size += slice_bytes + 1
 
         _flush()
+        failed = chunks_total - chunks_sent
+        # No run clock here, so a run ends completed or failed, never stopped for time.
+        _backfill_send_outcome(api_key, backend_url, config_dir, 'failed' if failed else 'completed', failed, previous)
+        reported = True
         if not found:
-            if _backfill_skipped_anything(_backfill_uploader_stats):
-                # Nothing else goes up, so the counts go alone; a device whose every transcript is skipped still reports.
-                _backfill_upload_chunk(api_key, backend_url, [])
             _backfill_write_cutoff(config_dir, started_at)
             print("[backfill] No past sessions found.")
             return
 
-        failed = chunks_total - chunks_sent
         sessions_sent = len(sessions_sent_ids)
         if sessions_sent == 0:
             print(f"[backfill] No sessions queued (all {chunks_total} uploads failed).")
@@ -2179,6 +2232,8 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
+        if not reported and config_dir is not None:
+            _backfill_save_outcome(config_dir, 'failed')
 
 
 def _wsl_distros():

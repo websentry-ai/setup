@@ -222,6 +222,11 @@ def _stats(seen=0, unreadable=0, count=0, largest=0, total=0):
             "skipped_over_cap": {"count": count, "largest_bytes": largest, "total_bytes": total, "by_size": by_size}}
 
 
+def _closing(stats, outcome="completed", failed=0):
+    """The run's closing report (WEB-6392): the walk's counts plus how the run ended."""
+    return {**stats, "outcome": outcome, "uploads_failed": failed}
+
+
 def _fake_http(bodies, raw=None):
     def http(url, method, headers, body=None, timeout=30):
         if url.endswith("/upload-url/"):
@@ -318,22 +323,24 @@ class MdmRunTestCase(_HomesMixin, unittest.TestCase):
         home, expected = self._home(("a", "b", "c"), big=(500, 900), no_id=1)
         bodies = _run(mdm, [home])
         counted = [b for b in bodies if "uploader_stats" in b]
-        self.assertEqual(counted, [{"tool_type": "claude-code", "sessions": [], "uploader_stats": expected}])
+        self.assertEqual(counted, [{"tool_type": "claude-code", "sessions": [], "uploader_stats": _closing(expected)}])
         self.assertIs(bodies[-1], counted[0])
         self.assertEqual(sorted(s["session_id"] for b in bodies[:-1] for s in b["sessions"]), ["a", "b", "c"])
 
-    def test_no_time_left_sends_no_counts(self):
+    def test_no_time_left_sends_the_outcome_without_counts(self):
         home, _ = self._home(("a",), big=(500,))
         bodies = _run(mdm, [home], [patch.object(mdm._BackfillRun, "has_time_for_a_batch",
                                                  side_effect=[True, False])])
-        self.assertEqual([[s["session_id"] for s in b["sessions"]] for b in bodies], [["a"]])
+        self.assertEqual([[s["session_id"] for s in b["sessions"]] for b in bodies], [["a"], []])
         self.assertNotIn("uploader_stats", bodies[0])
+        self.assertEqual(bodies[-1]["uploader_stats"], {"outcome": "completed", "uploads_failed": 0})
 
-    def test_nothing_skipped_sends_no_counts(self):
+    def test_nothing_skipped_still_sends_the_counts_once_at_the_end(self):
         home, _ = self._home(("a", "b"))
-        bodies = _run(mdm, [home])
-        self.assertTrue(bodies)
-        self.assertFalse(any("uploader_stats" in b or not b["sessions"] for b in bodies))
+        *uploads, closing = _run(mdm, [home])
+        self.assertTrue(uploads)
+        self.assertFalse(any("uploader_stats" in b or not b["sessions"] for b in uploads))
+        self.assertEqual((closing["sessions"], closing["uploader_stats"]), ([], _closing(_stats(seen=2))))
 
     def test_every_profile_is_summed(self):
         alice, first = self._home(("a",), big=(500, 2000), no_id=2)
@@ -341,7 +348,7 @@ class MdmRunTestCase(_HomesMixin, unittest.TestCase):
         total = _stats()
         mdm._backfill_add_stats(total, first)
         mdm._backfill_add_stats(total, second)
-        self.assertEqual(_run(mdm, [alice, bob])[-1]["uploader_stats"], total)
+        self.assertEqual(_run(mdm, [alice, bob])[-1]["uploader_stats"], _closing(total))
 
     def test_a_refused_profile_counts_nothing_and_keeps_no_state(self):
         alice, counted = self._home(("a",), big=(500,))
@@ -357,7 +364,7 @@ class MdmRunTestCase(_HomesMixin, unittest.TestCase):
             return result
         bodies = _run(mdm, [alice, bob], [patch("os.lstat", side_effect=lstat),
                                           patch.object(mdm.platform, "system", return_value="Windows")])
-        self.assertEqual(bodies[-1]["uploader_stats"], counted)
+        self.assertEqual(bodies[-1]["uploader_stats"], _closing(counted))
         self.assertEqual(sorted(s["session_id"] for b in bodies for s in b["sessions"]), ["a"])
         self.assertEqual(list(hooks.iterdir()), [])
         self.assertTrue((alice / ".claude" / "hooks" / mdm.BACKFILL_STATE_FILE).exists())
@@ -367,8 +374,9 @@ class MdmRunTestCase(_HomesMixin, unittest.TestCase):
         clean, _ = self._home(("b",))
         self.assertIn("uploader_stats", _run(mdm, [skipping])[-1])
         bodies = _run(mdm, [clean])
-        self.assertEqual([[s["session_id"] for s in b["sessions"]] for b in bodies], [["b"]])
+        self.assertEqual([[s["session_id"] for s in b["sessions"]] for b in bodies], [["b"], []])
         self.assertNotIn("uploader_stats", bodies[0])
+        self.assertEqual(bodies[-1]["uploader_stats"], _closing(_stats(seen=1)))
         self.assertIsNone(mdm._backfill_uploader_stats)
 
     def test_a_disabled_backfill_sends_nothing(self):
@@ -384,27 +392,30 @@ class StandaloneRunTestCase(_HomesMixin, unittest.TestCase):
     def test_every_chunk_carries_the_same_counts(self):
         home, expected = self._home(("a", "b", "c", "d"), big=(700,), no_id=2)
         # Room for one session per chunk, so the four go up apart.
-        bodies = _run(setup, [home], [patch.object(setup, "BACKFILL_CHUNK_BYTES", 150)])
+        *bodies, closing = _run(setup, [home], [patch.object(setup, "BACKFILL_CHUNK_BYTES", 150)])
         self.assertEqual(len(bodies), 4)
         self.assertEqual([b["uploader_stats"] for b in bodies], [expected] * 4)
+        self.assertEqual((closing["sessions"], closing["uploader_stats"]), ([], _closing(expected)))
         self.assertEqual(sorted(s["session_id"] for b in bodies for s in b["sessions"]), ["a", "b", "c", "d"])
 
     def test_a_run_that_only_skips_sends_the_counts_alone(self):
         home, expected = self._home(big=(500, 800), no_id=1)
         self.assertEqual(_run(setup, [home]),
-                         [{"tool_type": "claude-code", "sessions": [], "uploader_stats": expected}])
+                         [{"tool_type": "claude-code", "sessions": [], "uploader_stats": _closing(expected)}])
 
-    def test_an_empty_home_sends_nothing(self):
+    def test_an_empty_home_sends_only_its_closing_report(self):
         home, _ = self._home()
-        self.assertEqual(_run(setup, [home]), [])
+        closing = [{"tool_type": "claude-code", "sessions": [], "uploader_stats": _closing(_stats())}]
+        self.assertEqual(_run(setup, [home]), closing)
         shutil.rmtree(home / ".claude" / "projects")
-        self.assertEqual(_run(setup, [home]), [])
+        self.assertEqual(_run(setup, [home]), closing)
 
     def test_with_nothing_skipped_the_counts_still_ride_the_chunks(self):
         home, expected = self._home(("a", "b"))
-        bodies = _run(setup, [home])
+        *bodies, closing = _run(setup, [home])
         self.assertTrue(bodies)
         self.assertEqual([b["uploader_stats"] for b in bodies], [expected] * len(bodies))
+        self.assertEqual(closing["uploader_stats"], _closing(expected))
         self.assertEqual(expected, _stats(seen=2))
 
 

@@ -154,7 +154,7 @@ class MdmBandSumTestCase(unittest.TestCase):
         everything = [s for part in sizes for s in part]
         self.assertEqual(sorted(s["session_id"] for b in uploads for s in b["sessions"]), ["s0", "s1", "s2"])
         self.assertEqual(counts["sessions"], [])
-        self.assertEqual(counts["uploader_stats"], _sum_profiles(parts))
+        self.assertEqual(counts["uploader_stats"], {**_sum_profiles(parts), "outcome": "completed", "uploads_failed": 0})
         self.assertEqual(counts["uploader_stats"]["skipped_over_cap"]["by_size"], _spec_bands(everything))
 
     def _run(self, homes):

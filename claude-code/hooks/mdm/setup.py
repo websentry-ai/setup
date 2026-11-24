@@ -44,6 +44,9 @@ BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 # Where each transcript too big to read whole stopped, beside the walk's state, which other writes replace.
 BACKFILL_RESUME_FILE = '.unbound_backfill_resume'
+# How a run that could not send its closing report ended, for the next run to send as previous_outcome.
+BACKFILL_OUTCOME_FILE = '.unbound_backfill_outcome'
+BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'failed')
 _SCRIPT_START = time.time()
 # All measured from script start. No new batch starts unless it can land before the
 # soft stop (margin: 90s or 1.5x the slowest batch so far); the hard kill backs it up
@@ -61,6 +64,8 @@ BACKFILL_PUT_MIN_SECONDS = 45
 # from-s3 is sized to end this long before the hard deadline, and never given less than the floor per attempt.
 BACKFILL_FROM_S3_SLACK_SECONDS = 10
 BACKFILL_FROM_S3_MIN_SECONDS = 5
+# Kept free at the end of the soft stop for the run's closing report (outcome and counts): data stops this early.
+BACKFILL_STATS_RESERVE_SECONDS = 30
 
 
 def normalize_url(value: str) -> str:
@@ -2676,13 +2681,13 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
-def _backfill_put_budget_seconds() -> int:
-    # What one PUT may take and still leave from-s3 its turn before the soft stop.
-    return int(BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START)) - BACKFILL_FROM_S3_RESERVE_SECONDS
+def _backfill_put_budget_seconds(reserve: int = BACKFILL_STATS_RESERVE_SECONDS) -> int:
+    # What one PUT may take and still leave from-s3 its turn, and the closing report its reserve, before the soft stop.
+    return int(BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START)) - BACKFILL_FROM_S3_RESERVE_SECONDS - reserve
 
 
-def _backfill_has_time_for_a_chunk() -> bool:
-    return _backfill_put_budget_seconds() >= BACKFILL_PUT_MIN_SECONDS
+def _backfill_has_time_for_a_chunk(reserve: int = BACKFILL_STATS_RESERVE_SECONDS) -> bool:
+    return _backfill_put_budget_seconds(reserve) >= BACKFILL_PUT_MIN_SECONDS
 
 
 def _backfill_from_s3_timeout_seconds() -> int:
@@ -2694,6 +2699,8 @@ def _backfill_from_s3_timeout_seconds() -> int:
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> Optional[bool]:
     # None when the chunk ran out of time before its PUT could start: a stop, not a failed upload.
+    # The closing report (no sessions) is the one upload that may use the reserve.
+    reserve = BACKFILL_STATS_RESERVE_SECONDS if sessions else 0
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if _backfill_uploader_stats is not None:
         payload['uploader_stats'] = _backfill_uploader_stats
@@ -2709,7 +2716,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     })
 
     for _ in range(BACKFILL_PUT_ATTEMPTS):
-        if not _backfill_has_time_for_a_chunk():
+        if not _backfill_has_time_for_a_chunk(reserve):
             debug_print("S3 PUT not started: too close to the soft stop")
             return None
         code, body = _backfill_http_request(
@@ -2735,7 +2742,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
             return False
 
         # Measured after the link request, whose own retries can use up to two minutes.
-        put_cap = _backfill_put_budget_seconds()
+        put_cap = _backfill_put_budget_seconds(reserve)
         if put_cap < BACKFILL_PUT_MIN_SECONDS:
             debug_print("S3 PUT not started: the link request used the time left")
             return None
@@ -2952,11 +2959,26 @@ class _BackfillRun:
         self.force_epoch, self.force_days = force_config
         self.completed_watermark = completed_watermark
         self.slowest_batch = 0.0
+        self.uploads_failed = 0
+        self.stopped_by_time = False
 
     def has_time_for_a_batch(self) -> bool:
-        # Start a batch only if even the slowest one so far would land before the soft stop.
+        # Start a batch only if even the slowest one so far would land before the soft stop, less the
+        # closing report's reserve.
         margin = max(BACKFILL_MIN_MARGIN_SECONDS, 1.5 * self.slowest_batch)
-        return BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START) >= margin
+        return BACKFILL_SOFT_STOP_SECONDS - BACKFILL_STATS_RESERVE_SECONDS - (time.time() - _SCRIPT_START) >= margin
+
+    def out_of_time(self) -> bool:
+        """No batch fits any more; remembered, so the run reports it stopped for time."""
+        if self.has_time_for_a_batch():
+            return False
+        self.stopped_by_time = True
+        return True
+
+    def outcome(self, statuses: set) -> str:
+        if 'failed' in statuses:
+            return 'failed'
+        return 'stopped_by_time_limit' if self.stopped_by_time else 'completed'
 
     def upload(self, sessions: List[Dict], forced: bool) -> Tuple[int, int, bool]:
         """(sessions_sent, chunks_failed, out_of_time) for one batch."""
@@ -2964,7 +2986,9 @@ class _BackfillRun:
         try:
             sent, _, failed = _backfill_send_sessions(self.api_key, self.backend_url, sessions, forced)
         except _BackfillOutOfTime as stop:
+            self.stopped_by_time = True
             return stop.args[0], 0, True
+        self.uploads_failed += failed
         return sent, failed, False
 
 
@@ -2984,7 +3008,7 @@ def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], sessio
     _backfill_attach_identity([session], run.device_serial, None)
     resume = _run_as_user(username, _backfill_read_file_resume, home_dir, session, tag)
     while True:
-        if not run.has_time_for_a_batch():
+        if run.out_of_time():
             return sent, 'more'
         began = time.time()
         result = _run_as_user(username, _backfill_read_slice_or_false, session, resume, BACKFILL_CHUNK_BYTES)
@@ -3018,7 +3042,7 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
         return 0, 0, 'unreadable'
     start, home_forced, sent_total, batches = None, None, 0, 0
     for _ in range(BACKFILL_MAX_BATCHES_PER_HOME):
-        if not run.has_time_for_a_batch():
+        if run.out_of_time():
             return sent_total, batches, 'more'
         began = time.time()
         result = _run_as_user(username, _backfill_collect_sessions, home_dir,
@@ -3095,6 +3119,77 @@ def _backfill_add_stats(total: Dict, part: Optional[Dict]) -> None:
         over['by_size'][name]['total_bytes'] += band['total_bytes']
 
 
+def _backfill_outcome_path(home: Path) -> Path:
+    return _backfill_state_path(home).with_name(BACKFILL_OUTCOME_FILE)
+
+
+def _backfill_read_outcome(home: Path) -> Optional[str]:
+    try:
+        value = _backfill_outcome_path(home).read_text().strip()
+    except OSError:
+        return None
+    return value if value in BACKFILL_OUTCOMES else None
+
+
+def _backfill_clear_outcome(home: Path) -> None:
+    path = _backfill_outcome_path(home)
+    if _backfill_root_is_linked(home / '.claude', path.parent):
+        return  # never delete through a link into another profile
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _backfill_save_outcome(user_homes: List[Tuple[str, Path]], outcome: str) -> None:
+    # In every profile, each as its own user; the next run takes the first it finds. Never raises: it also
+    # runs from the error path.
+    for username, home_dir in user_homes:
+        try:
+            _run_as_user(username, _backfill_write_state_text, home_dir, outcome, BACKFILL_OUTCOME_FILE)
+        except Exception as e:
+            debug_print(f"backfill outcome not saved for {username}: {e}")
+
+
+def _backfill_take_outcome(user_homes: List[Tuple[str, Path]]) -> Optional[str]:
+    """The outcome an earlier run could not send. Replaced by stopped_by_time_limit until this run reports:
+    the hard deadline kills a run with no chance to save anything, and that is how such a run ended."""
+    found = (_run_as_user(username, _backfill_read_outcome, home_dir) for username, home_dir in user_homes)
+    previous = next((outcome for outcome in found if outcome), None)
+    _backfill_save_outcome(user_homes, 'stopped_by_time_limit')
+    return previous
+
+
+def _backfill_send_outcome(run: _BackfillRun, user_homes: List[Tuple[str, Path]], outcome: str,
+                           previous: Optional[str]) -> None:
+    """The run's closing upload: the counts when there is time to walk for them, how the run ended, and an
+    earlier run's unsent outcome. Left on disk for the next run when it can't go."""
+    global _backfill_uploader_stats
+    stats: Dict = {}
+    # Walked after the uploads, with the time left, so a large history never holds an upload back.
+    if run.has_time_for_a_batch():
+        stats = _backfill_empty_stats()
+        for username, home_dir in user_homes:
+            _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
+    stats.update(outcome=outcome, uploads_failed=run.uploads_failed)
+    if previous:
+        stats['previous_outcome'] = previous
+    _backfill_uploader_stats = stats
+    try:
+        sent = _backfill_upload_chunk(run.api_key, run.backend_url, []) is True
+    finally:
+        _backfill_uploader_stats = None  # data uploads never carry it
+    if not sent:
+        debug_print(f"backfill outcome {outcome} not sent; the next run sends it")
+        _backfill_save_outcome(user_homes, outcome)
+        return
+    for username, home_dir in user_homes:
+        try:
+            _run_as_user(username, _backfill_clear_outcome, home_dir)
+        except Exception as e:  # sent already; only the next run's previous_outcome can be off
+            debug_print(f"backfill outcome not cleared for {username}: {e}")
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
@@ -3108,10 +3203,12 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
 
+    reported = False
     try:
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
             return
+        previous = _backfill_take_outcome(user_homes)
         device_serial = get_device_identifier()
         # Watermark first: a force request filed after this instant must stay pending.
         completed_watermark = time.time()
@@ -3129,17 +3226,13 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print(f"backfill {user_home[0]}: {status}, {sent} sessions in {home_batches} batches")
             sessions_sent, batches = sessions_sent + sent, batches + home_batches
             statuses.add(status)
-        # Counted after the uploads, with the time left, so a large history never holds an upload back.
-        if run.has_time_for_a_batch():
-            stats = _backfill_empty_stats()
-            for username, home_dir in user_homes:
-                _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
-            if _backfill_skipped_anything(stats):
-                _backfill_uploader_stats = stats
-                _backfill_upload_chunk(api_key, backend_url, [])
+        _backfill_send_outcome(run, user_homes, run.outcome(statuses), previous)
+        reported = True
         _backfill_report(sessions_sent, batches, statuses)
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
+        if user_homes and not reported:
+            _backfill_save_outcome(user_homes, 'failed')
 
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:
