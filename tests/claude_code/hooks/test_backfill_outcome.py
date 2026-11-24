@@ -189,3 +189,24 @@ class AHooksFolderSetupCannotWriteTestCase(_Homes):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheReserveCoversTheClosingReportTestCase(_Homes):
+
+    def test_a_last_data_put_that_runs_to_its_cap_still_leaves_the_closing_report_its_time(self):
+        """The worst case the reserve exists for: the last batch starts at the edge, its link request takes
+        a second and its PUT the whole cap. The closing report must still clear the PUT floor."""
+        home = self._home(("a",))
+        clock = [time.time()]  # after the transcript: one stamped later than the clock reads as from the future
+        start = mdm.BACKFILL_SOFT_STOP_SECONDS - mdm.BACKFILL_STATS_RESERVE_SECONDS - mdm.BACKFILL_MIN_MARGIN_SECONDS
+
+        class Timed(_Backend):
+            def __call__(self, url, method, headers, body=None, timeout=30):
+                clock[0] += timeout if method == "PUT" and json.loads(body)["sessions"] else 1
+                return super().__call__(url, method, headers, body, timeout)
+
+        backend = _run(mdm, home, Timed(),
+                       [patch.object(mdm.time, "time", lambda: clock[0]),
+                        patch.object(mdm, "_SCRIPT_START", clock[0] - start)])
+        self.assertEqual([b["sessions"] != [] for b in backend.bodies], [True, False])
+        self.assertEqual(len(backend.stats()), 1)

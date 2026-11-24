@@ -65,7 +65,10 @@ BACKFILL_PUT_MIN_SECONDS = 45
 BACKFILL_FROM_S3_SLACK_SECONDS = 10
 BACKFILL_FROM_S3_MIN_SECONDS = 5
 # Kept free at the end of the soft stop for the run's closing report (outcome and counts): data stops this early.
-BACKFILL_STATS_RESERVE_SECONDS = 30
+# A last data PUT can run to its cap, so this must hold the closing upload's PUT floor and its link request
+# (30s an attempt); from-s3 has a reserve of its own.
+BACKFILL_LINK_REQUEST_SECONDS = 30
+BACKFILL_STATS_RESERVE_SECONDS = BACKFILL_PUT_MIN_SECONDS + BACKFILL_LINK_REQUEST_SECONDS
 
 
 def normalize_url(value: str) -> str:
