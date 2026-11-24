@@ -364,3 +364,48 @@ def test_lines_that_are_not_log_entries_are_skipped(env, backend):
     _log(env["home"], "claude-code", ["not an entry", f"{_utc(5)}: real one", "  continued text"])
     _run(backend)
     assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == ["real one"]
+
+
+# --- F9: the run reports' inputs fail open ---------------------------------------
+
+def _first_call_raises(module, name, monkeypatch):
+    """Raises on run()'s own call only: the tools call the same function afterwards."""
+    real, calls = getattr(module, name), []
+
+    def flaky(*a, **k):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError(f"{name} broke")
+        return real(*a, **k)
+    monkeypatch.setattr(module, name, flaky)
+
+
+def _installs_everything(env):
+    assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
+    assert (env["tmp"] / "managed-codex" / "hooks.json").exists()
+    assert (env["tmp"] / "enterprise-cursor" / "hooks.json").exists()
+    assert (env["home"] / ".copilot" / "hooks" / "unbound.json").exists()
+    assert len(env["notified"]) == 5
+
+
+def test_a_serial_lookup_that_raises_costs_only_the_run_reports(env, backend, monkeypatch):
+    _first_call_raises(env["modules"]["claude-code"], "get_device_identifier", monkeypatch)
+    assert _run(backend) == 0
+    _installs_everything(env)
+    assert _run_reports(backend) == []
+
+
+def test_a_home_lookup_that_raises_costs_only_the_home_counts(env, backend, monkeypatch):
+    _first_call_raises(env["modules"]["claude-code"], "get_all_user_homes", monkeypatch)
+    assert _run(backend) == 0
+    _installs_everything(env)
+    start, end = (r["body"] for r in _run_reports(backend))
+    assert "user_homes" not in end
+    assert "no user homes found" not in end["preflight_warnings"]
+
+
+def test_preflight_checks_that_raise_cost_only_the_warnings(env, backend, monkeypatch):
+    monkeypatch.setattr(setup_cmd, "_preflight_warnings", lambda homes: 1 / 0)
+    assert _run(backend) == 0
+    _installs_everything(env)
+    assert _run_reports(backend)[-1]["body"]["preflight_warnings"] == []

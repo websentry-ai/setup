@@ -161,13 +161,23 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _report_input(fn, fallback, what):
+    """A value only the run reports use: when it can't be had, the reports lose it, never the install."""
+    try:
+        return fn()
+    except Exception as e:
+        print(f"[report] {what} unavailable: {e}")
+        return fallback
+
+
 def _send_run_report(opts, serial, phase, fields) -> None:
+    """fields is called here, inside the fail-open guard."""
     try:
         if not serial:  # the endpoint joins on it; without one the report is dropped anyway
             print(f"[report] install-report {phase} not sent: no device serial")
             return
         body = {"serial_number": serial, "phase": phase,
-                "install_mode": "binary-skip" if opts["skip_managed_settings"] else "binary", **fields}
+                "install_mode": "binary-skip" if opts["skip_managed_settings"] else "binary", **fields()}
         code, _ = _post_json(opts["backend_url"] + INSTALL_REPORT_PATH, body, {"X-API-KEY": opts["api_key"]})
         if not 200 <= code < 300:
             print(f"[report] install-report {phase} not sent: HTTP {code}")
@@ -184,11 +194,11 @@ def _start_fields() -> dict:
 
 
 def _preflight_warnings(user_homes) -> list:
-    """What this run can already tell will keep the device from reporting."""
+    """What this run can already tell will keep the device from reporting. user_homes None: unknown."""
     warnings = []
     if not HOOK_BINARY.is_file():  # every managed hook command points at it
         warnings.append(f"hook binary not found at {HOOK_BINARY}")
-    if not user_homes:
+    if user_homes == []:
         warnings.append("no user homes found")
     return warnings
 
@@ -246,11 +256,12 @@ def _report(m, tool, api_key, status, reason=None, **fields):
 
 
 def _end_fields(opts, user_homes, warnings) -> dict:
-    writes = opts.get("config_writes", {})
-    configured = sum(1 for _, home in user_homes if writes.get(str(home)) is True)
-    return {"timestamps": {"completed_at": _utc_now()},
-            "preflight_warnings": warnings,
-            "user_homes": {"configured": configured, "skipped": len(user_homes) - configured}}
+    fields = {"timestamps": {"completed_at": _utc_now()}, "preflight_warnings": warnings}
+    if user_homes is not None:  # unknown homes send no counts rather than wrong ones
+        writes = opts.get("config_writes", {})
+        configured = sum(1 for _, home in user_homes if writes.get(str(home)) is True)
+        fields["user_homes"] = {"configured": configured, "skipped": len(user_homes) - configured}
+    return fields
 
 
 # ---------------------------------------------------------------------------
@@ -1831,10 +1842,11 @@ def run(argv) -> int:
         opts["frontend_url"] = m0.normalize_url(opts["frontend_url"])
 
     opts["config_writes"] = {}
-    serial = m0.get_device_identifier()
-    user_homes = m0.get_all_user_homes()
-    warnings = _preflight_warnings(user_homes)
-    _send_run_report(opts, serial, "start", _start_fields())
+    # Report-only inputs: none of them may stop the install or change its exit code.
+    serial = _report_input(m0.get_device_identifier, None, "device serial")
+    user_homes = _report_input(m0.get_all_user_homes, None, "user homes")
+    warnings = _report_input(lambda: _preflight_warnings(user_homes), [], "preflight checks")
+    _send_run_report(opts, serial, "start", _start_fields)
 
     statuses = {}
 
@@ -1869,5 +1881,5 @@ def run(argv) -> int:
         print(line)
         if status == "deferred":
             any_deferred = True
-    _send_run_report(opts, serial, "end", _end_fields(opts, user_homes, warnings))
+    _send_run_report(opts, serial, "end", lambda: _end_fields(opts, user_homes, warnings))
     return 1 if any_deferred else 0
