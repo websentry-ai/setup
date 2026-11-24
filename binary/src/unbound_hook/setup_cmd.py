@@ -296,7 +296,8 @@ _HOOK_ERROR_LOGS = {
     "copilot": (".copilot/hooks/error.log", "copilot"),
     "augment": (".augment/hooks/error.log", "augment_code"),
 }
-# Beside each error.log: the timestamp of the newest entry the gateway accepted.
+# Beside each error.log: "<timestamp> <n>", the newest entry the gateway accepted and how many entries
+# stamped exactly then were sent (two can share a stamp, and a request can end between them).
 FORWARDED_STATE_NAME = ".error_log_forwarded"
 HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
 # error.log is the user's to write: per tool and home, a run sends at most the newest 25 (what a hook keeps)
@@ -317,30 +318,46 @@ def _log_time(text):
     return when if when.tzinfo else None
 
 
-def _unsent_hook_errors(log: Path) -> list:
-    """Runs as the profile's user: the newest HOOK_ERRORS_PER_RUN entries newer than both the last one
-    forwarded and HOOK_ERROR_MAX_AGE, oldest first."""
-    floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
+def _forwarded_place(log: Path):
+    """(timestamp, how many entries stamped then were sent) from the state file; (None, 0) for none.
+    A bare timestamp, as written before the count, means every entry stamped then was sent."""
     try:
-        last = _log_time(_read_user_file(log.with_name(FORWARDED_STATE_NAME), follow=False).decode().strip())
+        parts = _read_user_file(log.with_name(FORWARDED_STATE_NAME), follow=False).decode().split()
     except (OSError, UnicodeDecodeError):
-        last = None
-    if last is not None and last > floor:
-        floor = last
-    entries = []
+        return None, 0
+    last = _log_time(parts[0]) if parts else None
+    sent_then = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else float("inf")
+    return last, sent_then if last else 0
+
+
+def _unsent_hook_errors(log: Path) -> list:
+    """Runs as the profile's user: the newest HOOK_ERRORS_PER_RUN entries after the last one forwarded and
+    newer than HOOK_ERROR_MAX_AGE, oldest first. Each carries the 'state' to save once it is sent."""
+    floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
+    last, sent_then = _forwarded_place(log)
+    entries, seen_then = [], 0
     for line in _read_user_file(log, follow=False).decode("utf-8", "replace").splitlines():
         match = _HOOK_ERROR_LINE.match(line)
         when = _log_time(match.group(1)) if match else None
-        if when and when > floor:
-            entries.append((when, {"timestamp": match.group(1), "message": match.group(2)[:2000],
-                                   "category": FORWARDED_ERROR_CATEGORY}))
-    entries.sort(key=lambda entry: entry[0])
-    return [entry for _, entry in entries[-HOOK_ERRORS_PER_RUN:]]
+        if when is None or when <= floor:
+            continue
+        if last is not None and when <= last:
+            seen_then += when == last
+            if when < last or seen_then <= sent_then:
+                continue  # sent already
+        entries.append((when, {"timestamp": match.group(1), "message": match.group(2)[:2000],
+                               "category": FORWARDED_ERROR_CATEGORY}))
+    entries.sort(key=lambda entry: entry[0])  # stable: entries sharing a stamp keep the log's order
+    chosen = entries[-HOOK_ERRORS_PER_RUN:]
+    for i, (when, entry) in enumerate(chosen):
+        same = sum(1 for other, _ in chosen[:i + 1] if other == when) + (sent_then if when == last else 0)
+        entry["state"] = f"{entry['timestamp']} {same}"
+    return [entry for _, entry in chosen]
 
 
-def _save_forwarded(log: Path, timestamp: str) -> bool:
+def _save_forwarded(log: Path, state: str) -> bool:
     """Runs as the profile's user."""
-    _replace_user_file(log.with_name(FORWARDED_STATE_NAME), timestamp.encode("utf-8"), 0o600)
+    _replace_user_file(log.with_name(FORWARDED_STATE_NAME), state.encode("utf-8"), 0o600)
     return True
 
 
@@ -348,8 +365,9 @@ def _post_hook_errors(url, api_key, hook_source, hook_sha, batch) -> str:
     """The hook's own request shape and auth. 'sent' when the gateway took them; 'down' when it gave no
     answer or a 5xx; 'refused' when it answered no. It refuses only a key (200 with success false, or a
     4xx), never an entry, so a refusal is about this tool's key and not about what the log holds."""
-    errors = [dict(entry, message=re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]",
-                                          entry["message"].replace(api_key, "[REDACTED]")))
+    errors = [{**{k: v for k, v in entry.items() if k != "state"},
+               "message": re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]",
+                                 entry["message"].replace(api_key, "[REDACTED]"))}
               for entry in batch]
     code, answer = _post_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
                               {"Authorization": f"Bearer {api_key}"})
@@ -374,7 +392,7 @@ def _forward_home_errors(m, username, log, send):
         verdict = send(batch)
         if verdict != "sent":
             return start, verdict
-        if _as_user(m, username, _save_forwarded, log, batch[-1]["timestamp"]) is not True:
+        if _as_user(m, username, _save_forwarded, log, batch[-1]["state"]) is not True:
             print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
             return start + len(batch), "sent"
     return len(entries), "sent"

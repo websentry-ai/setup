@@ -318,7 +318,7 @@ def test_errors_newer_than_the_last_forwarded_one_go_to_the_gateway(env, backend
     assert body["hook_source"] == "claude-code" and len(body["hook_sha"]) == 12
     assert [(e["timestamp"], e["message"]) for e in body["errors"]] == [
         (_utc(1), "gateway unreachable 1"), (_utc(2), "gateway unreachable 2")]
-    assert log.with_name(STATE).read_text() == _utc(2)
+    assert log.with_name(STATE).read_text() == f"{_utc(2)} 1"
 
 
 def test_errors_go_ten_to_a_request_and_none_is_sent_twice(env, backend):
@@ -326,7 +326,7 @@ def test_errors_go_ten_to_a_request_and_none_is_sent_twice(env, backend):
     _run(backend)
     assert [len(r["body"]["errors"]) for r in _forwarded(backend)] == [10, 10, 5]
     assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == [f"e{n}" for n in range(25)]
-    assert log.with_name(STATE).read_text() == _utc(24)
+    assert log.with_name(STATE).read_text() == f"{_utc(24)} 1"
     backend.requests.clear()
     _run(backend)
     assert _forwarded(backend) == []
@@ -366,7 +366,7 @@ def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, 
     sent = {r["body"]["hook_source"]: [e["message"] for e in r["body"]["errors"]] for r in _forwarded(backend)}
     assert sent == {"cursor": ["cursor broke"], "copilot": ["copilot broke"], "codex": ["codex broke"],
                     "claude-code": ["bob's claude broke"], "augment_code": ["auggie broke"]}
-    assert (env["home"] / ".copilot/hooks" / STATE).read_text() == _pacific(1)
+    assert (env["home"] / ".copilot/hooks" / STATE).read_text() == f"{_pacific(1)} 1"
     assert (other / ".claude/hooks" / STATE).exists() and not (env["home"] / ".claude/hooks" / STATE).exists()
     # Cursor's setup removes the python-era ~/.cursor/hooks, log and all, after its errors went out.
     assert not (env["home"] / ".cursor/hooks").exists()
@@ -437,7 +437,7 @@ def test_a_huge_log_sends_only_its_25_newest_entries(env, backend):
     _run(backend)
     assert len(_forwarded(backend)) <= 3
     assert [m.split()[1] for m in _messages(backend)] == [str(n) for n in range(39975, 40000)]
-    assert log.with_name(STATE).read_text() == _utc(39999 / 100)
+    assert log.with_name(STATE).read_text() == f"{_utc(39999 / 100)} 1"
 
 
 def test_entries_older_than_seven_days_are_never_sent(env, backend):
@@ -519,7 +519,7 @@ def test_a_state_file_that_is_a_link_is_replaced_not_followed(env, backend, tmp_
     assert _messages(backend) == ["e0", "e1"]
     assert victim.read_text() == _utc(100)
     state = log.with_name(STATE)
-    assert not state.is_symlink() and state.read_text() == _utc(1)
+    assert not state.is_symlink() and state.read_text() == f"{_utc(1)} 1"
 
 
 # --- S-U5: what reaches the gateway, and Sentry behind it ------------------------
@@ -602,3 +602,23 @@ def test_a_key_the_gateway_refuses_stops_only_that_tool(env, backend):
     assert {r["body"]["hook_source"] for r in _forwarded(backend)} == {"codex", "copilot"}
     assert (env["home"] / ".copilot/hooks" / STATE).exists()
     assert not (env["home"] / ".codex/hooks" / STATE).exists()  # refused: retried next run
+
+
+# --- Review #9: entries sharing the saved timestamp aren't lost ------------------
+
+def test_an_entry_sharing_the_last_sent_timestamp_is_still_sent(env, backend):
+    same = _utc(9)
+    lines = [f"{_utc(n)}: e{n}" for n in range(9)] + [f"{same}: e9", f"{same}: e10"]
+    _log(env["home"], "claude-code", lines)
+    ok = {"status": "ok", "success": True, "accepted": 1}
+    # The batch boundary (ten a request) falls between e9 and e10; the second request fails.
+    backend.answer = lambda path: (503, {}) if len(_forwarded(backend)) == 2 else (200, ok)
+    _run(backend)
+    assert _messages(backend) == [f"e{n}" for n in range(11)]  # e10 was tried, not taken
+    backend.requests.clear()
+    backend.answer = lambda path: (200, ok)
+    _run(backend)
+    assert _messages(backend) == ["e10"]
+    backend.requests.clear()
+    _run(backend)
+    assert _messages(backend) == []
