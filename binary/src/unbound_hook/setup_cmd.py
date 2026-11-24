@@ -28,6 +28,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -109,19 +110,29 @@ REPORT_TIMEOUT_SECONDS = 5
 
 def _post_json(url, body, headers, timeout=REPORT_TIMEOUT_SECONDS):
     """POST a JSON body with curl (the system trust store, as every call here uses).
-    Returns (http status, response bytes); status 0 when nothing came back. Never raises."""
-    cmd = ["curl", "-sS", "-m", str(timeout), "-X", "POST", "-w", "\n%{http_code}",
-           "-H", "Content-Type: application/json"]
-    for name, value in headers.items():
-        cmd += ["-H", f"{name}: {value}"]
-    cmd += ["--data-binary", "@-", "--", url]
+    Returns (http status, response bytes); status 0 when nothing came back. Never raises.
+    The headers carry keys, and any local user can read a process's argv, so they go to
+    curl in a 0600 file (-H @file) that is removed afterwards."""
+    header_file = None
     try:
+        fd, header_file = tempfile.mkstemp(prefix=".unbound-headers.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("".join(f"{name}: {value}\n" for name, value in
+                            {"Content-Type": "application/json", **headers}.items()))
+        cmd = ["curl", "-sS", "-m", str(timeout), "-X", "POST", "-w", "\n%{http_code}",
+               "-H", f"@{header_file}", "--data-binary", "@-", "--", url]
         result = subprocess.run(cmd, input=json.dumps(body).encode("utf-8"),
                                 capture_output=True, timeout=timeout + 3)
         answer, _, code = (result.stdout or b"").rpartition(b"\n")
         return int(code.strip() or 0), answer
     except Exception:
         return 0, b""
+    finally:
+        if header_file:
+            try:
+                os.unlink(header_file)
+            except OSError:
+                pass
 
 
 def _module(tool):

@@ -6,6 +6,8 @@ primitives are stubbed by the `env` fixture, as in test_setup_migration.
 """
 
 import json
+import os
+import stat
 import re
 import threading
 from datetime import datetime, timedelta, timezone
@@ -532,3 +534,29 @@ def test_the_key_and_bearer_tokens_are_redacted_and_messages_cut(env, backend):
                                   "retry said Bearer [REDACTED] and gave up", "y" * 2000]
     [request] = _forwarded(backend)
     assert not re.search(r"per-device-key|sk-live-abc123|tok_lower", json.dumps(request["body"]))
+
+
+# --- Review #5: keys never ride on curl's argv ----------------------------------
+
+def test_no_key_reaches_a_curl_command_line(env, backend, monkeypatch):
+    """Any local user can read a process's argv with ps; the headers go in a 0600 file instead."""
+    import subprocess as sp
+    real_run, argvs, modes = sp.run, [], []
+
+    def recording_run(cmd, *a, **k):
+        if cmd and cmd[0] == "curl":
+            argvs.append(list(cmd))
+            for arg in cmd:
+                if arg.startswith("@") and os.path.exists(arg[1:]):
+                    modes.append(stat.S_IMODE(os.stat(arg[1:]).st_mode))
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(setup_cmd.subprocess, "run", recording_run)
+    _log(env["home"], "claude-code", [f"{_utc(0)}: e0"])
+    assert _run(backend) == 0
+    assert argvs, "the run made no curl calls"
+    assert not [a for argv in argvs for a in argv if "admin-key" in a or "per-device-key" in a]
+    assert modes and set(modes) == {0o600}
+    # The headers still arrive.
+    assert {r["headers"].get("X-API-KEY") for r in _run_reports(backend)} == {"admin-key"}
+    assert _forwarded(backend)[0]["headers"]["Authorization"] == "Bearer per-device-key"
