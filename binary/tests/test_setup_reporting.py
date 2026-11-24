@@ -560,3 +560,26 @@ def test_no_key_reaches_a_curl_command_line(env, backend, monkeypatch):
     # The headers still arrive.
     assert {r["headers"].get("X-API-KEY") for r in _run_reports(backend)} == {"admin-key"}
     assert _forwarded(backend)[0]["headers"]["Authorization"] == "Bearer per-device-key"
+
+
+# --- Review #3: no forwarding where the place can't be saved --------------------
+
+def test_a_log_whose_place_cannot_be_saved_is_not_forwarded_run_after_run(env, backend):
+    log = _log(env["home"], "claude-code", [f"{_utc(n)}: e{n}" for n in range(3)])
+    log.parent.chmod(0o555)  # the user can't write .error_log_forwarded beside it
+    try:
+        _run(backend)
+        _run(backend)
+    finally:
+        log.parent.chmod(0o755)
+    assert _forwarded(backend) == []
+    assert not log.with_name(STATE).exists()
+
+
+def test_a_save_that_fails_after_a_send_stops_that_home(env, backend, monkeypatch):
+    _log(env["home"], "claude-code", [f"{_utc(n)}: e{n}" for n in range(15)])
+    # What the real privilege drop hands back when the write inside it fails.
+    monkeypatch.setattr(setup_cmd, "_save_forwarded", lambda log, state: None)
+    _run(backend)
+    # The first ten went out; with their place unsaved the rest wait rather than pile up repeats.
+    assert [len(r["body"]["errors"]) for r in _forwarded(backend)] == [10]

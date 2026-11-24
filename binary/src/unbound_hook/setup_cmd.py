@@ -359,13 +359,19 @@ def _post_hook_errors(url, api_key, hook_source, hook_sha, batch) -> bool:
 
 
 def _forward_home_errors(m, username, log, send):
-    """(entries sent, whether every request went through). The place is saved after each accepted request."""
+    """(entries sent, whether every request went through). The place is saved after each accepted request;
+    where it can't be saved nothing more is sent, or every run would send the same entries again."""
+    if _as_user(m, username, _writable_dir, log.parent) is not True:
+        print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
+        return 0, True
     entries = _as_user(m, username, _unsent_hook_errors, log) or []
     for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
         batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
         if not send(batch):
             return start, False
-        _as_user(m, username, _save_forwarded, log, batch[-1]["timestamp"])
+        if _as_user(m, username, _save_forwarded, log, batch[-1]["timestamp"]) is not True:
+            print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
+            return start + len(batch), True
     return len(entries), True
 
 
