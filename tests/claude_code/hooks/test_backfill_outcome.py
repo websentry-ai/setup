@@ -8,7 +8,7 @@ import shutil
 import tempfile
 import time
 import unittest
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,9 +22,10 @@ class _Backend:
     """Records each uploaded body. fail_puts: the PUTs (by index) S3 refuses; down: every request fails."""
 
     def __init__(self, fail_puts=(), down=False):
-        self.bodies, self.fail_puts, self.down, self.puts = [], set(fail_puts), down, 0
+        self.bodies, self.fail_puts, self.down, self.puts, self.calls = [], set(fail_puts), down, 0, 0
 
     def __call__(self, url, method, headers, body=None, timeout=30):
+        self.calls += 1
         if self.down:
             return -7, b""  # curl: could not connect
         if url.endswith("/upload-url/"):
@@ -152,6 +153,38 @@ class AnUnsentOutcomeGoesUpNextRunTestCase(_Homes):
                 (hooks / up.BACKFILL_OUTCOME_FILE).write_text("exploded\n")
                 [stats] = _run(up, home, _Backend()).stats()
                 self.assertNotIn("previous_outcome", stats)
+
+
+class AHooksFolderSetupCannotWriteTestCase(_Homes):
+    """MDM runs can leave a root-owned ~/.claude/hooks behind, which neither uploader can write as the user.
+    Saving the outcome there fails; the run must end as it always did, and still try to report."""
+
+    def _hooks_not_writable(self, home):
+        hooks = home / ".claude" / "hooks"
+        hooks.mkdir(parents=True, exist_ok=True)
+        hooks.chmod(0o555)
+        self.addCleanup(hooks.chmod, 0o755)  # runs before the home's rmtree
+        return hooks
+
+    def test_an_outcome_that_cannot_be_saved_never_breaks_the_run(self):
+        for up in (mdm, setup):
+            with self.subTest(up.__name__):
+                home = self._home(("a",))
+                hooks = self._hooks_not_writable(home)
+                errors = io.StringIO()
+                with redirect_stderr(errors):
+                    backend = _run(up, home, _Backend(down=True))
+                self.assertGreater(backend.calls, 0, "the closing upload was never tried")
+                self.assertNotIn("Skipped due to error", errors.getvalue())
+                self.assertEqual(list(hooks.iterdir()), [])
+
+    def test_the_closing_report_still_goes_up(self):
+        for up in (mdm, setup):
+            with self.subTest(up.__name__):
+                home = self._home(("a",))
+                self._hooks_not_writable(home)
+                [stats] = _run(up, home, _Backend()).stats()
+                self.assertEqual(stats["outcome"], "completed")
 
 
 if __name__ == "__main__":
