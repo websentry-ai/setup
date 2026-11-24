@@ -2088,8 +2088,11 @@ def hook_script_hash(script_path) -> Optional[str]:
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
-                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None):
-    """Notify backend that tool setup completed. Never fails the setup."""
+                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None,
+                          status: Optional[str] = None, reason: Optional[str] = None,
+                          written_to: Optional[str] = None):
+    """Notify backend how tool setup ended. Never fails the setup. status is configured, skipped or
+    deferred; left out, the backend reads configured, as from older installers."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
         body = {"tool_type": tool_type, "managed": True}
@@ -2101,6 +2104,9 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
             body["hook_hash"] = hook_hash
         if install_mode is not None:
             body["install_mode"] = install_mode
+        for key, value in (("status", status), ("reason", reason), ("written_to", written_to)):
+            if value is not None:
+                body[key] = str(value)[:500]  # the backend's limit
         data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",

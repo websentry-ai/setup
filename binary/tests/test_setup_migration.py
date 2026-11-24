@@ -83,6 +83,8 @@ def env(tmp_path, monkeypatch):
     # The run's own reports never leave the machine from a test; test_setup_reporting
     # points them at a local server instead.
     monkeypatch.setattr(setup_cmd, "_post_json", lambda *a, **k: (0, b""))
+    # Which tools look installed must not depend on the machine running the tests.
+    monkeypatch.setattr(setup_cmd, "_MACHINE_ROOT", tmp_path / "machine")
     return {"tmp": tmp_path, "home": home, "modules": modules,
             "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts,
             "daemon_bootouts": daemon_bootouts}
@@ -1824,7 +1826,9 @@ def test_a_python_era_copilot_hook_behind_a_locked_folder_is_tampered(env, monke
         setup_cmd.run(["--api-key", "admin-key"])
     finally:
         hooks_dir.chmod(0o755)
-    assert _states(env, "copilot") == ["tampered"]
+    # The tamper is still reported, then why setup deferred (WEB-6392).
+    assert _states(env, "copilot") == ["tampered", None]
+    assert [k.get("status") for a, k in env["notified"] if a[1] == "copilot"] == [None, "deferred"]
 
 
 @pytest.mark.parametrize("tool", ["claude-code", "augment_code"])

@@ -136,3 +136,138 @@ def test_a_backend_error_changes_nothing_about_the_run(env, backend, capsys):
     assert _run(backend) == 0
     assert [r["body"]["phase"] for r in _run_reports(backend)] == ["start", "end"]
     assert "[report] install-report end not sent: HTTP 500" in capsys.readouterr().out
+
+
+# --- Step 3: every tool's outcome, every run -----------------------------------
+
+# One footprint per tool that proves it is installed, under the patched machine root.
+FOOTPRINTS = {
+    "claude-code": "opt/homebrew/bin/claude",
+    "cursor": "Applications/Cursor.app",
+    "codex": "usr/local/bin/codex",
+    "copilot": "Applications/Visual Studio Code.app",
+    "augment": "opt/homebrew/bin/auggie",
+}
+TOOL_TYPES = {"claude-code": "claude-code", "cursor": "cursor", "codex": "codex",
+              "copilot": "copilot", "augment": "augment_code"}
+NAMES = {"claude-code": "Claude Code", "cursor": "Cursor", "codex": "Codex",
+         "copilot": "GitHub Copilot", "augment": "Augment"}
+
+
+def _install(root, relpath):
+    path = root / relpath
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.mkdir() if relpath.endswith(".app") else path.write_text("")
+
+
+@pytest.fixture
+def machine(env, tmp_path, monkeypatch):
+    root = tmp_path / "machine"
+    root.mkdir()
+    monkeypatch.setattr(setup_cmd, "_MACHINE_ROOT", root)
+    return root
+
+
+def _reports(env, tool):
+    return [k for a, k in env["notified"] if a[1] == TOOL_TYPES[tool]]
+
+
+def test_every_installed_tool_reports_configured_and_where_it_wrote(env, machine):
+    for relpath in FOOTPRINTS.values():
+        _install(machine, relpath)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    written = {
+        "claude-code": str(env["tmp"] / "managed-claude" / "managed-settings.json"),
+        "cursor": str(env["tmp"] / "enterprise-cursor" / "hooks.json"),
+        "codex": str(env["tmp"] / "managed-codex" / "hooks.json"),
+        "copilot": "~/.copilot/hooks/unbound.json",
+        "augment": str(env["tmp"] / "managed-augment" / "settings.json"),
+    }
+    for tool in FOOTPRINTS:
+        [report] = _reports(env, tool)
+        assert (report["status"], report["reason"], report["written_to"]) == ("configured", None, written[tool])
+
+
+@pytest.mark.parametrize("tool", sorted(FOOTPRINTS))
+def test_a_tool_that_is_not_installed_is_reported_skipped_and_still_written(env, machine, tool):
+    for other, relpath in FOOTPRINTS.items():
+        if other != tool:
+            _install(machine, relpath)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    [report] = _reports(env, tool)
+    assert (report["status"], report["reason"]) == ("skipped", f"{NAMES[tool]} is not installed")
+    # Reporting only: the config is written all the same, so the hook works once the tool arrives.
+    assert report["written_to"]
+    assert all(_reports(env, other)[0]["status"] == "configured" for other in FOOTPRINTS if other != tool)
+
+
+@pytest.mark.parametrize("tool,relpath", [
+    ("claude-code", "HOME/.local/bin/claude"), ("claude-code", "HOME/.claude.json"),
+    ("claude-code", "HOME/.nvm/versions/node/v22.1.0/bin/claude"), ("claude-code", "Applications/Claude.app"),
+    ("cursor", "HOME/Applications/Cursor.app"), ("cursor", "HOME/.local/bin/cursor-agent"),
+    ("codex", "opt/homebrew/bin/codex"), ("codex", "HOME/.codex/auth.json"), ("codex", "Applications/Codex.app"),
+    ("copilot", "usr/local/bin/copilot"), ("copilot", "HOME/.bun/bin/copilot"),
+    ("copilot", "Applications/Visual Studio Code - Insiders.app"),
+    ("augment", "usr/local/bin/auggie"), ("augment", "HOME/.local/bin/auggie"),
+])
+def test_each_install_location_counts_as_installed(env, machine, tool, relpath):
+    if relpath.startswith("HOME/"):
+        _install(env["home"], relpath[len("HOME/"):])
+    else:
+        _install(machine, relpath)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert _reports(env, tool)[0]["status"] == "configured"
+
+
+def test_our_own_files_do_not_count_as_the_tool_being_installed(env, machine):
+    # A re-run finds the files the first run wrote; none of them is the tool.
+    setup_cmd.run(["--api-key", "admin-key"])
+    env["notified"].clear()
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert {k["status"] for _, k in env["notified"]} == {"skipped"}
+
+
+def test_a_failed_write_is_reported_deferred_with_the_printed_reason(env, machine, monkeypatch):
+    _install(machine, FOOTPRINTS["cursor"])
+    monkeypatch.setattr(setup_cmd, "_write_cursor_enterprise_hooks", lambda m: (False, False))
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    [report] = _reports(env, "cursor")
+    assert (report["status"], report["reason"]) == ("deferred", "enterprise hooks.json write failed")
+
+
+def test_a_deferred_tool_is_reported_even_when_it_is_not_installed(env, machine, monkeypatch):
+    monkeypatch.setattr(setup_cmd, "_write_codex_system_hooks", lambda m: False)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    [report] = _reports(env, "codex")
+    assert (report["status"], report["reason"]) == ("deferred", "codex system hooks.json write failed")
+
+
+def test_a_skipped_scan_is_reported_skipped_not_configured(env, machine, capsys):
+    env["tmp"].joinpath("unbound-discovery").write_text(
+        "#!/bin/sh\necho 'Scan skipped: another scan is running'\nexit 0\n")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    out = capsys.readouterr().out
+    assert "  discovery    skipped (another scan is running)" in out
+    # The scan's own output still reaches the MDM log.
+    assert "Scan skipped: another scan is running" in out.split("[discovery] coding-tool scan")[1]
+
+
+def test_a_completed_scan_is_still_configured(env, machine, capsys):
+    env["tmp"].joinpath("unbound-discovery").write_text("#!/bin/sh\necho 'Scan complete'\nexit 0\n")
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert "  discovery    configured" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("tool", sorted(TOOL_TYPES))
+def test_the_notifier_sends_status_reason_and_where_it_wrote(tool, monkeypatch):
+    from unbound_hook._loader import load_mdm_setup_module
+    m = load_mdm_setup_module(tool)
+    sent = []
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, **kw: sent.append(json.loads(kw["input"])))
+    m.notify_setup_complete("k", TOOL_TYPES[tool], backend_url="https://b", status="skipped",
+                            reason="r" * 600, written_to="/p" * 300)
+    m.notify_setup_complete("k", TOOL_TYPES[tool], backend_url="https://b")
+    skipped, plain = sent
+    assert (skipped["status"], skipped["reason"], skipped["written_to"]) == ("skipped", "r" * 500, ("/p" * 300)[:500])
+    # An old-style call sends the body it always did: a missing status means configured.
+    assert not {"status", "reason", "written_to"} & set(plain)

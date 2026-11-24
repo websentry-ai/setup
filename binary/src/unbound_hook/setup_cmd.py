@@ -18,6 +18,7 @@ Fail-open: a component failure is reported in the summary and the exit code,
 but never aborts the remaining components.
 """
 
+import functools
 import json
 import math
 import os
@@ -26,6 +27,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -188,6 +190,58 @@ def _preflight_warnings(user_homes) -> list:
     if not user_homes:
         warnings.append("no user homes found")
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# Per-tool outcome (WEB-6392): every tool sends setup/complete every run,
+# configured | skipped | deferred, with the reason setup prints.
+# ---------------------------------------------------------------------------
+
+_TOOL_TYPES = {"claude-code": "claude-code", "cursor": "cursor", "codex": "codex",
+               "copilot": "copilot", "augment": "augment_code"}
+
+# What an installed tool leaves on disk: (name, its CLI, its app bundles, other files under a home).
+# None of these is a file setup writes, so a re-run never takes its own files for the tool.
+_TOOL_FOOTPRINTS = {
+    "claude-code": ("Claude Code", "claude", ("Claude.app",), (".claude/local/claude", ".claude.json")),
+    "cursor": ("Cursor", "cursor-agent", ("Cursor.app",), ()),
+    "codex": ("Codex", "codex", ("Codex.app",), (".codex/auth.json", ".codex/sessions")),
+    "copilot": ("GitHub Copilot", "copilot",
+                ("Visual Studio Code.app", "Visual Studio Code - Insiders.app"), ()),
+    "augment": ("Augment", "auggie", (), ()),
+}
+_MACHINE_ROOT = Path("/")
+
+
+def _present(root: Path, relpath: str) -> bool:
+    try:
+        return any(root.glob(relpath)) if "*" in relpath else (root / relpath).exists()
+    except OSError:
+        return False
+
+
+def _tool_installed(tool, user_homes) -> bool:
+    """Any footprint machine-wide (Homebrew, /usr/local, /Applications) or in a home (a user install, Bun,
+    npm, nvm, ~/Applications). A check that fails counts as installed, the report setup always sent."""
+    try:
+        _, cli, apps, home_files = _TOOL_FOOTPRINTS[tool]
+        app_paths = [f"Applications/{app}" for app in apps]
+        machine = [f"opt/homebrew/bin/{cli}", f"usr/local/bin/{cli}", *app_paths]
+        per_home = [f".local/bin/{cli}", f".bun/bin/{cli}", f".npm-global/bin/{cli}",
+                    f".nvm/versions/node/*/bin/{cli}", *home_files, *app_paths]
+        roots = [(_MACHINE_ROOT, machine)] + [(home, per_home) for _, home in user_homes if home is not None]
+        return any(_present(root, rel) for root, rels in roots for rel in rels)
+    except Exception:
+        return True
+
+
+def _report(m, tool, api_key, status, reason=None, **fields):
+    """This tool's setup/complete call for the run; returns the (status, reason) it sent. Configured on a Mac
+    without the tool reads skipped: its config is still written, so the hook works once the tool arrives."""
+    if status == "configured" and not _tool_installed(tool, m.get_all_user_homes()):
+        status, reason = "skipped", f"{_TOOL_FOOTPRINTS[tool][0]} is not installed"
+    m.notify_setup_complete(api_key, _TOOL_TYPES[tool], status=status, reason=reason, **fields)
+    return status, reason
 
 
 def _end_fields(opts, user_homes, warnings) -> dict:
@@ -1106,6 +1160,9 @@ def _setup_claude_code(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    skip_settings = opts["skip_managed_settings"]
+    report = functools.partial(_report, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
+                               install_mode="binary-skip" if skip_settings else "binary")
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
@@ -1118,13 +1175,12 @@ def _setup_claude_code(opts):
         config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
     m.remove_legacy_key_env()
 
-    skip_settings = opts["skip_managed_settings"]
     # None (unknown) without looking: in skip mode managed-settings.json is the
     # admin's file, and unknown leaves the backend's tamper state untouched.
     state = None if skip_settings else _detect_state(
         m.get_managed_settings_dir() / "managed-settings.json", _claude_detected_hooks())
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
-        return ("deferred", "managed settings update failed")
+        return report("deferred", "managed settings update failed")
     if skip_settings:
         # A remote policy may name the python script; deleting it here would
         # strand that policy on a missing file with no local error.
@@ -1133,18 +1189,18 @@ def _setup_claude_code(opts):
         _remove_stale_managed_script(m.get_managed_settings_dir())
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "claude-code", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
-                            install_mode="binary-skip" if skip_settings else "binary")
+    # skip mode writes no hook config of its own: the remote policy holds it
+    outcome = report("configured", install_state=state,
+                     hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
+                     written_to=None if skip_settings else str(m.get_managed_settings_dir() / "managed-settings.json"))
     if opts["backfill"]:
         # Bounded like the MDM script: a heavy history must not hold setup open. The
         # deadline origin is this tool's turn, not module import in the shared process.
         m._SCRIPT_START = time.time()
         m._run_backfill_bounded(api_key, base, m.get_all_user_homes())
-    return ("configured", None)
+    return outcome
 
 
 def _setup_augment(opts):
@@ -1165,6 +1221,8 @@ def _setup_augment(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = functools.partial(_report, m, "augment", api_key, backend_url=base, serial_number=device_id,
+                               install_mode="binary")
 
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
@@ -1177,7 +1235,7 @@ def _setup_augment(opts):
 
     state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
     if not _write_augment_managed_settings(m):
-        return ("deferred", "managed settings write failed")
+        return report("deferred", "managed settings write failed")
     _remove_stale_managed_script(m.get_managed_settings_dir())
 
     # Strip leftover user-level Unbound hooks only after the managed write
@@ -1186,13 +1244,10 @@ def _setup_augment(opts):
         m.remove_user_level_hooks_for_user(username, home_dir)
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "augment_code", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("augment")),
-                            install_mode="binary")
-    return ("configured", None)
+    return report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("augment")),
+                  written_to=str(m.get_managed_settings_dir() / "settings.json"))
 
 
 def _setup_codex(opts):
@@ -1205,6 +1260,8 @@ def _setup_codex(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = functools.partial(_report, m, "codex", api_key, backend_url=base, serial_number=device_id,
+                               install_mode="binary")
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
@@ -1216,7 +1273,7 @@ def _setup_codex(opts):
     user_homes = m.get_all_user_homes()
     state = _codex_detect_state(m, user_homes)
     if not _write_codex_system_hooks(m):
-        return ("deferred", "codex system hooks.json write failed")
+        return report("deferred", "codex system hooks.json write failed")
     config_ok = True
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
@@ -1227,16 +1284,14 @@ def _setup_codex(opts):
     m.remove_legacy_key_env()
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "codex", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("codex")),
-                            install_mode="binary")
+    outcome = report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("codex")),
+                     written_to=str(m.get_managed_settings_dir() / "hooks.json"))
     if opts["backfill"]:
         m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, m.get_all_user_homes())
-    return ("configured", None)
+    return outcome
 
 
 # Characters the shell acts on in an unquoted word.
@@ -1415,6 +1470,8 @@ def _setup_cursor(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = functools.partial(_report, m, "cursor", api_key, backend_url=base, serial_number=device_id,
+                               install_mode="binary")
 
     config_ok = True
     for username, home_dir in m.get_all_user_homes():
@@ -1428,19 +1485,17 @@ def _setup_cursor(opts):
                           relative_ok=True)
     hooks_ok, hooks_changed = _write_cursor_enterprise_hooks(m)
     if not hooks_ok:
-        return ("deferred", "enterprise hooks.json write failed")
+        return report("deferred", "enterprise hooks.json write failed")
     _remove_stale_managed_script(m.get_enterprise_hooks_dir())
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "cursor", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("cursor")),
-                            install_mode="binary")
+    outcome = report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("cursor")),
+                     written_to=str(m.get_enterprise_hooks_dir() / "hooks.json"))
     if hooks_changed:
         m.restart_cursor()
-    return ("configured", None)
+    return outcome
 
 
 def _copilot_detect_state(m, user_homes):
@@ -1502,6 +1557,8 @@ def _setup_copilot(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = functools.partial(_report, m, "copilot", api_key, backend_url=base, serial_number=device_id,
+                               install_mode="binary")
 
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
@@ -1539,20 +1596,19 @@ def _setup_copilot(opts):
             m.notify_setup_complete(api_key, "copilot", backend_url=base,
                                     install_state=state, serial_number=device_id,
                                     install_mode="binary")
-        return ("deferred", "hook install failed for all users")
+        return report("deferred", "hook install failed for all users")
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "copilot", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("copilot")),
-                            install_mode="binary")
+    # One file per user, so the per-user path rather than any one home's.
+    outcome = report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("copilot")),
+                     written_to="~/.copilot/hooks/unbound.json")
     if opts["backfill"]:
         hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
         m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, user_homes, hook_source)
-    return ("configured", None)
+    return outcome
 
 
 def _fetch_device_owner_key(opts):
@@ -1567,6 +1623,23 @@ def _fetch_device_owner_key(opts):
         opts["backend_url"], opts["app_name"], opts["api_key"], device_id,
         app_type="default",
     )
+
+
+SCAN_SKIPPED_PREFIX = "Scan skipped:"
+
+
+def _echo_scan_output(stream, skipped) -> None:
+    """Pass the scan's stdout through to the MDM log line by line, keeping the reason
+    of the first 'Scan skipped: <reason>' line it prints."""
+    try:
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if not skipped and line.startswith(SCAN_SKIPPED_PREFIX):
+                skipped.append(line[len(SCAN_SKIPPED_PREFIX):].strip())
+    except Exception:
+        pass
 
 
 def _run_discovery(opts):
@@ -1584,9 +1657,13 @@ def _run_discovery(opts):
     env = {**os.environ, "UNBOUND_API_KEY": scan_key}
     backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
     try:
-        proc = subprocess.Popen(cmd, start_new_session=True, env=env)
+        proc = subprocess.Popen(cmd, start_new_session=True, env=env, stdout=subprocess.PIPE)
+        skipped = []
+        echo = threading.Thread(target=_echo_scan_output, args=(proc.stdout, skipped), daemon=True)
+        echo.start()
         try:
             rc = proc.wait(timeout=backstop)
+            echo.join(timeout=5)  # a child still holding the pipe must not hold setup
         except subprocess.TimeoutExpired:
             import signal
             try:
@@ -1598,6 +1675,8 @@ def _run_discovery(opts):
                 except Exception:
                     pass
             return ("deferred", f"discovery exceeded {backstop}s and was terminated")
+        if skipped:  # it ran and chose not to scan: nothing for a re-run to retry
+            return ("skipped", skipped[0] or "scan skipped")
         if rc != 0:
             return ("deferred", f"discovery exited with code {rc}")
         return ("configured", None)
