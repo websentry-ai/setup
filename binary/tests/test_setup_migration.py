@@ -80,6 +80,9 @@ def env(tmp_path, monkeypatch):
     discovery_bin.write_text("#!/bin/sh\nexit 0\n")
     discovery_bin.chmod(0o755)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_BINARY", discovery_bin)
+    # The run's own reports never leave the machine from a test; test_setup_reporting
+    # points them at a local server instead.
+    monkeypatch.setattr(setup_cmd, "_post_json", lambda *a, **k: (0, b""))
     return {"tmp": tmp_path, "home": home, "modules": modules,
             "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts,
             "daemon_bootouts": daemon_bootouts}

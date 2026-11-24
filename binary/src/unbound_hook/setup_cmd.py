@@ -27,8 +27,10 @@ import stat
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
+from . import __version__
 from ._loader import load_mdm_setup_module
 from ._resources import (
     DISCOVERY_BINARY,
@@ -98,6 +100,27 @@ def _parse_args(argv):
     return opts
 
 
+# Reports about this run (start/end, hook errors) must never hold setup up.
+REPORT_TIMEOUT_SECONDS = 5
+
+
+def _post_json(url, body, headers, timeout=REPORT_TIMEOUT_SECONDS):
+    """POST a JSON body with curl (the system trust store, as every call here uses).
+    Returns (http status, response bytes); status 0 when nothing came back. Never raises."""
+    cmd = ["curl", "-sS", "-m", str(timeout), "-X", "POST", "-w", "\n%{http_code}",
+           "-H", "Content-Type: application/json"]
+    for name, value in headers.items():
+        cmd += ["-H", f"{name}: {value}"]
+    cmd += ["--data-binary", "@-", "--", url]
+    try:
+        result = subprocess.run(cmd, input=json.dumps(body).encode("utf-8"),
+                                capture_output=True, timeout=timeout + 3)
+        answer, _, code = (result.stdout or b"").rpartition(b"\n")
+        return int(code.strip() or 0), answer
+    except Exception:
+        return 0, b""
+
+
 def _module(tool):
     m = load_mdm_setup_module(tool)
     m.DEBUG = True  # MDM runs always log diagnostics (parity with python path)
@@ -108,6 +131,71 @@ def _normalized_urls(m, opts):
     base = m.normalize_url(opts["backend_url"])
     gateway = m.normalize_url(opts["gateway_url"])
     return base, gateway
+
+
+def _write_user_config(m, opts, username, home_dir, api_key) -> bool:
+    """Every adapter's per-user ~/.unbound/config.json write, tallied per home for the end report:
+    a home counts as configured only if every tool that reached it wrote there."""
+    base, gateway = _normalized_urls(m, opts)
+    ok = m.write_unbound_config_for_user(
+        username, home_dir, api_key,
+        urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+    writes = opts.setdefault("config_writes", {})
+    writes[str(home_dir)] = writes.get(str(home_dir), True) and bool(ok)
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Run reports (WEB-6392): the device's install report hears when this run
+# started and how it ended, on the endpoint and admin key onboard.sh's exit
+# report uses. Fail-open: a report that can't be sent logs one line.
+# ---------------------------------------------------------------------------
+
+INSTALL_REPORT_PATH = "/api/v1/automations/mdm/install-report/"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _send_run_report(opts, serial, phase, fields) -> None:
+    try:
+        if not serial:  # the endpoint joins on it; without one the report is dropped anyway
+            print(f"[report] install-report {phase} not sent: no device serial")
+            return
+        body = {"serial_number": serial, "phase": phase,
+                "install_mode": "binary-skip" if opts["skip_managed_settings"] else "binary", **fields}
+        code, _ = _post_json(opts["backend_url"] + INSTALL_REPORT_PATH, body, {"X-API-KEY": opts["api_key"]})
+        if not 200 <= code < 300:
+            print(f"[report] install-report {phase} not sent: HTTP {code}")
+    except Exception as e:
+        print(f"[report] install-report {phase} not sent: {e}")
+
+
+def _start_fields() -> dict:
+    host = {"hostname": platform.node(), "arch": platform.machine()}
+    return {"runtime_version": __version__,
+            "os_version": platform.mac_ver()[0] or platform.release(),
+            **{k: v for k, v in host.items() if v},
+            "timestamps": {"started_at": _utc_now()}}
+
+
+def _preflight_warnings(user_homes) -> list:
+    """What this run can already tell will keep the device from reporting."""
+    warnings = []
+    if not HOOK_BINARY.is_file():  # every managed hook command points at it
+        warnings.append(f"hook binary not found at {HOOK_BINARY}")
+    if not user_homes:
+        warnings.append("no user homes found")
+    return warnings
+
+
+def _end_fields(opts, user_homes, warnings) -> dict:
+    writes = opts.get("config_writes", {})
+    configured = sum(1 for _, home in user_homes if writes.get(str(home)) is True)
+    return {"timestamps": {"completed_at": _utc_now()},
+            "preflight_warnings": warnings,
+            "user_homes": {"configured": configured, "skipped": len(user_homes) - configured}}
 
 
 def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
@@ -1027,9 +1115,7 @@ def _setup_claude_code(opts):
     for username, home_dir in m.get_all_user_homes():
         m.remove_gateway_artifacts_for_user(username, home_dir)
         m.remove_user_level_hooks_for_user(username, home_dir)
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
     m.remove_legacy_key_env()
 
     skip_settings = opts["skip_managed_settings"]
@@ -1086,9 +1172,7 @@ def _setup_augment(opts):
     config_ok = True
     user_homes = m.get_all_user_homes()
     for username, home_dir in user_homes:
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
     m.remove_legacy_key_env()
 
     state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
@@ -1136,9 +1220,7 @@ def _setup_codex(opts):
     config_ok = True
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         _strip_codex_user_hooks(m, username, home_dir)
     # After the new hooks are in place: an older codex hook reads only the per-tool var.
@@ -1336,9 +1418,7 @@ def _setup_cursor(opts):
 
     config_ok = True
     for username, home_dir in m.get_all_user_homes():
-        if m.write_unbound_config_for_user(
-                username, home_dir, api_key,
-                urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
+        if _write_user_config(m, opts, username, home_dir, api_key):
             m.remove_user_level_hooks(username, home_dir)
         else:
             config_ok = False
@@ -1430,9 +1510,7 @@ def _setup_copilot(opts):
     for username, home_dir in user_homes:
         if home_dir is None:
             continue  # no home to hold a config or a registration
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
         # Earlier versions configured the exporter here, per user, in VS Code
         # settings. The managed file written below outranks those, so they are only
         # taken back out.
@@ -1564,6 +1642,12 @@ def run(argv) -> int:
     if opts["frontend_url"]:
         opts["frontend_url"] = m0.normalize_url(opts["frontend_url"])
 
+    opts["config_writes"] = {}
+    serial = m0.get_device_identifier()
+    user_homes = m0.get_all_user_homes()
+    warnings = _preflight_warnings(user_homes)
+    _send_run_report(opts, serial, "start", _start_fields())
+
     statuses = {}
 
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
@@ -1597,4 +1681,5 @@ def run(argv) -> int:
         print(line)
         if status == "deferred":
             any_deferred = True
+    _send_run_report(opts, serial, "end", _end_fields(opts, user_homes, warnings))
     return 1 if any_deferred else 0
