@@ -234,12 +234,35 @@ _TOOL_FOOTPRINTS = {
     "augment": ("Augment", "auggie", (), tuple(f"{editor}/extensions/augment.vscode-augment-*"
                                               for editor in (".vscode", ".vscode-insiders", ".cursor"))),
 }
-# Where a CLI lands under a home: a user install, Bun, npm's user prefix, and the Node version managers
-# (nvm, Volta, pnpm's default PNPM_HOME, fnm in both its folders, asdf and mise shims, mise's installs).
+# Where a CLI lands under a home: a user install, Bun, npm's user prefix, yarn global, and the Node version
+# managers (nvm, Volta, pnpm's default PNPM_HOME, fnm in both its folders, asdf and mise shims, mise's
+# installs, nodenv). A prefix set in ~/.npmrc is read as well (_npmrc_bin).
 _HOME_CLI_DIRS = (".local/bin", ".bun/bin", ".npm-global/bin", ".nvm/versions/node/*/bin", ".volta/bin",
                   "Library/pnpm", ".local/share/fnm/node-versions/*/installation/bin",
                   ".fnm/node-versions/*/installation/bin", ".asdf/shims", ".local/share/mise/shims",
-                  ".local/share/mise/installs/*/*/bin")
+                  ".local/share/mise/installs/*/*/bin", ".nodenv/shims", ".nodenv/versions/*/bin",
+                  ".yarn/bin", ".config/yarn/global/node_modules/.bin")
+# Homebrew (Apple silicon, Intel) and MacPorts.
+_MACHINE_CLI_DIRS = ("opt/homebrew/bin", "usr/local/bin", "opt/local/bin")
+
+
+def _npmrc_bin(home: Path):
+    """The bin folder of a prefix the user set in ~/.npmrc, or None. Read without following a link and
+    used only to look for a file, so a root run learns nothing else from it."""
+    try:
+        text = _read_user_file(home / ".npmrc", follow=False).decode("utf-8", "replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "prefix":
+            value = value.strip().strip('"\'')
+            for token in ("${HOME}", "$HOME"):
+                value = value.replace(token, str(home))
+            if value.startswith("~/"):
+                value = str(home) + value[1:]
+            return Path(value) / "bin" if value.startswith("/") else None
+    return None
 _MACHINE_ROOT = Path("/")
 
 
@@ -256,10 +279,13 @@ def _tool_installed(tool, user_homes) -> bool:
     try:
         _, cli, apps, home_files = _TOOL_FOOTPRINTS[tool]
         app_paths = [f"Applications/{app}" for app in apps]
-        machine = [f"opt/homebrew/bin/{cli}", f"usr/local/bin/{cli}", *app_paths]
+        machine = [f"{folder}/{cli}" for folder in _MACHINE_CLI_DIRS] + app_paths
         per_home = [f"{folder}/{cli}" for folder in _HOME_CLI_DIRS] + [*home_files, *app_paths]
-        roots = [(_MACHINE_ROOT, machine)] + [(home, per_home) for _, home in user_homes if home is not None]
-        return any(_present(root, rel) for root, rels in roots for rel in rels)
+        homes = [home for _, home in user_homes if home is not None]
+        roots = [(_MACHINE_ROOT, machine)] + [(home, per_home) for home in homes]
+        npm_bins = [b for b in map(_npmrc_bin, homes) if b is not None]
+        return (any(_present(root, rel) for root, rels in roots for rel in rels)
+                or any((b / cli).exists() for b in npm_bins))
     except Exception:
         return True
 

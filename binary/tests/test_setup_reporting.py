@@ -638,3 +638,33 @@ def test_an_entry_sharing_the_last_sent_timestamp_is_still_sent(env, backend):
     backend.requests.clear()
     _run(backend)
     assert _messages(backend) == []
+
+
+# --- Review #7: nodenv, yarn, MacPorts and a custom npm prefix --------------------
+
+@pytest.mark.parametrize("tool,relpath", [
+    ("claude-code", "HOME/.nodenv/shims/claude"),
+    ("codex", "HOME/.nodenv/versions/22.1.0/bin/codex"),
+    ("copilot", "HOME/.yarn/bin/copilot"),
+    ("augment", "HOME/.config/yarn/global/node_modules/.bin/auggie"),
+    ("claude-code", "opt/local/bin/claude"),
+])
+def test_more_install_locations_count(env, machine, tool, relpath):
+    if relpath.startswith("HOME/"):
+        _install(env["home"], relpath[len("HOME/"):])
+    else:
+        _install(machine, relpath)
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert _reports(env, tool)[0]["status"] == "configured"
+
+
+@pytest.mark.parametrize("prefix", ["~/.npm-packages", "${HOME}/.npm-packages", "$HOME/.npm-packages", "HOME"])
+def test_an_npm_prefix_from_npmrc_counts(env, machine, prefix):
+    prefix = prefix.replace("HOME", str(env["home"])) if prefix == "HOME" else prefix
+    if prefix == str(env["home"]):
+        prefix = str(env["home"] / ".npm-packages")
+    (env["home"] / ".npmrc").write_text(f"; comment\ninit-author-name=me\nprefix = {prefix}\n")
+    _install(env["home"], ".npm-packages/bin/codex")
+    setup_cmd.run(["--api-key", "admin-key"])
+    assert _reports(env, "codex")[0]["status"] == "configured"
+    assert _reports(env, "cursor")[0]["status"] == "skipped"
