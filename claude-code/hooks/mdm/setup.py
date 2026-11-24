@@ -46,7 +46,7 @@ BACKFILL_STATE_FILE = '.unbound_last_backfill'
 BACKFILL_RESUME_FILE = '.unbound_backfill_resume'
 # How a run that could not send its closing report ended, for the next run to send as previous_outcome.
 BACKFILL_OUTCOME_FILE = '.unbound_backfill_outcome'
-BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'failed')
+BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'stopped_by_cap', 'failed')
 _SCRIPT_START = time.time()
 # All measured from script start. No new batch starts unless it can land before the
 # soft stop (margin: 90s or 1.5x the slowest batch so far); the hard kill backs it up
@@ -2981,7 +2981,10 @@ class _BackfillRun:
     def outcome(self, statuses: set) -> str:
         if 'failed' in statuses:
             return 'failed'
-        return 'stopped_by_time_limit' if self.stopped_by_time else 'completed'
+        if self.stopped_by_time:
+            return 'stopped_by_time_limit'
+        # History left with time to spare: a batch cap (or a cursor that stopped moving) ended it.
+        return 'stopped_by_cap' if 'more' in statuses else 'completed'
 
     def upload(self, sessions: List[Dict], forced: bool) -> Tuple[int, int, bool]:
         """(sessions_sent, chunks_failed, out_of_time) for one batch."""

@@ -210,3 +210,36 @@ class TheReserveCoversTheClosingReportTestCase(_Homes):
                         patch.object(mdm, "_SCRIPT_START", clock[0] - start)])
         self.assertEqual([b["sessions"] != [] for b in backend.bodies], [True, False])
         self.assertEqual(len(backend.stats()), 1)
+
+
+class ACapIsNotCompletionTestCase(_Homes):
+    """History a cap left behind must not read as a finished run."""
+
+    def test_the_mdm_batch_cap_ends_the_run_stopped_by_cap(self):
+        backend = _run(mdm, self._home(("a", "b", "c")), _Backend(),
+                       [patch.object(mdm, "BACKFILL_BATCH_BYTES", 1),
+                        patch.object(mdm, "BACKFILL_MAX_BATCHES_PER_HOME", 1)])
+        self.assertTrue(any(b["sessions"] for b in backend.bodies))
+        self.assertEqual([s["outcome"] for s in backend.stats()], ["stopped_by_cap"])
+
+    def test_the_per_user_session_cap_ends_the_run_stopped_by_cap(self):
+        backend = _run(setup, self._home(("a", "b", "c")), _Backend(),
+                       [patch.object(setup, "BACKFILL_MAX_SESSIONS_PER_RUN", 1)])
+        self.assertEqual([s["outcome"] for s in backend.stats()], ["stopped_by_cap"])
+
+    def test_an_unsent_cap_outcome_is_the_next_runs_previous_outcome(self):
+        for up, cap in ((mdm, [patch.object(mdm, "BACKFILL_BATCH_BYTES", 1),
+                               patch.object(mdm, "BACKFILL_MAX_BATCHES_PER_HOME", 1)]),
+                        (setup, [patch.object(setup, "BACKFILL_MAX_SESSIONS_PER_RUN", 1)])):
+            with self.subTest(up.__name__):
+                home = self._home(("a", "b", "c"))
+
+                class StatsDown(_Backend):
+                    def __call__(self, url, method, headers, body=None, timeout=30):
+                        if method == "PUT" and not json.loads(body)["sessions"]:
+                            return 503, b""  # only the closing report fails
+                        return super().__call__(url, method, headers, body, timeout)
+
+                _run(up, home, StatsDown(), cap)
+                [stats] = _run(up, home, _Backend()).stats()
+                self.assertEqual(stats["previous_outcome"], "stopped_by_cap")

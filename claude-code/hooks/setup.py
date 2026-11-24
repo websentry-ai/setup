@@ -42,7 +42,7 @@ BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 # How a run that could not send its closing report ended, for the next run to send as previous_outcome.
 BACKFILL_OUTCOME_FILE = '.unbound_backfill_outcome'
-BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'failed')
+BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'stopped_by_cap', 'failed')
 # An S3 PUT is given up on only after this long below this speed, then re-sent on a fresh link.
 BACKFILL_PUT_STALL_SECONDS = 60
 BACKFILL_PUT_STALL_BYTES_PER_SECOND = 1024
@@ -2213,8 +2213,9 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
 
         _flush()
         failed = chunks_total - chunks_sent
-        # No run clock here, so a run ends completed or failed, never stopped for time.
-        _backfill_send_outcome(api_key, backend_url, config_dir, 'failed' if failed else 'completed', failed, previous)
+        # No run clock here, so a run is never stopped for time; the per-run session cap can stop it.
+        outcome = 'failed' if failed else 'stopped_by_cap' if capped else 'completed'
+        _backfill_send_outcome(api_key, backend_url, config_dir, outcome, failed, previous)
         reported = True
         if not found:
             _backfill_write_cutoff(config_dir, started_at)
