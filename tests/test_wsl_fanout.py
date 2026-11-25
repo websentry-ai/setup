@@ -1,0 +1,75 @@
+"""Every user-level installer, run on Windows, also runs itself inside the user's WSL distros."""
+import subprocess
+import unittest
+from unittest import mock
+
+from tests.conftest import load_module
+
+INSTALLERS = [
+    "augment/hooks/setup.py", "claude-code/gateway/setup.py", "claude-code/hooks/setup.py",
+    "codex/gateway/setup.py", "codex/hooks/setup.py", "copilot/hooks/setup.py", "cursor/setup.py",
+    "gemini-cli/gateway/setup.py", "pi/setup.py",
+]
+
+
+class TestSetupWsl(unittest.TestCase):
+    def _run(self, mod, argv, system="Windows", codes=None, distros=("Ubuntu", "Debian")):
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            code = (codes or {}).get(cmd[2], 0)
+            out = b"execvpe(python3) failed" if code == 1 else b"boom\n" if code == 2 else b""
+            return subprocess.CompletedProcess(cmd, code, out, b"")
+
+        with mock.patch.object(mod.platform, "system", return_value=system), \
+                mock.patch.object(mod, "_wsl_distros", return_value=list(distros)), \
+                mock.patch.object(mod.subprocess, "run", side_effect=fake_run), \
+                mock.patch("builtins.print") as printed:
+            mod.setup_wsl(argv)
+        return calls, [c.args[0] for c in printed.call_args_list]
+
+    def test_each_installer_reruns_itself_in_every_distro(self):
+        for path in INSTALLERS:
+            with self.subTest(path):
+                mod = load_module(path)
+                calls, lines = self._run(mod, ["--api-key", "k", "--config-dir", "C:\\x", "--backfill"])
+                self.assertEqual([c[:6] for c, _ in calls],
+                                 [["wsl.exe", "-d", d, "--exec", "python3", "-"] for d in ("Ubuntu", "Debian")])
+                self.assertEqual(calls[0][0][6:], ["--api-key", "k", "--backfill"])
+                self.assertEqual(calls[0][1]["input"], open(mod.__file__, "rb").read())
+                self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
+
+    def test_main_runs_the_wsl_step_first(self):
+        for path in INSTALLERS:
+            with self.subTest(path):
+                mod = load_module(path)
+                with mock.patch.object(mod, "setup_wsl", side_effect=RuntimeError("wsl step")), \
+                        mock.patch.object(mod.sys, "argv", ["setup.py", "--api-key", "k"]):
+                    with self.assertRaisesRegex(RuntimeError, "wsl step"):
+                        mod.main()
+
+    def test_clear_reaches_wsl_too(self):
+        calls, _ = self._run(load_module("cursor/setup.py"), ["--clear"])
+        self.assertEqual(calls[0][0][6:], ["--clear"])
+
+    def test_off_windows_or_without_a_key_does_nothing(self):
+        mod = load_module("codex/hooks/setup.py")
+        self.assertEqual(self._run(mod, ["--api-key", "k"], system="Linux")[0], [])
+        self.assertEqual(self._run(mod, ["--domain", "https://x"])[0], [])
+
+    def test_reports_mdm_missing_python_and_failures_without_raising(self):
+        mod = load_module("claude-code/hooks/setup.py")
+        _, lines = self._run(mod, ["--api-key", "k"], codes={"A": 3, "B": 1, "C": 2}, distros=("A", "B", "C"))
+        self.assertEqual(lines, ["WSL A: managed by MDM", "WSL B: skipped, python3 not installed",
+                                 "WSL C: failed (exit 2): boom"])
+        with mock.patch.object(mod.platform, "system", return_value="Windows"), \
+                mock.patch.object(mod, "_wsl_distros", return_value=["A"]), \
+                mock.patch.object(mod.subprocess, "run", side_effect=subprocess.TimeoutExpired("wsl", 900)), \
+                mock.patch("builtins.print") as printed:
+            mod.setup_wsl(["--api-key", "k"])
+        printed.assert_called_once_with("WSL A: failed (TimeoutExpired)")
+
+
+if __name__ == "__main__":
+    unittest.main()
