@@ -724,3 +724,25 @@ def test_a_home_with_no_key_yet_forwards_nothing(env, backend):
     _log(env["home"], "codex", [f"{_utc(0)}: codex broke"], key=None)
     _run(backend)
     assert _forwarded(backend) == []
+
+
+# --- Final review #1: one home's refused key doesn't stop the other homes ---------
+
+def test_a_refused_key_in_one_home_leaves_the_other_homes_forwarding(env, backend, monkeypatch, tmp_path):
+    other = tmp_path / "other-home"
+    other.mkdir()
+    for m in env["modules"].values():
+        monkeypatch.setattr(m, "get_all_user_homes", lambda: [("alice", env["home"]), ("bob", other)])
+    _log(env["home"], "codex", [f"{_utc(0)}: alice's codex broke"], key="revoked-key")
+    _log(other, "codex", [f"{_utc(1)}: bob's codex broke"], key="bob-key")
+    ok = {"status": "ok", "success": True, "accepted": 1}
+
+    def answer(path):
+        revoked = backend.requests[-1]["headers"].get("Authorization") == "Bearer revoked-key"
+        return (200, {"success": False, "reason": "invalid_key"}) if revoked else (200, ok)
+
+    backend.answer = answer
+    _run(backend)
+    assert _messages(backend) == ["alice's codex broke", "bob's codex broke"]
+    assert (other / ".codex/hooks" / STATE).exists()
+    assert not (env["home"] / ".codex/hooks" / STATE).exists()

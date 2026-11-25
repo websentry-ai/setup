@@ -92,8 +92,8 @@ the python path, by design:
   at most the newest 25 per tool and home, none older than seven days, with
   `category: forwarded_error_log`),
   recording the newest accepted timestamp in `.error_log_forwarded` beside the
-  log; a gateway that is down ends forwarding for the run, a refused key ends
-  it for that tool, and neither saves anything.
+  log; a gateway that is down ends forwarding for the run, a refused key skips
+  that home (each home has its own key), and neither saves anything.
 - **`detect_install_state`** is adapted: the python version checked for the
   managed `unbound.py`, which no longer exists. Binary semantics: settings
   file absent → `fresh`; present and referencing the binary → `persisted`;

@@ -389,8 +389,8 @@ def _home_device_key(home: Path):
 def _forward_hook_errors(m, tool, opts) -> None:
     """Forward every home's unsent error.log entries for this tool, with that home's own device key. Runs
     before the migration sweep, which removes ~/.cursor/hooks and its log. A gateway that is down ends
-    forwarding for the whole run, so it costs one short timeout; a refused key ends it for this tool only.
-    Either way nothing is marked sent, and the next run retries."""
+    forwarding for the whole run, so it costs one short timeout; a refused key is that home's own and skips
+    only that home. Either way nothing is marked sent, and the next run retries."""
     if opts.get("hook_errors_held"):
         return
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
@@ -408,9 +408,11 @@ def _forward_hook_errors(m, tool, opts) -> None:
                                      api_key, hook_source, hook_sha)
             count, verdict = _forward_home_errors(m, username, log, send)
             sent += count
-            if verdict != "sent":
-                opts["hook_errors_held"] = opts.get("hook_errors_held") or verdict == "down"
-                print(f"[errors] {tool} hook errors not forwarded (gateway {verdict}); the next run retries")
+            if verdict == "refused":
+                print(f"[errors] {tool} hook errors in {home_dir} not forwarded (key refused); the next run retries")
+            elif verdict == "down":
+                opts["hook_errors_held"] = True
+                print(f"[errors] {tool} hook errors not forwarded (gateway down); the next run retries")
                 break
     except Exception as e:
         print(f"[errors] {tool} hook errors not forwarded: {e}")
