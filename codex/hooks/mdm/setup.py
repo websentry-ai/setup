@@ -2669,6 +2669,16 @@ def main():
         return False
     print("API key received")
 
+    tool_present = tool_installed(get_all_user_homes())  # before this run writes anything
+
+    def report(status, reason=None, **fields):
+        """This tool's setup/complete for the run, whatever happened (WEB-6392). Configured on a device
+        without the tool reads skipped: its config is written all the same."""
+        if status == "configured" and not tool_present:
+            status, reason = "skipped", f"{TOOL_NAME} is not installed"
+        notify_setup_complete(api_key, "codex", backend_url=base_url, serial_number=device_id,
+                              install_mode="mdm", status=status, reason=reason, **fields)
+
     print("\nSetting environment variables system-wide...")
     # Remove leftover gateway setup env vars
     for username, home_dir in get_all_user_homes():
@@ -2678,6 +2688,7 @@ def main():
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
+        report("deferred", "Failed to set UNBOUND_BACKEND_URL")
         return False
 
     state = detect_install_state()
@@ -2687,6 +2698,7 @@ def main():
     system_wide = platform.system().lower() != "windows"
     if system_wide and not setup_managed_hooks(gateway_url):
         print("Failed to set up codex managed hooks")
+        report("deferred", "Failed to set up codex managed hooks")
         return False
 
     print("\nConfiguring Codex user hooks...")
@@ -2706,11 +2718,14 @@ def main():
 
     success = bool(user_homes) and installed == len(user_homes) and config_ok
     if not user_homes:
-        print("No user home directories found")
-    elif success:
-        print(f"Registered codex hooks for {installed} user(s)")
+        failure = "No user home directories found"
+    elif installed < len(user_homes):
+        failure = f"Registered codex hooks for {installed} of {len(user_homes)} user(s) — {len(user_homes) - installed} failed"
+    elif not config_ok:
+        failure = "Could not write ~/.unbound/config.json for every user"
     else:
-        print(f"Registered codex hooks for {installed} of {len(user_homes)} user(s) — {len(user_homes) - installed} failed")
+        failure = None
+    print(failure or f"Registered codex hooks for {installed} user(s)")
 
     print("\n" + "=" * 60)
     print("Setup Complete!" if success else "Setup Failed")
@@ -2719,8 +2734,10 @@ def main():
     if success:
         # After the new hooks are in place: an older codex hook reads only the per-tool var.
         remove_legacy_key_env()
-        notify_setup_complete(api_key, "codex", backend_url=base_url, install_state=state, serial_number=device_id,
-                              hook_hash=hook_script_hash(_installed_hook_script()), install_mode="mdm")
+        report("configured", install_state=state, hook_hash=hook_script_hash(_installed_hook_script()),
+               written_to=str(get_managed_settings_dir() / "hooks.json") if system_wide else "~/.codex/hooks.json")
+    else:
+        report("deferred", failure)
 
     if success and backfill_mode:
         with _backfill_soft_stop(BACKFILL_SOFT_STOP_SECONDS):

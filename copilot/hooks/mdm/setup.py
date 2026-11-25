@@ -2898,17 +2898,29 @@ def main():
         return False
     print("API key received")
 
+    tool_present = tool_installed(get_all_user_homes())  # before this run writes anything
+
+    def report(status, reason=None, **fields):
+        """This tool's setup/complete for the run, whatever happened (WEB-6392). Configured on a device
+        without the tool reads skipped: its config is written all the same."""
+        if status == "configured" and not tool_present:
+            status, reason = "skipped", f"{TOOL_NAME} is not installed"
+        notify_setup_complete(api_key, "copilot", backend_url=base_url, serial_number=device_id,
+                              install_mode="mdm", status=status, reason=reason, **fields)
+
     print("\nSetting environment variables system-wide...")
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
+        report("deferred", "Failed to set UNBOUND_BACKEND_URL")
         return False
 
     print("\nDownloading hook script...")
     script_text = _fetch_hook_script(gateway_url)
     if script_text is None:
         print("Failed to download unbound.py")
+        report("deferred", "Failed to download unbound.py")
         return False
 
     state = detect_install_state()
@@ -2939,11 +2951,15 @@ def main():
 
     success = bool(user_homes) and installed_count == len(user_homes) and config_ok
     if not user_homes:
-        print("No user home directories found")
-    elif success:
-        print(f"Installed Copilot hooks for {installed_count} user(s)")
+        failure = "No user home directories found"
+    elif installed_count < len(user_homes):
+        failure = (f"Installed Copilot hooks for {installed_count} of {len(user_homes)} user(s)"
+                   f" — {len(user_homes) - installed_count} failed")
+    elif not config_ok:
+        failure = "Could not write ~/.unbound/config.json for every user"
     else:
-        print(f"Installed Copilot hooks for {installed_count} of {len(user_homes)} user(s) — {len(user_homes) - installed_count} failed")
+        failure = None
+    print(failure or f"Installed Copilot hooks for {installed_count} user(s)")
 
     print("\n" + "=" * 60)
     print("Setup Complete!" if success else "Setup Failed")
@@ -2951,9 +2967,15 @@ def main():
 
     if success:
         # Every user gets the same script bytes, so the first copy identifies the version.
-        notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id,
-                              hook_hash=hook_script_hash(user_homes[0][1] / ".copilot" / "hooks" / "unbound.py"),
-                              install_mode="mdm")
+        report("configured", install_state=state,
+               hook_hash=hook_script_hash(user_homes[0][1] / ".copilot" / "hooks" / "unbound.py"),
+               written_to="~/.copilot/hooks/unbound.json")
+    elif user_homes and installed_count < len(user_homes):
+        # A user can make every install fail: the report carries the state found, and the backend counts
+        # a tamper on a deferred report without marking the tool connected or deployed.
+        report("deferred", failure, install_state=state)
+    else:
+        report("deferred", failure)
 
     # Before the re-walk: onboard.py allows one installer 600s and the re-walk is bounded
     # by session count, not time. Visual Studio fires no hook, so the sweep is the only

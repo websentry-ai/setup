@@ -1435,9 +1435,20 @@ def main():
         return False
     print("✅ API key received")
 
+    tool_present = tool_installed(get_all_user_homes())  # before this run writes anything
+
+    def report(status, reason=None, **fields):
+        """This tool's setup/complete for the run, whatever happened (WEB-6392). Configured on a device
+        without the tool reads skipped: its config is written all the same."""
+        if status == "configured" and not tool_present:
+            status, reason = "skipped", f"{TOOL_NAME} is not installed"
+        notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url, serial_number=serial_number,
+                              install_mode="mdm", status=status, reason=reason, **fields)
+
     url_ok, _, url_message = set_env_var("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print(f"❌ Failed to set UNBOUND_BACKEND_URL: {url_message}")
+        report("deferred", f"Failed to set UNBOUND_BACKEND_URL: {url_message}")
         return False
 
     # Write API key to ~/.unbound/config.json for each user and remove user-level hooks
@@ -1461,19 +1472,21 @@ def main():
     hooks_success, hooks_changed = setup_hooks(gateway_url=gateway_url)
     if not hooks_success:
         print("\n❌ Failed to setup hooks")
+        report("deferred", "Failed to setup hooks")
         return False
     debug_print("Hooks setup complete")
 
     if config_count < len(user_homes):
         print("Could not write ~/.unbound/config.json for every user")
+        report("deferred", "Could not write ~/.unbound/config.json for every user")
         return False
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url, install_state=state, serial_number=serial_number,
-                          hook_hash=hook_script_hash(get_enterprise_hooks_dir() / "hooks" / "unbound.py"), install_mode="mdm")
+    report("configured", install_state=state, hook_hash=hook_script_hash(get_enterprise_hooks_dir() / "hooks" / "unbound.py"),
+           written_to=str(get_enterprise_hooks_dir() / "hooks.json"))
 
     if hooks_changed:
         debug_print("Restart needed: hooks changed")

@@ -3499,6 +3499,16 @@ def main():
         return False
     print("API key received")
 
+    tool_present = tool_installed(get_all_user_homes())  # before this run writes anything
+
+    def report(status, reason=None, **fields):
+        """This tool's setup/complete for the run, whatever happened (WEB-6392). Configured on a device
+        without the tool reads skipped: its config is written all the same."""
+        if status == "configured" and not tool_present:
+            status, reason = "skipped", f"{TOOL_NAME} is not installed"
+        notify_setup_complete(api_key, "claude-code", backend_url=base_url, serial_number=device_id,
+                              install_mode="mdm-skip" if skip_managed_settings else "mdm", status=status, reason=reason, **fields)
+
     print("\nSetting environment variables system-wide...")
     _freeze_ownership_evidence()
 
@@ -3513,6 +3523,7 @@ def main():
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
+        report("deferred", "Failed to set UNBOUND_BACKEND_URL")
         return False
 
     # Remove gateway artifacts, strip leftover user-level Unbound hooks
@@ -3536,19 +3547,22 @@ def main():
             print(f"Created managed hooks in {managed_dir}")
     else:
         print("Failed to configure managed hooks")
+        report("deferred", "Failed to configure managed hooks")
         return False
 
     if not config_ok:
         print("Could not write ~/.unbound/config.json for every user")
+        report("deferred", "Could not write ~/.unbound/config.json for every user")
         return False
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "claude-code", backend_url=base_url, install_state=state, serial_number=device_id,
-                          hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"),
-                          install_mode="mdm-skip" if skip_managed_settings else "mdm")
+    managed_dir = get_managed_settings_dir()
+    report("configured", install_state=state, hook_hash=hook_script_hash(managed_dir / "hooks" / "unbound.py"),
+           written_to=str(managed_dir / "hooks" / "unbound.py" if skip_managed_settings
+                          else managed_dir / "managed-settings.json"))
 
     if backfill_mode:
         _run_backfill_bounded(api_key, base_url, get_all_user_homes())

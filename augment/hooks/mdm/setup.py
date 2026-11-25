@@ -1658,11 +1658,22 @@ def main():
         return False
     print("API key received")
 
+    tool_present = tool_installed(get_all_user_homes())  # before this run writes anything
+
+    def report(status, reason=None, **fields):
+        """This tool's setup/complete for the run, whatever happened (WEB-6392). Configured on a device
+        without the tool reads skipped: its config is written all the same."""
+        if status == "configured" and not tool_present:
+            status, reason = "skipped", f"{TOOL_NAME} is not installed"
+        notify_setup_complete(api_key, "augment_code", backend_url=base_url, serial_number=device_id,
+                              install_mode="mdm", status=status, reason=reason, **fields)
+
     print("\nSetting environment variables system-wide...")
 
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
+        report("deferred", "Failed to set UNBOUND_BACKEND_URL")
         return False
 
     # Write the per-user unbound config now (needed by the managed hook; harmless
@@ -1679,6 +1690,7 @@ def main():
     print("\nConfiguring Augment managed hooks...")
     if not setup_managed_hooks(gateway_url=gateway_url):
         print("Failed to configure managed hooks")
+        report("deferred", "Failed to configure managed hooks")
         return False
     managed_dir = get_managed_settings_dir()
     print(f"Created managed hooks in {managed_dir}")
@@ -1696,14 +1708,15 @@ def main():
 
     if not config_ok:
         print("Could not write ~/.unbound/config.json for every user")
+        report("deferred", "Could not write ~/.unbound/config.json for every user")
         return False
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "augment_code", backend_url=base_url, install_state=state, serial_number=device_id,
-                          hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"), install_mode="mdm")
+    report("configured", install_state=state, hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"),
+           written_to=str(get_managed_settings_dir() / "settings.json"))
 
     return True
 
