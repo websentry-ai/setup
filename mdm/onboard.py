@@ -766,22 +766,20 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
         return False
     target = _wsl_dir()
     try:
-        # Download and check every script first, so a failed download keeps the last good set.
-        staged = {}
-        for url in mdm_urls:
-            user_url = url.replace("/mdm/setup.py", "/setup.py")
-            source = fetch_script(user_url)
-            compile(source, user_url, "exec")
-            staged[user_url[len(_RAW_SETUP) + 1:].replace("/", "-")] = source
         target.mkdir(parents=True, exist_ok=True)
-        for old in target.glob("*-setup.py"):
-            old.unlink()
-        for name, source in staged.items():
-            (target / name).write_bytes(source)
         (target / "run.py").write_text(WSL_RUNNER, encoding="utf-8")
-    except Exception as e:
+    except OSError as e:
         print(f"   Could not stage the WSL installers: {e}", file=sys.stderr)
         return False
+    # Only --clear removes an installer, so a tool that fails one run keeps the copy staged before.
+    for url in mdm_urls:
+        user_url = url.replace("/mdm/setup.py", "/setup.py")
+        try:
+            source = fetch_script(user_url)
+            compile(source, user_url, "exec")
+            (target / user_url[len(_RAW_SETUP) + 1:].replace("/", "-")).write_bytes(source)
+        except Exception as e:
+            print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
     return _powershell(
         "$a = New-ScheduledTaskAction -Execute $env:UNB_EXE -Argument $env:UNB_ARGS; "
         "$p = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited; "

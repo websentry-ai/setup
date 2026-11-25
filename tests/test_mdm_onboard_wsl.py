@@ -80,23 +80,27 @@ class TestInstall(unittest.TestCase):
         self.assertEqual(env["UNB_ARGS"], f'-I "{stage / "run.py"}"')
         self.assertEqual(env["UNB_TASK"], "Unbound WSL Setup")
 
-    def test_failed_download_keeps_the_last_good_scripts(self):
+    def test_a_failed_tool_keeps_its_staged_installer_and_the_rest_still_stage(self):
         stage = self.pf / "Unbound WSL"
         stage.mkdir()
         (stage / "cursor-setup.py").write_text("GOOD = 1\n")
-        with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
-                mock.patch.object(onboard, "fetch_script", side_effect=RuntimeError("offline")), \
-                mock.patch.object(onboard, "_powershell") as ps:
-            self.assertFalse(onboard.install_wsl_logon_task([f"{onboard._RAW_SETUP}/cursor/mdm/setup.py"]))
-        self.assertEqual((stage / "cursor-setup.py").read_text(), "GOOD = 1\n")
-        ps.assert_not_called()
+        bad = {"cursor/setup.py": RuntimeError("offline"), "codex/hooks/setup.py": b"def broken(:\n"}
 
-    def test_bad_download_registers_nothing(self):
+        def fetch(url):
+            result = next((v for k, v in bad.items() if url.endswith(k)), b"OK = 1\n")
+            if isinstance(result, Exception):
+                raise result
+            return result
+        urls = [f"{onboard._RAW_SETUP}/{t}/mdm/setup.py" for t in ("cursor", "codex/hooks", "augment/hooks")]
         with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
-                mock.patch.object(onboard, "fetch_script", return_value=b"def broken(:\n"), \
-                mock.patch.object(onboard, "_powershell") as ps:
-            self.assertFalse(onboard.install_wsl_logon_task([f"{onboard._RAW_SETUP}/cursor/mdm/setup.py"]))
-        ps.assert_not_called()
+                mock.patch.object(onboard, "fetch_script", side_effect=fetch), \
+                mock.patch.object(onboard, "_powershell", return_value=True) as ps, \
+                mock.patch("builtins.print"):
+            self.assertTrue(onboard.install_wsl_logon_task(urls))
+        self.assertEqual((stage / "cursor-setup.py").read_text(), "GOOD = 1\n")
+        self.assertFalse((stage / "codex-hooks-setup.py").exists())
+        self.assertEqual((stage / "augment-hooks-setup.py").read_text(), "OK = 1\n")
+        ps.assert_called_once()
 
     def test_python_users_could_replace_is_refused(self):
         with mock.patch.object(onboard, "_all_users_pythonw", return_value=None), \
