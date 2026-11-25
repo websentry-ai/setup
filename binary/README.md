@@ -81,7 +81,7 @@ the python path, by design:
   summary + exit code but never aborts the others. `deferred` means a re-run
   should retry; `skipped` is intentional. Every tool that got its device key
   sends this status, reason and `written_to` to `/api/v1/setup/complete/` each
-  run; a tool with no footprint on the Mac (`_TOOL_FOOTPRINTS`) is still
+  run; a tool with no footprint on the Mac (`tool_installed()` in its MDM module) is still
   written but reported `skipped` ("<Tool> is not installed"). A discovery run
   that prints `Scan skipped: <reason>` is `skipped`. The run itself posts
   `phase: start` first and `phase: end` last to the MDM install report.

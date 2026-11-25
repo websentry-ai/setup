@@ -1441,6 +1441,100 @@ def hook_script_hash(script_path) -> Optional[str]:
         return None
 
 
+TOOL_NAME, TOOL_CLI = "Augment", "auggie"
+# The Auggie CLI, or the Augment extension alone in VS Code, VS Code Insiders or Cursor.
+_AUGMENT_EXTENSIONS = tuple(f"{editor}/extensions/augment.vscode-augment-*"
+                            for editor in (".vscode", ".vscode-insiders", ".cursor"))
+# Per OS: (machine-wide paths, paths under a home), beside the CLI's own folders.
+TOOL_FOOTPRINTS = {system: ((), _AUGMENT_EXTENSIONS) for system in ("darwin", "linux", "windows")}
+
+# --- Whether the tool is installed (WEB-6392) ---------------------------------------------
+# For the setup/complete status only: a tool with none of its files on disk is reported skipped,
+# "<Tool> is not installed", and its config is written all the same. Existence checks only (and
+# ~/.npmrc, read without following a link, for its prefix); a check that fails counts as installed.
+# Every tool's MDM script runs on its own, so each one carries this same code with its own
+# footprints, kept equal by tests/test_tool_installed.py; the unbound-hook binary calls it too.
+_UNIX_HOME_CLI_DIRS = (
+    ".local/bin", ".bun/bin", ".npm-global/bin", ".nvm/versions/node/*/bin", ".volta/bin",
+    ".local/share/fnm/node-versions/*/installation/bin", ".fnm/node-versions/*/installation/bin",
+    ".asdf/shims", ".local/share/mise/shims", ".local/share/mise/installs/*/*/bin",
+    ".nodenv/shims", ".nodenv/versions/*/bin", ".yarn/bin", ".config/yarn/global/node_modules/.bin")
+# Where a CLI lands, per OS: (machine-wide folders, folders under a user's home).
+_CLI_DIRS = {
+    "darwin": (("opt/homebrew/bin", "usr/local/bin", "opt/local/bin"), _UNIX_HOME_CLI_DIRS + ("Library/pnpm",)),
+    "linux": (("usr/local/bin", "usr/bin", "snap/bin", "var/lib/flatpak/exports/bin"),
+              _UNIX_HOME_CLI_DIRS + (".local/share/pnpm", ".local/share/flatpak/exports/bin")),
+    "windows": (("ProgramData/chocolatey/bin", "Program Files/nodejs"),
+                ("AppData/Roaming/npm", "AppData/Local/pnpm", "AppData/Local/Volta/bin", "AppData/Roaming/nvm/*",
+                 "scoop/shims", ".local/bin", ".bun/bin")),
+}
+_CLI_SUFFIXES = {"windows": ("", ".exe", ".cmd", ".ps1")}
+
+
+def _install_root(system: str) -> Path:
+    return Path((os.environ.get("SystemDrive") or "C:") + "\\") if system == "windows" else Path("/")
+
+
+def _found(root: Path, relpath: str) -> bool:
+    """Something is at relpath; a place that can't be looked at counts as found."""
+    try:
+        return any(root.glob(relpath)) if "*" in relpath else (root / relpath).exists()
+    except OSError:
+        return True
+
+
+def _npmrc_cli_dir(home: Path, system: str) -> Optional[Path]:
+    """Where npm puts CLIs for a prefix the user set in ~/.npmrc, or None."""
+    try:
+        fd = os.open(str(home / ".npmrc"), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        text = os.read(fd, 65536).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "prefix":
+            value = value.strip().strip("\"'")
+            for token in ("${HOME}", "$HOME"):
+                value = value.replace(token, str(home))
+            if value.startswith("~/"):
+                value = str(home) + value[1:]
+            if not os.path.isabs(value):
+                return None
+            return Path(value) if system == "windows" else Path(value) / "bin"
+    return None
+
+
+def tool_installed(user_homes, system: Optional[str] = None, machine_root: Optional[Path] = None) -> bool:
+    """Whether any of this tool's footprints is on the machine or in a user's home."""
+    try:
+        system = system or platform.system().lower()
+        root = machine_root if machine_root is not None else _install_root(system)
+        machine_dirs, home_dirs = _CLI_DIRS.get(system, ((), ()))
+        machine_files, home_files = TOOL_FOOTPRINTS.get(system, ((), ()))
+        names = [TOOL_CLI + suffix for suffix in _CLI_SUFFIXES.get(system, ("",))]
+        machine = [f"{d}/{n}" for d in machine_dirs for n in names] + list(machine_files)
+        per_home = [f"{d}/{n}" for d in home_dirs for n in names] + list(home_files)
+        if any(_found(root, rel) for rel in machine):
+            return True
+        for _, home in user_homes:
+            if home is None:
+                continue
+            npm_dir = _npmrc_cli_dir(Path(home), system)
+            if any(_found(Path(home), rel) for rel in per_home) or (
+                    npm_dir is not None and any(_found(npm_dir, n) for n in names)):
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
                           hook_hash: Optional[str] = None, install_mode: Optional[str] = None,
                           status: Optional[str] = None, reason: Optional[str] = None,

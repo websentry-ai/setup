@@ -222,70 +222,15 @@ def _preflight_warnings(user_homes) -> list:
 _TOOL_TYPES = {"claude-code": "claude-code", "cursor": "cursor", "codex": "codex",
                "copilot": "copilot", "augment": "augment_code"}
 
-# What an installed tool leaves on disk: (name, its CLI, its app bundles, other files under a home).
-# None of these is a file setup writes, so a re-run never takes its own files for the tool.
-_TOOL_FOOTPRINTS = {
-    "claude-code": ("Claude Code", "claude", ("Claude.app",), (".claude/local/claude", ".claude.json")),
-    "cursor": ("Cursor", "cursor-agent", ("Cursor.app",), ()),
-    "codex": ("Codex", "codex", ("Codex.app",), (".codex/auth.json", ".codex/sessions")),
-    "copilot": ("GitHub Copilot", "copilot",
-                ("Visual Studio Code.app", "Visual Studio Code - Insiders.app"), ()),
-    # The editor extension alone, in VS Code, VS Code Insiders or Cursor, also counts.
-    "augment": ("Augment", "auggie", (), tuple(f"{editor}/extensions/augment.vscode-augment-*"
-                                              for editor in (".vscode", ".vscode-insiders", ".cursor"))),
-}
-# Where a CLI lands under a home: a user install, Bun, npm's user prefix, yarn global, and the Node version
-# managers (nvm, Volta, pnpm's default PNPM_HOME, fnm in both its folders, asdf and mise shims, mise's
-# installs, nodenv). A prefix set in ~/.npmrc is read as well (_npmrc_bin).
-_HOME_CLI_DIRS = (".local/bin", ".bun/bin", ".npm-global/bin", ".nvm/versions/node/*/bin", ".volta/bin",
-                  "Library/pnpm", ".local/share/fnm/node-versions/*/installation/bin",
-                  ".fnm/node-versions/*/installation/bin", ".asdf/shims", ".local/share/mise/shims",
-                  ".local/share/mise/installs/*/*/bin", ".nodenv/shims", ".nodenv/versions/*/bin",
-                  ".yarn/bin", ".config/yarn/global/node_modules/.bin")
-# Homebrew (Apple silicon, Intel) and MacPorts.
-_MACHINE_CLI_DIRS = ("opt/homebrew/bin", "usr/local/bin", "opt/local/bin")
-
-
-def _npmrc_bin(home: Path):
-    """The bin folder of a prefix the user set in ~/.npmrc, or None. Read without following a link and
-    used only to look for a file, so a root run learns nothing else from it."""
-    try:
-        text = _read_user_file(home / ".npmrc", follow=False).decode("utf-8", "replace")
-    except OSError:
-        return None
-    for line in text.splitlines():
-        key, sep, value = line.partition("=")
-        if sep and key.strip() == "prefix":
-            value = value.strip().strip('"\'')
-            for token in ("${HOME}", "$HOME"):
-                value = value.replace(token, str(home))
-            if value.startswith("~/"):
-                value = str(home) + value[1:]
-            return Path(value) / "bin" if value.startswith("/") else None
-    return None
+# The machine root the installed check looks under; tests point it at a sandbox.
 _MACHINE_ROOT = Path("/")
 
 
-def _present(root: Path, relpath: str) -> bool:
-    try:
-        return any(root.glob(relpath)) if "*" in relpath else (root / relpath).exists()
-    except OSError:
-        return False
-
-
 def _tool_installed(tool, user_homes) -> bool:
-    """Any footprint machine-wide (Homebrew, /usr/local, /Applications) or in a home (_HOME_CLI_DIRS,
-    ~/Applications, the tool's own files). A check that fails counts as installed, the report setup always sent."""
+    """The tool's own MDM module answers (one check per tool, shared with the python setup), with the
+    macOS rules: this binary runs on macOS only. A check that fails counts as installed."""
     try:
-        _, cli, apps, home_files = _TOOL_FOOTPRINTS[tool]
-        app_paths = [f"Applications/{app}" for app in apps]
-        machine = [f"{folder}/{cli}" for folder in _MACHINE_CLI_DIRS] + app_paths
-        per_home = [f"{folder}/{cli}" for folder in _HOME_CLI_DIRS] + [*home_files, *app_paths]
-        homes = [home for _, home in user_homes if home is not None]
-        roots = [(_MACHINE_ROOT, machine)] + [(home, per_home) for home in homes]
-        npm_bins = [b for b in map(_npmrc_bin, homes) if b is not None]
-        return (any(_present(root, rel) for root, rels in roots for rel in rels)
-                or any((b / cli).exists() for b in npm_bins))
+        return load_mdm_setup_module(tool).tool_installed(user_homes, system="darwin", machine_root=_MACHINE_ROOT)
     except Exception:
         return True
 
@@ -295,7 +240,7 @@ def _report(m, tool, api_key, status, reason=None, installed=True, **fields):
     without the tool (installed False, from the run's one check) reads skipped: its config is still written,
     so the hook works once the tool arrives."""
     if status == "configured" and not installed:
-        status, reason = "skipped", f"{_TOOL_FOOTPRINTS[tool][0]} is not installed"
+        status, reason = "skipped", f"{m.TOOL_NAME} is not installed"
     m.notify_setup_complete(api_key, _TOOL_TYPES[tool], status=status, reason=reason, **fields)
     return status, reason
 
@@ -1957,7 +1902,7 @@ def run(argv) -> int:
     warnings = _report_input(lambda: _preflight_warnings(user_homes), [], "preflight checks")
     # Once, before any tool writes: unknown homes (or a failed check) leave every tool reported as installed.
     opts["installed"] = _report_input(lambda: {} if user_homes is None else {
-        tool: _tool_installed(tool, user_homes) for tool in opts["tools"] if tool in _TOOL_FOOTPRINTS},
+        tool: _tool_installed(tool, user_homes) for tool in opts["tools"] if tool in _TOOL_TYPES},
         {}, "installed tools")
     _send_run_report(opts, serial, "start", _start_fields)
     # Before the sweep: it removes ~/.cursor/hooks, and with it Cursor's error.log.
