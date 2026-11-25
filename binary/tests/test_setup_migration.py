@@ -1826,9 +1826,10 @@ def test_a_python_era_copilot_hook_behind_a_locked_folder_is_tampered(env, monke
         setup_cmd.run(["--api-key", "admin-key"])
     finally:
         hooks_dir.chmod(0o755)
-    # The tamper is still reported, then why setup deferred (WEB-6392).
-    assert _states(env, "copilot") == ["tampered", None]
-    assert [k.get("status") for a, k in env["notified"] if a[1] == "copilot"] == [None, "deferred"]
+    # One report: why setup deferred, carrying the tamper it found (WEB-6392).
+    assert _states(env, "copilot") == ["tampered"]
+    [report] = [k for a, k in env["notified"] if a[1] == "copilot"]
+    assert (report["status"], report["reason"]) == ("deferred", "hook install failed for all users")
 
 
 @pytest.mark.parametrize("tool", ["claude-code", "augment_code"])

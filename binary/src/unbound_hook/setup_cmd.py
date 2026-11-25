@@ -1817,12 +1817,9 @@ def _setup_copilot(opts):
     m.configure_managed_telemetry(api_key, gateway_url=gateway)
 
     if user_homes and installed == 0:
-        # A user can make every install fail, so a detected tamper is still reported.
-        if state == "tampered":
-            m.notify_setup_complete(api_key, "copilot", backend_url=base,
-                                    install_state=state, serial_number=device_id,
-                                    install_mode="binary")
-        return report("deferred", "hook install failed for all users")
+        # A user can make every install fail, so the report carries the state found: the backend counts a
+        # tamper on a deferred report without marking the tool connected or deployed.
+        return report("deferred", "hook install failed for all users", install_state=state)
 
     if not config_ok:
         return report("deferred", "config.json write failed for some users")
