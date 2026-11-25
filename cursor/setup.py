@@ -717,8 +717,61 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+def _wsl_distros():
+    """This Windows user's WSL distros, from the registry: wsl.exe blocks on an install prompt when WSL is absent."""
+    import winreg
+    names = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Lxss") as root:
+            for i in range(winreg.QueryInfoKey(root)[0]):
+                try:
+                    with winreg.OpenKey(root, winreg.EnumKey(root, i)) as sub:
+                        names.append(winreg.QueryValueEx(sub, "DistributionName")[0])
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    # WSL itself rejects any other distro name (E_INVALIDARG), so this drops only corrupt entries.
+    return [n for n in names if isinstance(n, str) and n and all(c.isalnum() or c in "._-" for c in n)
+            and not n.lower().startswith(("docker-desktop", "rancher-desktop", "podman-"))]
+
+
+def setup_wsl(argv) -> None:
+    """Windows: run this same setup in each of the user's WSL distros, which keep their own Linux home."""
+    key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
+        argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None)
+    # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
+    if platform.system() != "Windows" or not (key or "--clear" in argv):
+        return
+    # --config-dir is a Windows path; the key goes in on stdin so ps inside WSL can't read it.
+    drop = ("--config-dir", "--api-key")
+    args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
+    # Absolute path: a bare name lets CreateProcess pick up a wsl.exe from the current directory.
+    root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
+    try:
+        source = Path(__file__).read_bytes()
+        if key:
+            source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
+    except (NameError, OSError):
+        return
+    for distro in _wsl_distros() if wsl else []:
+        try:
+            r = subprocess.run([str(wsl), "-d", distro, "--exec", "python3", "-", *args], input=source,
+                               capture_output=True, timeout=900, env={**os.environ, "WSL_UTF8": "1"},
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            out = (r.stdout + r.stderr).decode("utf-8", "replace")
+            status = {0: "done", 3: "managed by MDM"}.get(r.returncode) or (
+                "skipped, python3 not installed" if "execvpe(python3)" in out
+                else f"failed (exit {r.returncode}): {(out.strip().splitlines() or [''])[-1]}")
+        except (OSError, subprocess.TimeoutExpired) as e:
+            status = f"failed ({type(e).__name__})"
+        print(f"WSL {distro}: {status}")
+
+
 def main():
     global DEBUG
+    setup_wsl(sys.argv[1:])
 
     # Parse arguments
     clear_mode = "--clear" in sys.argv
