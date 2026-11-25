@@ -548,15 +548,20 @@ def _wsl_distros():
 
 def setup_wsl(argv) -> None:
     """Windows: run this same setup in each of the user's WSL distros, which keep their own Linux home."""
+    # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
     if platform.system() != "Windows" or not {"--api-key", "--clear"} & set(argv):
         return
-    # --config-dir is a Windows path; inside WSL the default applies.
-    args = [a for i, a in enumerate(argv) if not a.startswith("--config-dir") and (i == 0 or argv[i - 1] != "--config-dir")]
+    key = argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None
+    # --config-dir is a Windows path; the key goes in on stdin so ps inside WSL can't read it.
+    drop = ("--config-dir", "--api-key")
+    args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
     # Absolute path: a bare name lets CreateProcess pick up a wsl.exe from the current directory.
     root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
     wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
     try:
         source = Path(__file__).read_bytes()
+        if key:
+            source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
     except (NameError, OSError):
         return
     for distro in _wsl_distros() if wsl else []:

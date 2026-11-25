@@ -1,5 +1,6 @@
 """Every user-level installer, run on Windows, also runs itself inside the user's WSL distros."""
 import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -39,8 +40,9 @@ class TestSetupWsl(unittest.TestCase):
                 self.assertEqual([c[:6] for c, _ in calls],
                                  [[str(mod.Path("C:\\Windows") / "System32" / "wsl.exe"), "-d", d, "--exec", "python3", "-"]
                                   for d in ("Ubuntu", "Debian")])
-                self.assertEqual(calls[0][0][6:], ["--api-key", "k", "--backfill"])
-                self.assertEqual(calls[0][1]["input"], open(mod.__file__, "rb").read())
+                self.assertEqual(calls[0][0][6:], ["--backfill"])
+                self.assertEqual(calls[0][1]["input"],
+                                 b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
 
     def test_main_runs_the_wsl_step_first(self):
@@ -64,6 +66,15 @@ class TestSetupWsl(unittest.TestCase):
     def test_clear_reaches_wsl_too(self):
         calls, _ = self._run(load_module("cursor/setup.py"), ["--clear"])
         self.assertEqual(calls[0][0][6:], ["--clear"])
+        self.assertEqual(calls[0][1]["input"], open(load_module("cursor/setup.py").__file__, "rb").read())
+
+    def test_key_reaches_wsl_on_stdin_not_argv(self):
+        mod = load_module("codex/hooks/setup.py")
+        calls, _ = self._run(mod, ["--api-key", "s3cr'et\n", "--domain", "https://x"], distros=("Ubuntu",))
+        self.assertNotIn("s3cr'et\n", " ".join(calls[0][0]))
+        header = calls[0][1]["input"].split(b"\n", 1)[0] + b"\nprint(repr(sys.argv))\n"
+        out = subprocess.run([sys.executable, "-", "--domain", "https://x"], input=header, capture_output=True).stdout
+        self.assertEqual(out.decode().strip(), repr(["-", "--api-key", "s3cr'et\n", "--domain", "https://x"]))
 
     def test_off_windows_or_without_a_key_does_nothing(self):
         mod = load_module("codex/hooks/setup.py")
