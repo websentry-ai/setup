@@ -387,22 +387,26 @@ def _home_device_key(home: Path):
     return key if isinstance(key, str) and key else None
 
 
-def _forward_hook_errors(m, tool, opts) -> None:
+def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
     """Forward every home's unsent error.log entries for this tool, with that home's own device key. Runs
     before the migration sweep, which removes ~/.cursor/hooks and its log. A gateway that is down ends
     forwarding for the whole run, so it costs one short timeout; a refused key is that home's own and skips
-    only that home. Either way nothing is marked sent, and the next run retries."""
+    only that home. Either way nothing is marked sent, and the next run retries. user_homes and keys (home
+    to its key, filled as homes are read) come from run(), so each home is found and read once a run."""
     if opts.get("hook_errors_held"):
         return
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
     sent = 0
     try:
         hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
-        for username, home_dir in m.get_all_user_homes():
+        keys = {} if keys is None else keys
+        for username, home_dir in user_homes if user_homes is not None else m.get_all_user_homes():
             log = home_dir / relpath if home_dir is not None else None
             if log is None or not os.path.lexists(log):
                 continue
-            api_key = _as_user(m, username, _home_device_key, home_dir)
+            if str(home_dir) not in keys:
+                keys[str(home_dir)] = _as_user(m, username, _home_device_key, home_dir)
+            api_key = keys[str(home_dir)]
             if not api_key:
                 continue  # no hook here has a key to report with yet
             send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
@@ -1909,9 +1913,10 @@ def run(argv) -> int:
         {}, "installed tools")
     _send_run_report(opts, serial, "start", _start_fields)
     # Before the sweep: it removes ~/.cursor/hooks, and with it Cursor's error.log.
+    home_keys = {}
     for tool in opts["tools"]:
         if tool in _HOOK_ERROR_LOGS:
-            _forward_hook_errors(m0, tool, opts)
+            _forward_hook_errors(m0, tool, opts, user_homes, home_keys)
 
     statuses = {}
 

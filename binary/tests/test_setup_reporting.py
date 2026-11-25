@@ -761,3 +761,15 @@ def test_forwarding_uses_and_redacts_the_key_the_hooks_read_first(env, backend):
     [request] = _forwarded(backend)
     assert request["headers"]["Authorization"] == "Bearer api-key-1"
     assert _messages(backend) == ["request with [REDACTED] failed"]
+
+
+# --- Final review #6: each home's key is read once a run -------------------------
+
+def test_each_homes_key_is_read_once_however_many_tools_log_there(env, backend, monkeypatch):
+    reads, real = [], setup_cmd._home_device_key
+    monkeypatch.setattr(setup_cmd, "_home_device_key", lambda home: reads.append(home) or real(home))
+    for tool in ("claude-code", "codex", "copilot"):
+        _log(env["home"], tool, [f"{_utc(0)}: {tool} broke"])
+    _run(backend)
+    assert {r["body"]["hook_source"] for r in _forwarded(backend)} == {"claude-code", "codex", "copilot"}
+    assert reads == [env["home"]]
