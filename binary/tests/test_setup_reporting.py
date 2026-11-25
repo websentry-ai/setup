@@ -746,3 +746,18 @@ def test_a_refused_key_in_one_home_leaves_the_other_homes_forwarding(env, backen
     assert _messages(backend) == ["alice's codex broke", "bob's codex broke"]
     assert (other / ".codex/hooks" / STATE).exists()
     assert not (env["home"] / ".codex/hooks" / STATE).exists()
+
+
+# --- Final review #2: the key the hooks use, and redacted ------------------------
+
+def test_forwarding_uses_and_redacts_the_key_the_hooks_read_first(env, backend):
+    """The hooks read cfg.get('api_key') or cfg.get('device_token'); when both are there and differ,
+    that is the key their errors belong to."""
+    (env["home"] / ".unbound").mkdir(exist_ok=True)
+    (env["home"] / ".unbound" / "config.json").write_text(
+        json.dumps({"device_token": "token-key-2", "api_key": "api-key-1"}))
+    _log(env["home"], "codex", [f"{_utc(0)}: request with api-key-1 failed"], key=None)
+    _run(backend)
+    [request] = _forwarded(backend)
+    assert request["headers"]["Authorization"] == "Bearer api-key-1"
+    assert _messages(backend) == ["request with [REDACTED] failed"]

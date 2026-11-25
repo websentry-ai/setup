@@ -382,7 +382,8 @@ def _home_device_key(home: Path):
         config = json.loads(_read_user_file(home / ".unbound" / "config.json", follow=False).decode("utf-8"))
     except (OSError, ValueError):
         return None
-    key = (config.get("device_token") or config.get("api_key")) if isinstance(config, dict) else None
+    # The hooks' own order (cfg.get('api_key') or cfg.get('device_token')): their errors are this key's.
+    key = (config.get("api_key") or config.get("device_token")) if isinstance(config, dict) else None
     return key if isinstance(key, str) and key else None
 
 
