@@ -201,6 +201,8 @@ def test_copilot_with_some_installs_failed_reports_how_many(run):
     r.mp.setattr(r.m, "install_hooks_for_user", lambda *a, **k: next(answers))
     assert r() is False
     assert (r.report["status"], r.report["reason"]) == ("deferred", "Installed Copilot hooks for 1 of 2 user(s) — 1 failed")
+    # As in the binary, the tamper state rides only on a run where every install failed.
+    assert "install_state" not in r.report
 
 
 @pytest.mark.parametrize("tool", sorted(MODULES))

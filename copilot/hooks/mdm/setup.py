@@ -2970,9 +2970,10 @@ def main():
         report("configured", install_state=state,
                hook_hash=hook_script_hash(user_homes[0][1] / ".copilot" / "hooks" / "unbound.py"),
                written_to="~/.copilot/hooks/unbound.json")
-    elif user_homes and installed_count < len(user_homes):
+    elif user_homes and installed_count == 0:
         # A user can make every install fail: the report carries the state found, and the backend counts
-        # a tamper on a deferred report without marking the tool connected or deployed.
+        # a tamper on a deferred report without marking the tool connected or deployed. Same rule as the
+        # unbound-hook binary.
         report("deferred", failure, install_state=state)
     else:
         report("deferred", failure)
