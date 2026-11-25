@@ -1166,9 +1166,16 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         path.write_text(new_text, encoding="utf-8")
 
 
+# The settings file setup_managed_hooks last wrote: managed-settings.json, or on Windows the
+# managed-settings.d drop-in when its folder could be made. main reports it as written_to.
+_managed_settings_written: Optional[Path] = None
+
+
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: bool = False) -> bool:
     """Set up system-wide managed hooks for Claude Code: download unbound.py and
     configure managed-settings.json. With skip_settings, install only the script."""
+    global _managed_settings_written
+    _managed_settings_written = None
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
@@ -1361,6 +1368,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         if _is_reparse_point(settings_path):
             raise OSError(f"{settings_path} is a link; refusing to write through it as root")
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        _managed_settings_written = settings_path
         debug_print(f"Created managed settings: {settings_path}")
 
         # Delete the gateway key helper only after the hooks settings are
@@ -3560,9 +3568,10 @@ def main():
     print("=" * 60)
 
     managed_dir = get_managed_settings_dir()
+    # The file the write actually went to: on Windows that is the managed-settings.d drop-in.
+    written = managed_dir / "hooks" / "unbound.py" if skip_managed_settings else _managed_settings_written
     report("configured", install_state=state, hook_hash=hook_script_hash(managed_dir / "hooks" / "unbound.py"),
-           written_to=str(managed_dir / "hooks" / "unbound.py" if skip_managed_settings
-                          else managed_dir / "managed-settings.json"))
+           written_to=str(written) if written else None)
 
     if backfill_mode:
         _run_backfill_bounded(api_key, base_url, get_all_user_homes())

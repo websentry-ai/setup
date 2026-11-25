@@ -66,7 +66,11 @@ class Run:
         self.mp.setattr(self.m, name, lambda *a, _n=name, _r=result, **k: self.writes.append(_n) or _r)
 
     def _claude_code(self):
-        self.writer("setup_managed_hooks")
+        # The real writer, so the report names the file it wrote; only the script download is faked.
+        real = self.m.setup_managed_hooks
+        self.mp.setattr(self.m, "setup_managed_hooks",
+                        lambda *a, **k: self.writes.append("setup_managed_hooks") or real(*a, **k))
+        self.mp.setattr(self.m, "download_file", lambda url, dest, *a, **k: Path(dest).write_text("# hook") or True)
         self.stub("_unbound_base_url_matcher", None)
 
     def _cursor(self):
@@ -212,3 +216,31 @@ def test_a_failure_before_the_key_sends_nothing(run, tool):
     r.stub("fetch_api_key_from_mdm", None)
     assert r() is False
     assert r.reports == []
+
+
+# --- Claude Code reports the settings file it actually wrote (found on a Windows VM) ---
+
+REAL_CLAUDE_SETUP_MANAGED_HOOKS = load_module(MODULES["claude-code"]).setup_managed_hooks
+
+
+def _claude_on_windows(run):
+    r = run("claude-code")
+    r.mp.setattr(r.m.platform, "system", lambda: "Windows")
+    r.mp.setattr(r.m, "setup_managed_hooks", REAL_CLAUDE_SETUP_MANAGED_HOOKS)
+    r.mp.setattr(r.m, "download_file", lambda url, dest, *a, **k: Path(dest).write_text("# hook") or True)
+    return r
+
+
+def test_claude_code_on_windows_reports_the_drop_in_it_wrote(run):
+    r = _claude_on_windows(run)
+    assert r() is True
+    assert Path(r.report["written_to"]) == r.managed / "managed-settings.d" / "unbound.json"
+    assert (r.managed / "managed-settings.d" / "unbound.json").is_file()
+
+
+def test_claude_code_on_windows_reports_managed_settings_when_the_drop_in_cannot_be_made(run):
+    r = _claude_on_windows(run)
+    (r.managed / "managed-settings.d").write_text("")  # a file where the folder would go
+    assert r() is True
+    assert Path(r.report["written_to"]) == r.managed / "managed-settings.json"
+    assert (r.managed / "managed-settings.json").is_file()
