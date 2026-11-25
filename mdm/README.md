@@ -40,6 +40,26 @@ Optional parameters:
 .\onboard.ps1 -ApiKey YOUR_KEY -SkipManagedSettings
 ```
 
+### Install report (Windows)
+
+`onboard.ps1` posts its result to `/api/v1/automations/mdm/install-report/`, the endpoint `onboard.sh` uses. Success is `step=setup` with `exit_code=0`. The report is best-effort: if it fails, the script prints one line to stderr and keeps its exit code.
+
+| `step` | What failed |
+| --- | --- |
+| `check_admin` | The shell is not elevated |
+| `find_python` | Python 3 is not on `PATH` |
+| `download_onboard_py` | `onboard.py` could not be downloaded |
+| `prepare_onboard_py` | The temporary script could not be written |
+| `setup` | `onboard.py` exited non-zero without naming a step |
+| `setup:<steps>` | `onboard.py` named the steps that failed, for example `setup:cursor,discovery` |
+
+These failures send no report, because `onboard.ps1` never ran or cannot reach the backend:
+
+- The download of `onboard.ps1` itself, in the Intune or scheduled task script
+- PowerShell refusing to start the script, for example under an execution policy or AppLocker
+- A run with no `-ApiKey`, and every `-Clear` run
+- The process being killed, or the backend being unreachable from the device
+
 ### Clearing Setup (Windows)
 
 ```powershell

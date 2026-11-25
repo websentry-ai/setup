@@ -9,8 +9,8 @@
     Administrator) with python 3 on PATH.
 
     Covers T1-T5 (direct), T7 (Intune remediation front door), T8 (Scheduled
-    Task front door), T9 (stress). T6 (proven-to-fail) is a separate script,
-    Invoke-ProvenToFail.ps1. Exits 0 only if every assertion passes.
+    Task front door), T9 (stress), T10 (install report). T6 (proven-to-fail) is a
+    separate script, Invoke-ProvenToFail.ps1. Exits 0 only if every assertion passes.
 #>
 [CmdletBinding()]
 param()
@@ -79,6 +79,16 @@ $r = Invoke-OnboardRun -Mode direct -ChildExit 0 -StdoutLines 5000
 Assert 'T9-ok'   'stress success -> exit 0' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit)"
 $r = Invoke-OnboardRun -Mode direct -ChildExit 42 -StdoutLines 5000
 Assert 'T9-fail' 'stress failure -> exit 42 (distinctive, not a masking 1)' ($r.ProcExit -eq 42) "ProcExit=$($r.ProcExit)"
+
+# T10 - the install report carries the result, and a failed report changes nothing.
+$r = Invoke-OnboardRun -Mode direct -ChildExit 0
+Assert 'T10-ok'   'success reports step=setup exit_code=0' (($r.Report.step -eq 'setup') -and ($r.Report.exit_code -eq 0)) "step=$($r.Report.step) code=$($r.Report.exit_code)"
+$r = Invoke-OnboardRun -Mode direct -ChildExit 42
+Assert 'T10-fail' 'failure reports the exit code (==42)' (($r.Report.step -eq 'setup') -and ($r.Report.exit_code -eq 42)) "step=$($r.Report.step) code=$($r.Report.exit_code)"
+$r = Invoke-OnboardRun -Mode direct -ChildExit 0 -ReportFails
+Assert 'T10-open0' 'failed report keeps a success exit 0' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit)"
+$r = Invoke-OnboardRun -Mode direct -ChildExit 42 -ReportFails
+Assert 'T10-open42' 'failed report keeps a failure exit 42' ($r.ProcExit -eq 42) "ProcExit=$($r.ProcExit)"
 
 Write-Host ""
 $fail = @($results | Where-Object { -not $_.Pass })
