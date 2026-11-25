@@ -542,16 +542,18 @@ def _wsl_distros():
                     continue
     except OSError:
         pass
+    # WSL itself rejects any other distro name (E_INVALIDARG), so this drops only corrupt entries.
     return [n for n in names if isinstance(n, str) and n and all(c.isalnum() or c in "._-" for c in n)
             and not n.lower().startswith(("docker-desktop", "rancher-desktop", "podman-"))]
 
 
 def setup_wsl(argv) -> None:
     """Windows: run this same setup in each of the user's WSL distros, which keep their own Linux home."""
+    key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
+        argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None)
     # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
-    if platform.system() != "Windows" or not {"--api-key", "--clear"} & set(argv):
+    if platform.system() != "Windows" or not (key or "--clear" in argv):
         return
-    key = argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None
     # --config-dir is a Windows path; the key goes in on stdin so ps inside WSL can't read it.
     drop = ("--config-dir", "--api-key")
     args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]

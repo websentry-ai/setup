@@ -76,6 +76,12 @@ class TestSetupWsl(unittest.TestCase):
         out = subprocess.run([sys.executable, "-", "--domain", "https://x"], input=header, capture_output=True).stdout
         self.assertEqual(out.decode().strip(), repr(["-", "--api-key", "s3cr'et\n", "--domain", "https://x"]))
 
+    def test_equals_form_api_key_reaches_wsl_on_stdin(self):
+        mod = load_module("claude-code/gateway/setup.py")
+        calls, _ = self._run(mod, ["--api-key=k", "--gateway-url", "https://g"], distros=("Ubuntu",))
+        self.assertEqual(calls[0][0][6:], ["--gateway-url", "https://g"])
+        self.assertTrue(calls[0][1]["input"].startswith(b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n"))
+
     def test_off_windows_or_without_a_key_does_nothing(self):
         mod = load_module("codex/hooks/setup.py")
         self.assertEqual(self._run(mod, ["--api-key", "k"], system="Linux")[0], [])
