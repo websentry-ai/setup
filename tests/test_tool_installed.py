@@ -72,6 +72,19 @@ FOOTPRINTS = [
     ("copilot", "linux", "home", ".local/share/flatpak/app/com.visualstudio.code"),
     ("copilot", "windows", "home", "AppData/Local/Programs/Microsoft VS Code"),
     ("copilot", "windows", "machine", "Program Files/Microsoft VS Code"),
+    # Visual Studio: the installer's instance registry (what the hook's _vs_installed reads) and the
+    # Copilot chat log the hook's sweep reads.
+    ("copilot", "windows", "machine", "ProgramData/Microsoft/VisualStudio/Packages/_Instances/3f1e2d4c"),
+    ("copilot", "windows", "home", "AppData/Local/Temp/VSGitHubCopilotLogs/20261124_VSGitHubCopilot.chat.log"),
+    # JetBrains: the Copilot plugin's own config (read by the hook and by discovery), and the plugin
+    # folder in an IDE's per-user config (JetBrains and Google, as discovery scans them).
+    ("copilot", "darwin", "home", ".config/github-copilot/intellij/mcp.json"),
+    ("copilot", "linux", "home", ".config/github-copilot/intellij/global-copilot-instructions.md"),
+    ("copilot", "windows", "home", "AppData/Local/github-copilot/intellij/mcp.json"),
+    ("copilot", "darwin", "home", "Library/Application Support/JetBrains/IntelliJIdea2025.2/plugins/github-copilot-intellij/lib/x.jar"),
+    ("copilot", "linux", "home", ".config/JetBrains/PyCharm2025.1/plugins/github-copilot-intellij/lib/x.jar"),
+    ("copilot", "linux", "home", ".config/Google/AndroidStudio2025.1/plugins/github-copilot-intellij/lib/x.jar"),
+    ("copilot", "windows", "home", "AppData/Roaming/JetBrains/Rider2025.2/plugins/github-copilot-intellij/lib/x.jar"),
     ("augment", "darwin", "home", ".vscode/extensions/augment.vscode-augment-0.512.0"),
     ("augment", "linux", "home", ".local/bin/auggie"),
     ("augment", "linux", "machine", "usr/bin/auggie"),

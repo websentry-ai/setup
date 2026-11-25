@@ -2088,18 +2088,26 @@ def hook_script_hash(script_path) -> Optional[str]:
 
 
 TOOL_NAME, TOOL_CLI = "GitHub Copilot", "copilot"
-# The Copilot CLI, or VS Code (Copilot ships in it) or its Copilot extensions.
+# The Copilot CLI; VS Code (Copilot ships in it) or its Copilot extensions; Visual Studio (Copilot ships in
+# it: the installer's instance registry, as the hook's _vs_installed reads it, and the Copilot chat log its
+# sweep reads); or the JetBrains Copilot plugin: its own config (the hook and discovery read it) and its
+# folder in an IDE's per-user config (the JetBrains and Google vendor folders discovery scans).
 _VSCODE_MAC = ("Applications/Visual Studio Code.app", "Applications/Visual Studio Code - Insiders.app")
 _COPILOT_EXTENSIONS = (".vscode/extensions/github.copilot-*", ".vscode-insiders/extensions/github.copilot-*")
+_JETBRAINS_PLUGIN = tuple(f"{{root}}/{vendor}/*/plugins/github-copilot-intellij" for vendor in ("JetBrains", "Google"))
 # Per OS: (machine-wide paths, paths under a home), beside the CLI's own folders.
 TOOL_FOOTPRINTS = {
-    "darwin": (_VSCODE_MAC, _VSCODE_MAC + _COPILOT_EXTENSIONS),
+    "darwin": (_VSCODE_MAC, _VSCODE_MAC + _COPILOT_EXTENSIONS + (".config/github-copilot/intellij",)
+               + tuple(p.format(root="Library/Application Support") for p in _JETBRAINS_PLUGIN)),
     "linux": (("usr/share/code", "usr/share/code-insiders", "usr/bin/code", "snap/bin/code",
                "var/lib/flatpak/app/com.visualstudio.code"),
-              (".local/share/flatpak/app/com.visualstudio.code",) + _COPILOT_EXTENSIONS),
-    "windows": (("Program Files/Microsoft VS Code",),
-                ("AppData/Local/Programs/Microsoft VS Code", "AppData/Local/Programs/Microsoft VS Code Insiders")
-                + _COPILOT_EXTENSIONS),
+              (".local/share/flatpak/app/com.visualstudio.code",) + _COPILOT_EXTENSIONS
+              + (".config/github-copilot/intellij",) + tuple(p.format(root=".config") for p in _JETBRAINS_PLUGIN)),
+    "windows": (("Program Files/Microsoft VS Code", "ProgramData/Microsoft/VisualStudio/Packages/_Instances/*"),
+                ("AppData/Local/Programs/Microsoft VS Code", "AppData/Local/Programs/Microsoft VS Code Insiders",
+                 "AppData/Local/Temp/VSGitHubCopilotLogs/*_VSGitHubCopilot.chat.log",
+                 "AppData/Local/github-copilot/intellij") + _COPILOT_EXTENSIONS
+                + tuple(p.format(root="AppData/Roaming") for p in _JETBRAINS_PLUGIN)),
 }
 
 # --- Whether the tool is installed (WEB-6392) ---------------------------------------------
