@@ -23,6 +23,8 @@ class TestSetupWsl(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, code, out, b"")
 
         with mock.patch.object(mod.platform, "system", return_value=system), \
+                mock.patch.dict(mod.os.environ, {"SystemRoot": "C:\\Windows"}), \
+                mock.patch.object(mod.Path, "is_file", lambda p: p.name == "wsl.exe" and p.parent.name == "System32"), \
                 mock.patch.object(mod, "_wsl_distros", return_value=list(distros)), \
                 mock.patch.object(mod.subprocess, "run", side_effect=fake_run), \
                 mock.patch("builtins.print") as printed:
@@ -35,7 +37,8 @@ class TestSetupWsl(unittest.TestCase):
                 mod = load_module(path)
                 calls, lines = self._run(mod, ["--api-key", "k", "--config-dir", "C:\\x", "--backfill"])
                 self.assertEqual([c[:6] for c, _ in calls],
-                                 [["wsl.exe", "-d", d, "--exec", "python3", "-"] for d in ("Ubuntu", "Debian")])
+                                 [[str(mod.Path("C:\\Windows") / "System32" / "wsl.exe"), "-d", d, "--exec", "python3", "-"]
+                                  for d in ("Ubuntu", "Debian")])
                 self.assertEqual(calls[0][0][6:], ["--api-key", "k", "--backfill"])
                 self.assertEqual(calls[0][1]["input"], open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
@@ -48,6 +51,15 @@ class TestSetupWsl(unittest.TestCase):
                         mock.patch.object(mod.sys, "argv", ["setup.py", "--api-key", "k"]):
                     with self.assertRaisesRegex(RuntimeError, "wsl step"):
                         mod.main()
+
+    def test_no_wsl_exe_in_system_dir_does_nothing(self):
+        mod = load_module("cursor/setup.py")
+        with mock.patch.object(mod.platform, "system", return_value="Windows"), \
+                mock.patch.object(mod.Path, "is_file", lambda p: False), \
+                mock.patch.object(mod, "_wsl_distros", return_value=["Ubuntu"]), \
+                mock.patch.object(mod.subprocess, "run") as run:
+            mod.setup_wsl(["--api-key", "k"])
+        run.assert_not_called()
 
     def test_clear_reaches_wsl_too(self):
         calls, _ = self._run(load_module("cursor/setup.py"), ["--clear"])
@@ -64,6 +76,7 @@ class TestSetupWsl(unittest.TestCase):
         self.assertEqual(lines, ["WSL A: managed by MDM", "WSL B: skipped, python3 not installed",
                                  "WSL C: failed (exit 2): boom"])
         with mock.patch.object(mod.platform, "system", return_value="Windows"), \
+                mock.patch.object(mod.Path, "is_file", lambda p: True), \
                 mock.patch.object(mod, "_wsl_distros", return_value=["A"]), \
                 mock.patch.object(mod.subprocess, "run", side_effect=subprocess.TimeoutExpired("wsl", 900)), \
                 mock.patch("builtins.print") as printed:

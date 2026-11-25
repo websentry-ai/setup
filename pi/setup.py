@@ -856,13 +856,16 @@ def setup_wsl(argv) -> None:
         return
     # --config-dir is a Windows path; inside WSL the default applies.
     args = [a for i, a in enumerate(argv) if not a.startswith("--config-dir") and (i == 0 or argv[i - 1] != "--config-dir")]
+    # Absolute path: a bare name lets CreateProcess pick up a wsl.exe from the current directory.
+    root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+    wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
     try:
         source = Path(__file__).read_bytes()
     except (NameError, OSError):
         return
-    for distro in _wsl_distros():
+    for distro in _wsl_distros() if wsl else []:
         try:
-            r = subprocess.run(["wsl.exe", "-d", distro, "--exec", "python3", "-", *args], input=source,
+            r = subprocess.run([str(wsl), "-d", distro, "--exec", "python3", "-", *args], input=source,
                                capture_output=True, timeout=900, env={**os.environ, "WSL_UTF8": "1"},
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             out = (r.stdout + r.stderr).decode("utf-8", "replace")
