@@ -284,10 +284,16 @@ ERROR_LOGS = {"claude-code": ".claude/hooks/error.log", "cursor": ".cursor/hooks
 STATE = ".error_log_forwarded"
 
 
-def _log(home, tool, lines):
+def _log(home, tool, lines, key="per-device-key"):
+    """An error.log for the tool, and (unless key is None) the device key a previous run left in the
+    home's config, which is what the hooks, and so forwarding, report with."""
     path = home / ERROR_LOGS[tool]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(line + "\n" for line in lines))
+    config = home / ".unbound" / "config.json"
+    if key is not None and not config.exists():
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text(json.dumps({"api_key": key, "device_token": key}))
     return path
 
 
@@ -685,3 +691,36 @@ def test_installed_tools_are_found_once_before_the_first_report(env, machine, mo
     first_report = next(i for i, (kind, _) in enumerate(events) if kind == "report")
     assert all(kind == "check" for kind, _ in events[:first_report])
     assert len(events[:first_report]) == len(FOOTPRINTS)
+
+
+# --- Cursor: errors go out before the migration sweep deletes ~/.cursor/hooks -----
+
+def test_cursor_errors_go_out_before_the_sweep_removes_their_log(env, backend):
+    """env's one home belongs to the real user running the tests, so the migration sweep runs on it and
+    removes ~/.cursor/hooks, error.log and all, before Cursor's own setup step."""
+    _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    _run(backend)
+    assert not (env["home"] / ".cursor/hooks").exists()  # the sweep did run
+    sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
+    assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
+    assert sent[0]["headers"]["Authorization"] == "Bearer per-device-key"
+    # Gone with its log, so nothing can be sent twice.
+    backend.requests.clear()
+    _run(backend)
+    assert [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"] == []
+
+
+def test_errors_go_out_with_the_key_the_hooks_use(env, backend):
+    """Forwarding runs before any tool fetches its key, so it uses the one the home's hooks report with."""
+    (env["home"] / ".unbound").mkdir(exist_ok=True)
+    (env["home"] / ".unbound" / "config.json").write_text(json.dumps({"device_token": "home-key"}))
+    _log(env["home"], "codex", [f"{_utc(0)}: codex broke"], key=None)
+    _run(backend)
+    [request] = _forwarded(backend)
+    assert request["headers"]["Authorization"] == "Bearer home-key"
+
+
+def test_a_home_with_no_key_yet_forwards_nothing(env, backend):
+    _log(env["home"], "codex", [f"{_utc(0)}: codex broke"], key=None)
+    _run(backend)
+    assert _forwarded(backend) == []

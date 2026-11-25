@@ -85,12 +85,15 @@ the python path, by design:
   written but reported `skipped` ("<Tool> is not installed"). A discovery run
   that prints `Scan skipped: <reason>` is `skipped`. The run itself posts
   `phase: start` first and `phase: end` last to the MDM install report.
-  Each tool's adapter also forwards its hook's `error.log` entries newer than
+  Before the migration sweep (which removes `~/.cursor/hooks`), setup
+  forwards each tool's hook `error.log` entries, with the device key in the
+  home's `~/.unbound/config.json` (the key the hooks use), newer than
   the last forwarded one to the gateway's `/v1/hooks/errors` (ten a request,
   at most the newest 25 per tool and home, none older than seven days, with
   `category: forwarded_error_log`),
   recording the newest accepted timestamp in `.error_log_forwarded` beside the
-  log; a failed request saves nothing and ends forwarding for the run.
+  log; a gateway that is down ends forwarding for the run, a refused key ends
+  it for that tool, and neither saves anything.
 - **`detect_install_state`** is adapted: the python version checked for the
   managed `unbound.py`, which no longer exists. Binary semantics: settings
   file absent → `fresh`; present and referencing the binary → `persisted`;

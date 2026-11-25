@@ -430,22 +430,37 @@ def _forward_home_errors(m, username, log, send):
     return len(entries), "sent"
 
 
-def _forward_hook_errors(m, tool, api_key, opts) -> None:
-    """Forward every home's unsent error.log entries for this tool. A gateway that is down ends forwarding
-    for the whole run, so it costs one short timeout; a refused key ends it for this tool only. Either way
-    nothing is marked sent, and the next run retries."""
+def _home_device_key(home: Path):
+    """Runs as the profile's user: the device key in ~/.unbound/config.json, the one its hooks report
+    errors with, or None before setup first wrote it."""
+    try:
+        config = json.loads(_read_user_file(home / ".unbound" / "config.json", follow=False).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    key = (config.get("device_token") or config.get("api_key")) if isinstance(config, dict) else None
+    return key if isinstance(key, str) and key else None
+
+
+def _forward_hook_errors(m, tool, opts) -> None:
+    """Forward every home's unsent error.log entries for this tool, with that home's own device key. Runs
+    before the migration sweep, which removes ~/.cursor/hooks and its log. A gateway that is down ends
+    forwarding for the whole run, so it costs one short timeout; a refused key ends it for this tool only.
+    Either way nothing is marked sent, and the next run retries."""
     if opts.get("hook_errors_held"):
         return
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
     sent = 0
     try:
         hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
-        send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
-                                 api_key, hook_source, hook_sha)
         for username, home_dir in m.get_all_user_homes():
             log = home_dir / relpath if home_dir is not None else None
             if log is None or not os.path.lexists(log):
                 continue
+            api_key = _as_user(m, username, _home_device_key, home_dir)
+            if not api_key:
+                continue  # no hook here has a key to report with yet
+            send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
+                                     api_key, hook_source, hook_sha)
             count, verdict = _forward_home_errors(m, username, log, send)
             sent += count
             if verdict != "sent":
@@ -1370,7 +1385,6 @@ def _setup_claude_code(opts):
     report = functools.partial(_report, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
                                installed=opts.get("installed", {}).get("claude-code", True),
                                install_mode="binary-skip" if skip_settings else "binary")
-    _forward_hook_errors(m, "claude-code", api_key, opts)
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
@@ -1432,7 +1446,6 @@ def _setup_augment(opts):
     report = functools.partial(_report, m, "augment", api_key, backend_url=base, serial_number=device_id,
                                installed=opts.get("installed", {}).get("augment", True),
                                install_mode="binary")
-    _forward_hook_errors(m, "augment", api_key, opts)
 
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
@@ -1473,7 +1486,6 @@ def _setup_codex(opts):
     report = functools.partial(_report, m, "codex", api_key, backend_url=base, serial_number=device_id,
                                installed=opts.get("installed", {}).get("codex", True),
                                install_mode="binary")
-    _forward_hook_errors(m, "codex", api_key, opts)
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
@@ -1685,7 +1697,6 @@ def _setup_cursor(opts):
     report = functools.partial(_report, m, "cursor", api_key, backend_url=base, serial_number=device_id,
                                installed=opts.get("installed", {}).get("cursor", True),
                                install_mode="binary")
-    _forward_hook_errors(m, "cursor", api_key, opts)
 
     config_ok = True
     for username, home_dir in m.get_all_user_homes():
@@ -1774,7 +1785,6 @@ def _setup_copilot(opts):
     report = functools.partial(_report, m, "copilot", api_key, backend_url=base, serial_number=device_id,
                                installed=opts.get("installed", {}).get("copilot", True),
                                install_mode="binary")
-    _forward_hook_errors(m, "copilot", api_key, opts)
 
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
@@ -1953,6 +1963,10 @@ def run(argv) -> int:
         tool: _tool_installed(tool, user_homes) for tool in opts["tools"] if tool in _TOOL_FOOTPRINTS},
         {}, "installed tools")
     _send_run_report(opts, serial, "start", _start_fields)
+    # Before the sweep: it removes ~/.cursor/hooks, and with it Cursor's error.log.
+    for tool in opts["tools"]:
+        if tool in _HOOK_ERROR_LOGS:
+            _forward_hook_errors(m0, tool, opts)
 
     statuses = {}
 
