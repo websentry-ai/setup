@@ -14,7 +14,8 @@ INSTALLERS = [
 
 
 class TestSetupWsl(unittest.TestCase):
-    def _run(self, mod, argv, system="Windows", codes=None, distros=("Ubuntu", "Debian")):
+    def _run(self, mod, argv, system="Windows", codes=None, distros=("Ubuntu", "Debian"),
+             release="10", py="/mnt/c/Windows/py.exe"):
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -24,6 +25,8 @@ class TestSetupWsl(unittest.TestCase):
             return subprocess.CompletedProcess(cmd, code, out, b"")
 
         with mock.patch.object(mod.platform, "system", return_value=system), \
+                mock.patch.object(mod.platform, "release", return_value=release), \
+                mock.patch.object(mod.shutil, "which", lambda name: py if name == "py.exe" else None), \
                 mock.patch.dict(mod.os.environ, {"SystemRoot": "C:\\Windows"}), \
                 mock.patch.object(mod.Path, "is_file", lambda p: p.name == "wsl.exe" and p.parent.name == "System32"), \
                 mock.patch.object(mod, "_wsl_distros", return_value=list(distros)), \
@@ -44,6 +47,33 @@ class TestSetupWsl(unittest.TestCase):
                 self.assertEqual(calls[0][1]["input"],
                                  b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
+
+    def test_each_installer_in_wsl_reruns_itself_on_windows(self):
+        for path in INSTALLERS:
+            with self.subTest(path):
+                mod = load_module(path)
+                calls, lines = self._run(mod, ["--api-key", "k", "--config-dir", "/home/u/.claude", "--backfill"],
+                                         system="Linux", release="5.15.167.4-microsoft-standard-WSL2", codes={"-X": 3})
+                self.assertEqual([c for c, _ in calls], [["/mnt/c/Windows/py.exe", "-3", "-X", "utf8", "-", "--backfill"]])
+                self.assertEqual(calls[0][1]["input"],
+                                 b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
+                self.assertEqual(lines, ["Windows: managed by MDM"])
+
+    def test_wsl_without_windows_python_says_so(self):
+        calls, lines = self._run(load_module("cursor/setup.py"), ["--api-key", "k"], system="Linux",
+                                 release="4.4.0-19041-Microsoft", py=None)
+        self.assertEqual((calls, lines), ([], ["Windows: skipped, py.exe not found"]))
+
+    def test_plain_linux_does_nothing(self):
+        mod = load_module("cursor/setup.py")
+        self.assertEqual(self._run(mod, ["--api-key", "k"], system="Linux", release="6.8.0-45-generic"), ([], []))
+
+    def test_a_run_fed_on_stdin_never_fans_back_out(self):
+        for system, release in (("Windows", "10"), ("Linux", "5.15.167.4-microsoft-standard-WSL2")):
+            with self.subTest(system):
+                mod = load_module("codex/hooks/setup.py")
+                with mock.patch.object(mod, "__file__", "<stdin>"):
+                    self.assertEqual(self._run(mod, ["--api-key", "k"], system=system, release=release), ([], []))
 
     def test_main_runs_the_wsl_step_first(self):
         for path in INSTALLERS:
