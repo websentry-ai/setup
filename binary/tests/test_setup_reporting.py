@@ -710,6 +710,21 @@ def test_cursor_errors_go_out_before_the_sweep_removes_their_log(env, backend):
     assert [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"] == []
 
 
+def test_cursor_errors_the_gateway_did_not_take_survive_the_sweep_for_the_next_run(env, backend):
+    """The sweep still clears ~/.cursor/hooks, but an unsent log is put back so 'the next run retries' holds."""
+    _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    ok = backend.answer
+    backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
+    _run(backend)
+    assert (env["home"] / ".cursor/hooks/error.log").exists()
+    assert not (env["home"] / ".cursor/hooks/unbound.py").exists()  # the rest of the sweep still ran
+    backend.answer = ok
+    backend.requests.clear()
+    _run(backend)
+    sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
+    assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
+
+
 def test_errors_go_out_with_the_key_the_hooks_use(env, backend):
     """Forwarding runs before any tool fetches its key, so it uses the one the home's hooks report with."""
     (env["home"] / ".unbound").mkdir(exist_ok=True)

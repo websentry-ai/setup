@@ -374,21 +374,45 @@ def _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets=()) ->
 
 
 def _forward_home_errors(m, username, log, send):
-    """(entries sent, 'sent' or the verdict that stopped it). The place is saved after each accepted
-    request; where it can't be saved nothing more is sent, or every run would send the same entries again."""
+    """(entries sent, 'sent' or the verdict that stopped it, whether every unsent entry went out). The place
+    is saved after each accepted request; where it can't be saved nothing more is sent, or every run would
+    send the same entries again."""
     if _as_user(m, username, _writable_dir, log.parent) is not True:
         print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
-        return 0, "sent"
-    entries = _as_user(m, username, _unsent_hook_errors, log) or []
+        return 0, "sent", False
+    entries = _as_user(m, username, _unsent_hook_errors, log)
+    if entries is None:
+        return 0, "sent", False
     for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
         batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
         verdict = send(batch)
         if verdict != "sent":
-            return start, verdict
+            return start, verdict, False
         if _as_user(m, username, _save_forwarded, log, batch[-1]["state"]) is not True:
             print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
-            return start + len(batch), "sent"
-    return len(entries), "sent"
+            return start + len(batch), "sent", False
+    return len(entries), "sent", True
+
+
+def _read_unsent_log(log: Path) -> dict:
+    """Runs as the profile's user: the log and its forwarded place, by name, to put back after the sweep."""
+    kept = {}
+    for path in (log, log.with_name(FORWARDED_STATE_NAME)):
+        try:
+            kept[path.name] = _read_user_file(path, follow=False)
+        except OSError:
+            continue
+    return kept
+
+
+def _restore_unsent_log(log: Path, kept: dict) -> bool:
+    """Runs as the profile's user: put a log the sweep removed back, with its place, for the next run."""
+    if os.path.lexists(log):
+        return False
+    log.parent.mkdir(mode=0o700, exist_ok=True)
+    for name, data in kept.items():
+        _replace_user_file(log.with_name(name), data, 0o600)
+    return True
 
 
 def _home_device_key(home: Path):
@@ -412,9 +436,8 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
     forwarding for the whole run, so it costs one short timeout; a refused key is that home's own and skips
     only that home. Either way nothing is marked sent, and the next run retries. user_homes and keys (home
     to its key, filled as homes are read) come from run(), so each home is found and read once a run."""
-    if opts.get("hook_errors_held"):
-        return
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
+    unsent = opts.setdefault("unsent_hook_logs", [])
     sent = 0
     try:
         hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
@@ -423,22 +446,27 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
             log = home_dir / relpath if home_dir is not None else None
             if log is None or not os.path.lexists(log):
                 continue
+            if opts.get("hook_errors_held"):
+                unsent.append((username, log))  # the gateway is down: keep it for the next run
+                continue
             if str(home_dir) not in keys:
                 keys[str(home_dir)] = _as_user(m, username, _home_device_key, home_dir)
             found = keys[str(home_dir)]
             if not found:
-                continue  # no hook here has a key to report with yet
+                unsent.append((username, log))  # no hook here has a key to report with yet
+                continue
             api_key, secrets = found
             send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
                                      api_key, hook_source, hook_sha, secrets=secrets)
-            count, verdict = _forward_home_errors(m, username, log, send)
+            count, verdict, done = _forward_home_errors(m, username, log, send)
             sent += count
+            if not done:
+                unsent.append((username, log))
             if verdict == "refused":
                 print(f"[errors] {tool} hook errors in {home_dir} not forwarded (key refused); the next run retries")
             elif verdict == "down":
                 opts["hook_errors_held"] = True
                 print(f"[errors] {tool} hook errors not forwarded (gateway down); the next run retries")
-                break
     except Exception as e:
         print(f"[errors] {tool} hook errors not forwarded: {e}")
     if sent:
@@ -1941,6 +1969,8 @@ def run(argv) -> int:
     statuses = {}
 
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
+    # The sweep and Cursor's step remove ~/.cursor/hooks: a log the gateway has not taken is put back after.
+    kept = [(u, log, _as_user(m0, u, _read_unsent_log, log)) for u, log in opts.get("unsent_hook_logs", [])]
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:
@@ -1955,6 +1985,10 @@ def run(argv) -> int:
             statuses[tool] = ("deferred", f"component exited early: {e}")
         except Exception as e:
             statuses[tool] = ("deferred", f"error: {e}")
+
+    for username, log, data in kept:
+        if data and _as_user(m0, username, _restore_unsent_log, log, data) is not True and not os.path.lexists(log):
+            print(f"[errors] {log}: unsent hook errors could not be kept for the next run")
 
     print(f"\n{'=' * 60}\n[discovery] coding-tool scan\n{'=' * 60}")
     try:
