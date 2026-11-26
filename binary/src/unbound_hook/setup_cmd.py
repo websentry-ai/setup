@@ -432,14 +432,40 @@ def _set_aside_unsent_log(log: Path) -> list:
     return moved
 
 
+def _append_user_file(path: Path, data: bytes) -> None:
+    """Runs as the profile's user: add data to the end of a regular file, on a line of its own."""
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    try:
+        size = os.fstat(fd).st_size
+        if size:
+            os.lseek(fd, size - 1, os.SEEK_SET)
+            if os.read(fd, 1) != b"\n":
+                data = b"\n" + data
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
 def _restore_unsent_log(log: Path, names: list) -> bool:
-    """Runs as the profile's user: move a set-aside log and its place back for the next run."""
+    """Runs as the profile's user: move a set-aside log and its place back for the next run. A hook can
+    write a new log while the old one is aside: its entries go after the set-aside ones, so both are kept."""
     log.parent.mkdir(mode=0o700, exist_ok=True)
     for name in names:
         path = log.with_name(name)
-        if not os.path.lexists(path):
-            os.rename(_set_aside_name(path), path)
+        if os.path.lexists(path):
+            if name != log.name:
+                continue  # setup writes the forwarded place, never a hook
+            _append_user_file(_set_aside_name(path), _read_user_file(path, follow=False))
+        os.replace(_set_aside_name(path), path)
     return True
+
+
+def _recover_set_aside_log(log: Path) -> bool:
+    """Runs as the profile's user: put back a log an earlier run set aside and could not restore."""
+    return _restore_unsent_log(log, [p.name for p in (log, log.with_name(FORWARDED_STATE_NAME))
+                                     if os.path.lexists(_set_aside_name(p))])
 
 
 def _home_device_key(home: Path):
@@ -472,6 +498,8 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
         keys = {} if keys is None else keys
         for username, home_dir in user_homes if user_homes is not None else m.get_all_user_homes():
             log = home_dir / relpath if home_dir is not None else None
+            if log is not None and tool in _SWEPT_HOOK_LOG_TOOLS and os.path.lexists(_set_aside_name(log)):
+                _as_user(m, username, _recover_set_aside_log, log)  # an earlier run could not put it back
             if log is None or not os.path.lexists(log):
                 continue
             if opts.get("hook_errors_held"):

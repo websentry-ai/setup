@@ -1589,14 +1589,52 @@ def _set_aside_unsent_log(log: Path) -> list:
     return moved
 
 
+def _append_user_file(path: Path, data: bytes) -> None:
+    """Runs as the home's user: add data to the end of a regular file, on a line of its own."""
+    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | _USER_FILE_FLAGS)
+    try:
+        size = os.fstat(fd).st_size
+        if size:
+            os.lseek(fd, size - 1, os.SEEK_SET)
+            if os.read(fd, 1) != b"\n":
+                data = b"\n" + data
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+
+
 def _restore_unsent_log(log: Path, names: list) -> bool:
-    """Runs as the home's user: move a set-aside log and its place back for the next run."""
+    """Runs as the home's user: move a set-aside log and its place back for the next run. A hook can write
+    a new log while the old one is aside: its entries go after the set-aside ones, so both are kept."""
     log.parent.mkdir(mode=0o700, exist_ok=True)
     for name in names:
         path = log.with_name(name)
-        if not os.path.lexists(path):
-            os.rename(_set_aside_name(path), path)
+        if os.path.lexists(path):
+            if name != log.name:
+                continue  # setup writes the forwarded place, never a hook
+            _append_user_file(_set_aside_name(path), _read_user_file(path))
+        os.replace(_set_aside_name(path), path)
     return True
+
+
+def _recover_set_aside_log(log: Path) -> bool:
+    """Runs as the home's user: put back a log an earlier run set aside and could not restore."""
+    return _restore_unsent_log(log, [p.name for p in (log, log.with_name(FORWARDED_STATE_NAME))
+                                     if os.path.lexists(_set_aside_name(p))])
+
+
+def recover_set_aside_hook_logs(user_homes) -> None:
+    """Before forwarding: a log an earlier run set aside and could not put back goes back, so it is sent.
+    Never raises."""
+    for username, home_dir in user_homes:
+        try:
+            log = Path(home_dir) / HOOK_ERROR_LOG[0]
+            if os.path.lexists(_set_aside_name(log)):
+                _run_as_user(username, _recover_set_aside_log, log)
+        except Exception as e:
+            print(f"[errors] set-aside hook errors in {home_dir} not put back: {e}")
 
 
 def keep_unsent_hook_logs(unsent) -> list:
@@ -1736,7 +1774,9 @@ def main():
 
     # Before this run changes anything, with the key each home's hooks already report with. A log not
     # fully sent is kept across remove_user_level_hooks below, which removes ~/.cursor/hooks.
-    unsent_logs = forward_hook_errors(get_all_user_homes(), gateway_url, get_enterprise_hooks_dir() / "hooks" / "unbound.py")
+    homes = get_all_user_homes()
+    recover_set_aside_hook_logs(homes)
+    unsent_logs = forward_hook_errors(homes, gateway_url, get_enterprise_hooks_dir() / "hooks" / "unbound.py")
 
     # Get device identifier
     print("\n🔍 Getting device serial number...")

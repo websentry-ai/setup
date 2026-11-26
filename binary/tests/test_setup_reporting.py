@@ -746,6 +746,43 @@ def test_cursor_errors_the_gateway_did_not_take_survive_the_sweep_for_the_next_r
     assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
 
 
+def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(env, backend, monkeypatch):
+    """Cursor can run a hook while setup runs: its new error.log and the set-aside one are both kept."""
+    _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    ok = backend.answer
+    backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
+    real = setup_cmd._ADAPTERS["cursor"]
+
+    def cursor_runs_a_hook_meanwhile(opts):
+        status = real(opts)
+        log = env["home"] / ".cursor/hooks/error.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"{_pacific(2)}: cursor broke during setup\n")
+        return status
+
+    monkeypatch.setitem(setup_cmd._ADAPTERS, "cursor", cursor_runs_a_hook_meanwhile)
+    _run(backend)
+    monkeypatch.setitem(setup_cmd._ADAPTERS, "cursor", real)
+    backend.answer = ok
+    backend.requests.clear()
+    _run(backend)
+    sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
+    assert [e["message"] for r in sent for e in r["body"]["errors"]] == [
+        "cursor broke", "cursor broke again", "cursor broke during setup"]
+
+
+def test_a_cursor_log_an_earlier_run_could_not_put_back_is_forwarded(env, backend):
+    """A restore that failed leaves the log at its set-aside name; the next run puts it back and sends it."""
+    aside = env["home"] / ".cursor" / ".unbound-unsent-hooks-error.log"
+    _log(env["home"], "cursor", [f"{_pacific(2)}: cursor broke later"])
+    aside.write_text(f"{_pacific(0)}: cursor broke\n{_pacific(1)}: cursor broke again\n")
+    _run(backend)
+    sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
+    assert [e["message"] for r in sent for e in r["body"]["errors"]] == [
+        "cursor broke", "cursor broke again", "cursor broke later"]
+    assert not aside.exists()
+
+
 def test_an_oversized_cursor_log_is_kept_and_its_newest_errors_still_go_out(env, backend):
     """Bigger than the 4 MiB read cap: kept across the sweep by moving it, and forwarded from its tail."""
     old = [f"{_pacific(-800000)}: ancient {'x' * 200}"] * 25000  # over 5 MiB, all past the 7-day limit

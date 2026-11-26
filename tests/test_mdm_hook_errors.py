@@ -475,6 +475,38 @@ def test_cursor_errors_the_gateway_did_not_take_survive_its_cleanup_for_the_next
     assert _messages(gateway) == ["cursor broke", "cursor broke again"]
 
 
+def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_its_cleanup(setup, gateway):
+    """Cursor can run a hook while setup runs: its new error.log and the set-aside one are both kept."""
+    r = setup("cursor")
+    _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+
+    def cleanup_then_a_hook_writes(username, home_dir):
+        REAL_CURSOR_CLEANUP(username, home_dir)
+        log = home_dir / ERROR_LOGS["cursor"]
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text(f"{_pacific(2)}: cursor broke during setup\n")
+
+    r.mp.setattr(r.m, "remove_user_level_hooks", cleanup_then_a_hook_writes)
+    gateway.answer = lambda request: (503, {})
+    assert r() is True
+    real_cursor_cleanup(r)
+    gateway.answer = lambda request: (200, OK)
+    gateway.requests.clear()
+    r()
+    assert _messages(gateway) == ["cursor broke", "cursor broke again", "cursor broke during setup"]
+
+
+def test_a_cursor_log_an_earlier_run_could_not_put_back_is_forwarded(setup, gateway):
+    """A restore that failed leaves the log at its set-aside name; the next run puts it back and sends it."""
+    r = setup("cursor")
+    _log(r.home, "cursor", [f"{_pacific(2)}: cursor broke later"])
+    aside = r.home / ".cursor" / ".unbound-unsent-hooks-error.log"
+    aside.write_text(f"{_pacific(0)}: cursor broke\n{_pacific(1)}: cursor broke again\n")
+    assert r() is True
+    assert _messages(gateway) == ["cursor broke", "cursor broke again", "cursor broke later"]
+    assert not aside.exists()
+
+
 def test_a_partly_sent_cursor_log_keeps_its_place_across_the_cleanup(setup, gateway):
     r = setup("cursor")
     real_cursor_cleanup(r)
