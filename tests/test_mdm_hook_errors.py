@@ -575,7 +575,7 @@ def test_a_cursor_log_in_a_home_without_a_key_survives_its_cleanup(setup, gatewa
 
 # --- The five copies stay equal, and equal to the binary ---------------------------
 
-SHARED_FUNCTIONS = ("_log_time", "_read_user_file", "_read_user_file_tail", "_replace_user_file", "_forwarded_place",
+SHARED_FUNCTIONS = ("_log_time", "_refuse_if_redirected", "_read_user_file", "_read_user_file_tail", "_replace_user_file", "_forwarded_place",
                     "_unsent_hook_errors", "_save_forwarded", "_redact_hook_error", "_post_hook_json",
                     "_post_hook_errors", "_writable_dir", "_home_device_key", "_forward_home_errors",
                     "forward_hook_errors")

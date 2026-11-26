@@ -1385,9 +1385,37 @@ def _log_time(text):
     return when if when.tzinfo else None
 
 
+def _refuse_if_redirected(fd: int, path: Path) -> None:
+    """Windows has no O_NOFOLLOW, and SYSTEM opens a user's files itself: the file opened must be the one at
+    the path asked for, with no link or junction anywhere on the way. Closes fd and raises OSError if not."""
+    if os.name != "nt":
+        return
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetLongPathNameW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    kernel32.GetLongPathNameW.restype = wintypes.DWORD
+
+    def plain(name):
+        return "\\\\" + name[8:] if name.startswith("\\\\?\\UNC\\") else name[4:] if name.startswith("\\\\?\\") else name
+
+    final, asked = ctypes.create_unicode_buffer(32768), ctypes.create_unicode_buffer(32768)
+    got = kernel32.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), final, len(final), 0)
+    # The path asked for in its long form (a temp folder is often given as C:\\Users\\RUNNER~1\\...).
+    wanted = kernel32.GetLongPathNameW(os.path.abspath(str(path)), asked, len(asked))
+    if not (0 < got < len(final) and 0 < wanted < len(asked)
+            and os.path.normcase(plain(final.value)) == os.path.normcase(plain(asked.value))):
+        os.close(fd)
+        raise OSError(f"{path} is reached through a link or junction")
+
+
 def _read_user_file(path: Path) -> bytes:
     """A user's regular file, whole and within _USER_FILE_MAX_BYTES. Raises OSError for anything else."""
     fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
+    _refuse_if_redirected(fd, path)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise OSError(f"{path} is not a regular file")
@@ -1401,6 +1429,7 @@ def _read_user_file(path: Path) -> bytes:
 def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
     """A user's regular file's last max_bytes, from a whole line on: a long log is read from its end."""
     fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
+    _refuse_if_redirected(fd, path)
     st = os.fstat(fd)
     if not stat.S_ISREG(st.st_mode):
         os.close(fd)
@@ -1421,6 +1450,7 @@ def _replace_user_file(path: Path, data: bytes) -> None:
         tmp.unlink()
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _USER_FILE_FLAGS, 0o600)
     try:
+        _refuse_if_redirected(fd, tmp)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         os.replace(tmp, path)
@@ -1636,6 +1666,7 @@ def _set_aside_unsent_log(log: Path) -> list:
 def _append_user_file(path: Path, data: bytes) -> None:
     """Runs as the home's user: add data to the end of a regular file, on a line of its own."""
     fd = os.open(str(path), os.O_RDWR | os.O_APPEND | _USER_FILE_FLAGS)
+    _refuse_if_redirected(fd, path)
     try:
         size = os.fstat(fd).st_size
         if size:
