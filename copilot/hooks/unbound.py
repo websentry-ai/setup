@@ -4792,6 +4792,10 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     }
     if canonical == 'Bash':
         request_body['pre_tool_use_data'].update(detect_shell('copilot', raw_tool, event.get('cwd')))
+    # The gateway reads `/ETC/x` as /etc only on macOS, whose disks ignore case.
+    device = device_os()
+    if device:
+        request_body['pre_tool_use_data']['os'] = device
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -5831,6 +5835,17 @@ def detect_shell(agent, tool_name=None, cwd=None):
             shell, source = None, None
         _SHELL_CACHE[key] = {'shell': shell, 'shell_source': source} if shell in _SHELL_NAMES else {}
     return dict(_SHELL_CACHE[key])
+
+
+_DEVICE_OSES = {'Darwin': 'macos', 'Linux': 'linux', 'Windows': 'windows'}
+
+
+def device_os():
+    """'macos', 'linux' or 'windows' for this machine, or None when the hook can't tell; never raises."""
+    try:
+        return _DEVICE_OSES.get(platform.system())
+    except Exception:
+        return None
 # --- end shell detection ---
 
 

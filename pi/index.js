@@ -484,7 +484,7 @@ function createBreaker(opts = {}) {
 // packages/core/src/cache.ts
 import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { dirname, isAbsolute, join as join2 } from "node:path";
+import { dirname, isAbsolute, join as join3 } from "node:path";
 
 // packages/core/src/policyState.ts
 function parseFailureAction(raw) {
@@ -574,6 +574,74 @@ function createPolicyState() {
   };
 }
 var policyState = createPolicyState();
+
+// packages/core/src/shell.ts
+import { existsSync, lstatSync as lstatSync2 } from "node:fs";
+import { homedir } from "node:os";
+import { delimiter, join as join2 } from "node:path";
+var SHELL_NAMES = /* @__PURE__ */ new Set(["bash", "zsh", "sh", "fish", "dash", "ksh", "powershell", "pwsh", "cmd"]);
+var shellCache = /* @__PURE__ */ new Map();
+function shellName(program2) {
+  if (typeof program2 !== "string" || program2.trim() === "") return void 0;
+  let name = (program2.trim().replace(/^"|"$/g, "").split(/[\\/]/).pop() ?? "").toLowerCase();
+  if (name.endsWith(".exe")) name = name.slice(0, -4);
+  return SHELL_NAMES.has(name) ? name : void 0;
+}
+function onPath(program2) {
+  const suffixes = process.platform === "win32" ? [".exe", ""] : [""];
+  return (process.env.PATH ?? "").split(delimiter).some((dir) => dir !== "" && suffixes.some((suffix) => existsSync(join2(dir, program2 + suffix))));
+}
+var UNREADABLE = /* @__PURE__ */ Symbol("unreadable");
+function isLink(path) {
+  try {
+    return lstatSync2(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+function piShellPath() {
+  try {
+    const dir = resolvePiAgentDir(process.env, homedir());
+    if (dir === void 0) return void 0;
+    const file = join2(dir, "settings.json");
+    const raw = readSmallRegularFile(file, MAX_CONFIG_BYTES);
+    if (raw === void 0) return isLink(file) ? UNREADABLE : void 0;
+    const settings = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    if (settings === null || typeof settings !== "object") return void 0;
+    return settings.shellPath;
+  } catch {
+    return void 0;
+  }
+}
+function detectShell(toolName) {
+  if (typeof toolName !== "string") return {};
+  const tool = toolName.toLowerCase();
+  if (tool !== "bash" && tool !== "powershell") return {};
+  const cached = shellCache.get(tool);
+  if (cached !== void 0) return { ...cached };
+  let info = {};
+  try {
+    const custom = tool === "bash" ? piShellPath() : void 0;
+    if (custom === UNREADABLE) {
+      shellCache.set(tool, {});
+      return {};
+    }
+    const shell = tool === "powershell" ? process.platform === "win32" && !onPath("pwsh") ? "powershell" : "pwsh" : typeof custom === "string" && custom !== "" ? shellName(custom) : "bash";
+    info = shell === void 0 ? {} : { shell, shell_source: "tool" };
+  } catch {
+    info = {};
+  }
+  shellCache.set(tool, info);
+  return { ...info };
+}
+var DEVICE_OSES = {
+  darwin: "macos",
+  linux: "linux",
+  win32: "windows"
+};
+function deviceOs(platform2 = process.platform) {
+  return Object.hasOwn(DEVICE_OSES, platform2) ? DEVICE_OSES[platform2] : void 0;
+}
 
 // packages/core/src/payload.ts
 var PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"];
@@ -840,6 +908,8 @@ function buildPretoolPayload(input) {
     preToolUseData.shell = input.shell.shell;
     if (typeof input.shell.shell_source === "string") preToolUseData.shell_source = input.shell.shell_source;
   }
+  const os = deviceOs();
+  if (os !== void 0) preToolUseData.os = os;
   const body = {
     conversation_id: input.sessionId,
     // `model` is required on the wire and `ctx.model` may be undefined (§A4); `'auto'` is the same
@@ -921,20 +991,20 @@ function expandTilde(raw, homeDir) {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return void 0;
   if (trimmed === "~") return homeDir;
-  if (trimmed.startsWith("~/")) return join2(homeDir, trimmed.slice(2));
+  if (trimmed.startsWith("~/")) return join3(homeDir, trimmed.slice(2));
   return trimmed;
 }
 function resolveCachePath(env, homeDir) {
   const base = resolvePiAgentDir(env, homeDir);
   if (base === void 0) return void 0;
-  return join2(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
+  return join3(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
 }
 function resolvePiAgentDir(env, homeDir) {
   try {
     let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
     if (base === void 0 || !isAbsolute(base)) {
       if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return void 0;
-      base = join2(homeDir, ...PI_AGENT_DIR_SEGMENTS);
+      base = join3(homeDir, ...PI_AGENT_DIR_SEGMENTS);
     }
     return isAbsolute(base) ? base : void 0;
   } catch {
@@ -1172,11 +1242,11 @@ function createHeartbeatGate(opts) {
 }
 
 // packages/core/src/config.ts
-import { isAbsolute as isAbsolute2, join as join3 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join4 } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 function readUnboundConfig(homeDir) {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute2(homeDir)) return {};
-  const raw = readSmallRegularFile(join3(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  const raw = readSmallRegularFile(join4(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
   if (raw === void 0) return {};
   try {
     const parsed = JSON.parse(raw);
@@ -1222,66 +1292,6 @@ function redactSecrets(text, apiKey) {
     out = out.split(apiKey).join("[REDACTED]");
   }
   return out;
-}
-
-// packages/core/src/shell.ts
-import { existsSync, lstatSync as lstatSync2 } from "node:fs";
-import { homedir } from "node:os";
-import { delimiter, join as join4 } from "node:path";
-var SHELL_NAMES = /* @__PURE__ */ new Set(["bash", "zsh", "sh", "fish", "dash", "ksh", "powershell", "pwsh", "cmd"]);
-var shellCache = /* @__PURE__ */ new Map();
-function shellName(program2) {
-  if (typeof program2 !== "string" || program2.trim() === "") return void 0;
-  let name = (program2.trim().replace(/^"|"$/g, "").split(/[\\/]/).pop() ?? "").toLowerCase();
-  if (name.endsWith(".exe")) name = name.slice(0, -4);
-  return SHELL_NAMES.has(name) ? name : void 0;
-}
-function onPath(program2) {
-  const suffixes = process.platform === "win32" ? [".exe", ""] : [""];
-  return (process.env.PATH ?? "").split(delimiter).some((dir) => dir !== "" && suffixes.some((suffix) => existsSync(join4(dir, program2 + suffix))));
-}
-var UNREADABLE = /* @__PURE__ */ Symbol("unreadable");
-function isLink(path) {
-  try {
-    return lstatSync2(path).isSymbolicLink();
-  } catch {
-    return false;
-  }
-}
-function piShellPath() {
-  try {
-    const dir = resolvePiAgentDir(process.env, homedir());
-    if (dir === void 0) return void 0;
-    const file = join4(dir, "settings.json");
-    const raw = readSmallRegularFile(file, MAX_CONFIG_BYTES);
-    if (raw === void 0) return isLink(file) ? UNREADABLE : void 0;
-    const settings = JSON.parse(raw.replace(/^\uFEFF/, ""));
-    if (settings === null || typeof settings !== "object") return void 0;
-    return settings.shellPath;
-  } catch {
-    return void 0;
-  }
-}
-function detectShell(toolName) {
-  if (typeof toolName !== "string") return {};
-  const tool = toolName.toLowerCase();
-  if (tool !== "bash" && tool !== "powershell") return {};
-  const cached = shellCache.get(tool);
-  if (cached !== void 0) return { ...cached };
-  let info = {};
-  try {
-    const custom = tool === "bash" ? piShellPath() : void 0;
-    if (custom === UNREADABLE) {
-      shellCache.set(tool, {});
-      return {};
-    }
-    const shell = tool === "powershell" ? process.platform === "win32" && !onPath("pwsh") ? "powershell" : "pwsh" : typeof custom === "string" && custom !== "" ? shellName(custom) : "bash";
-    info = shell === void 0 ? {} : { shell, shell_source: "tool" };
-  } catch {
-    info = {};
-  }
-  shellCache.set(tool, info);
-  return { ...info };
 }
 
 // packages/core/src/turnLog.ts

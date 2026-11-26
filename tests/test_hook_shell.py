@@ -303,3 +303,24 @@ class FailOpenTests(ShellTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class DeviceOsTests(unittest.TestCase):
+    """Every hook names the device's OS the way the gateway reads it, and never raises."""
+
+    def test_the_three_desktop_systems(self):
+        for hook in HOOKS:
+            for system, expected in (('Darwin', 'macos'), ('Linux', 'linux'), ('Windows', 'windows')):
+                with patch.object(hook.platform, 'system', return_value=system):
+                    self.assertEqual(hook.device_os(), expected, (hook.__name__, system))
+
+    def test_nothing_for_any_other_system(self):
+        for hook in HOOKS:
+            for system in ('FreeBSD', 'Java', '', 'darwin'):
+                with patch.object(hook.platform, 'system', return_value=system):
+                    self.assertIsNone(hook.device_os(), (hook.__name__, system))
+
+    def test_a_failing_probe_is_none(self):
+        for hook in HOOKS:
+            with patch.object(hook.platform, 'system', side_effect=OSError('no uname')):
+                self.assertIsNone(hook.device_os(), hook.__name__)

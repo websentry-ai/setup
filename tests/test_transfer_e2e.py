@@ -495,6 +495,18 @@ def test_the_real_hook_names_the_shell_on_the_policy_check_and_the_turn_log(tool
         assert shell_of(body['pre_tool_use_data']) == expected, json.dumps(body['pre_tool_use_data'], indent=2)
 
 
+@pytest.mark.parametrize('tool', sorted(RUNS))
+def test_the_real_hook_names_this_machines_os_on_the_policy_check(tool, sandbox, gateway):
+    expected = {'darwin': 'macos', 'linux': 'linux', 'win32': 'windows'}[sys.platform]
+    RUNS[tool](sandbox, shell_env(sandbox, gateway))
+
+    checks = [r['body'] for r in gateway.requests if 'pretool' in r['path'] and isinstance(r['body'], dict)
+              and (r['body'].get('pre_tool_use_data') or {}).get('command') == COMMAND]
+    assert checks, 'no policy check for the command: %s' % sorted({r['path'] for r in gateway.requests})
+    for body in checks:
+        assert body['pre_tool_use_data'].get('os') == expected, json.dumps(body['pre_tool_use_data'], indent=2)
+
+
 def _vscode_user_settings(home):
     if sys.platform == 'darwin':
         return home / 'Library' / 'Application Support' / 'Code' / 'User' / 'settings.json'
