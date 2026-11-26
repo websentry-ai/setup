@@ -1,5 +1,4 @@
 """mdm/onboard.py on Windows: a logon task sets up each user's WSL distros as that user."""
-import hashlib
 import json
 import os
 import subprocess
@@ -41,40 +40,44 @@ class TestRunner(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], ["claude_code_hooks_setup", "cursor_setup"])
         self.assertEqual(calls[0][1], ["--api-key", "K", "--backend-url", "https://b", "--gateway-url", "https://g",
                                        "--domain", "https://f"])
-        self.assertEqual(sorted(p.name for p in (self.tmp / "local" / "Unbound" / "wsl").iterdir()),
-                         ["claude-code-hooks-setup.py", "cursor-setup.py"])
 
-    def _known(self, name, text):
-        (self.stage / f"{name}.sha256").write_text(hashlib.sha256(text.encode()).hexdigest() + "\n")
+    def _clear_copy(self, name, text=RECORDER):
+        (self.stage / "clear").mkdir(exist_ok=True)
+        (self.stage / "clear" / name).write_text(text)
 
-    def test_a_tool_no_longer_staged_is_cleared_from_the_distros(self):
-        done = self.tmp / "local" / "Unbound" / "wsl"
-        done.mkdir(parents=True)
-        (done / "cursor-setup.py").write_text(RECORDER)
-        self._known("cursor-setup.py", RECORDER)
+    def test_a_tool_no_longer_staged_is_cleared_from_the_protected_copy(self):
+        self._clear_copy("cursor-setup.py")
+        self._clear_copy("codex-hooks-setup.py")
         (self.stage / "codex-hooks-setup.py").write_text(RECORDER)
         calls, _ = self._run({"api_key": "K"})
         self.assertEqual(calls, [["cursor_setup", ["--clear"]], ["codex_hooks_setup", ["--api-key", "K"]]])
-        self.assertEqual([p.name for p in done.iterdir()], ["codex-hooks-setup.py"])
 
     def test_clearing_needs_no_key(self):
-        done = self.tmp / "local" / "Unbound" / "wsl"
-        done.mkdir(parents=True)
-        (done / "cursor-setup.py").write_text(RECORDER)
-        self._known("cursor-setup.py", RECORDER)
+        self._clear_copy("cursor-setup.py")
         calls, log = self._run(None)
         self.assertEqual(calls, [["cursor_setup", ["--clear"]]])
         self.assertIn("no key", log)
 
-    def test_a_copy_onboard_never_staged_is_dropped_not_run(self):
-        done = self.tmp / "local" / "Unbound" / "wsl"
-        done.mkdir(parents=True)
-        (done / "cursor-setup.py").write_text(RECORDER + "# changed\n")
-        (done / "planted-setup.py").write_text(RECORDER)
-        self._known("cursor-setup.py", RECORDER)
+    def test_a_clear_that_succeeded_does_not_run_again(self):
+        self._clear_copy("cursor-setup.py")
+        self._run(None)
         calls, _ = self._run(None)
-        self.assertEqual(calls, [])
-        self.assertEqual(list(done.iterdir()), [])
+        self.assertEqual(calls, [["cursor_setup", ["--clear"]]])
+
+    def test_a_failed_clear_runs_again_next_logon(self):
+        self._clear_copy("cursor-setup.py", RECORDER + "    return False\n")
+        self._run(None)
+        calls, _ = self._run(None)
+        self.assertEqual(calls, [["cursor_setup", ["--clear"]]] * 2)
+
+    def test_a_tool_staged_again_is_cleared_again_once_unstaged(self):
+        self._clear_copy("cursor-setup.py")
+        self._run(None)
+        (self.stage / "cursor-setup.py").write_text(RECORDER)
+        self._run({"api_key": "K"})
+        (self.stage / "cursor-setup.py").unlink()
+        calls, _ = self._run(None)
+        self.assertEqual([c[1] for c in calls], [["--clear"], ["--api-key", "K"], ["--clear"]])
 
     def test_no_key_runs_nothing(self):
         (self.stage / "cursor-setup.py").write_text(RECORDER)
@@ -107,10 +110,9 @@ class TestInstall(unittest.TestCase):
                          [u.replace("/mdm/setup.py", "/setup.py") for u in urls])
         stage = self.pf / "Unbound WSL"
         self.assertEqual(sorted(p.name for p in stage.iterdir()),
-                         ["claude-code-hooks-setup.py", "claude-code-hooks-setup.py.sha256",
-                          "cursor-setup.py", "cursor-setup.py.sha256", "run.py"])
-        source = f"URL = {urls[1].replace('/mdm/setup.py', '/setup.py')!r}\n".encode()
-        self.assertEqual((stage / "cursor-setup.py.sha256").read_text().split(), [hashlib.sha256(source).hexdigest()])
+                         ["claude-code-hooks-setup.py", "clear", "cursor-setup.py", "run.py"])
+        self.assertEqual(sorted(p.name for p in (stage / "clear").iterdir()),
+                         ["claude-code-hooks-setup.py", "cursor-setup.py"])
         script, env = ps.call_args.args
         self.assertIn("-GroupId 'S-1-5-32-545'", script)
         self.assertIn("-AtLogOn", script)
@@ -142,16 +144,6 @@ class TestInstall(unittest.TestCase):
         self.assertEqual((stage / "augment-hooks-setup.py").read_text(), "OK = 1\n")
         ps.assert_called_once()
 
-    def test_restaging_keeps_every_staged_version_trusted(self):
-        url = f"{onboard._RAW_SETUP}/cursor/mdm/setup.py"
-        for body in (b"V1 = 1\n", b"V2 = 1\n", b"V1 = 1\n"):
-            with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
-                    mock.patch.object(onboard, "fetch_script", return_value=body), \
-                    mock.patch.object(onboard, "_powershell", return_value=True):
-                onboard.install_wsl_logon_task([url])
-        self.assertEqual((self.pf / "Unbound WSL" / "cursor-setup.py.sha256").read_text().split(),
-                         [hashlib.sha256(b"V1 = 1\n").hexdigest(), hashlib.sha256(b"V2 = 1\n").hexdigest()])
-
     def test_a_failed_write_keeps_the_staged_installer(self):
         stage = self.pf / "Unbound WSL"
         stage.mkdir()
@@ -172,7 +164,7 @@ class TestInstall(unittest.TestCase):
         self.assertEqual((stage / "cursor-setup.py").read_text(), "GOOD = 1\n")
         self.assertEqual(sorted(p.name for p in stage.glob("*-setup.py")), ["cursor-setup.py"])
 
-    def test_clear_unstages_every_tool_and_keeps_the_task_30_days(self):
+    def test_clear_moves_every_tool_to_clear_and_keeps_the_task_30_days(self):
         stage = self.pf / "Unbound WSL"
         stage.mkdir()
         for name in ("run.py", "cursor-setup.py", "codex-hooks-setup.py"):
@@ -180,7 +172,10 @@ class TestInstall(unittest.TestCase):
         with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
                 mock.patch.object(onboard, "_powershell", return_value=True) as ps:
             self.assertTrue(onboard.remove_wsl_logon_task())
-        self.assertEqual([p.name for p in stage.iterdir()], ["run.py"])
+        self.assertEqual(sorted(p.name for p in stage.iterdir()), ["clear", "run.py"])
+        self.assertEqual(sorted(p.name for p in (stage / "clear").iterdir()), ["codex-hooks-setup.py", "cursor-setup.py"])
+        # A runner staged before the clear step existed is replaced.
+        self.assertEqual((stage / "run.py").read_text(), onboard.WSL_RUNNER)
         script, env = ps.call_args.args
         self.assertEqual(env["UNB_DAYS"], "30")
         self.assertIn("DeleteExpiredTaskAfter = 'PT0S'", script)

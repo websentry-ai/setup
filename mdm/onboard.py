@@ -60,7 +60,6 @@ Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
 """
 
-import hashlib
 import json
 import os
 import platform
@@ -143,13 +142,11 @@ MDM_RETRY_JITTER_SECONDS = 5
 WSL_TASK_NAME = "Unbound WSL Setup"
 # Runs as each user at logon with the user-level installers staged beside it; their
 # setup_wsl() installs into the user's WSL distros and leaves Windows untouched.
-WSL_RUNNER = r'''import hashlib, importlib.util, json, os, shutil, sys, time
+WSL_RUNNER = r'''import importlib.util, json, os, sys, time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
 local = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Unbound"
-# This user's copy of each installer it ran, so a tool MDM later unstages can still be cleared.
-done = local / "wsl"
 log = local / "wsl_setup.log"
 log.parent.mkdir(parents=True, exist_ok=True)
 sys.stdout = sys.stderr = open(log, "a", encoding="utf-8")
@@ -162,23 +159,25 @@ def run(script, args):
         spec = importlib.util.spec_from_file_location(script.stem.replace("-", "_"), script)
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        mod.setup_wsl(args)
+        return mod.setup_wsl(args) is not False
     except Exception as e:
         print(f"WSL: failed ({e!r})")
+        return False
 
 
 staged = Path(__file__).parent
-for old in sorted(done.glob("*-setup.py")):
-    if (staged / old.name).is_file():
-        continue
-    # The copy sits in a folder this user can write, so it runs only if onboard staged that exact file.
-    try:
-        known = hashlib.sha256(old.read_bytes()).hexdigest() in (staged / f"{old.name}.sha256").read_text().split()
-    except OSError:
-        known = False
-    if known:
-        run(old, ["--clear"])
-    old.unlink(missing_ok=True)
+# clear\ holds onboard's own copy of every installer it staged, so a tool unstaged since is cleared from there.
+# The per-user list only skips clears that already succeeded; a failed one runs again at the next logon.
+done = local / "wsl_cleared.txt"
+try:
+    cleared = set(done.read_text(encoding="utf-8").split())
+except OSError:
+    cleared = set()
+cleared -= {p.name for p in staged.glob("*-setup.py")}
+for script in sorted((staged / "clear").glob("*-setup.py")):
+    if not (staged / script.name).is_file() and script.name not in cleared and run(script, ["--clear"]):
+        cleared.add(script.name)
+done.write_text("\n".join(sorted(cleared)), encoding="utf-8")
 try:
     cfg = json.loads((Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8"))
 except (OSError, ValueError):
@@ -193,8 +192,6 @@ for flag, name in (("--backend-url", "base_url"), ("--gateway-url", "gateway_url
         args += [flag, cfg[name]]
 for script in sorted(staged.glob("*-setup.py")):
     run(script, args)
-    done.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(script, done / script.name)
 '''
 
 USAGE = (
@@ -804,16 +801,13 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
         try:
             source = fetch_script(user_url)
             compile(source, user_url, "exec")
-            dest = target / user_url[len(_RAW_SETUP) + 1:].replace("/", "-")
-            # Write beside it, then rename: a failed write never truncates the staged copy.
-            dest.with_suffix(".tmp").write_bytes(source)
-            os.replace(dest.with_suffix(".tmp"), dest)
-            # Every version ever staged, so the runner can trust a user's copy of an older one at clear time.
-            known = dest.with_name(f"{dest.name}.sha256")
-            seen = known.read_text().split() if known.is_file() else []
-            digest = hashlib.sha256(source).hexdigest()
-            if digest not in seen:
-                known.write_text("\n".join(seen + [digest]) + "\n")
+            name = user_url[len(_RAW_SETUP) + 1:].replace("/", "-")
+            # clear\ keeps a copy the runner clears from once the tool is unstaged, even by a bare unlink.
+            for dest in (target / name, target / "clear" / name):
+                dest.parent.mkdir(exist_ok=True)
+                # Write beside it, then rename: a failed write never truncates the staged copy.
+                dest.with_suffix(".tmp").write_bytes(source)
+                os.replace(dest.with_suffix(".tmp"), dest)
         except Exception as e:
             print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
     return _register_wsl_task(pythonw, "")
@@ -837,13 +831,21 @@ def _register_wsl_task(pythonw: Path, days: str) -> bool:
 
 
 def remove_wsl_logon_task() -> bool:
-    """Unstages every installer; the runner then clears them from each user's distros at their next
-    logon, for the 30 days the task is kept."""
-    for p in _wsl_dir().glob("*-setup.py"):
-        p.unlink(missing_ok=True)
+    """Moves every staged installer into clear\\ and keeps the task 30 days, so each user's next logon
+    clears their distros from that protected copy; Windows then deletes the task."""
+    target = _wsl_dir()
     pythonw = _all_users_pythonw()
-    if (_wsl_dir() / "run.py").is_file() and pythonw:
-        return _register_wsl_task(pythonw, "30") and not any(_wsl_dir().glob("*-setup.py"))
+    if (target / "run.py").is_file() and pythonw:
+        try:
+            # Rewritten so a device staged by an older runner, with no clear step, gets one now.
+            (target / "run.py").write_text(WSL_RUNNER, encoding="utf-8")
+            (target / "clear").mkdir(exist_ok=True)
+            for p in target.glob("*-setup.py"):
+                os.replace(p, target / "clear" / p.name)
+        except OSError as e:
+            print(f"   Could not unstage the WSL installers: {e}", file=sys.stderr)
+            return False
+        return _register_wsl_task(pythonw, "30")
     # Never staged, or no trusted Python to clear with: a missing task is not a failure; a bare Unregister of one exits 1.
     ok = _powershell("Get-ScheduledTask -TaskName $env:UNB_TASK -ErrorAction SilentlyContinue | "
                      "Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop; exit 0", {"UNB_TASK": WSL_TASK_NAME})

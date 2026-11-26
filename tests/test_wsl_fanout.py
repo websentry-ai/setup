@@ -36,7 +36,7 @@ class TestSetupWsl(unittest.TestCase):
                 mock.patch.object(mod.subprocess, "check_output", return_value=b"/mnt/c/\n"), \
                 mock.patch.object(mod.subprocess, "run", side_effect=fake_run), \
                 mock.patch("builtins.print") as printed:
-            mod.setup_wsl(argv)
+            self.ret = mod.setup_wsl(argv)
         return calls, [c.args[0] for c in printed.call_args_list]
 
     def test_each_installer_reruns_itself_in_every_distro(self):
@@ -146,11 +146,11 @@ class TestSetupWsl(unittest.TestCase):
         mod = load_module("cursor/setup.py")
         staged = "/mnt/c/Program Files/Unbound WSL/cursor-setup.py"
         wsl = dict(system="Linux", release="5.15.167.4-microsoft-standard-WSL2")
-        with mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)):
-            with self.assertRaises(SystemExit) as e:
-                self._run(mod, ["--api-key", "k"], **wsl)
-            self.assertEqual(e.exception.code, 3)
-            self.assertEqual(self._run(mod, ["--clear"], **wsl), ([], ["Windows: managed by MDM"]))
+        for argv in (["--api-key", "k"], ["--clear"]):
+            with self.subTest(argv), mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)):
+                with self.assertRaises(SystemExit) as e:
+                    self._run(mod, argv, **wsl)
+                self.assertEqual(e.exception.code, 3)
 
     def test_the_mdm_task_running_its_staged_file_still_fans_out(self):
         pf = tempfile.mkdtemp()
@@ -168,6 +168,13 @@ class TestSetupWsl(unittest.TestCase):
                 mock.patch.object(mod.os.path, "isfile", lambda p: True):
             self.assertEqual(self._run(mod, ["--api-key", "k"], system="Linux",
                                        release="5.15.167.4-microsoft-standard-WSL2"), ([], []))
+
+    def test_reports_whether_every_distro_finished(self):
+        mod = load_module("cursor/setup.py")
+        self._run(mod, ["--clear"], codes={"Debian": 1})
+        self.assertTrue(self.ret)
+        self._run(mod, ["--clear"], codes={"Debian": 2})
+        self.assertFalse(self.ret)
 
     def test_main_runs_the_wsl_step_first(self):
         for path in INSTALLERS:

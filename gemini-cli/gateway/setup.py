@@ -552,20 +552,21 @@ def _wsl_distros():
 MDM_WSL_NAME = "gemini-cli-gateway-setup.py"
 
 
-def setup_wsl(argv) -> None:
-    """Windows and its WSL distros are one machine: run this same setup on the other side too."""
+def setup_wsl(argv) -> bool:
+    """Windows and its WSL distros are one machine: run this same setup on the other side too.
+    False when the other side failed, so the MDM logon task retries a clear."""
     key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
         argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None)
     in_wsl = platform.system() == "Linux" and "microsoft" in platform.release().lower()
     # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
     if not (platform.system() == "Windows" or in_wsl) or not (key or "--clear" in argv):
-        return
+        return True
     # --config-dir is a path on this side only; the key goes in on stdin so ps on the other side can't read it.
     drop = ("--config-dir", "--api-key")
     args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
     # The run forwarded from the other side carries this flag and never fans back out.
     if globals().get("_UNBOUND_FORWARDED"):
-        return
+        return True
     if in_wsl:
         # Drives mount under /mnt unless wsl.conf moves them; wslpath reports where C: actually landed.
         try:
@@ -581,25 +582,26 @@ def setup_wsl(argv) -> None:
               os.path.join(pf, "Unbound WSL", MDM_WSL_NAME))
     here = globals().get("__file__", "<stdin>")
     same = os.path.normcase(os.path.realpath(here)) == os.path.normcase(os.path.realpath(staged))
+    # Best effort, like any user-level check: the user owns these files, and the next logon restores MDM's setup.
     if os.path.isfile(staged) and not same:
-        if in_wsl and key:
-            print("Skipped: MDM sets this tool up on Windows and in WSL")
+        if in_wsl:
+            print("Skipped: MDM manages this tool on Windows and in WSL")
             raise SystemExit(3)
-        print(f"{'Windows' if in_wsl else 'WSL'}: managed by MDM")
-        return
+        print("WSL: managed by MDM")
+        return True
     # A run fed on stdin has no file to forward, even with a file named <stdin> in cwd.
     if here == "<stdin>":
-        return
+        return True
     # A pipe or <(curl ...) is read to its end before this runs, so there is no script left to forward.
     if not os.path.isfile(here):
         print(f"{'Windows' if in_wsl else 'WSL'}: skipped, run the installer from a saved file to set this side up too")
-        return
+        return True
     try:
         source = b"_UNBOUND_FORWARDED = True\n" + Path(here).read_bytes()
         if key:
             source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
     except OSError:
-        return
+        return False
     if in_wsl:
         # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
         # -I on both sides: a script read from stdin would otherwise import modules from the caller's cwd.
@@ -616,6 +618,7 @@ def setup_wsl(argv) -> None:
         root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
         wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
         targets = [(f"WSL {d}", [str(wsl), "-d", d, "--exec", "python3", "-I", "-", *args]) for d in (_wsl_distros() if wsl else [])]
+    ok = True
     for name, cmd in targets:
         try:
             r = subprocess.run(cmd, input=source,
@@ -627,7 +630,9 @@ def setup_wsl(argv) -> None:
                 else f"failed (exit {r.returncode}): {(out.strip().splitlines() or [''])[-1]}")
         except (OSError, subprocess.TimeoutExpired) as e:
             status = f"failed ({type(e).__name__})"
+        ok = ok and not status.startswith("failed")
         print(f"{name}: {status}")
+    return ok
 
 
 def main():
