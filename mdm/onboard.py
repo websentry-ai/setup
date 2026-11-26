@@ -60,6 +60,7 @@ Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
 """
 
+import hashlib
 import json
 import os
 import platform
@@ -142,7 +143,7 @@ MDM_RETRY_JITTER_SECONDS = 5
 WSL_TASK_NAME = "Unbound WSL Setup"
 # Runs as each user at logon with the user-level installers staged beside it; their
 # setup_wsl() installs into the user's WSL distros and leaves Windows untouched.
-WSL_RUNNER = r'''import importlib.util, json, os, shutil, sys, time
+WSL_RUNNER = r'''import hashlib, importlib.util, json, os, shutil, sys, time
 from pathlib import Path
 
 sys.dont_write_bytecode = True
@@ -168,9 +169,16 @@ def run(script, args):
 
 staged = Path(__file__).parent
 for old in sorted(done.glob("*-setup.py")):
-    if not (staged / old.name).is_file():
+    if (staged / old.name).is_file():
+        continue
+    # The copy sits in a folder this user can write, so it runs only if onboard staged that exact file.
+    try:
+        known = hashlib.sha256(old.read_bytes()).hexdigest() in (staged / f"{old.name}.sha256").read_text().split()
+    except OSError:
+        known = False
+    if known:
         run(old, ["--clear"])
-        old.unlink(missing_ok=True)
+    old.unlink(missing_ok=True)
 try:
     cfg = json.loads((Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8"))
 except (OSError, ValueError):
@@ -800,6 +808,12 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
             # Write beside it, then rename: a failed write never truncates the staged copy.
             dest.with_suffix(".tmp").write_bytes(source)
             os.replace(dest.with_suffix(".tmp"), dest)
+            # Every version ever staged, so the runner can trust a user's copy of an older one at clear time.
+            known = dest.with_name(f"{dest.name}.sha256")
+            seen = known.read_text().split() if known.is_file() else []
+            digest = hashlib.sha256(source).hexdigest()
+            if digest not in seen:
+                known.write_text("\n".join(seen + [digest]) + "\n")
         except Exception as e:
             print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
     return _register_wsl_task(pythonw, "")
