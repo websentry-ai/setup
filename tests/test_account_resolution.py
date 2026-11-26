@@ -24,11 +24,12 @@ START = '# KEEP IN SYNC: account resolution'
 END = '# --- end account resolution ---'
 # The cursor-plugin repo's hooks/unbound.py carries the same block and pins the same digest in its own test, so a
 # change made in one repo and not the other fails there. Update both together.
-BLOCK_SHA256 = 'e2319fa34a2f21dbbe52c959c67554a89eb27dfd8cf2dba4ae4ef13afbef3315'
+BLOCK_SHA256 = '8c71e6e093b51172405c2cdecf9fe5c38b0305ed361910dc1901b8249c86e703'
 # Not a real credential; it only has to sit where a token goes.
 FAKE_TOKEN = 'gho_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8'  # gitleaks:allow
 
-# A `git` stand-in: answers `config --get`, `remote get-url --push` and `symbolic-ref` from FAKE_GIT_ANSWERS,
+# A `git` stand-in: answers `config --get`, `config --name-only --list`, `remote get-url --push` and `symbolic-ref`
+# from FAKE_GIT_ANSWERS,
 # honours GIT_CONFIG_GLOBAL as git does, and logs every call.
 FAKE_GIT = '''#!{python}
 import json, os, re, sys
@@ -67,6 +68,13 @@ if args[:2] == ['config', '--get']:
         print(answers[name])
         sys.exit(0)
     sys.exit(1)
+if args[:3] == ['config', '--name-only', '--list']:
+    # Key names only, as git lists them: every dotted answer and every indexed key.
+    for key in sorted(k for k in answers if '.' in k):
+        print(key.lower())
+    for n in range(int(os.environ.get('GIT_CONFIG_COUNT') or 0)):
+        print(os.environ.get('GIT_CONFIG_KEY_%d' % n, '').lower())
+    sys.exit(0)
 if args[:2] == ['remote', '-v']:
     # The checkout's remotes, from FAKE_GIT_ANSWERS['remote.<name>.url'], listed by name as git does.
     for key in sorted(k for k in answers if k.startswith('remote.') and k.endswith('.url')):
@@ -1093,6 +1101,84 @@ class AccountResolutionTests(unittest.TestCase):
             hook._accounts('git checkout release', self.repo, state)
             self.assertNotIn('pushed_repo', bare, path)
             self.assertEqual(named['pushed_repo'], 'acme/app', path)
+
+    def test_a_branch_change_keeps_a_named_push_that_one_call_also_made_bare(self):
+        """In one call the two pushes collapse into one destination; the named one still reached it."""
+        for command in ('git push; git push origin main', 'git push origin main; git push'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                both = hook._with_accounts({}, hook._accounts(command, self.repo, state), state)
+                hook._accounts('git checkout release', self.repo, state)
+                self.assertEqual(both.get('pushed_repo'), 'acme/app', '%s / %s' % (path, command))
+            for path, resolved in self.each(command + '; git switch release'):
+                self.assertEqual((resolved or {}).get('pushed_repo'), 'acme/app', '%s / %s' % (path, command))
+
+    def test_removing_or_renaming_a_config_section_is_a_switch(self):
+        """`--remove-section user` exposes another committer; `--rename-section remote.origin` moves origin's pushes."""
+        for switch in ('git config --remove-section user', 'git config --rename-section user backup',
+                       'git config remove-section user'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                commit = hook._accounts('git commit -m one', self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(commit.get('accounts'), [], '%s / %s' % (path, switch))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            origin = hook._with_accounts({}, hook._accounts('git push origin main', self.repo, state), state)
+            personal = hook._with_accounts({}, hook._accounts('git push personal main', self.repo, state), state)
+            hook._accounts('git config --remove-section remote.origin', self.repo, state)
+            self.assertNotIn('pushed_repo', origin, path)
+            self.assertEqual(personal['pushed_repo'], 'jdoe-dev/app', path)
+
+    def test_changing_what_is_included_is_a_switch(self):
+        """An included file can set the committer and where a push goes, so a change to the includes moves both."""
+        for switch in ('git config --local include.path /tmp/personal.gitconfig',
+                       'git config includeIf.onbranch:main.path /tmp/personal.gitconfig',
+                       'git config --remove-section include'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                commit = hook._accounts('git commit -m one', self.repo, state)
+                push = hook._with_accounts({}, hook._accounts('git push origin main', self.repo, state), state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(commit.get('accounts'), [], '%s / %s' % (path, switch))
+                self.assertNotIn('pushed_repo', push, '%s / %s' % (path, switch))
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            commit = hook._accounts('git commit -m one', self.repo, state)
+            hook._accounts('git config --get include.path', self.repo, state)
+            self.assertEqual(commit['accounts'][0]['email'], 'jdoe@gmail.com', path)
+
+    def test_a_branch_change_moves_the_committer_only_when_a_file_is_included_by_branch(self):
+        """`includeIf "onbranch:..."` picks the committer by branch; without one a branch change keeps it."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        for included, kept in ((False, True), (True, False)):
+            if included:
+                answers['includeIf.onbranch:work/**.path'] = '/tmp/work.gitconfig'
+            with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+                for path, hook in zip(HOOK_PATHS, HOOKS):
+                    state = {}
+                    commit = hook._accounts('git commit -m one', self.repo, state)
+                    hook._accounts('git switch release', self.repo, state)
+                    self.assertEqual(bool(commit.get('accounts')), kept, '%s / included=%s' % (path, included))
+
+    def test_a_remote_change_moves_the_committer_only_when_a_file_is_included_by_remote(self):
+        """`includeIf "hasconfig:remote.*.url:..."` picks the committer by remote; without one a remote change keeps it."""
+        answers = json.loads(os.environ['FAKE_GIT_ANSWERS'])
+        for included, kept in ((False, True), (True, False)):
+            if included:
+                answers['includeIf.hasconfig:remote.*.url:git@github.com:acme/**.path'] = '/tmp/work.gitconfig'
+            with patch.dict(os.environ, {'FAKE_GIT_ANSWERS': json.dumps(answers)}):
+                for path, hook in zip(HOOK_PATHS, HOOKS):
+                    state = {}
+                    commit = hook._accounts('git commit -m one', self.repo, state)
+                    hook._accounts('git remote set-url origin git@github.com:jdoe/app.git', self.repo, state)
+                    self.assertEqual(bool(commit.get('accounts')), kept, '%s / included=%s' % (path, included))
+
+    def test_an_inherited_committer_email_the_reader_cannot_take_is_unknown(self):
+        """Inherited and already expanded, a `$` in it is literal; it is still set, so the config does not answer."""
+        with patch.dict(os.environ, {'GIT_COMMITTER_EMAIL': 'j$doe@gmail.com'}):
+            for path, resolved in self.each('git commit -m one'):
+                self.assertFalse((resolved or {}).get('accounts'), path)
 
     def test_a_scoped_remote_change_keeps_the_sibling_pushes_of_one_call(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):

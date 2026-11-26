@@ -7,9 +7,8 @@
 #
 # Payload:
 #   /opt/unbound/<version>/{unbound-hook/,unbound-discovery/,share/}
-#   /Library/LaunchDaemons/ai.getunbound.discovery.plist
 # Everything else (current symlink, /var/log/unbound, newsyslog conf,
-# daemon bootstrap, version GC) happens in postinstall — the `current`
+# daemon removal, version GC) happens in postinstall — the `current`
 # symlink especially must NOT be payload, because postinstall pre-warms the
 # new binaries before flipping it.
 set -euo pipefail
@@ -31,22 +30,19 @@ trap 'rm -rf "$stage"' EXIT
 root="$stage/root"
 verdir="$root$INSTALL_PREFIX/$version"
 
-mkdir -p "$verdir" "$root/Library/LaunchDaemons"
+mkdir -p "$verdir"
 cp -R "$dist/unbound-hook" "$dist/unbound-discovery" "$verdir/"
 
 # Canonical entry points are the bundle executables themselves:
 #   /opt/unbound/current/unbound-hook/unbound-hook
 #   /opt/unbound/current/unbound-discovery/unbound-discovery
 # (aligned with the unbound-hook binary work in WEB-4786 — no bin/ shim dir,
-# one path for LaunchDaemon, onboard.sh, and tool-hook commands alike).
+# one path for onboard.sh and tool-hook commands alike).
 
 # Shipped inside the version dir; postinstall copies it to /etc/newsyslog.d
 # (payload writing straight into /private/etc is avoidable churn).
 mkdir -p "$verdir/share"
 cp "$pkgdir/newsyslog-ai.getunbound.conf" "$verdir/share/"
-
-cp "$pkgdir/ai.getunbound.discovery.plist" "$root/Library/LaunchDaemons/"
-chmod 644 "$root/Library/LaunchDaemons/ai.getunbound.discovery.plist"
 
 scripts="$stage/scripts"
 mkdir -p "$scripts"

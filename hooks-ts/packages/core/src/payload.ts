@@ -54,6 +54,7 @@ import {
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
 } from "./constants.ts";
+import { deviceOs } from "./shell.ts";
 import type { AccountIdentity } from "./accountIdentity.ts";
 import type {
   PreToolUseData,
@@ -521,6 +522,12 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   if (typeof input.toolUseId === "string" && input.toolUseId.length > 0) {
     preToolUseData.tool_use_id = input.toolUseId;
   }
+  if (mcp === undefined && typeof input.shell?.shell === "string") {
+    preToolUseData.shell = input.shell.shell;
+    if (typeof input.shell.shell_source === "string") preToolUseData.shell_source = input.shell.shell_source;
+  }
+  const os = deviceOs();
+  if (os !== undefined) preToolUseData.os = os;
 
   const body: PretoolRequestBody = {
     conversation_id: input.sessionId,
