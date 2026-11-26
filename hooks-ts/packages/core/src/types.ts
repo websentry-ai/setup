@@ -34,6 +34,8 @@ export interface PreToolUseData {
   /** The shell that runs `command` and how the hook knows; absent for a non-shell tool. */
   shell?: string;
   shell_source?: string;
+  /** The device's operating system; the gateway reads `/ETC/x` as /etc only on macOS. */
+  os?: "macos" | "linux" | "windows";
   metadata: Record<string, unknown>;
 }
 

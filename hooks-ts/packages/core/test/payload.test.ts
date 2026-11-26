@@ -35,6 +35,7 @@ import {
   resolveFilePath,
   sanitizeToolInput,
 } from "../src/payload.ts";
+import { deviceOs } from "../src/shell.ts";
 import { resolveClientEntrypoint } from "../src/piVersion.ts";
 import type { PretoolPayloadInput } from "../src/types.ts";
 
@@ -673,4 +674,23 @@ test("structure-keeping is __proto__-safe", () => {
   assert.ok(Object.hasOwn(wire.toolInput, "__proto__"));
   assert.equal(Object.getPrototypeOf(wire.toolInput), Object.prototype);
   assert.equal(JSON.parse(JSON.stringify(wire.toolInput)).__proto__, "keep");
+});
+
+test("buildPretoolPayload: every call names this machine's operating system", () => {
+  const expected = { darwin: "macos", linux: "linux", win32: "windows" }[process.platform as string];
+  assert.equal(buildPretoolPayload(bashInput()).pre_tool_use_data.os, expected);
+  assert.equal(
+    buildPretoolPayload(bashInput({ toolName: "write", command: "" })).pre_tool_use_data.os,
+    expected,
+    "a file tool too, whose path the gateway checks",
+  );
+});
+
+test("deviceOs: the three desktop platforms, and nothing for any other", () => {
+  assert.equal(deviceOs("darwin"), "macos");
+  assert.equal(deviceOs("linux"), "linux");
+  assert.equal(deviceOs("win32"), "windows");
+  for (const other of ["freebsd", "aix", "android", "", "toString", "__proto__"]) {
+    assert.equal(deviceOs(other), undefined, other);
+  }
 });
