@@ -33,6 +33,7 @@ class TestSetupWsl(unittest.TestCase):
                 mock.patch.dict(mod.os.environ, {"SystemRoot": "C:\\Windows"}), \
                 mock.patch.object(mod.Path, "is_file", lambda p: p.name == "wsl.exe" and p.parent.name == "System32"), \
                 mock.patch.object(mod, "_wsl_distros", return_value=list(distros)), \
+                mock.patch.object(mod.subprocess, "check_output", return_value=b"/mnt/c/\n"), \
                 mock.patch.object(mod.subprocess, "run", side_effect=fake_run), \
                 mock.patch("builtins.print") as printed:
             mod.setup_wsl(argv)
@@ -78,6 +79,7 @@ class TestSetupWsl(unittest.TestCase):
                 mock.patch.object(mod.platform, "release", return_value="5.15.167.4-microsoft-standard-WSL2"), \
                 mock.patch.object(mod.os.path, "isfile", lambda p: p == mod.__file__), \
                 mock.patch.object(mod.shutil, "which", lambda name, path=None: searched.append(path)), \
+                mock.patch.object(mod.subprocess, "check_output", return_value=b"/mnt/c/\n"), \
                 mock.patch.object(mod.subprocess, "run") as run, mock.patch("builtins.print"):
             mod.setup_wsl(["--api-key", "k"])
         self.assertEqual(searched, [os.pathsep.join([launcher, "/mnt/c/WINDOWS"])])
