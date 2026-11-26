@@ -928,7 +928,7 @@ def get_device_identifier() -> Optional[str]:
             # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
             # "Serial Number" label is localized and fails on non-English macOS.
             result = subprocess.run(
-                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                 capture_output=True,
                 text=True,
                 timeout=10
