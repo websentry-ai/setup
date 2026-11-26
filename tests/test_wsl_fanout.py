@@ -2,7 +2,9 @@
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from tests.conftest import load_module
@@ -92,6 +94,11 @@ class TestSetupWsl(unittest.TestCase):
         self.assertEqual(self._run(mod, ["--api-key", "k"], system="Linux", release="6.8.0-45-generic"), ([], []))
 
     def test_a_run_fed_on_stdin_never_fans_back_out(self):
+        # A planted file named <stdin> in cwd must not be read and run on the other side.
+        cwd = tempfile.mkdtemp()
+        (Path(cwd) / "<stdin>").write_text("print('planted')\n")
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(cwd)
         for system, release in (("Windows", "10"), ("Linux", "5.15.167.4-microsoft-standard-WSL2")):
             with self.subTest(system):
                 mod = load_module("codex/hooks/setup.py")

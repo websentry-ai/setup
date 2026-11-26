@@ -1786,12 +1786,14 @@ def setup_wsl(argv) -> None:
     # --config-dir is a path on this side only; the key goes in on stdin so ps on the other side can't read it.
     drop = ("--config-dir", "--api-key")
     args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
+    # A run fed on stdin came from the other side and never fans back out, even with a file named <stdin> in cwd.
+    if globals().get("__file__", "<stdin>") == "<stdin>":
+        return
     try:
-        # A run fed on stdin has no file here, so the other side never fans back out.
         source = Path(__file__).read_bytes()
         if key:
             source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
-    except (NameError, OSError):
+    except OSError:
         return
     if in_wsl:
         # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
