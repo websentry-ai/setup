@@ -102,6 +102,26 @@ class TestInstall(unittest.TestCase):
         self.assertEqual((stage / "augment-hooks-setup.py").read_text(), "OK = 1\n")
         ps.assert_called_once()
 
+    def test_a_failed_write_keeps_the_staged_installer(self):
+        stage = self.pf / "Unbound WSL"
+        stage.mkdir()
+        (stage / "cursor-setup.py").write_text("GOOD = 1\n")
+        real = Path.write_bytes
+
+        def disk_full(path, data):
+            if path.suffix == ".tmp":
+                real(path, data[:3])
+                raise OSError("disk full")
+            return real(path, data)
+        with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
+                mock.patch.object(onboard, "fetch_script", return_value=b"NEW = 1\n"), \
+                mock.patch.object(onboard.Path, "write_bytes", disk_full), \
+                mock.patch.object(onboard, "_powershell", return_value=True), \
+                mock.patch("builtins.print"):
+            onboard.install_wsl_logon_task([f"{onboard._RAW_SETUP}/cursor/mdm/setup.py"])
+        self.assertEqual((stage / "cursor-setup.py").read_text(), "GOOD = 1\n")
+        self.assertEqual(sorted(p.name for p in stage.glob("*-setup.py")), ["cursor-setup.py"])
+
     def test_python_users_could_replace_is_refused(self):
         with mock.patch.object(onboard, "_all_users_pythonw", return_value=None), \
                 mock.patch.object(onboard, "_powershell") as ps:

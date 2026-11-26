@@ -777,7 +777,10 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
         try:
             source = fetch_script(user_url)
             compile(source, user_url, "exec")
-            (target / user_url[len(_RAW_SETUP) + 1:].replace("/", "-")).write_bytes(source)
+            dest = target / user_url[len(_RAW_SETUP) + 1:].replace("/", "-")
+            # Write beside it, then rename: a failed write never truncates the staged copy.
+            dest.with_suffix(".tmp").write_bytes(source)
+            os.replace(dest.with_suffix(".tmp"), dest)
         except Exception as e:
             print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
     return _powershell(
