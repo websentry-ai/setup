@@ -229,3 +229,43 @@ def test_setup_never_reads_or_writes_a_users_file_through_a_junction(tool, tmp_p
     assert m._read_user_file_tail(plain, 1024) == b"ok\n"
     m._replace_user_file(tmp_path / "state", b"saved")
     assert (tmp_path / "state").read_bytes() == b"saved"
+
+
+@windows_only
+def test_cursor_cleanup_keeps_only_the_log_and_its_place(tmp_path):
+    m = tool_module("cursor/mdm", "setup")
+    home = tmp_path / "home"
+    hooks = home / ".cursor" / "hooks"
+    (hooks / "old").mkdir(parents=True)
+    (hooks / "old" / "x.txt").write_text("x")
+    for name in ("unbound.py", "error.log", ".error_log_forwarded"):
+        (hooks / name).write_text(name)
+    (home / ".cursor" / "hooks.json").write_text("{}")
+    assert m.remove_user_level_hooks("u", home) is True
+    assert not (home / ".cursor" / "hooks.json").exists()
+    assert sorted(p.name for p in hooks.iterdir()) == [".error_log_forwarded", "error.log"]
+
+
+@windows_only
+@pytest.mark.parametrize("where", ["hooks", "inside"])
+def test_cursor_cleanup_never_deletes_through_a_junction(tmp_path, where):
+    """SYSTEM clears ~/.cursor/hooks: a junction there, or inside it, is never followed to delete elsewhere."""
+    import _winapi
+    m = tool_module("cursor/mdm", "setup")
+    private = tmp_path / "private"
+    private.mkdir()
+    for name in ("precious.txt", "unbound.py"):
+        (private / name).write_text("SYSTEM's")
+    home = tmp_path / "home"
+    hooks = home / ".cursor" / "hooks"
+    if where == "hooks":
+        hooks.parent.mkdir(parents=True)
+        _winapi.CreateJunction(str(private), str(hooks))
+    else:
+        hooks.mkdir(parents=True)
+        (hooks / "unbound.py").write_text("old hook")
+        _winapi.CreateJunction(str(private), str(hooks / "inner"))
+    m.remove_user_level_hooks("u", home)
+    assert sorted(p.name for p in private.iterdir()) == ["precious.txt", "unbound.py"]
+    if where == "inside":
+        assert not os.path.lexists(hooks / "inner") and not (hooks / "unbound.py").exists()

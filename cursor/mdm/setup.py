@@ -459,6 +459,63 @@ def _clear_dir_at(dir_fd: int, keep=frozenset()) -> None:
             os.unlink(name, dir_fd=dir_fd)
 
 
+def _delete_where_asked(path: Path) -> None:
+    """Windows: delete the file or empty folder at path itself (a link there, not what it points at). It is
+    opened for delete without following a link, its final path must be the path asked for, and the delete
+    goes through that same handle: a link or junction swapped in on the way can't point SYSTEM elsewhere."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                     wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    kernel32.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetLongPathNameW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    kernel32.GetLongPathNameW.restype = wintypes.DWORD
+    kernel32.SetFileInformationByHandle.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    kernel32.SetFileInformationByHandle.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+
+    class _Disposition(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOLEAN)]
+
+    def plain(name):
+        return "\\\\" + name[8:] if name.startswith("\\\\?\\UNC\\") else name[4:] if name.startswith("\\\\?\\") else name
+
+    asked = os.path.abspath(str(path))
+    handle = kernel32.CreateFileW(asked, 0x00010000 | 0x0080,  # DELETE | FILE_READ_ATTRIBUTES
+                                  0x7, None, 3,  # share all, OPEN_EXISTING
+                                  0x00200000 | 0x02000000, None)  # OPEN_REPARSE_POINT | BACKUP_SEMANTICS
+    if handle in (None, wintypes.HANDLE(-1).value):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        final, long_asked = ctypes.create_unicode_buffer(32768), ctypes.create_unicode_buffer(32768)
+        got = kernel32.GetFinalPathNameByHandleW(handle, final, len(final), 0)
+        wanted = kernel32.GetLongPathNameW(asked, long_asked, len(long_asked))
+        if not (0 < got < len(final) and 0 < wanted < len(long_asked)
+                and os.path.normcase(plain(final.value)) == os.path.normcase(plain(long_asked.value))):
+            raise OSError(f"{path} is reached through a link or junction")
+        disposition = _Disposition(True)
+        if not kernel32.SetFileInformationByHandle(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            raise ctypes.WinError(ctypes.get_last_error())  # FileDispositionInfo above
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _clear_dir_where_asked(folder: Path, keep=frozenset()) -> None:
+    """Windows: remove everything in folder but the names in keep, each through _delete_where_asked. A
+    real subfolder is emptied first; a link or junction is removed itself, never entered."""
+    for name in os.listdir(folder):
+        if name in keep:
+            continue
+        child = folder / name
+        st = os.lstat(child)
+        if stat.S_ISDIR(st.st_mode) and not getattr(st, "st_file_attributes", 0) & 0x400:
+            _clear_dir_where_asked(child)
+        _delete_where_asked(child)
+
+
 def _remove_cursor_hooks(home_dir: Path) -> bool:
     """Remove ~/.cursor/hooks.json and ~/.cursor/hooks, all but the folder's error.log and the log's
     forwarded place (WEB-6392): errors the gateway has not taken, or a hook writes while setup runs, go out
@@ -466,20 +523,16 @@ def _remove_cursor_hooks(home_dir: Path) -> bool:
     folder are opened without following a link and every removal is made relative to them: a link at either,
     or one swapped in, can't point root at another folder. True when anything was removed."""
     keep = {Path(HOOK_ERROR_LOG[0]).name, FORWARDED_STATE_NAME}
-    if os.name == "nt":  # no dir_fd here: SYSTEM checks the path for links and junctions first
-        import shutil
-        _refuse_links_on_the_way(home_dir / ".cursor" / "hooks")
+    if os.name == "nt":  # no dir_fd: each removal goes through a handle checked to be the one asked for
         removed = False
-        if (home_dir / ".cursor" / "hooks.json").exists():
-            (home_dir / ".cursor" / "hooks.json").unlink()
+        if os.path.lexists(home_dir / ".cursor" / "hooks.json"):
+            _delete_where_asked(home_dir / ".cursor" / "hooks.json")
             removed = True
         hooks_dir = home_dir / ".cursor" / "hooks"
-        if hooks_dir.exists():
-            for entry in os.scandir(hooks_dir):
-                if entry.name not in keep:
-                    shutil.rmtree(entry.path) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)
-            if not any(os.scandir(hooks_dir)):
-                os.rmdir(hooks_dir)
+        if os.path.lexists(hooks_dir):
+            _clear_dir_where_asked(hooks_dir, keep)
+            if not os.listdir(hooks_dir):
+                _delete_where_asked(hooks_dir)
             removed = True
         return removed
     try:
