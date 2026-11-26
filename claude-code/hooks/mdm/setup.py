@@ -13,7 +13,9 @@ import threading
 import hashlib
 import bisect
 import json
-from datetime import datetime, timezone
+import re
+import tempfile
+from datetime import datetime, timedelta, timezone
 import shlex
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -3297,6 +3299,7 @@ def hook_script_hash(script_path) -> Optional[str]:
 
 
 TOOL_NAME, TOOL_CLI = "Claude Code", "claude"
+HOOK_ERROR_LOG = (".claude/hooks/error.log", "claude-code")  # this tool's log under a home, and its hook_source
 # Per OS: (machine-wide paths, paths under a home), beside the CLI's own folders.
 TOOL_FOOTPRINTS = {
     "darwin": (("Applications/Claude.app",), (".claude/local/claude", ".claude.json", "Applications/Claude.app")),
@@ -3389,6 +3392,268 @@ def tool_installed(user_homes, system: Optional[str] = None, machine_root: Optio
         return False
     except Exception:
         return True
+
+
+# --- Stuck hook errors (WEB-6392) -----------------------------------------------------------
+# A hook reports an error to the gateway at most once a minute and never retries, so the rest wait in
+# its error.log. Each run sends this tool's entries (HOOK_ERROR_LOG) newer than the last one forwarded,
+# per home and with that home's own key, as the unbound-hook binary does on a Mac. Every tool's MDM script
+# runs on its own, so each one carries this same code, kept equal by tests/test_mdm_hook_errors.py.
+# Beside each error.log: "<timestamp> <n>", the newest entry the gateway accepted and how many entries
+# stamped exactly then were sent (two can share a stamp, and a request can end between them).
+FORWARDED_STATE_NAME = ".error_log_forwarded"
+HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
+# error.log is the user's to write: per home, a run sends at most the newest 25 (what a hook keeps) and
+# nothing older than a week, so a flooded or first-seen log costs at most three requests.
+HOOK_ERRORS_PER_RUN = 25
+HOOK_ERROR_MAX_AGE = timedelta(days=7)
+# Sentry groups by category: forwarded entries group together, apart from the hook's live reports.
+FORWARDED_ERROR_CATEGORY = "forwarded_error_log"
+HOOK_ERROR_TIMEOUT_SECONDS = 5  # forwarding must never hold setup up
+_HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
+_USER_FILE_MAX_BYTES = 4 * 1024 * 1024
+# A user's file: never followed if it is a link, never waited on if it is a FIFO, never text-mode on Windows.
+_USER_FILE_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+_BEARER = re.compile(r"(?i)\bBearer\s+\S+")
+_NAMED_SECRET = re.compile(r"""(?i)\b([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd))("?\s*[:=]\s*"?)([^\s"',;&}]+)""")
+_URL_SECRET = re.compile(r"(?i)([?&](?:key|token|api_key|access_token|sig|signature)=)[^&\s\"]+")
+_VENDOR_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{10,}")
+
+
+def _log_time(text):
+    """An entry's timestamp as an aware datetime (hooks write UTC 'Z' or local time with its offset), else None."""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo else None
+
+
+def _read_user_file(path: Path) -> bytes:
+    """A user's regular file, whole and within _USER_FILE_MAX_BYTES. Raises OSError for anything else."""
+    fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(_USER_FILE_MAX_BYTES + 1)
+    if len(data) > _USER_FILE_MAX_BYTES:
+        raise OSError(f"{path} is larger than {_USER_FILE_MAX_BYTES} bytes")
+    return data
+
+
+def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
+    """A user's regular file's last max_bytes, from a whole line on: a long log is read from its end."""
+    fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        if st.st_size <= max_bytes:
+            return f.read(max_bytes)
+        f.seek(st.st_size - max_bytes)
+        data = f.read(max_bytes)
+    return data.split(b"\n", 1)[1] if b"\n" in data else b""
+
+
+def _replace_user_file(path: Path, data: bytes) -> None:
+    """Write data (0600) beside path and rename it over: a link or FIFO there is replaced, not written
+    through, and a failed write leaves the old file in place."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    if os.path.lexists(tmp):
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _USER_FILE_FLAGS, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _forwarded_place(log: Path):
+    """(timestamp, how many entries stamped then were sent) from the state file; (None, 0) for none.
+    A bare timestamp, as written before the count, means every entry stamped then was sent."""
+    try:
+        parts = _read_user_file(log.with_name(FORWARDED_STATE_NAME)).decode().split()
+    except (OSError, UnicodeDecodeError):
+        return None, 0
+    last = _log_time(parts[0]) if parts else None
+    sent_then = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else float("inf")
+    return last, sent_then if last else 0
+
+
+def _unsent_hook_errors(log: Path) -> list:
+    """Runs as the home's user: the newest HOOK_ERRORS_PER_RUN entries after the last one forwarded and
+    newer than HOOK_ERROR_MAX_AGE, oldest first. Each carries the 'state' to save once it is sent."""
+    floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
+    last, sent_then = _forwarded_place(log)
+    entries, seen_then, current = [], 0, None
+    for line in _read_user_file_tail(log, _USER_FILE_MAX_BYTES).decode("utf-8", "replace").splitlines():
+        match = _HOOK_ERROR_LINE.match(line)
+        if not match:  # a message's own later lines (a traceback); they go with the entry they follow
+            if current is not None:
+                current["message"] = (current["message"] + "\n" + line)[:2000]
+            continue
+        when, current = _log_time(match.group(1)), None
+        if when is None or when <= floor:
+            continue
+        if last is not None and when <= last:
+            seen_then += when == last
+            if when < last or seen_then <= sent_then:
+                continue  # sent already
+        current = {"timestamp": match.group(1), "message": match.group(2)[:2000],
+                   "category": FORWARDED_ERROR_CATEGORY}
+        entries.append((when, current))
+    entries.sort(key=lambda entry: entry[0])  # stable: entries sharing a stamp keep the log's order
+    chosen = entries[-HOOK_ERRORS_PER_RUN:]
+    for i, (when, entry) in enumerate(chosen):
+        same = sum(1 for other, _ in chosen[:i + 1] if other == when) + (sent_then if when == last else 0)
+        entry["state"] = f"{entry['timestamp']} {same}"
+    return [entry for _, entry in chosen]
+
+
+def _save_forwarded(log: Path, state: str) -> bool:
+    """Runs as the home's user."""
+    _replace_user_file(log.with_name(FORWARDED_STATE_NAME), state.encode("utf-8"))
+    return True
+
+
+def _redact_hook_error(message: str, secrets) -> str:
+    """The home's own keys, then common credential shapes, each value replaced and its name kept."""
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    message = _BEARER.sub("Bearer [REDACTED]", message)
+    message = _NAMED_SECRET.sub(r"\1\2[REDACTED]", message)
+    message = _URL_SECRET.sub(r"\1[REDACTED]", message)
+    return _VENDOR_KEY.sub("[REDACTED]", message)
+
+
+def _post_hook_json(url, body, headers):
+    """POST a JSON body with curl (the system trust store, as every call here uses). Returns (http status,
+    response bytes); status 0 when nothing came back. Never raises. The headers carry the key, and any local
+    user can read a process's argv, so they go to curl in a 0600 file (-H @file) that is removed afterwards."""
+    header_file = None
+    try:
+        fd, header_file = tempfile.mkstemp(prefix=".unbound-headers.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("".join(f"{name}: {value}\n" for name, value in
+                            {"Content-Type": "application/json", **headers}.items()))
+        cmd = ["curl", "-sS", "-m", str(HOOK_ERROR_TIMEOUT_SECONDS), "-X", "POST", "-w", "\n%{http_code}",
+               "-H", f"@{header_file}", "--data-binary", "@-", "--", url]
+        result = subprocess.run(cmd, input=json.dumps(body).encode("utf-8"),
+                                capture_output=True, timeout=HOOK_ERROR_TIMEOUT_SECONDS + 3)
+        answer, _, code = (result.stdout or b"").rpartition(b"\n")
+        return int(code.strip() or 0), answer
+    except Exception:
+        return 0, b""
+    finally:
+        if header_file:
+            try:
+                os.unlink(header_file)
+            except OSError:
+                pass
+
+
+def _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets=()) -> str:
+    """The hook's own request shape and auth. 'sent' when the gateway took them; 'down' when it gave no
+    answer or a 5xx; 'refused' when it answered no. It refuses only a key (200 with success false, or a
+    4xx), never an entry, so a refusal is about this home's key and not about what the log holds."""
+    errors = [{**{k: v for k, v in entry.items() if k != "state"},
+               "message": _redact_hook_error(entry["message"], (api_key, *secrets))}
+              for entry in batch]
+    code, answer = _post_hook_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
+                                   {"Authorization": f"Bearer {api_key}"})
+    if code <= 0 or code >= 500:
+        return "down"
+    try:
+        taken = 200 <= code < 300 and json.loads(answer.decode("utf-8")).get("success") is True
+    except (ValueError, AttributeError):
+        taken = False
+    return "sent" if taken else "refused"
+
+
+def _writable_dir(path: Path) -> bool:
+    """Runs as the home's user: the forwarded place can be saved in this folder."""
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def _home_device_key(home: Path):
+    """Runs as the home's user: (the key its hooks report errors with, every key in ~/.unbound/config.json
+    to redact), or None before setup first wrote it."""
+    try:
+        config = json.loads(_read_user_file(home / ".unbound" / "config.json").decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    # The hooks' own order (cfg.get('api_key') or cfg.get('device_token')): their errors are this key's.
+    if not isinstance(config, dict):
+        return None
+    key = config.get("api_key") or config.get("device_token")
+    secrets = tuple(v for v in (config.get("api_key"), config.get("device_token")) if isinstance(v, str) and v)
+    return (key, secrets) if isinstance(key, str) and key else None
+
+
+def _forward_home_errors(username, log, send):
+    """(entries sent, 'sent' or the verdict that stopped it, whether every unsent entry went out). The place
+    is saved after each accepted request; where it can't be saved nothing more is sent, or every run would
+    send the same entries again."""
+    if _run_as_user(username, _writable_dir, log.parent) is not True:
+        print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
+        return 0, "sent", False
+    entries = _run_as_user(username, _unsent_hook_errors, log)
+    if entries is None:
+        return 0, "sent", False
+    for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
+        batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
+        verdict = send(batch)
+        if verdict != "sent":
+            return start, verdict, False
+        if _run_as_user(username, _save_forwarded, log, batch[-1]["state"]) is not True:
+            print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
+            return start + len(batch), "sent", False
+    return len(entries), "sent", True
+
+
+def forward_hook_errors(user_homes, gateway_url, hook_path) -> list:
+    """Forward every home's unsent error.log entries for this tool, with that home's own key, before this run
+    changes anything. A gateway that is down ends forwarding for the run, so it costs one short timeout; a
+    refused key is that home's own and skips only that home. Either way nothing is marked sent, and the next
+    run retries. Never raises. Returns the (username, log) of every log not fully sent."""
+    relpath, hook_source = HOOK_ERROR_LOG
+    unsent, sent, down = [], 0, False
+    try:
+        hook_sha = (hook_script_hash(hook_path) or "unknown")[:12]
+        url = gateway_url.rstrip("/") + "/v1/hooks/errors"
+        for username, home_dir in user_homes:
+            log = Path(home_dir) / relpath if home_dir is not None else None
+            if log is None or not os.path.lexists(log):
+                continue
+            found = None if down else _run_as_user(username, _home_device_key, Path(home_dir))
+            if not found:
+                unsent.append((username, log))  # the gateway is down, or no hook here has a key yet
+                continue
+            api_key, secrets = found
+            count, verdict, done = _forward_home_errors(
+                username, log, lambda batch: _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets))
+            sent += count
+            if not done:
+                unsent.append((username, log))
+            if verdict == "refused":
+                print(f"[errors] {TOOL_NAME} hook errors in {home_dir} not forwarded (key refused); the next run retries")
+            elif verdict == "down":
+                down = True
+                print(f"[errors] {TOOL_NAME} hook errors not forwarded (gateway down); the next run retries")
+    except Exception as e:
+        print(f"[errors] {TOOL_NAME} hook errors not forwarded: {e}")
+    if sent:
+        print(f"[errors] forwarded {sent} {TOOL_NAME} hook errors")
+    return unsent
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
@@ -3504,6 +3769,9 @@ def main():
         print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug] [--backfill] [--skip-managed-settings]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return False
+
+    # Before this run changes anything, with the key each home's hooks already report with.
+    forward_hook_errors(get_all_user_homes(), gateway_url, get_managed_settings_dir() / "hooks" / "unbound.py")
 
     print("\nGetting device identifier...")
     device_id = get_device_identifier()
