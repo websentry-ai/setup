@@ -771,6 +771,23 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(en
         "cursor broke", "cursor broke again", "cursor broke during setup"]
 
 
+def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_the_cleanup(env, backend, monkeypatch):
+    """The user may not be able to write ~/.cursor (a sudo'd Cursor run leaves it root's), so the move aside
+    fails; the cleanup, which removes ~/.cursor/hooks as root, then keeps that log and removes the rest."""
+    log = _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke"])
+    (log.parent / "unbound.py").write_text("# python-era hook")
+    monkeypatch.setattr(setup_cmd, "_set_aside_unsent_log", lambda log: [])
+    ok = backend.answer
+    backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
+    _run(backend)
+    assert sorted(p.name for p in log.parent.iterdir()) == ["error.log"]
+    backend.answer = ok
+    backend.requests.clear()
+    _run(backend)
+    assert [e["message"] for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"
+            for e in r["body"]["errors"]] == ["cursor broke"]
+
+
 def test_a_cursor_log_an_earlier_run_could_not_put_back_is_forwarded(env, backend):
     """A restore that failed leaves the log at its set-aside name; the next run puts it back and sends it."""
     aside = env["home"] / ".cursor" / ".unbound-unsent-hooks-error.log"

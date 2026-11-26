@@ -496,6 +496,24 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_its_clea
     assert _messages(gateway) == ["cursor broke", "cursor broke again", "cursor broke during setup"]
 
 
+def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_its_cleanup(setup, gateway):
+    """The user may not be able to write ~/.cursor, so the move aside fails; the cleanup, which removes
+    ~/.cursor/hooks as root, then keeps that log and removes the rest."""
+    r = setup("cursor")
+    real_cursor_cleanup(r)
+    log = _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke"])
+    (log.parent / "unbound.py").write_text("# python-era hook")
+    r.mp.setattr(r.m, "_set_aside_unsent_log", lambda log: [])
+    gateway.answer = lambda request: (503, {})
+    assert r() is True
+    assert sorted(p.name for p in log.parent.iterdir()) == ["error.log"]
+    assert r.m.KEEP_UNSENT_HOOK_LOGS == set()
+    gateway.answer = lambda request: (200, OK)
+    gateway.requests.clear()
+    r()
+    assert _messages(gateway) == ["cursor broke"]
+
+
 def test_a_cursor_log_an_earlier_run_could_not_put_back_is_forwarded(setup, gateway):
     """A restore that failed leaves the log at its set-aside name; the next run puts it back and sends it."""
     r = setup("cursor")

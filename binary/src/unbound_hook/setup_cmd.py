@@ -2047,6 +2047,10 @@ def run(argv) -> int:
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
     # The sweep and Cursor's step remove ~/.cursor/hooks: a log the gateway has not taken is put back after.
     kept = [(u, log, _as_user(m0, u, _set_aside_unsent_log, log)) for u, log in opts.get("unsent_hook_logs", [])]
+    # One the user can't move (they may not be able to write ~/.cursor) stays where it is: Cursor's
+    # cleanup, which removes ~/.cursor/hooks as root, keeps it.
+    cursor_hooks = load_mdm_setup_module("cursor").KEEP_UNSENT_HOOK_LOGS if kept else set()
+    cursor_hooks.update(log for _, log, data in kept if not data and os.path.lexists(log))
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:
@@ -2062,6 +2066,7 @@ def run(argv) -> int:
         except Exception as e:
             statuses[tool] = _report_failed_setup(opts, tool, f"error: {e}")
 
+    cursor_hooks.clear()
     for username, log, data in kept:
         if data and _as_user(m0, username, _restore_unsent_log, log, data) is not True and not os.path.lexists(log):
             print(f"[errors] {log}: unsent hook errors could not be kept for the next run")

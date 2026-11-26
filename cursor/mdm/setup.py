@@ -418,6 +418,27 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
     return True
 
 
+# Unsent hook error logs this run could not move out of ~/.cursor/hooks before removing it (WEB-6392).
+KEEP_UNSENT_HOOK_LOGS = set()
+
+
+def _remove_hooks_dir(hooks_dir: Path) -> None:
+    """Remove ~/.cursor/hooks, all but an unsent error.log and its forwarded place when one is kept here."""
+    import shutil
+    keep = {log.name for log in KEEP_UNSENT_HOOK_LOGS if log.parent == hooks_dir}
+    if not keep:
+        shutil.rmtree(hooks_dir)
+        return
+    keep.add(FORWARDED_STATE_NAME)
+    for entry in os.scandir(hooks_dir):
+        if entry.name in keep:
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            shutil.rmtree(entry.path)
+        else:
+            os.unlink(entry.path)
+
+
 def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
     """Remove user-level Cursor hooks (from normal setup) to prevent duplicate execution."""
     hooks_json = home_dir / ".cursor" / "hooks.json"
@@ -431,8 +452,7 @@ def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
             debug_print(f"Failed to remove {hooks_json}: {e}")
     if hooks_dir.exists():
         try:
-            import shutil
-            shutil.rmtree(hooks_dir)
+            _remove_hooks_dir(hooks_dir)
             removed = True
         except Exception as e:
             debug_print(f"Failed to remove {hooks_dir}: {e}")
@@ -1638,16 +1658,24 @@ def recover_set_aside_hook_logs(user_homes) -> None:
 
 
 def keep_unsent_hook_logs(unsent) -> list:
-    """Set aside each (username, log) not fully sent: [(username, log, names moved)]. Never raises."""
-    try:
-        return [(username, log, _run_as_user(username, _set_aside_unsent_log, log)) for username, log in unsent]
-    except Exception as e:
-        print(f"[errors] unsent hook errors not set aside: {e}")
-        return []
+    """Set aside each (username, log) not fully sent: [(username, log, names moved)]. A log that can't be
+    moved (the user may not be able to write ~/.cursor) is kept in place by the cleanup. Never raises."""
+    kept = []
+    for username, log in unsent:
+        try:
+            names = _run_as_user(username, _set_aside_unsent_log, log)
+        except Exception as e:
+            print(f"[errors] {log}: unsent hook errors not set aside: {e}")
+            names = None
+        if not names and os.path.lexists(log):
+            KEEP_UNSENT_HOOK_LOGS.add(log)
+        kept.append((username, log, names))
+    return kept
 
 
 def restore_unsent_hook_logs(kept) -> None:
     """Put back what keep_unsent_hook_logs set aside. Never raises."""
+    KEEP_UNSENT_HOOK_LOGS.clear()
     for username, log, names in kept:
         try:
             if names and _run_as_user(username, _restore_unsent_log, log, names) is not True and not os.path.lexists(log):
