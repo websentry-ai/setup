@@ -2080,9 +2080,13 @@ def detect_install_state() -> Optional[str]:
 
 def hook_script_hash(script_path) -> Optional[str]:
     """sha256 of the hook script this run installed, so the backend can tell which
-    hook version a device is running. None when absent or unreadable."""
+    hook version a device is running. None when absent or unreadable.
+
+    The script sits in a user's home, and error forwarding hashes it before this run
+    replaces it, so it is read as a user's file: not through a link, never a FIFO
+    or device, and within a size cap."""
     try:
-        return hashlib.sha256(Path(script_path).read_bytes()).hexdigest()
+        return hashlib.sha256(_read_user_file(Path(script_path))).hexdigest()
     except Exception:
         return None
 

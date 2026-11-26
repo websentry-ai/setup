@@ -555,3 +555,31 @@ def test_the_limits_and_redaction_are_the_binarys(binary, name):
 @pytest.mark.parametrize("tool", sorted(MODULES))
 def test_each_script_forwards_the_log_the_binary_does_for_its_tool(binary, tool):
     assert load_module(MODULES[tool]).HOOK_ERROR_LOG == binary._HOOK_ERROR_LOGS[tool]
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs are POSIX")
+@pytest.mark.parametrize("tool", ["copilot", "codex"])
+def test_the_hook_hashed_before_install_is_read_as_a_users_file(tool, tmp_path):
+    """Copilot and codex hash a hook in a user's home, before this run has replaced it, and root reads it.
+    A FIFO there must not hang the run, and a link must not make root hash a file the user can't read."""
+    m = load_module(MODULES[tool])
+    hooks = tmp_path / "hooks"
+    hooks.mkdir()
+    real = hooks / "real.py"
+    real.write_bytes(b"print('hook')\n")
+    assert m.hook_script_hash(real) == "a1000e5bd44e3cdc4bfe2631b9dffa642fa8fd55bc86f07c2823eb7bdd4aacab"
+    root_only = tmp_path / "root-only.py"
+    root_only.write_bytes(b"secret\n")
+    link = hooks / "link.py"
+    link.symlink_to(root_only)
+    assert m.hook_script_hash(link) is None
+    fifo = hooks / "unbound.py"
+    os.mkfifo(fifo)
+    answer = []
+    reader = threading.Thread(target=lambda: answer.append(m.hook_script_hash(fifo)), daemon=True)
+    reader.start()
+    reader.join(5)
+    if reader.is_alive():  # release the blocked open before failing
+        os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("hashing a FIFO blocked the run")
+    assert answer == [None]
