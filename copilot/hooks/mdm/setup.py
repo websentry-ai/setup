@@ -2335,45 +2335,67 @@ def _replace_user_file(path: Path, data: bytes) -> None:
 
 
 def _forwarded_place(log: Path):
-    """(timestamp, how many entries stamped then were sent) from the state file; (None, 0) for none.
-    A bare timestamp, as written before the count, means every entry stamped then was sent."""
+    """(timestamp, how many entries stamped then were sent, their digests or None) from the state file;
+    (None, 0, None) for none. Without digests (written before them) the count alone says which were sent,
+    and a bare timestamp means every entry stamped then was."""
     try:
         parts = _read_user_file(log.with_name(FORWARDED_STATE_NAME)).decode().split()
     except (OSError, UnicodeDecodeError):
-        return None, 0
+        return None, 0, None
     last = _log_time(parts[0]) if parts else None
-    sent_then = int(parts[1]) if len(parts) == 2 and parts[1].isdigit() else float("inf")
-    return last, sent_then if last else 0
+    sent_then = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else float("inf")
+    digests = parts[2].split(",") if len(parts) == 3 and parts[1].isdigit() else None
+    return (last, sent_then, digests) if last else (None, 0, None)
 
 
 def _unsent_hook_errors(log: Path) -> list:
     """Runs as the home's user: the newest HOOK_ERRORS_PER_RUN entries after the last one forwarded and
     newer than HOOK_ERROR_MAX_AGE, oldest first. Each carries the 'state' to save once it is sent."""
     floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
-    last, sent_then = _forwarded_place(log)
-    entries, seen_then, current = [], 0, None
+    last, sent_then, sent_digests = _forwarded_place(log)
+    parsed = []
     for line in _read_user_file_tail(log, _USER_FILE_MAX_BYTES).decode("utf-8", "replace").splitlines():
         match = _HOOK_ERROR_LINE.match(line)
         if not match:  # a message's own later lines (a traceback); they go with the entry they follow
-            if current is not None:
-                current["message"] = (current["message"] + "\n" + line)[:2000]
+            if parsed:
+                parsed[-1]["message"] = (parsed[-1]["message"] + "\n" + line)[:2000]
             continue
-        when, current = _log_time(match.group(1)), None
-        if when is None or when <= floor:
+        parsed.append({"timestamp": match.group(1), "message": match.group(2)[:2000],
+                       "category": FORWARDED_ERROR_CATEGORY})
+    # Entries stamped with the saved time are told apart by digest: the hook keeps only its last 25, so
+    # rotation can drop a sent one and leave a count that no longer lines up.
+    unmatched = list(sent_digests or ())
+    entries, seen_then, kept_then = [], 0, []
+    for entry in parsed:
+        when = _log_time(entry["timestamp"])
+        if when is None or when <= floor or (last is not None and when < last):
             continue
-        if last is not None and when <= last:
-            seen_then += when == last
-            if when < last or seen_then <= sent_then:
-                continue  # sent already
-        current = {"timestamp": match.group(1), "message": match.group(2)[:2000],
-                   "category": FORWARDED_ERROR_CATEGORY}
-        entries.append((when, current))
+        if last is not None and when == last:
+            digest = _entry_digest(entry["message"])
+            if sent_digests is not None:
+                if digest in unmatched:
+                    unmatched.remove(digest)
+                    kept_then.append(digest)
+                    continue  # sent already
+            else:
+                seen_then += 1
+                if seen_then <= sent_then:
+                    kept_then.append(digest)
+                    continue  # sent already, by the count a place without digests carries
+        entries.append((when, entry))
     entries.sort(key=lambda entry: entry[0])  # stable: entries sharing a stamp keep the log's order
     chosen = entries[-HOOK_ERRORS_PER_RUN:]
     for i, (when, entry) in enumerate(chosen):
-        same = sum(1 for other, _ in chosen[:i + 1] if other == when) + (sent_then if when == last else 0)
-        entry["state"] = f"{entry['timestamp']} {same}"
+        stamped = [e for other, e in chosen[:i + 1] if other == when]
+        earlier = kept_then if when == last else []
+        digests = earlier + [_entry_digest(e["message"]) for e in stamped]
+        entry["state"] = f"{entry['timestamp']} {len(digests)} {','.join(digests)}"
     return [entry for _, entry in chosen]
+
+
+def _entry_digest(message: str) -> str:
+    """A short digest that tells one sent entry from another stamped at the same time."""
+    return hashlib.sha256(message.encode("utf-8", "replace")).hexdigest()[:12]
 
 
 def _save_forwarded(log: Path, state: str) -> bool:

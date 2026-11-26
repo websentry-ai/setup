@@ -334,7 +334,7 @@ def test_errors_newer_than_the_last_forwarded_one_go_to_the_gateway(env, backend
     assert body["hook_source"] == "claude-code" and len(body["hook_sha"]) == 12
     assert [(e["timestamp"], e["message"]) for e in body["errors"]] == [
         (_utc(1), "gateway unreachable 1"), (_utc(2), "gateway unreachable 2")]
-    assert log.with_name(STATE).read_text() == f"{_utc(2)} 1"
+    assert log.with_name(STATE).read_text().rsplit(" ", 1)[0] == f"{_utc(2)} 1"
 
 
 def test_errors_go_ten_to_a_request_and_none_is_sent_twice(env, backend):
@@ -342,7 +342,7 @@ def test_errors_go_ten_to_a_request_and_none_is_sent_twice(env, backend):
     _run(backend)
     assert [len(r["body"]["errors"]) for r in _forwarded(backend)] == [10, 10, 5]
     assert [e["message"] for r in _forwarded(backend) for e in r["body"]["errors"]] == [f"e{n}" for n in range(25)]
-    assert log.with_name(STATE).read_text() == f"{_utc(24)} 1"
+    assert log.with_name(STATE).read_text().rsplit(" ", 1)[0] == f"{_utc(24)} 1"
     backend.requests.clear()
     _run(backend)
     assert _forwarded(backend) == []
@@ -382,7 +382,7 @@ def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, 
     sent = {r["body"]["hook_source"]: [e["message"] for e in r["body"]["errors"]] for r in _forwarded(backend)}
     assert sent == {"cursor": ["cursor broke"], "copilot": ["copilot broke"], "codex": ["codex broke"],
                     "claude-code": ["bob's claude broke"], "augment_code": ["auggie broke"]}
-    assert (env["home"] / ".copilot/hooks" / STATE).read_text() == f"{_pacific(1)} 1"
+    assert (env["home"] / ".copilot/hooks" / STATE).read_text().rsplit(" ", 1)[0] == f"{_pacific(1)} 1"
     assert (other / ".claude/hooks" / STATE).exists() and not (env["home"] / ".claude/hooks" / STATE).exists()
     # Cursor's setup removes the python-era ~/.cursor/hooks; its sent log comes back with its place.
     assert sorted(p.name for p in (env["home"] / ".cursor/hooks").iterdir()) == [STATE, "error.log"]
@@ -469,7 +469,7 @@ def test_a_huge_log_sends_only_its_25_newest_entries(env, backend):
     _run(backend)
     assert len(_forwarded(backend)) <= 3
     assert [m.split()[1] for m in _messages(backend)] == [str(n) for n in range(39975, 40000)]
-    assert log.with_name(STATE).read_text() == f"{_utc(39999 / 100)} 1"
+    assert log.with_name(STATE).read_text().rsplit(" ", 1)[0] == f"{_utc(39999 / 100)} 1"
 
 
 def test_entries_older_than_seven_days_are_never_sent(env, backend):
@@ -562,7 +562,7 @@ def test_a_state_file_that_is_a_link_is_replaced_not_followed(env, backend, tmp_
     assert _messages(backend) == ["e0", "e1"]
     assert victim.read_text() == _utc(100)
     state = log.with_name(STATE)
-    assert not state.is_symlink() and state.read_text() == f"{_utc(1)} 1"
+    assert not state.is_symlink() and state.read_text().rsplit(" ", 1)[0] == f"{_utc(1)} 1"
 
 
 # --- S-U5: what reaches the gateway, and Sentry behind it ------------------------
@@ -648,6 +648,34 @@ def test_a_key_the_gateway_refuses_stops_only_that_tool(env, backend):
 
 
 # --- Review #9: entries sharing the saved timestamp aren't lost ------------------
+
+def test_an_entry_sharing_the_saved_timestamp_is_sent_after_the_log_rotates(env, backend):
+    """The hook keeps its last 25 entries: after rotation drops one already sent at the saved stamp, a new
+    entry stamped the same is still told apart from the sent one beside it."""
+    same = _utc(9)
+    log = _log(env["home"], "claude-code", [f"{same}: e1", f"{same}: e2"])
+    _run(backend)
+    assert _messages(backend) == ["e1", "e2"]
+    log.write_text(f"{same}: e2\n{same}: e3\n")  # e1 rotated out, e3 added with the same stamp
+    backend.requests.clear()
+    _run(backend)
+    assert _messages(backend) == ["e3"]
+    backend.requests.clear()
+    _run(backend)
+    assert _messages(backend) == []
+
+
+def test_a_place_saved_before_digests_still_reads(env, backend):
+    """A place saved as '<stamp> <count>' (or a bare stamp) reads as before."""
+    same = _utc(9)
+    log = _log(env["home"], "claude-code", [f"{same}: e1", f"{same}: e2", f"{_utc(10)}: e3"])
+    log.with_name(STATE).write_text(f"{same} 1")
+    _run(backend)
+    assert _messages(backend) == ["e2", "e3"]
+    backend.requests.clear()
+    _run(backend)
+    assert _messages(backend) == []  # e1, sent by the old count, is not sent again
+
 
 def test_an_entry_sharing_the_last_sent_timestamp_is_still_sent(env, backend):
     same = _utc(9)

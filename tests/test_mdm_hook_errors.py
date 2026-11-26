@@ -153,7 +153,7 @@ def test_each_script_sends_only_its_own_tools_errors_newer_than_the_last_sent(se
     assert (body["hook_source"], body["hook_sha"]) == (HOOK_SOURCES[tool], "h" * 12)
     assert [(e["timestamp"], e["message"], e["category"]) for e in body["errors"]] == [
         (_utc(1), f"{tool} e1", "forwarded_error_log"), (_utc(2), f"{tool} e2", "forwarded_error_log")]
-    assert log.with_name(STATE).read_text() == f"{_utc(2)} 1"
+    assert log.with_name(STATE).read_text().rsplit(" ", 1)[0] == f"{_utc(2)} 1"
 
 
 @pytest.mark.parametrize("tool", sorted(MODULES))
@@ -199,7 +199,7 @@ def test_errors_go_ten_to_a_request_and_none_is_sent_twice(setup, gateway):
     r()
     assert [len(req["body"]["errors"]) for req in _forwarded(gateway)] == [10, 10, 5]
     assert _messages(gateway) == [f"e{n}" for n in range(25)]
-    assert log.with_name(STATE).read_text() == f"{_utc(24)} 1"
+    assert log.with_name(STATE).read_text().rsplit(" ", 1)[0] == f"{_utc(24)} 1"
     gateway.requests.clear()
     r()
     assert _forwarded(gateway) == []
@@ -253,6 +253,36 @@ def test_a_4xx_is_a_refusal_and_saves_nothing(setup, gateway):
     assert r() is True
     assert len(_forwarded(gateway)) == 1
     assert not log.with_name(STATE).exists()
+
+
+def test_an_entry_sharing_the_saved_timestamp_is_sent_after_the_log_rotates(setup, gateway):
+    """The hook keeps its last 25 entries: after rotation drops one already sent at the saved stamp, a new
+    entry stamped the same is still told apart from the sent one beside it."""
+    r = setup("claude-code")
+    same = _utc(9)
+    log = _log(r.home, "claude-code", [f"{same}: e1", f"{same}: e2"])
+    r()
+    assert _messages(gateway) == ["e1", "e2"]
+    log.write_text(f"{same}: e2\n{same}: e3\n")  # e1 rotated out, e3 added with the same stamp
+    gateway.requests.clear()
+    r()
+    assert _messages(gateway) == ["e3"]
+    gateway.requests.clear()
+    r()
+    assert _messages(gateway) == []
+
+
+def test_a_place_saved_before_digests_still_reads(setup, gateway):
+    """A place saved as '<stamp> <count>' (or a bare stamp) reads as before."""
+    r = setup("claude-code")
+    same = _utc(9)
+    log = _log(r.home, "claude-code", [f"{same}: e1", f"{same}: e2", f"{_utc(10)}: e3"])
+    log.with_name(STATE).write_text(f"{same} 1")
+    r()
+    assert _messages(gateway) == ["e2", "e3"]
+    gateway.requests.clear()
+    r()
+    assert _messages(gateway) == []  # e1, sent by the old count, is not sent again
 
 
 def test_an_entry_sharing_the_last_sent_timestamp_is_still_sent(setup, gateway):
@@ -428,7 +458,7 @@ def test_a_state_file_that_is_a_link_is_replaced_not_followed(setup, gateway, tm
     assert _messages(gateway) == ["e0", "e1"]
     assert victim.read_text() == _utc(100)
     state = log.with_name(STATE)
-    assert not state.is_symlink() and state.read_text() == f"{_utc(1)} 1"
+    assert not state.is_symlink() and state.read_text().rsplit(" ", 1)[0] == f"{_utc(1)} 1"
 
 
 def test_a_config_that_is_a_link_gives_no_key(setup, gateway, tmp_path):
@@ -531,7 +561,7 @@ def test_a_partly_sent_cursor_log_keeps_its_place_across_the_cleanup(setup, gate
     log = _log(r.home, "cursor", [f"{_pacific(n)}: e{n}" for n in range(15)])
     gateway.answer = lambda request: (503, {}) if len(_forwarded(gateway)) == 2 else (200, OK)
     r()
-    assert log.with_name(STATE).read_text() == f"{_pacific(9)} 1"
+    assert log.with_name(STATE).read_text().rsplit(" ", 1)[0] == f"{_pacific(9)} 1"
     gateway.answer = lambda request: (200, OK)
     gateway.requests.clear()
     r()
@@ -564,7 +594,7 @@ def test_a_cursor_log_in_a_home_without_a_key_survives_its_cleanup(setup, gatewa
 
 # --- The five copies stay equal, and equal to the binary ---------------------------
 
-SHARED_FUNCTIONS = ("_log_time", "_refuse_links_on_the_way", "_refuse_if_redirected", "_read_user_file", "_read_user_file_tail", "_replace_user_file", "_forwarded_place",
+SHARED_FUNCTIONS = ("_log_time", "_entry_digest", "_refuse_links_on_the_way", "_refuse_if_redirected", "_read_user_file", "_read_user_file_tail", "_replace_user_file", "_forwarded_place",
                     "_unsent_hook_errors", "_save_forwarded", "_redact_hook_error", "_post_hook_json",
                     "_post_hook_errors", "_writable_dir", "_home_device_key", "_forward_home_errors",
                     "forward_hook_errors")
