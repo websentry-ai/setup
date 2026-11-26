@@ -77,6 +77,7 @@ class TestInstall(unittest.TestCase):
         self.assertIn("-GroupId 'S-1-5-32-545'", script)
         self.assertIn("-AtLogOn", script)
         self.assertIn("-MultipleInstances Parallel", script)
+        self.assertIn("-ExecutionTimeLimit ([TimeSpan]::Zero)", script)
         self.assertEqual(env["UNB_ARGS"], f'-I "{stage / "run.py"}"')
         self.assertEqual(env["UNB_TASK"], "Unbound WSL Setup")
 

@@ -783,10 +783,11 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
             os.replace(dest.with_suffix(".tmp"), dest)
         except Exception as e:
             print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
+    # No task time limit (PT0S): each distro call already stops after 900s, so tools x distros bounds the run.
     return _powershell(
         "$a = New-ScheduledTaskAction -Execute $env:UNB_EXE -Argument $env:UNB_ARGS; "
         "$p = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited; "
-        "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Hours 1) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel; "
+        "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel; "
         "Register-ScheduledTask -TaskName $env:UNB_TASK -Action $a -Trigger (New-ScheduledTaskTrigger -AtLogOn) "
         "-Principal $p -Settings $s -Force -ErrorAction Stop | Out-Null; "
         "Start-ScheduledTask -TaskName $env:UNB_TASK",
