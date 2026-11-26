@@ -53,7 +53,8 @@ The Pi clear step always runs, detected or not: a device whose pi was
 uninstalled still carries the extension and the rc export.
 
 On Windows it also registers a logon task that sets up each user's WSL distros
-as that user, since SYSTEM cannot run wsl.exe. --clear removes the task.
+as that user, since SYSTEM cannot run wsl.exe. --clear unstages every tool, so each
+user's next logon clears their distros; the task deletes itself after 30 days.
 
 Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
@@ -141,13 +142,35 @@ MDM_RETRY_JITTER_SECONDS = 5
 WSL_TASK_NAME = "Unbound WSL Setup"
 # Runs as each user at logon with the user-level installers staged beside it; their
 # setup_wsl() installs into the user's WSL distros and leaves Windows untouched.
-WSL_RUNNER = r'''import importlib.util, json, os, sys, time
+WSL_RUNNER = r'''import importlib.util, json, os, shutil, sys, time
 from pathlib import Path
 
-log = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Unbound" / "wsl_setup.log"
+sys.dont_write_bytecode = True
+local = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Unbound"
+# This user's copy of each installer it ran, so a tool MDM later unstages can still be cleared.
+done = local / "wsl"
+log = local / "wsl_setup.log"
 log.parent.mkdir(parents=True, exist_ok=True)
 sys.stdout = sys.stderr = open(log, "a", encoding="utf-8")
 print(time.strftime("%Y-%m-%d %H:%M:%S"), "WSL setup")
+
+
+def run(script, args):
+    print(script.name)
+    try:
+        spec = importlib.util.spec_from_file_location(script.stem.replace("-", "_"), script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.setup_wsl(args)
+    except Exception as e:
+        print(f"WSL: failed ({e!r})")
+
+
+staged = Path(__file__).parent
+for old in sorted(done.glob("*-setup.py")):
+    if not (staged / old.name).is_file():
+        run(old, ["--clear"])
+        old.unlink(missing_ok=True)
 try:
     cfg = json.loads((Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8"))
 except (OSError, ValueError):
@@ -160,15 +183,10 @@ args = ["--api-key", key]
 for flag, name in (("--backend-url", "base_url"), ("--gateway-url", "gateway_url"), ("--domain", "frontend_url")):
     if isinstance(cfg.get(name), str) and cfg[name]:
         args += [flag, cfg[name]]
-for script in sorted(Path(__file__).parent.glob("*-setup.py")):
-    print(script.name)
-    try:
-        spec = importlib.util.spec_from_file_location(script.stem.replace("-", "_"), script)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        mod.setup_wsl(args)
-    except Exception as e:
-        print(f"WSL: failed ({e!r})")
+for script in sorted(staged.glob("*-setup.py")):
+    run(script, args)
+    done.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(script, done / script.name)
 '''
 
 USAGE = (
@@ -733,7 +751,8 @@ def should_install_pi() -> bool:
 
 def _wsl_dir() -> Path:
     # Program Files, not ProgramData: users can't add a script here for another user's logon to run.
-    return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Unbound WSL"
+    # ProgramW6432 first: under a 32-bit Python ProgramFiles is the (x86) folder the installers don't check.
+    return Path(os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles", r"C:\Program Files")) / "Unbound WSL"
 
 
 def _powershell(script: str, env: dict) -> bool:
@@ -783,19 +802,35 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
             os.replace(dest.with_suffix(".tmp"), dest)
         except Exception as e:
             print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
+    return _register_wsl_task(pythonw, "")
+
+
+def _register_wsl_task(pythonw: Path, days: str) -> bool:
     # No task time limit (PT0S): each distro call already stops after 900s, so tools x distros bounds the run.
+    # With days set the trigger expires then and Windows deletes the task (DeleteExpiredTaskAfter PT0S).
     return _powershell(
         "$a = New-ScheduledTaskAction -Execute $env:UNB_EXE -Argument $env:UNB_ARGS; "
         "$p = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited; "
+        "$t = New-ScheduledTaskTrigger -AtLogOn; "
+        "if ($env:UNB_DAYS) { $t.EndBoundary = (Get-Date).AddDays([int]$env:UNB_DAYS).ToString('s') }; "
         "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel; "
-        "Register-ScheduledTask -TaskName $env:UNB_TASK -Action $a -Trigger (New-ScheduledTaskTrigger -AtLogOn) "
+        "if ($env:UNB_DAYS) { $s.DeleteExpiredTaskAfter = 'PT0S' }; "
+        "Register-ScheduledTask -TaskName $env:UNB_TASK -Action $a -Trigger $t "
         "-Principal $p -Settings $s -Force -ErrorAction Stop | Out-Null; "
         "Start-ScheduledTask -TaskName $env:UNB_TASK",
-        {"UNB_EXE": str(pythonw), "UNB_ARGS": f'-I "{target / "run.py"}"', "UNB_TASK": WSL_TASK_NAME})
+        {"UNB_EXE": str(pythonw), "UNB_ARGS": f'-I "{_wsl_dir() / "run.py"}"', "UNB_TASK": WSL_TASK_NAME,
+         "UNB_DAYS": days})
 
 
 def remove_wsl_logon_task() -> bool:
-    # A missing task is not a failure; a bare Unregister of one exits 1.
+    """Unstages every installer; the runner then clears them from each user's distros at their next
+    logon, for the 30 days the task is kept."""
+    for p in _wsl_dir().glob("*-setup.py"):
+        p.unlink(missing_ok=True)
+    pythonw = _all_users_pythonw()
+    if (_wsl_dir() / "run.py").is_file() and pythonw:
+        return _register_wsl_task(pythonw, "30") and not any(_wsl_dir().glob("*-setup.py"))
+    # Never staged, or no trusted Python to clear with: a missing task is not a failure; a bare Unregister of one exits 1.
     ok = _powershell("Get-ScheduledTask -TaskName $env:UNB_TASK -ErrorAction SilentlyContinue | "
                      "Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop; exit 0", {"UNB_TASK": WSL_TASK_NAME})
     shutil.rmtree(_wsl_dir(), ignore_errors=True)
@@ -881,7 +916,8 @@ def main() -> int:
     if platform.system().lower() == "windows":
         print(f"\n{'=' * 60}\n[WSL] per-user logon task\n{'=' * 60}\n")
         if is_clear:
-            print("✅ Removed" if remove_wsl_logon_task() else "⚠️  Could not fully remove the WSL logon task")
+            print("✅ Each user's WSL distros are cleared at their next logon" if remove_wsl_logon_task()
+                  else "⚠️  Could not fully remove the WSL logon task")
         elif installed:
             print("✅ Registered" if install_wsl_logon_task(installed)
                   else "⚠️  WSL distros will not be set up; Windows setup is unaffected")

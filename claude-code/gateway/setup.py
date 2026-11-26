@@ -901,6 +901,10 @@ def _wsl_distros():
             and not n.lower().startswith(("docker-desktop", "rancher-desktop", "podman-"))]
 
 
+# The name mdm/onboard.py stages this installer under for its WSL logon task.
+MDM_WSL_NAME = "claude-code-gateway-setup.py"
+
+
 def setup_wsl(argv) -> None:
     """Windows and its WSL distros are one machine: run this same setup on the other side too."""
     key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
@@ -912,15 +916,39 @@ def setup_wsl(argv) -> None:
     # --config-dir is a path on this side only; the key goes in on stdin so ps on the other side can't read it.
     drop = ("--config-dir", "--api-key")
     args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
-    # A run fed on stdin came from the other side and never fans back out, even with a file named <stdin> in cwd.
-    if globals().get("__file__", "<stdin>") == "<stdin>":
+    # The run forwarded from the other side carries this flag and never fans back out.
+    if globals().get("_UNBOUND_FORWARDED"):
+        return
+    if in_wsl:
+        # Drives mount under /mnt unless wsl.conf moves them; wslpath reports where C: actually landed.
+        try:
+            c = subprocess.check_output(["/usr/bin/wslpath", "-u", "C:\\"], timeout=10).decode().strip().rstrip("/")
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            c = ""
+        mnt = os.path.dirname(c or "/mnt/c")
+    # MDM's logon task sets this tool up in WSL with the device key; a user-level run must not swap in its own.
+    # The task itself runs the staged file, so that one still fans out. ProgramW6432 first: a 32-bit Python's
+    # ProgramFiles is the (x86) folder, and onboard always stages under the 64-bit one.
+    pf = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles", r"C:\Program Files")
+    staged = (os.path.join(mnt, "c", "Program Files", "Unbound WSL", MDM_WSL_NAME) if in_wsl else
+              os.path.join(pf, "Unbound WSL", MDM_WSL_NAME))
+    here = globals().get("__file__", "<stdin>")
+    same = os.path.normcase(os.path.realpath(here)) == os.path.normcase(os.path.realpath(staged))
+    if os.path.isfile(staged) and not same:
+        if in_wsl and key:
+            print("Skipped: MDM sets this tool up on Windows and in WSL")
+            raise SystemExit(3)
+        print(f"{'Windows' if in_wsl else 'WSL'}: managed by MDM")
+        return
+    # A run fed on stdin has no file to forward, even with a file named <stdin> in cwd.
+    if here == "<stdin>":
         return
     # A pipe or <(curl ...) is read to its end before this runs, so there is no script left to forward.
-    if not os.path.isfile(__file__):
+    if not os.path.isfile(here):
         print(f"{'Windows' if in_wsl else 'WSL'}: skipped, run the installer from a saved file to set this side up too")
         return
     try:
-        source = Path(__file__).read_bytes()
+        source = b"_UNBOUND_FORWARDED = True\n" + Path(here).read_bytes()
         if key:
             source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
     except OSError:
@@ -930,12 +958,6 @@ def setup_wsl(argv) -> None:
         # -I on both sides: a script read from stdin would otherwise import modules from the caller's cwd.
         # The all-users launcher, else PATH folders that resolve onto a Windows drive, so /mnt/c/../home can't reach Linux ones.
         # A Windows-drive folder the user put on PATH (direnv, a venv) already runs code as them, so it is trusted like PATH.
-        # Drives mount under /mnt unless wsl.conf moves them; wslpath reports where C: actually landed.
-        try:
-            c = subprocess.check_output(["/usr/bin/wslpath", "-u", "C:\\"], timeout=10).decode().strip().rstrip("/")
-        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
-            c = ""
-        mnt = os.path.dirname(c or "/mnt/c")
         dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.startswith("/")]
         win_path = os.pathsep.join(p for p in dirs if len(os.path.relpath(p, mnt).split("/")[0]) == 1 and p != mnt)
         py = next((p for p in (os.path.join(mnt, "c", "Windows", "py.exe"),) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)

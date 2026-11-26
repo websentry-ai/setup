@@ -40,6 +40,25 @@ class TestRunner(unittest.TestCase):
         self.assertEqual([c[0] for c in calls], ["claude_code_hooks_setup", "cursor_setup"])
         self.assertEqual(calls[0][1], ["--api-key", "K", "--backend-url", "https://b", "--gateway-url", "https://g",
                                        "--domain", "https://f"])
+        self.assertEqual(sorted(p.name for p in (self.tmp / "local" / "Unbound" / "wsl").iterdir()),
+                         ["claude-code-hooks-setup.py", "cursor-setup.py"])
+
+    def test_a_tool_no_longer_staged_is_cleared_from_the_distros(self):
+        done = self.tmp / "local" / "Unbound" / "wsl"
+        done.mkdir(parents=True)
+        (done / "cursor-setup.py").write_text(RECORDER)
+        (self.stage / "codex-hooks-setup.py").write_text(RECORDER)
+        calls, _ = self._run({"api_key": "K"})
+        self.assertEqual(calls, [["cursor_setup", ["--clear"]], ["codex_hooks_setup", ["--api-key", "K"]]])
+        self.assertEqual([p.name for p in done.iterdir()], ["codex-hooks-setup.py"])
+
+    def test_clearing_needs_no_key(self):
+        done = self.tmp / "local" / "Unbound" / "wsl"
+        done.mkdir(parents=True)
+        (done / "cursor-setup.py").write_text(RECORDER)
+        calls, log = self._run(None)
+        self.assertEqual(calls, [["cursor_setup", ["--clear"]]])
+        self.assertIn("no key", log)
 
     def test_no_key_runs_nothing(self):
         (self.stage / "cursor-setup.py").write_text(RECORDER)
@@ -58,7 +77,7 @@ class TestRunner(unittest.TestCase):
 class TestInstall(unittest.TestCase):
     def setUp(self):
         self.pf = Path(tempfile.mkdtemp())
-        self.env = mock.patch.dict(os.environ, {"ProgramFiles": str(self.pf)})
+        self.env = mock.patch.dict(os.environ, {"ProgramFiles": str(self.pf), "ProgramW6432": str(self.pf)})
         self.env.start()
         self.addCleanup(self.env.stop)
 
@@ -80,6 +99,7 @@ class TestInstall(unittest.TestCase):
         self.assertIn("-ExecutionTimeLimit ([TimeSpan]::Zero)", script)
         self.assertEqual(env["UNB_ARGS"], f'-I "{stage / "run.py"}"')
         self.assertEqual(env["UNB_TASK"], "Unbound WSL Setup")
+        self.assertEqual(env["UNB_DAYS"], "")
 
     def test_a_failed_tool_keeps_its_staged_installer_and_the_rest_still_stage(self):
         stage = self.pf / "Unbound WSL"
@@ -122,6 +142,26 @@ class TestInstall(unittest.TestCase):
             onboard.install_wsl_logon_task([f"{onboard._RAW_SETUP}/cursor/mdm/setup.py"])
         self.assertEqual((stage / "cursor-setup.py").read_text(), "GOOD = 1\n")
         self.assertEqual(sorted(p.name for p in stage.glob("*-setup.py")), ["cursor-setup.py"])
+
+    def test_clear_unstages_every_tool_and_keeps_the_task_30_days(self):
+        stage = self.pf / "Unbound WSL"
+        stage.mkdir()
+        for name in ("run.py", "cursor-setup.py", "codex-hooks-setup.py"):
+            (stage / name).write_text("")
+        with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
+                mock.patch.object(onboard, "_powershell", return_value=True) as ps:
+            self.assertTrue(onboard.remove_wsl_logon_task())
+        self.assertEqual([p.name for p in stage.iterdir()], ["run.py"])
+        script, env = ps.call_args.args
+        self.assertEqual(env["UNB_DAYS"], "30")
+        self.assertIn("DeleteExpiredTaskAfter = 'PT0S'", script)
+        self.assertIn("-AtLogOn", script)
+
+    def test_clear_with_nothing_staged_unregisters(self):
+        with mock.patch.object(onboard, "_all_users_pythonw", return_value=Path("pythonw.exe")), \
+                mock.patch.object(onboard, "_powershell", return_value=True) as ps:
+            self.assertTrue(onboard.remove_wsl_logon_task())
+        self.assertIn("Unregister-ScheduledTask", ps.call_args.args[0])
 
     def test_python_users_could_replace_is_refused(self):
         with mock.patch.object(onboard, "_all_users_pythonw", return_value=None), \
