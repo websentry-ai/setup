@@ -440,39 +440,82 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
     return True
 
 
-def _remove_hooks_dir(hooks_dir: Path) -> None:
-    """Remove ~/.cursor/hooks, all but its error.log and the log's forwarded place (WEB-6392): errors the
-    gateway has not taken, or a hook writes while setup runs, go out on a later run, and nothing twice."""
-    import shutil
-    keep = {Path(HOOK_ERROR_LOG[0]).name, FORWARDED_STATE_NAME}
-    for entry in os.scandir(hooks_dir):
-        if entry.name in keep:
+_NO_LINK_DIR = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _clear_dir_at(dir_fd: int, keep=frozenset()) -> None:
+    """Remove everything in the open folder but the names in keep, relative to it and never through a link."""
+    for name in os.listdir(dir_fd):
+        if name in keep:
             continue
-        if entry.is_dir(follow_symlinks=False):
-            shutil.rmtree(entry.path)
+        if stat.S_ISDIR(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode):
+            sub = os.open(name, _NO_LINK_DIR, dir_fd=dir_fd)
+            try:
+                _clear_dir_at(sub)
+            finally:
+                os.close(sub)
+            os.rmdir(name, dir_fd=dir_fd)
         else:
-            os.unlink(entry.path)
-    if not any(os.scandir(hooks_dir)):
-        os.rmdir(hooks_dir)
+            os.unlink(name, dir_fd=dir_fd)
+
+
+def _remove_cursor_hooks(home_dir: Path) -> bool:
+    """Remove ~/.cursor/hooks.json and ~/.cursor/hooks, all but the folder's error.log and the log's
+    forwarded place (WEB-6392): errors the gateway has not taken, or a hook writes while setup runs, go out
+    on a later run, and nothing twice. Root does this in a folder the user owns, so ~/.cursor and its hooks
+    folder are opened without following a link and every removal is made relative to them: a link at either,
+    or one swapped in, can't point root at another folder. True when anything was removed."""
+    keep = {Path(HOOK_ERROR_LOG[0]).name, FORWARDED_STATE_NAME}
+    if os.name == "nt":  # no dir_fd here: SYSTEM checks the path for links and junctions first
+        import shutil
+        _refuse_links_on_the_way(home_dir / ".cursor" / "hooks")
+        removed = False
+        if (home_dir / ".cursor" / "hooks.json").exists():
+            (home_dir / ".cursor" / "hooks.json").unlink()
+            removed = True
+        hooks_dir = home_dir / ".cursor" / "hooks"
+        if hooks_dir.exists():
+            for entry in os.scandir(hooks_dir):
+                if entry.name not in keep:
+                    shutil.rmtree(entry.path) if entry.is_dir(follow_symlinks=False) else os.unlink(entry.path)
+            if not any(os.scandir(hooks_dir)):
+                os.rmdir(hooks_dir)
+            removed = True
+        return removed
+    try:
+        cursor_dir = os.open(str(home_dir / ".cursor"), _NO_LINK_DIR)
+    except FileNotFoundError:
+        return False
+    removed = False
+    try:
+        try:
+            os.unlink("hooks.json", dir_fd=cursor_dir)
+            removed = True
+        except FileNotFoundError:
+            pass
+        try:
+            hooks = os.open("hooks", _NO_LINK_DIR, dir_fd=cursor_dir)
+        except FileNotFoundError:
+            return removed
+        try:
+            _clear_dir_at(hooks, keep)
+            empty = not os.listdir(hooks)
+        finally:
+            os.close(hooks)
+        if empty:
+            os.rmdir("hooks", dir_fd=cursor_dir)
+        return True
+    finally:
+        os.close(cursor_dir)
 
 
 def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
     """Remove user-level Cursor hooks (from normal setup) to prevent duplicate execution."""
-    hooks_json = home_dir / ".cursor" / "hooks.json"
-    hooks_dir = home_dir / ".cursor" / "hooks"
     removed = False
-    if hooks_json.exists():
-        try:
-            hooks_json.unlink()
-            removed = True
-        except Exception as e:
-            debug_print(f"Failed to remove {hooks_json}: {e}")
-    if hooks_dir.exists():
-        try:
-            _remove_hooks_dir(hooks_dir)
-            removed = True
-        except Exception as e:
-            debug_print(f"Failed to remove {hooks_dir}: {e}")
+    try:
+        removed = _remove_cursor_hooks(home_dir)
+    except Exception as e:
+        debug_print(f"Failed to remove the user-level hooks in {home_dir / '.cursor'}: {e}")
     if removed:
         print(f"   Removed user-level hooks for {username} (replaced by enterprise hooks)")
     return removed

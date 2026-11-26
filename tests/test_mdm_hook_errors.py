@@ -491,6 +491,26 @@ def test_cursor_errors_go_out_before_its_cleanup_removes_their_log(setup, gatewa
     assert _forwarded(gateway) == []
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks; Windows is covered in test_windows_paths")
+@pytest.mark.parametrize("linked", [".cursor/hooks", ".cursor"])
+def test_cursor_cleanup_never_follows_a_link_out_of_the_home(setup, gateway, tmp_path, linked):
+    """The cleanup runs as root over a folder the user owns: a link at ~/.cursor/hooks, or at ~/.cursor,
+    must not send it into another folder to delete what is there."""
+    r = setup("cursor")
+    real_cursor_cleanup(r)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "hooks").mkdir(parents=True)
+    for target in (elsewhere, elsewhere / "hooks"):
+        (target / "precious.txt").write_text("root's")
+        (target / "unbound.py").write_text("root's")
+    link = r.home / linked
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(elsewhere / "hooks" if linked == ".cursor/hooks" else elsewhere)
+    assert r() is True
+    for target in (elsewhere, elsewhere / "hooks"):
+        assert sorted(p.name for p in target.iterdir() if p.is_file()) == ["precious.txt", "unbound.py"]
+
+
 @pytest.mark.parametrize("before", [["cursor broke"], []])
 def test_a_cursor_error_written_after_a_full_send_survives_its_cleanup(setup, gateway, before):
     """Everything in the log went out (or there was no log yet), then a hook added an error before the
