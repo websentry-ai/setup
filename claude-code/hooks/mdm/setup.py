@@ -3243,19 +3243,18 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
         if user_homes and not reported:
-            _backfill_report_crash(run, user_homes, previous)
+            _backfill_report_crash(run or _BackfillRun(api_key, backend_url, None, (None, None), time.time()),
+                                   user_homes, previous)
 
 
 def _backfill_report_crash(run, user_homes, previous) -> None:
     """A run that raised before its closing upload sends 'failed' now, with any earlier unsent outcome; what
     can't go is saved for the next run."""
     try:
-        if run is not None:
-            _backfill_send_outcome(run, user_homes, 'failed', previous)
-            return
+        _backfill_send_outcome(run, user_homes, 'failed', previous)
     except Exception as e:
         debug_print(f"backfill failed outcome not sent: {e}")
-    _backfill_save_outcome(user_homes, 'failed')
+        _backfill_save_outcome(user_homes, 'failed')
 
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:

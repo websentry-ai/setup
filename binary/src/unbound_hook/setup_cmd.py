@@ -235,6 +235,24 @@ def _tool_installed(tool, user_homes) -> bool:
         return True
 
 
+def _tool_reporter(opts, m, tool, api_key, **fields):
+    """This tool's report call, kept in opts so run() can still report a setup that raises after it."""
+    report = functools.partial(_report, m, tool, api_key, **fields)
+    opts.setdefault("tool_reporters", {})[tool] = report
+    return report
+
+
+def _report_failed_setup(opts, tool, reason) -> tuple:
+    """A tool's setup raised: send 'deferred' when it got far enough to report, and keep it as the status."""
+    report = opts.get("tool_reporters", {}).get(tool)
+    if report is not None:
+        try:
+            return report("deferred", reason)
+        except Exception as e:
+            print(f"[{tool}] deferred status not reported: {e}")
+    return "deferred", reason
+
+
 def _report(m, tool, api_key, status, reason=None, installed=True, **fields):
     """This tool's setup/complete call for the run; returns the (status, reason) it sent. Configured on a Mac
     without the tool (installed False, from the run's one check) reads skipped: its config is still written,
@@ -1382,9 +1400,9 @@ def _setup_claude_code(opts):
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
     skip_settings = opts["skip_managed_settings"]
-    report = functools.partial(_report, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
-                               installed=opts.get("installed", {}).get("claude-code", True),
-                               install_mode="binary-skip" if skip_settings else "binary")
+    report = _tool_reporter(opts, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("claude-code", True),
+                            install_mode="binary-skip" if skip_settings else "binary")
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
@@ -1443,9 +1461,9 @@ def _setup_augment(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
-    report = functools.partial(_report, m, "augment", api_key, backend_url=base, serial_number=device_id,
-                               installed=opts.get("installed", {}).get("augment", True),
-                               install_mode="binary")
+    report = _tool_reporter(opts, m, "augment", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("augment", True),
+                            install_mode="binary")
 
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
@@ -1483,9 +1501,9 @@ def _setup_codex(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
-    report = functools.partial(_report, m, "codex", api_key, backend_url=base, serial_number=device_id,
-                               installed=opts.get("installed", {}).get("codex", True),
-                               install_mode="binary")
+    report = _tool_reporter(opts, m, "codex", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("codex", True),
+                            install_mode="binary")
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
@@ -1694,9 +1712,9 @@ def _setup_cursor(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
-    report = functools.partial(_report, m, "cursor", api_key, backend_url=base, serial_number=device_id,
-                               installed=opts.get("installed", {}).get("cursor", True),
-                               install_mode="binary")
+    report = _tool_reporter(opts, m, "cursor", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("cursor", True),
+                            install_mode="binary")
 
     config_ok = True
     for username, home_dir in m.get_all_user_homes():
@@ -1782,9 +1800,9 @@ def _setup_copilot(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
-    report = functools.partial(_report, m, "copilot", api_key, backend_url=base, serial_number=device_id,
-                               installed=opts.get("installed", {}).get("copilot", True),
-                               install_mode="binary")
+    report = _tool_reporter(opts, m, "copilot", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("copilot", True),
+                            install_mode="binary")
 
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
@@ -1982,9 +2000,9 @@ def run(argv) -> int:
         try:
             statuses[tool] = adapter(opts)
         except SystemExit as e:
-            statuses[tool] = ("deferred", f"component exited early: {e}")
+            statuses[tool] = _report_failed_setup(opts, tool, f"component exited early: {e}")
         except Exception as e:
-            statuses[tool] = ("deferred", f"error: {e}")
+            statuses[tool] = _report_failed_setup(opts, tool, f"error: {e}")
 
     for username, log, data in kept:
         if data and _as_user(m0, username, _restore_unsent_log, log, data) is not True and not os.path.lexists(log):

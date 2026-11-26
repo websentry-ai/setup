@@ -175,6 +175,16 @@ def _reports(env, tool):
     return [k for a, k in env["notified"] if a[1] == TOOL_TYPES[tool]]
 
 
+def test_a_tool_whose_setup_raises_after_its_key_reports_deferred(env, machine, monkeypatch):
+    """Otherwise the backend keeps the last run's 'configured' for a tool whose setup just failed."""
+    def boom(m):
+        raise RuntimeError("disk full")
+    monkeypatch.setattr(setup_cmd, "_write_cursor_enterprise_hooks", boom)
+    setup_cmd.run(["--api-key", "admin-key"])
+    [cursor] = _reports(env, "cursor")
+    assert (cursor["status"], cursor["reason"]) == ("deferred", "error: disk full")
+
+
 def test_every_installed_tool_reports_configured_and_where_it_wrote(env, machine):
     for relpath in FOOTPRINTS.values():
         _install(machine, relpath)
