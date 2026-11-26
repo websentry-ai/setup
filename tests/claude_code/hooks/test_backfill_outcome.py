@@ -114,6 +114,13 @@ class EveryRunReportsHowItEndedTestCase(_Homes):
         self.assertEqual([b["sessions"] for b in backend.bodies], [[]])
         self.assertEqual([s["outcome"] for s in backend.stats()], ["stopped_by_time_limit"])
 
+    def test_an_mdm_home_whose_history_cannot_be_read_ends_with_failed(self):
+        for name, unreadable in (("collect fails", patch.object(mdm, "_backfill_collect_sessions", return_value=None)),
+                                 ("linked root", patch.object(mdm, "_backfill_root_is_linked", return_value=True))):
+            with self.subTest(name):
+                backend = _run(mdm, self._home(("a",)), _Backend(), [unreadable])
+                self.assertEqual([s["outcome"] for s in backend.stats()], ["failed"])
+
     def test_data_uploads_carry_no_outcome(self):
         for up in (mdm, setup):
             with self.subTest(up.__name__):

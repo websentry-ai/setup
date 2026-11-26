@@ -357,7 +357,8 @@ class MdmRunTestCase(_HomesMixin, unittest.TestCase):
             return result
         bodies = _run(mdm, [alice, bob], [patch("os.lstat", side_effect=lstat),
                                           patch.object(mdm.platform, "system", return_value="Windows")])
-        self.assertEqual(bodies[-1]["uploader_stats"], _closing(counted))
+        # The refused profile's history was never read, so the run reports failed rather than completed.
+        self.assertEqual(bodies[-1]["uploader_stats"], _closing(counted, outcome="failed"))
         self.assertEqual(sorted(s["session_id"] for b in bodies for s in b["sessions"]), ["a"])
         self.assertEqual(list(hooks.iterdir()), [])
         self.assertTrue((alice / ".claude" / "hooks" / mdm.BACKFILL_STATE_FILE).exists())

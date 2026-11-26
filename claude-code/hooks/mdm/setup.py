@@ -2983,7 +2983,8 @@ class _BackfillRun:
         return True
 
     def outcome(self, statuses: set) -> str:
-        if 'failed' in statuses:
+        # A home whose history could not be read was never processed, so the run did not complete.
+        if statuses & {'failed', 'unreadable'}:
             return 'failed'
         if self.stopped_by_time:
             return 'stopped_by_time_limit'
