@@ -338,13 +338,29 @@ def _save_forwarded(log: Path, state: str) -> bool:
     return True
 
 
-def _post_hook_errors(url, api_key, hook_source, hook_sha, batch) -> str:
+_BEARER = re.compile(r"(?i)\bBearer\s+\S+")
+_NAMED_SECRET = re.compile(r"""(?i)\b([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd))("?\s*[:=]\s*"?)([^\s"',;&}]+)""")
+_URL_SECRET = re.compile(r"(?i)([?&](?:key|token|api_key|access_token|sig|signature)=)[^&\s\"]+")
+_VENDOR_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{10,}")
+
+
+def _redact_hook_error(message: str, secrets) -> str:
+    """The home's own keys, then common credential shapes, each value replaced and its name kept."""
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    message = _BEARER.sub("Bearer [REDACTED]", message)
+    message = _NAMED_SECRET.sub(r"\1\2[REDACTED]", message)
+    message = _URL_SECRET.sub(r"\1[REDACTED]", message)
+    return _VENDOR_KEY.sub("[REDACTED]", message)
+
+
+def _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets=()) -> str:
     """The hook's own request shape and auth. 'sent' when the gateway took them; 'down' when it gave no
     answer or a 5xx; 'refused' when it answered no. It refuses only a key (200 with success false, or a
     4xx), never an entry, so a refusal is about this tool's key and not about what the log holds."""
     errors = [{**{k: v for k, v in entry.items() if k != "state"},
-               "message": re.sub(r"(?i)\bBearer\s+\S+", "Bearer [REDACTED]",
-                                 entry["message"].replace(api_key, "[REDACTED]"))}
+               "message": _redact_hook_error(entry["message"], (api_key, *secrets))}
               for entry in batch]
     code, answer = _post_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
                               {"Authorization": f"Bearer {api_key}"})
@@ -376,15 +392,18 @@ def _forward_home_errors(m, username, log, send):
 
 
 def _home_device_key(home: Path):
-    """Runs as the profile's user: the device key in ~/.unbound/config.json, the one its hooks report
-    errors with, or None before setup first wrote it."""
+    """Runs as the profile's user: (the key its hooks report errors with, every key in ~/.unbound/config.json
+    to redact), or None before setup first wrote it."""
     try:
         config = json.loads(_read_user_file(home / ".unbound" / "config.json", follow=False).decode("utf-8"))
     except (OSError, ValueError):
         return None
     # The hooks' own order (cfg.get('api_key') or cfg.get('device_token')): their errors are this key's.
-    key = (config.get("api_key") or config.get("device_token")) if isinstance(config, dict) else None
-    return key if isinstance(key, str) and key else None
+    if not isinstance(config, dict):
+        return None
+    key = config.get("api_key") or config.get("device_token")
+    secrets = tuple(v for v in (config.get("api_key"), config.get("device_token")) if isinstance(v, str) and v)
+    return (key, secrets) if isinstance(key, str) and key else None
 
 
 def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
@@ -406,11 +425,12 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
                 continue
             if str(home_dir) not in keys:
                 keys[str(home_dir)] = _as_user(m, username, _home_device_key, home_dir)
-            api_key = keys[str(home_dir)]
-            if not api_key:
+            found = keys[str(home_dir)]
+            if not found:
                 continue  # no hook here has a key to report with yet
+            api_key, secrets = found
             send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
-                                     api_key, hook_source, hook_sha)
+                                     api_key, hook_source, hook_sha, secrets=secrets)
             count, verdict = _forward_home_errors(m, username, log, send)
             sent += count
             if verdict == "refused":

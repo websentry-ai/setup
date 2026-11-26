@@ -763,6 +763,25 @@ def test_forwarding_uses_and_redacts_the_key_the_hooks_read_first(env, backend):
     assert _messages(backend) == ["request with [REDACTED] failed"]
 
 
+def test_the_homes_other_token_and_common_credential_shapes_are_redacted(env, backend):
+    vendor_key = "sk-" + "fake-" + "0" * 16  # built at runtime so secret scanners skip this fixture
+    (env["home"] / ".unbound").mkdir(exist_ok=True)
+    (env["home"] / ".unbound" / "config.json").write_text(
+        json.dumps({"device_token": "token-key-2", "api_key": "api-key-1"}))
+    _log(env["home"], "codex", [
+        f"{_utc(0)}: old token token-key-2 was refused",
+        f"{_utc(1)}: header X-API-KEY: hdr-secret-9 and ANTHROPIC_API_KEY=env-secret-8 set",
+        f"{_utc(2)}: vendor key {vendor_key} leaked",
+        f"{_utc(3)}: GET https://api.example.com/v1?key=url-secret-7&page=2 failed",
+        f'{_utc(4)}: config {{"password": "pw-secret-6", "token":"tok-secret-5"}}'], key=None)
+    _run(backend)
+    body = json.dumps(_forwarded(backend)[0]["body"])
+    for secret in ("token-key-2", "hdr-secret-9", "env-secret-8", vendor_key,
+                   "url-secret-7", "pw-secret-6", "tok-secret-5"):
+        assert secret not in body, secret
+    assert _messages(backend)[3] == "GET https://api.example.com/v1?key=[REDACTED]&page=2 failed"
+
+
 # --- Final review #6: each home's key is read once a run -------------------------
 
 def test_each_homes_key_is_read_once_however_many_tools_log_there(env, backend, monkeypatch):
