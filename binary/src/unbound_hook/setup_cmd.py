@@ -289,6 +289,8 @@ _HOOK_ERROR_LOGS = {
 # Beside each error.log: "<timestamp> <n>", the newest entry the gateway accepted and how many entries
 # stamped exactly then were sent (two can share a stamp, and a request can end between them).
 FORWARDED_STATE_NAME = ".error_log_forwarded"
+# Tools whose error.log lives in a folder the migration sweep and the tool step remove (~/.cursor/hooks).
+_SWEPT_HOOK_LOG_TOOLS = ("cursor",)
 HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
 # error.log is the user's to write: per tool and home, a run sends at most the newest 25 (what a hook keeps)
 # and nothing older than a week, so a flooded or first-seen log costs at most three requests.
@@ -326,7 +328,7 @@ def _unsent_hook_errors(log: Path) -> list:
     floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
     last, sent_then = _forwarded_place(log)
     entries, seen_then, current = [], 0, None
-    for line in _read_user_file(log, follow=False).decode("utf-8", "replace").splitlines():
+    for line in _read_user_file_tail(log, _USER_FILE_MAX_BYTES).decode("utf-8", "replace").splitlines():
         match = _HOOK_ERROR_LINE.match(line)
         if not match:  # a message's own later lines (a traceback); they go with the entry they follow
             if current is not None:
@@ -412,24 +414,31 @@ def _forward_home_errors(m, username, log, send):
     return len(entries), "sent", True
 
 
-def _read_unsent_log(log: Path) -> dict:
-    """Runs as the profile's user: the log and its forwarded place, by name, to put back after the sweep."""
-    kept = {}
+def _set_aside_name(path: Path) -> Path:
+    return path.parent.parent / f".unbound-unsent-{path.parent.name}-{path.name}"
+
+
+def _set_aside_unsent_log(log: Path) -> list:
+    """Runs as the profile's user: move the log and its forwarded place out of the folder the sweep removes,
+    by rename so any size moves. Returns the names moved."""
+    moved = []
     for path in (log, log.with_name(FORWARDED_STATE_NAME)):
         try:
-            kept[path.name] = _read_user_file(path, follow=False)
+            if os.path.lexists(path):
+                os.rename(path, _set_aside_name(path))
+                moved.append(path.name)
         except OSError:
             continue
-    return kept
+    return moved
 
 
-def _restore_unsent_log(log: Path, kept: dict) -> bool:
-    """Runs as the profile's user: put a log the sweep removed back, with its place, for the next run."""
-    if os.path.lexists(log):
-        return False
+def _restore_unsent_log(log: Path, names: list) -> bool:
+    """Runs as the profile's user: move a set-aside log and its place back for the next run."""
     log.parent.mkdir(mode=0o700, exist_ok=True)
-    for name, data in kept.items():
-        _replace_user_file(log.with_name(name), data, 0o600)
+    for name in names:
+        path = log.with_name(name)
+        if not os.path.lexists(path):
+            os.rename(_set_aside_name(path), path)
     return True
 
 
@@ -455,7 +464,8 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
     only that home. Either way nothing is marked sent, and the next run retries. user_homes and keys (home
     to its key, filled as homes are read) come from run(), so each home is found and read once a run."""
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
-    unsent = opts.setdefault("unsent_hook_logs", [])
+    # Only a log in a folder the migration sweep removes needs keeping; the others stay where they are.
+    unsent = opts.setdefault("unsent_hook_logs", []) if tool in _SWEPT_HOOK_LOG_TOOLS else []
     sent = 0
     try:
         hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
@@ -1062,6 +1072,22 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
     if len(data) > _USER_FILE_MAX_BYTES:
         raise OSError(f"{path} is larger than {_USER_FILE_MAX_BYTES} bytes")
     return data
+
+
+def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
+    """A user-owned regular file's last max_bytes, from a whole line on: a long log is read from its end."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        if st.st_size <= max_bytes:
+            return f.read(max_bytes)
+        f.seek(st.st_size - max_bytes)
+        data = f.read(max_bytes)
+    return data.split(b"\n", 1)[1] if b"\n" in data else b""
 
 
 class _JsonObject(dict):
@@ -1988,7 +2014,7 @@ def run(argv) -> int:
 
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
     # The sweep and Cursor's step remove ~/.cursor/hooks: a log the gateway has not taken is put back after.
-    kept = [(u, log, _as_user(m0, u, _read_unsent_log, log)) for u, log in opts.get("unsent_hook_logs", [])]
+    kept = [(u, log, _as_user(m0, u, _set_aside_unsent_log, log)) for u, log in opts.get("unsent_hook_logs", [])]
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:

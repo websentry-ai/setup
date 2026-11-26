@@ -735,6 +735,23 @@ def test_cursor_errors_the_gateway_did_not_take_survive_the_sweep_for_the_next_r
     assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
 
 
+def test_an_oversized_cursor_log_is_kept_and_its_newest_errors_still_go_out(env, backend):
+    """Bigger than the 4 MiB read cap: kept across the sweep by moving it, and forwarded from its tail."""
+    old = [f"{_pacific(-800000)}: ancient {'x' * 200}"] * 25000  # over 5 MiB, all past the 7-day limit
+    log = _log(env["home"], "cursor", old + [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    size = log.stat().st_size
+    assert size > setup_cmd._USER_FILE_MAX_BYTES
+    ok = backend.answer
+    backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
+    _run(backend)
+    assert log.exists() and log.stat().st_size == size
+    backend.answer = ok
+    backend.requests.clear()
+    _run(backend)
+    sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
+    assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
+
+
 def test_errors_go_out_with_the_key_the_hooks_use(env, backend):
     """Forwarding runs before any tool fetches its key, so it uses the one the home's hooks report with."""
     (env["home"] / ".unbound").mkdir(exist_ok=True)
