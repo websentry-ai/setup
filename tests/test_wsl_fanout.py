@@ -43,10 +43,10 @@ class TestSetupWsl(unittest.TestCase):
             with self.subTest(path):
                 mod = load_module(path)
                 calls, lines = self._run(mod, ["--api-key", "k", "--config-dir", "C:\\x", "--backfill"])
-                self.assertEqual([c[:6] for c, _ in calls],
-                                 [[str(mod.Path("C:\\Windows") / "System32" / "wsl.exe"), "-d", d, "--exec", "python3", "-"]
+                self.assertEqual([c[:7] for c, _ in calls],
+                                 [[str(mod.Path("C:\\Windows") / "System32" / "wsl.exe"), "-d", d, "--exec", "python3", "-I", "-"]
                                   for d in ("Ubuntu", "Debian")])
-                self.assertEqual(calls[0][0][6:], ["--backfill"])
+                self.assertEqual(calls[0][0][7:], ["--backfill"])
                 self.assertEqual(calls[0][1]["input"],
                                  b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
@@ -56,8 +56,8 @@ class TestSetupWsl(unittest.TestCase):
             with self.subTest(path):
                 mod = load_module(path)
                 calls, lines = self._run(mod, ["--api-key", "k", "--config-dir", "/home/u/.claude", "--backfill"],
-                                         system="Linux", release="5.15.167.4-microsoft-standard-WSL2", codes={"-X": 3})
-                self.assertEqual([c for c, _ in calls], [["/mnt/c/Windows/py.exe", "-3", "-X", "utf8", "-", "--backfill"]])
+                                         system="Linux", release="5.15.167.4-microsoft-standard-WSL2", codes={"-I": 3})
+                self.assertEqual([c for c, _ in calls], [["/mnt/c/Windows/py.exe", "-3", "-I", "-X", "utf8", "-", "--backfill"]])
                 self.assertEqual(calls[0][1]["input"],
                                  b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["Windows: managed by MDM"])
@@ -82,6 +82,19 @@ class TestSetupWsl(unittest.TestCase):
             mod.setup_wsl(["--api-key", "k"])
         self.assertEqual(searched, [os.pathsep.join([launcher, "/mnt/c/WINDOWS"])])
         run.assert_not_called()
+
+    def test_wsl_finds_drives_under_a_custom_mount_root(self):
+        mod = load_module("cursor/setup.py")
+        searched = []
+        with mock.patch.dict(mod.os.environ, {"PATH": os.pathsep.join(["/c/Launcher", "/usr/bin", "/mnt/c/x"])}), \
+                mock.patch.object(mod.platform, "system", return_value="Linux"), \
+                mock.patch.object(mod.platform, "release", return_value="5.15.167.4-microsoft-standard-WSL2"), \
+                mock.patch.object(mod.subprocess, "check_output", return_value=b"/c/\n"), \
+                mock.patch.object(mod.os.path, "isfile", lambda p: p == mod.__file__), \
+                mock.patch.object(mod.shutil, "which", lambda name, path=None: searched.append(path)), \
+                mock.patch("builtins.print"):
+            mod.setup_wsl(["--api-key", "k"])
+        self.assertEqual(searched, ["/c/Launcher"])
 
     def test_wsl_prefers_the_all_users_launcher(self):
         mod = load_module("cursor/setup.py")
@@ -136,7 +149,7 @@ class TestSetupWsl(unittest.TestCase):
 
     def test_clear_reaches_wsl_too(self):
         calls, _ = self._run(load_module("cursor/setup.py"), ["--clear"])
-        self.assertEqual(calls[0][0][6:], ["--clear"])
+        self.assertEqual(calls[0][0][7:], ["--clear"])
         self.assertEqual(calls[0][1]["input"], open(load_module("cursor/setup.py").__file__, "rb").read())
 
     def test_key_reaches_wsl_on_stdin_not_argv(self):
@@ -150,7 +163,7 @@ class TestSetupWsl(unittest.TestCase):
     def test_equals_form_api_key_reaches_wsl_on_stdin(self):
         mod = load_module("claude-code/gateway/setup.py")
         calls, _ = self._run(mod, ["--api-key=k", "--gateway-url", "https://g"], distros=("Ubuntu",))
-        self.assertEqual(calls[0][0][6:], ["--gateway-url", "https://g"])
+        self.assertEqual(calls[0][0][7:], ["--gateway-url", "https://g"])
         self.assertTrue(calls[0][1]["input"].startswith(b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n"))
 
     def test_off_windows_or_without_a_key_does_nothing(self):

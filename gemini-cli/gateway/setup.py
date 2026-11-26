@@ -574,19 +574,26 @@ def setup_wsl(argv) -> None:
         return
     if in_wsl:
         # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
+        # -I on both sides: a script read from stdin would otherwise import modules from the caller's cwd.
         # The all-users launcher, else PATH folders that resolve onto a Windows drive, so /mnt/c/../home can't reach Linux ones.
         # A Windows-drive folder the user put on PATH (direnv, a venv) already runs code as them, so it is trusted like PATH.
-        dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.startswith("/mnt/")]
-        win_path = os.pathsep.join(p for p in dirs if p.startswith("/mnt/") and len(p.split("/")[2]) == 1)
-        py = next((p for p in ("/mnt/c/Windows/py.exe",) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)
+        # Drives mount under /mnt unless wsl.conf moves them; wslpath reports where C: actually landed.
+        try:
+            c = subprocess.check_output(["/usr/bin/wslpath", "-u", "C:\\"], timeout=10).decode().strip().rstrip("/")
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            c = ""
+        mnt = os.path.dirname(c or "/mnt/c")
+        dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.startswith("/")]
+        win_path = os.pathsep.join(p for p in dirs if len(os.path.relpath(p, mnt).split("/")[0]) == 1 and p != mnt)
+        py = next((p for p in (os.path.join(mnt, "c", "Windows", "py.exe"),) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)
         if not py:
             print("Windows: skipped, py.exe not found")
-        targets = [("Windows", [py, "-3", "-X", "utf8", "-", *args])] if py else []
+        targets = [("Windows", [py, "-3", "-I", "-X", "utf8", "-", *args])] if py else []
     else:
         # Absolute path: a bare name lets CreateProcess pick up a wsl.exe from the current directory.
         root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
         wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
-        targets = [(f"WSL {d}", [str(wsl), "-d", d, "--exec", "python3", "-", *args]) for d in (_wsl_distros() if wsl else [])]
+        targets = [(f"WSL {d}", [str(wsl), "-d", d, "--exec", "python3", "-I", "-", *args]) for d in (_wsl_distros() if wsl else [])]
     for name, cmd in targets:
         try:
             r = subprocess.run(cmd, input=source,
