@@ -301,10 +301,6 @@ class FailOpenTests(ShellTestCase):
         self.assert_shell('windsurf', 'Bash', {})
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class DeviceOsTests(unittest.TestCase):
     """Every hook names the device's OS the way the gateway reads it, and never raises."""
 
@@ -324,3 +320,7 @@ class DeviceOsTests(unittest.TestCase):
         for hook in HOOKS:
             with patch.object(hook.platform, 'system', side_effect=OSError('no uname')):
                 self.assertIsNone(hook.device_os(), hook.__name__)
+
+
+if __name__ == '__main__':
+    unittest.main()
