@@ -168,15 +168,21 @@ def run(script, args):
 staged = Path(__file__).parent
 # clear\ holds onboard's own copy of every installer it staged, so a tool unstaged since is cleared from there.
 # The per-user list only skips clears that already succeeded; a failed one runs again at the next logon.
+# Entries carry the enrollment, so a clear after a re-onboard runs even if this user cleared the last one.
+try:
+    gen = (staged / "generation").read_text(encoding="utf-8").strip()
+except OSError:
+    gen = ""
 done = local / "wsl_cleared.txt"
 try:
     cleared = set(done.read_text(encoding="utf-8").split())
 except OSError:
     cleared = set()
-cleared -= {p.name for p in staged.glob("*-setup.py")}
+cleared = {c for c in cleared if not (staged / c.rsplit("@", 1)[0]).is_file()}
 for script in sorted((staged / "clear").glob("*-setup.py")):
-    if not (staged / script.name).is_file() and script.name not in cleared and run(script, ["--clear"]):
-        cleared.add(script.name)
+    tag = f"{script.name}@{gen}"
+    if not (staged / script.name).is_file() and tag not in cleared and run(script, ["--clear"]):
+        cleared.add(tag)
 done.write_text("\n".join(sorted(cleared)), encoding="utf-8")
 try:
     cfg = json.loads((Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8"))
@@ -792,6 +798,8 @@ def install_wsl_logon_task(mdm_urls: list) -> bool:
     try:
         target.mkdir(parents=True, exist_ok=True)
         (target / "run.py").write_text(WSL_RUNNER, encoding="utf-8")
+        # A new enrollment, so each user's record of an earlier clear no longer counts.
+        (target / "generation").write_text(os.urandom(8).hex(), encoding="utf-8")
     except OSError as e:
         print(f"   Could not stage the WSL installers: {e}", file=sys.stderr)
         return False

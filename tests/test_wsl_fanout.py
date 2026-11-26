@@ -152,6 +152,27 @@ class TestSetupWsl(unittest.TestCase):
                     self._run(mod, argv, **wsl)
                 self.assertEqual(e.exception.code, 3)
 
+    def test_in_wsl_the_staged_check_follows_windows_program_files(self):
+        mod = load_module("cursor/setup.py")
+        staged = "/mnt/d/Apps/Unbound WSL/cursor-setup.py"
+        outputs = iter([b"/mnt/c/\n", b"D:\\Apps\r\n"])
+        with mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)), \
+                mock.patch.object(mod.platform, "system", return_value="Linux"), \
+                mock.patch.object(mod.platform, "release", return_value="5.15.167.4-microsoft-standard-WSL2"), \
+                mock.patch.object(mod.subprocess, "check_output", lambda *a, **k: next(outputs)), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit) as e:
+                mod.setup_wsl(["--api-key", "k"])
+        self.assertEqual(e.exception.code, 3)
+
+    def test_in_wsl_a_domain_only_run_of_an_mdm_staged_tool_is_refused(self):
+        mod = load_module("cursor/setup.py")
+        staged = "/mnt/c/Program Files/Unbound WSL/cursor-setup.py"
+        with mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)):
+            with self.assertRaises(SystemExit) as e:
+                self._run(mod, ["--domain", "https://x"], system="Linux", release="5.15.167.4-microsoft-standard-WSL2")
+        self.assertEqual(e.exception.code, 3)
+
     def test_the_mdm_task_running_its_staged_file_still_fans_out(self):
         pf = tempfile.mkdtemp()
         staged = Path(pf) / "Unbound WSL" / "cursor-setup.py"

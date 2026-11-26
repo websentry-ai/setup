@@ -70,6 +70,14 @@ class TestRunner(unittest.TestCase):
         calls, _ = self._run(None)
         self.assertEqual(calls, [["cursor_setup", ["--clear"]]] * 2)
 
+    def test_a_clear_after_a_re_onboard_runs_again(self):
+        self._clear_copy("cursor-setup.py")
+        (self.stage / "generation").write_text("g1")
+        self._run(None)
+        (self.stage / "generation").write_text("g2")
+        calls, _ = self._run(None)
+        self.assertEqual(calls, [["cursor_setup", ["--clear"]]] * 2)
+
     def test_a_tool_staged_again_is_cleared_again_once_unstaged(self):
         self._clear_copy("cursor-setup.py")
         self._run(None)
@@ -110,7 +118,7 @@ class TestInstall(unittest.TestCase):
                          [u.replace("/mdm/setup.py", "/setup.py") for u in urls])
         stage = self.pf / "Unbound WSL"
         self.assertEqual(sorted(p.name for p in stage.iterdir()),
-                         ["claude-code-hooks-setup.py", "clear", "cursor-setup.py", "run.py"])
+                         ["claude-code-hooks-setup.py", "clear", "cursor-setup.py", "generation", "run.py"])
         self.assertEqual(sorted(p.name for p in (stage / "clear").iterdir()),
                          ["claude-code-hooks-setup.py", "cursor-setup.py"])
         script, env = ps.call_args.args

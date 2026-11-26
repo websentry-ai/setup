@@ -911,8 +911,7 @@ def setup_wsl(argv) -> bool:
     key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
         argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None)
     in_wsl = platform.system() == "Linux" and "microsoft" in platform.release().lower()
-    # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
-    if not (platform.system() == "Windows" or in_wsl) or not (key or "--clear" in argv):
+    if not (platform.system() == "Windows" or in_wsl):
         return True
     # --config-dir is a path on this side only; the key goes in on stdin so ps on the other side can't read it.
     drop = ("--config-dir", "--api-key")
@@ -931,8 +930,16 @@ def setup_wsl(argv) -> bool:
     # The task itself runs the staged file, so that one still fans out. ProgramW6432 first: a 32-bit Python's
     # ProgramFiles is the (x86) folder, and onboard always stages under the 64-bit one.
     pf = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles", r"C:\Program Files")
-    staged = (os.path.join(mnt, "c", "Program Files", "Unbound WSL", MDM_WSL_NAME) if in_wsl else
-              os.path.join(pf, "Unbound WSL", MDM_WSL_NAME))
+    if in_wsl:
+        # Windows' own ProgramW6432, since Program Files can sit on another drive or path.
+        try:
+            pf = subprocess.check_output([os.path.join(mnt, "c", "Windows", "System32", "cmd.exe"), "/d", "/c",
+                                          "echo %ProgramW6432%"], cwd=os.path.join(mnt, "c"), timeout=10).decode().strip()
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            pass
+        pf = pf if len(pf) > 3 and pf[1:3] == ":\\" else r"C:\Program Files"
+        pf = os.path.join(mnt, pf[0].lower(), *pf[3:].split("\\"))
+    staged = os.path.join(pf, "Unbound WSL", MDM_WSL_NAME)
     here = globals().get("__file__", "<stdin>")
     same = os.path.normcase(os.path.realpath(here)) == os.path.normcase(os.path.realpath(staged))
     # Best effort, like any user-level check: the user owns these files, and the next logon restores MDM's setup.
@@ -941,6 +948,9 @@ def setup_wsl(argv) -> bool:
             print("Skipped: MDM manages this tool on Windows and in WSL")
             raise SystemExit(3)
         print("WSL: managed by MDM")
+        return True
+    # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
+    if not (key or "--clear" in argv):
         return True
     # A run fed on stdin has no file to forward, even with a file named <stdin> in cwd.
     if here == "<stdin>":
