@@ -71,11 +71,12 @@ class TestSetupWsl(unittest.TestCase):
         mod = load_module("cursor/setup.py")
         launcher = "/mnt/c/Users/u/AppData/Local/Programs/Python/Launcher"
         searched = []
-        path = os.pathsep.join(["/home/u/proj/.venv/bin", "/usr/bin", "/mnt/wsl/x", launcher, "/mnt/c/WINDOWS"])
+        path = os.pathsep.join(["/home/u/proj/.venv/bin", "/usr/bin", "/mnt/wsl/x", "/mnt/c/../../home/u/bin",
+                                launcher, "/mnt/c/WINDOWS"])
         with mock.patch.dict(mod.os.environ, {"PATH": path}), \
                 mock.patch.object(mod.platform, "system", return_value="Linux"), \
                 mock.patch.object(mod.platform, "release", return_value="5.15.167.4-microsoft-standard-WSL2"), \
-                mock.patch.object(mod.os.path, "isfile", return_value=False), \
+                mock.patch.object(mod.os.path, "isfile", lambda p: p == mod.__file__), \
                 mock.patch.object(mod.shutil, "which", lambda name, path=None: searched.append(path)), \
                 mock.patch.object(mod.subprocess, "run") as run, mock.patch("builtins.print"):
             mod.setup_wsl(["--api-key", "k"])
@@ -84,7 +85,7 @@ class TestSetupWsl(unittest.TestCase):
 
     def test_wsl_prefers_the_all_users_launcher(self):
         mod = load_module("cursor/setup.py")
-        with mock.patch.object(mod.os.path, "isfile", lambda p: p == "/mnt/c/Windows/py.exe"):
+        with mock.patch.object(mod.os.path, "isfile", lambda p: p in ("/mnt/c/Windows/py.exe", mod.__file__)):
             calls, _ = self._run(mod, ["--api-key", "k"], system="Linux",
                                  release="5.15.167.4-microsoft-standard-WSL2", py="/home/u/.venv/bin/py.exe")
         self.assertEqual(calls[0][0][0], "/mnt/c/Windows/py.exe")
@@ -104,6 +105,16 @@ class TestSetupWsl(unittest.TestCase):
                 mod = load_module("codex/hooks/setup.py")
                 with mock.patch.object(mod, "__file__", "<stdin>"):
                     self.assertEqual(self._run(mod, ["--api-key", "k"], system=system, release=release), ([], []))
+
+    def test_a_piped_script_is_not_forwarded_empty(self):
+        # python3 <(curl ...) leaves __file__ as a used-up pipe; forwarding it would run nothing and report done.
+        r, w = os.pipe()
+        os.close(w)
+        self.addCleanup(os.close, r)
+        mod = load_module("cursor/setup.py")
+        with mock.patch.object(mod, "__file__", f"/dev/fd/{r}"):
+            calls, lines = self._run(mod, ["--clear"], system="Linux", release="5.15.167.4-microsoft-standard-WSL2")
+        self.assertEqual((calls, lines), ([], ["Windows: skipped, run the installer from a saved file to set this side up too"]))
 
     def test_main_runs_the_wsl_step_first(self):
         for path in INSTALLERS:

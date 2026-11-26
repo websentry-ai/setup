@@ -2214,6 +2214,10 @@ def setup_wsl(argv) -> None:
     # A run fed on stdin came from the other side and never fans back out, even with a file named <stdin> in cwd.
     if globals().get("__file__", "<stdin>") == "<stdin>":
         return
+    # A pipe or <(curl ...) is read to its end before this runs, so there is no script left to forward.
+    if not os.path.isfile(__file__):
+        print(f"{'Windows' if in_wsl else 'WSL'}: skipped, run the installer from a saved file to set this side up too")
+        return
     try:
         source = Path(__file__).read_bytes()
         if key:
@@ -2222,9 +2226,10 @@ def setup_wsl(argv) -> None:
         return
     if in_wsl:
         # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
-        # The all-users launcher, else Windows drive folders on PATH: a py.exe a venv or .envrc puts on the Linux PATH never gets the key.
-        win_path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
-                                   if p.startswith("/mnt/") and len(p.split("/")[2]) == 1)
+        # The all-users launcher, else PATH folders that resolve onto a Windows drive, so /mnt/c/../home can't reach Linux ones.
+        # A Windows-drive folder the user put on PATH (direnv, a venv) already runs code as them, so it is trusted like PATH.
+        dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.startswith("/mnt/")]
+        win_path = os.pathsep.join(p for p in dirs if p.startswith("/mnt/") and len(p.split("/")[2]) == 1)
         py = next((p for p in ("/mnt/c/Windows/py.exe",) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)
         if not py:
             print("Windows: skipped, py.exe not found")
