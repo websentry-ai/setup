@@ -921,7 +921,10 @@ def setup_wsl(argv) -> None:
         return
     if in_wsl:
         # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
-        py = shutil.which("py.exe")
+        # The all-users launcher, else Windows drive folders on PATH: a py.exe a venv or .envrc puts on the Linux PATH never gets the key.
+        win_path = os.pathsep.join(p for p in os.environ.get("PATH", "").split(os.pathsep)
+                                   if p.startswith("/mnt/") and len(p.split("/")[2]) == 1)
+        py = next((p for p in ("/mnt/c/Windows/py.exe",) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)
         if not py:
             print("Windows: skipped, py.exe not found")
         targets = [("Windows", [py, "-3", "-X", "utf8", "-", *args])] if py else []

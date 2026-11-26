@@ -1,4 +1,5 @@
 """Every user-level installer, run on Windows, also runs itself inside the user's WSL distros."""
+import os
 import subprocess
 import sys
 import unittest
@@ -26,7 +27,7 @@ class TestSetupWsl(unittest.TestCase):
 
         with mock.patch.object(mod.platform, "system", return_value=system), \
                 mock.patch.object(mod.platform, "release", return_value=release), \
-                mock.patch.object(mod.shutil, "which", lambda name: py if name == "py.exe" else None), \
+                mock.patch.object(mod.shutil, "which", lambda name, path=None: py if name == "py.exe" else None), \
                 mock.patch.dict(mod.os.environ, {"SystemRoot": "C:\\Windows"}), \
                 mock.patch.object(mod.Path, "is_file", lambda p: p.name == "wsl.exe" and p.parent.name == "System32"), \
                 mock.patch.object(mod, "_wsl_distros", return_value=list(distros)), \
@@ -63,6 +64,28 @@ class TestSetupWsl(unittest.TestCase):
         calls, lines = self._run(load_module("cursor/setup.py"), ["--api-key", "k"], system="Linux",
                                  release="4.4.0-19041-Microsoft", py=None)
         self.assertEqual((calls, lines), ([], ["Windows: skipped, py.exe not found"]))
+
+    def test_wsl_finds_py_exe_only_on_windows_drives(self):
+        mod = load_module("cursor/setup.py")
+        launcher = "/mnt/c/Users/u/AppData/Local/Programs/Python/Launcher"
+        searched = []
+        path = os.pathsep.join(["/home/u/proj/.venv/bin", "/usr/bin", "/mnt/wsl/x", launcher, "/mnt/c/WINDOWS"])
+        with mock.patch.dict(mod.os.environ, {"PATH": path}), \
+                mock.patch.object(mod.platform, "system", return_value="Linux"), \
+                mock.patch.object(mod.platform, "release", return_value="5.15.167.4-microsoft-standard-WSL2"), \
+                mock.patch.object(mod.os.path, "isfile", return_value=False), \
+                mock.patch.object(mod.shutil, "which", lambda name, path=None: searched.append(path)), \
+                mock.patch.object(mod.subprocess, "run") as run, mock.patch("builtins.print"):
+            mod.setup_wsl(["--api-key", "k"])
+        self.assertEqual(searched, [os.pathsep.join([launcher, "/mnt/c/WINDOWS"])])
+        run.assert_not_called()
+
+    def test_wsl_prefers_the_all_users_launcher(self):
+        mod = load_module("cursor/setup.py")
+        with mock.patch.object(mod.os.path, "isfile", lambda p: p == "/mnt/c/Windows/py.exe"):
+            calls, _ = self._run(mod, ["--api-key", "k"], system="Linux",
+                                 release="5.15.167.4-microsoft-standard-WSL2", py="/home/u/.venv/bin/py.exe")
+        self.assertEqual(calls[0][0][0], "/mnt/c/Windows/py.exe")
 
     def test_plain_linux_does_nothing(self):
         mod = load_module("cursor/setup.py")
