@@ -36,7 +36,7 @@ class TestSetupWsl(unittest.TestCase):
                 mock.patch.object(mod.subprocess, "check_output", return_value=b"/mnt/c/\n"), \
                 mock.patch.object(mod.subprocess, "run", side_effect=fake_run), \
                 mock.patch("builtins.print") as printed:
-            mod.setup_wsl(argv)
+            self.ret = mod.setup_wsl(argv)
         return calls, [c.args[0] for c in printed.call_args_list]
 
     def test_each_installer_reruns_itself_in_every_distro(self):
@@ -48,8 +48,8 @@ class TestSetupWsl(unittest.TestCase):
                                  [[str(mod.Path("C:\\Windows") / "System32" / "wsl.exe"), "-d", d, "--exec", "python3", "-I", "-"]
                                   for d in ("Ubuntu", "Debian")])
                 self.assertEqual(calls[0][0][7:], ["--backfill"])
-                self.assertEqual(calls[0][1]["input"],
-                                 b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
+                self.assertEqual(calls[0][1]["input"], b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n"
+                                 + b"_UNBOUND_FORWARDED = True\n" + open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
 
     def test_each_installer_in_wsl_reruns_itself_on_windows(self):
@@ -59,8 +59,8 @@ class TestSetupWsl(unittest.TestCase):
                 calls, lines = self._run(mod, ["--api-key", "k", "--config-dir", "/home/u/.claude", "--backfill"],
                                          system="Linux", release="5.15.167.4-microsoft-standard-WSL2", codes={"-I": 3})
                 self.assertEqual([c for c, _ in calls], [["/mnt/c/Windows/py.exe", "-3", "-I", "-X", "utf8", "-", "--backfill"]])
-                self.assertEqual(calls[0][1]["input"],
-                                 b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n" + open(mod.__file__, "rb").read())
+                self.assertEqual(calls[0][1]["input"], b"import sys; sys.argv[1:1] = ['--api-key', 'k']\n"
+                                 + b"_UNBOUND_FORWARDED = True\n" + open(mod.__file__, "rb").read())
                 self.assertEqual(lines, ["Windows: managed by MDM"])
 
     def test_wsl_without_windows_python_says_so(self):
@@ -131,6 +131,72 @@ class TestSetupWsl(unittest.TestCase):
             calls, lines = self._run(mod, ["--clear"], system="Linux", release="5.15.167.4-microsoft-standard-WSL2")
         self.assertEqual((calls, lines), ([], ["Windows: skipped, run the installer from a saved file to set this side up too"]))
 
+    def test_a_tool_mdm_stages_for_wsl_is_left_to_mdm(self):
+        pf = tempfile.mkdtemp()
+        (Path(pf) / "Unbound WSL").mkdir()
+        (Path(pf) / "Unbound WSL" / "cursor-setup.py").write_text("")
+        for argv in (["--api-key", "k"], ["--clear"]):
+            with self.subTest(argv), mock.patch.dict(os.environ, {"ProgramFiles": pf, "ProgramW6432": pf}):
+                self.assertEqual(self._run(load_module("cursor/setup.py"), argv), ([], ["WSL: managed by MDM"]))
+        # A different tool is not MDM's, so it still fans out.
+        with mock.patch.dict(os.environ, {"ProgramFiles": pf, "ProgramW6432": pf}):
+            self.assertEqual(len(self._run(load_module("codex/hooks/setup.py"), ["--api-key", "k"])[0]), 2)
+
+    def test_in_wsl_an_mdm_staged_tool_skips_both_sides(self):
+        mod = load_module("cursor/setup.py")
+        staged = "/mnt/c/Program Files/Unbound WSL/cursor-setup.py"
+        wsl = dict(system="Linux", release="5.15.167.4-microsoft-standard-WSL2")
+        for argv in (["--api-key", "k"], ["--clear"]):
+            with self.subTest(argv), mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)):
+                with self.assertRaises(SystemExit) as e:
+                    self._run(mod, argv, **wsl)
+                self.assertEqual(e.exception.code, 3)
+
+    def test_in_wsl_the_staged_check_follows_windows_program_files(self):
+        mod = load_module("cursor/setup.py")
+        staged = "/mnt/d/Apps/Unbound WSL/cursor-setup.py"
+        outputs = iter([b"/mnt/c/\n", b"D:\\Apps\r\n"])
+        with mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)), \
+                mock.patch.object(mod.platform, "system", return_value="Linux"), \
+                mock.patch.object(mod.platform, "release", return_value="5.15.167.4-microsoft-standard-WSL2"), \
+                mock.patch.object(mod.subprocess, "check_output", lambda *a, **k: next(outputs)), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit) as e:
+                mod.setup_wsl(["--api-key", "k"])
+        self.assertEqual(e.exception.code, 3)
+
+    def test_in_wsl_a_domain_only_run_of_an_mdm_staged_tool_is_refused(self):
+        mod = load_module("cursor/setup.py")
+        staged = "/mnt/c/Program Files/Unbound WSL/cursor-setup.py"
+        with mock.patch.object(mod.os.path, "isfile", lambda p: p in (staged, mod.__file__)):
+            with self.assertRaises(SystemExit) as e:
+                self._run(mod, ["--domain", "https://x"], system="Linux", release="5.15.167.4-microsoft-standard-WSL2")
+        self.assertEqual(e.exception.code, 3)
+
+    def test_the_mdm_task_running_its_staged_file_still_fans_out(self):
+        pf = tempfile.mkdtemp()
+        staged = Path(pf) / "Unbound WSL" / "cursor-setup.py"
+        staged.parent.mkdir()
+        mod = load_module("cursor/setup.py")
+        staged.write_bytes(open(mod.__file__, "rb").read())
+        with mock.patch.dict(os.environ, {"ProgramFiles": pf, "ProgramW6432": pf}), mock.patch.object(mod, "__file__", str(staged)):
+            _, lines = self._run(mod, ["--api-key", "k"])
+        self.assertEqual(lines, ["WSL Ubuntu: done", "WSL Debian: done"])
+
+    def test_a_forwarded_run_never_fans_back_out_even_where_mdm_staged(self):
+        mod = load_module("cursor/setup.py")
+        with mock.patch.object(mod, "_UNBOUND_FORWARDED", True, create=True), \
+                mock.patch.object(mod.os.path, "isfile", lambda p: True):
+            self.assertEqual(self._run(mod, ["--api-key", "k"], system="Linux",
+                                       release="5.15.167.4-microsoft-standard-WSL2"), ([], []))
+
+    def test_reports_whether_every_distro_finished(self):
+        mod = load_module("cursor/setup.py")
+        self._run(mod, ["--clear"], codes={"Debian": 1})
+        self.assertTrue(self.ret)
+        self._run(mod, ["--clear"], codes={"Debian": 2})
+        self.assertFalse(self.ret)
+
     def test_main_runs_the_wsl_step_first(self):
         for path in INSTALLERS:
             with self.subTest(path):
@@ -152,7 +218,8 @@ class TestSetupWsl(unittest.TestCase):
     def test_clear_reaches_wsl_too(self):
         calls, _ = self._run(load_module("cursor/setup.py"), ["--clear"])
         self.assertEqual(calls[0][0][7:], ["--clear"])
-        self.assertEqual(calls[0][1]["input"], open(load_module("cursor/setup.py").__file__, "rb").read())
+        self.assertEqual(calls[0][1]["input"],
+                         b"_UNBOUND_FORWARDED = True\n" + open(load_module("cursor/setup.py").__file__, "rb").read())
 
     def test_key_reaches_wsl_on_stdin_not_argv(self):
         mod = load_module("codex/hooks/setup.py")

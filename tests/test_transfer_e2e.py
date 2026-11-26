@@ -495,6 +495,35 @@ def test_the_real_hook_names_the_shell_on_the_policy_check_and_the_turn_log(tool
         assert shell_of(body['pre_tool_use_data']) == expected, json.dumps(body['pre_tool_use_data'], indent=2)
 
 
+@pytest.mark.parametrize('tool', sorted(RUNS))
+def test_the_real_hook_names_this_machines_os_on_the_policy_check(tool, sandbox, gateway):
+    expected = {'darwin': 'macos', 'linux': 'linux', 'win32': 'windows'}[sys.platform]
+    RUNS[tool](sandbox, shell_env(sandbox, gateway))
+
+    checks = [r['body'] for r in gateway.requests if 'pretool' in r['path'] and isinstance(r['body'], dict)
+              and (r['body'].get('pre_tool_use_data') or {}).get('command') == COMMAND]
+    assert checks, 'no policy check for the command: %s' % sorted({r['path'] for r in gateway.requests})
+    for body in checks:
+        assert body['pre_tool_use_data'].get('os') == expected, json.dumps(body['pre_tool_use_data'], indent=2)
+
+
+def test_cursor_names_this_machines_os_on_a_native_file_check(sandbox, gateway):
+    expected = {'darwin': 'macos', 'linux': 'linux', 'win32': 'windows'}[sys.platform]
+    project = str(sandbox['project'])
+    event = {'conversation_id': str(uuid.uuid4()), 'generation_id': str(uuid.uuid4()),
+             'model': 'claude-4.5-sonnet', 'cursor_version': '2.0.77', 'workspace_roots': [project],
+             'user_email': 'dev@example.com', 'transcript_path': None, 'hook_event_name': 'preToolUse',
+             'tool_name': 'Write', 'tool_input': {'file_path': '/ETC/sudoers', 'content': 'x'},
+             'tool_use_id': 'call_write'}
+    fire('cursor', event, shell_env(sandbox, gateway), project)
+
+    checks = [r['body'] for r in gateway.requests if 'pretool' in r['path'] and isinstance(r['body'], dict)
+              and (r['body'].get('pre_tool_use_data') or {}).get('tool_name') == 'Write']
+    assert checks, 'no policy check for the Write: %s' % sorted({r['path'] for r in gateway.requests})
+    for body in checks:
+        assert body['pre_tool_use_data'].get('os') == expected, json.dumps(body['pre_tool_use_data'], indent=2)
+
+
 def _vscode_user_settings(home):
     if sys.platform == 'darwin':
         return home / 'Library' / 'Application Support' / 'Code' / 'User' / 'settings.json'

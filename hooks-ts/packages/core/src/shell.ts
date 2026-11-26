@@ -97,3 +97,14 @@ export function detectShell(toolName: unknown): ShellInfo {
 export function resetShellCache(): void {
   shellCache.clear();
 }
+
+const DEVICE_OSES: Record<string, "macos" | "linux" | "windows"> = {
+  darwin: "macos",
+  linux: "linux",
+  win32: "windows",
+};
+
+/** `'macos'`, `'linux'` or `'windows'` for this machine, or undefined for any other platform. */
+export function deviceOs(platform: string = process.platform): "macos" | "linux" | "windows" | undefined {
+  return Object.hasOwn(DEVICE_OSES, platform) ? DEVICE_OSES[platform] : undefined;
+}
