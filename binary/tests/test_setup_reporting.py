@@ -773,8 +773,8 @@ def test_a_cursor_error_written_after_a_full_send_survives_the_sweep(env, backen
             for e in r["body"]["errors"]] == ["cursor broke after the send"]
 
 
-def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(env, backend, monkeypatch):
-    """Cursor can run a hook while setup runs: its new error.log and the set-aside one are both kept."""
+def test_cursor_errors_unsent_survive_an_error_a_hook_writes_during_setup(env, backend, monkeypatch):
+    """Cursor can run a hook while setup runs: what it adds and what the gateway had not taken both go out."""
     _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
     ok = backend.answer
     backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
@@ -784,7 +784,8 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(en
         status = real(opts)
         log = env["home"] / ".cursor/hooks/error.log"
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text(f"{_pacific(2)}: cursor broke during setup\n")
+        with open(log, "a") as f:  # a hook appends to its log
+            f.write(f"{_pacific(2)}: cursor broke during setup\n")
         return status
 
     monkeypatch.setitem(setup_cmd._ADAPTERS, "cursor", cursor_runs_a_hook_meanwhile)
@@ -796,46 +797,6 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(en
     sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
     assert [e["message"] for r in sent for e in r["body"]["errors"]] == [
         "cursor broke", "cursor broke again", "cursor broke during setup"]
-
-
-@pytest.mark.parametrize("moved", ["nothing", "only its place"])
-def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_the_cleanup(env, backend, monkeypatch, moved):
-    """The user may not be able to write ~/.cursor (a sudo'd Cursor run leaves it root's), so the move aside
-    fails, for the log or for the log alone; the cleanup, which removes ~/.cursor/hooks as root, then keeps
-    that log and removes the rest."""
-    log = _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke"])
-    (log.parent / "unbound.py").write_text("# python-era hook")
-    (log.parent / STATE).write_text("2000-01-01T00:00:00 1")
-
-    def set_aside(log):
-        if moved == "nothing":
-            return []
-        os.rename(log.with_name(STATE), setup_cmd._set_aside_name(log.with_name(STATE)))
-        return [STATE]
-
-    monkeypatch.setattr(setup_cmd, "_set_aside_unsent_log", set_aside)
-    ok = backend.answer
-    backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
-    _run(backend)
-    assert "error.log" in [p.name for p in log.parent.iterdir()]
-    assert not (log.parent / "unbound.py").exists()
-    backend.answer = ok
-    backend.requests.clear()
-    _run(backend)
-    assert [e["message"] for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"
-            for e in r["body"]["errors"]] == ["cursor broke"]
-
-
-def test_a_cursor_log_an_earlier_run_could_not_put_back_is_forwarded(env, backend):
-    """A restore that failed leaves the log at its set-aside name; the next run puts it back and sends it."""
-    aside = env["home"] / ".cursor" / ".unbound-unsent-hooks-error.log"
-    _log(env["home"], "cursor", [f"{_pacific(2)}: cursor broke later"])
-    aside.write_text(f"{_pacific(0)}: cursor broke\n{_pacific(1)}: cursor broke again\n")
-    _run(backend)
-    sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
-    assert [e["message"] for r in sent for e in r["body"]["errors"]] == [
-        "cursor broke", "cursor broke again", "cursor broke later"]
-    assert not aside.exists()
 
 
 def test_an_oversized_cursor_log_is_kept_and_its_newest_errors_still_go_out(env, backend):

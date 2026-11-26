@@ -496,15 +496,15 @@ def test_cursor_errors_the_gateway_did_not_take_survive_its_cleanup_for_the_next
     assert r() is True
     assert log.exists()
     assert not (log.parent / "unbound.py").exists()  # the rest of the cleanup still ran
-    assert [p.name for p in (r.home / ".cursor").iterdir()] == ["hooks"]  # nothing left set aside
+    assert [p.name for p in (r.home / ".cursor").iterdir()] == ["hooks"]  # nothing left beside it
     gateway.answer = lambda request: (200, OK)
     gateway.requests.clear()
     r()
     assert _messages(gateway) == ["cursor broke", "cursor broke again"]
 
 
-def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_its_cleanup(setup, gateway):
-    """Cursor can run a hook while setup runs: its new error.log and the set-aside one are both kept."""
+def test_cursor_errors_unsent_survive_an_error_a_hook_writes_during_its_cleanup(setup, gateway):
+    """Cursor can run a hook while setup runs: what it adds and what the gateway had not taken both go out."""
     r = setup("cursor")
     _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
 
@@ -512,7 +512,8 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_its_clea
         REAL_CURSOR_CLEANUP(username, home_dir)
         log = home_dir / ERROR_LOGS["cursor"]
         log.parent.mkdir(parents=True, exist_ok=True)
-        log.write_text(f"{_pacific(2)}: cursor broke during setup\n")
+        with open(log, "a") as f:  # a hook appends to its log
+            f.write(f"{_pacific(2)}: cursor broke during setup\n")
 
     r.mp.setattr(r.m, "remove_user_level_hooks", cleanup_then_a_hook_writes)
     gateway.answer = lambda request: (503, {})
@@ -522,45 +523,6 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_its_clea
     gateway.requests.clear()
     r()
     assert _messages(gateway) == ["cursor broke", "cursor broke again", "cursor broke during setup"]
-
-
-@pytest.mark.parametrize("moved", ["nothing", "only its place"])
-def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_its_cleanup(setup, gateway, moved):
-    """The user may not be able to write ~/.cursor, so the move aside fails, for the log or for the log
-    alone; the cleanup, which removes ~/.cursor/hooks as root, then keeps that log and removes the rest."""
-    r = setup("cursor")
-    real_cursor_cleanup(r)
-    log = _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke"])
-    (log.parent / "unbound.py").write_text("# python-era hook")
-    (log.parent / STATE).write_text("2000-01-01T00:00:00 1")
-
-    def set_aside(log):
-        if moved == "nothing":
-            return []
-        os.rename(log.with_name(STATE), r.m._set_aside_name(log.with_name(STATE)))
-        return [STATE]
-
-    r.mp.setattr(r.m, "_set_aside_unsent_log", set_aside)
-    gateway.answer = lambda request: (503, {})
-    assert r() is True
-    assert "error.log" in [p.name for p in log.parent.iterdir()]
-    assert not (log.parent / "unbound.py").exists()
-    assert r.m.KEEP_UNSENT_HOOK_LOGS == set()
-    gateway.answer = lambda request: (200, OK)
-    gateway.requests.clear()
-    r()
-    assert _messages(gateway) == ["cursor broke"]
-
-
-def test_a_cursor_log_an_earlier_run_could_not_put_back_is_forwarded(setup, gateway):
-    """A restore that failed leaves the log at its set-aside name; the next run puts it back and sends it."""
-    r = setup("cursor")
-    _log(r.home, "cursor", [f"{_pacific(2)}: cursor broke later"])
-    aside = r.home / ".cursor" / ".unbound-unsent-hooks-error.log"
-    aside.write_text(f"{_pacific(0)}: cursor broke\n{_pacific(1)}: cursor broke again\n")
-    assert r() is True
-    assert _messages(gateway) == ["cursor broke", "cursor broke again", "cursor broke later"]
-    assert not aside.exists()
 
 
 def test_a_partly_sent_cursor_log_keeps_its_place_across_the_cleanup(setup, gateway):
@@ -602,7 +564,7 @@ def test_a_cursor_log_in_a_home_without_a_key_survives_its_cleanup(setup, gatewa
 
 # --- The five copies stay equal, and equal to the binary ---------------------------
 
-SHARED_FUNCTIONS = ("_log_time", "_refuse_if_redirected", "_read_user_file", "_read_user_file_tail", "_replace_user_file", "_forwarded_place",
+SHARED_FUNCTIONS = ("_log_time", "_refuse_links_on_the_way", "_refuse_if_redirected", "_read_user_file", "_read_user_file_tail", "_replace_user_file", "_forwarded_place",
                     "_unsent_hook_errors", "_save_forwarded", "_redact_hook_error", "_post_hook_json",
                     "_post_hook_errors", "_writable_dir", "_home_device_key", "_forward_home_errors",
                     "forward_hook_errors")

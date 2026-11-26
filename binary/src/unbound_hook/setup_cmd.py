@@ -289,8 +289,6 @@ _HOOK_ERROR_LOGS = {
 # Beside each error.log: "<timestamp> <n>", the newest entry the gateway accepted and how many entries
 # stamped exactly then were sent (two can share a stamp, and a request can end between them).
 FORWARDED_STATE_NAME = ".error_log_forwarded"
-# Tools whose error.log lives in a folder the migration sweep and the tool step remove (~/.cursor/hooks).
-_SWEPT_HOOK_LOG_TOOLS = ("cursor",)
 HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
 # error.log is the user's to write: per tool and home, a run sends at most the newest 25 (what a hook keeps)
 # and nothing older than a week, so a flooded or first-seen log costs at most three requests.
@@ -414,60 +412,6 @@ def _forward_home_errors(m, username, log, send):
     return len(entries), "sent", True
 
 
-def _set_aside_name(path: Path) -> Path:
-    return path.parent.parent / f".unbound-unsent-{path.parent.name}-{path.name}"
-
-
-def _set_aside_unsent_log(log: Path) -> list:
-    """Runs as the profile's user: move the log and its forwarded place out of the folder the sweep removes,
-    by rename so any size moves. Returns the names moved."""
-    moved = []
-    for path in (log, log.with_name(FORWARDED_STATE_NAME)):
-        try:
-            if os.path.lexists(path):
-                os.rename(path, _set_aside_name(path))
-                moved.append(path.name)
-        except OSError:
-            continue
-    return moved
-
-
-def _append_user_file(path: Path, data: bytes) -> None:
-    """Runs as the profile's user: add data to the end of a regular file, on a line of its own."""
-    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
-    try:
-        size = os.fstat(fd).st_size
-        if size:
-            os.lseek(fd, size - 1, os.SEEK_SET)
-            if os.read(fd, 1) != b"\n":
-                data = b"\n" + data
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view):]
-    finally:
-        os.close(fd)
-
-
-def _restore_unsent_log(log: Path, names: list) -> bool:
-    """Runs as the profile's user: move a set-aside log and its place back for the next run. A hook can
-    write a new log while the old one is aside: its entries go after the set-aside ones, so both are kept."""
-    log.parent.mkdir(mode=0o700, exist_ok=True)
-    for name in names:
-        path = log.with_name(name)
-        if os.path.lexists(path):
-            if name != log.name:
-                continue  # setup writes the forwarded place, never a hook
-            _append_user_file(_set_aside_name(path), _read_user_file(path, follow=False))
-        os.replace(_set_aside_name(path), path)
-    return True
-
-
-def _recover_set_aside_log(log: Path) -> bool:
-    """Runs as the profile's user: put back a log an earlier run set aside and could not restore."""
-    return _restore_unsent_log(log, [p.name for p in (log, log.with_name(FORWARDED_STATE_NAME))
-                                     if os.path.lexists(_set_aside_name(p))])
-
-
 def _home_device_key(home: Path):
     """Runs as the profile's user: (the key its hooks report errors with, every key in ~/.unbound/config.json
     to redact), or None before setup first wrote it."""
@@ -485,7 +429,7 @@ def _home_device_key(home: Path):
 
 def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
     """Forward every home's unsent error.log entries for this tool, with that home's own device key. Runs
-    before the migration sweep, which removes ~/.cursor/hooks and its log. A gateway that is down ends
+    before the migration sweep and the tool steps. A gateway that is down ends
     forwarding for the whole run, so it costs one short timeout; a refused key is that home's own and skips
     only that home. Either way nothing is marked sent, and the next run retries. user_homes and keys (home
     to its key, filled as homes are read) come from run(), so each home is found and read once a run."""
@@ -496,8 +440,6 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
         keys = {} if keys is None else keys
         for username, home_dir in user_homes if user_homes is not None else m.get_all_user_homes():
             log = home_dir / relpath if home_dir is not None else None
-            if log is not None and tool in _SWEPT_HOOK_LOG_TOOLS and os.path.lexists(_set_aside_name(log)):
-                _as_user(m, username, _recover_set_aside_log, log)  # an earlier run could not put it back
             if log is None or not os.path.lexists(log):
                 continue
             if opts.get("hook_errors_held"):
@@ -2039,16 +1981,8 @@ def run(argv) -> int:
     statuses = {}
 
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
-    # The sweep and Cursor's step remove ~/.cursor/hooks: a log the gateway has not taken is put back after.
-    # Every such log is kept across them, sent or not, and listed now: a hook can add an error after
-    # forwarding read the log (or start one), and the saved place keeps what went out from going again.
-    swept = [(u, h / _HOOK_ERROR_LOGS[t][0]) for t in opts["tools"] if t in _SWEPT_HOOK_LOG_TOOLS
-             for u, h in user_homes or [] if h is not None and os.path.lexists(h / _HOOK_ERROR_LOGS[t][0])]
-    kept = [(u, log, _as_user(m0, u, _set_aside_unsent_log, log)) for u, log in swept]
-    # One the user can't move (they may not be able to write ~/.cursor) stays where it is: Cursor's
-    # cleanup, which removes ~/.cursor/hooks as root, keeps it.
-    cursor_hooks = load_mdm_setup_module("cursor").KEEP_UNSENT_HOOK_LOGS if kept else set()
-    cursor_hooks.update(log for _, log, data in kept if log.name not in (data or ()) and os.path.lexists(log))
+    # Cursor's step clears ~/.cursor/hooks but keeps error.log and its forwarded place, so what the gateway
+    # has not taken, or a hook writes during the run, goes out on a later run and nothing goes twice.
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:
@@ -2063,11 +1997,6 @@ def run(argv) -> int:
             statuses[tool] = _report_failed_setup(opts, tool, f"component exited early: {e}")
         except Exception as e:
             statuses[tool] = _report_failed_setup(opts, tool, f"error: {e}")
-
-    cursor_hooks.clear()
-    for username, log, data in kept:
-        if data and _as_user(m0, username, _restore_unsent_log, log, data) is not True and not os.path.lexists(log):
-            print(f"[errors] {log}: unsent hook errors could not be kept for the next run")
 
     print(f"\n{'=' * 60}\n[discovery] coding-tool scan\n{'=' * 60}")
     try:

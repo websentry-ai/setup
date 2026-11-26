@@ -3451,6 +3451,21 @@ def _log_time(text):
     return when if when.tzinfo else None
 
 
+def _refuse_links_on_the_way(path: Path) -> None:
+    """Windows: SYSTEM opens a user's path itself, so a link or junction anywhere on it is refused before the
+    open, and _refuse_if_redirected checks the opened file after it. A part not made yet is skipped."""
+    if os.name != "nt":
+        return
+    path = Path(os.path.abspath(str(path)))
+    for part in (path, *path.parents):
+        try:
+            st = os.lstat(part)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:  # a reparse point
+            raise OSError(f"{part} is a link or junction")
+
+
 def _refuse_if_redirected(fd: int, path: Path) -> None:
     """Windows has no O_NOFOLLOW, and SYSTEM opens a user's files itself: the file opened must be the one at
     the path asked for, with no link or junction anywhere on the way. Closes fd and raises OSError if not."""
@@ -3481,6 +3496,7 @@ def _refuse_if_redirected(fd: int, path: Path) -> None:
 
 def _read_user_file(path: Path) -> bytes:
     """A user's regular file, whole and within _USER_FILE_MAX_BYTES. Raises OSError for anything else."""
+    _refuse_links_on_the_way(path)
     fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
     _refuse_if_redirected(fd, path)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -3495,6 +3511,7 @@ def _read_user_file(path: Path) -> bytes:
 
 def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
     """A user's regular file's last max_bytes, from a whole line on: a long log is read from its end."""
+    _refuse_links_on_the_way(path)
     fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
     _refuse_if_redirected(fd, path)
     st = os.fstat(fd)
@@ -3513,6 +3530,7 @@ def _replace_user_file(path: Path, data: bytes) -> None:
     """Write data (0600) beside path and rename it over: a link or FIFO there is replaced, not written
     through, and a failed write leaves the old file in place."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    _refuse_links_on_the_way(tmp)
     if os.path.lexists(tmp):
         tmp.unlink()
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _USER_FILE_FLAGS, 0o600)

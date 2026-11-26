@@ -440,18 +440,11 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
     return True
 
 
-# Unsent hook error logs this run could not move out of ~/.cursor/hooks before removing it (WEB-6392).
-KEEP_UNSENT_HOOK_LOGS = set()
-
-
 def _remove_hooks_dir(hooks_dir: Path) -> None:
-    """Remove ~/.cursor/hooks, all but an unsent error.log and its forwarded place when one is kept here."""
+    """Remove ~/.cursor/hooks, all but its error.log and the log's forwarded place (WEB-6392): errors the
+    gateway has not taken, or a hook writes while setup runs, go out on a later run, and nothing twice."""
     import shutil
-    keep = {log.name for log in KEEP_UNSENT_HOOK_LOGS if log.parent == hooks_dir}
-    if not keep:
-        shutil.rmtree(hooks_dir)
-        return
-    keep.add(FORWARDED_STATE_NAME)
+    keep = {Path(HOOK_ERROR_LOG[0]).name, FORWARDED_STATE_NAME}
     for entry in os.scandir(hooks_dir):
         if entry.name in keep:
             continue
@@ -459,6 +452,8 @@ def _remove_hooks_dir(hooks_dir: Path) -> None:
             shutil.rmtree(entry.path)
         else:
             os.unlink(entry.path)
+    if not any(os.scandir(hooks_dir)):
+        os.rmdir(hooks_dir)
 
 
 def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
@@ -1385,6 +1380,21 @@ def _log_time(text):
     return when if when.tzinfo else None
 
 
+def _refuse_links_on_the_way(path: Path) -> None:
+    """Windows: SYSTEM opens a user's path itself, so a link or junction anywhere on it is refused before the
+    open, and _refuse_if_redirected checks the opened file after it. A part not made yet is skipped."""
+    if os.name != "nt":
+        return
+    path = Path(os.path.abspath(str(path)))
+    for part in (path, *path.parents):
+        try:
+            st = os.lstat(part)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:  # a reparse point
+            raise OSError(f"{part} is a link or junction")
+
+
 def _refuse_if_redirected(fd: int, path: Path) -> None:
     """Windows has no O_NOFOLLOW, and SYSTEM opens a user's files itself: the file opened must be the one at
     the path asked for, with no link or junction anywhere on the way. Closes fd and raises OSError if not."""
@@ -1415,6 +1425,7 @@ def _refuse_if_redirected(fd: int, path: Path) -> None:
 
 def _read_user_file(path: Path) -> bytes:
     """A user's regular file, whole and within _USER_FILE_MAX_BYTES. Raises OSError for anything else."""
+    _refuse_links_on_the_way(path)
     fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
     _refuse_if_redirected(fd, path)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -1429,6 +1440,7 @@ def _read_user_file(path: Path) -> bytes:
 
 def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
     """A user's regular file's last max_bytes, from a whole line on: a long log is read from its end."""
+    _refuse_links_on_the_way(path)
     fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
     _refuse_if_redirected(fd, path)
     st = os.fstat(fd)
@@ -1447,6 +1459,7 @@ def _replace_user_file(path: Path, data: bytes) -> None:
     """Write data (0600) beside path and rename it over: a link or FIFO there is replaced, not written
     through, and a failed write leaves the old file in place."""
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    _refuse_links_on_the_way(tmp)
     if os.path.lexists(tmp):
         tmp.unlink()
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _USER_FILE_FLAGS, 0o600)
@@ -1644,103 +1657,6 @@ def forward_hook_errors(user_homes, gateway_url, hook_path) -> list:
     return unsent
 
 
-# Cursor only: remove_user_level_hooks removes ~/.cursor/hooks, and the error.log in it. A log the gateway
-# has not taken all of is moved out of that folder by rename (so any size moves) and put back after.
-def _set_aside_name(path: Path) -> Path:
-    return path.parent.parent / f".unbound-unsent-{path.parent.name}-{path.name}"
-
-
-def _set_aside_unsent_log(log: Path) -> list:
-    """Runs as the home's user: move the log and its forwarded place out of ~/.cursor/hooks. Returns the
-    names moved."""
-    moved = []
-    for path in (log, log.with_name(FORWARDED_STATE_NAME)):
-        try:
-            if os.path.lexists(path):
-                os.replace(path, _set_aside_name(path))
-                moved.append(path.name)
-        except OSError:
-            continue
-    return moved
-
-
-def _append_user_file(path: Path, data: bytes) -> None:
-    """Runs as the home's user: add data to the end of a regular file, on a line of its own."""
-    fd = os.open(str(path), os.O_RDWR | os.O_APPEND | _USER_FILE_FLAGS)
-    _refuse_if_redirected(fd, path)
-    try:
-        size = os.fstat(fd).st_size
-        if size:
-            os.lseek(fd, size - 1, os.SEEK_SET)
-            if os.read(fd, 1) != b"\n":
-                data = b"\n" + data
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view):]
-    finally:
-        os.close(fd)
-
-
-def _restore_unsent_log(log: Path, names: list) -> bool:
-    """Runs as the home's user: move a set-aside log and its place back for the next run. A hook can write
-    a new log while the old one is aside: its entries go after the set-aside ones, so both are kept."""
-    log.parent.mkdir(mode=0o700, exist_ok=True)
-    for name in names:
-        path = log.with_name(name)
-        if os.path.lexists(path):
-            if name != log.name:
-                continue  # setup writes the forwarded place, never a hook
-            _append_user_file(_set_aside_name(path), _read_user_file(path))
-        os.replace(_set_aside_name(path), path)
-    return True
-
-
-def _recover_set_aside_log(log: Path) -> bool:
-    """Runs as the home's user: put back a log an earlier run set aside and could not restore."""
-    return _restore_unsent_log(log, [p.name for p in (log, log.with_name(FORWARDED_STATE_NAME))
-                                     if os.path.lexists(_set_aside_name(p))])
-
-
-def recover_set_aside_hook_logs(user_homes) -> None:
-    """Before forwarding: a log an earlier run set aside and could not put back goes back, so it is sent.
-    Never raises."""
-    for username, home_dir in user_homes:
-        try:
-            log = Path(home_dir) / HOOK_ERROR_LOG[0]
-            if os.path.lexists(_set_aside_name(log)):
-                _run_as_user(username, _recover_set_aside_log, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
-        except Exception as e:
-            print(f"[errors] set-aside hook errors in {home_dir} not put back: {e}")
-
-
-def keep_unsent_hook_logs(unsent) -> list:
-    """Set aside each (username, log) not fully sent: [(username, log, names moved)]. A log that can't be
-    moved (the user may not be able to write ~/.cursor) is kept in place by the cleanup. Never raises."""
-    kept = []
-    for username, log in unsent:
-        try:
-            names = _run_as_user(username, _set_aside_unsent_log, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
-        except Exception as e:
-            print(f"[errors] {log}: unsent hook errors not set aside: {e}")
-            names = None
-        if log.name not in (names or ()) and os.path.lexists(log):
-            KEEP_UNSENT_HOOK_LOGS.add(log)
-        kept.append((username, log, names))
-    return kept
-
-
-def restore_unsent_hook_logs(kept) -> None:
-    """Put back what keep_unsent_hook_logs set aside. Never raises."""
-    KEEP_UNSENT_HOOK_LOGS.clear()
-    for username, log, names in kept:
-        try:
-            if (names and _run_as_user(username, _restore_unsent_log, log, names, _timeout=HOOK_ERROR_USER_TIMEOUT)
-                    is not True and not os.path.lexists(log)):
-                print(f"[errors] {log}: unsent hook errors could not be kept for the next run")
-        except Exception as e:
-            print(f"[errors] {log}: unsent hook errors could not be kept for the next run: {e}")
-
-
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
                           hook_hash: Optional[str] = None, install_mode: Optional[str] = None,
                           status: Optional[str] = None, reason: Optional[str] = None,
@@ -1857,11 +1773,8 @@ def main():
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return False
 
-    # Before this run changes anything, with the key each home's hooks already report with. The log is kept
-    # across remove_user_level_hooks below, which removes ~/.cursor/hooks.
-    homes = get_all_user_homes()
-    recover_set_aside_hook_logs(homes)
-    forward_hook_errors(homes, gateway_url, get_enterprise_hooks_dir() / "hooks" / "unbound.py")
+    # Before this run changes anything, with the key each home's hooks already report with.
+    forward_hook_errors(get_all_user_homes(), gateway_url, get_enterprise_hooks_dir() / "hooks" / "unbound.py")
 
     # Get device identifier
     print("\n🔍 Getting device serial number...")
@@ -1899,19 +1812,12 @@ def main():
     print("\n📝 Writing config for all users...")
     user_homes = get_all_user_homes()
     config_count = 0
-    # Every log is kept across remove_user_level_hooks, sent or not, and listed now: a hook can add an error
-    # after forwarding read the log (or start one), and the saved place keeps what went out from going again.
-    kept_logs = keep_unsent_hook_logs([(username, Path(home_dir) / HOOK_ERROR_LOG[0]) for username, home_dir in homes
-                                       if home_dir is not None and os.path.lexists(Path(home_dir) / HOOK_ERROR_LOG[0])])
-    try:
-        for username, home_dir in user_homes:
-            if write_unbound_config_for_user(username, home_dir, cursor_api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}):
-                config_count += 1
-                remove_user_level_hooks(username, home_dir)
-            else:
-                print(f"⚠️  Skipping hook removal for {username}: config write failed")
-    finally:
-        restore_unsent_hook_logs(kept_logs)
+    for username, home_dir in user_homes:
+        if write_unbound_config_for_user(username, home_dir, cursor_api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}):
+            config_count += 1
+            remove_user_level_hooks(username, home_dir)
+        else:
+            print(f"⚠️  Skipping hook removal for {username}: config write failed")
     if config_count > 0:
         print(f"✅ Config written for {config_count} user(s)")
     remove_legacy_key_env()
