@@ -1319,7 +1319,11 @@ _USER_CHECK_TIMEOUT = 30
 
 
 def _as_user(m, username, fn, *args):
-    """The module's _run_as_user, bounded: an answer of None (unknown) after the timeout."""
+    """The module's _run_as_user, bounded: an answer of None (unknown) after the timeout. The claude-code,
+    cursor and augment copies take no timeout (one passed would reach fn and fail every call), so those
+    checks run through codex's copy, the same privilege drop with the bound."""
+    if not hasattr(m, "_RUN_AS_USER_TIMEOUT"):  # set only where _run_as_user takes _timeout
+        m = load_mdm_setup_module("codex")
     return m._run_as_user(username, fn, *args, _timeout=_USER_CHECK_TIMEOUT)
 
 

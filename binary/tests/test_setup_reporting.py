@@ -523,6 +523,17 @@ def _as_user_like_the_real_one(env, monkeypatch):
         monkeypatch.setattr(m, "_run_as_user", run_as)
 
 
+@pytest.mark.parametrize("tool", ["claude-code", "cursor", "codex", "copilot", "augment"])
+def test_a_check_run_as_the_user_answers_through_each_tools_own_runner(tool, monkeypatch):
+    """setup_cmd hands every tool's module to _as_user, claude-code's included (the error forwarding and
+    Cursor's log keeping use it). Each module's real _run_as_user must take the bounded call and answer."""
+    from unbound_hook._loader import load_mdm_setup_module
+    m = load_mdm_setup_module(tool)
+    # The Windows branch runs fn in this process, so the real runner answers without root.
+    monkeypatch.setattr(m.platform, "system", lambda: "Windows")
+    assert setup_cmd._as_user(m, "alice", lambda a, b: a + b, 2, 3) == 5
+
+
 def test_an_error_log_that_is_a_link_is_never_read_through(env, backend, monkeypatch, tmp_path):
     _as_user_like_the_real_one(env, monkeypatch)
     other = tmp_path / "other-home"
