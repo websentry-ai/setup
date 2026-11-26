@@ -177,7 +177,7 @@ def get_mac_serial_number() -> str:
     """
     try:
         result = subprocess.run(
-            ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
             capture_output=True,
             text=True,
             timeout=10
