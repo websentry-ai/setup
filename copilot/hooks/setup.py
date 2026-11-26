@@ -1650,27 +1650,54 @@ def _wsl_distros():
 
 
 def setup_wsl(argv) -> None:
-    """Windows: run this same setup in each of the user's WSL distros, which keep their own Linux home."""
+    """Windows and its WSL distros are one machine: run this same setup on the other side too."""
     key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
         argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None)
+    in_wsl = platform.system() == "Linux" and "microsoft" in platform.release().lower()
     # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
-    if platform.system() != "Windows" or not (key or "--clear" in argv):
+    if not (platform.system() == "Windows" or in_wsl) or not (key or "--clear" in argv):
         return
-    # --config-dir is a Windows path; the key goes in on stdin so ps inside WSL can't read it.
+    # --config-dir is a path on this side only; the key goes in on stdin so ps on the other side can't read it.
     drop = ("--config-dir", "--api-key")
     args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
-    # Absolute path: a bare name lets CreateProcess pick up a wsl.exe from the current directory.
-    root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
-    wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
+    # A run fed on stdin came from the other side and never fans back out, even with a file named <stdin> in cwd.
+    if globals().get("__file__", "<stdin>") == "<stdin>":
+        return
+    # A pipe or <(curl ...) is read to its end before this runs, so there is no script left to forward.
+    if not os.path.isfile(__file__):
+        print(f"{'Windows' if in_wsl else 'WSL'}: skipped, run the installer from a saved file to set this side up too")
+        return
     try:
         source = Path(__file__).read_bytes()
         if key:
             source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
-    except (NameError, OSError):
+    except OSError:
         return
-    for distro in _wsl_distros() if wsl else []:
+    if in_wsl:
+        # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
+        # -I on both sides: a script read from stdin would otherwise import modules from the caller's cwd.
+        # The all-users launcher, else PATH folders that resolve onto a Windows drive, so /mnt/c/../home can't reach Linux ones.
+        # A Windows-drive folder the user put on PATH (direnv, a venv) already runs code as them, so it is trusted like PATH.
+        # Drives mount under /mnt unless wsl.conf moves them; wslpath reports where C: actually landed.
         try:
-            r = subprocess.run([str(wsl), "-d", distro, "--exec", "python3", "-", *args], input=source,
+            c = subprocess.check_output(["/usr/bin/wslpath", "-u", "C:\\"], timeout=10).decode().strip().rstrip("/")
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            c = ""
+        mnt = os.path.dirname(c or "/mnt/c")
+        dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.startswith("/")]
+        win_path = os.pathsep.join(p for p in dirs if len(os.path.relpath(p, mnt).split("/")[0]) == 1 and p != mnt)
+        py = next((p for p in (os.path.join(mnt, "c", "Windows", "py.exe"),) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)
+        if not py:
+            print("Windows: skipped, py.exe not found")
+        targets = [("Windows", [py, "-3", "-I", "-X", "utf8", "-", *args])] if py else []
+    else:
+        # Absolute path: a bare name lets CreateProcess pick up a wsl.exe from the current directory.
+        root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
+        targets = [(f"WSL {d}", [str(wsl), "-d", d, "--exec", "python3", "-I", "-", *args]) for d in (_wsl_distros() if wsl else [])]
+    for name, cmd in targets:
+        try:
+            r = subprocess.run(cmd, input=source,
                                capture_output=True, timeout=900, env={**os.environ, "WSL_UTF8": "1"},
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             out = (r.stdout + r.stderr).decode("utf-8", "replace")
@@ -1679,7 +1706,7 @@ def setup_wsl(argv) -> None:
                 else f"failed (exit {r.returncode}): {(out.strip().splitlines() or [''])[-1]}")
         except (OSError, subprocess.TimeoutExpired) as e:
             status = f"failed ({type(e).__name__})"
-        print(f"WSL {distro}: {status}")
+        print(f"{name}: {status}")
 
 
 def main():
