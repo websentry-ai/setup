@@ -2200,41 +2200,75 @@ def _wsl_distros():
             and not n.lower().startswith(("docker-desktop", "rancher-desktop", "podman-"))]
 
 
-def setup_wsl(argv) -> None:
-    """Windows and its WSL distros are one machine: run this same setup on the other side too."""
+# The name mdm/onboard.py stages this installer under for its WSL logon task.
+MDM_WSL_NAME = "claude-code-hooks-setup.py"
+
+
+def setup_wsl(argv) -> bool:
+    """Windows and its WSL distros are one machine: run this same setup on the other side too.
+    False when the other side failed, so the MDM logon task retries a clear."""
     key = next((a.split("=", 1)[1] for a in argv if a.startswith("--api-key=")), None) or (
         argv[argv.index("--api-key") + 1] if "--api-key" in argv[:-1] else None)
     in_wsl = platform.system() == "Linux" and "microsoft" in platform.release().lower()
-    # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
-    if not (platform.system() == "Windows" or in_wsl) or not (key or "--clear" in argv):
-        return
+    if not (platform.system() == "Windows" or in_wsl):
+        return True
     # --config-dir is a path on this side only; the key goes in on stdin so ps on the other side can't read it.
     drop = ("--config-dir", "--api-key")
     args = [a for i, a in enumerate(argv) if a.split("=")[0] not in drop and (i == 0 or argv[i - 1] not in drop)]
-    # A run fed on stdin came from the other side and never fans back out, even with a file named <stdin> in cwd.
-    if globals().get("__file__", "<stdin>") == "<stdin>":
-        return
-    # A pipe or <(curl ...) is read to its end before this runs, so there is no script left to forward.
-    if not os.path.isfile(__file__):
-        print(f"{'Windows' if in_wsl else 'WSL'}: skipped, run the installer from a saved file to set this side up too")
-        return
-    try:
-        source = Path(__file__).read_bytes()
-        if key:
-            source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
-    except OSError:
-        return
+    # The run forwarded from the other side carries this flag and never fans back out.
+    if globals().get("_UNBOUND_FORWARDED"):
+        return True
     if in_wsl:
-        # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
-        # -I on both sides: a script read from stdin would otherwise import modules from the caller's cwd.
-        # The all-users launcher, else PATH folders that resolve onto a Windows drive, so /mnt/c/../home can't reach Linux ones.
-        # A Windows-drive folder the user put on PATH (direnv, a venv) already runs code as them, so it is trusted like PATH.
         # Drives mount under /mnt unless wsl.conf moves them; wslpath reports where C: actually landed.
         try:
             c = subprocess.check_output(["/usr/bin/wslpath", "-u", "C:\\"], timeout=10).decode().strip().rstrip("/")
         except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
             c = ""
         mnt = os.path.dirname(c or "/mnt/c")
+    # MDM's logon task sets this tool up in WSL with the device key; a user-level run must not swap in its own.
+    # The task itself runs the staged file, so that one still fans out. ProgramW6432 first: a 32-bit Python's
+    # ProgramFiles is the (x86) folder, and onboard always stages under the 64-bit one.
+    pf = os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles", r"C:\Program Files")
+    if in_wsl:
+        # Windows' own ProgramW6432, since Program Files can sit on another drive or path.
+        try:
+            pf = subprocess.check_output([os.path.join(mnt, "c", "Windows", "System32", "cmd.exe"), "/d", "/c",
+                                          "echo %ProgramW6432%"], cwd=os.path.join(mnt, "c"), timeout=10).decode().strip()
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError):
+            pass
+        pf = pf if len(pf) > 3 and pf[1:3] == ":\\" else r"C:\Program Files"
+        pf = os.path.join(mnt, pf[0].lower(), *pf[3:].split("\\"))
+    staged = os.path.join(pf, "Unbound WSL", MDM_WSL_NAME)
+    here = globals().get("__file__", "<stdin>")
+    same = os.path.normcase(os.path.realpath(here)) == os.path.normcase(os.path.realpath(staged))
+    # Best effort, like any user-level check: the user owns these files, and the next logon restores MDM's setup.
+    if os.path.isfile(staged) and not same:
+        if in_wsl:
+            print("Skipped: MDM manages this tool on Windows and in WSL")
+            raise SystemExit(3)
+        print("WSL: managed by MDM")
+        return True
+    # --domain alone is a direct run: the CLI always logs in first and passes --api-key.
+    if not (key or "--clear" in argv):
+        return True
+    # A run fed on stdin has no file to forward, even with a file named <stdin> in cwd.
+    if here == "<stdin>":
+        return True
+    # A pipe or <(curl ...) is read to its end before this runs, so there is no script left to forward.
+    if not os.path.isfile(here):
+        print(f"{'Windows' if in_wsl else 'WSL'}: skipped, run the installer from a saved file to set this side up too")
+        return True
+    try:
+        source = b"_UNBOUND_FORWARDED = True\n" + Path(here).read_bytes()
+        if key:
+            source = f"import sys; sys.argv[1:1] = {['--api-key', key]!r}\n".encode() + source
+    except OSError:
+        return False
+    if in_wsl:
+        # Interop runs it as this distro's Windows user; -X utf8 keeps status lines printable on a pipe.
+        # -I on both sides: a script read from stdin would otherwise import modules from the caller's cwd.
+        # The all-users launcher, else PATH folders that resolve onto a Windows drive, so /mnt/c/../home can't reach Linux ones.
+        # A Windows-drive folder the user put on PATH (direnv, a venv) already runs code as them, so it is trusted like PATH.
         dirs = [os.path.realpath(p) for p in os.environ.get("PATH", "").split(os.pathsep) if p.startswith("/")]
         win_path = os.pathsep.join(p for p in dirs if len(os.path.relpath(p, mnt).split("/")[0]) == 1 and p != mnt)
         py = next((p for p in (os.path.join(mnt, "c", "Windows", "py.exe"),) if os.path.isfile(p)), None) or shutil.which("py.exe", path=win_path)
@@ -2246,6 +2280,7 @@ def setup_wsl(argv) -> None:
         root = Path(os.environ.get("SystemRoot", r"C:\Windows"))
         wsl = next((p for p in (root / "Sysnative" / "wsl.exe", root / "System32" / "wsl.exe") if p.is_file()), None)
         targets = [(f"WSL {d}", [str(wsl), "-d", d, "--exec", "python3", "-I", "-", *args]) for d in (_wsl_distros() if wsl else [])]
+    ok = True
     for name, cmd in targets:
         try:
             r = subprocess.run(cmd, input=source,
@@ -2257,7 +2292,9 @@ def setup_wsl(argv) -> None:
                 else f"failed (exit {r.returncode}): {(out.strip().splitlines() or [''])[-1]}")
         except (OSError, subprocess.TimeoutExpired) as e:
             status = f"failed ({type(e).__name__})"
+        ok = ok and not status.startswith("failed")
         print(f"{name}: {status}")
+    return ok
 
 
 def main():
