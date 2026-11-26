@@ -140,6 +140,15 @@ class AnUnsentOutcomeGoesUpNextRunTestCase(_Homes):
                 [third] = _run(up, home, _Backend()).stats()
                 self.assertNotIn("previous_outcome", third)
 
+    def test_a_run_that_crashes_sends_failed_in_the_same_run(self):
+        crashes = {mdm: patch.object(mdm._BackfillRun, "outcome", side_effect=RuntimeError("boom")),
+                   setup: patch.object(setup, "_backfill_read_session", side_effect=RuntimeError("boom"))}
+        for up, crash in crashes.items():
+            with self.subTest(up.__name__):
+                with redirect_stderr(io.StringIO()):
+                    backend = _run(up, self._home(("a",)), _Backend(), [crash])
+                self.assertEqual([s["outcome"] for s in backend.stats()], ["failed"])
+
     def test_an_mdm_run_killed_before_it_reported_reads_as_stopped_by_time_limit(self):
         home = self._home(("a",))
 

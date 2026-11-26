@@ -2128,7 +2128,7 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
     except (OSError, AttributeError) as e:
         debug_print(f"lowering backfill priority failed: {e}")
 
-    reported = False
+    reported, previous = False, None
     try:
         # The signed-in email and the desktop session cache are keyed off the home
         # dir; only the transcripts and the cutoff follow the config dir.
@@ -2230,7 +2230,14 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
         if not reported and config_dir is not None:
-            _backfill_save_outcome(config_dir, 'failed')
+            # Sent now with any earlier unsent outcome; saved for the next run if it can't go.
+            try:
+                if _backfill_uploader_stats is None:
+                    _backfill_uploader_stats = _backfill_empty_stats()
+                _backfill_send_outcome(api_key, backend_url, config_dir, 'failed', 0, previous)
+            except Exception as send_error:
+                debug_print(f"backfill failed outcome not sent: {send_error}")
+                _backfill_save_outcome(config_dir, 'failed')
 
 
 def _wsl_distros():
