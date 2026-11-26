@@ -2050,7 +2050,7 @@ def run(argv) -> int:
     # One the user can't move (they may not be able to write ~/.cursor) stays where it is: Cursor's
     # cleanup, which removes ~/.cursor/hooks as root, keeps it.
     cursor_hooks = load_mdm_setup_module("cursor").KEEP_UNSENT_HOOK_LOGS if kept else set()
-    cursor_hooks.update(log for _, log, data in kept if not data and os.path.lexists(log))
+    cursor_hooks.update(log for _, log, data in kept if log.name not in (data or ()) and os.path.lexists(log))
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:

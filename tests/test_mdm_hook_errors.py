@@ -64,7 +64,7 @@ def gateway():
     server.server_close()
 
 
-def _like_the_real_run_as_user(username, fn, *args, **kwargs):
+def _like_the_real_run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """The real one answers None when fn raises in the user's child."""
     try:
         return fn(*args, **kwargs)
@@ -88,6 +88,7 @@ def point(r, gateway_url):
 
 
 REAL_CURSOR_CLEANUP = load_module(MODULES["cursor"]).remove_user_level_hooks
+REAL_RUN_AS_USER = {tool: load_module(path)._run_as_user for tool, path in MODULES.items()}
 
 
 def real_cursor_cleanup(r):
@@ -496,17 +497,27 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_its_clea
     assert _messages(gateway) == ["cursor broke", "cursor broke again", "cursor broke during setup"]
 
 
-def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_its_cleanup(setup, gateway):
-    """The user may not be able to write ~/.cursor, so the move aside fails; the cleanup, which removes
-    ~/.cursor/hooks as root, then keeps that log and removes the rest."""
+@pytest.mark.parametrize("moved", ["nothing", "only its place"])
+def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_its_cleanup(setup, gateway, moved):
+    """The user may not be able to write ~/.cursor, so the move aside fails, for the log or for the log
+    alone; the cleanup, which removes ~/.cursor/hooks as root, then keeps that log and removes the rest."""
     r = setup("cursor")
     real_cursor_cleanup(r)
     log = _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke"])
     (log.parent / "unbound.py").write_text("# python-era hook")
-    r.mp.setattr(r.m, "_set_aside_unsent_log", lambda log: [])
+    (log.parent / STATE).write_text("2000-01-01T00:00:00 1")
+
+    def set_aside(log):
+        if moved == "nothing":
+            return []
+        os.rename(log.with_name(STATE), r.m._set_aside_name(log.with_name(STATE)))
+        return [STATE]
+
+    r.mp.setattr(r.m, "_set_aside_unsent_log", set_aside)
     gateway.answer = lambda request: (503, {})
     assert r() is True
-    assert sorted(p.name for p in log.parent.iterdir()) == ["error.log"]
+    assert "error.log" in [p.name for p in log.parent.iterdir()]
+    assert not (log.parent / "unbound.py").exists()
     assert r.m.KEEP_UNSENT_HOOK_LOGS == set()
     gateway.answer = lambda request: (200, OK)
     gateway.requests.clear()
@@ -633,3 +644,44 @@ def test_the_hook_hashed_before_install_is_read_as_a_users_file(tool, tmp_path):
         os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
         pytest.fail("hashing a FIFO blocked the run")
     assert answer == [None]
+
+
+
+def _fork_as_this_user(monkeypatch, m, tool):
+    """The real fork-and-drop runner, as a non-root test can run it: the drop to this same user is a no-op."""
+    for name in ("setgroups", "setgid", "setuid"):
+        monkeypatch.setattr(os, name, lambda *a: None)
+    monkeypatch.setattr(m, "_run_as_user", REAL_RUN_AS_USER[tool])
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="the runner forks on POSIX only")
+@pytest.mark.parametrize("tool", sorted(MODULES))
+def test_a_step_run_as_the_user_ends_at_its_timeout(tool, monkeypatch):
+    """The user can pause the child it runs in: a bounded call answers None (unknown) when the time is up."""
+    import getpass
+    import time
+    m = load_module(MODULES[tool])
+    _fork_as_this_user(monkeypatch, m, tool)
+    monkeypatch.setattr(m.platform, "system", lambda: "Linux")
+    started = time.monotonic()
+    assert m._run_as_user(getpass.getuser(), time.sleep, 30, _timeout=1) is None
+    assert time.monotonic() - started < 10
+    assert m._run_as_user(getpass.getuser(), lambda a, b: a + b, 2, 3, _timeout=5) == 5
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="the runner forks on POSIX only")
+def test_forwarding_a_user_pauses_does_not_hold_setup_up(setup, gateway, monkeypatch):
+    """Forwarding runs before setup fetches its key: a paused read of the user's log ends at the bound."""
+    import getpass
+    import time
+    r = setup("claude-code")
+    _fork_as_this_user(monkeypatch, r.m, "claude-code")
+    r.stub("get_all_user_homes", [(getpass.getuser(), r.home)])
+    _log(r.home, "claude-code", [f"{_utc(0)}: claude broke"])
+    r.mp.setattr(r.m, "_unsent_hook_errors", lambda log: time.sleep(60))
+    r.mp.setattr(r.m, "HOOK_ERROR_USER_TIMEOUT", 1, raising=False)
+    started = time.monotonic()
+    assert r() is True
+    assert time.monotonic() - started < 20
+    assert _forwarded(gateway) == []
+

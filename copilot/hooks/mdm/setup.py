@@ -2218,6 +2218,7 @@ HOOK_ERROR_MAX_AGE = timedelta(days=7)
 # Sentry groups by category: forwarded entries group together, apart from the hook's live reports.
 FORWARDED_ERROR_CATEGORY = "forwarded_error_log"
 HOOK_ERROR_TIMEOUT_SECONDS = 5  # forwarding must never hold setup up
+HOOK_ERROR_USER_TIMEOUT = 30  # a step run as the user, who can pause it, ends after this
 _HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
 _USER_FILE_MAX_BYTES = 4 * 1024 * 1024
 # A user's file: never followed if it is a link, never waited on if it is a FIFO, never text-mode on Windows.
@@ -2411,10 +2412,10 @@ def _forward_home_errors(username, log, send):
     """(entries sent, 'sent' or the verdict that stopped it, whether every unsent entry went out). The place
     is saved after each accepted request; where it can't be saved nothing more is sent, or every run would
     send the same entries again."""
-    if _run_as_user(username, _writable_dir, log.parent) is not True:
+    if _run_as_user(username, _writable_dir, log.parent, _timeout=HOOK_ERROR_USER_TIMEOUT) is not True:
         print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
         return 0, "sent", False
-    entries = _run_as_user(username, _unsent_hook_errors, log)
+    entries = _run_as_user(username, _unsent_hook_errors, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
     if entries is None:
         return 0, "sent", False
     for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
@@ -2422,7 +2423,7 @@ def _forward_home_errors(username, log, send):
         verdict = send(batch)
         if verdict != "sent":
             return start, verdict, False
-        if _run_as_user(username, _save_forwarded, log, batch[-1]["state"]) is not True:
+        if _run_as_user(username, _save_forwarded, log, batch[-1]["state"], _timeout=HOOK_ERROR_USER_TIMEOUT) is not True:
             print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
             return start + len(batch), "sent", False
     return len(entries), "sent", True
@@ -2442,7 +2443,8 @@ def forward_hook_errors(user_homes, gateway_url, hook_path) -> list:
             log = Path(home_dir) / relpath if home_dir is not None else None
             if log is None or not os.path.lexists(log):
                 continue
-            found = None if down else _run_as_user(username, _home_device_key, Path(home_dir))
+            found = None if down else _run_as_user(username, _home_device_key, Path(home_dir),
+                                                   _timeout=HOOK_ERROR_USER_TIMEOUT)
             if not found:
                 unsent.append((username, log))  # the gateway is down, or no hook here has a key yet
                 continue

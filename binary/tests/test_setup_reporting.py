@@ -771,16 +771,27 @@ def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(en
         "cursor broke", "cursor broke again", "cursor broke during setup"]
 
 
-def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_the_cleanup(env, backend, monkeypatch):
+@pytest.mark.parametrize("moved", ["nothing", "only its place"])
+def test_a_cursor_log_that_cannot_be_set_aside_is_kept_by_the_cleanup(env, backend, monkeypatch, moved):
     """The user may not be able to write ~/.cursor (a sudo'd Cursor run leaves it root's), so the move aside
-    fails; the cleanup, which removes ~/.cursor/hooks as root, then keeps that log and removes the rest."""
+    fails, for the log or for the log alone; the cleanup, which removes ~/.cursor/hooks as root, then keeps
+    that log and removes the rest."""
     log = _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke"])
     (log.parent / "unbound.py").write_text("# python-era hook")
-    monkeypatch.setattr(setup_cmd, "_set_aside_unsent_log", lambda log: [])
+    (log.parent / STATE).write_text("2000-01-01T00:00:00 1")
+
+    def set_aside(log):
+        if moved == "nothing":
+            return []
+        os.rename(log.with_name(STATE), setup_cmd._set_aside_name(log.with_name(STATE)))
+        return [STATE]
+
+    monkeypatch.setattr(setup_cmd, "_set_aside_unsent_log", set_aside)
     ok = backend.answer
     backend.answer = lambda path: (503, {}) if "/v1/hooks/errors" in path else ok(path)
     _run(backend)
-    assert sorted(p.name for p in log.parent.iterdir()) == ["error.log"]
+    assert "error.log" in [p.name for p in log.parent.iterdir()]
+    assert not (log.parent / "unbound.py").exists()
     backend.answer = ok
     backend.requests.clear()
     _run(backend)

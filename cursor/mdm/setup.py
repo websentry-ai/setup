@@ -13,6 +13,8 @@ import json
 import re
 import tempfile
 import time
+import signal
+import select
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Tuple, List, Optional
@@ -56,7 +58,7 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
-def _run_as_user(username, fn, *args, **kwargs):
+def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
 
@@ -112,7 +114,16 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
+        # The child runs as the user, who can pause it: a caller can bound the wait (WEB-6392).
+        deadline = None if _timeout is None else time.monotonic() + _timeout
         while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
             try:
                 chunk = os.read(r_fd, 1 << 20)
             except OSError:
@@ -124,7 +135,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         data = b''.join(chunks)
         del chunks
         try:
-            _, status = os.waitpid(pid, 0)
+            if deadline is None:
+                _, status = os.waitpid(pid, 0)
+            else:  # paused after closing the pipe, it would still hold the wait
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        return None
+                    time.sleep(0.05)
         except OSError:
             return None
         if os.WEXITSTATUS(status) != 0:
@@ -1343,6 +1365,7 @@ HOOK_ERROR_MAX_AGE = timedelta(days=7)
 # Sentry groups by category: forwarded entries group together, apart from the hook's live reports.
 FORWARDED_ERROR_CATEGORY = "forwarded_error_log"
 HOOK_ERROR_TIMEOUT_SECONDS = 5  # forwarding must never hold setup up
+HOOK_ERROR_USER_TIMEOUT = 30  # a step run as the user, who can pause it, ends after this
 _HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
 _USER_FILE_MAX_BYTES = 4 * 1024 * 1024
 # A user's file: never followed if it is a link, never waited on if it is a FIFO, never text-mode on Windows.
@@ -1536,10 +1559,10 @@ def _forward_home_errors(username, log, send):
     """(entries sent, 'sent' or the verdict that stopped it, whether every unsent entry went out). The place
     is saved after each accepted request; where it can't be saved nothing more is sent, or every run would
     send the same entries again."""
-    if _run_as_user(username, _writable_dir, log.parent) is not True:
+    if _run_as_user(username, _writable_dir, log.parent, _timeout=HOOK_ERROR_USER_TIMEOUT) is not True:
         print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
         return 0, "sent", False
-    entries = _run_as_user(username, _unsent_hook_errors, log)
+    entries = _run_as_user(username, _unsent_hook_errors, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
     if entries is None:
         return 0, "sent", False
     for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
@@ -1547,7 +1570,7 @@ def _forward_home_errors(username, log, send):
         verdict = send(batch)
         if verdict != "sent":
             return start, verdict, False
-        if _run_as_user(username, _save_forwarded, log, batch[-1]["state"]) is not True:
+        if _run_as_user(username, _save_forwarded, log, batch[-1]["state"], _timeout=HOOK_ERROR_USER_TIMEOUT) is not True:
             print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
             return start + len(batch), "sent", False
     return len(entries), "sent", True
@@ -1567,7 +1590,8 @@ def forward_hook_errors(user_homes, gateway_url, hook_path) -> list:
             log = Path(home_dir) / relpath if home_dir is not None else None
             if log is None or not os.path.lexists(log):
                 continue
-            found = None if down else _run_as_user(username, _home_device_key, Path(home_dir))
+            found = None if down else _run_as_user(username, _home_device_key, Path(home_dir),
+                                                   _timeout=HOOK_ERROR_USER_TIMEOUT)
             if not found:
                 unsent.append((username, log))  # the gateway is down, or no hook here has a key yet
                 continue
@@ -1652,7 +1676,7 @@ def recover_set_aside_hook_logs(user_homes) -> None:
         try:
             log = Path(home_dir) / HOOK_ERROR_LOG[0]
             if os.path.lexists(_set_aside_name(log)):
-                _run_as_user(username, _recover_set_aside_log, log)
+                _run_as_user(username, _recover_set_aside_log, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
         except Exception as e:
             print(f"[errors] set-aside hook errors in {home_dir} not put back: {e}")
 
@@ -1663,11 +1687,11 @@ def keep_unsent_hook_logs(unsent) -> list:
     kept = []
     for username, log in unsent:
         try:
-            names = _run_as_user(username, _set_aside_unsent_log, log)
+            names = _run_as_user(username, _set_aside_unsent_log, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
         except Exception as e:
             print(f"[errors] {log}: unsent hook errors not set aside: {e}")
             names = None
-        if not names and os.path.lexists(log):
+        if log.name not in (names or ()) and os.path.lexists(log):
             KEEP_UNSENT_HOOK_LOGS.add(log)
         kept.append((username, log, names))
     return kept
@@ -1678,7 +1702,8 @@ def restore_unsent_hook_logs(kept) -> None:
     KEEP_UNSENT_HOOK_LOGS.clear()
     for username, log, names in kept:
         try:
-            if names and _run_as_user(username, _restore_unsent_log, log, names) is not True and not os.path.lexists(log):
+            if (names and _run_as_user(username, _restore_unsent_log, log, names, _timeout=HOOK_ERROR_USER_TIMEOUT)
+                    is not True and not os.path.lexists(log)):
                 print(f"[errors] {log}: unsent hook errors could not be kept for the next run")
         except Exception as e:
             print(f"[errors] {log}: unsent hook errors could not be kept for the next run: {e}")
