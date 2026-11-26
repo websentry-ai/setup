@@ -2605,7 +2605,8 @@ def _refuse_if_redirected(fd: int, path: Path) -> None:
     got = kernel32.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), final, len(final), 0)
     # The path asked for in its long form (a temp folder is often given as C:\\Users\\RUNNER~1\\...).
     wanted = kernel32.GetLongPathNameW(os.path.abspath(str(path)), asked, len(asked))
-    if not (0 < got < len(final) and 0 < wanted < len(asked)
+    # A hard link has no other path to find, so a file with more than one name is refused as well.
+    if not (0 < got < len(final) and 0 < wanted < len(asked) and os.fstat(fd).st_nlink == 1
             and os.path.normcase(plain(final.value)) == os.path.normcase(plain(asked.value))):
         os.close(fd)
         raise OSError(f"{path} is reached through a link or junction")

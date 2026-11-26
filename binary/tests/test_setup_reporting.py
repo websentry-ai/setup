@@ -384,8 +384,8 @@ def test_each_tool_and_each_home_keeps_its_own_place(env, backend, monkeypatch, 
                     "claude-code": ["bob's claude broke"], "augment_code": ["auggie broke"]}
     assert (env["home"] / ".copilot/hooks" / STATE).read_text() == f"{_pacific(1)} 1"
     assert (other / ".claude/hooks" / STATE).exists() and not (env["home"] / ".claude/hooks" / STATE).exists()
-    # Cursor's setup removes the python-era ~/.cursor/hooks, log and all, after its errors went out.
-    assert not (env["home"] / ".cursor/hooks").exists()
+    # Cursor's setup removes the python-era ~/.cursor/hooks; its sent log comes back with its place.
+    assert sorted(p.name for p in (env["home"] / ".cursor/hooks").iterdir()) == [STATE, "error.log"]
 
 
 def test_lines_before_the_first_entry_are_skipped_and_later_ones_continue_it(env, backend):
@@ -718,10 +718,11 @@ def test_installed_tools_are_found_once_before_the_first_report(env, machine, mo
 
 def test_cursor_errors_go_out_before_the_sweep_removes_their_log(env, backend):
     """env's one home belongs to the real user running the tests, so the migration sweep runs on it and
-    removes ~/.cursor/hooks, error.log and all, before Cursor's own setup step."""
-    _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    removes ~/.cursor/hooks before Cursor's own setup step; the log and its place are kept across it."""
+    log = _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    (log.parent / "unbound.py").write_text("# python-era hook")
     _run(backend)
-    assert not (env["home"] / ".cursor/hooks").exists()  # the sweep did run
+    assert not (log.parent / "unbound.py").exists()  # the sweep did run
     sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
     assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
     assert sent[0]["headers"]["Authorization"] == "Bearer per-device-key"
@@ -744,6 +745,32 @@ def test_cursor_errors_the_gateway_did_not_take_survive_the_sweep_for_the_next_r
     _run(backend)
     sent = [r for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"]
     assert [e["message"] for r in sent for e in r["body"]["errors"]] == ["cursor broke", "cursor broke again"]
+
+
+@pytest.mark.parametrize("before", [["cursor broke"], []])
+def test_a_cursor_error_written_after_a_full_send_survives_the_sweep(env, backend, monkeypatch, before):
+    """Everything in the log went out (or there was no log yet), then a hook added an error before the sweep:
+    that error is kept and goes out next run, and nothing already sent goes again."""
+    log = _log(env["home"], "cursor", [f"{_pacific(0)}: cursor broke"])
+    if not before:
+        log.unlink()
+    real = setup_cmd._forward_hook_errors
+
+    def a_hook_writes_after_forwarding(m, tool, *args, **kwargs):
+        real(m, tool, *args, **kwargs)
+        if tool == "cursor":
+            with open(log, "a") as f:
+                f.write(f"{_pacific(1)}: cursor broke after the send\n")
+
+    monkeypatch.setattr(setup_cmd, "_forward_hook_errors", a_hook_writes_after_forwarding)
+    _run(backend)
+    monkeypatch.setattr(setup_cmd, "_forward_hook_errors", real)
+    assert [e["message"] for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"
+            for e in r["body"]["errors"]] == before
+    backend.requests.clear()
+    _run(backend)
+    assert [e["message"] for r in _forwarded(backend) if r["body"]["hook_source"] == "cursor"
+            for e in r["body"]["errors"]] == ["cursor broke after the send"]
 
 
 def test_cursor_errors_set_aside_survive_a_new_log_a_hook_writes_during_setup(env, backend, monkeypatch):

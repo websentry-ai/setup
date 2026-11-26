@@ -220,6 +220,9 @@ def test_setup_never_reads_or_writes_a_users_file_through_a_junction(tool, tmp_p
     with pytest.raises(OSError):
         m._replace_user_file(hooks / ".error_log_forwarded", b"2026-01-01T00:00:00.000Z 1")
     assert sorted(p.name for p in private.iterdir()) == ["error.log"]
+    os.link(private / "error.log", hooks.parent / "hard-linked.log")  # a second name for the same file
+    with pytest.raises(OSError):
+        m._read_user_file(hooks.parent / "hard-linked.log")
     plain = tmp_path / "plain.log"
     plain.write_bytes(b"ok\n")
     assert m._read_user_file(plain) == b"ok\n"

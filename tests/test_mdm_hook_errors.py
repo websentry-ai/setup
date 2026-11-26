@@ -450,14 +450,41 @@ def test_a_config_that_is_a_link_gives_no_key(setup, gateway, tmp_path):
 def test_cursor_errors_go_out_before_its_cleanup_removes_their_log(setup, gateway):
     r = setup("cursor")
     real_cursor_cleanup(r)
-    _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    log = _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke", f"{_pacific(1)}: cursor broke again"])
+    (log.parent / "unbound.py").write_text("# python-era hook")
     assert r() is True
-    assert not (r.home / ".cursor/hooks").exists()  # the cleanup did run
+    assert not (log.parent / "unbound.py").exists()  # the cleanup did run
     assert _messages(gateway) == ["cursor broke", "cursor broke again"]
-    # Gone with its log, so nothing can be sent twice.
+    # Kept with its forwarded place, so nothing is sent twice.
     gateway.requests.clear()
     r()
     assert _forwarded(gateway) == []
+
+
+@pytest.mark.parametrize("before", [["cursor broke"], []])
+def test_a_cursor_error_written_after_a_full_send_survives_its_cleanup(setup, gateway, before):
+    """Everything in the log went out (or there was no log yet), then a hook added an error before the
+    cleanup: that error is kept and goes out next run, and nothing already sent goes again."""
+    r = setup("cursor")
+    real_cursor_cleanup(r)
+    log = _log(r.home, "cursor", [f"{_pacific(0)}: cursor broke"])
+    if not before:
+        log.unlink()
+    real = r.m.forward_hook_errors
+
+    def a_hook_writes_after_forwarding(*args):
+        unsent = real(*args)
+        with open(log, "a") as f:
+            f.write(f"{_pacific(1)}: cursor broke after the send\n")
+        return unsent
+
+    r.mp.setattr(r.m, "forward_hook_errors", a_hook_writes_after_forwarding)
+    assert r() is True
+    r.mp.setattr(r.m, "forward_hook_errors", real)
+    assert _messages(gateway) == before
+    gateway.requests.clear()
+    r()
+    assert _messages(gateway) == ["cursor broke after the send"]
 
 
 def test_cursor_errors_the_gateway_did_not_take_survive_its_cleanup_for_the_next_run(setup, gateway):

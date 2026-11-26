@@ -490,8 +490,6 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
     only that home. Either way nothing is marked sent, and the next run retries. user_homes and keys (home
     to its key, filled as homes are read) come from run(), so each home is found and read once a run."""
     relpath, hook_source = _HOOK_ERROR_LOGS[tool]
-    # Only a log in a folder the migration sweep removes needs keeping; the others stay where they are.
-    unsent = opts.setdefault("unsent_hook_logs", []) if tool in _SWEPT_HOOK_LOG_TOOLS else []
     sent = 0
     try:
         hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
@@ -503,21 +501,17 @@ def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
             if log is None or not os.path.lexists(log):
                 continue
             if opts.get("hook_errors_held"):
-                unsent.append((username, log))  # the gateway is down: keep it for the next run
-                continue
+                continue  # the gateway is down: the next run retries
             if str(home_dir) not in keys:
                 keys[str(home_dir)] = _as_user(m, username, _home_device_key, home_dir)
             found = keys[str(home_dir)]
             if not found:
-                unsent.append((username, log))  # no hook here has a key to report with yet
-                continue
+                continue  # no hook here has a key to report with yet
             api_key, secrets = found
             send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
                                      api_key, hook_source, hook_sha, secrets=secrets)
-            count, verdict, done = _forward_home_errors(m, username, log, send)
+            count, verdict, _ = _forward_home_errors(m, username, log, send)
             sent += count
-            if not done:
-                unsent.append((username, log))
             if verdict == "refused":
                 print(f"[errors] {tool} hook errors in {home_dir} not forwarded (key refused); the next run retries")
             elif verdict == "down":
@@ -2046,7 +2040,11 @@ def run(argv) -> int:
 
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
     # The sweep and Cursor's step remove ~/.cursor/hooks: a log the gateway has not taken is put back after.
-    kept = [(u, log, _as_user(m0, u, _set_aside_unsent_log, log)) for u, log in opts.get("unsent_hook_logs", [])]
+    # Every such log is kept across them, sent or not, and listed now: a hook can add an error after
+    # forwarding read the log (or start one), and the saved place keeps what went out from going again.
+    swept = [(u, h / _HOOK_ERROR_LOGS[t][0]) for t in opts["tools"] if t in _SWEPT_HOOK_LOG_TOOLS
+             for u, h in user_homes or [] if h is not None and os.path.lexists(h / _HOOK_ERROR_LOGS[t][0])]
+    kept = [(u, log, _as_user(m0, u, _set_aside_unsent_log, log)) for u, log in swept]
     # One the user can't move (they may not be able to write ~/.cursor) stays where it is: Cursor's
     # cleanup, which removes ~/.cursor/hooks as root, keeps it.
     cursor_hooks = load_mdm_setup_module("cursor").KEEP_UNSENT_HOOK_LOGS if kept else set()

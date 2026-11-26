@@ -1406,7 +1406,8 @@ def _refuse_if_redirected(fd: int, path: Path) -> None:
     got = kernel32.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), final, len(final), 0)
     # The path asked for in its long form (a temp folder is often given as C:\\Users\\RUNNER~1\\...).
     wanted = kernel32.GetLongPathNameW(os.path.abspath(str(path)), asked, len(asked))
-    if not (0 < got < len(final) and 0 < wanted < len(asked)
+    # A hard link has no other path to find, so a file with more than one name is refused as well.
+    if not (0 < got < len(final) and 0 < wanted < len(asked) and os.fstat(fd).st_nlink == 1
             and os.path.normcase(plain(final.value)) == os.path.normcase(plain(asked.value))):
         os.close(fd)
         raise OSError(f"{path} is reached through a link or junction")
@@ -1856,11 +1857,11 @@ def main():
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return False
 
-    # Before this run changes anything, with the key each home's hooks already report with. A log not
-    # fully sent is kept across remove_user_level_hooks below, which removes ~/.cursor/hooks.
+    # Before this run changes anything, with the key each home's hooks already report with. The log is kept
+    # across remove_user_level_hooks below, which removes ~/.cursor/hooks.
     homes = get_all_user_homes()
     recover_set_aside_hook_logs(homes)
-    unsent_logs = forward_hook_errors(homes, gateway_url, get_enterprise_hooks_dir() / "hooks" / "unbound.py")
+    forward_hook_errors(homes, gateway_url, get_enterprise_hooks_dir() / "hooks" / "unbound.py")
 
     # Get device identifier
     print("\n🔍 Getting device serial number...")
@@ -1898,7 +1899,10 @@ def main():
     print("\n📝 Writing config for all users...")
     user_homes = get_all_user_homes()
     config_count = 0
-    kept_logs = keep_unsent_hook_logs(unsent_logs)
+    # Every log is kept across remove_user_level_hooks, sent or not, and listed now: a hook can add an error
+    # after forwarding read the log (or start one), and the saved place keeps what went out from going again.
+    kept_logs = keep_unsent_hook_logs([(username, Path(home_dir) / HOOK_ERROR_LOG[0]) for username, home_dir in homes
+                                       if home_dir is not None and os.path.lexists(Path(home_dir) / HOOK_ERROR_LOG[0])])
     try:
         for username, home_dir in user_homes:
             if write_unbound_config_for_user(username, home_dir, cursor_api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}):
