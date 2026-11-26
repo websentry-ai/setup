@@ -60,10 +60,11 @@ pytestmark = pytest.mark.skipif(not os.path.isfile('/usr/bin/ssh'), reason='need
 
 
 class Capture:
-    """A gateway stand-in on 127.0.0.1 that keeps every request and allows every check."""
+    """A gateway stand-in on 127.0.0.1 that keeps every request and answers every check with `decision`."""
 
     def __init__(self):
         self.requests, self.lock = [], threading.Lock()
+        self.decision = 'allow'
         capture = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -87,7 +88,7 @@ class Capture:
                 with capture.lock:
                     capture.requests.append({'path': urlparse(self.path).path, 'headers': dict(self.headers.items()),
                                              'raw': raw.decode('utf-8', 'replace'), 'body': body})
-                self._reply({'decision': 'allow', 'policy_check_failure_action': 'allow'}
+                self._reply({'decision': capture.decision, 'policy_check_failure_action': 'allow'}
                             if 'pretool' in self.path else {})
 
             def _reply(self, payload):
@@ -522,6 +523,42 @@ def test_cursor_names_this_machines_os_on_a_native_file_check(sandbox, gateway):
     assert checks, 'no policy check for the Write: %s' % sorted({r['path'] for r in gateway.requests})
     for body in checks:
         assert body['pre_tool_use_data'].get('os') == expected, json.dumps(body['pre_tool_use_data'], indent=2)
+
+
+def _reports_os(sandbox, name):
+    """A sitecustomize on PYTHONPATH that makes platform.system() answer `name`."""
+    shim = sandbox['root'] / 'shim'
+    shim.mkdir(exist_ok=True)
+    (shim / 'sitecustomize.py').write_text('import platform\nplatform.system = lambda: %r\n' % name)
+    return str(shim)
+
+
+@pytest.mark.parametrize('name', ['', 'FreeBSD'])
+@pytest.mark.parametrize('tool', sorted(t for t in RUNS if t != 'pi'))
+def test_a_hook_on_an_os_it_cannot_name_checks_the_policy_without_one(tool, name, sandbox, gateway):
+    env = {**shell_env(sandbox, gateway), 'PYTHONPATH': _reports_os(sandbox, name)}
+    RUNS[tool](sandbox, env)
+
+    checks = [r['body'] for r in gateway.requests if 'pretool' in r['path'] and isinstance(r['body'], dict)
+              and (r['body'].get('pre_tool_use_data') or {}).get('command') == COMMAND]
+    assert checks, 'no policy check for the command: %s' % sorted({r['path'] for r in gateway.requests})
+    for body in checks:
+        assert 'os' not in body['pre_tool_use_data'], json.dumps(body['pre_tool_use_data'], indent=2)
+
+
+def test_a_hook_on_an_os_it_cannot_name_still_obeys_a_deny(sandbox, gateway):
+    gateway.decision = 'deny'
+    env = {**shell_env(sandbox, gateway), 'PYTHONPATH': _reports_os(sandbox, '')}
+    project = str(sandbox['project'])
+    event = {'session_id': str(uuid.uuid4()), 'transcript_path': None, 'cwd': project,
+             'permission_mode': 'default', 'hook_event_name': 'PreToolUse', 'tool_name': 'Bash',
+             'tool_input': {'command': COMMAND}, 'tool_use_id': 'toolu_deny'}
+    result = subprocess.run([sys.executable, str(HOOKS['claude-code'])], input=json.dumps(event),
+                            capture_output=True, text=True, timeout=90, env=env, cwd=project)
+
+    assert result.returncode == 0, result.stderr[-600:]
+    decision = json.loads(result.stdout)['hookSpecificOutput']['permissionDecision']
+    assert decision == 'deny', result.stdout
 
 
 def _vscode_user_settings(home):
