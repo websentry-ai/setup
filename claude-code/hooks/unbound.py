@@ -2209,13 +2209,106 @@ def _claude_plugin_launch_values() -> tuple:
         return [], []
 
 
-def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
-    try:
-        if not config_path.exists():
-            return None
+def _mcpjson_settings(cwd: str) -> Dict:
+    """disabledMcpjsonServers / enabledMcpjsonServers / enableAllProjectMcpServers merged
+    from user, managed and project settings (the launch folder's, the git root's and, in
+    a worktree, the main checkout's)."""
+    paths = [_CONFIG_DIR / 'settings.json', _CONFIG_DIR / 'settings.local.json']
+    for d in dict.fromkeys(filter(None, [cwd, _find_git_root(cwd)] + _git_worktree_roots(cwd)[:1])):
+        paths += [Path(d) / '.claude' / 'settings.json', Path(d) / '.claude' / 'settings.local.json']
+    paths += _managed_settings_files()
+    out = {'disabled': set(), 'enabled': set(), 'enable_all': False}
+    for path in paths:
+        try:
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        for key, bucket in (('disabledMcpjsonServers', 'disabled'), ('enabledMcpjsonServers', 'enabled')):
+            if isinstance(data.get(key), list):
+                out[bucket].update(v for v in data[key] if isinstance(v, str))
+        out['enable_all'] = out['enable_all'] or data.get('enableAllProjectMcpServers') is True
+    return out
 
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = json.loads(f.read())
+
+def _project_mcp_json_server(server_name: str, cwd: str) -> Optional[Dict]:
+    """The server's entry in the nearest project .mcp.json at or above cwd, where
+    Claude Code loads its project-scoped servers."""
+    try:
+        start = Path(cwd).expanduser()
+    except (TypeError, ValueError):
+        return None
+    if server_name in _mcpjson_settings(cwd)['disabled']:
+        return None
+    for folder in (start, *start.parents):
+        if folder == folder.parent:
+            break  # Claude stops below the filesystem root
+        path = folder / '.mcp.json'
+        try:
+            if not path.is_file():
+                continue
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        servers = data.get('mcpServers') if isinstance(data, dict) else None
+        if isinstance(servers, dict) and server_name in servers:
+            result = _extract_mcp_server_fields(servers[server_name])
+            if result:
+                return result
+    return None
+
+
+def _user_scope_has(config: Dict, server_name: str) -> bool:
+    top = config.get('mcpServers')
+    return isinstance(top, dict) and server_name in top
+
+
+def _project_settings_loaded(argv: List[str]) -> bool:
+    """Claude loads every settings source unless --setting-sources narrows them."""
+    sources = None
+    for i, a in enumerate(argv):
+        if a == '--setting-sources':
+            sources = argv[i + 1] if i + 1 < len(argv) else ''
+        elif a.startswith('--setting-sources='):
+            sources = a.split('=', 1)[1]
+    return sources is None or 'project' in sources.split(',')
+
+
+def _project_server_approved(server_name: str, cwd: str, permission_mode: Optional[str]) -> bool:
+    # Claude approves project servers only while project settings load: via the approval keys,
+    # or automatically in bypass and non-interactive sessions (-p, SDKs, GitHub Action). A
+    # nested `claude -p` keeps its parent's entrypoint, hence the argv check.
+    found = _claude_launch_argv()
+    argv = found[1][1:] if found else []
+    if not _project_settings_loaded(argv):
+        return False
+    settings = _mcpjson_settings(cwd)
+    return (settings['enable_all'] or server_name in settings['enabled']
+            or permission_mode == 'bypassPermissions'
+            or os.environ.get('CLAUDE_CODE_ENTRYPOINT') in ('sdk-cli', 'sdk-ts', 'sdk-py', 'claude-code-github-action')
+            or any(a in ('-p', '--print') for a in argv))
+
+
+def _claude_launch_dir(cwd: Optional[str]) -> Optional[str]:
+    """Where Claude was launched: it loads and starts MCP servers there, while the
+    event cwd follows an in-session cd."""
+    return os.environ.get('CLAUDE_PROJECT_DIR') or cwd
+
+
+def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None,
+                            permission_mode: Optional[str] = None) -> Optional[Dict]:
+    """Claude Code's own scope order, from the launch folder: local (~/.claude.json
+    projects, keyed by the main checkout in a worktree), then project (.mcp.json), then user."""
+    cwd = _claude_launch_dir(cwd)
+    try:
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = json.loads(f.read())
+        except Exception:
+            config = {}  # missing or mid-write: project .mcp.json still applies
+        if not isinstance(config, dict):
+            config = {}
 
         if cwd:
             projects = config.get('projects', {})
@@ -2233,6 +2326,21 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                     if parent == cwd_path:
                         break
                     cwd_path = parent
+
+            # From a linked worktree, Claude's local scope is the main checkout's entry.
+            roots = _git_worktree_roots(cwd)
+            main = projects.get(roots[0].replace('\\', '/').rstrip('/')) if roots and isinstance(projects, dict) else None
+            main_servers = main.get('mcpServers') if isinstance(main, dict) else None
+            if isinstance(main_servers, dict) and server_name in main_servers:
+                result = _extract_mcp_server_fields(main_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+            result = _project_mcp_json_server(server_name, cwd)
+            # Claude runs an unapproved project server's user-scope namesake instead; when
+            # approval can't be shown, keep reporting the user-scope server.
+            if result and (not _user_scope_has(config, server_name)
+                           or _project_server_approved(server_name, cwd, permission_mode)):
+                return _augment_script_hash(result, cwd)
 
         top_servers = config.get('mcpServers', {})
         if isinstance(top_servers, dict) and server_name in top_servers:
@@ -3523,15 +3631,22 @@ def _settings_base_url(path: Path) -> Optional[str]:
     return url if isinstance(url, str) and url.strip() else None
 
 
-def _managed_base_url() -> Optional[str]:
-    url = None
+def _managed_settings_files() -> List[Path]:
+    """Base file first, then drop-ins in the order Claude applies them."""
+    files = []
     for directory in MANAGED_SETTINGS_DIRS:
         try:
             dropins = sorted((directory / 'managed-settings.d').glob('*.json'))
         except Exception:
             dropins = []
-        for path in [directory / 'managed-settings.json', *dropins]:
-            url = _settings_base_url(path) or url
+        files += [directory / 'managed-settings.json', *dropins]
+    return files
+
+
+def _managed_base_url() -> Optional[str]:
+    url = None
+    for path in _managed_settings_files():
+        url = _settings_base_url(path) or url
     return url
 
 
@@ -3574,7 +3689,7 @@ def _valid_serial(value: Optional[str]) -> bool:
 def _get_device_serial() -> Optional[str]:
     """Best-effort hardware serial, mirroring the MDM setup scripts. Filters known
     OEM/VM placeholder values so two machines never collide on the same fake serial,
-    falling through to a stable per-install id (machine-id / MachineGuid) instead."""
+    falling through to a stable per-install id (Linux machine-id) instead."""
     try:
         system = platform.system().lower()
         if system == 'darwin':
@@ -3610,14 +3725,6 @@ def _get_device_serial() -> Optional[str]:
                     return out.stdout.strip()
             except Exception:
                 pass
-            try:
-                out = subprocess.run(['powershell', '-NoProfile', '-Command',
-                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
-                                     capture_output=True, text=True, timeout=10)
-                if out.returncode == 0 and _valid_serial(out.stdout):
-                    return out.stdout.strip()
-            except Exception:
-                pass
     except Exception:
         pass
     return None
@@ -3637,7 +3744,9 @@ def _device_serial(probe: bool = True) -> Optional[str]:
         if isinstance(loaded, dict):
             data = loaded
             cached = data.get('device_serial')
-            if isinstance(cached, str) and cached.strip():
+            # Windows caches written before BIOS-only probing may hold a MachineGuid; re-probe once.
+            if isinstance(cached, str) and cached.strip() and (
+                    data.get('serial_source') == 'bios' or platform.system() != 'Windows'):
                 return cached.strip()
     except Exception:
         data = {}
@@ -3650,6 +3759,7 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     if serial:
         try:
             data['device_serial'] = serial
+            data['serial_source'] = 'bios'
             IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
             tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
             tmp.write_text(json.dumps(data), encoding='utf-8')
@@ -4102,9 +4212,10 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         plugin_dirs = plugin_urls = None  # lazy: --plugin-dir paths / --plugin-url values
 
         if mcp_server_name:
-            cwd = event.get('cwd')
+            cwd = _claude_launch_dir(event.get('cwd'))
             server_cfg = _read_mcp_server_config(
-                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd,
+                permission_mode=event.get('permission_mode'),
             )
             if server_cfg:
                 metadata['mcp_server_config'] = server_cfg
@@ -4180,6 +4291,12 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     }
 
     request_body['pre_tool_use_data']['tool_use_id'] = resolve_tool_use_id(event)
+    if tool_name in SHELL_TOOL_NAMES:
+        request_body['pre_tool_use_data'].update(detect_shell('claude-code', tool_name, event.get('cwd')))
+    # The gateway reads `/ETC/x` as /etc only on macOS, whose disks ignore case.
+    device = device_os()
+    if device:
+        request_body['pre_tool_use_data']['os'] = device
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -4246,7 +4363,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     if is_mcp and api_response.get('unknown_mcp_server'):
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
-            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
+            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=_claude_launch_dir(metadata.get('cwd')))
 
     # Null fingerprint: the hook resolved no config for a real MCP server. The
     # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
@@ -4398,9 +4515,37 @@ def _git_branch(root: Optional[str]) -> Optional[str]:
 _WRITE_TOOLS = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
 _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 
+_WINDOWS_PATHS = os.name == 'nt'
+# C:\x, C:/x, or a \\server\share path.
+_DRIVE_PATH_RE = re.compile(r'^(?:[A-Za-z]:[\\/]|\\\\[^\\])')
+# Git Bash spells C:\x as /c/x, and Windows normpath turns that into \c\x.
+_GIT_BASH_DRIVE_RE = re.compile(r'^[\\/]([A-Za-z])(?=[\\/]|$)')
+
+
+def _is_abs_path(path: str) -> bool:
+    """True for /x everywhere, and for C:\\x, C:/x or \\\\server\\share on Windows."""
+    return path.startswith('/') or (_WINDOWS_PATHS and bool(_DRIVE_PATH_RE.match(path)))
+
+
+def _native_path(path: str) -> str:
+    """On Windows, Git Bash's /c/x becomes C:/x; any other path is returned unchanged."""
+    match = _GIT_BASH_DRIVE_RE.match(path) if _WINDOWS_PATHS else None
+    if not match:
+        return path
+    return match.group(1).upper() + ':' + (path[2:] or '\\')
+
+
 # Absolute paths inside a Bash command; the left boundary stops a relative
 # token like tests/webapp/ reading as absolute.
-_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# On Windows, C:\ and C:/ paths count too, and a single- or double-quoted
+# C:\ or Git Bash /c/ path keeps its spaces.
+_ABS_PATH_RE = re.compile(
+    r'(?:^|[\s"\'=(])('
+    + (r'(?<=")(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^"]*(?=")|'
+       r"(?<=')(?:[A-Za-z]:[\\/]|/[A-Za-z]/)[^']*(?=')|" if _WINDOWS_PATHS else '')
+    + r'/[^\s"\';|&<>()]+'
+    + (r'|[A-Za-z]:[\\/][^\s"\';|&<>()]*' if _WINDOWS_PATHS else '')
+    + r')')
 # Real git clones that are never the engineer's project: a path under
 # /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
@@ -4497,11 +4642,11 @@ def _git_path_opt_targets(command, shell_dir, powershell=False):
                         continue
                     for cwd in cwds:
                         target = os.path.expanduser(raw) if raw.startswith('~') else raw
-                        if not target.startswith('/'):
+                        if not _is_abs_path(target):
                             if not cwd:
                                 continue
                             target = os.path.join(cwd, target)
-                        target = os.path.normpath(target)
+                        target = os.path.normpath(_native_path(target))
                         if _is_system_checkout_path(target) or target in targets:
                             continue
                         targets.append(target)
@@ -4532,7 +4677,7 @@ def _git_path_opt_targets(command, shell_dir, powershell=False):
 def _find_git_root(path: str) -> Optional[str]:
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
-        p = Path(path)
+        p = Path(_native_path(path))
         for parent in [p] + list(p.parents):
             if (parent / '.git').exists():
                 return str(parent)
@@ -4590,8 +4735,8 @@ def _next_shell_dir(command: str, shell_dir: Optional[str], powershell: bool = F
             return shell_dir
         if target.startswith('~'):
             target = os.path.expanduser(target)
-        if target.startswith('/') or powershell and re.match(r'[A-Za-z]:[\\/]', target):
-            return os.path.normpath(target)
+        if _is_abs_path(target) or powershell and re.match(r'[A-Za-z]:[\\/]', target):
+            return os.path.normpath(_native_path(target))
         if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
             return shell_dir
         if shell_dir:
@@ -4727,13 +4872,13 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
         path = tool_input.get('file_path') or tool_input.get('notebook_path')
         if isinstance(path, str) and path:
             # A relative path resolves against the cwd, or the gate sees nothing.
-            if not path.startswith('/') and shell_dir:
+            if not _is_abs_path(path) and shell_dir:
                 path = os.path.normpath(os.path.join(shell_dir, path))
-            if path.startswith('/') and not _is_system_checkout_path(path):
+            if _is_abs_path(path) and not _is_system_checkout_path(path):
                 candidates.append(os.path.dirname(path))
     elif tool_name in _READ_TOOLS:
         path = tool_input.get('file_path') or tool_input.get('path')
-        if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
+        if isinstance(path, str) and _is_abs_path(path) and not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
     elif tool_name in SHELL_TOOL_NAMES:
         command = tool_input.get('command')
@@ -5281,6 +5426,224 @@ def _cowork_skill_path(prefix: str, name: str, session: Path) -> Optional[str]:
         return None
     (copies,) = sources.values()
     return str(max(copies, key=lambda c: (c.stat().st_mtime, str(c))))
+
+
+# KEEP IN SYNC: shell detection — byte-identical in every agent hook, do not diverge.
+# Which shell runs an agent's terminal command, and how the hook knows: the agent's tool names it ('tool'), or the hook
+# applies the rule that agent uses to pick its shell ('agent_rule'). Fails open: nothing is sent when neither works.
+_SHELL_NAMES = frozenset({'bash', 'zsh', 'sh', 'fish', 'dash', 'ksh', 'powershell', 'pwsh', 'cmd'})
+_SHELL_CACHE = {}
+_SHELL_SETTINGS_MAX_BYTES = 1 << 20
+
+
+def _shell_name(program):
+    """The shell a path or program name runs ('/bin/zsh', 'pwsh.exe'), or None for anything else."""
+    if not isinstance(program, str) or not program.strip():
+        return None
+    name = re.split(r'[\\/]', program.strip().strip('"'))[-1].lower()
+    name = name[:-4] if name.endswith('.exe') else name
+    return name if name in _SHELL_NAMES else None
+
+
+def _shell_windows():
+    return os.name == 'nt'
+
+
+def _shell_windows_powershell():
+    """PowerShell 7 when it is on PATH, else Windows PowerShell, which every Windows install has."""
+    return 'pwsh' if shutil.which('pwsh') else 'powershell'
+
+
+def _shell_env():
+    return _shell_name(os.environ.get('SHELL'))
+
+
+def _shell_login():
+    """The account's login shell from the user database, as Codex reads it, else $SHELL."""
+    try:
+        import pwd
+        return _shell_name(pwd.getpwuid(os.getuid()).pw_shell) or _shell_env()
+    except Exception:
+        return _shell_env()
+
+
+def _shell_settings(path):
+    """A JSON settings file that may hold comments and trailing commas, as VS Code writes them; {} when unreadable."""
+    # Only a small regular file: a repo's own settings could be a pipe or a device that never finishes reading.
+    try:
+        if not os.path.isfile(path):
+            return {}
+        with open(path, 'rb') as f:
+            raw = f.read(_SHELL_SETTINGS_MAX_BYTES + 1)
+        if len(raw) > _SHELL_SETTINGS_MAX_BYTES:
+            return {}
+        text = raw.decode('utf-8-sig')
+    except (OSError, ValueError):
+        return {}
+    # Drop // and /* */ comments outside strings, then commas before a closing bracket. An unclosed string or comment
+    # runs to the end, so a malformed file is one linear pass rather than a rescan from every quote.
+    text = re.sub(r'("(?:\\.|[^"\\])*"?)|//[^\n]*|/\*.*?(?:\*/|\Z)', lambda m: m.group(1) or '', text, flags=re.S)
+    text = re.sub(r'("(?:\\.|[^"\\])*"?)|,(\s*[}\]])', lambda m: m.group(1) or m.group(2), text)
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+# VS Code's built-in terminal profile names on each OS, for a default profile with no path of its own.
+_SHELL_VSCODE_BUILTIN = {'powershell': None, 'windows powershell': 'powershell', 'command prompt': 'cmd',
+                         'git bash': 'bash'}
+# How the Insiders build names itself in its folders, sockets and version string.
+_SHELL_INSIDERS = re.compile(r'code - insiders|code-insiders|-insider\b', re.I)
+
+
+def _shell_vscode_app():
+    """The VS Code edition running the hook: Insiders when its environment names that build, else the stable one."""
+    for key in ('VSCODE_IPC_HOOK', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_CODE_CACHE_PATH', 'VSCODE_NLS_CONFIG',
+                'TERM_PROGRAM_VERSION'):
+        if _SHELL_INSIDERS.search(os.environ.get(key) or ''):
+            return 'Code - Insiders'
+    return 'Code'
+
+
+def _shell_workspace_settings(cwd):
+    """The repository's own VS Code settings, read only when neither `.vscode` nor the file is a link: a link could
+    lead to a network share, and the folder is checked first so the file's own check never passes through it."""
+    folder = Path(cwd) / '.vscode'
+    try:
+        if os.path.islink(folder) or os.path.islink(folder / 'settings.json'):
+            return {}
+    except (OSError, ValueError):
+        return {}
+    return _shell_settings(folder / 'settings.json')
+
+
+def _shell_profile_path(path, check=True):
+    """A profile's executable as VS Code resolves it: `${env:…}` expanded, then the first entry that is installed, or
+    nothing. Without `check` nothing on disk is touched: one path is taken as written, and a list, whose pick needs
+    the disk, names nothing."""
+    if not check and isinstance(path, list) and len(path) > 1:
+        return None
+    for candidate in [path] if isinstance(path, str) else path if isinstance(path, list) else []:
+        if not isinstance(candidate, str):
+            continue
+        expanded = re.sub(r'\$\{env:([^}]+)\}', lambda m: os.environ.get(m.group(1), ''), candidate).strip().strip('"')
+        if not expanded:
+            continue
+        if not check or os.path.isfile(expanded) or (
+                '/' not in expanded and '\\' not in expanded and shutil.which(expanded)):
+            return expanded
+    return None
+
+
+def _shell_vscode(cwd):
+    """The shell Copilot's run_in_terminal uses: its own terminal profile, else the default one, from the workspace
+    and then the running edition's user settings; a default of cmd runs as Windows PowerShell and of /bin/sh as bash.
+    A path a repository's settings supply is never looked up on disk, so it can't make the hook reach a network share."""
+    windows = _shell_windows()
+    key = 'windows' if windows else 'osx' if sys.platform == 'darwin' else 'linux'
+    if windows:
+        user_root = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    elif sys.platform == 'darwin':
+        user_root = Path.home() / 'Library' / 'Application Support'
+    else:
+        user_root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    # (settings, from the repository's own workspace settings)
+    layers = ([(_shell_workspace_settings(cwd), True)] if cwd else []) + \
+        [(_shell_settings(user_root / _shell_vscode_app() / 'User' / 'settings.json'), False)]
+    for layer, _ in layers:
+        profile = layer.get('chat.tools.terminal.terminalProfile.' + key)
+        # Copilot's own profile takes one path, kept even when the file is missing; any other shape is ignored.
+        if isinstance(profile, dict) and isinstance(profile.get('path'), str):
+            return _shell_name(_shell_profile_path(profile['path'], check=False))
+    for layer, _ in layers:
+        chosen = layer.get('terminal.integrated.defaultProfile.' + key)
+        if not isinstance(chosen, str):
+            continue
+        spec, from_repo = next(((p[chosen], repo) for p, repo in
+                                ((lay.get('terminal.integrated.profiles.' + key), repo) for lay, repo in layers)
+                                if isinstance(p, dict) and isinstance(p.get(chosen), dict)), ({}, False))
+        if 'path' in spec:
+            name = _shell_name(_shell_profile_path(spec['path'], check=not from_repo))
+        elif chosen.lower() in _SHELL_VSCODE_BUILTIN:
+            name = _SHELL_VSCODE_BUILTIN[chosen.lower()] or _shell_windows_powershell()
+        else:
+            name = _shell_name(chosen)
+        break
+    else:
+        name = _shell_windows_powershell() if windows else _shell_env()
+    return {'cmd': 'powershell', 'sh': 'bash'}.get(name, name)
+
+
+def _shell_augment():
+    """Augment's shellPath setting, else the user's shell when Augment supports it, else its own default."""
+    settings = _shell_settings(Path.home() / '.augment' / 'settings.json')
+    for key in ('shellPath', 'shell'):
+        chosen = _shell_name(settings.get(key))
+        if chosen:
+            return chosen
+    if _shell_windows():
+        return 'powershell'
+    env = _shell_env()
+    return env if env in ('bash', 'zsh', 'fish', 'sh') else 'zsh' if sys.platform == 'darwin' else 'sh'
+
+
+def _shell_detect(agent, tool_name, cwd):
+    windows = _shell_windows()
+    tool = tool_name if isinstance(tool_name, str) else ''
+    if tool.lower() == 'powershell':
+        # Claude Code's, Copilot CLI's and Pi's PowerShell tools: pwsh, else Windows PowerShell.
+        return (_shell_windows_powershell() if windows else 'pwsh'), 'tool'
+    if agent == 'claude-code':
+        # The Bash tool runs Git Bash on Windows and the user's bash or zsh elsewhere.
+        env = None if windows else _shell_env()
+        return (env if env in ('bash', 'zsh') else 'bash'), 'tool'
+    if agent == 'copilot':
+        # The CLI's lowercase `bash` is its Unix tool; its PascalCase `Bash` names either shell.
+        if tool == 'bash':
+            return 'bash', 'tool'
+        if tool in ('run_in_terminal', 'runInTerminal'):
+            return _shell_vscode(cwd), 'agent_rule'
+        return ('powershell' if windows else 'bash'), 'agent_rule'
+    if agent == 'codex':
+        # Codex runs a login shell it supports, else zsh on macOS and bash elsewhere.
+        if windows:
+            return _shell_windows_powershell(), 'agent_rule'
+        login = _shell_login()
+        if login not in ('bash', 'zsh', 'sh', 'pwsh', 'powershell'):
+            login = 'zsh' if sys.platform == 'darwin' else 'bash'
+        return login, 'agent_rule'
+    if agent == 'cursor':
+        # Cursor runs $SHELL; one this hook doesn't know names nothing rather than a guess.
+        return (_shell_windows_powershell() if windows else _shell_env()), 'agent_rule'
+    if agent == 'augment':
+        return _shell_augment(), 'agent_rule'
+    return None, None
+
+
+def detect_shell(agent, tool_name=None, cwd=None):
+    """{'shell': …, 'shell_source': …} for one terminal call, or {} when the hook can't tell; never raises."""
+    key = (agent, tool_name, cwd)
+    if key not in _SHELL_CACHE:
+        try:
+            shell, source = _shell_detect(agent, tool_name, cwd)
+        except Exception:
+            shell, source = None, None
+        _SHELL_CACHE[key] = {'shell': shell, 'shell_source': source} if shell in _SHELL_NAMES else {}
+    return dict(_SHELL_CACHE[key])
+
+
+_DEVICE_OSES = {'Darwin': 'macos', 'Linux': 'linux', 'Windows': 'windows'}
+
+
+def device_os():
+    """'macos', 'linux' or 'windows' for this machine, or None when the hook can't tell; never raises."""
+    try:
+        return _DEVICE_OSES.get(platform.system())
+    except Exception:
+        return None
+# --- end shell detection ---
 
 
 # KEEP IN SYNC: transfer resolution — byte-identical in every agent hook, here and in cursor-plugin, do not diverge.
@@ -9942,6 +10305,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'git_branch': tool_branch
             }, log_entry.get('timestamp'))
             if tool_name in SHELL_TOOL_NAMES and isinstance(tool_input, dict):
+                tool_use_entry.update(detect_shell('claude-code', tool_name, event.get('cwd')))
                 transfer = _transfer(command, transfer_dir, transfer_state)
                 # Resolved from where the command STARTED, like the transfer above: _accounts replays the
                 # call's own cd, so the folder it ended in would move it a second time.
@@ -10710,7 +11074,7 @@ def _mcp_diag_claude_json(server, cwd):
 
 
 def _mcp_diag_project_mcp_json(cwd):
-    """Project .mcp.json up the cwd chain — the hook does NOT read these."""
+    """Project .mcp.json files up the cwd chain."""
     found = []
     try:
         start = Path(cwd or os.getcwd()).resolve()
@@ -10886,7 +11250,7 @@ def _diag_inventory(cwd, ps_out):
             seen.add(f)
             m = _diag_servers_from_json(f)
             if m:
-                inv.append({'source': 'project .mcp.json (hook does NOT read)',
+                inv.append({'source': 'project .mcp.json',
                             'file': str(f), 'servers': _summ(m)})
     except Exception:
         pass
@@ -11252,7 +11616,7 @@ def _render_mcp_diagnostic(d):
     for f in (d.get('launch_flags') or []):
         L.append('  %s' % f)
 
-    head('project .mcp.json files (hook does NOT read)')
+    head('project .mcp.json files')
     for pj in (d.get('project_mcp_json') or []):
         L.append('  %s -> %s' % (pj.get('file'), ', '.join(pj.get('servers') or [])))
 

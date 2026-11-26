@@ -314,6 +314,17 @@ def check_admin_privileges() -> bool:
         return False
 
 
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
+    'na', 'n/a', 'unknown', 'default', 'default string',
+    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
+    'system serial number', 'serial number', 'chassis serial number',
+    'system manufacturer', 'not applicable', 'not specified',
+    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
+    'xxxxxxxxxxxxxx',
+}
+
+
 def get_device_identifier() -> Optional[str]:
     """The device serial the backend keys this report on. None when it cannot be read."""
     system = platform.system().lower()
@@ -322,7 +333,7 @@ def get_device_identifier() -> Optional[str]:
             # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
             # "Serial Number" label is localized and fails on non-English macOS.
             result = subprocess.run(
-                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                 capture_output=True, text=True, timeout=10,
             )
             if result.returncode == 0:
@@ -369,22 +380,13 @@ def get_device_identifier() -> Optional[str]:
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True, text=True, timeout=10,
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
+                serial = result.stdout.strip() if result.returncode == 0 else ""
+                if serial and serial.lower() not in _PLACEHOLDER_SERIALS:
+                    return serial
             except Exception:
-                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                    r"SOFTWARE\Microsoft\Cryptography") as key:
-                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
-                    if value:
-                        return value
-            except Exception as e:
-                debug_print(f"Registry MachineGuid read failed: {e}")
+                pass
             return None
 
-        return None
     except Exception as e:
         debug_print(f"Failed to get device identifier: {e}")
         return None

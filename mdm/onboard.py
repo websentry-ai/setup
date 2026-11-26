@@ -52,6 +52,10 @@ nothing to clear; backfill is also skipped because there's nothing to seed):
 The Pi clear step always runs, detected or not: a device whose pi was
 uninstalled still carries the extension and the rc export.
 
+On Windows it also registers a logon task that sets up each user's WSL distros
+as that user, since SYSTEM cannot run wsl.exe. --clear unstages every tool, so each
+user's next logon clears their distros; the task deletes itself after 30 days.
+
 Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
 """
@@ -60,6 +64,7 @@ import json
 import os
 import platform
 import random
+import shutil
 import signal
 import stat
 import subprocess
@@ -67,6 +72,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+from pathlib import Path
 
 _RAW_SETUP = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main"
 _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main"
@@ -132,6 +138,67 @@ DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
 
 # Spread a fleet-wide Jamf push across a window, like the per-tool MDM scripts.
 MDM_RETRY_JITTER_SECONDS = 5
+
+WSL_TASK_NAME = "Unbound WSL Setup"
+# Runs as each user at logon with the user-level installers staged beside it; their
+# setup_wsl() installs into the user's WSL distros and leaves Windows untouched.
+WSL_RUNNER = r'''import importlib.util, json, os, sys, time
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+local = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Unbound"
+log = local / "wsl_setup.log"
+log.parent.mkdir(parents=True, exist_ok=True)
+sys.stdout = sys.stderr = open(log, "a", encoding="utf-8")
+print(time.strftime("%Y-%m-%d %H:%M:%S"), "WSL setup")
+
+
+def run(script, args):
+    print(script.name)
+    try:
+        spec = importlib.util.spec_from_file_location(script.stem.replace("-", "_"), script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.setup_wsl(args) is not False
+    except Exception as e:
+        print(f"WSL: failed ({e!r})")
+        return False
+
+
+staged = Path(__file__).parent
+# clear\ holds onboard's own copy of every installer it staged, so a tool unstaged since is cleared from there.
+# The per-user list only skips clears that already succeeded; a failed one runs again at the next logon.
+# Entries carry the enrollment, so a clear after a re-onboard runs even if this user cleared the last one.
+try:
+    gen = (staged / "generation").read_text(encoding="utf-8").strip()
+except OSError:
+    gen = ""
+done = local / "wsl_cleared.txt"
+try:
+    cleared = set(done.read_text(encoding="utf-8").split())
+except OSError:
+    cleared = set()
+cleared = {c for c in cleared if not (staged / c.rsplit("@", 1)[0]).is_file()}
+for script in sorted((staged / "clear").glob("*-setup.py")):
+    tag = f"{script.name}@{gen}"
+    if not (staged / script.name).is_file() and tag not in cleared and run(script, ["--clear"]):
+        cleared.add(tag)
+done.write_text("\n".join(sorted(cleared)), encoding="utf-8")
+try:
+    cfg = json.loads((Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8"))
+except (OSError, ValueError):
+    cfg = {}
+key = cfg.get("device_token") or cfg.get("api_key")
+if not isinstance(key, str) or not key:
+    print("no key in ~/.unbound/config.json yet")
+    sys.exit(0)
+args = ["--api-key", key]
+for flag, name in (("--backend-url", "base_url"), ("--gateway-url", "gateway_url"), ("--domain", "frontend_url")):
+    if isinstance(cfg.get(name), str) and cfg[name]:
+        args += [flag, cfg[name]]
+for script in sorted(staged.glob("*-setup.py")):
+    run(script, args)
+'''
 
 USAGE = (
     "Usage:\n"
@@ -277,6 +344,17 @@ def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -
         print(f"[Discovery] [{host}] discovery not reaped within 10s of SIGKILL.", file=sys.stderr)
 
 
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', '000000000000', 'none',
+    'na', 'n/a', 'unknown', 'default', 'default string',
+    'to be filled by o.e.m.', 'to be filled by oem', 'serialnumber',
+    'system serial number', 'serial number', 'chassis serial number',
+    'system manufacturer', 'not applicable', 'not specified',
+    'not available', 'oem', 'o.e.m.', 'invalid', '123456789', 'xxxxxxxx',
+    'xxxxxxxxxxxxxx',
+}
+
+
 def get_device_identifier():
     """Hardware serial, resolved exactly as the per-tool MDM scripts resolve it
     (claude-code/hooks/mdm/setup.py). Steps 1-5 enroll the device under this
@@ -289,7 +367,7 @@ def get_device_identifier():
             # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
             # "Serial Number" label is localized and fails on non-English macOS.
             result = subprocess.run(
-                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                 capture_output=True, text=True, timeout=10,
             )
             if result.returncode == 0:
@@ -336,24 +414,13 @@ def get_device_identifier():
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True, text=True, timeout=10,
                 )
-                if result.returncode == 0 and result.stdout.strip():
-                    return result.stdout.strip()
+                serial = result.stdout.strip() if result.returncode == 0 else ""
+                if serial and serial.lower() not in _PLACEHOLDER_SERIALS:
+                    return serial
             except Exception:
                 pass
-            try:
-                import winreg
-                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                                    r"SOFTWARE\Microsoft\Cryptography") as key:
-                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
-                    if value:
-                        return str(value).strip()
-            except Exception:
-                pass
-            try:
-                import socket
-                return socket.gethostname()
-            except Exception:
-                return None
+            return None
+
     except Exception as e:
         print(f"[Discovery] device identifier probe failed: {e}", file=sys.stderr)
         return None
@@ -693,6 +760,107 @@ def should_install_pi() -> bool:
         return True
 
 
+def _wsl_dir() -> Path:
+    # Program Files, not ProgramData: users can't add a script here for another user's logon to run.
+    # ProgramW6432 first: under a 32-bit Python ProgramFiles is the (x86) folder the installers don't check.
+    return Path(os.environ.get("ProgramW6432") or os.environ.get("ProgramFiles", r"C:\Program Files")) / "Unbound WSL"
+
+
+def _powershell(script: str, env: dict) -> bool:
+    exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    try:
+        r = subprocess.run([str(exe), "-NoProfile", "-NonInteractive", "-Command", script],
+                           capture_output=True, text=True, timeout=120, env={**os.environ, **env})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"   PowerShell failed: {e!r}", file=sys.stderr)
+        return False
+    if r.returncode != 0:
+        print(f"   PowerShell failed: {r.stderr.strip()[-400:]}", file=sys.stderr)
+    return r.returncode == 0
+
+
+def _all_users_pythonw():
+    """The task runs this interpreter as every user, so it must be one users can't replace."""
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+    roots = [os.environ.get(v) for v in ("ProgramFiles", "ProgramFiles(x86)")]
+    trusted = any(r and str(pythonw).lower().startswith(r.lower().rstrip("\\") + "\\") for r in roots)
+    return pythonw if trusted and pythonw.is_file() else None
+
+
+def install_wsl_logon_task(mdm_urls: list) -> bool:
+    """Stages the user-level installers for `mdm_urls` and registers a task that runs them
+    for each user at logon, so their WSL distros get set up as them."""
+    pythonw = _all_users_pythonw()
+    if not pythonw:
+        print(f"   Skipped: {sys.executable} is not an all-users Python under Program Files.")
+        return False
+    target = _wsl_dir()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "run.py").write_text(WSL_RUNNER, encoding="utf-8")
+        # A new enrollment, so each user's record of an earlier clear no longer counts.
+        (target / "generation").write_text(os.urandom(8).hex(), encoding="utf-8")
+    except OSError as e:
+        print(f"   Could not stage the WSL installers: {e}", file=sys.stderr)
+        return False
+    # Only --clear removes an installer, so a tool that fails one run keeps the copy staged before.
+    for url in mdm_urls:
+        user_url = url.replace("/mdm/setup.py", "/setup.py")
+        try:
+            source = fetch_script(user_url)
+            compile(source, user_url, "exec")
+            name = user_url[len(_RAW_SETUP) + 1:].replace("/", "-")
+            # clear\ keeps a copy the runner clears from once the tool is unstaged, even by a bare unlink.
+            for dest in (target / name, target / "clear" / name):
+                dest.parent.mkdir(exist_ok=True)
+                # Write beside it, then rename: a failed write never truncates the staged copy.
+                dest.with_suffix(".tmp").write_bytes(source)
+                os.replace(dest.with_suffix(".tmp"), dest)
+        except Exception as e:
+            print(f"   Could not stage {user_url}: {e}", file=sys.stderr)
+    return _register_wsl_task(pythonw, "")
+
+
+def _register_wsl_task(pythonw: Path, days: str) -> bool:
+    # No task time limit (PT0S): each distro call already stops after 900s, so tools x distros bounds the run.
+    # With days set the trigger expires then and Windows deletes the task (DeleteExpiredTaskAfter PT0S).
+    return _powershell(
+        "$a = New-ScheduledTaskAction -Execute $env:UNB_EXE -Argument $env:UNB_ARGS; "
+        "$p = New-ScheduledTaskPrincipal -GroupId 'S-1-5-32-545' -RunLevel Limited; "
+        "$t = New-ScheduledTaskTrigger -AtLogOn; "
+        "if ($env:UNB_DAYS) { $t.EndBoundary = (Get-Date).AddDays([int]$env:UNB_DAYS).ToString('s') }; "
+        "$s = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances Parallel; "
+        "if ($env:UNB_DAYS) { $s.DeleteExpiredTaskAfter = 'PT0S' }; "
+        "Register-ScheduledTask -TaskName $env:UNB_TASK -Action $a -Trigger $t "
+        "-Principal $p -Settings $s -Force -ErrorAction Stop | Out-Null; "
+        "Start-ScheduledTask -TaskName $env:UNB_TASK",
+        {"UNB_EXE": str(pythonw), "UNB_ARGS": f'-I "{_wsl_dir() / "run.py"}"', "UNB_TASK": WSL_TASK_NAME,
+         "UNB_DAYS": days})
+
+
+def remove_wsl_logon_task() -> bool:
+    """Moves every staged installer into clear\\ and keeps the task 30 days, so each user's next logon
+    clears their distros from that protected copy; Windows then deletes the task."""
+    target = _wsl_dir()
+    pythonw = _all_users_pythonw()
+    if (target / "run.py").is_file() and pythonw:
+        try:
+            # Rewritten so a device staged by an older runner, with no clear step, gets one now.
+            (target / "run.py").write_text(WSL_RUNNER, encoding="utf-8")
+            (target / "clear").mkdir(exist_ok=True)
+            for p in target.glob("*-setup.py"):
+                os.replace(p, target / "clear" / p.name)
+        except OSError as e:
+            print(f"   Could not unstage the WSL installers: {e}", file=sys.stderr)
+            return False
+        return _register_wsl_task(pythonw, "30")
+    # Never staged, or no trusted Python to clear with: a missing task is not a failure; a bare Unregister of one exits 1.
+    ok = _powershell("Get-ScheduledTask -TaskName $env:UNB_TASK -ErrorAction SilentlyContinue | "
+                     "Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop; exit 0", {"UNB_TASK": WSL_TASK_NAME})
+    shutil.rmtree(_wsl_dir(), ignore_errors=True)
+    return ok and not _wsl_dir().exists()
+
+
 def _stdout_never_raises() -> None:
     """MDM gives this a non-console pipe, which on Windows defaults to cp1252 and
     raises UnicodeEncodeError on the first non-ASCII status line."""
@@ -741,6 +909,7 @@ def main() -> int:
         return 1
 
     failures = []
+    installed = []
 
     for name, url, supports_backfill, supports_skip_settings in TOOLS:
         print(f"\n{'=' * 60}\n[{name}] MDM setup\n{'=' * 60}\n")
@@ -748,6 +917,8 @@ def main() -> int:
                                    skip_managed_settings)
         if not run_tool(name, url, tool_args):
             failures.append(name)
+        else:
+            installed.append(url)
 
     # Pi installs only where pi is detected. --clear never asks: a device whose pi
     # was uninstalled still carries the extension and the rc export.
@@ -758,10 +929,22 @@ def main() -> int:
         pi_args = tool_arguments(mdm_args, pi_backfill, pi_skip_settings, skip_managed_settings)
         if not run_tool(pi_name, pi_url, pi_args):
             failures.append(pi_name)
+        else:
+            installed.append(pi_url)
     else:
         pi_skipped = True
         print(f"\n[{pi_name}] pi was not detected on this device; skipping its setup. "
               "This is not a failure.")
+
+    # WSL distros are per user and SYSTEM cannot reach them; a failure here leaves Windows set up.
+    if platform.system().lower() == "windows":
+        print(f"\n{'=' * 60}\n[WSL] per-user logon task\n{'=' * 60}\n")
+        if is_clear:
+            print("✅ Each user's WSL distros are cleared at their next logon" if remove_wsl_logon_task()
+                  else "⚠️  Could not fully remove the WSL logon task")
+        elif installed:
+            print("✅ Registered" if install_wsl_logon_task(installed)
+                  else "⚠️  WSL distros will not be set up; Windows setup is unaffected")
 
     # Discovery is a one-shot scan — skip it on --clear (nothing to remove).
     discovery_skipped = False
