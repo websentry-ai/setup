@@ -10465,8 +10465,19 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     # A resource ID (`--ids`, `--scope`) acts in the subscription it names, not the default; several, or one the
     # hook cannot read (`--ids "$(…)"`), are unknown.
     in_ids = {match.lower() for arg in args for match in _ACCOUNT_AZ_ID_SUBSCRIPTION.findall(arg)}
-    if in_ids or any(arg.split('=', 1)[0] in ('--ids', '--scope') for arg in args):
-        only = _account_value(next(iter(in_ids))) if len(in_ids) == 1 else None
+    values, taking = [], False
+    for arg in args:
+        option, equals, value = arg.partition('=')
+        if option in ('--ids', '--scope'):
+            values, taking = values + ([value] if equals else []), not equals
+        elif arg.startswith('-'):
+            taking = False
+        elif taking:
+            values.append(arg)
+    if in_ids or values or any(arg.partition('=')[0] in ('--ids', '--scope') for arg in args):
+        # Every ID given must name a readable subscription, or one that cannot be read may name another.
+        unread = any(not _account_value(next(iter(_ACCOUNT_AZ_ID_SUBSCRIPTION.findall(v)), '')) for v in values)
+        only = _account_value(next(iter(in_ids))) if len(in_ids) == 1 and not unread else None
         if not only or (named and named.lower() != only):
             return [], None
         named = only
@@ -10762,9 +10773,9 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
             return 'kubeconfig'
         if (group, action) == ('account', 'set'):
             return 'azure'
-        # `az login` rewrites every subscription entry, and `az cloud set`, or an `az config` write to a `cloud.`
-        # key, changes the cloud each is matched within; other config keys (`defaults.location`) do not.
-        if group == 'login' or (group, action) == ('cloud', 'set') or (
+        # `az login`, `az logout` and `az account clear` rewrite every subscription entry, and `az cloud set`, or an
+        # `az config` write to a `cloud.` key, changes the cloud each is matched within; `defaults.*` keys do not.
+        if group in ('login', 'logout') or (group, action) in (('account', 'clear'), ('cloud', 'set')) or (
                 group == 'config' and action in ('set', 'unset') and any(
                     arg.lower().startswith('cloud.') for arg in args)):
             return 'azure-cloud'

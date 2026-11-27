@@ -458,6 +458,7 @@ class AccountPlatformTests(unittest.TestCase):
         for command in ('az vm delete --ids %s %s' % (sandbox, other),
                         'az vm delete --ids /subscriptions/$SUB/resourceGroups/rg',
                         'az vm delete --ids "$IDS"',
+                        'az vm delete --ids %s "$OTHER_ID"' % sandbox,
                         'az role assignment list --scope=$SCOPE',
                         "az vm delete --subscription 'Acme Production' --ids " + sandbox):
             for path, resolved in self.each(command):
@@ -805,6 +806,12 @@ class AccountPlatformTests(unittest.TestCase):
             named = hook._accounts("az group list --subscription 'Acme Production'", self.repo, state)
             hook._accounts('az login', self.repo, state)
             self.assertEqual(named.get('accounts'), [], path)
+        for switch in ('az logout', 'az account clear'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                named = hook._accounts("az group list --subscription 'Acme Production'", self.repo, state)
+                hook._accounts(switch, self.repo, state)
+                self.assertEqual(named.get('accounts'), [], '%s / %s' % (path, switch))
 
     def test_a_kubeconfig_the_call_set_to_something_unreadable_is_not_ours(self):
         for command in ('KUBECONFIG=$KCFG kubectl get pods', 'KUBECONFIG=$(cat kcfg) kubectl get pods'):
