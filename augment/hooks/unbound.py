@@ -8644,9 +8644,10 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     named, known = _account_option(args, ('--subscription',), _account_path)
     if not known:
         return [], None
-    # A resource ID (`--ids`, `--scope`) acts in the subscription it names, not the default; several are unknown.
+    # A resource ID (`--ids`, `--scope`) acts in the subscription it names, not the default; several, or one the
+    # hook cannot read (`--ids "$(…)"`), are unknown.
     in_ids = {match.lower() for arg in args for match in _ACCOUNT_AZ_ID_SUBSCRIPTION.findall(arg)}
-    if in_ids:
+    if in_ids or any(arg.split('=', 1)[0] in ('--ids', '--scope') for arg in args):
         only = _account_value(next(iter(in_ids))) if len(in_ids) == 1 else None
         if not only or (named and named.lower() != only):
             return [], None

@@ -457,6 +457,8 @@ class AccountPlatformTests(unittest.TestCase):
         other = sandbox.replace('0002', '0001')
         for command in ('az vm delete --ids %s %s' % (sandbox, other),
                         'az vm delete --ids /subscriptions/$SUB/resourceGroups/rg',
+                        'az vm delete --ids "$IDS"',
+                        'az role assignment list --scope=$SCOPE',
                         "az vm delete --subscription 'Acme Production' --ids " + sandbox):
             for path, resolved in self.each(command):
                 self.assertEqual((resolved or {}).get('accounts', []), [], '%s / %s' % (path, command))
