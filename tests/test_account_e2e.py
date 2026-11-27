@@ -5,7 +5,8 @@ Each test runs the hook file as a subprocess, with a sandboxed $HOME holding fak
 configuration, the real `git`, `gh` and `kubectl`, and every proxy pointed at a closed port. The comparisons against
 the hook as it was before account resolution load that version from `origin/staging`.
 
-Set UNBOUND_ACCOUNT_E2E_OUT to a folder to keep each turn-log body there as <test>_<tool>.json.
+Set UNBOUND_ACCOUNT_E2E_OUT to a folder to keep each turn-log body there as <test>_<tool>.json, and
+UNBOUND_ACCOUNT_E2E_STAGING to an extracted origin/staging tree where this checkout has no git history.
 """
 
 import base64
@@ -128,17 +129,58 @@ PLATFORM_CALLS = [
 
 STAGING_HOOKS = {}
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == 'win32' or not all(shutil.which(name) for name in ('git', 'gh', 'kubectl')),
-    reason='needs a POSIX shell layout and the real git, gh and kubectl')
+WINDOWS = os.name == 'nt'
+# What Python and the CLIs need to start on Windows, passed through from the runner's own environment.
+_WINDOWS_PASSTHROUGH = ('SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT', 'PROCESSOR_ARCHITECTURE',
+                        'NUMBER_OF_PROCESSORS', 'USERNAME', 'USERDOMAIN')
+
+pytestmark = pytest.mark.skipif(not all(shutil.which(name) for name in ('git', 'gh', 'kubectl')),
+                                reason='needs the real git, gh and kubectl')
 
 
 # --- Sandbox -----------------------------------------------------------------------------------------------------
 
 
+def _home_env(home):
+    """The variables every CLI reads its home from: HOME, and on Windows the profile and AppData folders too."""
+    env = {'HOME': str(home)}
+    if WINDOWS:
+        drive, rest = os.path.splitdrive(str(home))
+        env.update({'USERPROFILE': str(home), 'HOMEDRIVE': drive, 'HOMEPATH': rest,
+                    'APPDATA': str(home / 'AppData' / 'Roaming'), 'LOCALAPPDATA': str(home / 'AppData' / 'Local')})
+        env.update({name: os.environ[name] for name in _WINDOWS_PASSTHROUGH if name in os.environ})
+    return env
+
+
+def _system_path():
+    """The system folders, with git; on Windows git's own folder, since it is not in System32."""
+    if WINDOWS:
+        root = os.environ.get('SYSTEMROOT', r'C:\Windows')
+        return os.pathsep.join([os.path.dirname(shutil.which('git')), os.path.join(root, 'System32'), root])
+    return '/usr/bin:/bin:/usr/sbin:/sbin'
+
+
 def _git(project, home, *args):
     subprocess.run(['git', *args], cwd=str(project), check=True, capture_output=True,
-                   env={'HOME': str(home), 'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1'})
+                   env={**_home_env(home), 'PATH': _system_path(), 'GIT_CONFIG_NOSYSTEM': '1'})
+
+
+def _gh_hosts(home):
+    """Where gh keeps its logins: AppData on Windows, ~/.config elsewhere."""
+    if WINDOWS:
+        return home / 'AppData' / 'Roaming' / 'GitHub CLI' / 'hosts.yml'
+    return home / '.config' / 'gh' / 'hosts.yml'
+
+
+def _add_tools(bin_dir):
+    """The real gh and kubectl, which the hook runs for its two lookups; copied where a link cannot be made."""
+    for name in ('gh', 'kubectl'):
+        found = shutil.which(name)
+        target = bin_dir / os.path.basename(found)
+        if WINDOWS:
+            shutil.copy2(found, str(target))
+        else:
+            os.symlink(found, str(target))
 
 
 def _write_accounts(home):
@@ -149,8 +191,8 @@ def _write_accounts(home):
     (home / '.aws' / 'credentials').write_text(AWS_CREDENTIALS)
     (home / '.kube').mkdir()
     (home / '.kube' / 'config').write_text(KUBECONFIG)
-    (home / '.config' / 'gh').mkdir(parents=True)
-    (home / '.config' / 'gh' / 'hosts.yml').write_text(GH_HOSTS)
+    _gh_hosts(home).parent.mkdir(parents=True)
+    _gh_hosts(home).write_text(GH_HOSTS)
     (home / '.azure').mkdir()
     # The Azure CLI writes its profile with a UTF-8 BOM.
     (home / '.azure' / 'azureProfile.json').write_bytes(b'\xef\xbb\xbf' + json.dumps(AZURE_PROFILE).encode())
@@ -167,22 +209,25 @@ def accounts(sandbox):
     _git(project, home, 'init', '-q', '-b', 'main')
     _git(project, home, 'remote', 'add', 'origin', 'https://github.com/acme/app.git')
     _git(project, home, 'remote', 'add', 'backup', 'https://github.com/acme-backup/app.git')
-    # The real gh and kubectl, which the hook runs for its two lookups; nothing else it may not run is on PATH.
-    for name in ('gh', 'kubectl'):
-        os.symlink(shutil.which(name), str(sandbox['bin'] / name))
+    _add_tools(sandbox['bin'])
     return sandbox
 
 
 def env_for(sandbox, gateway):
-    return {**hook_env(sandbox, gateway), 'SHELL': '/bin/zsh'}
+    if not WINDOWS:
+        return {**hook_env(sandbox, gateway), 'SHELL': '/bin/zsh'}
+    tmp = str(sandbox['tmp'])
+    return {**hook_env(sandbox, gateway), **_home_env(sandbox['home']), 'TEMP': tmp, 'TMP': tmp,
+            'PATH': os.pathsep.join([str(sandbox['bin']), _system_path()])}
 
 
 def staging_hook(tool, tmp_root):
     """The hook file as it is on origin/staging, before account resolution, written outside the repository."""
     relative = HOOKS[tool].relative_to(REPO)
     if tool not in STAGING_HOOKS:
+        staging_tree = os.environ.get('UNBOUND_ACCOUNT_E2E_STAGING')
         try:
-            text = subprocess.run(['git', 'show', 'origin/staging:%s' % relative.as_posix()], cwd=str(REPO),
+            text = (Path(staging_tree) / relative).read_text(encoding='utf-8') if staging_tree else subprocess.run(['git', 'show', 'origin/staging:%s' % relative.as_posix()], cwd=str(REPO),
                                   check=True, capture_output=True, text=True).stdout
         except (OSError, subprocess.CalledProcessError):
             pytest.skip('origin/staging is not available to compare against')
@@ -190,7 +235,7 @@ def staging_hook(tool, tmp_root):
         STAGING_HOOKS[tool] = text
     path = tmp_root / 'staging-hooks' / relative
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(STAGING_HOOKS[tool])
+    path.write_text(STAGING_HOOKS[tool], encoding='utf-8')
     return path
 
 
@@ -533,7 +578,9 @@ def _normalise(value, root):
     if isinstance(value, list):
         return [_normalise(item, root) for item in value]
     if isinstance(value, str):
-        text = value.replace(str(root), '<root>')
+        text = value
+        for spelling in {str(root), str(root).replace('\\', '/'), os.path.realpath(str(root))}:
+            text = text.replace(spelling, '<root>')
         if text != value or not text.startswith('{'):
             return _UUID.sub('<uuid>', _ISO.sub('<ts>', text))
         # A JSON document inside a string (the turn log's assistant message) is compared as data.
@@ -580,8 +627,7 @@ def _sandbox_at(root):
     _git(project, home, 'init', '-q', '-b', 'main')
     _git(project, home, 'remote', 'add', 'origin', 'https://github.com/acme/app.git')
     _git(project, home, 'remote', 'add', 'backup', 'https://github.com/acme-backup/app.git')
-    for name in ('gh', 'kubectl'):
-        os.symlink(shutil.which(name), str(bin_dir / name))
+    _add_tools(bin_dir)
     return {'root': root, 'home': home, 'project': project, 'tmp': tmp, 'bin': bin_dir}
 
 
@@ -633,13 +679,28 @@ def _diff(left, right):
 
 def _break(home, how):
     files = [home / '.aws' / 'config', home / '.kube' / 'config', home / '.azure' / 'azureProfile.json',
-             home / '.config' / 'gh' / 'hosts.yml']
+             _gh_hosts(home)]
     for path in files:
         if how == 'garbage':
             path.write_bytes(b'\x00\xff\xfe[[[ not: a: config\n\x89PNG\r\n' * 64)
+        elif WINDOWS:
+            # chmod only sets the read-only flag on Windows; a deny entry is what stops a read.
+            subprocess.run(['icacls', str(path), '/deny', '%s:(R)' % os.environ['USERNAME']], check=True,
+                           capture_output=True)
         else:
             path.chmod(0)
+    if how == 'unreadable':
+        for path in files:
+            with pytest.raises(OSError):
+                path.read_bytes()
     return files
+
+
+def _mend(files):
+    for path in files:
+        if WINDOWS:
+            subprocess.run(['icacls', str(path), '/remove:d', os.environ['USERNAME']], capture_output=True)
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
 @pytest.mark.parametrize('how', ['garbage', 'unreadable'])
@@ -654,8 +715,7 @@ def test_b10_a_corrupt_or_unreadable_config_sends_the_turn_and_no_account_for_th
                     'git commit -m "still known"']
         body, _ = run_turn(tool, accounts, gateway, commands)
     finally:
-        for path in broken:
-            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        _mend(broken)
     entries = calls_by_command(body, commands)
     for command in commands[:-1]:
         assert 'accounts' not in entries[command], '%s: %s' % (command, json.dumps(entries[command], indent=2))
