@@ -969,6 +969,12 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('docker push acme.azurecr.io/app:1'):
             self.assertEqual([a['platform'] for a in resolved['accounts']], ['docker'], path)
 
+    def test_a_gcr_image_records_only_its_registry_host(self):
+        """Google Cloud is not resolved, so the project in the path is not taken for an account."""
+        for path, resolved in self.each('docker push gcr.io/customer-prod/app:1'):
+            self.assertEqual(resolved['accounts'],
+                             [{'platform': 'docker', 'registry': 'gcr.io', 'source': 'hostname'}], path)
+
     # -- the whole payload ----------------------------------------------------
 
     def test_no_secret_from_any_credential_store_reaches_the_payload(self):
