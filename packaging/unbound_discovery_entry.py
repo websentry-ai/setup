@@ -14,6 +14,9 @@ the UNBOUND_API_KEY env var, mirroring upstream) and --domain are non-empty.
 Subcommand routing mirrors upstream install.sh at SOURCE_REF: a leading
 "mcp-scan" runs the on-demand single-server scan (scan_single_mcp_server,
 used by the agent hooks when the gateway reports an unknown MCP server);
+a leading "memory-fix" runs the keyless memory-file fixer (memory_fix_helper)
+that the agent re-launches itself into as the file's owner, speaking JSON on
+stdin/stdout, so that route never writes to stdout itself;
 anything else runs the full discovery sweep. Everything else (argument
 semantics, detection, reporting via curl) is the upstream script, unchanged.
 """
@@ -86,6 +89,26 @@ def main():
 
         try:
             return mcp_scan_main()
+        except Exception:
+            _log_crash()
+            return 1
+
+    if argv and argv[0] == "memory-fix":
+        sys.argv = [sys.argv[0]] + argv[1:]
+        try:
+            from coding_discovery_tools.memory_fix_helper import main as memory_fix_main
+        except ModuleNotFoundError as missing:
+            # Only the helper itself being absent means "this bundle has no helper"; anything else is a crash.
+            if missing.name not in ("coding_discovery_tools", "coding_discovery_tools.memory_fix_helper"):
+                _log_crash()
+                return 1
+            return 3
+        except ImportError:
+            _log_crash()
+            return 1
+
+        try:
+            return memory_fix_main()
         except Exception:
             _log_crash()
             return 1

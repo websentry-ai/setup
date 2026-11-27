@@ -14,6 +14,8 @@ this side.
 
 import importlib.util
 import json
+import sys
+import types
 
 import pytest
 
@@ -129,3 +131,72 @@ def test_frozen_discovery_missing_binary_skips_without_exec(frozen_module, monke
     monkeypatch.setattr(m, "FROZEN_DISCOVERY_BIN", str(REPO / "does-not-exist"))
     m._dispatch_discovery()
     assert calls == [], "must not exec (or fall back to download) when binary missing"
+
+
+def _load_discovery_entry():
+    spec = importlib.util.spec_from_file_location(
+        "unbound_discovery_entry", REPO / "packaging" / "unbound_discovery_entry.py"
+    )
+    entry = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(entry)
+    return entry
+
+
+def _install_fake_memory_fix_helper(monkeypatch, helper_main):
+    for name in ("coding_discovery_tools", "coding_discovery_tools.memory_fix_helper"):
+        monkeypatch.delitem(sys.modules, name, raising=False)
+    package = types.ModuleType("coding_discovery_tools")
+    package.__path__ = []
+    helper = types.ModuleType("coding_discovery_tools.memory_fix_helper")
+    helper.main = helper_main
+    monkeypatch.setitem(sys.modules, "coding_discovery_tools", package)
+    monkeypatch.setitem(sys.modules, "coding_discovery_tools.memory_fix_helper", helper)
+
+
+def test_entry_memory_fix_runs_helper_and_strips_token(monkeypatch):
+    seen_argv = []
+
+    def helper_main():
+        seen_argv.append(list(sys.argv))
+        return 2
+
+    _install_fake_memory_fix_helper(monkeypatch, helper_main)
+    monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix", "--extra"])
+    assert _load_discovery_entry().main() == 2
+    assert seen_argv == [["unbound-discovery", "--extra"]]
+
+
+def test_entry_memory_fix_runs_without_any_config(monkeypatch, capsys):
+    monkeypatch.delenv("UNBOUND_API_KEY", raising=False)
+    calls = []
+    _install_fake_memory_fix_helper(monkeypatch, lambda: calls.append(1) or 0)
+    monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix"])
+    assert _load_discovery_entry().main() == 0
+    assert calls == [1], "memory-fix must not fall into the no-config idle branch"
+    assert capsys.readouterr().out == ""
+
+
+def test_entry_memory_fix_missing_helper_exits_3_with_empty_stdout(monkeypatch, capsys):
+    monkeypatch.delitem(sys.modules, "coding_discovery_tools.memory_fix_helper", raising=False)
+    monkeypatch.setitem(sys.modules, "coding_discovery_tools", types.ModuleType("coding_discovery_tools"))
+    monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix"])
+    assert _load_discovery_entry().main() == 3
+    assert capsys.readouterr().out == ""
+
+
+def test_entry_memory_fix_broken_helper_import_exits_1_not_3(monkeypatch, capsys):
+    _install_fake_memory_fix_helper(monkeypatch, lambda: 0)
+    monkeypatch.delattr(sys.modules["coding_discovery_tools.memory_fix_helper"], "main")
+    monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix"])
+    assert _load_discovery_entry().main() == 1
+    assert capsys.readouterr().out == ""
+
+
+def test_entry_memory_fix_helper_crash_exits_1(monkeypatch, capsys):
+    def helper_main():
+        raise RuntimeError("boom")
+
+    _install_fake_memory_fix_helper(monkeypatch, helper_main)
+    monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix"])
+    assert _load_discovery_entry().main() == 1
+    assert capsys.readouterr().out == ""
