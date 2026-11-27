@@ -424,6 +424,22 @@ class AccountPlatformTests(unittest.TestCase):
             self.assertEqual(before.get('accounts'), [], path)
             self.assertEqual(named['accounts'][0]['context'], 'prod-eks', path)
 
+    def test_any_kubeconfig_writer_leaves_the_earlier_kubectl_call_unknown(self):
+        """Tools beyond kubectl write the kubeconfig too: by what they say, or by being a context switcher."""
+        for writer in ('gcloud container clusters get-credentials prod', 'eksctl utils write-kubeconfig -c prod',
+                       'kind export kubeconfig', 'kubectx prod', 'minikube start'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('kubectl get pods', self.repo, state)
+                hook._accounts(writer, self.repo, state)
+                self.assertEqual(before.get('accounts'), [], '%s / %s' % (path, writer))
+        for other in ('helm list --kubeconfig ./kc', 'ls -la'):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                state = {}
+                before = hook._accounts('kubectl get pods', self.repo, state)
+                hook._accounts(other, self.repo, state)
+                self.assertNotEqual(before.get('accounts'), [], '%s / %s' % (path, other))
+
     def test_a_later_subscription_switch_leaves_the_earlier_az_call_unknown(self):
         for path, hook in zip(HOOK_PATHS, HOOKS):
             state = {}

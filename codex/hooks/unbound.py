@@ -9145,7 +9145,17 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
                 group == 'config' and action in ('set', 'unset') and any(
                     arg.lower().startswith('cloud.') for arg in args)):
             return 'azure-cloud'
+    # Any other tool that writes a kubeconfig moves what an earlier kubectl call read: one that says so in a word
+    # (`gcloud … get-credentials`, `eksctl utils write-kubeconfig`, `kind export kubeconfig`), or a context switcher
+    # or local-cluster tool that sets the current context without saying so. A false match only leaves it unknown.
+    if program != 'kubectl' and (program in _ACCOUNT_KUBE_WRITERS or any(
+            _ACCOUNT_KUBE_WRITE_WORD.match(arg) for arg in args if not arg.startswith('-'))):
+        return 'kubeconfig'
     return None
+
+
+_ACCOUNT_KUBE_WRITERS = frozenset({'kubectx', 'minikube', 'kind', 'k3d', 'eksctl'})
+_ACCOUNT_KUBE_WRITE_WORD = re.compile(r'^(?:get-credentials|[\w-]*kubeconfig|use-context|set-context)$', re.I)
 
 
 # `git remote` subcommands that change where a push goes, and the config keys that do.
@@ -9194,7 +9204,8 @@ def _account_remote_scope(args: List[str]) -> Optional[str]:
 # A call that only SETS a remembered variable still has to be read, or the export it makes is never remembered.
 # Case-insensitive and with an optional `.exe`, as the walk itself names a program (`Git.exe push` on Windows).
 _ACCOUNT_TRIGGERS = re.compile(
-    r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])' % '|'.join(sorted(_ACCOUNT_HANDLERS)), re.IGNORECASE)
+    r'(?<![\w.-])(%s)(?:\.exe)?(?![\w.-])|get-credentials|kubeconfig|use-context|set-context'
+    % '|'.join(sorted(set(_ACCOUNT_HANDLERS) | _ACCOUNT_KUBE_WRITERS)), re.IGNORECASE)
 # `GIT_CONFIG_GLOBAL=` set empty makes git read no global file, while `unset` makes it read the default one; the
 # walk sees both as empty, so a git call after an explicit empty one is not resolved.
 _ACCOUNT_EMPTY_GIT_CONFIG = re.compile(r'(?<![\w$])GIT_CONFIG_(?:GLOBAL|SYSTEM)=(?=\s|$|[;&|)]|""|\'\')')
