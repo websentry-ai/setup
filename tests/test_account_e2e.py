@@ -709,8 +709,18 @@ def test_b10_a_corrupt_or_unreadable_config_sends_the_turn_and_no_account_for_th
                                                                                           gateway):
     if how == 'unreadable' and hasattr(os, 'geteuid') and os.geteuid() == 0:
         pytest.skip('root reads any file')
+    if how == 'unreadable' and WINDOWS:
+        import ctypes
+        if ctypes.windll.shell32.IsUserAnAdmin():
+            pytest.skip('an elevated session reads through a deny entry')
     broken = _break(accounts['home'], how)
     try:
+        if how == 'unreadable':
+            # The CLI the hook asks must be unable to read it too, or the file is not unreadable to it.
+            kubeconfig = accounts['home'] / '.kube' / 'config'
+            seen = subprocess.run([shutil.which('kubectl'), 'config', 'view', '--kubeconfig', str(kubeconfig)],
+                                  capture_output=True, text=True, env=env_for(accounts, gateway))
+            assert seen.returncode != 0, 'kubectl still reads the unreadable kubeconfig: %s' % seen.stdout[:200]
         commands = ['aws --profile prod s3 ls', 'kubectl get nodes', 'az group list', 'gh pr list',
                     'git commit -m "still known"']
         body, _ = run_turn(tool, accounts, gateway, commands)
