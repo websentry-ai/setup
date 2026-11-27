@@ -352,10 +352,10 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('kubectl --kubeconfig /tmp/a.kc:/tmp/b.kc get pods'):
             self.assertIsNone(resolved, path)
 
-    def test_a_single_dash_long_option_is_not_an_attached_server(self):
-        """kubectl reads `-server` as a flag, not `-s` with `erver` attached."""
+    def test_a_single_dash_since_is_an_unreachable_server_and_no_cluster(self):
+        """kubectl reads `-since=1h` as `-s ince=1h`, a server it cannot reach, so the call reached no cluster."""
         for path, resolved in self.each('kubectl logs pod -since=1h'):
-            self.assertNotEqual((resolved or {}).get('accounts', [{}])[0].get('server'), 'ince=1h', path)
+            self.assertEqual((resolved or {}).get('accounts', []), [], path)
 
     def test_docker_short_global_options_take_their_value(self):
         """`-c` is `--context` and `-l` is `--log-level`; their value is not the subcommand."""
@@ -753,6 +753,14 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('az config set defaults.location=westus', self.repo, state)
             self.assertEqual(named['accounts'][0]['subscription_name'], 'Acme Production', path)
             hook._accounts('az cloud set --name AzureUSGovernment', self.repo, state)
+            self.assertEqual(named.get('accounts'), [], path)
+
+    def test_a_login_drops_a_named_subscription_too(self):
+        """`az login` rewrites every subscription entry, so a named one read before it may no longer hold."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            named = hook._accounts("az group list --subscription 'Acme Production'", self.repo, state)
+            hook._accounts('az login', self.repo, state)
             self.assertEqual(named.get('accounts'), [], path)
 
     def test_a_kubeconfig_the_call_set_to_something_unreadable_is_not_ours(self):

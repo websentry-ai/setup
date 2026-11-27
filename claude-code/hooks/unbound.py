@@ -10544,12 +10544,13 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         if (group, action) == ('aks', 'get-credentials'):
             # Merges a cluster into the kubeconfig and makes it the current context.
             return 'kubeconfig'
-        if group == 'login' or (group, action) == ('account', 'set'):
+        if (group, action) == ('account', 'set'):
             return 'azure'
-        # `az cloud set`, or an `az config` write to a `cloud.` key, changes the cloud every subscription is
-        # matched within; other config keys (`defaults.location`) do not.
-        if (group, action) == ('cloud', 'set') or (group == 'config' and action in ('set', 'unset') and any(
-                arg.lower().startswith('cloud.') for arg in args)):
+        # `az login` rewrites every subscription entry, and `az cloud set`, or an `az config` write to a `cloud.`
+        # key, changes the cloud each is matched within; other config keys (`defaults.location`) do not.
+        if group == 'login' or (group, action) == ('cloud', 'set') or (
+                group == 'config' and action in ('set', 'unset') and any(
+                    arg.lower().startswith('cloud.') for arg in args)):
             return 'azure-cloud'
     return None
 
