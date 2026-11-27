@@ -431,6 +431,20 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('az account set --subscription "Acme Sandbox"', self.repo, state)
             self.assertEqual(before.get('accounts'), [], path)
 
+    def test_a_resource_id_names_the_subscription_the_call_acted_in(self):
+        """`--ids` and `--scope` act in the subscription inside the ID, not the default; two different are unknown."""
+        sandbox = '/subscriptions/00000000-0000-0000-0000-000000000002/resourceGroups/rg/providers/x/vm/db'
+        for command in ('az vm delete --ids ' + sandbox,
+                        'az role assignment list --scope /subscriptions/00000000-0000-0000-0000-000000000002'):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Acme Sandbox', '%s / %s' % (path, command))
+        other = sandbox.replace('0002', '0001')
+        for command in ('az vm delete --ids %s %s' % (sandbox, other),
+                        'az vm delete --ids /subscriptions/$SUB/resourceGroups/rg',
+                        "az vm delete --subscription 'Acme Production' --ids " + sandbox):
+            for path, resolved in self.each(command):
+                self.assertEqual((resolved or {}).get('accounts', []), [], '%s / %s' % (path, command))
+
     def test_a_named_subscription_survives_a_later_switch(self):
         """An account the call named itself is not the active one, so a switch does not touch it."""
         for path, hook in zip(HOOK_PATHS, HOOKS):

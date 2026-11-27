@@ -8840,6 +8840,13 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
     named, known = _account_option(args, ('--subscription',), _account_path)
     if not known:
         return [], None
+    # A resource ID (`--ids`, `--scope`) acts in the subscription it names, not the default; several are unknown.
+    in_ids = {match.lower() for arg in args for match in _ACCOUNT_AZ_ID_SUBSCRIPTION.findall(arg)}
+    if in_ids:
+        only = _account_value(next(iter(in_ids))) if len(in_ids) == 1 else None
+        if not only or (named and named.lower() != only):
+            return [], None
+        named = only
     # Never the CLI: az loads the extensions in its config folder, which an agent can plant earlier in the turn.
     entry, _settled = _account_azure_entry(named, env, cwd, state)
     source = 'file'
@@ -9023,6 +9030,7 @@ _ACCOUNT_KUBE_CONFIG_READS = frozenset({'', 'view', 'current-context', 'get-cont
 _ACCOUNT_AWS_VALUE_OPTIONS = frozenset({'--profile', '--region', '--output', '--endpoint-url', '--query',
                                         '--ca-bundle', '--color', '--cli-read-timeout', '--cli-connect-timeout',
                                         '--cli-binary-format'})
+_ACCOUNT_AZ_ID_SUBSCRIPTION = re.compile(r'/subscriptions/([^/\s]*)', re.I)
 # az command groups that run on this machine only, and the `az account` actions that read or set local state.
 _ACCOUNT_AZ_LOCAL = frozenset({'', 'help', 'configure', 'config', 'extension', 'bicep', 'cloud', 'version',
                                'upgrade', 'find', 'feedback', 'interactive', 'init', 'self-test', 'login', 'logout'})
