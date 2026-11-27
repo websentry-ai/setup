@@ -8991,6 +8991,9 @@ def _account_switches(program: str, args: List[str]) -> Optional[str]:
         action = _account_cobra_subcommand(after, _ACCOUNT_KUBE_SWITCHES)[0] if subcommand == 'config' else ''
         if action in ('use-context', 'use'):
             return 'kubernetes'
+        # The krew plugin forms of the context switchers (`kubectl ctx prod`, `kubectl konfig …`).
+        if subcommand in ('ctx', 'konfig'):
+            return 'kubeconfig'
         if subcommand == 'config' and action not in _ACCOUNT_KUBE_CONFIG_READS:
             return 'kubeconfig'
     if program == 'aws':

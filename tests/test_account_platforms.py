@@ -427,7 +427,7 @@ class AccountPlatformTests(unittest.TestCase):
     def test_any_kubeconfig_writer_leaves_the_earlier_kubectl_call_unknown(self):
         """Tools beyond kubectl write the kubeconfig too: by what they say, or by being a context switcher."""
         for writer in ('gcloud container clusters get-credentials prod', 'eksctl utils write-kubeconfig -c prod',
-                       'kind export kubeconfig', 'kubectx prod', 'minikube start'):
+                       'kind export kubeconfig', 'kubectx prod', 'minikube start', 'kubectl ctx prod'):
             for path, hook in zip(HOOK_PATHS, HOOKS):
                 state = {}
                 before = hook._accounts('kubectl get pods', self.repo, state)
