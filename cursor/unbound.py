@@ -8912,11 +8912,15 @@ _ACCOUNT_GH_SWITCH_OPTIONS = frozenset({'--help', '--version'})
 
 
 def _account_aws_configure_profile(args: List[str], env: Dict) -> Optional[str]:
-    """The profile an `aws configure` write edits: `set profile.<p>.key`, `--profile`, else the environment's;
-    None when it cannot be told."""
-    words = [arg for arg in _account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)[1] if not arg.startswith('-')]
-    if words[:1] == ['set'] and len(words) > 1 and words[1].startswith('profile.') and words[1].count('.') >= 2:
-        return _account_path(words[1].split('.')[1])
+    """The profile an `aws configure` write edits: `set profile.<p>.key` or `set default.key` as the CLI reads the
+    key whatever `--profile` says, else `--profile`, else the environment's; None when it cannot be told."""
+    action, rest = _account_subcommand(_account_subcommand(args, _ACCOUNT_AWS_VALUE_OPTIONS)[1],
+                                       _ACCOUNT_AWS_VALUE_OPTIONS)
+    key = _account_subcommand(rest, _ACCOUNT_AWS_VALUE_OPTIONS)[0] if action == 'set' else ''
+    if key.startswith('profile.') and key.count('.') >= 2:
+        return _account_path(key.split('.')[1])
+    if key.startswith('default.'):
+        return 'default'
     named, known = _account_option(args, ('--profile',), _account_path)
     if named or not known:
         return named

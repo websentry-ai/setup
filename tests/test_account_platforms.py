@@ -629,6 +629,17 @@ class AccountPlatformTests(unittest.TestCase):
             hook._accounts('aws configure set sso_account_id 999999999999 --profile home', self.repo, state)
             self.assertEqual(home.get('accounts'), [], path)
 
+    def test_an_aws_configure_key_names_its_profile_over_the_flag_and_the_environment(self):
+        """The CLI writes `profile.<p>.key` to <p> and `default.key` to default, whatever `--profile` says."""
+        for path, hook in zip(HOOK_PATHS, HOOKS):
+            state = {}
+            home = hook._accounts('aws s3 ls --profile home', self.repo, state)
+            hook._accounts('AWS_PROFILE=home aws configure set default.region us-east-1', self.repo, state)
+            self.assertEqual(home['accounts'][0]['account_id'], '987654321098', path)
+            hook._accounts('aws configure --profile other set profile.home.sso_account_id 999999999999',
+                           self.repo, state)
+            self.assertEqual(home.get('accounts'), [], path)
+
     def test_a_quoted_or_spaced_profile_section_is_that_profile(self):
         """botocore splits a section with shlex, so `[profile "my team"]` and `[profile   ops]` are real profiles."""
         config = Path(tempfile.mkdtemp(), 'config')
