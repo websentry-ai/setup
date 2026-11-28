@@ -232,6 +232,55 @@ class TurnLogTests(HookRun):
         self.assertEqual(len(first["messages"][1]["tool_use"]), 1)
         self.assertFalse(second["messages"][1].get("tool_use"))
 
+    def pad_audit_log(self, count, session_id=CONVERSATION):
+        log = self.home / ".gemini" / "antigravity-hooks" / "agent-audit.log"
+        record = json.loads(log.read_text().splitlines()[0])
+        with log.open("a") as f:
+            for i in range(count):
+                row = json.loads(json.dumps(record))
+                row["session_id"] = row["event"]["session_id"] = session_id
+                row["event"]["tool_use_id"] = "pad_%d" % i
+                f.write(json.dumps(row) + "\n")
+
+    def stop_tool_ids(self):
+        transcript = self.root / "transcript_full.jsonl"
+        transcript.write_text(json.dumps({"step_index": 0, "type": "PLANNER_RESPONSE", "content": "Done."}))
+        self.run_hook(payload("Stop", transcriptPath=str(transcript)))
+        [turn] = self.requests("/v1/hooks/antigravity")
+        return [use["tool_use_id"] for use in turn["messages"][1]["tool_use"]]
+
+    def test_another_conversations_activity_keeps_an_open_turns_tool_calls(self):
+        self.run_hook(payload("PostToolUse", error="", **tool_call(
+            "run_command", {"CommandLine": "rm -rf build"}, call_id="call_9")))
+        other = "0f3c2a51-7d7e-4c4b-9a43-5b1f0f6d2e10"
+        self.pad_audit_log(100, session_id=other)
+        self.run_hook(payload("PostToolUse", conversationId=other, error="", **tool_call(
+            "run_command", {"CommandLine": "ls"}, call_id="call_other")))
+        self.assertEqual(self.stop_tool_ids(), ["call_9"])
+
+    def test_a_turn_over_the_log_limit_keeps_its_first_tool_call(self):
+        self.run_hook(payload("PostToolUse", error="", **tool_call(
+            "run_command", {"CommandLine": "rm -rf build"}, call_id="call_9")))
+        self.pad_audit_log(100)
+        self.run_hook(payload("PostToolUse", error="", **tool_call(
+            "run_command", {"CommandLine": "ls"}, call_id="call_last")))
+        ids = self.stop_tool_ids()
+        self.assertEqual((ids[0], ids[-1], len(ids)), ("call_9", "call_last", 102))
+
+    def test_each_command_is_attributed_from_its_own_working_directory(self):
+        calls = [unbound._antigravity_event(payload("PostToolUse", **tool_call("run_command", args, call_id=cid)))
+                 for cid, args in (("c1", {"CommandLine": "git status", "Cwd": "/work/other"}),
+                                   ("c2", {"CommandLine": "git status"}))]
+        dirs = []
+
+        def capture(tool_name, tool_input, shell_dir, root_projects):
+            dirs.append(shell_dir)
+            return None, None, "/work/other"
+        with patch.object(unbound, "_repo_for_tool_use", side_effect=capture):
+            unbound.build_llm_exchange(unbound._antigravity_event(payload("Stop")),
+                                       [{"event": ev} for ev in calls])
+        self.assertEqual(dirs, ["/work/other", "/work/repo"])
+
 
 class RepoGateTests(unittest.TestCase):
     def candidates_cwd(self, event):

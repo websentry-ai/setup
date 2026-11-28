@@ -6,7 +6,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import time
 import hashlib
@@ -7610,10 +7610,8 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     assistant_response = (exchange.get('response_text')
                           or conversation.get('agentTextResponse') or '').strip()
 
-    # Per-tool-use project resolution state: the shell starts at the session
-    # cwd; origin and branch lookups are cached per repo root across the turn.
+    # Origin and branch lookups are cached per repo root across the turn.
     cwd = event.get('cwd')
-    shell_dir = cwd
     root_projects = {}
     # Every call's input, so a turn that names an ssh config makes no ssh lookups. The Stop hook has a timeout too,
     # so the lookups get 3 s and the turn is still built and sent.
@@ -7629,18 +7627,18 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             continue
         shaped = _antigravity_posttooluse_to_exchange(ev, mcp_servers)
         if shaped:
-            # Attribute this tool call to the repo it worked in (file path /
-            # shell cwd tracking); rides on the tool_use entry so the backend
-            # can store per-call project on each analytics row.
-            tool_project, tool_branch, shell_dir = _repo_for_tool_use(
-                shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
+            # A run_command call is a new process in its own cwd, relative to the workspace root; no cd carries over.
+            start = cwd
+            if shaped.get('tool_name') == 'Bash':
+                call_cwd = (ev.get('tool_input') or {}).get('cwd') if isinstance(ev.get('tool_input'), dict) else None
+                start = os.path.join(cwd or '', call_cwd) if isinstance(call_cwd, str) and call_cwd else cwd
+            start = start if start and os.path.isabs(start) else None
+            # Attribute this tool call to the repo it worked in; rides on the tool_use entry as the per-call project.
+            tool_project, tool_branch, _ = _repo_for_tool_use(
+                shaped.get('tool_name'), shaped.get('tool_input'), start, root_projects)
             shaped['project'] = tool_project
             shaped['git_branch'] = tool_branch
             if shaped.get('tool_name') == 'Bash' and isinstance(shaped.get('tool_input'), dict):
-                # A run_command call is a new process in its own cwd, relative to the workspace root; no cd carries over.
-                call_cwd = (ev.get('tool_input') or {}).get('cwd') if isinstance(ev.get('tool_input'), dict) else None
-                start = os.path.join(cwd or '', call_cwd) if isinstance(call_cwd, str) and call_cwd else cwd
-                start = start if start and os.path.isabs(start) else None
                 ran = _antigravity_call_ran(ev.get('tool_error'))
                 transfer = _transfer(shaped['tool_input'].get('command'), start, transfer_state, ran is True) \
                     if ran is not False else None
@@ -7759,30 +7757,47 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
     return False
 
 
+def _keep_open_turns(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach each session's tool calls since its latest Stop: that turn's Stop reads them from this log.
+    A turn idle for a day is let go."""
+    sessions = [log.get('session_id') or (log.get('event') or {}).get('session_id') for log in logs]
+    opened, last_seen = {}, {}
+    for index, (log, session_id) in enumerate(zip(logs, sessions)):
+        name = (log.get('event') or {}).get('hook_event_name')
+        last_seen[session_id] = str(log.get('timestamp') or '')
+        if name in ('SessionStart', 'Stop'):
+            opened.pop(session_id, None)
+        elif name == 'PostToolUse':
+            opened.setdefault(session_id, index)
+    stale = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat().replace('+00:00', 'Z')
+    keep = {id(log) for log in kept}
+    for session_id, start in opened.items():
+        if last_seen[session_id] >= stale:
+            keep.update(id(logs[i]) for i in range(start, len(logs)) if sessions[i] == session_id)
+    return [log for log in logs if id(log) in keep]
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
-    session_order = []
-    seen_sessions = set()
+    # By latest activity, not first appearance: an older conversation can still be the busy one.
+    last_seen = {}
+    for index, log in enumerate(logs):
+        if log.get('session_id'):
+            last_seen[log['session_id']] = index
 
-    for log in logs:
-        session_id = log.get('session_id')
-        if session_id and session_id not in seen_sessions:
-            session_order.append(session_id)
-            seen_sessions.add(session_id)
-
-    if len(session_order) > 1:
-        most_recent_session = session_order[-1]
+    if len(last_seen) > 1:
+        most_recent_session = max(last_seen, key=last_seen.get)
         kept_logs = [
             log for log in logs
             if log.get('session_id') == most_recent_session
-        ]
-        save_logs(kept_logs)
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        ][-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept_logs = logs[-AUDIT_LOG_TOTAL_LIMIT:]
+    save_logs(_keep_open_turns(logs, kept_logs))
 
 
 def process_stop_event(event: Dict, api_key: str):
