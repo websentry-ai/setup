@@ -35,7 +35,7 @@ import sys
 # TODO(WEB-4802): hook and discovery versions must be bumped in lockstep on
 # every tag until build-time version injection lands (the workflow already
 # notes this). Keep this equal to unbound_hook.__version__ until then.
-__version__ = "0.1.50"
+__version__ = "0.1.51"
 
 if "__compiled__" in globals():
     # A Nuitka build sets neither of these; the agent finds and re-launches this binary through them.
