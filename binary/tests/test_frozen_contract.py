@@ -14,6 +14,7 @@ this side.
 
 import importlib.util
 import json
+import os
 import sys
 import types
 
@@ -133,11 +134,13 @@ def test_frozen_discovery_missing_binary_skips_without_exec(frozen_module, monke
     assert calls == [], "must not exec (or fall back to download) when binary missing"
 
 
-def _load_discovery_entry():
+def _load_discovery_entry(compiled=False):
     spec = importlib.util.spec_from_file_location(
         "unbound_discovery_entry", REPO / "packaging" / "unbound_discovery_entry.py"
     )
     entry = importlib.util.module_from_spec(spec)
+    if compiled:
+        entry.__compiled__ = object()  # what Nuitka defines in a compiled module
     spec.loader.exec_module(entry)
     return entry
 
@@ -190,6 +193,26 @@ def test_entry_memory_fix_broken_helper_import_exits_1_not_3(monkeypatch, capsys
     monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix"])
     assert _load_discovery_entry().main() == 1
     assert capsys.readouterr().out == ""
+
+
+def test_entry_in_a_nuitka_build_is_frozen_and_points_at_its_own_binary(monkeypatch):
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+    monkeypatch.setattr(sys, "executable", sys.executable)
+    _load_discovery_entry(compiled=True)
+    assert sys.frozen is True
+    assert sys.executable == os.path.join(os.path.abspath(REPO / "packaging"), "unbound-discovery")
+
+
+@pytest.mark.parametrize("supported, exit_code", [(True, 0), (False, 1)])
+def test_entry_memory_fix_selftest_exits_by_the_agents_answer(monkeypatch, supported, exit_code):
+    seen_users = []
+    _install_fake_memory_fix_helper(monkeypatch, lambda: 0)
+    agent = types.ModuleType("coding_discovery_tools.memory_fix")
+    agent.supports_fixes = lambda users: seen_users.append(users) or supported
+    monkeypatch.setitem(sys.modules, "coding_discovery_tools.memory_fix", agent)
+    monkeypatch.setattr(sys, "argv", ["unbound-discovery", "memory-fix-selftest", "ann"])
+    assert _load_discovery_entry().main() == exit_code
+    assert seen_users == [["ann"]]
 
 
 def test_entry_memory_fix_helper_crash_exits_1(monkeypatch, capsys):
