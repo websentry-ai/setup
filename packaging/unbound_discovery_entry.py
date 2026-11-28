@@ -17,6 +17,7 @@ used by the agent hooks when the gateway reports an unknown MCP server);
 a leading "memory-fix" runs the keyless memory-file fixer (memory_fix_helper)
 that the agent re-launches itself into as the file's owner, speaking JSON on
 stdin/stdout, so that route never writes to stdout itself;
+a leading "memory-fix-selftest" is the release workflow's check of that re-launch;
 anything else runs the full discovery sweep. Everything else (argument
 semantics, detection, reporting via curl) is the upstream script, unchanged.
 """
@@ -35,6 +36,11 @@ import sys
 # every tag until build-time version injection lands (the workflow already
 # notes this). Keep this equal to unbound_hook.__version__ until then.
 __version__ = "0.1.50"
+
+if "__compiled__" in globals():
+    # A Nuitka build sets neither of these; the agent finds and re-launches this binary through them.
+    sys.frozen = True
+    sys.executable = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unbound-discovery")
 
 
 def _missing_required_config(argv):
@@ -109,6 +115,16 @@ def main():
 
         try:
             return memory_fix_main()
+        except Exception:
+            _log_crash()
+            return 1
+
+    if argv and argv[0] == "memory-fix-selftest":
+        # Release check, run as root: exit 0 only when the agent can start its fix helper as the named user.
+        try:
+            from coding_discovery_tools.memory_fix import supports_fixes
+
+            return 0 if supports_fixes(argv[1:2]) else 1
         except Exception:
             _log_crash()
             return 1

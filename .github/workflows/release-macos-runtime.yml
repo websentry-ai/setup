@@ -530,6 +530,11 @@ jobs:
               echo "::warning::$bin reports '$v_out' (placeholder/dev build) — would fail a tag release"
             fi
           done
+          # Memory Fix It: the agent, as root, must be able to re-launch this binary as a user.
+          if ! sudo /opt/unbound/current/unbound-discovery/unbound-discovery memory-fix-selftest "$(id -un)"; then
+            echo "::error::unbound-discovery cannot start its memory-fix helper — refusing to release"
+            exit 1
+          fi
           pkgutil --pkg-info ai.getunbound.runtime
           if sudo launchctl print system/ai.getunbound.discovery >/dev/null 2>&1; then
             echo "::error::discovery LaunchDaemon still loaded"; exit 1
