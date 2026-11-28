@@ -6,6 +6,7 @@ import stat
 import shutil
 import sys
 import time
+import select
 import platform
 import subprocess
 import signal
@@ -13,7 +14,9 @@ import threading
 import hashlib
 import bisect
 import json
-from datetime import datetime, timezone
+import re
+import tempfile
+from datetime import datetime, timedelta, timezone
 import shlex
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -44,6 +47,9 @@ BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 # Where each transcript too big to read whole stopped, beside the walk's state, which other writes replace.
 BACKFILL_RESUME_FILE = '.unbound_backfill_resume'
+# How a run that could not send its closing report ended, for the next run to send as previous_outcome.
+BACKFILL_OUTCOME_FILE = '.unbound_backfill_outcome'
+BACKFILL_OUTCOMES = ('completed', 'stopped_by_time_limit', 'stopped_by_cap', 'failed')
 _SCRIPT_START = time.time()
 # All measured from script start. No new batch starts unless it can land before the
 # soft stop (margin: 90s or 1.5x the slowest batch so far); the hard kill backs it up
@@ -61,6 +67,11 @@ BACKFILL_PUT_MIN_SECONDS = 45
 # from-s3 is sized to end this long before the hard deadline, and never given less than the floor per attempt.
 BACKFILL_FROM_S3_SLACK_SECONDS = 10
 BACKFILL_FROM_S3_MIN_SECONDS = 5
+# Kept free at the end of the soft stop for the run's closing report (outcome and counts): data stops this early.
+# A last data PUT can run to its cap, so this must hold the closing upload's PUT floor and its link request
+# (30s an attempt); from-s3 has a reserve of its own.
+BACKFILL_LINK_REQUEST_SECONDS = 30
+BACKFILL_STATS_RESERVE_SECONDS = BACKFILL_PUT_MIN_SECONDS + BACKFILL_LINK_REQUEST_SECONDS
 
 
 def normalize_url(value: str) -> str:
@@ -77,7 +88,7 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
-def _run_as_user(username, fn, *args, **kwargs):
+def _run_as_user(username, fn, *args, _timeout=None, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
     Returns whatever fn returns on success, or None on failure.
 
@@ -133,7 +144,16 @@ def _run_as_user(username, fn, *args, **kwargs):
         # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
         # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
         chunks = []
+        # The child runs as the user, who can pause it: a caller can bound the wait (WEB-6392).
+        deadline = None if _timeout is None else time.monotonic() + _timeout
         while True:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and (remaining <= 0 or not select.select([r_fd], [], [], remaining)[0]):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                break
             try:
                 chunk = os.read(r_fd, 1 << 20)
             except OSError:
@@ -145,7 +165,18 @@ def _run_as_user(username, fn, *args, **kwargs):
         data = b''.join(chunks)
         del chunks
         try:
-            _, status = os.waitpid(pid, 0)
+            if deadline is None:
+                _, status = os.waitpid(pid, 0)
+            else:  # paused after closing the pipe, it would still hold the wait
+                while True:
+                    done, status = os.waitpid(pid, os.WNOHANG)
+                    if done:
+                        break
+                    if time.monotonic() > deadline:
+                        os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+                        return None
+                    time.sleep(0.05)
         except OSError:
             return None
         if os.WEXITSTATUS(status) != 0:
@@ -1158,9 +1189,16 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         path.write_text(new_text, encoding="utf-8")
 
 
+# The settings file setup_managed_hooks last wrote: managed-settings.json, or on Windows the
+# managed-settings.d drop-in when its folder could be made. main reports it as written_to.
+_managed_settings_written: Optional[Path] = None
+
+
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: bool = False) -> bool:
     """Set up system-wide managed hooks for Claude Code: download unbound.py and
     configure managed-settings.json. With skip_settings, install only the script."""
+    global _managed_settings_written
+    _managed_settings_written = None
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
@@ -1353,6 +1391,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         if _is_reparse_point(settings_path):
             raise OSError(f"{settings_path} is a link; refusing to write through it as root")
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        _managed_settings_written = settings_path
         debug_print(f"Created managed settings: {settings_path}")
 
         # Delete the gateway key helper only after the hooks settings are
@@ -2057,10 +2096,6 @@ def _backfill_first_session_id(transcript_path: Path):
     return None
 
 
-def _backfill_skipped_anything(stats: Dict) -> bool:
-    return bool(stats['skipped_over_cap']['count'] or stats['unreadable'])
-
-
 def _backfill_walk_stats(root: Path) -> Dict:
     """uploader_stats for every transcript under root, whatever its age: how many, which are over the cap, and
     which can't be read."""
@@ -2676,13 +2711,13 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
-def _backfill_put_budget_seconds() -> int:
-    # What one PUT may take and still leave from-s3 its turn before the soft stop.
-    return int(BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START)) - BACKFILL_FROM_S3_RESERVE_SECONDS
+def _backfill_put_budget_seconds(reserve: int = BACKFILL_STATS_RESERVE_SECONDS) -> int:
+    # What one PUT may take and still leave from-s3 its turn, and the closing report its reserve, before the soft stop.
+    return int(BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START)) - BACKFILL_FROM_S3_RESERVE_SECONDS - reserve
 
 
-def _backfill_has_time_for_a_chunk() -> bool:
-    return _backfill_put_budget_seconds() >= BACKFILL_PUT_MIN_SECONDS
+def _backfill_has_time_for_a_chunk(reserve: int = BACKFILL_STATS_RESERVE_SECONDS) -> bool:
+    return _backfill_put_budget_seconds(reserve) >= BACKFILL_PUT_MIN_SECONDS
 
 
 def _backfill_from_s3_timeout_seconds() -> int:
@@ -2694,6 +2729,8 @@ def _backfill_from_s3_timeout_seconds() -> int:
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
                            force: bool = False) -> Optional[bool]:
     # None when the chunk ran out of time before its PUT could start: a stop, not a failed upload.
+    # The closing report (no sessions) is the one upload that may use the reserve.
+    reserve = BACKFILL_STATS_RESERVE_SECONDS if sessions else 0
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if _backfill_uploader_stats is not None:
         payload['uploader_stats'] = _backfill_uploader_stats
@@ -2709,7 +2746,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     })
 
     for _ in range(BACKFILL_PUT_ATTEMPTS):
-        if not _backfill_has_time_for_a_chunk():
+        if not _backfill_has_time_for_a_chunk(reserve):
             debug_print("S3 PUT not started: too close to the soft stop")
             return None
         code, body = _backfill_http_request(
@@ -2735,7 +2772,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
             return False
 
         # Measured after the link request, whose own retries can use up to two minutes.
-        put_cap = _backfill_put_budget_seconds()
+        put_cap = _backfill_put_budget_seconds(reserve)
         if put_cap < BACKFILL_PUT_MIN_SECONDS:
             debug_print("S3 PUT not started: the link request used the time left")
             return None
@@ -2952,11 +2989,30 @@ class _BackfillRun:
         self.force_epoch, self.force_days = force_config
         self.completed_watermark = completed_watermark
         self.slowest_batch = 0.0
+        self.uploads_failed = 0
+        self.stopped_by_time = False
 
     def has_time_for_a_batch(self) -> bool:
-        # Start a batch only if even the slowest one so far would land before the soft stop.
+        # Start a batch only if even the slowest one so far would land before the soft stop, less the
+        # closing report's reserve.
         margin = max(BACKFILL_MIN_MARGIN_SECONDS, 1.5 * self.slowest_batch)
-        return BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START) >= margin
+        return BACKFILL_SOFT_STOP_SECONDS - BACKFILL_STATS_RESERVE_SECONDS - (time.time() - _SCRIPT_START) >= margin
+
+    def out_of_time(self) -> bool:
+        """No batch fits any more; remembered, so the run reports it stopped for time."""
+        if self.has_time_for_a_batch():
+            return False
+        self.stopped_by_time = True
+        return True
+
+    def outcome(self, statuses: set) -> str:
+        # A home whose history could not be read was never processed, so the run did not complete.
+        if statuses & {'failed', 'unreadable'}:
+            return 'failed'
+        if self.stopped_by_time:
+            return 'stopped_by_time_limit'
+        # History left with time to spare: a batch cap (or a cursor that stopped moving) ended it.
+        return 'stopped_by_cap' if 'more' in statuses else 'completed'
 
     def upload(self, sessions: List[Dict], forced: bool) -> Tuple[int, int, bool]:
         """(sessions_sent, chunks_failed, out_of_time) for one batch."""
@@ -2964,7 +3020,9 @@ class _BackfillRun:
         try:
             sent, _, failed = _backfill_send_sessions(self.api_key, self.backend_url, sessions, forced)
         except _BackfillOutOfTime as stop:
+            self.stopped_by_time = True
             return stop.args[0], 0, True
+        self.uploads_failed += failed
         return sent, failed, False
 
 
@@ -2984,7 +3042,7 @@ def _backfill_stream_file(run: _BackfillRun, user_home: Tuple[str, Path], sessio
     _backfill_attach_identity([session], run.device_serial, None)
     resume = _run_as_user(username, _backfill_read_file_resume, home_dir, session, tag)
     while True:
-        if not run.has_time_for_a_batch():
+        if run.out_of_time():
             return sent, 'more'
         began = time.time()
         result = _run_as_user(username, _backfill_read_slice_or_false, session, resume, BACKFILL_CHUNK_BYTES)
@@ -3018,7 +3076,7 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
         return 0, 0, 'unreadable'
     start, home_forced, sent_total, batches = None, None, 0, 0
     for _ in range(BACKFILL_MAX_BATCHES_PER_HOME):
-        if not run.has_time_for_a_batch():
+        if run.out_of_time():
             return sent_total, batches, 'more'
         began = time.time()
         result = _run_as_user(username, _backfill_collect_sessions, home_dir,
@@ -3095,6 +3153,77 @@ def _backfill_add_stats(total: Dict, part: Optional[Dict]) -> None:
         over['by_size'][name]['total_bytes'] += band['total_bytes']
 
 
+def _backfill_outcome_path(home: Path) -> Path:
+    return _backfill_state_path(home).with_name(BACKFILL_OUTCOME_FILE)
+
+
+def _backfill_read_outcome(home: Path) -> Optional[str]:
+    try:
+        value = _backfill_outcome_path(home).read_text().strip()
+    except OSError:
+        return None
+    return value if value in BACKFILL_OUTCOMES else None
+
+
+def _backfill_clear_outcome(home: Path) -> None:
+    path = _backfill_outcome_path(home)
+    if _backfill_root_is_linked(home / '.claude', path.parent):
+        return  # never delete through a link into another profile
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _backfill_save_outcome(user_homes: List[Tuple[str, Path]], outcome: str) -> None:
+    # In every profile, each as its own user; the next run takes the first it finds. Never raises: it also
+    # runs from the error path.
+    for username, home_dir in user_homes:
+        try:
+            _run_as_user(username, _backfill_write_state_text, home_dir, outcome, BACKFILL_OUTCOME_FILE)
+        except Exception as e:
+            debug_print(f"backfill outcome not saved for {username}: {e}")
+
+
+def _backfill_take_outcome(user_homes: List[Tuple[str, Path]]) -> Optional[str]:
+    """The outcome an earlier run could not send. Replaced by stopped_by_time_limit until this run reports:
+    the hard deadline kills a run with no chance to save anything, and that is how such a run ended."""
+    found = (_run_as_user(username, _backfill_read_outcome, home_dir) for username, home_dir in user_homes)
+    previous = next((outcome for outcome in found if outcome), None)
+    _backfill_save_outcome(user_homes, 'stopped_by_time_limit')
+    return previous
+
+
+def _backfill_send_outcome(run: _BackfillRun, user_homes: List[Tuple[str, Path]], outcome: str,
+                           previous: Optional[str]) -> None:
+    """The run's closing upload: the counts when there is time to walk for them, how the run ended, and an
+    earlier run's unsent outcome. Left on disk for the next run when it can't go."""
+    global _backfill_uploader_stats
+    stats: Dict = {}
+    # Walked after the uploads, with the time left, so a large history never holds an upload back.
+    if run.has_time_for_a_batch():
+        stats = _backfill_empty_stats()
+        for username, home_dir in user_homes:
+            _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
+    stats.update(outcome=outcome, uploads_failed=run.uploads_failed)
+    if previous:
+        stats['previous_outcome'] = previous
+    _backfill_uploader_stats = stats
+    try:
+        sent = _backfill_upload_chunk(run.api_key, run.backend_url, []) is True
+    finally:
+        _backfill_uploader_stats = None  # data uploads never carry it
+    if not sent:
+        debug_print(f"backfill outcome {outcome} not sent; the next run sends it")
+        _backfill_save_outcome(user_homes, outcome)
+        return
+    for username, home_dir in user_homes:
+        try:
+            _run_as_user(username, _backfill_clear_outcome, home_dir)
+        except Exception as e:  # sent already; only the next run's previous_outcome can be off
+            debug_print(f"backfill outcome not cleared for {username}: {e}")
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
@@ -3108,10 +3237,12 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
 
+    reported, run, previous = False, None, None
     try:
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
             return
+        previous = _backfill_take_outcome(user_homes)
         device_serial = get_device_identifier()
         # Watermark first: a force request filed after this instant must stay pending.
         completed_watermark = time.time()
@@ -3129,17 +3260,24 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print(f"backfill {user_home[0]}: {status}, {sent} sessions in {home_batches} batches")
             sessions_sent, batches = sessions_sent + sent, batches + home_batches
             statuses.add(status)
-        # Counted after the uploads, with the time left, so a large history never holds an upload back.
-        if run.has_time_for_a_batch():
-            stats = _backfill_empty_stats()
-            for username, home_dir in user_homes:
-                _backfill_add_stats(stats, _run_as_user(username, _backfill_home_stats, home_dir))
-            if _backfill_skipped_anything(stats):
-                _backfill_uploader_stats = stats
-                _backfill_upload_chunk(api_key, backend_url, [])
+        _backfill_send_outcome(run, user_homes, run.outcome(statuses), previous)
+        reported = True
         _backfill_report(sessions_sent, batches, statuses)
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
+        if user_homes and not reported:
+            _backfill_report_crash(run or _BackfillRun(api_key, backend_url, None, (None, None), time.time()),
+                                   user_homes, previous)
+
+
+def _backfill_report_crash(run, user_homes, previous) -> None:
+    """A run that raised before its closing upload sends 'failed' now, with any earlier unsent outcome; what
+    can't go is saved for the next run."""
+    try:
+        _backfill_send_outcome(run, user_homes, 'failed', previous)
+    except Exception as e:
+        debug_print(f"backfill failed outcome not sent: {e}")
+        _backfill_save_outcome(user_homes, 'failed')
 
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:
@@ -3181,9 +3319,443 @@ def hook_script_hash(script_path) -> Optional[str]:
         return None
 
 
+TOOL_NAME, TOOL_CLI = "Claude Code", "claude"
+HOOK_ERROR_LOG = (".claude/hooks/error.log", "claude-code")  # this tool's log under a home, and its hook_source
+# Per OS: (machine-wide paths, paths under a home), beside the CLI's own folders.
+TOOL_FOOTPRINTS = {
+    "darwin": (("Applications/Claude.app",), (".claude/local/claude", ".claude.json", "Applications/Claude.app")),
+    "linux": ((), (".claude/local/claude", ".claude.json")),
+    "windows": ((), (".claude.json", ".claude/local/claude.exe", "AppData/Local/AnthropicClaude")),
+}
+
+# --- Whether the tool is installed (WEB-6392) ---------------------------------------------
+# For the setup/complete status only: a tool with none of its files on disk is reported skipped,
+# "<Tool> is not installed", and its config is written all the same. Existence checks only (and
+# ~/.npmrc, read without following a link, for its prefix); a check that fails counts as installed.
+# Every tool's MDM script runs on its own, so each one carries this same code with its own
+# footprints, kept equal by tests/test_tool_installed.py; the unbound-hook binary calls it too.
+_UNIX_HOME_CLI_DIRS = (
+    ".local/bin", ".bun/bin", ".npm-global/bin", ".nvm/versions/node/*/bin", ".volta/bin",
+    ".local/share/fnm/node-versions/*/installation/bin", ".fnm/node-versions/*/installation/bin",
+    ".asdf/shims", ".local/share/mise/shims", ".local/share/mise/installs/*/*/bin",
+    ".nodenv/shims", ".nodenv/versions/*/bin", ".yarn/bin", ".config/yarn/global/node_modules/.bin")
+# Where a CLI lands, per OS: (machine-wide folders, folders under a user's home).
+_CLI_DIRS = {
+    "darwin": (("opt/homebrew/bin", "usr/local/bin", "opt/local/bin"), _UNIX_HOME_CLI_DIRS + ("Library/pnpm",)),
+    "linux": (("usr/local/bin", "usr/bin", "snap/bin", "var/lib/flatpak/exports/bin"),
+              _UNIX_HOME_CLI_DIRS + (".local/share/pnpm", ".local/share/flatpak/exports/bin")),
+    "windows": (("ProgramData/chocolatey/bin", "Program Files/nodejs"),
+                ("AppData/Roaming/npm", "AppData/Local/pnpm", "AppData/Local/Volta/bin", "AppData/Roaming/nvm/*",
+                 "scoop/shims", ".local/bin", ".bun/bin")),
+}
+_CLI_SUFFIXES = {"windows": ("", ".exe", ".cmd", ".ps1")}
+
+
+def _install_root(system: str) -> Path:
+    return Path((os.environ.get("SystemDrive") or "C:") + "\\") if system == "windows" else Path("/")
+
+
+def _found(root: Path, relpath: str) -> bool:
+    """Something is at relpath; a place that can't be looked at counts as found."""
+    try:
+        return any(root.glob(relpath)) if "*" in relpath else (root / relpath).exists()
+    except OSError:
+        return True
+
+
+def _npmrc_cli_dir(home: Path, system: str) -> Optional[Path]:
+    """Where npm puts CLIs for a prefix the user set in ~/.npmrc, or None."""
+    try:
+        fd = os.open(str(home / ".npmrc"), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        text = os.read(fd, 65536).decode("utf-8", "replace")
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        if sep and key.strip() == "prefix":
+            value = value.strip().strip("\"'")
+            for token in ("${HOME}", "$HOME"):
+                value = value.replace(token, str(home))
+            if value.startswith("~/"):
+                value = str(home) + value[1:]
+            if not os.path.isabs(value):
+                return None
+            return Path(value) if system == "windows" else Path(value) / "bin"
+    return None
+
+
+def tool_installed(user_homes, system: Optional[str] = None, machine_root: Optional[Path] = None) -> bool:
+    """Whether any of this tool's footprints is on the machine or in a user's home."""
+    try:
+        system = system or platform.system().lower()
+        root = machine_root if machine_root is not None else _install_root(system)
+        machine_dirs, home_dirs = _CLI_DIRS.get(system, ((), ()))
+        machine_files, home_files = TOOL_FOOTPRINTS.get(system, ((), ()))
+        names = [TOOL_CLI + suffix for suffix in _CLI_SUFFIXES.get(system, ("",))]
+        machine = [f"{d}/{n}" for d in machine_dirs for n in names] + list(machine_files)
+        per_home = [f"{d}/{n}" for d in home_dirs for n in names] + list(home_files)
+        if any(_found(root, rel) for rel in machine):
+            return True
+        for _, home in user_homes:
+            if home is None:
+                continue
+            npm_dir = _npmrc_cli_dir(Path(home), system)
+            if any(_found(Path(home), rel) for rel in per_home) or (
+                    npm_dir is not None and any(_found(npm_dir, n) for n in names)):
+                return True
+        return False
+    except Exception:
+        return True
+
+
+# --- Stuck hook errors (WEB-6392) -----------------------------------------------------------
+# A hook reports an error to the gateway at most once a minute and never retries, so the rest wait in
+# its error.log. Each run sends this tool's entries (HOOK_ERROR_LOG) newer than the last one forwarded,
+# per home and with that home's own key, as the unbound-hook binary does on a Mac. Every tool's MDM script
+# runs on its own, so each one carries this same code, kept equal by tests/test_mdm_hook_errors.py.
+# Beside each error.log: "<timestamp> <n>", the newest entry the gateway accepted and how many entries
+# stamped exactly then were sent (two can share a stamp, and a request can end between them).
+FORWARDED_STATE_NAME = ".error_log_forwarded"
+HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
+# error.log is the user's to write: per home, a run sends at most the newest 25 (what a hook keeps) and
+# nothing older than a week, so a flooded or first-seen log costs at most three requests.
+HOOK_ERRORS_PER_RUN = 25
+HOOK_ERROR_MAX_AGE = timedelta(days=7)
+# Sentry groups by category: forwarded entries group together, apart from the hook's live reports.
+FORWARDED_ERROR_CATEGORY = "forwarded_error_log"
+HOOK_ERROR_TIMEOUT_SECONDS = 5  # forwarding must never hold setup up
+HOOK_ERROR_USER_TIMEOUT = 30  # a step run as the user, who can pause it, ends after this
+_HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
+_USER_FILE_MAX_BYTES = 4 * 1024 * 1024
+# A user's file: never followed if it is a link, never waited on if it is a FIFO, never text-mode on Windows.
+_USER_FILE_FLAGS = getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+_BEARER = re.compile(r"(?i)\bBearer\s+\S+")
+_NAMED_SECRET = re.compile(r"""(?i)\b([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd))("?\s*[:=]\s*"?)([^\s"',;&}]+)""")
+_URL_SECRET = re.compile(r"(?i)([?&](?:key|token|api_key|access_token|sig|signature)=)[^&\s\"]+")
+_VENDOR_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{10,}")
+
+
+def _log_time(text):
+    """An entry's timestamp as an aware datetime (hooks write UTC 'Z' or local time with its offset), else None."""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo else None
+
+
+def _refuse_links_on_the_way(path: Path) -> None:
+    """Windows: SYSTEM opens a user's path itself, so a link or junction anywhere on it is refused before the
+    open, and _refuse_if_redirected checks the opened file after it. A part not made yet is skipped."""
+    if os.name != "nt":
+        return
+    path = Path(os.path.abspath(str(path)))
+    for part in (path, *path.parents):
+        try:
+            st = os.lstat(part)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & 0x400:  # a reparse point
+            raise OSError(f"{part} is a link or junction")
+
+
+def _refuse_if_redirected(fd: int, path: Path) -> None:
+    """Windows has no O_NOFOLLOW, and SYSTEM opens a user's files itself: the file opened must be the one at
+    the path asked for, with no link or junction anywhere on the way. Closes fd and raises OSError if not."""
+    if os.name != "nt":
+        return
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    kernel32.GetLongPathNameW.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+    kernel32.GetLongPathNameW.restype = wintypes.DWORD
+
+    def plain(name):
+        return "\\\\" + name[8:] if name.startswith("\\\\?\\UNC\\") else name[4:] if name.startswith("\\\\?\\") else name
+
+    final, asked = ctypes.create_unicode_buffer(32768), ctypes.create_unicode_buffer(32768)
+    got = kernel32.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), final, len(final), 0)
+    # The path asked for in its long form (a temp folder is often given as C:\\Users\\RUNNER~1\\...).
+    wanted = kernel32.GetLongPathNameW(os.path.abspath(str(path)), asked, len(asked))
+    # A hard link has no other path to find, so a file with more than one name is refused as well.
+    if not (0 < got < len(final) and 0 < wanted < len(asked) and os.fstat(fd).st_nlink == 1
+            and os.path.normcase(plain(final.value)) == os.path.normcase(plain(asked.value))):
+        os.close(fd)
+        raise OSError(f"{path} is reached through a link or junction")
+
+
+def _read_user_file(path: Path) -> bytes:
+    """A user's regular file, whole and within _USER_FILE_MAX_BYTES. Raises OSError for anything else."""
+    _refuse_links_on_the_way(path)
+    fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
+    _refuse_if_redirected(fd, path)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        data = f.read(_USER_FILE_MAX_BYTES + 1)
+    if len(data) > _USER_FILE_MAX_BYTES:
+        raise OSError(f"{path} is larger than {_USER_FILE_MAX_BYTES} bytes")
+    return data
+
+
+def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
+    """A user's regular file's last max_bytes, from a whole line on: a long log is read from its end."""
+    _refuse_links_on_the_way(path)
+    fd = os.open(str(path), os.O_RDONLY | _USER_FILE_FLAGS)
+    _refuse_if_redirected(fd, path)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        if st.st_size <= max_bytes:
+            return f.read(max_bytes)
+        f.seek(st.st_size - max_bytes)
+        data = f.read(max_bytes)
+    return data.split(b"\n", 1)[1] if b"\n" in data else b""
+
+
+def _replace_user_file(path: Path, data: bytes) -> None:
+    """Write data (0600) beside path and rename it over: a link or FIFO there is replaced, not written
+    through, and a failed write leaves the old file in place."""
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    _refuse_links_on_the_way(tmp)
+    if os.path.lexists(tmp):
+        tmp.unlink()
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL | _USER_FILE_FLAGS, 0o600)
+    try:
+        _refuse_if_redirected(fd, tmp)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _forwarded_place(log: Path):
+    """(timestamp, how many entries stamped then were sent, their digests or None) from the state file;
+    (None, 0, None) for none. Without digests (written before them) the count alone says which were sent,
+    and a bare timestamp means every entry stamped then was."""
+    try:
+        parts = _read_user_file(log.with_name(FORWARDED_STATE_NAME)).decode().split()
+    except (OSError, UnicodeDecodeError):
+        return None, 0, None
+    last = _log_time(parts[0]) if parts else None
+    sent_then = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else float("inf")
+    digests = parts[2].split(",") if len(parts) == 3 and parts[1].isdigit() else None
+    return (last, sent_then, digests) if last else (None, 0, None)
+
+
+def _unsent_hook_errors(log: Path) -> list:
+    """Runs as the home's user: the newest HOOK_ERRORS_PER_RUN entries after the last one forwarded and
+    newer than HOOK_ERROR_MAX_AGE, oldest first. Each carries the 'state' to save once it is sent."""
+    floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
+    last, sent_then, sent_digests = _forwarded_place(log)
+    parsed = []
+    for line in _read_user_file_tail(log, _USER_FILE_MAX_BYTES).decode("utf-8", "replace").splitlines():
+        match = _HOOK_ERROR_LINE.match(line)
+        if not match:  # a message's own later lines (a traceback); they go with the entry they follow
+            if parsed:
+                parsed[-1]["message"] = (parsed[-1]["message"] + "\n" + line)[:2000]
+            continue
+        parsed.append({"timestamp": match.group(1), "message": match.group(2)[:2000],
+                       "category": FORWARDED_ERROR_CATEGORY})
+    # Entries stamped with the saved time are told apart by digest: the hook keeps only its last 25, so
+    # rotation can drop a sent one and leave a count that no longer lines up.
+    unmatched = list(sent_digests or ())
+    entries, seen_then, kept_then = [], 0, []
+    for entry in parsed:
+        when = _log_time(entry["timestamp"])
+        if when is None or when <= floor or (last is not None and when < last):
+            continue
+        if last is not None and when == last:
+            digest = _entry_digest(entry["message"])
+            if sent_digests is not None:
+                if digest in unmatched:
+                    unmatched.remove(digest)
+                    kept_then.append(digest)
+                    continue  # sent already
+            else:
+                seen_then += 1
+                if seen_then <= sent_then:
+                    kept_then.append(digest)
+                    continue  # sent already, by the count a place without digests carries
+        entries.append((when, entry))
+    entries.sort(key=lambda entry: entry[0])  # stable: entries sharing a stamp keep the log's order
+    chosen = entries[-HOOK_ERRORS_PER_RUN:]
+    for i, (when, entry) in enumerate(chosen):
+        stamped = [e for other, e in chosen[:i + 1] if other == when]
+        earlier = kept_then if when == last else []
+        digests = earlier + [_entry_digest(e["message"]) for e in stamped]
+        entry["state"] = f"{entry['timestamp']} {len(digests)} {','.join(digests)}"
+    return [entry for _, entry in chosen]
+
+
+def _entry_digest(message: str) -> str:
+    """A short digest that tells one sent entry from another stamped at the same time."""
+    return hashlib.sha256(message.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _save_forwarded(log: Path, state: str) -> bool:
+    """Runs as the home's user."""
+    _replace_user_file(log.with_name(FORWARDED_STATE_NAME), state.encode("utf-8"))
+    return True
+
+
+def _redact_hook_error(message: str, secrets) -> str:
+    """The home's own keys, then common credential shapes, each value replaced and its name kept."""
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    message = _BEARER.sub("Bearer [REDACTED]", message)
+    message = _NAMED_SECRET.sub(r"\1\2[REDACTED]", message)
+    message = _URL_SECRET.sub(r"\1[REDACTED]", message)
+    return _VENDOR_KEY.sub("[REDACTED]", message)
+
+
+def _post_hook_json(url, body, headers):
+    """POST a JSON body with curl (the system trust store, as every call here uses). Returns (http status,
+    response bytes); status 0 when nothing came back. Never raises. The headers carry the key, and any local
+    user can read a process's argv, so they go to curl in a 0600 file (-H @file) that is removed afterwards."""
+    header_file = None
+    try:
+        fd, header_file = tempfile.mkstemp(prefix=".unbound-headers.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("".join(f"{name}: {value}\n" for name, value in
+                            {"Content-Type": "application/json", **headers}.items()))
+        cmd = ["curl", "-sS", "-m", str(HOOK_ERROR_TIMEOUT_SECONDS), "-X", "POST", "-w", "\n%{http_code}",
+               "-H", f"@{header_file}", "--data-binary", "@-", "--", url]
+        result = subprocess.run(cmd, input=json.dumps(body).encode("utf-8"),
+                                capture_output=True, timeout=HOOK_ERROR_TIMEOUT_SECONDS + 3)
+        answer, _, code = (result.stdout or b"").rpartition(b"\n")
+        return int(code.strip() or 0), answer
+    except Exception:
+        return 0, b""
+    finally:
+        if header_file:
+            try:
+                os.unlink(header_file)
+            except OSError:
+                pass
+
+
+def _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets=()) -> str:
+    """The hook's own request shape and auth. 'sent' when the gateway took them; 'down' when it gave no
+    answer or a 5xx; 'refused' when it answered no. It refuses only a key (200 with success false, or a
+    4xx), never an entry, so a refusal is about this home's key and not about what the log holds."""
+    errors = [{**{k: v for k, v in entry.items() if k != "state"},
+               "message": _redact_hook_error(entry["message"], (api_key, *secrets))}
+              for entry in batch]
+    code, answer = _post_hook_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
+                                   {"Authorization": f"Bearer {api_key}"})
+    if code <= 0 or code >= 500:
+        return "down"
+    try:
+        taken = 200 <= code < 300 and json.loads(answer.decode("utf-8")).get("success") is True
+    except (ValueError, AttributeError):
+        taken = False
+    return "sent" if taken else "refused"
+
+
+def _writable_dir(path: Path) -> bool:
+    """Runs as the home's user: the forwarded place can be saved in this folder."""
+    return os.access(path, os.W_OK | os.X_OK)
+
+
+def _home_device_key(home: Path):
+    """Runs as the home's user: (the key its hooks report errors with, every key in ~/.unbound/config.json
+    to redact), or None before setup first wrote it."""
+    try:
+        config = json.loads(_read_user_file(home / ".unbound" / "config.json").decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    # The hooks' own order (cfg.get('api_key') or cfg.get('device_token')): their errors are this key's.
+    if not isinstance(config, dict):
+        return None
+    key = config.get("api_key") or config.get("device_token")
+    secrets = tuple(v for v in (config.get("api_key"), config.get("device_token")) if isinstance(v, str) and v)
+    return (key, secrets) if isinstance(key, str) and key else None
+
+
+def _forward_home_errors(username, log, send):
+    """(entries sent, 'sent' or the verdict that stopped it, whether every unsent entry went out). The place
+    is saved after each accepted request; where it can't be saved nothing more is sent, or every run would
+    send the same entries again."""
+    if _run_as_user(username, _writable_dir, log.parent, _timeout=HOOK_ERROR_USER_TIMEOUT) is not True:
+        print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
+        return 0, "sent", False
+    entries = _run_as_user(username, _unsent_hook_errors, log, _timeout=HOOK_ERROR_USER_TIMEOUT)
+    if entries is None:
+        return 0, "sent", False
+    for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
+        batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
+        verdict = send(batch)
+        if verdict != "sent":
+            return start, verdict, False
+        if _run_as_user(username, _save_forwarded, log, batch[-1]["state"], _timeout=HOOK_ERROR_USER_TIMEOUT) is not True:
+            print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
+            return start + len(batch), "sent", False
+    return len(entries), "sent", True
+
+
+def forward_hook_errors(user_homes, gateway_url, hook_path) -> list:
+    """Forward every home's unsent error.log entries for this tool, with that home's own key, before this run
+    changes anything. A gateway that is down ends forwarding for the run, so it costs one short timeout; a
+    refused key is that home's own and skips only that home. Either way nothing is marked sent, and the next
+    run retries. Never raises. Returns the (username, log) of every log not fully sent."""
+    relpath, hook_source = HOOK_ERROR_LOG
+    unsent, sent, down = [], 0, False
+    try:
+        hook_sha = (hook_script_hash(hook_path) or "unknown")[:12]
+        url = gateway_url.rstrip("/") + "/v1/hooks/errors"
+        for username, home_dir in user_homes:
+            log = Path(home_dir) / relpath if home_dir is not None else None
+            if log is None or not os.path.lexists(log):
+                continue
+            found = None if down else _run_as_user(username, _home_device_key, Path(home_dir),
+                                                   _timeout=HOOK_ERROR_USER_TIMEOUT)
+            if not found:
+                unsent.append((username, log))  # the gateway is down, or no hook here has a key yet
+                continue
+            api_key, secrets = found
+            count, verdict, done = _forward_home_errors(
+                username, log, lambda batch: _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets))
+            sent += count
+            if not done:
+                unsent.append((username, log))
+            if verdict == "refused":
+                print(f"[errors] {TOOL_NAME} hook errors in {home_dir} not forwarded (key refused); the next run retries")
+            elif verdict == "down":
+                down = True
+                print(f"[errors] {TOOL_NAME} hook errors not forwarded (gateway down); the next run retries")
+    except Exception as e:
+        print(f"[errors] {TOOL_NAME} hook errors not forwarded: {e}")
+    if sent:
+        print(f"[errors] forwarded {sent} {TOOL_NAME} hook errors")
+    return unsent
+
+
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
-                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None):
-    """Notify backend that tool setup completed. Never fails the setup."""
+                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None,
+                          status: Optional[str] = None, reason: Optional[str] = None,
+                          written_to: Optional[str] = None):
+    """Notify backend how tool setup ended. Never fails the setup. status is configured, skipped or
+    deferred; left out, the backend reads configured, as from older installers."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
         body = {"tool_type": tool_type, "managed": True}
@@ -3195,6 +3767,9 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
             body["hook_hash"] = hook_hash
         if install_mode is not None:
             body["install_mode"] = install_mode
+        for key, value in (("status", status), ("reason", reason), ("written_to", written_to)):
+            if value is not None:
+                body[key] = str(value)[:500]  # the backend's limit
         data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
@@ -3289,6 +3864,9 @@ def main():
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return False
 
+    # Before this run changes anything, with the key each home's hooks already report with.
+    forward_hook_errors(get_all_user_homes(), gateway_url, get_managed_settings_dir() / "hooks" / "unbound.py")
+
     print("\nGetting device identifier...")
     device_id = get_device_identifier()
     if not device_id:
@@ -3302,6 +3880,16 @@ def main():
     if not api_key:
         return False
     print("API key received")
+
+    tool_present = tool_installed(get_all_user_homes())  # before this run writes anything
+
+    def report(status, reason=None, **fields):
+        """This tool's setup/complete for the run, whatever happened (WEB-6392). Configured on a device
+        without the tool reads skipped: its config is written all the same."""
+        if status == "configured" and not tool_present:
+            status, reason = "skipped", f"{TOOL_NAME} is not installed"
+        notify_setup_complete(api_key, "claude-code", backend_url=base_url, serial_number=device_id,
+                              install_mode="mdm-skip" if skip_managed_settings else "mdm", status=status, reason=reason, **fields)
 
     print("\nSetting environment variables system-wide...")
     _freeze_ownership_evidence()
@@ -3317,6 +3905,7 @@ def main():
     url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
     if not url_ok:
         print("Failed to set UNBOUND_BACKEND_URL")
+        report("deferred", "Failed to set UNBOUND_BACKEND_URL")
         return False
 
     # Remove gateway artifacts, strip leftover user-level Unbound hooks
@@ -3340,19 +3929,23 @@ def main():
             print(f"Created managed hooks in {managed_dir}")
     else:
         print("Failed to configure managed hooks")
+        report("deferred", "Failed to configure managed hooks")
         return False
 
     if not config_ok:
         print("Could not write ~/.unbound/config.json for every user")
+        report("deferred", "Could not write ~/.unbound/config.json for every user")
         return False
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "claude-code", backend_url=base_url, install_state=state, serial_number=device_id,
-                          hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"),
-                          install_mode="mdm-skip" if skip_managed_settings else "mdm")
+    managed_dir = get_managed_settings_dir()
+    # The file the write actually went to: on Windows that is the managed-settings.d drop-in.
+    written = managed_dir / "hooks" / "unbound.py" if skip_managed_settings else _managed_settings_written
+    report("configured", install_state=state, hook_hash=hook_script_hash(managed_dir / "hooks" / "unbound.py"),
+           written_to=str(written) if written else None)
 
     if backfill_mode:
         _run_backfill_bounded(api_key, base_url, get_all_user_homes())

@@ -187,3 +187,85 @@ class TestCopilotPatchHeaders:
         patch_text = "*** Begin Patch\n*** Update File: %s\n@@\n-a\n+b\n*** End Patch\n" % (spaced / "a.py")
         candidates = m._repo_gate_candidates("Edit", {"input": patch_text}, str(tmp_path))
         assert m._repo_gate_violating_repo(candidates, ALLOWED_ONLY, {}) == "acme/web"
+
+
+# --- WEB-6392: MDM setup runs as SYSTEM and opens users' files itself on Windows ---------------------
+
+MDM_SCRIPTS = {
+    "claude-code": "claude-code/hooks/mdm",
+    "cursor": "cursor/mdm",
+    "codex": "codex/hooks/mdm",
+    "copilot": "copilot/hooks/mdm",
+    "augment": "augment/hooks/mdm",
+}
+
+
+@windows_only
+@pytest.mark.parametrize("tool", sorted(MDM_SCRIPTS))
+def test_setup_never_reads_or_writes_a_users_file_through_a_junction(tool, tmp_path):
+    """A user can point their hooks folder at one only SYSTEM can read: error forwarding must not read the
+    error.log there, nor save its forwarded place there. A file at its own path still reads."""
+    import _winapi
+    m = tool_module(MDM_SCRIPTS[tool], "setup")
+    private = tmp_path / "private"
+    private.mkdir()
+    (private / "error.log").write_text("2026-01-01T00:00:00.000Z: system secret\n")
+    hooks = tmp_path / "home" / ".cursor" / "hooks"
+    hooks.parent.mkdir(parents=True)
+    _winapi.CreateJunction(str(private), str(hooks))
+    with pytest.raises(OSError):
+        m._read_user_file(hooks / "error.log")
+    with pytest.raises(OSError):
+        m._read_user_file_tail(hooks / "error.log", 1024)
+    with pytest.raises(OSError):
+        m._replace_user_file(hooks / ".error_log_forwarded", b"2026-01-01T00:00:00.000Z 1")
+    assert sorted(p.name for p in private.iterdir()) == ["error.log"]
+    os.link(private / "error.log", hooks.parent / "hard-linked.log")  # a second name for the same file
+    with pytest.raises(OSError):
+        m._read_user_file(hooks.parent / "hard-linked.log")
+    plain = tmp_path / "plain.log"
+    plain.write_bytes(b"ok\n")
+    assert m._read_user_file(plain) == b"ok\n"
+    assert m._read_user_file_tail(plain, 1024) == b"ok\n"
+    m._replace_user_file(tmp_path / "state", b"saved")
+    assert (tmp_path / "state").read_bytes() == b"saved"
+
+
+@windows_only
+def test_cursor_cleanup_keeps_only_the_log_and_its_place(tmp_path):
+    m = tool_module("cursor/mdm", "setup")
+    home = tmp_path / "home"
+    hooks = home / ".cursor" / "hooks"
+    (hooks / "old").mkdir(parents=True)
+    (hooks / "old" / "x.txt").write_text("x")
+    for name in ("unbound.py", "error.log", ".error_log_forwarded"):
+        (hooks / name).write_text(name)
+    (home / ".cursor" / "hooks.json").write_text("{}")
+    assert m.remove_user_level_hooks("u", home) is True
+    assert not (home / ".cursor" / "hooks.json").exists()
+    assert sorted(p.name for p in hooks.iterdir()) == [".error_log_forwarded", "error.log"]
+
+
+@windows_only
+@pytest.mark.parametrize("where", ["hooks", "inside"])
+def test_cursor_cleanup_never_deletes_through_a_junction(tmp_path, where):
+    """SYSTEM clears ~/.cursor/hooks: a junction there, or inside it, is never followed to delete elsewhere."""
+    import _winapi
+    m = tool_module("cursor/mdm", "setup")
+    private = tmp_path / "private"
+    private.mkdir()
+    for name in ("precious.txt", "unbound.py"):
+        (private / name).write_text("SYSTEM's")
+    home = tmp_path / "home"
+    hooks = home / ".cursor" / "hooks"
+    if where == "hooks":
+        hooks.parent.mkdir(parents=True)
+        _winapi.CreateJunction(str(private), str(hooks))
+    else:
+        hooks.mkdir(parents=True)
+        (hooks / "unbound.py").write_text("old hook")
+        _winapi.CreateJunction(str(private), str(hooks / "inner"))
+    m.remove_user_level_hooks("u", home)
+    assert sorted(p.name for p in private.iterdir()) == ["precious.txt", "unbound.py"]
+    if where == "inside":
+        assert not os.path.lexists(hooks / "inner") and not (hooks / "unbound.py").exists()

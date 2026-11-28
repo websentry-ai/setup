@@ -79,7 +79,21 @@ the python path, by design:
 - **Per-component status** (`configured | skipped(reason) | deferred(reason)`)
   with fail-open orchestration: a component failure is reported in the
   summary + exit code but never aborts the others. `deferred` means a re-run
-  should retry; `skipped` is intentional.
+  should retry; `skipped` is intentional. Every tool that got its device key
+  sends this status, reason and `written_to` to `/api/v1/setup/complete/` each
+  run; a tool with no footprint on the Mac (`tool_installed()` in its MDM module) is still
+  written but reported `skipped` ("<Tool> is not installed"). A discovery run
+  that prints `Scan skipped: <reason>` is `skipped`. The run itself posts
+  `phase: start` first and `phase: end` last to the MDM install report.
+  Before the migration sweep (which removes `~/.cursor/hooks`), setup
+  forwards each tool's hook `error.log` entries, with the device key in the
+  home's `~/.unbound/config.json` (the key the hooks use), newer than
+  the last forwarded one to the gateway's `/v1/hooks/errors` (ten a request,
+  at most the newest 25 per tool and home, none older than seven days, with
+  `category: forwarded_error_log`),
+  recording the newest accepted timestamp in `.error_log_forwarded` beside the
+  log; a gateway that is down ends forwarding for the run, a refused key skips
+  that home (each home has its own key), and neither saves anything.
 - **`detect_install_state`** is adapted: the python version checked for the
   managed `unbound.py`, which no longer exists. Binary semantics: settings
   file absent → `fresh`; present and referencing the binary → `persisted`;

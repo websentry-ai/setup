@@ -569,7 +569,8 @@ class TestMdmBackfillBatches(unittest.TestCase):
 
     def test_slowest_batch_sets_the_margin_before_the_soft_stop(self):
         """Each batch takes 100s on a fake clock: a new batch needs 1.5x that (150s)
-        left, not just the 90s floor, so the batch that would end at 600s never starts."""
+        left, not just the 90s floor, before the soft stop less the closing report's
+        75s reserve (525s), so the batch that would start at 400s never does."""
         mdm = self.mdm
         clock = {"now": 0.0}
         fake_time = type("T", (), {"time": staticmethod(lambda: clock["now"])})
@@ -581,8 +582,8 @@ class TestMdmBackfillBatches(unittest.TestCase):
         batches = [self._batch([f"a-{i}"], float(i + 1)) for i in range(10)]
         with patch.object(mdm, "time", fake_time), patch.object(mdm, "_SCRIPT_START", 0.0):
             events, starts, out = self._run({"a": batches}, send=slow_send)
-        self.assertEqual(len(starts), 5)  # batches start at 0, 100, 200, 300, 400s
-        self.assertEqual(events[-1], ("write", "a", 5.0))
+        self.assertEqual(len(starts), 4)  # batches start at 0, 100, 200, 300s
+        self.assertEqual(events[-1], ("write", "a", 4.0))
         self.assertIn("More history remains", out)
 
     def test_batch_cap_bounds_one_run(self):
@@ -675,13 +676,13 @@ class TestMdmBackfillBatches(unittest.TestCase):
         """Against a hung backend each chunk burns ~2 min of curl retries, so the rest
         of a failing batch is never attempted; the batch is retried whole next run."""
         calls, cursor, b1_mtime, out = self._drain_with_failing_chunk(failing_call=1)
-        self.assertEqual(calls, [["b2"]])
+        self.assertEqual(calls, [["b2"], []])  # then the run's closing report, sessions-free
         self.assertEqual(cursor, b1_mtime)
         self.assertIn("Some uploads failed", out)
 
     def test_a_later_failed_chunk_also_stops_the_batch(self):
         calls, cursor, b1_mtime, out = self._drain_with_failing_chunk(failing_call=2)
-        self.assertEqual(calls, [["b2"], ["b3"]])
+        self.assertEqual(calls, [["b2"], ["b3"], []])
         self.assertEqual(cursor, b1_mtime)
         self.assertIn("Some uploads failed", out)
 
@@ -703,7 +704,7 @@ class TestMdmBackfillBatches(unittest.TestCase):
              patch.object(mdm, "_backfill_upload_chunk", side_effect=slow_chunk), \
              patch.object(mdm, "BACKFILL_CHUNK_BYTES", 10000):
             out = _drain_real_home(self, home, batch_bytes=30000, real_send=True)
-        self.assertEqual(calls, [["b2"]])
+        self.assertEqual(calls, [["b2"], []])
         self.assertEqual(mdm._backfill_read_state(home)["cursor"], b1.stat().st_mtime)
         self.assertIn("Queued 1 sessions in 1 batches. More history remains", out)
         self.assertNotIn("Some uploads failed", out)
@@ -731,20 +732,21 @@ class TestMdmBackfillBatches(unittest.TestCase):
                 landed = mdm._backfill_upload_chunk("key", "https://backend", [{"session_id": "s"}])
             return landed, requests[1:2], sleep.call_args
 
-        # 500s left: the PUT may take all of it but the 40s kept for from-s3, then rests as long as it took.
-        self.assertEqual(upload_at(100.0), (True, [("PUT", 460)], unittest.mock.call(20)))
-        # 95s left once the PUT lands: the rest is cut to what still leaves the next chunk its 45s floor.
-        self.assertEqual(upload_at(485.0), (True, [("PUT", 75)], unittest.mock.call(10)))
+        # 500s left: the PUT may take all of it but the 40s kept for from-s3 and the 75s kept for the run's
+        # closing report (its 45s PUT floor and a 30s link request), then rests as long as it took.
+        self.assertEqual(upload_at(100.0), (True, [("PUT", 385)], unittest.mock.call(20)))
+        # 160s left: a PUT at the 45s floor; once it lands nothing is left above the next chunk's floor to rest.
+        self.assertEqual(upload_at(440.0), (True, [("PUT", 45)], unittest.mock.call(0)))
         # Under the floor no link is asked for and nothing is sent: None, a stop rather than a failed upload.
-        self.assertEqual(upload_at(520.0), (None, [], None))
+        self.assertEqual(upload_at(485.0), (None, [], None))
         # A link request that retried for 60s comes out of the PUT's time, not on top of it.
-        self.assertEqual(upload_at(100.0, link_took=60.0), (True, [("PUT", 400)], unittest.mock.call(20)))
+        self.assertEqual(upload_at(100.0, link_took=60.0), (True, [("PUT", 325)], unittest.mock.call(20)))
         # And when it leaves less than the floor, the link is dropped and nothing is sent.
-        self.assertEqual(upload_at(485.0, link_took=60.0), (None, [], None))
+        self.assertEqual(upload_at(440.0, link_took=60.0), (None, [], None))
         # from-s3 gets 30s an attempt with time in hand, and less when its four attempts must end before the kill.
         upload_at(100.0)
         self.assertEqual(requests[2], ("POST", 30))
-        upload_at(485.0, put_took=74.0)
+        upload_at(440.0, put_took=119.0)
         # 91s to the kill less the slack: 17s an attempt puts the call's 4 x 17 + 20 subprocess budget inside it.
         self.assertEqual(requests[2], ("POST", 17))
 

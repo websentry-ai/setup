@@ -58,6 +58,11 @@ def _run(up, home, more=()):
     return bodies
 
 
+def _closing(stats, outcome="completed", failed=0):
+    """The run's closing report (WEB-6392): the walk's counts plus how the run ended."""
+    return {**stats, "outcome": outcome, "uploads_failed": failed}
+
+
 # The size bands as the spec states them, by upper bound, written out apart from the code under test.
 BANDS = (("under_100mb", 100 << 20), ("under_250mb", 250 << 20), ("under_500mb", 500 << 20), ("under_1gb", 1 << 30),
          ("1gb_or_more", None))
@@ -101,31 +106,33 @@ class UploaderStatsTestCase(unittest.TestCase):
                                      "by_size": _by_size(self.big)}}
 
     def test_every_standalone_upload_reports_what_was_seen_and_left_behind(self):
-        bodies = _run(setup, self._populated_home())
+        *bodies, closing = _run(setup, self._populated_home())
         self.assertEqual(sorted(s["session_id"] for b in bodies for s in b["sessions"]), ["a", "b"])
         for body in bodies:
             self.assertEqual(set(body), {"tool_type", "sessions", "uploader_stats"})
             self.assertEqual(body["uploader_stats"], self._expected(6))
+        self.assertEqual((closing["sessions"], closing["uploader_stats"]), ([], _closing(self._expected(6))))
 
     def test_mdm_uploads_first_then_sends_the_counts_once(self):
         bodies = _run(mdm, self._populated_home())
         *uploads, counts = bodies
         self.assertEqual(sorted(s["session_id"] for b in uploads for s in b["sessions"]), ["a", "b"])
         self.assertTrue(all("uploader_stats" not in b for b in uploads))
-        self.assertEqual((counts["sessions"], counts["uploader_stats"]), ([], self._expected(6)))
+        self.assertEqual((counts["sessions"], counts["uploader_stats"]), ([], _closing(self._expected(6))))
 
     def test_mdm_skips_the_count_when_the_run_is_out_of_time(self):
-        # Time for the one batch this home needs, none left for the count.
+        # Time for the one batch this home needs, none left for the count: the outcome goes up alone.
         with patch.object(mdm._BackfillRun, "has_time_for_a_batch", side_effect=[True, False]):
-            bodies = _run(mdm, self._populated_home())
+            *bodies, closing = _run(mdm, self._populated_home())
         self.assertTrue(bodies)
         self.assertTrue(all("uploader_stats" not in b for b in bodies))
+        self.assertEqual(closing["uploader_stats"], {"outcome": "completed", "uploads_failed": 0})
 
     def test_mdm_counts_every_profile_of_the_run(self):
         other, projects = self._home()
         (projects / "c.jsonl").write_text(json.dumps({"type": "user", "sessionId": "c"}) + "\n")
         bodies = _run(mdm, self._populated_home(), more=[("bob", other)])
-        self.assertEqual(bodies[-1]["uploader_stats"], self._expected(7))
+        self.assertEqual(bodies[-1]["uploader_stats"], _closing(self._expected(7)))
 
     def test_a_run_that_only_skips_still_reports_its_counts(self):
         for up in (mdm, setup):
@@ -136,11 +143,12 @@ class UploaderStatsTestCase(unittest.TestCase):
                 self.assertEqual([b["sessions"] for b in bodies], [[]])
                 self.assertEqual(bodies[0]["uploader_stats"]["skipped_over_cap"]["count"], 1)
 
-    def test_a_run_with_nothing_skipped_and_nothing_to_send_uploads_nothing(self):
+    def test_a_run_with_nothing_skipped_and_nothing_to_send_uploads_only_its_closing_report(self):
         for up in (mdm, setup):
             with self.subTest(up.__name__):
                 home, _ = self._home()
-                self.assertEqual(_run(up, home), [])
+                self.assertEqual(_run(up, home), [{"tool_type": "claude-code", "sessions": [],
+                                                   "uploader_stats": _closing(up._backfill_empty_stats())}])
 
     def test_unreadable_counts_the_files_the_collector_drops(self):
         for up in (mdm, setup):

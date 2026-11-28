@@ -18,17 +18,24 @@ Fail-open: a component failure is reported in the summary and the exit code,
 but never aborts the remaining components.
 """
 
+import functools
+import hashlib
 import json
 import math
 import os
 import platform
+import re
 import shlex
 import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from . import __version__
 from ._loader import load_mdm_setup_module
 from ._resources import (
     DISCOVERY_BINARY,
@@ -98,6 +105,37 @@ def _parse_args(argv):
     return opts
 
 
+# Reports about this run (start/end, hook errors) must never hold setup up.
+REPORT_TIMEOUT_SECONDS = 5
+
+
+def _post_json(url, body, headers, timeout=REPORT_TIMEOUT_SECONDS):
+    """POST a JSON body with curl (the system trust store, as every call here uses).
+    Returns (http status, response bytes); status 0 when nothing came back. Never raises.
+    The headers carry keys, and any local user can read a process's argv, so they go to
+    curl in a 0600 file (-H @file) that is removed afterwards."""
+    header_file = None
+    try:
+        fd, header_file = tempfile.mkstemp(prefix=".unbound-headers.")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("".join(f"{name}: {value}\n" for name, value in
+                            {"Content-Type": "application/json", **headers}.items()))
+        cmd = ["curl", "-sS", "-m", str(timeout), "-X", "POST", "-w", "\n%{http_code}",
+               "-H", f"@{header_file}", "--data-binary", "@-", "--", url]
+        result = subprocess.run(cmd, input=json.dumps(body).encode("utf-8"),
+                                capture_output=True, timeout=timeout + 3)
+        answer, _, code = (result.stdout or b"").rpartition(b"\n")
+        return int(code.strip() or 0), answer
+    except Exception:
+        return 0, b""
+    finally:
+        if header_file:
+            try:
+                os.unlink(header_file)
+            except OSError:
+                pass
+
+
 def _module(tool):
     m = load_mdm_setup_module(tool)
     m.DEBUG = True  # MDM runs always log diagnostics (parity with python path)
@@ -108,6 +146,346 @@ def _normalized_urls(m, opts):
     base = m.normalize_url(opts["backend_url"])
     gateway = m.normalize_url(opts["gateway_url"])
     return base, gateway
+
+
+def _write_user_config(m, opts, username, home_dir, api_key) -> bool:
+    """Every adapter's per-user ~/.unbound/config.json write, tallied per home for the end report:
+    a home counts as configured only if every tool that reached it wrote there."""
+    base, gateway = _normalized_urls(m, opts)
+    ok = m.write_unbound_config_for_user(
+        username, home_dir, api_key,
+        urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+    writes = opts.setdefault("config_writes", {})
+    writes[str(home_dir)] = writes.get(str(home_dir), True) and bool(ok)
+    return ok
+
+
+# ---------------------------------------------------------------------------
+# Run reports (WEB-6392): the device's install report hears when this run
+# started and how it ended, on the endpoint and admin key onboard.sh's exit
+# report uses. Fail-open: a report that can't be sent logs one line.
+# ---------------------------------------------------------------------------
+
+INSTALL_REPORT_PATH = "/api/v1/automations/mdm/install-report/"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _report_input(fn, fallback, what):
+    """A value only the run reports use: when it can't be had, the reports lose it, never the install."""
+    try:
+        return fn()
+    except Exception as e:
+        print(f"[report] {what} unavailable: {e}")
+        return fallback
+
+
+def _send_run_report(opts, serial, phase, fields) -> None:
+    """fields is called here, inside the fail-open guard."""
+    try:
+        if not serial:  # the endpoint joins on it; without one the report is dropped anyway
+            print(f"[report] install-report {phase} not sent: no device serial")
+            return
+        body = {"serial_number": serial, "phase": phase,
+                "install_mode": "binary-skip" if opts["skip_managed_settings"] else "binary", **fields()}
+        code, _ = _post_json(opts["backend_url"] + INSTALL_REPORT_PATH, body, {"X-API-KEY": opts["api_key"]})
+        if not 200 <= code < 300:
+            print(f"[report] install-report {phase} not sent: HTTP {code}")
+    except Exception as e:
+        print(f"[report] install-report {phase} not sent: {e}")
+
+
+def _start_fields() -> dict:
+    host = {"hostname": platform.node(), "arch": platform.machine()}
+    return {"runtime_version": __version__,
+            "os_version": platform.mac_ver()[0] or platform.release(),
+            **{k: v for k, v in host.items() if v},
+            "timestamps": {"started_at": _utc_now()}}
+
+
+def _preflight_warnings(user_homes) -> list:
+    """What this run can already tell will keep the device from reporting. user_homes None: unknown."""
+    warnings = []
+    if not HOOK_BINARY.is_file():  # every managed hook command points at it
+        warnings.append(f"hook binary not found at {HOOK_BINARY}")
+    if user_homes == []:
+        warnings.append("no user homes found")
+    return warnings
+
+
+# ---------------------------------------------------------------------------
+# Per-tool outcome (WEB-6392): every tool sends setup/complete every run,
+# configured | skipped | deferred, with the reason setup prints.
+# ---------------------------------------------------------------------------
+
+_TOOL_TYPES = {"claude-code": "claude-code", "cursor": "cursor", "codex": "codex",
+               "copilot": "copilot", "augment": "augment_code"}
+
+# The machine root the installed check looks under; tests point it at a sandbox.
+_MACHINE_ROOT = Path("/")
+
+
+def _tool_installed(tool, user_homes) -> bool:
+    """The tool's own MDM module answers (one check per tool, shared with the python setup), with the
+    macOS rules: this binary runs on macOS only. A check that fails counts as installed."""
+    try:
+        return load_mdm_setup_module(tool).tool_installed(user_homes, system="darwin", machine_root=_MACHINE_ROOT)
+    except Exception:
+        return True
+
+
+def _tool_reporter(opts, m, tool, api_key, **fields):
+    """This tool's report call, kept in opts so run() can still report a setup that raises after it."""
+    report = functools.partial(_report, m, tool, api_key, **fields)
+    opts.setdefault("tool_reporters", {})[tool] = report
+    return report
+
+
+def _report_failed_setup(opts, tool, reason) -> tuple:
+    """A tool's setup raised: send 'deferred' when it got far enough to report, and keep it as the status."""
+    report = opts.get("tool_reporters", {}).get(tool)
+    if report is not None:
+        try:
+            return report("deferred", reason)
+        except Exception as e:
+            print(f"[{tool}] deferred status not reported: {e}")
+    return "deferred", reason
+
+
+def _report(m, tool, api_key, status, reason=None, installed=True, **fields):
+    """This tool's setup/complete call for the run; returns the (status, reason) it sent. Configured on a Mac
+    without the tool (installed False, from the run's one check) reads skipped: its config is still written,
+    so the hook works once the tool arrives."""
+    if status == "configured" and not installed:
+        status, reason = "skipped", f"{m.TOOL_NAME} is not installed"
+    m.notify_setup_complete(api_key, _TOOL_TYPES[tool], status=status, reason=reason, **fields)
+    return status, reason
+
+
+def _end_fields(opts, user_homes, warnings) -> dict:
+    fields = {"timestamps": {"completed_at": _utc_now()}, "preflight_warnings": warnings}
+    if user_homes is not None:  # unknown homes send no counts rather than wrong ones
+        writes = opts.get("config_writes", {})
+        configured = sum(1 for _, home in user_homes if writes.get(str(home)) is True)
+        fields["user_homes"] = {"configured": configured, "skipped": len(user_homes) - configured}
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Stuck hook errors (WEB-6392): a hook reports an error to the gateway at most
+# once a minute and never retries, so the rest wait in its error.log. Each run
+# sends the entries newer than the last one forwarded, per tool and per home.
+# ---------------------------------------------------------------------------
+
+# Each tool's hook log under a home, and the hook_source its hook reports as.
+_HOOK_ERROR_LOGS = {
+    "claude-code": (".claude/hooks/error.log", "claude-code"),
+    "cursor": (".cursor/hooks/error.log", "cursor"),
+    "codex": (".codex/hooks/error.log", "codex"),
+    "copilot": (".copilot/hooks/error.log", "copilot"),
+    "augment": (".augment/hooks/error.log", "augment_code"),
+}
+# Beside each error.log: "<timestamp> <n>", the newest entry the gateway accepted and how many entries
+# stamped exactly then were sent (two can share a stamp, and a request can end between them).
+FORWARDED_STATE_NAME = ".error_log_forwarded"
+HOOK_ERRORS_PER_REQUEST = 10  # the gateway takes at most ten
+# error.log is the user's to write: per tool and home, a run sends at most the newest 25 (what a hook keeps)
+# and nothing older than a week, so a flooded or first-seen log costs at most three requests.
+HOOK_ERRORS_PER_RUN = 25
+HOOK_ERROR_MAX_AGE = timedelta(days=7)
+# Sentry groups by category: forwarded entries group together, apart from the hook's live reports.
+FORWARDED_ERROR_CATEGORY = "forwarded_error_log"
+_HOOK_ERROR_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})): (.*)$")
+
+
+def _log_time(text):
+    """An entry's timestamp as an aware datetime (hooks write UTC 'Z' or local time with its offset), else None."""
+    try:
+        when = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return when if when.tzinfo else None
+
+
+def _forwarded_place(log: Path):
+    """(timestamp, how many entries stamped then were sent, their digests or None) from the state file;
+    (None, 0, None) for none. Without digests (written before them) the count alone says which were sent,
+    and a bare timestamp means every entry stamped then was."""
+    try:
+        parts = _read_user_file(log.with_name(FORWARDED_STATE_NAME), follow=False).decode().split()
+    except (OSError, UnicodeDecodeError):
+        return None, 0, None
+    last = _log_time(parts[0]) if parts else None
+    sent_then = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else float("inf")
+    digests = parts[2].split(",") if len(parts) == 3 and parts[1].isdigit() else None
+    return (last, sent_then, digests) if last else (None, 0, None)
+
+
+def _unsent_hook_errors(log: Path) -> list:
+    """Runs as the profile's user: the newest HOOK_ERRORS_PER_RUN entries after the last one forwarded and
+    newer than HOOK_ERROR_MAX_AGE, oldest first. Each carries the 'state' to save once it is sent."""
+    floor = datetime.now(timezone.utc) - HOOK_ERROR_MAX_AGE
+    last, sent_then, sent_digests = _forwarded_place(log)
+    parsed = []
+    for line in _read_user_file_tail(log, _USER_FILE_MAX_BYTES).decode("utf-8", "replace").splitlines():
+        match = _HOOK_ERROR_LINE.match(line)
+        if not match:  # a message's own later lines (a traceback); they go with the entry they follow
+            if parsed:
+                parsed[-1]["message"] = (parsed[-1]["message"] + "\n" + line)[:2000]
+            continue
+        parsed.append({"timestamp": match.group(1), "message": match.group(2)[:2000],
+                       "category": FORWARDED_ERROR_CATEGORY})
+    # Entries stamped with the saved time are told apart by digest: the hook keeps only its last 25, so
+    # rotation can drop a sent one and leave a count that no longer lines up.
+    unmatched = list(sent_digests or ())
+    entries, seen_then, kept_then = [], 0, []
+    for entry in parsed:
+        when = _log_time(entry["timestamp"])
+        if when is None or when <= floor or (last is not None and when < last):
+            continue
+        if last is not None and when == last:
+            digest = _entry_digest(entry["message"])
+            if sent_digests is not None:
+                if digest in unmatched:
+                    unmatched.remove(digest)
+                    kept_then.append(digest)
+                    continue  # sent already
+            else:
+                seen_then += 1
+                if seen_then <= sent_then:
+                    kept_then.append(digest)
+                    continue  # sent already, by the count a place without digests carries
+        entries.append((when, entry))
+    entries.sort(key=lambda entry: entry[0])  # stable: entries sharing a stamp keep the log's order
+    chosen = entries[-HOOK_ERRORS_PER_RUN:]
+    for i, (when, entry) in enumerate(chosen):
+        stamped = [e for other, e in chosen[:i + 1] if other == when]
+        earlier = kept_then if when == last else []
+        digests = earlier + [_entry_digest(e["message"]) for e in stamped]
+        entry["state"] = f"{entry['timestamp']} {len(digests)} {','.join(digests)}"
+    return [entry for _, entry in chosen]
+
+
+def _entry_digest(message: str) -> str:
+    """A short digest that tells one sent entry from another stamped at the same time."""
+    return hashlib.sha256(message.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _save_forwarded(log: Path, state: str) -> bool:
+    """Runs as the profile's user."""
+    _replace_user_file(log.with_name(FORWARDED_STATE_NAME), state.encode("utf-8"), 0o600)
+    return True
+
+
+_BEARER = re.compile(r"(?i)\bBearer\s+\S+")
+_NAMED_SECRET = re.compile(r"""(?i)\b([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd))("?\s*[:=]\s*"?)([^\s"',;&}]+)""")
+_URL_SECRET = re.compile(r"(?i)([?&](?:key|token|api_key|access_token|sig|signature)=)[^&\s\"]+")
+_VENDOR_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{10,}")
+
+
+def _redact_hook_error(message: str, secrets) -> str:
+    """The home's own keys, then common credential shapes, each value replaced and its name kept."""
+    for secret in secrets:
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    message = _BEARER.sub("Bearer [REDACTED]", message)
+    message = _NAMED_SECRET.sub(r"\1\2[REDACTED]", message)
+    message = _URL_SECRET.sub(r"\1[REDACTED]", message)
+    return _VENDOR_KEY.sub("[REDACTED]", message)
+
+
+def _post_hook_errors(url, api_key, hook_source, hook_sha, batch, secrets=()) -> str:
+    """The hook's own request shape and auth. 'sent' when the gateway took them; 'down' when it gave no
+    answer or a 5xx; 'refused' when it answered no. It refuses only a key (200 with success false, or a
+    4xx), never an entry, so a refusal is about this tool's key and not about what the log holds."""
+    errors = [{**{k: v for k, v in entry.items() if k != "state"},
+               "message": _redact_hook_error(entry["message"], (api_key, *secrets))}
+              for entry in batch]
+    code, answer = _post_json(url, {"errors": errors, "hook_source": hook_source, "hook_sha": hook_sha},
+                              {"Authorization": f"Bearer {api_key}"})
+    if code <= 0 or code >= 500:
+        return "down"
+    try:
+        taken = 200 <= code < 300 and json.loads(answer.decode("utf-8")).get("success") is True
+    except (ValueError, AttributeError):
+        taken = False
+    return "sent" if taken else "refused"
+
+
+def _forward_home_errors(m, username, log, send):
+    """(entries sent, 'sent' or the verdict that stopped it, whether every unsent entry went out). The place
+    is saved after each accepted request; where it can't be saved nothing more is sent, or every run would
+    send the same entries again."""
+    if _as_user(m, username, _writable_dir, log.parent) is not True:
+        print(f"[errors] {log} skipped: its forwarded place can't be saved beside it")
+        return 0, "sent", False
+    entries = _as_user(m, username, _unsent_hook_errors, log)
+    if entries is None:
+        return 0, "sent", False
+    for start in range(0, len(entries), HOOK_ERRORS_PER_REQUEST):
+        batch = entries[start:start + HOOK_ERRORS_PER_REQUEST]
+        verdict = send(batch)
+        if verdict != "sent":
+            return start, verdict, False
+        if _as_user(m, username, _save_forwarded, log, batch[-1]["state"]) is not True:
+            print(f"[errors] {log}: forwarded place not saved; the rest waits for the next run")
+            return start + len(batch), "sent", False
+    return len(entries), "sent", True
+
+
+def _home_device_key(home: Path):
+    """Runs as the profile's user: (the key its hooks report errors with, every key in ~/.unbound/config.json
+    to redact), or None before setup first wrote it."""
+    try:
+        config = json.loads(_read_user_file(home / ".unbound" / "config.json", follow=False).decode("utf-8"))
+    except (OSError, ValueError):
+        return None
+    # The hooks' own order (cfg.get('api_key') or cfg.get('device_token')): their errors are this key's.
+    if not isinstance(config, dict):
+        return None
+    key = config.get("api_key") or config.get("device_token")
+    secrets = tuple(v for v in (config.get("api_key"), config.get("device_token")) if isinstance(v, str) and v)
+    return (key, secrets) if isinstance(key, str) and key else None
+
+
+def _forward_hook_errors(m, tool, opts, user_homes=None, keys=None) -> None:
+    """Forward every home's unsent error.log entries for this tool, with that home's own device key. Runs
+    before the migration sweep and the tool steps. A gateway that is down ends
+    forwarding for the whole run, so it costs one short timeout; a refused key is that home's own and skips
+    only that home. Either way nothing is marked sent, and the next run retries. user_homes and keys (home
+    to its key, filled as homes are read) come from run(), so each home is found and read once a run."""
+    relpath, hook_source = _HOOK_ERROR_LOGS[tool]
+    sent = 0
+    try:
+        hook_sha = (m.hook_script_hash(hook_source_path(tool)) or "unknown")[:12]
+        keys = {} if keys is None else keys
+        for username, home_dir in user_homes if user_homes is not None else m.get_all_user_homes():
+            log = home_dir / relpath if home_dir is not None else None
+            if log is None or not os.path.lexists(log):
+                continue
+            if opts.get("hook_errors_held"):
+                continue  # the gateway is down: the next run retries
+            if str(home_dir) not in keys:
+                keys[str(home_dir)] = _as_user(m, username, _home_device_key, home_dir)
+            found = keys[str(home_dir)]
+            if not found:
+                continue  # no hook here has a key to report with yet
+            api_key, secrets = found
+            send = functools.partial(_post_hook_errors, opts["gateway_url"] + "/v1/hooks/errors",
+                                     api_key, hook_source, hook_sha, secrets=secrets)
+            count, verdict, _ = _forward_home_errors(m, username, log, send)
+            sent += count
+            if verdict == "refused":
+                print(f"[errors] {tool} hook errors in {home_dir} not forwarded (key refused); the next run retries")
+            elif verdict == "down":
+                opts["hook_errors_held"] = True
+                print(f"[errors] {tool} hook errors not forwarded (gateway down); the next run retries")
+    except Exception as e:
+        print(f"[errors] {tool} hook errors not forwarded: {e}")
+    if sent:
+        print(f"[errors] forwarded {sent} {tool} hook errors")
 
 
 def _detect_state(settings_path: Path, expected_hooks, relative_ok=False):
@@ -683,6 +1061,22 @@ def _read_user_file(path: Path, follow: bool) -> bytes:
     return data
 
 
+def _read_user_file_tail(path: Path, max_bytes: int) -> bytes:
+    """A user-owned regular file's last max_bytes, from a whole line on: a long log is read from its end."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags)
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        os.close(fd)
+        raise OSError(f"{path} is not a regular file")
+    with os.fdopen(fd, "rb") as f:
+        if st.st_size <= max_bytes:
+            return f.read(max_bytes)
+        f.seek(st.st_size - max_bytes)
+        data = f.read(max_bytes)
+    return data.split(b"\n", 1)[1] if b"\n" in data else b""
+
+
 class _JsonObject(dict):
     """A parsed JSON object that remembers which keys appeared more than once, and its
     nesting depth as serde_json reads it, including values a repeated key replaced."""
@@ -912,7 +1306,11 @@ _USER_CHECK_TIMEOUT = 30
 
 
 def _as_user(m, username, fn, *args):
-    """The module's _run_as_user, bounded: an answer of None (unknown) after the timeout."""
+    """The module's _run_as_user, bounded: an answer of None (unknown) after the timeout. The claude-code,
+    cursor and augment copies take no timeout (one passed would reach fn and fail every call), so those
+    checks run through codex's copy, the same privilege drop with the bound."""
+    if not hasattr(m, "_RUN_AS_USER_TIMEOUT"):  # set only where _run_as_user takes _timeout
+        m = load_mdm_setup_module("codex")
     return m._run_as_user(username, fn, *args, _timeout=_USER_CHECK_TIMEOUT)
 
 
@@ -1018,6 +1416,10 @@ def _setup_claude_code(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    skip_settings = opts["skip_managed_settings"]
+    report = _tool_reporter(opts, m, "claude-code", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("claude-code", True),
+                            install_mode="binary-skip" if skip_settings else "binary")
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
@@ -1027,18 +1429,15 @@ def _setup_claude_code(opts):
     for username, home_dir in m.get_all_user_homes():
         m.remove_gateway_artifacts_for_user(username, home_dir)
         m.remove_user_level_hooks_for_user(username, home_dir)
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
     m.remove_legacy_key_env()
 
-    skip_settings = opts["skip_managed_settings"]
     # None (unknown) without looking: in skip mode managed-settings.json is the
     # admin's file, and unknown leaves the backend's tamper state untouched.
     state = None if skip_settings else _detect_state(
         m.get_managed_settings_dir() / "managed-settings.json", _claude_detected_hooks())
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
-        return ("deferred", "managed settings update failed")
+        return report("deferred", "managed settings update failed")
     if skip_settings:
         # A remote policy may name the python script; deleting it here would
         # strand that policy on a missing file with no local error.
@@ -1047,18 +1446,18 @@ def _setup_claude_code(opts):
         _remove_stale_managed_script(m.get_managed_settings_dir())
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "claude-code", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
-                            install_mode="binary-skip" if skip_settings else "binary")
+    # skip mode writes no hook config of its own: the remote policy holds it
+    outcome = report("configured", install_state=state,
+                     hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
+                     written_to=None if skip_settings else str(m.get_managed_settings_dir() / "managed-settings.json"))
     if opts["backfill"]:
         # Bounded like the MDM script: a heavy history must not hold setup open. The
         # deadline origin is this tool's turn, not module import in the shared process.
         m._SCRIPT_START = time.time()
         m._run_backfill_bounded(api_key, base, m.get_all_user_homes())
-    return ("configured", None)
+    return outcome
 
 
 def _setup_augment(opts):
@@ -1079,6 +1478,9 @@ def _setup_augment(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = _tool_reporter(opts, m, "augment", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("augment", True),
+                            install_mode="binary")
 
     # Write the per-user unbound config now (needed by the managed hook). User
     # hook removal is deferred until the managed write succeeds (parity with
@@ -1086,14 +1488,12 @@ def _setup_augment(opts):
     config_ok = True
     user_homes = m.get_all_user_homes()
     for username, home_dir in user_homes:
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
     m.remove_legacy_key_env()
 
     state = _detect_state(m.get_managed_settings_dir() / "settings.json", _augment_written_hooks(m))
     if not _write_augment_managed_settings(m):
-        return ("deferred", "managed settings write failed")
+        return report("deferred", "managed settings write failed")
     _remove_stale_managed_script(m.get_managed_settings_dir())
 
     # Strip leftover user-level Unbound hooks only after the managed write
@@ -1102,13 +1502,10 @@ def _setup_augment(opts):
         m.remove_user_level_hooks_for_user(username, home_dir)
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "augment_code", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("augment")),
-                            install_mode="binary")
-    return ("configured", None)
+    return report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("augment")),
+                  written_to=str(m.get_managed_settings_dir() / "settings.json"))
 
 
 def _setup_codex(opts):
@@ -1121,6 +1518,9 @@ def _setup_codex(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = _tool_reporter(opts, m, "codex", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("codex", True),
+                            install_mode="binary")
 
     for username, home_dir in m.get_all_user_homes():
         m.remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
@@ -1132,29 +1532,25 @@ def _setup_codex(opts):
     user_homes = m.get_all_user_homes()
     state = _codex_detect_state(m, user_homes)
     if not _write_codex_system_hooks(m):
-        return ("deferred", "codex system hooks.json write failed")
+        return report("deferred", "codex system hooks.json write failed")
     config_ok = True
     for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
         m.enable_codex_hooks_feature_for_user(username, home_dir)
         _strip_codex_user_hooks(m, username, home_dir)
     # After the new hooks are in place: an older codex hook reads only the per-tool var.
     m.remove_legacy_key_env()
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "codex", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("codex")),
-                            install_mode="binary")
+    outcome = report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("codex")),
+                     written_to=str(m.get_managed_settings_dir() / "hooks.json"))
     if opts["backfill"]:
         m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, m.get_all_user_homes())
-    return ("configured", None)
+    return outcome
 
 
 # Characters the shell acts on in an unquoted word.
@@ -1333,12 +1729,13 @@ def _setup_cursor(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = _tool_reporter(opts, m, "cursor", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("cursor", True),
+                            install_mode="binary")
 
     config_ok = True
     for username, home_dir in m.get_all_user_homes():
-        if m.write_unbound_config_for_user(
-                username, home_dir, api_key,
-                urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}):
+        if _write_user_config(m, opts, username, home_dir, api_key):
             m.remove_user_level_hooks(username, home_dir)
         else:
             config_ok = False
@@ -1348,19 +1745,17 @@ def _setup_cursor(opts):
                           relative_ok=True)
     hooks_ok, hooks_changed = _write_cursor_enterprise_hooks(m)
     if not hooks_ok:
-        return ("deferred", "enterprise hooks.json write failed")
+        return report("deferred", "enterprise hooks.json write failed")
     _remove_stale_managed_script(m.get_enterprise_hooks_dir())
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "cursor", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("cursor")),
-                            install_mode="binary")
+    outcome = report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("cursor")),
+                     written_to=str(m.get_enterprise_hooks_dir() / "hooks.json"))
     if hooks_changed:
         m.restart_cursor()
-    return ("configured", None)
+    return outcome
 
 
 def _copilot_detect_state(m, user_homes):
@@ -1422,6 +1817,9 @@ def _setup_copilot(opts):
     api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
     if not api_key:
         return ("deferred", "MDM api key fetch failed")
+    report = _tool_reporter(opts, m, "copilot", api_key, backend_url=base, serial_number=device_id,
+                            installed=opts.get("installed", {}).get("copilot", True),
+                            install_mode="binary")
 
     user_homes = m.get_all_user_homes()
     state = _copilot_detect_state(m, user_homes)
@@ -1430,9 +1828,7 @@ def _setup_copilot(opts):
     for username, home_dir in user_homes:
         if home_dir is None:
             continue  # no home to hold a config or a registration
-        config_ok = m.write_unbound_config_for_user(
-            username, home_dir, api_key,
-            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]}) and config_ok
+        config_ok = _write_user_config(m, opts, username, home_dir, api_key) and config_ok
         # Earlier versions configured the exporter here, per user, in VS Code
         # settings. The managed file written below outranks those, so they are only
         # taken back out.
@@ -1456,25 +1852,21 @@ def _setup_copilot(opts):
     m.configure_managed_telemetry(api_key, gateway_url=gateway)
 
     if user_homes and installed == 0:
-        # A user can make every install fail, so a detected tamper is still reported.
-        if state == "tampered":
-            m.notify_setup_complete(api_key, "copilot", backend_url=base,
-                                    install_state=state, serial_number=device_id,
-                                    install_mode="binary")
-        return ("deferred", "hook install failed for all users")
+        # A user can make every install fail, so the report carries the state found: the backend counts a
+        # tamper on a deferred report without marking the tool connected or deployed.
+        return report("deferred", "hook install failed for all users", install_state=state)
 
     if not config_ok:
-        return ("deferred", "config.json write failed for some users")
+        return report("deferred", "config.json write failed for some users")
 
-    m.notify_setup_complete(api_key, "copilot", backend_url=base,
-                            install_state=state, serial_number=device_id,
-                            hook_hash=m.hook_script_hash(hook_source_path("copilot")),
-                            install_mode="binary")
+    # One file per user, so the per-user path rather than any one home's.
+    outcome = report("configured", install_state=state, hook_hash=m.hook_script_hash(hook_source_path("copilot")),
+                     written_to="~/.copilot/hooks/unbound.json")
     if opts["backfill"]:
         hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
         m._RUN_AS_USER_TIMEOUT = None  # a backfill takes as long as it takes
         m.run_backfill(api_key, base, user_homes, hook_source)
-    return ("configured", None)
+    return outcome
 
 
 def _fetch_device_owner_key(opts):
@@ -1489,6 +1881,29 @@ def _fetch_device_owner_key(opts):
         opts["backend_url"], opts["app_name"], opts["api_key"], device_id,
         app_type="default",
     )
+
+
+SCAN_SKIPPED_PREFIX = "Scan skipped:"
+
+
+def _echo_scan_output(stream, skipped) -> None:
+    """Pass the scan's stdout through to the MDM log line by line, keeping the reason
+    of the first 'Scan skipped: <reason>' line it prints. A log that can't be written stops the
+    echo, never the reading: a full pipe would stall the scan until the backstop."""
+    echo = True
+    try:
+        for raw in iter(stream.readline, b""):
+            line = raw.decode("utf-8", "replace")
+            if echo:
+                try:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                except Exception:
+                    echo = False
+            if not skipped and line.startswith(SCAN_SKIPPED_PREFIX):
+                skipped.append(line[len(SCAN_SKIPPED_PREFIX):].strip())
+    except Exception:
+        pass
 
 
 def _run_discovery(opts):
@@ -1506,9 +1921,13 @@ def _run_discovery(opts):
     env = {**os.environ, "UNBOUND_API_KEY": scan_key}
     backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
     try:
-        proc = subprocess.Popen(cmd, start_new_session=True, env=env)
+        proc = subprocess.Popen(cmd, start_new_session=True, env=env, stdout=subprocess.PIPE)
+        skipped = []
+        echo = threading.Thread(target=_echo_scan_output, args=(proc.stdout, skipped), daemon=True)
+        echo.start()
         try:
             rc = proc.wait(timeout=backstop)
+            echo.join(timeout=5)  # a child still holding the pipe must not hold setup
         except subprocess.TimeoutExpired:
             import signal
             try:
@@ -1520,6 +1939,8 @@ def _run_discovery(opts):
                 except Exception:
                     pass
             return ("deferred", f"discovery exceeded {backstop}s and was terminated")
+        if skipped:  # it ran and chose not to scan: nothing for a re-run to retry
+            return ("skipped", skipped[0] or "scan skipped")
         if rc != 0:
             return ("deferred", f"discovery exited with code {rc}")
         return ("configured", None)
@@ -1564,9 +1985,27 @@ def run(argv) -> int:
     if opts["frontend_url"]:
         opts["frontend_url"] = m0.normalize_url(opts["frontend_url"])
 
+    opts["config_writes"] = {}
+    # Report-only inputs: none of them may stop the install or change its exit code.
+    serial = _report_input(m0.get_device_identifier, None, "device serial")
+    user_homes = _report_input(m0.get_all_user_homes, None, "user homes")
+    warnings = _report_input(lambda: _preflight_warnings(user_homes), [], "preflight checks")
+    # Once, before any tool writes: unknown homes (or a failed check) leave every tool reported as installed.
+    opts["installed"] = _report_input(lambda: {} if user_homes is None else {
+        tool: _tool_installed(tool, user_homes) for tool in opts["tools"] if tool in _TOOL_TYPES},
+        {}, "installed tools")
+    _send_run_report(opts, serial, "start", _start_fields)
+    # Before the sweep: it removes ~/.cursor/hooks, and with it Cursor's error.log.
+    home_keys = {}
+    for tool in opts["tools"]:
+        if tool in _HOOK_ERROR_LOGS:
+            _forward_hook_errors(m0, tool, opts, user_homes, home_keys)
+
     statuses = {}
 
     print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
+    # Cursor's step clears ~/.cursor/hooks but keeps error.log and its forwarded place, so what the gateway
+    # has not taken, or a hook writes during the run, goes out on a later run and nothing goes twice.
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:
@@ -1578,9 +2017,9 @@ def run(argv) -> int:
         try:
             statuses[tool] = adapter(opts)
         except SystemExit as e:
-            statuses[tool] = ("deferred", f"component exited early: {e}")
+            statuses[tool] = _report_failed_setup(opts, tool, f"component exited early: {e}")
         except Exception as e:
-            statuses[tool] = ("deferred", f"error: {e}")
+            statuses[tool] = _report_failed_setup(opts, tool, f"error: {e}")
 
     print(f"\n{'=' * 60}\n[discovery] coding-tool scan\n{'=' * 60}")
     try:
@@ -1597,4 +2036,5 @@ def run(argv) -> int:
         print(line)
         if status == "deferred":
             any_deferred = True
+    _send_run_report(opts, serial, "end", lambda: _end_fields(opts, user_homes, warnings))
     return 1 if any_deferred else 0
