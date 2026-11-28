@@ -9947,8 +9947,9 @@ def _account_home(env: Dict) -> Optional[str]:
         found, known = _account_known(name, env, _account_path)
         if not known:
             return None
-        if name in (env or {}) and not found:
-            # Set to nothing on purpose, which is not the same as the home the password database names.
+        inherited = _TRANSFER_CLEAN_ENV not in (env or {}) and name in os.environ
+        if not found and (name in (env or {}) or inherited):
+            # Set to nothing, by the call or inherited, which is not the same as the home the password database names.
             return None
         if found:
             # Relative to a folder we do not own, so where the call actually looked is unknown.
@@ -10473,16 +10474,20 @@ def _account_azure(args: List[str], env: Dict, cwd: Optional[str], state: Dict) 
         return [], None
     # A resource ID (`--ids`, `--scope`) acts in the subscription it names, not the default; several, or one the
     # hook cannot read (`--ids "$(…)"`), are unknown.
-    in_ids = {match.lower() for arg in args for match in _ACCOUNT_AZ_ID_SUBSCRIPTION.findall(arg)}
-    values, taking = [], False
+    values, others, taking = [], [], False
     for arg in args:
         option, equals, value = arg.partition('=')
         if option in ('--ids', '--scope'):
             values, taking = values + ([value] if equals else []), not equals
-        elif arg.startswith('-'):
-            taking = False
-        elif taking:
+        elif taking and not arg.startswith('-'):
             values.append(arg)
+        else:
+            taking = False
+            others.append(arg)
+    if any(_ACCOUNT_AZ_ID_SUBSCRIPTION.search(arg) for arg in others):
+        # An ID in any other option (`--remote-vnet`, `--image`) may name another subscription than the one acted in.
+        return [], None
+    in_ids = {match.lower() for value in values for match in _ACCOUNT_AZ_ID_SUBSCRIPTION.findall(value)}
     if in_ids or values or any(arg.partition('=')[0] in ('--ids', '--scope') for arg in args):
         # Every ID given must name a readable subscription, or one that cannot be read may name another.
         unread = any(not _account_value(next(iter(_ACCOUNT_AZ_ID_SUBSCRIPTION.findall(v)), '')) for v in values)

@@ -291,6 +291,14 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('HOME= aws s3 ls --profile home'):
             self.assertIsNone(resolved, path)
 
+    def test_an_inherited_empty_home_is_not_the_password_database_home(self):
+        """An empty HOME the hook inherits is still set: the CLI reads `/.aws`, never the passwd home."""
+        with patch.dict(os.environ, {'HOME': ''}):
+            for path, hook in zip(HOOK_PATHS, HOOKS):
+                # The passwd home holds the profile, so only reading it could name an account.
+                with patch.object(hook, '_transfer_home', return_value=self.home):
+                    self.assertIsNone(self.resolve(hook, 'aws s3 ls --profile home'), path)
+
     def test_the_default_profile_variable_wins_as_botocore_reads_it(self):
         """botocore reads AWS_DEFAULT_PROFILE before AWS_PROFILE, so that is the account the CLI used."""
         for path, resolved in self.each('AWS_DEFAULT_PROFILE=home AWS_PROFILE=other aws s3 ls'):
@@ -610,6 +618,14 @@ class AccountPlatformTests(unittest.TestCase):
                 {'id': '00000000-0000-0000-0000-00000000000a', 'name': name, 'isDefault': True}]}).encode())
         for path, resolved in self.each("AZURE_CONFIG_DIR='~/az-alt' az group list"):
             self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Home Dev', path)
+
+    def test_an_id_in_any_other_option_leaves_the_subscription_unknown(self):
+        """A peered vnet or gallery image in another subscription is referenced from the one the call acts in."""
+        other = '/subscriptions/00000000-0000-0000-0000-000000000002/resourceGroups/rg/providers/x/vnet/hub'
+        for command in ('az network vnet peering create -g rg -n p --vnet-name v --remote-vnet ' + other,
+                        'az vm create -g rg -n vm --image=' + other):
+            for path, resolved in self.each(command):
+                self.assertEqual((resolved or {}).get('accounts', []), [], '%s / %s' % (path, command))
 
     def test_a_context_name_with_a_space_is_still_looked_up(self):
         kube = json.loads(os.environ['FAKE_KUBE'])
