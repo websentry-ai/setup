@@ -18,6 +18,7 @@ HOOK_PATHS = [
     'codex/hooks/unbound.py',
     'copilot/hooks/unbound.py',
     'augment/hooks/unbound.py',
+    'antigravity/hooks/unbound.py',
     'cursor/unbound.py',
 ]
 HOOKS = [load_module(p) for p in HOOK_PATHS]

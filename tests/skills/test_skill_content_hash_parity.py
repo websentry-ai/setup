@@ -24,7 +24,7 @@ import pytest
 
 from tests.conftest import tool_module
 
-TOOLS = ["claude-code/hooks", "copilot/hooks", "codex/hooks", "augment/hooks", "cursor"]
+TOOLS = ["claude-code/hooks", "copilot/hooks", "codex/hooks", "augment/hooks", "antigravity/hooks", "cursor"]
 
 CAP = 50 * 1024
 
