@@ -15,10 +15,11 @@ HOOKS = {
     "copilot": "copilot/hooks",
     "codex": "codex/hooks",
     "augment": "augment/hooks",
+    "antigravity": "antigravity/hooks",
 }
-# Per-call resolvers: file-path candidates (codex, copilot, cursor) vs a tool call (claude-code, augment).
+# Per-call resolvers: file-path candidates (codex, copilot, cursor) vs a tool call (claude-code, augment, antigravity).
 PATH_HOOKS = ["codex", "copilot", "cursor"]
-TOOL_HOOKS = ["claude-code", "augment"]
+TOOL_HOOKS = ["claude-code", "augment", "antigravity"]
 
 BRANCH = "feat/checkout-v2"
 WORKTREE_BRANCH = "fix/other"

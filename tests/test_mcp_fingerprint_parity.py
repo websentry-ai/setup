@@ -16,6 +16,7 @@ HOOKS = [
     load_module('codex/hooks/unbound.py'),
     COPILOT,
     load_module('augment/hooks/unbound.py'),
+    load_module('antigravity/hooks/unbound.py'),
     load_module('cursor/unbound.py'),
 ]
 

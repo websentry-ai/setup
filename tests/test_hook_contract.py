@@ -23,6 +23,7 @@ HOOKS = {
     "copilot": REPO / "copilot" / "hooks" / "unbound.py",
     "codex": REPO / "codex" / "hooks" / "unbound.py",
     "augment": REPO / "augment" / "hooks" / "unbound.py",
+    "antigravity": REPO / "antigravity" / "hooks" / "unbound.py",
 }
 
 # A port nothing listens on: a hook that reaches the network must still fail open.
@@ -128,6 +129,7 @@ MODULES = {
     "copilot": "copilot/hooks",
     "codex": "codex/hooks",
     "augment": "augment/hooks",
+    "antigravity": "antigravity/hooks",
 }
 
 # A tool added to HOOKS but not here would keep the fail-open checks and silently lose
@@ -138,7 +140,8 @@ assert set(MODULES) == set(HOOKS), "MODULES and HOOKS disagree on the tool list"
 # augment installs _hook(15000) milliseconds. cursor sets seconds and gives its gated
 # events 15000, but leaves beforeSubmitPrompt on an undocumented default, so it takes the
 # conservative 60 the other installers write rather than a number nobody has verified.
-HOOK_CAP_SECONDS = {"augment": 15}
+# antigravity takes its documented 30s default until its installer writes a timeout.
+HOOK_CAP_SECONDS = {"augment": 15, "antigravity": 30}
 DEFAULT_HOOK_CAP_SECONDS = 60
 
 # Nothing above models interpreter start, the stdin read or the fail-open write, and the

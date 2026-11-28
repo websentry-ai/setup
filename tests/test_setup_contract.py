@@ -460,7 +460,7 @@ class TestCollectorShapeMatchesEveryUnpacker:
 
 def test_every_hook_is_in_the_inventory():
     """A glob that silently matched nothing would make the check below vacuous."""
-    assert len(HOOKS) == 5, HOOKS
+    assert len(HOOKS) == 6, HOOKS
 
 
 @pytest.mark.parametrize("relpath", HOOKS)
