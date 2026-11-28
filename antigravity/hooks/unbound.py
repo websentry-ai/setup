@@ -2715,9 +2715,10 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     tools_to_check = cache.get('tools_to_check', []) if cache else []
     need_pull_policies = cache is None or is_cache_stale(cache)
 
+    # tools_to_check holds canonical names (Read/Write/Edit), the same ones the request sends.
     if (
         tool_name in NATIVE_FILE_TOOLS
-        and tool_name not in tools_to_check
+        and ANTIGRAVITY_TOOL_FAMILY[tool_name] not in tools_to_check
         and not need_pull_policies
     ):
         return {}
@@ -2800,6 +2801,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
             unbound_trace_id = marker_data.get('unboundTraceId')
             footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
             _clear_approval_marker()
+            # Waits up to APPROVAL_TIMEOUT; the installer writes a PreToolUse timeout above it (agy honors long timeouts).
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
             if result == 'approved':
@@ -3463,6 +3465,7 @@ def _repo_gate_incident_ordinal():
 
 def _repo_gate_post(body, api_key):
     """Never waited on, so the blocking path stays free of synchronous work."""
+    # Same argv header as every hook's _repo_gate_post: curl_with_auth blocks, so it cannot back a fire-and-forget call.
     proc = subprocess.Popen(
         ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
          '-H', 'Authorization: Bearer %s' % api_key,
@@ -3531,8 +3534,10 @@ def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
         if not block_policies:
             return None
 
+        tool_input = event.get('tool_input') if isinstance(event.get('tool_input'), dict) else {}
+        # run_command carries its own working directory; the workspace cwd is only the fallback.
         candidates = _repo_gate_candidates(
-            tool_name, event.get('tool_input'), event.get('cwd')
+            tool_name, tool_input, tool_input.get('cwd') or event.get('cwd')
         )
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
         if not repo:
@@ -7804,6 +7809,7 @@ def process_stop_event(event: Dict, api_key: str):
             session_events = []
         elif name == 'PostToolUse':
             session_events.append(log)
+    # main() logs this Stop first, so a tool-free turn ends on an empty segment, never the prior turn's.
     session_events = session_events or turn_events
 
     model = _extract_session_model(logs, session_id) or _antigravity_model(event, session_id)
@@ -8697,6 +8703,9 @@ def _antigravity_event(raw: Dict) -> Dict:
         args = call.get('args') if isinstance(call.get('args'), dict) else {}
         # The model's own one-line summary of the call, not an input to it.
         args = {k: v for k, v in args.items() if k != 'toolSummary'}
+        # Input typed into a running background command is checked as a command.
+        if tool_name == 'manage_task' and args.get('Action') == 'send_input':
+            tool_name, args = 'run_command', {'CommandLine': args.get('Input')}
         mcp = _antigravity_mcp_call(tool_name, args, event)
         if mcp:
             server, tool, tool_input = mcp
@@ -8728,7 +8737,8 @@ def _pretool_output(response: Optional[Dict]) -> Dict:
     hso = (response or {}).get('hookSpecificOutput') or {}
     decision = hso.get('permissionDecision')
     if decision in ('deny', 'ask'):
-        out = {'decision': decision}
+        # Plain `ask` is skipped by an "Always Allow" grant; a Warn must always reach the user.
+        out = {'decision': 'force_ask' if decision == 'ask' else decision}
         if hso.get('permissionDecisionReason'):
             out['reason'] = hso['permissionDecisionReason']
         return out

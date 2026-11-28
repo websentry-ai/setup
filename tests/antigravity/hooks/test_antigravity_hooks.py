@@ -4,6 +4,7 @@ plays back a canned gateway verdict, so nothing reaches the network."""
 
 import hashlib
 import json
+from datetime import datetime, timezone
 import stat
 import subprocess
 import sys
@@ -111,7 +112,7 @@ class PreToolUseTests(HookRun):
         call = payload("PreToolUse", **tool_call("run_command", {"CommandLine": "rm -rf /"}))
         cases = (
             ({"decision": "deny", "reason": "Blocked by policy"}, {"decision": "deny", "reason": "Blocked by policy"}),
-            ({"decision": "ask", "reason": "Confirm this"}, {"decision": "ask", "reason": "Confirm this"}),
+            ({"decision": "ask", "reason": "Confirm this"}, {"decision": "force_ask", "reason": "Confirm this"}),
             ({"decision": "allow"}, {"decision": "allow"}),
         )
         for verdict, expected in cases:
@@ -129,6 +130,33 @@ class PreToolUseTests(HookRun):
         r = subprocess.run([sys.executable, str(HOOK)], input="not json",
                            capture_output=True, text=True, timeout=60, env=self.env)
         self.assertEqual((r.returncode, json.loads(r.stdout)), (0, {"decision": "allow"}))
+
+    def write_policy_cache(self, tools_to_check):
+        cache = self.home / ".gemini" / "antigravity-hooks" / ".policy_cache.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"last_synced": datetime.now(timezone.utc).isoformat(),
+                                     "tools_to_check": tools_to_check}))
+
+    def test_a_fresh_cache_listing_the_canonical_name_still_checks_the_raw_tool(self):
+        self.write_policy_cache(["Read"])
+        self.run_hook(payload("PreToolUse", **tool_call("read_file", {"Path": "/work/repo/.env"})))
+        [sent] = self.requests("/v1/hooks/pretool")
+        self.assertEqual(sent["pre_tool_use_data"]["tool_name"], "Read")
+
+    def test_a_fresh_cache_without_the_family_skips_the_gateway(self):
+        self.write_policy_cache(["Write"])
+        out = self.run_hook(payload("PreToolUse", **tool_call("read_file", {"Path": "/work/repo/a.txt"})))
+        self.assertEqual((out, self.requests("/v1/hooks/pretool")), ({"decision": "allow"}, []))
+
+    def test_input_typed_into_a_running_command_is_checked_as_bash(self):
+        self.run_hook(payload("PreToolUse", **tool_call(
+            "manage_task", {"Action": "send_input", "TaskId": "t1", "Input": "git push --force"})))
+        sent = self.requests("/v1/hooks/pretool")[0]["pre_tool_use_data"]
+        self.assertEqual((sent["tool_name"], sent["command"]), ("Bash", "git push --force"))
+
+    def test_other_task_actions_are_not_sent(self):
+        out = self.run_hook(payload("PreToolUse", **tool_call("manage_task", {"Action": "list"})))
+        self.assertEqual((out, self.requests("/v1/hooks/pretool")), ({"decision": "allow"}, []))
 
     def test_a_lazy_mcp_call_carries_its_server_and_tool(self):
         self.run_hook(payload("PreToolUse", **tool_call("call_mcp_tool", {
@@ -190,6 +218,42 @@ class TurnLogTests(HookRun):
         [use] = assistant["tool_use"]
         self.assertEqual((use["tool_name"], use["tool_input"]["command"], use["tool_use_id"]),
                          ("Bash", "rm -rf build", "call_9"))
+
+
+    def test_a_text_only_turn_does_not_repeat_the_previous_turns_tools(self):
+        transcript = self.root / "transcript_full.jsonl"
+        transcript.write_text(json.dumps({"step_index": 0, "type": "PLANNER_RESPONSE", "content": "Done."}))
+        self.run_hook(payload("PostToolUse", error="", **tool_call(
+            "run_command", {"CommandLine": "rm -rf build"}, call_id="call_9")))
+        stop = payload("Stop", transcriptPath=str(transcript))
+        self.run_hook(stop)
+        self.run_hook(dict(stop, lastUserInput="thanks"))
+        first, second = self.requests("/v1/hooks/antigravity")
+        self.assertEqual(len(first["messages"][1]["tool_use"]), 1)
+        self.assertFalse(second["messages"][1].get("tool_use"))
+
+
+class RepoGateTests(unittest.TestCase):
+    def candidates_cwd(self, event):
+        seen = {}
+
+        def capture(tool_name, tool_input, cwd):
+            seen["cwd"] = cwd
+            return []
+        with patch.object(unbound, "_repo_gate_block_policies", return_value=[{"id": "p"}]), \
+                patch.object(unbound, "_repo_gate_candidates", side_effect=capture):
+            unbound._repo_gate_evaluate(event)
+        return seen.get("cwd")
+
+    def test_a_shell_command_is_gated_in_its_own_working_directory(self):
+        event = unbound._antigravity_event(payload("PreToolUse", **tool_call(
+            "run_command", {"CommandLine": "git push", "Cwd": "/work/other-org-repo"})))
+        self.assertEqual(self.candidates_cwd(event), "/work/other-org-repo")
+
+    def test_without_a_cwd_the_workspace_root_is_used(self):
+        event = unbound._antigravity_event(payload("PreToolUse", **tool_call(
+            "run_command", {"CommandLine": "git push"})))
+        self.assertEqual(self.candidates_cwd(event), "/work/repo")
 
 
 class SkillTests(unittest.TestCase):
