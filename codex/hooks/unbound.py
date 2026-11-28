@@ -8141,6 +8141,17 @@ def _account_path(value: Any) -> Optional[str]:
     return text
 
 
+def _account_config_location(path: str, env: Dict, cwd: Optional[str]) -> Optional[str]:
+    """A configured file or folder as its CLI opens it: `~` from the home folder, a relative one from the call's."""
+    if path == '~' or path.startswith('~/') or (os.name == 'nt' and path.startswith('~\\')):
+        home = _account_home(env)
+        return (os.path.join(home, path[2:]) if path[2:] else home) if home else None
+    if os.path.isabs(path):
+        return path
+    # Another user's `~name` is not resolved here, and a relative path needs the folder the call ran in.
+    return os.path.join(cwd, path) if isinstance(cwd, str) and not path.startswith('~') else None
+
+
 def _account_beyond_reading(env: Dict) -> bool:
     """Whether this call's environment is past reading at all, as it is after a `source` or an `eval`."""
     return _TRANSFER_UNKNOWN_ENV in (env or {})
@@ -8665,11 +8676,10 @@ def _account_aws_file(profile: str, env: Dict, cwd: Optional[str], state: Dict) 
         named, known = _account_known('AWS_CONFIG_FILE', env, _account_path)
         if not known:
             return None, None, False, False
-        if named and not os.path.isabs(named):
-            # The CLI opens a relative path from the folder the call ran in; with that unknown, so is the file.
-            if not isinstance(cwd, str):
+        if named:
+            named = _account_config_location(named, env, cwd)
+            if named is None:
                 return None, None, False, False
-            named = os.path.join(cwd, named)
         home = _account_home(env)
         path = named or (os.path.join(home, '.aws', 'config') if home else None)
         text = _account_file(path)
@@ -8757,8 +8767,7 @@ def _account_azure_dir(env: Dict, cwd: Optional[str]) -> Optional[str]:
     if not known:
         return None
     if found:
-        # The CLI resolves a relative one from the call's folder; with that unknown, so is the profile.
-        return found if os.path.isabs(found) else os.path.join(cwd, found) if isinstance(cwd, str) else None
+        return _account_config_location(found, env, cwd)
     home = _account_home(env)
     return os.path.join(home, '.azure') if home else None
 

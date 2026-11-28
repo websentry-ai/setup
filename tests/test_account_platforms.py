@@ -270,6 +270,16 @@ class AccountPlatformTests(unittest.TestCase):
         for path, resolved in self.each('AWS_CONFIG_FILE=config aws s3 ls --profile home'):
             self.assertEqual(resolved['accounts'][0]['account_id'], '666666666666', path)
 
+    def test_a_config_file_under_a_tilde_is_read_from_the_home_folder(self):
+        """botocore expands `~` itself, so a quoted one is the home folder's file, never `<call folder>/~`."""
+        Path(self.home, 'alt-config').write_text('[profile home]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 777777777777\n')
+        Path(self.repo, '~').mkdir()
+        Path(self.repo, '~', 'alt-config').write_text('[profile home]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 888888888888\n')
+        for command in ('AWS_CONFIG_FILE=~/alt-config aws s3 ls --profile home',
+                        "AWS_CONFIG_FILE='~/alt-config' aws s3 ls --profile home"):
+            for path, resolved in self.each(command):
+                self.assertEqual(resolved['accounts'][0]['account_id'], '777777777777', '%s / %s' % (path, command))
+
     def test_a_spaced_profile_named_on_the_command_is_that_profile(self):
         config = Path(tempfile.mkdtemp(), 'config')
         config.write_text('[profile "my profile"]\nsso_start_url = https://acme.awsapps.com/start\nsso_role_name = Engineer\nsso_account_id = 555555555555\n')
@@ -590,6 +600,16 @@ class AccountPlatformTests(unittest.TestCase):
             {'id': '00000000-0000-0000-0000-000000000009', 'name': 'Local Dev', 'isDefault': True}]}).encode())
         for path, resolved in self.each('AZURE_CONFIG_DIR=.az az group list'):
             self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Local Dev', path)
+
+    def test_an_azure_config_dir_under_a_tilde_is_read_from_the_home_folder(self):
+        """az expands `~` in AZURE_CONFIG_DIR, so a quoted one never means a folder named `~` where the call ran."""
+        for root, name in ((self.home, 'Home Dev'), (os.path.join(self.repo, '~'), 'Decoy')):
+            folder = Path(root, 'az-alt')
+            folder.mkdir(parents=True)
+            Path(folder, 'azureProfile.json').write_bytes(b'\xef\xbb\xbf' + json.dumps({'subscriptions': [
+                {'id': '00000000-0000-0000-0000-00000000000a', 'name': name, 'isDefault': True}]}).encode())
+        for path, resolved in self.each("AZURE_CONFIG_DIR='~/az-alt' az group list"):
+            self.assertEqual(resolved['accounts'][0]['subscription_name'], 'Home Dev', path)
 
     def test_a_context_name_with_a_space_is_still_looked_up(self):
         kube = json.loads(os.environ['FAKE_KUBE'])
